@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include <sys/wait.h>
 #include <torch/torch.h>
 #include <unistd.h>
@@ -195,6 +196,23 @@ void run_python_bridge(const char* operation, const std::vector<std::string>& ar
 }
 
 void populate_metadata_from_manifest(const json& metadata_json, NativeCheckpointMetadata& metadata) {
+    if (const auto layout = metadata_json.find("class_layout"); layout != metadata_json.end())
+        metadata.class_layout = decode_class_layout(layout->dump());
+    if (const auto evidence = metadata_json.find("class_name_evidence"); evidence != metadata_json.end()) {
+        if (!evidence->is_array() || evidence->size() > mmltk::backend::data::catalog::kClassCatalogCapacity)
+            throw std::invalid_argument("invalid upstream class-name evidence");
+        mmltk::backend::data::catalog::OrderedClassCatalog names;
+        for (const auto& entry : *evidence) {
+            if (!entry.is_string()) throw std::invalid_argument("invalid upstream class-name evidence entry");
+            auto name = entry.get<std::string>();
+            if (name.size() > mmltk::backend::data::catalog::kClassNameCapacity || name.find('\0') != std::string::npos)
+                throw std::invalid_argument("oversized upstream class-name evidence");
+            names.names.push_back({std::move(name)});
+        }
+        if (!metadata.class_layout.class_name_evidence.names.empty() && metadata.class_layout.class_name_evidence != names)
+            throw std::invalid_argument("conflicting upstream class-name evidence");
+        metadata.class_layout.class_name_evidence = std::move(names);
+    }
     metadata.num_queries = manifest_optional_value<int64_t>(metadata_json, "num_queries").value_or(0);
     metadata.num_select = manifest_optional_value<int64_t>(metadata_json, "num_select").value_or(0);
     metadata.for_each_detection_field([&metadata_json]<class Name, class Optional>(const Name& name, Optional& field) {
@@ -307,7 +325,16 @@ void write_upstream_model_state(const fs::path& checkpoint_path, const DecodedNa
     if (entries.empty()) { throw std::invalid_argument("RF-DETR upstream checkpoint model state must not be empty"); }
     ScopedTempDirectory temp_dir("mmltk_rfdetr_save_");
     const fs::path manifest_path = temp_dir.path / "manifest.json";
-    write_json_file(manifest_path, manifest_from_model_state(temp_dir.path, entries));
+    auto manifest = manifest_from_model_state(temp_dir.path, entries);
+    if (!model_state.metadata.class_layout.slots.empty())
+        manifest["metadata"]["class_layout"] = json::parse(encode_class_layout(model_state.metadata.class_layout));
+    if (model_state.metadata.num_queries > 0) manifest["metadata"]["num_queries"] = model_state.metadata.num_queries;
+    if (model_state.metadata.num_select > 0) manifest["metadata"]["num_select"] = model_state.metadata.num_select;
+    auto metadata = model_state.metadata;
+    metadata.for_each_detection_field([&]<class Name, class Optional>(const Name& name, const Optional& field) {
+        if (field) manifest["metadata"][name] = *field;
+    });
+    write_json_file(manifest_path, manifest);
     const fs::path output = std::filesystem::absolute(checkpoint_path).lexically_normal();
     fs::create_directories(output.parent_path());
     run_python_bridge("checkpoint write", {"write-upstream", "--output", output.string(), "--manifest", manifest_path.string()});

@@ -1,4 +1,6 @@
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include <array>
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include <cstring>
 #include <cstdint>
 #include <stdexcept>
@@ -17,6 +19,14 @@ import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr::detail {
 
 namespace torch_api = mmltk::backend::ml::torch_api;
+
+void publish_native_checkpoint_archive(torch_api::OutputArchive& archive, const std::filesystem::path& destination,
+    const std::filesystem::path& explicit_descriptor) {
+    ClassArtifactPublication publication(destination, explicit_descriptor);
+    archive.save_to(publication.staged_artifact().string());
+    publication.Publish();
+}
+
 namespace serialization = mmltk::frameworks::serialization;
 
 namespace {
@@ -56,6 +66,10 @@ void write_native_checkpoint_metadata(torch_api::OutputArchive& archive, const N
     if (metadata.num_queries <= 0 || metadata.num_select <= 0 || metadata.num_select > metadata.num_queries) {
         throw std::runtime_error("RF-DETR native checkpoint requires positive num_queries and num_select <= num_queries");
     }
+    const ResolvedClassLayout layout(metadata.class_layout);
+    if (layout.output_width() != static_cast<std::size_t>(metadata.num_classes))
+        throw std::runtime_error("native checkpoint class layout disagrees with tensor output width");
+    write_string(archive, "class_layout", encode_class_layout(metadata.class_layout));
     write_string(archive, "format", kNativeCheckpointFormat);
     write_int(archive, "format_version", kNativeCheckpointFormatVersion);
     write_string(archive, "preset_name", metadata.preset_name);
@@ -126,9 +140,7 @@ TrainingSupervisionConfig read_training_supervision_config(torch_api::InputArchi
     return *decoded;
 }
 
-void require_resume_training_supervision_config(const std::filesystem::path& checkpoint_path, const TrainingSupervisionConfig& expected) {
-    torch_api::InputArchive archive;
-    archive.load_from(checkpoint_path.string());
+void require_resume_training_supervision_config(torch_api::InputArchive& archive, const TrainingSupervisionConfig& expected) {
     if (read_training_supervision_config(archive) != expected) {
         throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");
     }

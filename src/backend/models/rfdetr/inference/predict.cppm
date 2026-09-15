@@ -33,7 +33,8 @@ struct PredictionRecord {
 struct PredictionRunResult {
     ResolvedModelArtifacts artifacts;
     std::string backend_name;
-    std::vector<std::string> class_names;
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
+    mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot;
     bool cancelled = false;
     std::size_t processed_images = 0;
     PhaseTiming timing;

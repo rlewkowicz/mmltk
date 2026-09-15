@@ -3,6 +3,8 @@
 #include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
 
 // CLEANUP-IGNORE: This global module fragment declares the direct validation implementation dependencies.
 
@@ -67,11 +69,17 @@ struct AlignmentSample final {
     predict.progress_bar = request.log_mode == ValidationLogMode::Interactive;
     predict.limit_images = request.limit_images;
     predict.include_masks = false;
+    std::vector<std::uint32_t> evaluator_order;
     std::vector<float> scores;
     std::vector<std::int64_t> labels;
     std::vector<float> boxes;
     const auto predictions = prediction_session.RunResolved(predict, artifact, command_stream, {
       .stop = delivery.stop,
+      .begin = [&](const PredictionRunResult& result) {
+        if (result.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || !result.class_catalog)
+            throw std::invalid_argument("semantic evaluation requires a fully bound model class layout");
+        evaluator_order = result.class_catalog->permutation_to(*dataset.class_catalog());
+      },
       .completed = [&](const PredictionRecord& record, PredictionPixels, const runtime::AnalysisAnnotationStorage&) {
         scores.clear();
         labels.clear();
@@ -81,7 +89,10 @@ struct AlignmentSample final {
         boxes.reserve(record.detections.size() * 4U);
         for (const auto& detection : record.detections) {
             scores.push_back(detection.score);
-            labels.push_back(detection.category_id - 1);
+            if (detection.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground ||
+                detection.class_reference < 0 || static_cast<std::size_t>(detection.class_reference) >= evaluator_order.size())
+                throw std::invalid_argument("invalid semantic evaluator class reference");
+            labels.push_back(evaluator_order[detection.class_reference]);
             boxes.insert(boxes.end(), detection.bbox_xyxy.begin(), detection.bbox_xyxy.end());
         }
         dataset.merge_bbox_predictions(record.dataset_index,
@@ -100,10 +111,12 @@ struct AlignmentSample final {
     });
 
     ValidationBackendResult result;
+    result.artifacts = predictions.artifacts;
     result.model_info.backend = artifact.backend_name;
     result.model_info.model_path = artifact.path.string();
     result.model_info.num_queries = static_cast<std::int64_t>(predict.max_dets_per_image);
-    result.model_info.num_classes = static_cast<std::int64_t>(dataset.category_count());
+    result.model_info.num_classes = predictions.artifacts.config.num_classes;
+    result.model_info.class_layout = predictions.artifacts.class_layout;
     result.summary = dataset.evaluate(predict.max_dets_per_image);
     result.timing = predictions.timing;
     return result;
@@ -161,6 +174,7 @@ ValidationRunResult run_validation(const ValidateRequest& request) {
 }
 
 ValidationRunResult ValidationSession::Run(const ValidateRequest& request, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
+    if (delivery.stop.stop_requested()) return {.cancelled = true};
     if (!command_stream) throw std::invalid_argument("RF-DETR validation command stream is invalid");
     auto options = finalize_validate_request(request);
     ValidationRunResult result;
@@ -177,10 +191,14 @@ ValidationRunResult ValidationSession::Run(const ValidateRequest& request, const
         .result = &result,
         .delivery = &delivery,
     };
-    torch_cuda::run_on_torch_cuda_stream(options.device_id, command_stream.native_handle, &call, [](void* opaque) {
-        auto& bound = *static_cast<BoundValidationCall*>(opaque);
-        *bound.result = bound.state->Run(*bound.options, bound.command_stream, *bound.delivery);
-    });
+    try {
+        torch_cuda::run_on_torch_cuda_stream(options.device_id, command_stream.native_handle, &call, [](void* opaque) {
+            auto& bound = *static_cast<BoundValidationCall*>(opaque);
+            *bound.result = bound.state->Run(*bound.options, bound.command_stream, *bound.delivery);
+        });
+    } catch (const ArtifactPublicationCancelled&) {
+        result.cancelled = true;
+    }
     return result;
 }
 
@@ -189,7 +207,33 @@ std::size_t ValidationSession::RunImageCount(const ValidateRequest& request, con
 }
 
 ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
-    if (options.tensorrt_path.empty() && !options.save_engine_path.empty()) {
+    std::vector<ResolvedInferenceArtifact> artifacts;
+    for (const auto& requested : evaluation_order(options.eval_order)) artifacts.push_back(resolve_inference_artifact(options, requested));
+    const bool materialize = options.tensorrt_path.empty() && !options.save_engine_path.empty();
+    std::optional<ResolvedInferenceArtifact> consumed_source;
+    if (materialize) consumed_source = resolve_inference_artifact(options, "onnx");
+    std::optional<ModelClassDescriptor> selected_descriptor;
+    const auto admit_file = [&](ResolvedInferenceArtifact& artifact) {
+        const auto existing = std::ranges::find_if(artifacts, [&](const auto& other) { return other.path == artifact.path && other.admitted_file; });
+        if (existing != artifacts.end()) artifact.admitted_file = existing->admitted_file;
+        else {
+            auto digest = mmltk::common::io::try_file_digests(artifact.path, true, [&] { return delivery.stop.stop_requested(); });
+            if (!digest) throw ArtifactPublicationCancelled{};
+            artifact.admitted_file = std::make_shared<const mmltk::common::io::FileDigests>(std::move(*digest));
+        }
+        return selected_descriptor->artifact_sha256 == mmltk::common::io::sha256_hex(artifact.admitted_file->sha256);
+    };
+    bool source_descriptor_matches = false;
+    if (!options.class_layout_path.empty()) {
+        selected_descriptor = read_class_descriptor(options.class_layout_path);
+        bool matched = false;
+        for (auto& artifact : artifacts) matched = admit_file(artifact) || matched;
+        if (consumed_source) source_descriptor_matches = admit_file(*consumed_source);
+        if (!matched && !source_descriptor_matches)
+            throw std::invalid_argument("selected class descriptor does not bind any consumed or selected validation artifact");
+    }
+
+    if (materialize) {
         BuildEngineRequest build;
         static_cast<ModelArtifactRequest&>(build) = options;
         build.weights_path.clear();
@@ -197,9 +241,16 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
         build.output_path = options.save_engine_path;
         build.device_id = options.device_id;
         build.allow_fp16 = options.allow_fp16;
-        build_tensorrt_engine(build, command_stream);
+        if (selected_descriptor && !source_descriptor_matches) build.class_layout_path.clear();
+        build_tensorrt_engine(build, command_stream, consumed_source->admitted_file, delivery.stop);
+        if (delivery.stop.stop_requested()) return {.cancelled = true};
         options.tensorrt_path = std::filesystem::absolute(options.save_engine_path);
+        for (auto& artifact : artifacts) if (artifact.compile_onnx_to_tensorrt) {
+            artifact = resolve_inference_artifact(options, "tensorrt");
+            if (selected_descriptor) static_cast<void>(admit_file(artifact));
+        }
     }
+    if (delivery.stop.stop_requested()) return {.cancelled = true};
     auto loader = inference_detail::make_loader(options.compiled_path, options.batch_size, options, options.prefetch_factor);
     EvaluationDatasetOwner dataset(*loader, EvaluationMetricSet::BBox);
     if (options.limit_images != 0U) { dataset.limit_images(options.limit_images); }
@@ -215,9 +266,11 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
 
     std::vector<std::optional<AlignmentSample>> onnx_predictions;
     std::vector<std::optional<AlignmentSample>> tensorrt_predictions;
-    for (const auto& requested : evaluation_order(options.eval_order)) {
+    for (const auto& artifact : artifacts) {
         if (delivery.stop.stop_requested()) break;
-        const auto artifact = resolve_inference_artifact(options, requested);
+        auto backend_request = options;
+        if (selected_descriptor && selected_descriptor->artifact_sha256 != mmltk::common::io::sha256_hex(artifact.admitted_file->sha256))
+            backend_request.class_layout_path.clear();
         result.eval_order.push_back(artifact.backend_name);
         std::vector<std::optional<AlignmentSample>>* captured_result = nullptr;
         switch (artifact.kind) {
@@ -233,7 +286,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
                 throw std::invalid_argument("invalid RF-DETR inference artifact kind");
         }
         result.backends.emplace(artifact.backend_name,
-                                evaluate_backend(options, artifact, dataset, For(artifact.kind), captured_result, command_stream, delivery));
+                                evaluate_backend(backend_request, artifact, dataset, For(artifact.kind), captured_result, command_stream, delivery));
     }
     if (const auto onnx = result.backends.find("onnx"); onnx != result.backends.end()) {
         if (const auto trt = result.backends.find("tensorrt"); trt != result.backends.end()) {

@@ -54,6 +54,8 @@
 #include "src/controller/subsystems/train/training_system.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
+#include "src/frameworks/gpu/tests/device_execution_fixture.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
 
 using namespace mmltk::controller::test_support;
 
@@ -286,6 +288,16 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     stale = settings;
     stale.workflows.predict.request.weights_path = "/tmp/replaced-predict.pt";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(stale, inspection, predict));
+    stale = settings;
+    stale.workflows.predict.request.class_layout_path = "/tmp/selected.classes.json";
+    CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(stale, inspection, predict));
+    const auto rebound = selected_model(stale, contracts::FeatureId::Predict);
+    const auto rebound_request = subsystems::system::ComputeIntentMaterializer::Predict(stale, inspection, rebound);
+    REQUIRE(rebound_request);
+    CHECK(rebound_request->class_layout_path == "/tmp/selected.classes.json");
+    auto inconsistent = inspection;
+    inconsistent.splits[1].class_names[0].value = "different";
+    CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inconsistent, train));
 }
 
 TEST_CASE("compute inputs retain normalized full-path identity and image independence", "[controller][systems][compute]") {
@@ -487,11 +499,11 @@ class FakeDatasetRuntime final : public DatasetRuntime {
 class BlockingModelRuntime final : public ModelRuntime {
    public:
     explicit BlockingModelRuntime(std::shared_ptr<StopGate> gate) : gate_(std::move(gate)) {}
-    std::string Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& custom, const std::stop_token stop,
+    ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& custom, int, const std::stop_token stop,
                         const std::function<void(const contracts::ModelProgress&)>& progress) override {
         progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "verifying fixture model"});
         if (!gate_->Wait(stop)) throw std::runtime_error("fixture model selection cancelled");
-        return custom.string();
+        return {.artifact = custom.string()};
     }
 
    private:
@@ -506,7 +518,7 @@ class ApplicationDataFixture final {
           dataset_gate_(std::make_shared<StopGate>()),
           dataset_(loaded_.settings, [gate = dataset_gate_] { return std::make_unique<FakeDatasetRuntime>(gate, false); }),
           model_(
-              loaded_.settings, [] { return std::make_unique<ArtifactModelRuntime>(); },
+              loaded_.settings, [] { auto gate = std::make_shared<StopGate>(); gate->Release(); return std::make_unique<BlockingModelRuntime>(std::move(gate)); },
               [this](ModelSystem::event_type event) {
                   if (std::holds_alternative<ModelChanged>(event)) {
                       {
@@ -2321,7 +2333,7 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
     namespace gpu = mmltk::frameworks::gpu;
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    const auto classes = std::make_shared<const std::vector<std::string>>(std::vector<std::string>{"first", "last"});
+    const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"first", "last"});
     const std::array<float, 12U> pixels{1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1};
     auto input = PredictionSource::Device(execution, {2U, 2U}, pixels, {}, classes);
     const auto* source = input.pixels();
@@ -2392,10 +2404,10 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
     namespace runtime = mmltk::backend::ml::runtime;
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    const auto classes = std::make_shared<const std::vector<std::string>>(std::vector<std::string>{"object"});
+    const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
     const std::array<float, 12U> pixels{};
     auto input = PredictionSource::Device(execution, {2U, 2U}, pixels,
-        {{.category_id = 1, .score = .7F}}, classes);
+        {{.class_reference = 0, .score = .7F}}, classes);
     const auto* source = input.pixels();
     auto& custody = input.custody();
     const std::weak_ptr<void> lifetime = custody;
@@ -2605,7 +2617,8 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
             CHECK(metadata->labels[index].name == selected.labels[index].name);
             CHECK(metadata->labels[index].box == selected.labels[index].box);
             CHECK(metadata->labels[index].confidence == selected.labels[index].confidence);
-            CHECK(metadata->labels[index].category == selected.labels[index].category);
+            CHECK(metadata->labels[index].class_reference == selected.labels[index].class_reference);
+            CHECK(metadata->labels[index].class_domain == selected.labels[index].class_domain);
             CHECK(metadata->labels[index].color == selected.labels[index].color);
         }
     };
@@ -2676,3 +2689,40 @@ TEST_CASE("preview context construction publishes only after exact caller restor
 }
 
 }  // namespace mmltk::controller
+
+TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior artifacts", "[controller][compute][gpu]") {
+    namespace controller = mmltk::controller;
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace io = mmltk::common::io;
+    const mmltk::testsupport::ScopedTempDir root("compute-stopped-artifact");
+    const auto output = root.path() / "model.output";
+    const auto companion = std::filesystem::path(output.string() + ".classes.json");
+    const auto layout = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
+    { std::ofstream file(output); file << "completed artifact"; }
+    const auto previous = io::sha256_file(output);
+    { std::ofstream file(companion); file << r::encode_class_descriptor({1, io::sha256_hex(previous), layout}); }
+    const auto previous_companion = io::sha256_file(companion);
+    const controller::DirectComputeConfiguration configuration{.execution = mmltk::frameworks::gpu::test_support::selected_test_device(
+        0, mmltk::common::system::NumaTopology::Capture())};
+    controller::CudaExportRuntime exporter(configuration);
+    controller::CudaValidationRuntime validator(configuration);
+    std::stop_source stop;
+    stop.request_stop();
+    r::ExportOnnxRequest onnx;
+    onnx.weights_path = root.path() / "not-opened.pt";
+    onnx.output_path = output;
+    CHECK(exporter.Run(onnx, stop.get_token(), {}).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
+    r::BuildEngineRequest engine;
+    engine.onnx_path = root.path() / "not-opened.onnx";
+    engine.output_path = output;
+    CHECK(exporter.Run(engine, stop.get_token(), {}).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
+    r::ValidateRequest validation;
+    validation.onnx_path = engine.onnx_path;
+    validation.save_engine_path = output;
+    validation.compiled_path = root.path() / "not-opened.bin";
+    validation.eval_order = "tensorrt";
+    CHECK(validator.Run(validation, stop.get_token(), {}).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
+    CHECK(io::sha256_file(output) == previous);
+    CHECK(io::sha256_file(companion) == previous_companion);
+    for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
+}

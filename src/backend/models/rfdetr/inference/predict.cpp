@@ -110,12 +110,12 @@ void finish_prediction_run(PredictionRunResult& result, const std::chrono::stead
     return encoded;
 }
 
-[[nodiscard]] nlohmann::json prediction_record_json(const PredictionRecord& record, const std::vector<std::string>& class_names) {
+[[nodiscard]] nlohmann::json prediction_record_json(const PredictionRecord& record, std::span<const std::string> class_names) {
     nlohmann::json detections = nlohmann::json::array();
     for (const Prediction& prediction : record.detections) {
-        const int class_index = prediction.category_id - 1;
-        std::string label = std::to_string(prediction.category_id);
-        if (class_index >= 0 && static_cast<std::size_t>(class_index) < class_names.size()) {
+        const int class_index = prediction.class_reference;
+        std::string label = std::to_string(prediction.class_reference);
+        if (prediction.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && class_index >= 0 && static_cast<std::size_t>(class_index) < class_names.size()) {
             label = class_names[static_cast<std::size_t>(class_index)];
         }
         nlohmann::json detection = {
@@ -183,11 +183,13 @@ class PredictionBackend final {
         validate_prediction_candidates(maximum_detections_);
         switch (artifact_.kind) {
             case InferenceArtifactKind::Weights: {
-                auto resolved = resolve_model_state(artifact_.path, options.preset_name, options.resolution);
+                auto resolved = resolve_model_state(artifact_.path, options.preset_name, options.resolution, options.class_layout_path, artifact_.admitted_file);
                 artifacts_ = std::move(resolved.artifacts);
                 static_cast<void>(PredictionCapacity::Resolve(maximum_detections_, 1U, artifacts_.config.num_queries,
                     artifacts_.config.num_classes, artifacts_.config.resolution, artifacts_.config.resolution, false));
-                native_ = std::make_unique<NativeRfDetrModel>(artifacts_.config);
+                native_ = std::make_unique<NativeRfDetrModel>(artifacts_.config, artifacts_.class_layout);
+                class_postprocess_ = std::make_unique<ClassPostprocessLane>(native_->class_layout());
+                class_postprocess_->Prepare(tensor_api::Device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(device_)));
                 auto& technical_model = detail::native_model_owner(*native_);
                 static_cast<void>(technical_model.load_normalized_state(detail::model_state_owner(resolved.model_state).entries, false));
                 technical_model.module().to(tensor_api::Device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(device_)));
@@ -224,9 +226,12 @@ class PredictionBackend final {
             .maximum_detections = options.max_dets_per_image,
             .save_compiled_model_path = {},
             .allow_fp16 = options.allow_fp16,
+            .admitted_file = artifact_.admitted_file,
         });
         resolution_ = runtime_->static_resolution();
         artifacts_ = describe_inference_artifact(options, artifact_, resolution_);
+        artifacts_.class_layout = runtime_->class_layout()->record();
+        artifacts_.artifact_sha256 = runtime_->artifact_sha256();
         const auto& shape = runtime_->logits_shape();
         const auto capacity = PredictionCapacity::Resolve(maximum_detections_, 1U, shape.extents[1], shape.extents[2], resolution_, resolution_, false);
         artifacts_.config.num_queries = static_cast<int>(shape.extents[1]);
@@ -249,9 +254,10 @@ class PredictionBackend final {
     }
     [[nodiscard]] std::size_t capacity(std::size_t batch, std::uint32_t width, std::uint32_t height, bool masks) const {
         return PredictionCapacity::Resolve(maximum_detections_, batch, artifacts_.config.num_queries, artifacts_.config.num_classes,
-                                            width, height, masks).candidates;
+                                            width, height, masks, class_layout()->eligible_slots().size()).candidates;
     }
     [[nodiscard]] const ResolvedModelArtifacts& artifacts() const noexcept { return artifacts_; }
+    [[nodiscard]] const std::shared_ptr<const ResolvedClassLayout>& class_layout() const noexcept { return native_ ? native_->class_layout() : runtime_->class_layout(); }
 
     void Execute(const tensor_api::Tensor& input, AnnotationBatch& annotations) {
         if (runtime_) {
@@ -259,6 +265,7 @@ class PredictionBackend final {
             runtime_->ReleaseAfterCompletion(std::move(submission));
             for (std::size_t index = 0; index < annotations.runtime_selections.size(); ++index) {
                 const auto& selected = annotations.runtime_selections[index];
+                if (annotations.storage[index].value_count == 0) { annotations.selections[index] = {}; continue; }
                 const auto view = [&](const runtime::RuntimeTensorBuffer& buffer, tensor_api::ScalarType type) {
                     return tensor_api::from_blob(buffer.device_data, tensor_api::IntArrayRef(buffer.shape.extents.data(), buffer.shape.rank), input.options().dtype(type));
                 };
@@ -298,6 +305,7 @@ class PredictionBackend final {
             if (selected != cudaSuccess) return static_cast<runtime::RuntimeStatus>(selected);
             const auto settled = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(command_stream_.native_handle));
             if (settled != cudaSuccess) return static_cast<runtime::RuntimeStatus>(settled);
+            class_postprocess_.reset();
             native_.reset();
         }
         return runtime::kRuntimeSuccess;
@@ -311,20 +319,26 @@ class PredictionBackend final {
         for (std::size_t index = 0U; index < annotations.storage.size(); ++index) {
             auto& storage = annotations.storage[index];
             const auto count = std::min({maximum_detections_, storage.value_capacity,
-                                         static_cast<std::size_t>(outputs.main.pred_logits.size(1) * outputs.main.pred_logits.size(2))});
+                                         static_cast<std::size_t>(outputs.main.pred_logits.size(1) * class_postprocess_->eligible_count())});
+            storage.class_catalog = native_->class_layout()->catalog();
+            storage.class_domain = native_->class_layout()->domain();
+            storage.masks_available = false;
+            if (count == 0) { storage.value_count = 0; annotations.selections[index] = {}; continue; }
             const auto processed = select_output_batch_fixed_size(
                 OutputTensors{
                     .pred_logits = outputs.main.pred_logits.narrow(0, static_cast<std::int64_t>(index), 1),
                     .pred_boxes = outputs.main.pred_boxes.narrow(0, static_cast<std::int64_t>(index), 1),
                     .pred_masks = annotations.want_masks && outputs.main.pred_masks ? std::optional{outputs.main.pred_masks->narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
                 },
-                storage.source_region.height, storage.source_region.width, static_cast<std::int64_t>(count), annotations.want_masks);
+                storage.source_region.height, storage.source_region.width, static_cast<std::int64_t>(count), annotations.want_masks, class_postprocess_.get());
             const auto active = static_cast<std::int64_t>(count);
             annotations.boxes[index].narrow(0, 0, active).copy_(processed.boxes[0].to(tensor_api::kFloat));
             annotations.labels[index].narrow(0, 0, active).copy_(processed.labels[0].to(tensor_api::kInt));
             annotations.scores[index].narrow(0, 0, active).copy_(processed.scores[0].to(tensor_api::kFloat));
             annotations.selections[index] = processed;
             storage.value_count = count;
+            storage.class_catalog = native_->class_layout()->catalog();
+            storage.class_domain = native_->class_layout()->domain();
         }
     }
 
@@ -332,6 +346,7 @@ class PredictionBackend final {
     ResolvedModelArtifacts artifacts_;
     std::shared_ptr<RfdetrRuntimeBackend> runtime_;
     std::unique_ptr<NativeRfDetrModel> native_;
+    std::unique_ptr<ClassPostprocessLane> class_postprocess_;
     std::size_t maximum_detections_ = 0U;
     std::uint32_t resolution_ = 0U;
     int device_ = 0;
@@ -354,7 +369,7 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
         else tensor.resize_(shape);
     };
     const auto count = static_cast<std::int64_t>(batch);
-    const auto limit = static_cast<std::int64_t>(capacity);
+    const auto limit = static_cast<std::int64_t>(std::max<std::size_t>(capacity, 1U));
     resize(result.boxes, {count, limit, 4}, tensor_api::kFloat);
     resize(result.labels, {count, limit}, tensor_api::kInt);
     resize(result.scores, {count, limit}, tensor_api::kFloat);
@@ -376,7 +391,7 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
                     .shape = {.rank = 2U, .extents = {static_cast<std::uint32_t>(capacity), 4U}},
                     .element_type = runtime::AnalysisElementType::Float32,
                 },
-            .category_ids =
+            .class_references =
                 {
                     .address = reinterpret_cast<std::uintptr_t>(result.labels[index].data_ptr()),
                     .capacity_bytes = capacity * sizeof(std::int32_t),
@@ -422,7 +437,7 @@ void execute_prediction_batch(const PredictRequest& options, PredictionBackend& 
     prepare_annotations(annotations, batch_size, backend.capacity(batch_size, width, height, masks), width, height,
                         options.device_id, masks, preview_requested(delivery, width, height));
     backend.Execute(input, annotations);
-    readback.Read(annotations);
+    if (annotations.storage.front().value_capacity != 0U) readback.Read(annotations);
 }
 
 struct PredictionSourceStorage final {
@@ -454,6 +469,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
 [[nodiscard]] std::vector<Prediction> copy_predictions(AnnotationBatch& batch, std::size_t index, float threshold,
                                                        PredictionReadback& storage, int class_count) {
     const auto count = batch.storage[index].value_count;
+    if (count == 0) return {};
     const auto boxes = storage.box_values[index];
     const auto labels = storage.label_values[index];
     const auto scores = storage.score_values[index];
@@ -474,7 +490,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
     for (std::size_t survivor = 0; survivor < survivors; ++survivor) {
         const auto detection = static_cast<std::size_t>(retained[survivor]);
         result.push_back({
-            .category_id = label_values[detection] + 1,
+            .class_reference = label_values[detection],
             .score = score_values[detection],
             .bbox_xyxy =
                 {
@@ -492,6 +508,8 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
     const auto scalar_layout = annotation;
     annotation = {};
     annotation.source_region = source_region;
+    annotation.class_domain = scalar_layout.class_domain;
+    annotation.class_catalog = scalar_layout.class_catalog;
     batch.preview_failure.clear();
     if (result.empty() || (!batch.raw_preview && !batch.want_masks)) return result;
     const auto active = static_cast<std::int64_t>(result.size());
@@ -525,9 +543,9 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         compact(batch.compact_scores, batch.scores[index]);
         annotation.value_capacity = result.size();
         annotation.boxes_xyxy.address = reinterpret_cast<std::uintptr_t>(batch.compact_boxes.data_ptr());
-        annotation.category_ids.address = reinterpret_cast<std::uintptr_t>(batch.compact_labels.data_ptr());
+        annotation.class_references.address = reinterpret_cast<std::uintptr_t>(batch.compact_labels.data_ptr());
         annotation.confidences.address = reinterpret_cast<std::uintptr_t>(batch.compact_scores.data_ptr());
-        for (auto* buffer : {&annotation.boxes_xyxy, &annotation.category_ids, &annotation.confidences}) {
+        for (auto* buffer : {&annotation.boxes_xyxy, &annotation.class_references, &annotation.confidences}) {
             buffer->shape.extents[0] = static_cast<std::uint32_t>(result.size());
             buffer->capacity_bytes = result.size() * (buffer == &annotation.boxes_xyxy ? 4U * sizeof(float) : sizeof(float));
         }
@@ -582,6 +600,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
             prediction.has_mask = true;
         }
     }
+    annotation.masks_available = preview.available();
     if (preview.available()) annotation.masks = {
         .address = reinterpret_cast<std::uintptr_t>(batch.masks.data_ptr()),
         .capacity_bytes = result.size() * pixels,
@@ -597,8 +616,11 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
     const PredictionBackend& backend, AnnotationBatch& annotations, PredictionReadback& readback,
     const PredictionDelivery& delivery, PredictionRunResult& result, std::size_t total,
     PredictionPixels pixels, std::shared_ptr<void> source = {}, DecodedPredictionImage* decoded_source = nullptr) {
-    record.detections = copy_predictions(annotations, index, options.threshold, readback, backend.artifacts().config.num_classes);
-    for (auto& detection : record.detections) detection.image_id = static_cast<int>(record.image_id);
+    record.detections = copy_predictions(annotations, index, options.threshold, readback, static_cast<int>(backend.class_layout()->semantic() ? backend.class_layout()->catalog()->size() : backend.class_layout()->output_width()));
+    for (auto& detection : record.detections) {
+        detection.image_id = static_cast<int>(record.image_id);
+        detection.class_domain = backend.class_layout()->domain();
+    }
     if (delivery.completed) {
         // Decoded images keep unique ownership until semantics are complete and
         // pixels are requested. The shared control block is optional preview work.
@@ -718,6 +740,7 @@ struct PredictionSession::State final {
     std::unique_ptr<PredictionReadback> readback;
     AnnotationBatch annotations;
     ResolvedInferenceArtifact artifact{};
+    std::optional<ClassArtifactSnapshot> admitted_snapshot;
     std::string preset_name;
     std::uint32_t resolution = 0U;
     std::size_t maximum_detections = 0U;
@@ -730,7 +753,8 @@ struct PredictionSession::State final {
     [[nodiscard]] PredictionBackend& Bind(const PredictRequest& options, const ResolvedInferenceArtifact& selected,
                                           const runtime::BorrowedCommandStream stream) {
         const auto requested_resolution = options.resolution > 0 ? static_cast<std::uint32_t>(options.resolution) : 0U;
-        if (!backend || !readback || artifact.kind != selected.kind || artifact.backend_name != selected.backend_name ||
+        const auto snapshot = ClassArtifactSnapshot::Read(selected.path, options.class_layout_path);
+        if (!backend || !readback || admitted_snapshot != snapshot || artifact.kind != selected.kind || artifact.backend_name != selected.backend_name ||
             artifact.path != selected.path || preset_name != options.preset_name || resolution != requested_resolution ||
             maximum_detections != options.max_dets_per_image || device != options.device_id || command_stream != stream.native_handle ||
             allow_fp16 != options.allow_fp16) {
@@ -740,6 +764,9 @@ struct PredictionSession::State final {
                 backend.reset();
             }
             backend = std::make_unique<PredictionBackend>(options, selected, stream);
+            if (snapshot != ClassArtifactSnapshot::Read(selected.path, options.class_layout_path))
+                throw std::runtime_error("model artifact changed during prediction admission");
+            admitted_snapshot = snapshot;
             readback = std::make_unique<PredictionReadback>(options.device_id);
             artifact = selected;
             preset_name = options.preset_name;
@@ -888,6 +915,9 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     PredictionRunResult result;
     result.backend_name = bound_backend.name();
     result.artifacts = bound_backend.artifacts();
+    result.artifacts.class_layout = bound_backend.class_layout()->record();
+    result.class_catalog = bound_backend.class_layout()->catalog();
+    result.class_domain = bound_backend.class_layout()->domain();
     if (options.source_kind == PredictSourceKind::VideoFile)
         return run_video_prediction(options, bound_backend, execution_stream, std::move(result), *readback, annotations, delivery, source_retirement);
     if (options.source_kind == PredictSourceKind::ImageFiles) {
@@ -897,9 +927,6 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
         throw std::invalid_argument("compiled dataset resolution does not match RF-DETR artifact");
     }
 
-    for (std::uint32_t index = 0U; index < loader->num_classes(); ++index) {
-        result.class_names.emplace_back(loader->class_name(index));
-    }
     if (delivery.begin) delivery.begin(result);
     const auto total = options.limit_images == 0U ? loader->num_images() : std::min(options.limit_images, loader->num_images());
     const auto image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids();
@@ -948,7 +975,7 @@ struct PredictionJsonWriter::State final {
     PredictRequest request;
     std::filesystem::path temporary;
     std::ofstream stream;
-    std::vector<std::string> class_names;
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
     bool first = true;
     bool begun = false;
     bool committed = false;
@@ -971,7 +998,7 @@ void PredictionJsonWriter::Begin(const PredictionRunResult& result) {
     state_->temporary = state_->request.output_path.string() + ".tmp." + std::to_string(::getpid()) + "." + std::to_string(++sequence);
     state_->stream.exceptions(std::ios::badbit | std::ios::failbit);
     state_->stream.open(state_->temporary);
-    state_->class_names = result.class_names;
+    state_->class_catalog = result.class_catalog;
     nlohmann::json output = {
         {"source_kind", predict_source_kind_name(state_->request.source_kind)},
         {"model_kind", result.artifacts.input_kind},
@@ -979,6 +1006,8 @@ void PredictionJsonWriter::Begin(const PredictionRunResult& result) {
         {"preset_name", result.artifacts.config.preset_name},
         {"backend", result.backend_name},
         {"mask_rle_encoding", "row_major_start_length"},
+        {"class_domain", result.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground ? "foreground" : "raw_output_slot"},
+        {"class_layout", nlohmann::json::parse(encode_class_layout(result.artifacts.class_layout))},
     };
     if (state_->request.source_kind == PredictSourceKind::CompiledDataset) {
         output["compiled_path"] = state_->request.compiled_path.string();
@@ -1000,7 +1029,7 @@ void PredictionJsonWriter::Append(const PredictionRecord& record) {
     if (state_->request.output_path.empty()) return;
     if (!state_->begun || state_->committed) throw std::logic_error("prediction JSON is not writable");
     if (!state_->first) state_->stream << ',';
-    state_->stream << prediction_record_json(record, state_->class_names).dump();
+    state_->stream << prediction_record_json(record, state_->class_catalog ? state_->class_catalog->names() : std::span<const std::string>{}).dump();
     state_->first = false;
 }
 void PredictionJsonWriter::Complete() {

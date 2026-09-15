@@ -28,7 +28,7 @@ class PredictionPreviewFrame final {
     [[nodiscard]] bool CompatibleWith(const mmltk::frameworks::gpu::SystemImageRuntime&) const noexcept;
     void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&) const;
     [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> predictions() const noexcept;
-    [[nodiscard]] const std::vector<std::string>& classes() const noexcept;
+    [[nodiscard]] std::span<const std::string> classes() const noexcept;
     [[nodiscard]] int class_count() const noexcept;
    private:
     friend class PredictionPreviewPool;
@@ -58,7 +58,7 @@ class PredictionPreviewPool final {
     [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(
         const float*, VisualExtent, std::uintptr_t source_stream,
         std::span<const mmltk::backend::models::rfdetr::Prediction>,
-        const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&, std::shared_ptr<const std::vector<std::string>>, int classes,
+        const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>, int classes,
         const std::uint8_t* rgb8 = nullptr, std::shared_ptr<void> source_custody = {}, void (*stop_source)(void*) = nullptr, void* source_control = nullptr);
     [[nodiscard]] bool HasUnsafeSourceCustody() const noexcept { return unsafe_source_; }
     [[nodiscard]] bool HasUnsafeCustody() const noexcept { return !retirement_->admission_open(); }

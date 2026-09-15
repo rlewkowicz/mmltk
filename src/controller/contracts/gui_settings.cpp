@@ -465,6 +465,7 @@ constexpr auto model_artifact_fields = [](auto& state, const ModelArtifactsShape
     visit("resolution", state.resolution);
     visit("source", state.source);
     visit("input", state.input);
+    visit("class_layout_path", state.class_layout_path);
     if (shape.weights) { visit("weights_path", state.weights_path); }
     if (shape.onnx) { visit(shape.onnx_key, state.onnx_path); }
     if (shape.tensorrt) { visit("tensorrt_path", state.tensorrt_path); }
@@ -565,6 +566,7 @@ constexpr auto train_flat_fields = [](auto& state, auto& artifact_state, const a
     visit("test_compiled_path", state.request.test_compiled_path);
     visit("compile_benchmark_dataset_override", state.compile_benchmark_dataset_override);
     visit("weights_path", artifact_state.weights_path);
+    visit("class_layout_path", artifact_state.class_layout_path);
     visit_option_fields<mmltk::backend::data::DataLoadingOptions>(state.request, visit);
     visit("cpu_affinity", state.request.cpu_affinity);
     visit("workers", state.request.workers);
@@ -600,6 +602,7 @@ constexpr auto validate_flat_fields = [](auto& state, const auto& visit) {
     visit("compiled_path", state.compiled_path);
     visit("source_dir", state.source_dir);
     visit("weights_path", state.weights_path);
+    if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
     visit("onnx_path", state.onnx_path);
     visit("tensorrt_path", state.tensorrt_path);
     visit("cpu_affinity", state.cpu_affinity);
@@ -620,6 +623,7 @@ constexpr auto predict_fields = [](auto& state, const auto& visit) {
 constexpr auto predict_flat_fields = [](auto& state, const auto& visit) {
     visit_option_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
     visit("weights_path", state.weights_path);
+    if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
     visit("onnx_path", state.onnx_path);
     visit("tensorrt_path", state.tensorrt_path);
     visit("cpu_affinity", state.cpu_affinity);
@@ -644,6 +648,7 @@ constexpr auto annotate_fields = [](auto& state, const auto& visit) {
 constexpr auto annotate_flat_fields = [](auto& state, const auto& visit) {
     visit("source", state.source);
     visit("weights_path", state.weights_path);
+    if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
     visit("onnx_path", state.onnx_path);
     visit("tensorrt_path", state.tensorrt_path);
     visit("device_id", state.device_id);
@@ -662,6 +667,7 @@ constexpr auto export_fields = [](auto& state, const auto& visit) {
 
 constexpr auto export_flat_fields = [](auto& state, const auto& visit) {
     visit("weights_path", state.weights_path);
+    if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
     visit("onnx_input_path", state.onnx_input_path);
     visit("device_id", state.device_id);
     visit("allow_fp16", state.allow_fp16);

@@ -71,6 +71,7 @@ class DatasetLoader {
     [[nodiscard]] uint32_t image_height() const;
     [[nodiscard]] uint32_t num_classes() const;
     [[nodiscard]] uint32_t max_instances_per_image() const;
+    [[nodiscard]] const std::shared_ptr<const catalog::ClassCatalog>& class_catalog() const noexcept;
     [[nodiscard]] const char* class_name(uint32_t id) const;
     [[nodiscard]] size_t image_stride() const;
     [[nodiscard]] size_t num_label_instances() const;

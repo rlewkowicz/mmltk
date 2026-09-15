@@ -8,7 +8,7 @@
 
 #include "src/backend/data/compiled_format_limits.h"
 #include "src/controller/contracts/application_boundary.h"
-#include "src/controller/contracts/artifact_catalog.h"
+#include "src/backend/data/catalog/class_catalog.h"
 
 namespace mmltk::controller {
 
@@ -58,7 +58,7 @@ struct ExploreFilterUpdate final {
 using ExploreClassCatalogIdentity = std::uint64_t;
 
 [[nodiscard]] inline ExploreClassCatalogIdentity explore_class_catalog_identity(
-    const std::span<const contracts::ArtifactClassName> class_names) noexcept {
+    const std::span<const mmltk::backend::data::catalog::ClassName> class_names) noexcept {
     constexpr ExploreClassCatalogIdentity offset_basis = 14'695'981'039'346'656'037ULL;
     constexpr ExploreClassCatalogIdentity prime = 1'099'511'628'211ULL;
     ExploreClassCatalogIdentity identity = offset_basis;

@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
 #include "src/backend/models/rfdetr/training/train.h"
@@ -623,7 +624,7 @@ void copy_module_state(torch_api::Module& destination, const torch_api::Module& 
 }
 
 std::shared_ptr<NativeRfDetrModel> make_train_lane_model(NativeRfDetrModel& model, int device_id) {
-    auto lane_model = std::make_shared<NativeRfDetrModel>(model.config());
+    auto lane_model = std::make_shared<NativeRfDetrModel>(model.config(), model.class_layout()->record());
     auto& lane_module = detail::native_model_owner(*lane_model).module();
     lane_module.to(cuda_device(device_id));
     lane_module.train();
@@ -1122,61 +1123,20 @@ std::vector<NormalizedModelStateEntry> collect_module_state(
     return state;
 }
 
-void require_unique_state_names(const std::vector<NormalizedModelStateEntry>& state, const std::string_view context) {
-    std::unordered_set<std::string_view> names;
-    names.reserve(state.size());
-    for (const auto& entry : state) {
-        if (entry.name.empty() || !names.insert(entry.name).second) {
-            throw std::runtime_error(std::string(context) + " contains an empty or duplicate model-state name");
-        }
-    }
-}
-
-ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel& model, const std::filesystem::path& checkpoint_path,
-                                                  const TrainingSupervisionRoute route, const bool resume) {
-    if (!route_is_active(route)) { return load_model_weights(model, checkpoint_path, false); }
-
-    const auto checkpoint = decode_model_state(checkpoint_path);
-    const auto& state = detail::model_state_owner(checkpoint).entries;
-    require_unique_state_names(state, resume ? "active RF-DETR resume checkpoint" : "active RF-DETR pretrained checkpoint");
-    const auto model_state = collect_module_state(model);
-    const std::size_t model_inventory_size = model_state.size();
-    if (resume && state.size() != model_inventory_size) {
-        throw std::runtime_error("active RF-DETR resume checkpoint does not contain the complete model-state inventory");
-    }
-    if (state.size() > model_inventory_size) {
-        throw std::runtime_error("active RF-DETR checkpoint exceeds the bounded model-state inventory");
-    }
-
-    if (resume) { return apply_checkpoint_to_module(model, checkpoint, true); }
-
-    std::vector<NormalizedModelStateEntry> candidate = state;
-    candidate.reserve(model_inventory_size);
-    std::unordered_set<std::string_view> supplied;
-    supplied.reserve(candidate.size());
-    for (const auto& entry : candidate) {
-        supplied.insert(entry.name);
-    }
-    for (const auto& entry : model_state) {
-        if (entry.name.starts_with("training_supervision.") && !supplied.contains(entry.name)) { candidate.push_back(entry); }
-    }
-    return detail::native_model_owner(model).load_normalized_state(candidate, true);
-}
-
-detail::NormalizedModelStateCandidate stage_active_resume_model_state(NativeRfDetrModel& model,
-                                                                      const std::filesystem::path& checkpoint_path) {
-    const auto checkpoint = decode_model_state(checkpoint_path);
-    const auto& state = detail::model_state_owner(checkpoint).entries;
-    require_unique_state_names(state, "active RF-DETR resume checkpoint");
-    if (state.size() != collect_module_state(model).size()) {
-        throw std::runtime_error("active RF-DETR resume checkpoint does not contain the complete model-state inventory");
-    }
-    return detail::native_model_owner(model).stage_normalized_state(state, detail::NormalizedModelStateAdmission::Exact);
+ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel& model, const DecodedNativeModelState& checkpoint,
+                                                  const TrainingSupervisionRoute route) {
+    const ResolvedClassLayout source_layout(checkpoint.metadata.class_layout);
+    auto candidate = detail::native_model_owner(model).stage_normalized_state(detail::model_state_owner(checkpoint).entries,
+        route_is_active(route) ? detail::NormalizedModelStateAdmission::FreshTransfer :
+                                detail::NormalizedModelStateAdmission::PartialFreshTransfer, &source_layout);
+    auto summary = candidate.summary;
+    detail::native_model_owner(model).commit_normalized_state(std::move(candidate));
+    return summary;
 }
 
 void save_collected_checkpoint(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, const NativeRfDetrModel& model,
                                const std::unordered_map<std::string, torch_api::Tensor>* parameter_overrides, const char* save_profile,
-                               const char* collect_profile) {
+                               const char* collect_profile, const std::filesystem::path& explicit_descriptor) {
     mmltk::common::logging::ScopedProfile save{save_profile};
     DecodedNativeModelState checkpoint;
     checkpoint.metadata = metadata;
@@ -1184,7 +1144,7 @@ void save_collected_checkpoint(const std::filesystem::path& path, const NativeCh
         mmltk::common::logging::ScopedProfile collect{collect_profile};
         detail::model_state_owner(checkpoint).entries = collect_module_state(model, parameter_overrides);
     }
-    save_native_checkpoint(path, checkpoint);
+    save_native_checkpoint(path, checkpoint, explicit_descriptor);
 }
 
 std::vector<NormalizedModelStateEntry> read_state_archive(torch_api::InputArchive& archive, const char* key,
@@ -1314,19 +1274,17 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, Native
     write_int(archive, "grad_scaler_growth_tracker", grad_scaler.growth_tracker());
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_archive_save_to{"rfdetr.train.save.resume.archive_save_to"};
-        archive.save_to(checkpoint_path.string());
+        detail::publish_native_checkpoint_archive(archive, checkpoint_path, options.class_layout_path);
     }
 }
 
-ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, NativeOptimizer& optimizer,
+ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, DecodedNativeModelState& admitted, NativeOptimizer& optimizer,
                                          const TrainRequest& options, const std::vector<std::string>& parameter_names,
                                          const std::vector<torch_api::Tensor>& parameters, const bool main_process) {
-    if (!is_native_checkpoint_file(checkpoint_path)) {
-        throw std::runtime_error("--resume requires a native RF-DETR .pt checkpoint: " + checkpoint_path.string());
-    }
-
-    torch_api::InputArchive archive;
-    archive.load_from(checkpoint_path.string());
+    auto& retained = detail::model_state_owner(admitted).native_archive;
+    if (!retained || !admitted.admitted_file) throw std::invalid_argument("full resume requires an admitted current native archive");
+    admitted.admitted_file->snapshot.RequireUnchanged(checkpoint_path);
+    auto& archive = *retained;
 
     if (const auto lr_scheduler = read_optional_value<std::string>(archive, "lr_scheduler");
         lr_scheduler.has_value() && *lr_scheduler != cli_enum_spelling(options.lr_scheduler)) {
@@ -1524,7 +1482,7 @@ std::future<TrainLaneResult> enqueue_train_lane(
                 prepared =
                     build_targets(batch, image_height, image_width, detection_config.include_masks, detection_config.include_masks,
                                   device_id, lane.target_scratch, "train", model.config().num_queries, model.config().training_supervision,
-                                  model.config().num_classes - 1, &lane.augmenter->batch_plan());
+                                  static_cast<int>(model.class_layout()->catalog()->size()), &lane.augmenter->batch_plan());
             }
             const auto target_count = prepared_target_count(prepared);
             if (wave_normalizer) { wave_normalizer->publish(lane_index, target_count); }
@@ -1691,6 +1649,9 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     };
 
     mmltk::backend::data::Batch batch{};
+    ClassPostprocessLane evaluation_classes(model.class_layout());
+    evaluation_classes.Prepare(cuda_device(options.device_id));
+
     while (loader.next_batch(batch)) {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_batch{"rfdetr.train.eval.batch"};
         {
@@ -1741,7 +1702,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
             prepared = build_targets(batch, static_cast<int>(loader.image_height()), static_cast<int>(loader.image_width()),
                                      detection_config.include_masks, detection_config.include_masks, options.device_id,
                                      validation.target_scratch(), validation.split_name(), model.config().num_queries,
-                                     model.config().training_supervision, model.config().num_classes - 1);
+                                     model.config().training_supervision, static_cast<int>(model.class_layout()->catalog()->size()));
         }
         batch_guard.release();
 
@@ -1825,7 +1786,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
             }
             PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(
                 OutputTensors{evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks},
-                static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select);
+                static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_classes);
             if (batch_timing) {
                 evaluation_run.record_timing_stop(batch_timing, EvaluationCudaBatchTiming::Phase::Postprocess, evaluation_stream);
             }
@@ -1889,7 +1850,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     }
     if (capture_eval_sample && captured_sample.has_value()) {
         RenderSampleOptions render_options;
-        render_options.num_classes = model.config().num_classes;
+        render_options.num_classes = static_cast<int>(model.class_layout()->catalog()->size());
         render_options.output_path = options.output_dir / "eval_samples" / std::format("epoch_{}.png", *current_epoch + 1);
         draw_eval_sample_async_gpu(captured_sample->image, captured_sample->boxes, captured_sample->labels, captured_sample->masks,
                                    render_options);
@@ -2021,12 +1982,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     artifact_request.weights_path = source_checkpoint;
     artifact_request.preset_name = options.preset_name;
     artifact_request.resolution = static_cast<int>(train_loader.image_width());
-    auto artifacts = resolve_training_artifacts(artifact_request.weights_path, artifact_request.preset_name, artifact_request.resolution);
+    auto admitted = resolve_model_state(artifact_request.weights_path, artifact_request.preset_name, artifact_request.resolution, options.class_layout_path);
+    auto artifacts = admitted.artifacts;
     if (!options.resume_path.empty()) {
-        if (!is_native_checkpoint_file(options.resume_path)) {
+        if (!detail::model_state_owner(admitted.model_state).native_archive) {
             throw std::runtime_error("--resume requires a native RF-DETR .pt checkpoint: " + options.resume_path.string());
         }
-        detail::require_resume_training_supervision_config(options.resume_path, options.training_supervision);
+        detail::require_resume_training_supervision_config(*detail::model_state_owner(admitted.model_state).native_archive, options.training_supervision);
     }
     artifacts.config.training_supervision = options.training_supervision;
     dataset_limits.automatic_num_queries_cap =
@@ -2043,7 +2005,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     }
     const int dataset_output_classes = rfdetr_output_class_count(train_loader.num_classes());
     if (!options.resume_path.empty()) {
-        const auto resume_checkpoint = decode_model_state(options.resume_path);
+        const auto& resume_checkpoint = admitted.model_state;
+        if (resume_checkpoint.metadata.class_layout != native_training_class_layout(*train_loader.class_catalog()))
+            throw std::runtime_error("resume class layout does not match ordered compiled catalog");
         if (resume_checkpoint.metadata.num_classes > 0 &&
             resume_checkpoint.metadata.num_classes != static_cast<int64_t>(dataset_output_classes)) {
             throw std::runtime_error("resume checkpoint class count does not match compiled dataset class count");
@@ -2067,6 +2031,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         dataset_limits.automatic = requested_query_limit.automatic;
     }
     artifacts.config.num_classes = dataset_output_classes;
+    artifacts.class_layout = native_training_class_layout(*train_loader.class_catalog());
     if (!training_supervision_model_config_valid(artifacts.config)) {
         throw std::runtime_error("resolved RF-DETR model is incompatible with the requested training supervision");
     }
@@ -2090,10 +2055,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             loader.image_height() != static_cast<uint32_t>(artifacts.config.resolution)) {
             throw std::runtime_error(std::string(split) + " compiled resolution does not match RF-DETR input size");
         }
-        if (loader.num_classes() != train_loader.num_classes()) {
-            throw std::runtime_error("compiled class count mismatch across train/val/test splits");
+        if (!loader.class_catalog()->ordered_equal(*train_loader.class_catalog())) {
+            throw std::runtime_error("ordered compiled class catalog mismatch across train/val/test splits");
         }
     };
+    if (!val_loader && !mmltk::backend::data::inspect_compiled_dataset(options.val_compiled_path).class_catalog->ordered_equal(*train_loader.class_catalog()))
+        throw std::runtime_error("ordered validation class catalog mismatch");
     validate_loader(train_loader, "train");
     if (val_loader) { validate_loader(*val_loader, "val"); }
     if (test_info.has_value()) {
@@ -2101,12 +2068,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             test_info->height != static_cast<std::uint32_t>(artifacts.config.resolution)) {
             throw std::runtime_error("test compiled resolution does not match RF-DETR input size");
         }
-        if (test_info->class_names.size() != static_cast<std::size_t>(train_loader.num_classes())) {
-            throw std::runtime_error("compiled class count mismatch across train/val/test splits");
+        if (!test_info->class_catalog->ordered_equal(*train_loader.class_catalog())) {
+            throw std::runtime_error("ordered compiled class catalog mismatch across train/val/test splits");
         }
     }
 
-    NativeRfDetrModel model(artifacts.config);
+    NativeRfDetrModel model(artifacts.config, artifacts.class_layout);
     detail::native_model_owner(model).initialize_training_supervision(static_cast<std::uint64_t>(options.seed));
     detail::native_model_owner(model).module().to(cuda_device(options.device_id));
     detail::native_model_owner(model).configure_supervision_timing(
@@ -2115,11 +2082,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     const auto resolved_route = supervision_route(options.training_supervision);
     std::optional<detail::NormalizedModelStateCandidate> resume_model_candidate;
     ModelStateLoadSummary load_summary;
-    if (!options.resume_path.empty() && route_is_active(resolved_route)) {
-        resume_model_candidate = stage_active_resume_model_state(model, source_checkpoint);
+    if (!options.resume_path.empty()) {
+        resume_model_candidate = detail::native_model_owner(model).stage_normalized_state(
+            detail::model_state_owner(admitted.model_state).entries, detail::NormalizedModelStateAdmission::Exact);
         load_summary = resume_model_candidate->summary;
     } else {
-        load_summary = load_training_model_weights(model, source_checkpoint, resolved_route, false);
+        load_summary = load_training_model_weights(model, admitted.model_state, resolved_route);
     }
     model.optimize_for_inference(checked_inference_batch_size(options.batch_size), true, options.compilation_mode);
     if (!options.val_compiled_path.empty()) {
@@ -2166,7 +2134,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     double best_ema = -std::numeric_limits<double>::infinity();
     if (!options.resume_path.empty()) {
         ResumeState resume_state =
-            load_resume_checkpoint_state(options.resume_path, optimizer, options, all_param_names, all_params, main_process);
+            load_resume_checkpoint_state(options.resume_path, admitted.model_state, optimizer, options, all_param_names, all_params, main_process);
         if (resume_model_candidate.has_value()) {
             detail::native_model_owner(model).commit_normalized_state(std::move(*resume_model_candidate));
         }
@@ -2182,6 +2150,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         best_regular = resume_state.best_regular;
         best_ema = resume_state.best_ema;
     }
+
+    detail::model_state_owner(admitted.model_state).entries.clear();
+    detail::model_state_owner(admitted.model_state).native_archive.reset();
 
     LrScheduleConfig lr_config;
     lr_config.warmup_epochs = options.warmup_epochs;
@@ -2536,7 +2507,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                         build_targets(*batch, static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()),
                                       detection_config.include_masks, detection_config.include_masks, options.device_id, target_scratch,
                                       "train", artifacts.config.num_queries, artifacts.config.training_supervision,
-                                      artifacts.config.num_classes - 1, &single_lane_augmenter->batch_plan());
+                                      static_cast<int>(model.class_layout()->catalog()->size()), &single_lane_augmenter->batch_plan());
                 }
                 batch_guard.set_consumer_stream(single_lane_augmenter->prepare_batch_consumer());
                 static_cast<void>(single_lane_augmenter->finish_batch(*batch));
@@ -2730,7 +2701,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 epoch_checkpoint.metadata = metadata;
                 detail::model_state_owner(epoch_checkpoint).entries = collect_module_state(model);
                 auto epoch_path = options.output_dir / std::format("checkpoint_epoch_{}.pt", epoch + 1);
-                save_native_checkpoint(epoch_path, epoch_checkpoint);
+                save_native_checkpoint(epoch_path, epoch_checkpoint, options.class_layout_path);
             }
 
             TrainEpochSummary epoch_summary;
@@ -2743,7 +2714,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             if (regular_metric > best_regular) {
                 best_regular = regular_metric;
                 save_collected_checkpoint(best_regular_checkpoint_path, metadata, model, nullptr, "rfdetr.train.save.best_regular",
-                                          "rfdetr.train.save.best_regular.collect_state");
+                                          "rfdetr.train.save.best_regular.collect_state", options.class_layout_path);
                 result.best_is_ema = false;
                 result.best_checkpoint_path = best_regular_checkpoint_path;
             }
@@ -2774,7 +2745,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                     best_ema = ema_metric;
                     const auto overrides = ema_override_map(all_param_names, *ema);
                     save_collected_checkpoint(best_ema_checkpoint_path, metadata, model, &overrides, "rfdetr.train.save.best_ema",
-                                              "rfdetr.train.save.best_ema.collect_state");
+                                              "rfdetr.train.save.best_ema.collect_state", options.class_layout_path);
                     result.best_is_ema = true;
                     result.best_checkpoint_path = best_ema_checkpoint_path;
                 }
@@ -2825,7 +2796,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             options, train_runtime, std::move(test_loader), val_batch_size, false,
             detection_config.include_masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox, artifacts.config.num_select,
             "test", dataset_limits.automatic);
-        NativeRfDetrModel best_model(artifacts.config);
+        NativeRfDetrModel best_model(artifacts.config, artifacts.class_layout);
         detail::native_model_owner(best_model).module().to(cuda_device(options.device_id));
         load_model_weights(best_model, *result.best_checkpoint_path, false);
         best_model.optimize_for_inference(checked_inference_batch_size(val_batch_size), false, options.compilation_mode);

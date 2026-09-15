@@ -12,6 +12,8 @@ mmltk_register_public_headers(
     mmltk_backend_models_rfdetr_contract
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        class_layout.h
+        output_roles.h
         artifacts.h
         cli.h
         contract.h
@@ -31,6 +33,7 @@ mmltk_register_ordinary_sources(
 )
 target_link_libraries(mmltk_backend_models_rfdetr_contract
     PUBLIC
+        mmltk::backend::data::catalog
         mmltk::frameworks::reflection
     PRIVATE
         mmltk::common::types

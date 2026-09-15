@@ -607,7 +607,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         if (opened->class_names().size() > kExploreClassCapacity)
             throw contracts::InvalidIntentError("Explore class catalog exceeds the application boundary");
         if (std::ranges::any_of(opened->class_names(),
-                                [](const auto& name) { return name.size() > contracts::kArtifactClassNameCapacity; }))
+                                [](const auto& name) { return name.size() > mmltk::backend::data::catalog::kClassNameCapacity; }))
             throw contracts::InvalidIntentError("Explore class name exceeds the application boundary");
         auto store = std::move(*opened);
         std::atomic_bool cancelled = false;

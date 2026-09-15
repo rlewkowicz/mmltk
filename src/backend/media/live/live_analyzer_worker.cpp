@@ -69,7 +69,7 @@ LiveAnalyzerWorker::LiveAnalyzerWorker(LiveFrameFanout& fanout, const std::uint3
                                          sizes[0],
                                          {2U, {static_cast<std::uint32_t>(values), 4U}},
                                          runtime::AnalysisElementType::Float32};
-                annotation.category_ids = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 1U]),
+                annotation.class_references = {static_cast<std::uintptr_t>(slot.allocations[region * 5U + 1U]),
                                            sizes[1],
                                            {1U, {static_cast<std::uint32_t>(values)}},
                                            runtime::AnalysisElementType::Int32};

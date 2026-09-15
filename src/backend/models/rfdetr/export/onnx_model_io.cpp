@@ -16,6 +16,9 @@ module;
 #include <string_view>
 
 #include "src/backend/models/rfdetr/core/model_info.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
 
 module mmltk.backend.models.rfdetr.model_export;
 
@@ -43,6 +46,8 @@ void write_onnx_model(const ONNX_NAMESPACE::ModelProto& model, const std::filesy
     std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
     if (!output.is_open()) { throw onnx_model_io_error("failed to open ONNX model for writing", output_path); }
     if (!model.SerializeToOstream(&output)) { throw onnx_model_io_error("failed to write ONNX model", output_path); }
+    output.close();
+    if (!output) throw onnx_model_io_error("failed to finish ONNX model", output_path);
 }
 
 [[nodiscard]] std::string onnx_tensor_dtype_name(const int elem_type) {
@@ -78,6 +83,12 @@ void write_onnx_model(const ONNX_NAMESPACE::ModelProto& model, const std::filesy
 [[nodiscard]] TensorInfo tensor_info_from_value_info(const ONNX_NAMESPACE::ValueInfoProto& value_info) {
     TensorInfo info;
     info.name = value_info.name();
+    for (const auto& metadata : value_info.metadata_props()) {
+        if (metadata.key() != "mmltk.rfdetr.output_role") continue;
+        if (info.role != RfdetrOutputRole::Unspecified) throw std::invalid_argument("duplicate ONNX output role metadata");
+        info.role = mmltk::frameworks::reflection::enum_from_name<RfdetrOutputRole>(metadata.value());
+        if (info.role == RfdetrOutputRole::Unspecified) throw std::invalid_argument("unresolved ONNX output role metadata");
+    }
     if (!value_info.has_type() || !value_info.type().has_tensor_type()) {
         info.dtype = "unknown";
         return info;
@@ -114,18 +125,19 @@ void run_onnx_simplify(ONNX_NAMESPACE::ModelProto& model) {
 
 }  // namespace
 
-void write_onnx_model_bytes(const std::string_view serialized_model, const std::filesystem::path& output_path) {
-    if (serialized_model.size() > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
-        throw std::length_error("serialized ONNX model exceeds stream capacity");
-    }
-    if (!output_path.parent_path().empty()) { std::filesystem::create_directories(output_path.parent_path()); }
-    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
-    if (!output.is_open()) { throw onnx_model_io_error("failed to open ONNX output file", output_path); }
-    output.write(serialized_model.data(), static_cast<std::streamsize>(serialized_model.size()));
-    if (!output) { throw onnx_model_io_error("failed to write ONNX output file", output_path); }
+void write_onnx_model_bytes(const std::string_view serialized_model, const std::filesystem::path& output_path,
+    const ModelClassLayout& layout) {
+    ONNX_NAMESPACE::ModelProto model;
+    if (serialized_model.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !model.ParseFromArray(serialized_model.data(), static_cast<int>(serialized_model.size())))
+        throw std::invalid_argument("invalid serialized ONNX model");
+    auto* metadata = model.add_metadata_props();
+    metadata->set_key("mmltk.rfdetr.class_layout");
+    metadata->set_value(encode_class_layout(layout));
+    write_onnx_model(model, output_path);
 }
 
-ModelInfo load_onnx_model_info(const std::filesystem::path& model_path) {
+ModelInfo load_onnx_model_info(const std::filesystem::path& model_path, std::span<const RfdetrNamedOutputRole> roles) {
     const ONNX_NAMESPACE::ModelProto model = load_onnx_model(model_path);
     const auto& graph = model.graph();
     if (graph.input_size() == 0) { throw std::runtime_error("ONNX model has no graph inputs: " + model_path.string()); }
@@ -152,14 +164,36 @@ ModelInfo load_onnx_model_info(const std::filesystem::path& model_path) {
     for (const auto& output : graph.output()) {
         info.outputs.push_back(tensor_info_from_value_info(output));
     }
-    infer_rfdetr_output_layout(info);
+    for (const auto& metadata : model.metadata_props()) {
+        if (metadata.key() != "mmltk.rfdetr.class_layout") continue;
+        if (info.class_layout) throw std::invalid_argument("duplicate ONNX class layout metadata");
+        info.class_layout = decode_class_layout(metadata.value());
+    }
+    apply_rfdetr_output_roles(info, roles);
+    static_cast<void>(validate_rfdetr_output_layout(info));
+    if (info.class_layout && info.class_layout->slots.size() != static_cast<std::size_t>(info.num_classes))
+        throw std::invalid_argument("ONNX class layout disagrees with logits width");
     return info;
 }
 
 void simplify_onnx_model_file(const std::filesystem::path& model_path) {
+    ClassArtifactPublication publication(model_path);
+    auto source_lease = publication.LockPreviousArtifact();
+    const auto& descriptor = publication.previous_descriptor();
+    const auto roles = descriptor ? descriptor->output_roles : std::vector<RfdetrNamedOutputRole>{};
+    const auto admitted = load_onnx_model_info(model_path, roles);
+    const auto expected = admit_artifact_class_layout(admitted.num_classes, admitted.class_layout,
+        descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{});
     auto model = load_onnx_model(model_path);
+    source_lease = {};
     run_onnx_simplify(model);
-    write_onnx_model(model, model_path);
+    write_onnx_model(model, publication.staged_artifact());
+    const auto reopened = load_onnx_model_info(publication.staged_artifact(), roles);
+    if (admit_artifact_class_layout(reopened.num_classes, reopened.class_layout,
+            descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{}) != expected ||
+        rfdetr_output_roles(reopened) != rfdetr_output_roles(admitted))
+        throw std::runtime_error("ONNX simplification changed admitted class metadata");
+    publication.Publish(descriptor);
 }
 
 }  // namespace mmltk::backend::models::rfdetr

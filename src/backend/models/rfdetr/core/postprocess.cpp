@@ -1,6 +1,7 @@
 #include "detail/postprocess.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include <ATen/ops/gather.h>
+#include <ATen/ops/index_select.h>
 #include <ATen/ops/gt.h>
 #include <ATen/ops/upsample_bilinear2d.h>
 
@@ -54,9 +55,9 @@ postprocess_detail::Tensor fixed_box_scale(const postprocess_detail::Tensor& box
 }
 
 PostprocessCore postprocess_core(const OutputTensors& outputs, const postprocess_detail::Tensor* target_sizes,
-                                 std::optional<std::pair<int64_t, int64_t>> fixed_size, int64_t num_select) {
+                                 std::optional<std::pair<int64_t, int64_t>> fixed_size, int64_t num_select, ClassPostprocessLane* classes) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_total{"rfdetr.native.postprocess.total"};
-    const auto out_logits = outputs.pred_logits.to(postprocess_detail::kFloat32);
+    const auto out_logits = (classes ? classes->Gather(outputs.pred_logits) : outputs.pred_logits).to(postprocess_detail::kFloat32);
     const auto out_bbox = outputs.pred_boxes.to(postprocess_detail::kFloat32);
     if (target_sizes != nullptr && (out_logits.size(0) != target_sizes->size(0) || target_sizes->size(1) != 2)) {
         throw std::runtime_error("target_sizes must be [batch,2] and aligned with RF-DETR outputs");
@@ -71,11 +72,18 @@ PostprocessCore postprocess_core(const OutputTensors& outputs, const postprocess
         const auto prob = out_logits.sigmoid();
         const auto flat_prob = prob.flatten(1);
         const int64_t k = std::min<int64_t>(num_select, flat_prob.size(1));
+        if (out_logits.size(2) == 0) {
+            core.scores = flat_prob.narrow(1, 0, 0);
+            core.query_indices = postprocess_detail::empty({out_logits.size(0), 0}, out_logits.options().dtype(postprocess_detail::kInt64));
+            core.labels = core.query_indices;
+        } else {
         const auto topk = flat_prob.topk(k, 1);
         core.scores = std::get<0>(topk);
         const auto topk_indexes = std::get<1>(topk).to(postprocess_detail::kInt64);
         core.query_indices = postprocess_detail::floor_divide(topk_indexes, out_logits.size(2));
         core.labels = topk_indexes.remainder(out_logits.size(2));
+        if (classes) core.labels = classes->References(core.labels);
+        }
     }
 
     core.boxes = box_cxcywh_to_xyxy(out_bbox, BoxExtentPolicy::ClampNonnegative);
@@ -102,9 +110,54 @@ PostprocessCore postprocess_core(const OutputTensors& outputs, const postprocess
 
 }  // namespace
 
-PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outputs, int64_t height, int64_t width, int64_t count, bool require_masks) {
+void ClassPostprocessLane::Prepare(const postprocess_detail::Device& device) {
+    prefix_identity_ = layout_->prefix_identity();
+    if (prefix_identity_ || eligible_count() == 0) return;
+    const auto stream = device.is_cuda() ? postprocess_detail::getCurrentCUDAStream(device.index()).stream() : nullptr;
+    if (slots_.defined() && slots_.device() == device && prepared_stream_ == stream) return;
+    const auto options = postprocess_detail::TensorOptions().dtype(postprocess_detail::kInt64).device(device);
+    auto slots = postprocess_detail::tensor(std::vector<std::int64_t>(layout_->eligible_slots().begin(), layout_->eligible_slots().end()), options);
+    auto references = postprocess_detail::tensor(std::vector<std::int64_t>(layout_->class_references().begin(), layout_->class_references().end()), options);
+    auto gather = gather_.defined() ? postprocess_detail::empty({gather_.numel()}, gather_.options().device(device)) : torch::Tensor{};
+    // Allocation and upload precede commit. Old tensors retain their original
+    // allocator stream; queued consumers never borrow the replacement storage.
+    slots_ = std::move(slots);
+    references_ = std::move(references);
+    gather_ = std::move(gather);
+    prepared_stream_ = stream;
+}
+postprocess_detail::Tensor ClassPostprocessLane::Gather(const postprocess_detail::Tensor& logits) {
+    if (logits.dim() != 3 || static_cast<std::size_t>(logits.size(2)) != layout_->output_width())
+        throw std::invalid_argument("logit width disagrees with admitted class layout");
+    if (prefix_identity_ || eligible_count() == 0) return logits.narrow(2, 0, eligible_count());
+    const auto stream = logits.is_cuda() ? postprocess_detail::getCurrentCUDAStream(logits.get_device()).stream() : nullptr;
+    if (!slots_.defined() || slots_.device() != logits.device() || prepared_stream_ != stream)
+        throw std::invalid_argument("class postprocessor was not prepared on this device and stream");
+    if (logits.numel() == 0) return logits.narrow(2, 0, eligible_count());
+    const auto rows = checked_prediction_extent(logits.size(0), logits.size(1), kMaximumPredictionTensorBytes);
+    const auto values = checked_prediction_extent(rows, eligible_count(), kMaximumPredictionTensorBytes);
+    static_cast<void>(checked_prediction_extent(values, logits.element_size(), kMaximumPredictionTensorBytes));
+    const bool replace = !gather_.defined() || gather_.scalar_type() != logits.scalar_type() ||
+        static_cast<std::size_t>(gather_.numel()) < values;
+    auto candidate = replace ? postprocess_detail::empty({static_cast<std::int64_t>(values)}, logits.options()) : gather_;
+    auto output = candidate.narrow(0, 0, static_cast<std::int64_t>(values)).view({logits.size(0), logits.size(1), static_cast<std::int64_t>(eligible_count())});
+    at::index_select_out(output, logits, 2, slots_);
+    if (replace) gather_ = std::move(candidate);
+    return output;
+}
+postprocess_detail::Tensor ClassPostprocessLane::References(const postprocess_detail::Tensor& indices) const {
+    if (prefix_identity_ || eligible_count() == 0) return indices;
+    const auto stream = indices.is_cuda() ? postprocess_detail::getCurrentCUDAStream(indices.get_device()).stream() : nullptr;
+    if (indices.device() != references_.device() || prepared_stream_ != stream)
+        throw std::invalid_argument("class references used outside the prepared lane");
+    // This allocation is the independently owned final label result, not
+    // temporary remap scratch. Earlier returned labels survive subsequent Runs.
+    return references_.index_select(0, indices.flatten()).view(indices.sizes());
+}
+
+PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outputs, int64_t height, int64_t width, int64_t count, bool require_masks, ClassPostprocessLane* classes) {
     if (require_masks && !outputs.pred_masks) throw std::runtime_error("RF-DETR requested masks are absent");
-    auto core = postprocess_core(outputs, nullptr, std::make_pair(height, width), count);
+    auto core = postprocess_core(outputs, nullptr, std::make_pair(height, width), count, classes);
     if (outputs.pred_masks && (outputs.pred_masks->dim() != 4 || outputs.pred_masks->size(0) != outputs.pred_logits.size(0) ||
         outputs.pred_masks->size(1) != outputs.pred_logits.size(1) || outputs.pred_masks->size(2) <= 0 || outputs.pred_masks->size(3) <= 0 ||
         !outputs.pred_masks->is_floating_point() || outputs.pred_masks->device() != outputs.pred_logits.device()))
@@ -155,8 +208,8 @@ postprocess_detail::Tensor materialize_selected_masks(const postprocess_detail::
 }
 
 PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width,
-                                                       int64_t num_select) {
-    auto selected = select_output_batch_fixed_size(outputs, target_height, target_width, num_select);
+                                                       int64_t num_select, ClassPostprocessLane* classes) {
+    auto selected = select_output_batch_fixed_size(outputs, target_height, target_width, num_select, false, classes);
     PostprocessedBatch result{selected.scores, selected.labels, selected.boxes, std::nullopt};
     if (selected.mask_logits) result.masks = materialize_selected_masks(*selected.mask_logits, selected.query_indices, target_height, target_width);
     return result;
@@ -191,8 +244,8 @@ PostprocessedBatch postprocessed_batch_from_result(const TensorMap& result) {
 }
 
 std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const postprocess_detail::Tensor& target_sizes,
-                                           int64_t num_select) {
-    PostprocessCore core = postprocess_core(outputs, &target_sizes, std::nullopt, num_select);
+                                           int64_t num_select, ClassPostprocessLane* classes) {
+    PostprocessCore core = postprocess_core(outputs, &target_sizes, std::nullopt, num_select, classes);
 
     std::vector<TensorMap> results;
     results.reserve(static_cast<size_t>(outputs.pred_logits.size(0)));
@@ -231,14 +284,14 @@ std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const p
 }
 
 std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs, const postprocess_detail::Tensor& target_sizes,
-                                           const int64_t num_select) {
+                                           const int64_t num_select, ClassPostprocessLane* classes) {
     return postprocess_outputs(OutputTensors{outputs.main.pred_logits, outputs.main.pred_boxes, outputs.main.pred_masks}, target_sizes,
-                               num_select);
+                               num_select, classes);
 }
 
 std::vector<TensorMap> postprocess_outputs_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width,
-                                                      int64_t num_select) {
-    return split_postprocessed_batch(postprocess_output_batch_fixed_size(outputs, target_height, target_width, num_select));
+                                                      int64_t num_select, ClassPostprocessLane* classes) {
+    return split_postprocessed_batch(postprocess_output_batch_fixed_size(outputs, target_height, target_width, num_select, classes));
 }
 
 }  // namespace mmltk::backend::models::rfdetr

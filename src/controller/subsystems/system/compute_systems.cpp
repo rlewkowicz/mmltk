@@ -220,15 +220,15 @@ contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr
     using mmltk::backend::models::rfdetr::BuildEngineRequest;
     using mmltk::backend::models::rfdetr::ExportOnnxRequest;
     return impl_->resources.Run(
-        [this, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+        [this, stop, operation = std::move(operation)](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
             if (auto* request = std::get_if<BuildEngineRequest>(&operation)) {
                 request->device_id = impl_->resources.device();
-                mmltk::backend::models::rfdetr::build_tensorrt_engine(*request, stream);
+                mmltk::backend::models::rfdetr::build_tensorrt_engine(*request, stream, {}, stop);
                 return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0, 0, request->output_path.string());
             }
             auto& request = std::get<ExportOnnxRequest>(operation);
             request.device_id = impl_->resources.device();
-            impl_->session.Run(request, stream);
+            impl_->session.Run(request, stream, stop);
             return contracts::make_compute_terminal(
                 contracts::ComputeOperationOutcome::Succeeded, 0, 0,
                 // CLEANUP-IGNORE: ONNX export publishes its domain output path from the validated request.

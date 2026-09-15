@@ -2,6 +2,7 @@ module;
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <stop_token>
 #include <string_view>
 
 #include "src/backend/ml/runtime/analysis_provider.h"
@@ -16,7 +17,7 @@ export import :onnx_simplify;
 
 namespace mmltk::backend::models::rfdetr {
 
-void write_onnx_model_bytes(std::string_view serialized_model, const std::filesystem::path& output_path);
+void write_onnx_model_bytes(std::string_view serialized_model, const std::filesystem::path& output_path, const ModelClassLayout& layout);
 
 }
 
@@ -32,7 +33,7 @@ class ExportOnnxSession final {
     ExportOnnxSession(const ExportOnnxSession&) = delete;
     ExportOnnxSession& operator=(const ExportOnnxSession&) = delete;
 
-    void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream);
+    void Run(const ExportOnnxRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, std::stop_token stop = {});
     [[nodiscard]] ModelExportStatus Close() noexcept;
 
    private:

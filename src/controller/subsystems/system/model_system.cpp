@@ -7,14 +7,21 @@
 #include <utility>
 
 #include "src/controller/contracts/compute.h"
+#include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/model_info.h"
+
+import mmltk.backend.models.rfdetr.model_export;
+import mmltk.backend.models.rfdetr.inference.runtime_backend;
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 
 namespace mmltk::controller {
 
-std::string ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& key, const std::filesystem::path& custom,
-                                          const std::stop_token stop,
+ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& key, const std::filesystem::path& custom,
+                                          const int inspection_device, const std::stop_token stop,
                                           const std::function<void(const contracts::ModelProgress&)>& progress) {
     if (!key.valid()) throw std::invalid_argument("model selection key is invalid");
+    std::filesystem::path artifact;
     if (key.source == contracts::ModelSelectionSource::Custom) {
         if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
         progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "Verifying selected model artifact"});
@@ -22,8 +29,8 @@ std::string ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& ke
         if (custom.empty() || !std::filesystem::is_regular_file(custom, error) || error)
             throw std::runtime_error("selected model artifact is unavailable");
         if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
-        return custom.string();
-    }
+        artifact = custom;
+    } else {
     auto cancellation = services::ArtifactCancellationSource::Mint();
     std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
     // CLEANUP-IGNORE: Artifact weight and dataset progress observers adapt distinct typed service callbacks at their
@@ -35,7 +42,29 @@ std::string ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& ke
                 (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
             } catch (...) {}
         }};
-    return store_.canonical_weight_path(key.preset, cancellation.second, observer).string();
+    artifact = store_.canonical_weight_path(key.preset, cancellation.second, observer);
+    }
+    if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    rfdetr::ModelClassLayout layout;
+    if (key.input == contracts::ModelArtifactInputKind::Weights) {
+        layout = rfdetr::resolve_model_state(artifact, key.preset, key.resolution, key.class_layout_path).artifacts.class_layout;
+    } else if (key.input == contracts::ModelArtifactInputKind::Onnx) {
+        const auto digest = mmltk::common::io::try_file_digests(artifact, false, [&] { return stop.stop_requested(); });
+        if (!digest) throw std::runtime_error("model selection cancelled");
+        const auto descriptors = rfdetr::read_artifact_class_descriptors(artifact, *digest, key.class_layout_path);
+        const auto info = rfdetr::load_onnx_model_info(artifact, rfdetr::class_descriptor_output_roles(descriptors));
+        layout = rfdetr::admit_artifact_class_layout(artifact, info.num_classes, info.class_layout, *digest, key.class_layout_path, &descriptors);
+    } else {
+        rfdetr::ModelArtifactRequest request;
+        request.tensorrt_path = artifact;
+        request.class_layout_path = key.class_layout_path;
+        const auto info = rfdetr::inspect_tensorrt_model(request, inspection_device);
+        if (!info.class_layout) throw std::runtime_error("TensorRT class inspection is unavailable");
+        layout = *info.class_layout;
+    }
+    if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
+    return {.artifact = artifact.string(), .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary()};
 }
 
 ModelSystem::ModelSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events)
@@ -80,7 +109,7 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
             try {
                 if (!runtime_) runtime_ = factory_();
                 if (!runtime_) throw std::runtime_error("model runtime is unavailable");
-                auto artifact = runtime_->Acquire(input.key, input.custom_artifact, stop,
+                auto artifact = runtime_->Acquire(input.key, input.custom_artifact, input.inspection_device, stop,
                                                   [this, &malformed_progress](const contracts::ModelProgress& value) {
                                                       if (!value.valid()) {
                                                           malformed_progress.store(true, std::memory_order_relaxed);
@@ -92,7 +121,7 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
                 if (stop.stop_requested()) {
                     terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
                 } else {
-                    selection = {.key = std::move(input.key), .artifact = std::move(artifact)};
+                    selection = {.key = std::move(input.key), .artifact = std::move(artifact.artifact), .class_layout = std::move(artifact.class_layout)};
                     if (!selection.valid()) throw std::runtime_error("model runtime returned an invalid selection");
                     terminal.outcome = contracts::ModelSelectionOutcome::Accepted;
                 }

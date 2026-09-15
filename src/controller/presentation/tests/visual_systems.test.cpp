@@ -995,9 +995,9 @@ class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
         candidate_order_ = {0U, 1U, 2U};
         candidate_render_failure_ = source == "/render-failed";
         if (source == "/allocation-failed") throw std::bad_alloc{};
-        const std::vector<contracts::ArtifactClassName> class_names =
-            source == "/different-catalog" ? std::vector<contracts::ArtifactClassName>{{"animal"}, {"building"}}
-                                           : std::vector<contracts::ArtifactClassName>{{"person"}, {"vehicle"}};
+        const std::vector<mmltk::backend::data::catalog::ClassName> class_names =
+            source == "/different-catalog" ? std::vector<mmltk::backend::data::catalog::ClassName>{{"animal"}, {"building"}}
+                                           : std::vector<mmltk::backend::data::catalog::ClassName>{{"person"}, {"vehicle"}};
         return {.dataset = {.image_count = 3U, .image_width = 64U, .image_height = 64U, .class_names = class_names},
                 .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .visible_indices = candidate_order_}};
     }
@@ -2677,8 +2677,8 @@ void check_restored_filter(const ExploreSnapshot& restored, const ExploreSnapsho
 
 [[nodiscard]] ExploreClassCatalogIdentity test_explore_catalog_identity() {
     const std::array names{
-        contracts::ArtifactClassName{.value = "person"},
-        contracts::ArtifactClassName{.value = "vehicle"},
+        mmltk::backend::data::catalog::ClassName{.value = "person"},
+        mmltk::backend::data::catalog::ClassName{.value = "vehicle"},
     };
     return explore_class_catalog_identity(names);
 }

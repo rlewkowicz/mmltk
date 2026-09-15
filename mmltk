@@ -1553,7 +1553,7 @@ rewrite_benchmark_cache_path() {
 
 is_path_option() {
     case "$1" in
-        --source-dir|--output-dir|--cache-dir|--compiled|--weights|--resume|--onnx|--tensorrt|--output|--input|--save-engine|--report-json|--source|--train-compiled|--val-compiled|--test-compiled|--dist-store-file|--file|--start-at|--log-file|--log-dir|source_dir|output_dir|compiled)
+        --source-dir|--output-dir|--cache-dir|--compiled|--weights|--class-layout|--resume|--onnx|--tensorrt|--output|--input|--save-engine|--report-json|--source|--train-compiled|--val-compiled|--test-compiled|--dist-store-file|--file|--start-at|--log-file|--log-dir|source_dir|output_dir|compiled)
             return 0
             ;;
         *)

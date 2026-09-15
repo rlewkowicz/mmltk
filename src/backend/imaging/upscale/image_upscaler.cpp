@@ -27,7 +27,7 @@ module;
 
 #include "detail/image_upscaler_cuda.h"
 #include "detail/image_upscaler_nis.h"
-#include "src/backend/data/benchmark_hash.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
@@ -443,9 +443,9 @@ struct ImageUpscaler::Impl {
             return ImageUpscalerOutcome::Cancelled;
         const std::filesystem::path path = image_upscaler_model_path(descriptor);
         const auto digest =
-            mmltk::backend::data::try_sha256_file(path, mmltk::common::concurrency::CancellationObservation::Borrow(cancellation));
+            mmltk::common::io::try_sha256_file(path, [&] { return cancellation.cancelled(); });
         if (!digest) return ImageUpscalerOutcome::Cancelled;
-        const std::string actual = mmltk::backend::data::sha256_hex(*digest);
+        const std::string actual = mmltk::common::io::sha256_hex(*digest);
         if (actual != descriptor.sha256) throw std::runtime_error(std::string(descriptor.label) + " model checksum mismatch");
         return ImageUpscalerOutcome::Completed;
     }

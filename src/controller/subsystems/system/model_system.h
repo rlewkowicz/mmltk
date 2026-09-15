@@ -30,10 +30,14 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     contracts::ModelUiState snapshot{};
 };
 
+struct ModelArtifactAdmission final {
+    std::string artifact;
+    mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout;
+};
 class ModelRuntime {
    public:
     virtual ~ModelRuntime() = default;
-    [[nodiscard]] virtual std::string Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, std::stop_token,
+    [[nodiscard]] virtual ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token,
                                               const std::function<void(const contracts::ModelProgress&)>&) = 0;
 };
 
@@ -41,7 +45,7 @@ class ArtifactModelRuntime final : public ModelRuntime {
    public:
     ArtifactModelRuntime() = default;
     explicit ArtifactModelRuntime(services::ArtifactStore store) : store_(std::move(store)) {}
-    [[nodiscard]] std::string Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, std::stop_token,
+    [[nodiscard]] ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token,
                                       const std::function<void(const contracts::ModelProgress&)>&) override;
 
    private:

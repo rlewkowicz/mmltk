@@ -35,7 +35,7 @@ class StopGate final {
 class PredictionSource final {
  public:
     using Detection = mmltk::backend::models::rfdetr::Prediction;
-    using Catalog = std::shared_ptr<const std::vector<std::string>>;
+    using Catalog = std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>;
     static PredictionSource Device(const mmltk::frameworks::gpu::DeviceExecution&, VisualExtent,
         std::span<const float> pixels, std::vector<Detection> detections = {}, Catalog = {});
     static PredictionSource Decoded(VisualExtent, std::span<const std::uint8_t> pixels, Catalog = {});

@@ -174,8 +174,8 @@ mod tests {
         let mut snapshot = explore_snapshot();
         snapshot.ready = true;
         snapshot.dataset.classnames = vec![
-            crate::generated::ArtifactClassName { value: "a".into() },
-            crate::generated::ArtifactClassName { value: "b".into() },
+            crate::generated::ClassName { value: "a".into() },
+            crate::generated::ClassName { value: "b".into() },
         ];
         model.snapshot = Some(snapshot);
         let state = super::super::state::State::default();

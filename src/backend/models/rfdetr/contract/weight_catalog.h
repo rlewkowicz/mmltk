@@ -11,6 +11,7 @@ struct WeightAsset final {
     std::string_view filename;
     std::string_view download_url;
     std::string_view md5_hash;
+    bool coco_sparse_slots = false;
 
     constexpr bool operator==(const WeightAsset&) const noexcept = default;
 };

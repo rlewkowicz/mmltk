@@ -33,7 +33,8 @@ namespace mmltk::controller {
 
 struct PredictLabel final {
     contracts::AnnotationBox box{};
-    int category = 0;
+    int class_reference = 0;
+    mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
     float confidence = 0.0F;
     contracts::AnnotationColor color{};
     [[= mmltk::frameworks::reflection::MaxBytes{256U}]] std::string name;

@@ -496,7 +496,7 @@ TEST_CASE("Annotation import capacity failure leaves the open editable document 
     REQUIRE(editor.Open(test_scene("direct://kept")).outcome == document::DocumentOutcome::Applied);
     const auto kept = editor.ui();
     auto excessive = test_scene("direct://too-many");
-    excessive.categories.resize(contracts::kAnnotationCategoryCapacity + 1U, contracts::ArtifactClassName{.value = "category"});
+    excessive.categories.resize(contracts::kAnnotationCategoryCapacity + 1U, mmltk::backend::data::catalog::ClassName{.value = "category"});
     CHECK(editor.Open(excessive).outcome != document::DocumentOutcome::Applied);
     CHECK(editor.ui() == kept);
     excessive = test_scene("direct://too-many-runs");
@@ -1238,4 +1238,38 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
     const auto failure = mmltk::testsupport::await_test_future(result, "native retained annotation raster");
     if (failure) std::rethrow_exception(failure);
     owner.StopAndWait();
+}
+
+namespace mmltk::controller {
+TEST_CASE("Annotation class admission preserves CBOR non-box content and journal identity", "[annotation][catalog]") {
+    namespace document = subsystems::annotation;
+    document::AnnotationDocument editor;
+    auto scene = test_scene("direct://catalog-roundtrip");
+    scene.categories = {{"background"}, {"point-object"}};
+    scene.objects = {{.category = 1, .name = contracts::AnnotationText::From("retained point"),
+        .shape = contracts::AnnotationShape::Point, .point = {12, 14}}};
+    REQUIRE(editor.Open(scene).outcome == document::DocumentOutcome::Applied);
+    const auto before = editor.ui();
+    CHECK(editor.Edit({.value = AnnotationCategoryEdit{contracts::AnnotationText::From("background")}}).outcome == document::DocumentOutcome::Rejected);
+    CHECK(editor.ui().scene.categories == before.scene.categories);
+    CHECK(editor.ui().scene.objects == before.scene.objects);
+    REQUIRE(editor.Edit({.value = AnnotationCategoryEdit{contracts::AnnotationText::From("new-class")}}).outcome == document::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = AnnotationUndoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    CHECK(editor.ui().scene.categories == before.scene.categories);
+    CHECK(editor.ui().scene.objects == before.scene.objects);
+    REQUIRE(editor.Edit({.value = AnnotationRedoEdit{}}).outcome == document::DocumentOutcome::Applied);
+    std::vector<std::byte> bytes;
+    REQUIRE(contracts::encode_annotation_persistence(editor.ui(), bytes));
+    const auto decoded = mmltk::frameworks::serialization::decode<contracts::AnnotationUiState>(
+        {.first = bytes}, {.max_bytes=contracts::kAnnotationUiStateByteBudget, .max_items=contracts::kAnnotationUiStateByteBudget});
+    REQUIRE(decoded);
+    document::AnnotationDocument reopened;
+    REQUIRE(reopened.Open(decoded->scene).outcome == document::DocumentOutcome::Applied);
+    CHECK(reopened.ui().scene.categories == editor.ui().scene.categories);
+    CHECK(reopened.ui().scene.objects == editor.ui().scene.objects);
+    auto invalid = decoded->scene;
+    invalid.categories.push_back(invalid.categories.front());
+    CHECK(reopened.Open(std::move(invalid)).outcome == document::DocumentOutcome::Rejected);
+    CHECK(reopened.ui().scene.objects == editor.ui().scene.objects);
+}
 }

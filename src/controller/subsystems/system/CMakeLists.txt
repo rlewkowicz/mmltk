@@ -24,13 +24,13 @@ mmltk_register_ordinary_sources(
     detail/cuda_runtime_resources.cpp
     dataset_system.cpp
     local_run.cpp
-    model_system.cpp
     ../../services/file_dialog_system.cpp
     ../../services/settings_system.cpp
     ../train/training_system.cpp)
 mmltk_register_retained_module_importers(
     mmltk_controller_data_compute_systems
     compute_systems.cpp
+    model_system.cpp
     predict_system.cpp
     detail/prediction_preview.cpp)
 mmltk_register_private_headers(

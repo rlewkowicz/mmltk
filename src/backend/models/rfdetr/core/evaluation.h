@@ -2,6 +2,7 @@
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 
 #include <array>
+#include "src/backend/data/catalog/class_catalog.h"
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -82,7 +83,8 @@ void encode_mask_values_into(const uint32_t height, const uint32_t width, Encode
 
 struct Prediction {
     int image_id = 0;
-    int category_id = 0;
+    int class_reference = 0;
+    mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
     float score = 0.0f;
     std::array<float, 4> bbox_xyxy{};
     EncodedMask mask;

@@ -45,6 +45,7 @@
 
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/image_resize.h"
@@ -360,17 +361,17 @@ class ProgressReporter {
 }
 
 [[nodiscard]] std::string combined_artifact_digest(const std::string& left, const std::string& right) {
-    const Sha256Digest left_digest = parse_sha256_hex(left);
-    const Sha256Digest right_digest = parse_sha256_hex(right);
+    const mmltk::common::io::Sha256Digest left_digest = mmltk::common::io::parse_sha256_hex(left);
+    const mmltk::common::io::Sha256Digest right_digest = mmltk::common::io::parse_sha256_hex(right);
     std::array<std::uint8_t, 64> identity{};
     std::ranges::copy(left_digest, identity.begin());
     std::ranges::copy(right_digest, identity.begin() + left_digest.size());
-    return sha256_hex(sha256_bytes(identity));
+    return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(identity));
 }
 
 [[nodiscard]] std::string output_lock_identity(const std::filesystem::path& normalized_output) {
     const std::string identity_material = normalized_output.generic_string();
-    return sha256_hex(sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
+    return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
 }
 
 [[nodiscard]] std::uint64_t available_bytes(const std::filesystem::path& path) {
@@ -667,7 +668,7 @@ class StagingFileCleanup {
     identity_material.push_back('\n');
     identity_material.append(std::to_string(expected_size));
     const std::string identity =
-        sha256_hex(sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
+        mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
     throw_if_benchmark_cancelled(cancel_requested);
     common_io::publish_staged_path_atomically(staging_path, output_path, true);
     write_json_atomically(completion,
@@ -1313,7 +1314,7 @@ void download_open_images(const std::span<const std::uint64_t> expected_ids, con
             throw_if_benchmark_cancelled(cancel_requested);
             if (std::filesystem::is_regular_file(request.destination)) {
                 progress->source_activity(source, "Failure-only SHA-256 diagnosis for " + archive_name);
-                const std::string failure_sha256 = sha256_hex(sha256_file(request.destination, cancel_requested));
+                const std::string failure_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(request.destination, [&] { return cancel_requested.requested(); }));
                 trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
                     return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", failure_sha256}, {"reason", failure_reason}};
                 });
@@ -2120,7 +2121,7 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
         for (const DownloadRequest& request : requests) {
             if (std::filesystem::is_regular_file(request.destination)) {
                 progress.source_activity(source, "Failure-only SHA-256 diagnosis for " + request.artifact_id);
-                const std::string failure_sha256 = sha256_hex(sha256_file(request.destination, cancel_requested));
+                const std::string failure_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(request.destination, [&] { return cancel_requested.requested(); }));
                 trace_benchmark_event(trace, "benchmark.download.failure_sha256", [&] {
                     return nlohmann::json{{"artifact", request.artifact_id}, {"sha256", failure_sha256}, {"reason", reason}};
                 });
@@ -2561,21 +2562,21 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
         if (report_progress) { progress.activity("Preparing COCO training labels"); }
         prepared_counts.push_back(append_source_plan(*coco_train, coco_train_images,
                                                      coco_train_unavailable_ids.empty() ? nullptr : &coco_train_unavailable_ids,
-                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, cancel_requested));
+                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, [&] { return cancel_requested.requested(); }));
         if (report_progress) {
             progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount);
             progress.activity("Preparing Objects365 training labels");
         }
         prepared_counts.push_back(append_source_plan(*objects, object_images,
                                                      objects_unavailable_ids.empty() ? nullptr : &objects_unavailable_ids,
-                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, cancel_requested));
+                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, [&] { return cancel_requested.requested(); }));
         if (report_progress) {
             progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount);
             progress.activity("Preparing Open Images training labels");
         }
         prepared_counts.push_back(append_source_plan(*open_images, open_image_directories,
                                                      open_images_unavailable_ids.empty() ? nullptr : &open_images_unavailable_ids,
-                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, cancel_requested));
+                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, [&] { return cancel_requested.requested(); }));
         if (report_progress) { progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount); }
         train = std::move(prepared);
         source_counts = std::move(prepared_counts);
@@ -2641,7 +2642,7 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
         const std::filesystem::path image_path = cached_image_path(source_root, error.source_image_id());
         if (std::filesystem::is_regular_file(image_path)) {
             progress.activity("Failure-only SHA-256 diagnosis for cached image " + std::to_string(error.source_image_id()));
-            const std::string failure_sha256 = sha256_hex(sha256_file(image_path, cancel_requested));
+            const std::string failure_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(image_path, [&] { return cancel_requested.requested(); }));
             trace_benchmark_event(trace, "benchmark.images.failure_sha256", [&] {
                 return nlohmann::json{{"path", image_path.string()},
                                       {"image_id", error.source_image_id()},
@@ -2765,8 +2766,8 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     progress.activity("Inspecting staged validation dataset");
     const CompiledDatasetInfo val_info = inspect_compiled_dataset(staging_dir / "val.bin");
     progress.phase(DatasetCompilePhase::Syncing, 2U, kSyncStepCount);
-    if (train_info.image_count != train.images.size() || val_info.image_count != 5000U || train_info.class_names != train.class_names ||
-        val_info.class_names != validation.class_names) {
+    if (train_info.image_count != train.images.size() || val_info.image_count != 5000U || !std::ranges::equal(train_info.class_names(), train.class_names) ||
+        !std::ranges::equal(val_info.class_names(), validation.class_names)) {
         throw std::runtime_error("staged benchmark compiled files do not match their plans");
     }
 

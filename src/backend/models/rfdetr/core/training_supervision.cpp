@@ -309,7 +309,7 @@ struct TrainingSupervisionImpl::TimingState {
 class TrainingSupervisionImpl::ProbeMlpImpl final : public torch::nn::Module {
    public:
     ProbeMlpImpl(const int64_t input_width, const int64_t hidden_width)
-        : linear1(register_module("linear1", torch::nn::Linear(input_width, hidden_width))),
+        : linear1(register_module(std::string(detail::kProbeInputLayer), torch::nn::Linear(input_width, hidden_width))),
           linear2(register_module("linear2", torch::nn::Linear(hidden_width, hidden_width))) {}
 
     torch::Tensor forward(const torch::Tensor& input) { return linear2->forward(torch::relu(linear1->forward(input))); }
@@ -326,7 +326,7 @@ class TrainingSupervisionImpl::ProbeMlpImpl final : public torch::nn::Module {
     torch::nn::Linear linear2{nullptr};
 };
 
-TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& config) : config_(config) {
+TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& config, const std::int64_t foreground_count) : config_(config), foreground_count_(foreground_count) {
     if (!training_supervision_enabled(config.training_supervision)) {
         throw std::runtime_error("inactive RF-DETR training supervision must not be constructed");
     }
@@ -340,11 +340,11 @@ TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& confi
         throw std::runtime_error("RF-DETR worst-case DN query layout exceeds allocation capacity");
     }
     if (config.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
-        const int64_t object_classes = config.num_classes - 1;
+        const int64_t object_classes = foreground_count_;
         if (object_classes < 1) { throw std::runtime_error("Match-Free requires at least one real object class and one reserved channel"); }
         // The source paper specifies independent hidden-width MLPs but leaves
         // their depth and activation open; RF-DETR completes them as two-layer ReLU MLPs.
-        ground_truth_mlp_ = register_module("ground_truth_mlp", std::make_shared<ProbeMlpImpl>(object_classes + 4, config.hidden_dim));
+        ground_truth_mlp_ = register_module(std::string(detail::kMatchFreeClassAxis.module_name()), std::make_shared<ProbeMlpImpl>(object_classes + 4, config.hidden_dim));
         query_mlp_ = register_module("query_mlp", std::make_shared<ProbeMlpImpl>(config.hidden_dim, config.hidden_dim));
         query_projection_ = register_module("query_projection",
                                             torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
@@ -352,12 +352,25 @@ TrainingSupervisionImpl::TrainingSupervisionImpl(const NativeRfDetrConfig& confi
                                           torch::nn::Linear(torch::nn::LinearOptions(config.hidden_dim, config.hidden_dim).bias(false)));
     }
     if (config.training_supervision.denoising.enabled) {
-        const int64_t object_classes = config.num_classes - 1;
+        const int64_t object_classes = foreground_count_;
         if (object_classes < 1) { throw std::runtime_error("DN requires at least one real object class and one reserved channel"); }
         denoising_scratch_ = std::make_unique<DenoisingScratch>();
-        denoising_label_embedding_ = register_module("denoising_label_embedding", torch::nn::Embedding(object_classes, config.hidden_dim));
+        denoising_label_embedding_ = register_module(std::string(detail::kDenoisingClassAxis.module_name()), torch::nn::Embedding(object_classes, config.hidden_dim));
         denoising_task_embedding_ = register_module("denoising_task_embedding", torch::nn::Embedding(1, config.hidden_dim));
     }
+}
+
+void TrainingSupervisionImpl::append_class_axes(std::vector<detail::ClassTensorAxis>& axes) const {
+    const auto append = [&](const auto& module, const detail::ClassTensorFamily& family) {
+        if (!module) return;
+        const auto prefix = family.prefix();
+        for (const auto& parameter : module->named_parameters(true)) {
+            const auto name = prefix + parameter.key();
+            if (const auto axis = family.Match(name)) axes.push_back({name, axis->dimension, axis->coordinates});
+        }
+    };
+    append(denoising_label_embedding_, detail::kDenoisingClassAxis);
+    append(ground_truth_mlp_, detail::kMatchFreeClassAxis);
 }
 
 TrainingSupervisionImpl::~TrainingSupervisionImpl() = default;
@@ -611,18 +624,18 @@ std::optional<DenoisingQueryBatch> TrainingSupervisionImpl::prepare_denoising(co
             generated.center = at::rand(coordinate_shape, *denoising_generator_, float_options);
             generated.size = at::rand(coordinate_shape, *denoising_generator_, float_options);
             generated.label_flip = at::rand(slot_shape, *denoising_generator_, float_options);
-            if (config_.num_classes - 1 > 1) {
+            if (foreground_count_ > 1) {
                 generated.other_label = at::randint(config_.num_classes - 2, slot_shape, *denoising_generator_, integer_options);
             }
             variates = &generated;
         } else {
-            require_denoising_variates(*variates, slot_shape, device, config_.num_classes - 1);
+            require_denoising_variates(*variates, slot_shape, device, foreground_count_);
         }
 
         const auto valid = padded.valid.unsqueeze(1).expand(slot_shape);
         const auto labels = padded.labels.unsqueeze(1).expand(slot_shape);
         const auto boxes = padded.boxes.unsqueeze(1).expand({batch, groups, padded.maximum_count, 4});
-        const int64_t object_classes = config_.num_classes - 1;
+        const int64_t object_classes = foreground_count_;
         auto transformed =
             transform_denoising_targets(labels, boxes, valid, object_classes, config_.training_supervision.denoising, *variates);
         // RF-DETR keeps pretrained ordinary query width and semantics intact.
@@ -712,7 +725,7 @@ void TrainingSupervisionImpl::configure_timing(const SupervisionTimingSetup& set
 }
 
 torch::Tensor TrainingSupervisionImpl::project_ground_truth(const torch::Tensor& labels, const torch::Tensor& boxes) {
-    return query_projection_->forward(ground_truth_mlp_->forward_ground_truth(labels, boxes, config_.num_classes - 1));
+    return query_projection_->forward(ground_truth_mlp_->forward_ground_truth(labels, boxes, foreground_count_));
 }
 
 torch::Tensor TrainingSupervisionImpl::dense_correspondence(const torch::Tensor& probes, const torch::Tensor& query_features) {

@@ -42,6 +42,7 @@
 #include "filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_loader.h"
@@ -305,7 +306,7 @@ class HttpServer {
 
 DownloadRequest request_for(const fs::path& root, const std::string& id, const std::string& url, const std::vector<std::uint8_t>& payload) {
     return DownloadRequest{
-        id, url, root / (id + ".bin"), root / "locks" / (id + ".lock"), payload.size(), sha256_hex(sha256_bytes(payload)), 3U,
+        id, url, root / (id + ".bin"), root / "locks" / (id + ".lock"), payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 3U,
     };
 }
 
@@ -395,7 +396,7 @@ void test_benchmark_annotation_indexes() {
     options.expected_image_count = 2U;
     options.num_workers = 2;
     options.keep_images_without_mapped_boxes = true;
-    const std::string digest = sha256_hex(sha256_file(coco));
+    const std::string digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(coco));
     NormalizedAnnotationIndex parsed = parse_coco_style_annotations(coco, digest, mappings, options);
     REQUIRE(parsed.images.size() == 2U);
     REQUIRE(parsed.boxes.size() == 1U);
@@ -430,7 +431,7 @@ void test_benchmark_annotation_indexes() {
     open_options.split = "train";
     open_options.num_workers = 2;
     NormalizedAnnotationIndex open =
-        parse_open_images_annotations(boxes, classes, sha256_hex(sha256_file(boxes)), open_mappings, open_options);
+        parse_open_images_annotations(boxes, classes, mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(boxes)), open_mappings, open_options);
     REQUIRE(open.images.size() == 1U);
     REQUIRE(open.boxes.size() == 1U);
     REQUIRE(open.rejected.duplicate_boxes == 1U);
@@ -701,7 +702,7 @@ void test_benchmark_cached_image_writer_and_loader() {
     REQUIRE(info.image_count == 2U);
     REQUIRE(info.width == kNanoResolution);
     REQUIRE(info.height == kNanoResolution);
-    REQUIRE(info.class_names == std::vector<std::string>{"person"});
+    REQUIRE(std::ranges::equal(info.class_names(), std::vector<std::string>{"person"}));
 
     const FileHandle file = FileHandle::open_readonly(output.string());
     const FileHeader header = read_compiled_header(file);
@@ -751,13 +752,13 @@ void test_benchmark_cached_image_writer_and_loader() {
     loader.synchronize();
     REQUIRE(loaded_images == 2U);
 
-    const std::string original_digest = sha256_hex(sha256_file(output));
+    const std::string original_digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(output));
     bool refused = false;
     try {
         write_benchmark_split(benchmark_write_request(split, output, kNanoResolution));
     } catch (const std::exception&) { refused = true; }
     REQUIRE(refused);
-    REQUIRE(sha256_hex(sha256_file(output)) == original_digest);
+    REQUIRE(mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(output)) == original_digest);
 
     std::atomic<bool> cancel{true};
     const fs::path cancelled_output = root.path() / "cancelled.bin";
@@ -794,7 +795,7 @@ void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress()
     const fs::path lock_path =
         root.path() / ".cache" / "benchmark-dataset" / "v1" / "locks" /
         ("output-" +
-         sha256_hex(sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(normalized_output.data()), normalized_output.size()))) +
+         mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(normalized_output.data()), normalized_output.size()))) +
          ".lock");
     fs::create_directories(lock_path.parent_path());
     const mmltk::common::io::ScopedFd lock_descriptor{::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)};

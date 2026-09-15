@@ -11,6 +11,7 @@ pub(crate) struct ModelSettingsProjection {
     pub(crate) preset: String,
     pub(crate) resolution: i32,
     pub(crate) artifact: String,
+    pub(crate) class_layout_path: String,
 }
 
 fn compatibility_for_dialog(
@@ -92,6 +93,7 @@ pub(crate) fn model_settings_projection(
             _ => None,
         })
         .unwrap_or_default();
+    let SettingsFieldValue::String(class_layout_path) = read_field(settings, fields.class_layout_field_id)? else { return None; };
     Some(ModelSettingsProjection {
         fields,
         artifact_field,
@@ -101,6 +103,7 @@ pub(crate) fn model_settings_projection(
         preset,
         resolution,
         artifact,
+        class_layout_path,
     })
 }
 
@@ -113,6 +116,7 @@ pub(super) struct EffectiveModelSelection {
     pub(super) preset: String,
     pub(super) resolution: u32,
     pub(super) artifact: String,
+    pub(super) class_layout_path: String,
 }
 
 impl EffectiveModelSelection {
@@ -140,6 +144,7 @@ impl EffectiveModelSelection {
             && selection.key.input == self.input
             && selection.key.preset == self.preset
             && selection.key.resolution == self.resolution
+            && selection.key.classlayoutpath == self.class_layout_path
             && (self.source == ModelSelectionSource::Canonical
                 || selection.artifact == self.artifact)
     }
@@ -158,6 +163,7 @@ pub(super) fn effective_model_selection(
         preset: projection.preset,
         resolution: projection.resolution as u32,
         artifact: projection.artifact,
+        class_layout_path: projection.class_layout_path,
     })
 }
 

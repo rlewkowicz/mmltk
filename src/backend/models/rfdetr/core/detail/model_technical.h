@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/detail/class_tensor_axes.h"
 
 #include <torch/torch.h>
 
@@ -7,6 +8,7 @@
 #include <vector>
 
 #include "detection_types.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 
 namespace mmltk::backend::models::rfdetr {
@@ -44,7 +46,9 @@ struct NormalizedModelStateCandidate {
 
 enum class NormalizedModelStateAdmission {
     Exact,
-    AdaptDetectionClassHead,
+    PartialExact,
+    FreshTransfer,
+    PartialFreshTransfer,
 };
 
 class NativeModelTechnicalOwner {
@@ -68,9 +72,9 @@ class NativeModelTechnicalOwner {
     virtual void begin_criterion_timing() = 0;
     virtual void end_criterion_timing() = 0;
     [[nodiscard]] virtual SupervisionTimingHandoff harvest_supervision_timing() = 0;
-    [[nodiscard]] virtual ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict) = 0;
+    [[nodiscard]] virtual ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict, const ModelClassLayout* admitted_layout = nullptr) = 0;
     [[nodiscard]] virtual NormalizedModelStateCandidate stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state,
-                                                                               NormalizedModelStateAdmission admission) = 0;
+                                                                               NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout = nullptr) = 0;
     virtual void commit_normalized_state(NormalizedModelStateCandidate candidate) = 0;
     virtual void set_force_pytorch_deformable_attn(bool value) = 0;
 

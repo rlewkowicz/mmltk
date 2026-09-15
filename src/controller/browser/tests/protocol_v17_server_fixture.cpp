@@ -57,7 +57,8 @@ int main(const int argument_count, char* const* const arguments) {
             frame.content = {1U, 2U, 20U, 16U};
             frame.clean_revision = 43U;
             mmltk::frameworks::reflection::access<Snapshot, Projection::revision>(snapshot) =
-                std::numeric_limits<std::uint64_t>::max() - session;
+                Projection::kind == PresentationSourceKind::Predict ? 7U + session :
+                    std::numeric_limits<std::uint64_t>::max() - session;
             snapshots_valid = snapshots_valid && visual_clean_content_identity(frame).revision == 43U;
         }
         if constexpr (std::same_as<Snapshot, AnnotationSnapshot>) {

@@ -61,11 +61,7 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
     for (const auto& entry : store.image_entries_)
         store.label_index_.push_back({static_cast<std::uint32_t>(entry.label_offset / sizeof(PackedInstance)), entry.num_instances, 0});
 
-    store.class_names_.reserve(store.header_.num_classes);
-    for (std::uint32_t class_id = 0U; class_id < store.header_.num_classes; ++class_id) {
-        const auto& stored_name = store.header_.class_names[class_id];
-        store.class_names_.emplace_back(stored_name.data(), ::strnlen(stored_name.data(), stored_name.size()));
-    }
+    store.catalog_ = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(store.header_));
 
     store.mapping_.advise_aligned_range(sections.index_offset, sections.expected_index_bytes, MADV_SEQUENTIAL);
     store.mapping_.advise_aligned_range(sections.pixel_offset, sections.pixel_blob_size, MADV_HUGEPAGE);
@@ -79,7 +75,7 @@ const std::filesystem::path& CompiledDataset::path() const noexcept { return pat
 
 const mmltk::backend::data::FileHeader& CompiledDataset::header() const noexcept { return header_; }
 
-std::span<const std::string> CompiledDataset::class_names() const noexcept { return class_names_; }
+std::span<const std::string> CompiledDataset::class_names() const noexcept { return catalog_ ? catalog_->names() : std::span<const std::string>{}; }
 
 std::span<const mmltk::backend::data::ImageEntry> CompiledDataset::image_entries() const noexcept { return image_entries_; }
 

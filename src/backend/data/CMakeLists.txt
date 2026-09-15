@@ -5,7 +5,6 @@ find_package(simdjson 3.13.0 EXACT CONFIG REQUIRED
     NO_DEFAULT_PATH)
 find_package(CURL REQUIRED)
 find_package(LibArchive REQUIRED)
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 find_path(MMLTK_TURBOJPEG_INCLUDE_DIR
     NAMES turbojpeg.h
@@ -143,6 +142,7 @@ target_include_directories(mmltk_backend_data SYSTEM PRIVATE
 )
 target_link_libraries(mmltk_backend_data
     PUBLIC
+        mmltk::backend::data::catalog
         mmltk::common::io
         mmltk::common::math
         mmltk::frameworks::reflection
@@ -158,7 +158,6 @@ target_link_libraries(mmltk_backend_data
         avir
         CURL::libcurl
         LibArchive::LibArchive
-        OpenSSL::Crypto
         rapidgzip::rapidgzip
         simdjson::simdjson
         stb
@@ -188,6 +187,9 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/roundtrip.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/benchmark_dataset.test.cpp)
+    mmltk_register_ordinary_sources(mmltk_backend_data_tests
+        ${CMAKE_SOURCE_DIR}/src/backend/data/catalog/tests/class_catalog.test.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/io/tests/file_digest.test.cpp)
     mmltk_register_private_headers(mmltk_backend_data_tests
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/perceptual_downscale_reference.h)
     if(BUILD_RFDETR_NATIVE)

@@ -1415,7 +1415,7 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
     scene.document = c::WorkspaceResource::From(std::string(c::kWorkspaceResourceCapacity, 'd'), 1U);
     scene.frame_width = scene.frame_height = std::numeric_limits<std::uint16_t>::max();
     scene.frame_ready = true;
-    scene.categories.resize(c::kAnnotationCategoryCapacity, {.value = std::string(c::kArtifactClassNameCapacity, 'c')});
+    scene.categories.resize(c::kAnnotationCategoryCapacity, {.value = std::string(mmltk::backend::data::catalog::kClassNameCapacity, 'c')});
     scene.palette.resize(c::kAnnotationCategoryCapacity, {.hue = 123.4567F, .saturation = 0.1234567F, .value = 0.7654321F});
     const c::AnnotationPoint point{1234.5678F, 2345.6789F};
     auto object = browser::test_support::make_annotation_wire_object(point, scene.palette.front());

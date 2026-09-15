@@ -513,7 +513,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
         require(
-            observed.snapshotrevision == u64::MAX - session
+            observed.snapshotrevision == if kind == generated::PresentationSourceKind::Predict { 7 + session } else { u64::MAX - session }
                 && observed.frame.revision == 7 + session,
             "native visual observation differs from Rust projection",
         )?;

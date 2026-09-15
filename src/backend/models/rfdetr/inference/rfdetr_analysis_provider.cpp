@@ -152,7 +152,7 @@ RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(con
                                  .capacity_bytes = static_cast<std::size_t>(input.numel() * input.element_size()),
                                  .shape = shape,
                                  .element_type = element_type},
-                                request.annotations));
+                                request.annotations, {}, impl_->backend->has_masks()));
         const auto& submission = *impl_->active_submission;
         return {
             .identity = request.identity,

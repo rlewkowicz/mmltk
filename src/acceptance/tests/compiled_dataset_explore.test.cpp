@@ -395,7 +395,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     REQUIRE(info.image_count == 12U);
     REQUIRE(info.width == 32U);
     REQUIRE(info.height == 32U);
-    REQUIRE(info.class_names.front() == "person");
+    REQUIRE(info.class_names().front() == "person");
 
     const mmltk::backend::data::CompiledDataset store = mmltk::backend::data::CompiledDataset::open(compiled);
     const mmltk::backend::data::CompiledDataset non_square_store = mmltk::backend::data::CompiledDataset::open(non_square_compiled);

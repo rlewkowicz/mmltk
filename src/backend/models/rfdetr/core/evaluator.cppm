@@ -56,6 +56,7 @@ class EvaluationDatasetOwner final {
     [[nodiscard]] std::vector<int> image_ids() const;
     [[nodiscard]] std::size_t image_count() const noexcept;
     [[nodiscard]] std::size_t category_count() const noexcept;
+    [[nodiscard]] const std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>& class_catalog() const noexcept;
     [[nodiscard]] Facts facts() const noexcept;
 
    private:

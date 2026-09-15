@@ -248,7 +248,7 @@ SelectedPredictions select_predictions(int image_id, const torch_api::Tensor& sc
         if (label < 0 || label >= static_cast<int64_t>(category_count)) { continue; }
         Prediction prediction;
         prediction.image_id = image_id;
-        prediction.category_id = static_cast<int>(label) + 1;
+        prediction.class_reference = static_cast<int>(label);
         prediction.score = score_ptr[index];
         prediction.bbox_xyxy = xyxy_clamped(box_ptr + index * 4);
         out.predictions.push_back(std::move(prediction));

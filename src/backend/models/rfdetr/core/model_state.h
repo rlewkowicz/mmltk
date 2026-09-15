@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "src/backend/models/rfdetr/contract/artifacts.h"
+#include "src/backend/models/rfdetr/contract/class_layout.h"
+#include "src/common/io/file_digest.h"
 namespace mmltk::backend::models::rfdetr::model_state_detail {
 template <class T>
 inline constexpr bool is_optional = false;
@@ -23,10 +25,10 @@ inline constexpr bool is_optional<std::optional<T>> = true;
 namespace mmltk::backend::models::rfdetr {
 
 inline constexpr const char* kNativeCheckpointFormat = "mmltk.rfdetr.native_checkpoint";
-inline constexpr int64_t kLegacyNativeCheckpointFormatVersion = 1;
-inline constexpr int64_t kNativeCheckpointFormatVersion = 2;
+inline constexpr int64_t kNativeCheckpointFormatVersion = 3;
 
 struct NativeCheckpointMetadata {
+    ModelClassLayout class_layout;
     std::string preset_name;
     std::string source_kind;
     std::string source_path;
@@ -72,6 +74,7 @@ class DecodedNativeModelState {
     DecodedNativeModelState& operator=(const DecodedNativeModelState&) = delete;
 
     NativeCheckpointMetadata metadata;
+    std::optional<mmltk::common::io::FileDigests> admitted_file;
 
     [[nodiscard]] std::size_t tensor_count() const noexcept;
     [[nodiscard]] void* technical_handle() noexcept;
@@ -87,12 +90,13 @@ struct ResolvedModelState {
     DecodedNativeModelState model_state;
 };
 
+void validate_decoded_model_state(const DecodedNativeModelState& state);
 [[nodiscard]] bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path);
 [[nodiscard]] DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path);
-[[nodiscard]] DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path);
+[[nodiscard]] DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path, std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file = {}, const std::filesystem::path& class_layout_path = {});
 void write_upstream_model_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& model_state);
 [[nodiscard]] ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, std::string_view preset_name,
-                                                     int resolution);
+                                                     int resolution, const std::filesystem::path& class_layout_path = {}, std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file = {});
 [[nodiscard]] NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, int64_t num_classes);
 
 }  // namespace mmltk::backend::models::rfdetr

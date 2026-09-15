@@ -836,3 +836,134 @@ TEST_CASE("mask materialization follows selected query identity and bounded reus
     output.pred_masks = torch_api::ones({1, 2, 1, 1});
     CHECK_THROWS_AS(rfdetr::select_output_batch_fixed_size(output, 2, 2, 2, true), std::invalid_argument);
 }
+
+TEST_CASE("Declared class slots are filtered before ranking without losing query masks", "[model][rfdetr][layout]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace catalog = mmltk::backend::data::catalog;
+    for (std::uint32_t background = 0; background < 3; ++background) {
+        auto record = r::native_training_class_layout(catalog::ClassCatalog({"cat", "dog"}));
+        record.no_object = r::NoObjectEncoding::ExplicitBackground;
+        std::uint32_t foreground = 0;
+        for (std::uint32_t slot = 0; slot < 3; ++slot)
+            record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt} :
+                r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
+        auto layout = std::make_shared<const r::ResolvedClassLayout>(record);
+        r::ClassPostprocessLane classes(layout);
+        classes.Prepare(torch_api::kCPU);
+        r::OutputTensors outputs;
+        outputs.pred_logits = torch_api::full({1, 2, 3}, -8.F);
+        outputs.pred_logits.select(2, background).fill_(100.F);
+        const auto first_slot = background == 0 ? 1 : 0;
+        const auto last_slot = background == 2 ? 1 : 2;
+        outputs.pred_logits[0][0][first_slot] = 4.F;
+        outputs.pred_logits[0][1][last_slot] = 3.F;
+        outputs.pred_boxes = torch_api::tensor({.25F, .25F, .2F, .2F, .75F, .75F, .2F, .2F}).view({1, 2, 4});
+        outputs.pred_masks = torch_api::tensor({8.F, -8.F}).view({1, 2, 1, 1});
+        const auto selected = r::select_output_batch_fixed_size(outputs, 10, 20, 2, true, &classes);
+        REQUIRE(selected.labels[0][0].item<std::int64_t>() == 0);
+        REQUIRE(selected.labels[0][1].item<std::int64_t>() == 1);
+        REQUIRE(selected.query_indices[0][0].item<std::int64_t>() == 0);
+        REQUIRE(selected.query_indices[0][1].item<std::int64_t>() == 1);
+        CHECK(selected.scores[0][0].item<float>() < .99F);
+        r::SelectedMaskWorkspace masks;
+        const auto materialized = masks.Materialize(*selected.mask_logits, selected.query_indices, 10, 20);
+        CHECK(materialized[0][0].all().item<bool>());
+        CHECK_FALSE(materialized[0][1].any().item<bool>());
+    }
+    auto empty = std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(catalog::ClassCatalog{}));
+    r::ClassPostprocessLane classes(empty);
+    classes.Prepare(torch_api::kCPU);
+    r::OutputTensors outputs{.pred_logits=torch_api::full({1, 2, 1}, 100.F), .pred_boxes=torch_api::zeros({1, 2, 4})};
+    const auto selected = r::select_output_batch_fixed_size(outputs, 10, 20, 500, false, &classes);
+    CHECK(selected.labels.numel() == 0);
+    CHECK(selected.boxes.size(1) == 0);
+}
+
+TEST_CASE("Class lanes retain gather capacity and independently owned final labels", "[model][rfdetr][layout]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    auto record = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
+    record.slots = {{r::ClassSlotRole::Foreground, 1U}, {r::ClassSlotRole::Unused, {}}, {r::ClassSlotRole::Foreground, 0U}};
+    r::ClassPostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
+    lane.Prepare(torch_api::kCPU);
+    const auto logits = torch_api::tensor({1.F, 100.F, 2.F, 4.F, 100.F, 3.F}).view({1, 2, 3});
+    const auto expected = torch_api::tensor({1.F, 2.F, 4.F, 3.F}).view({1, 2, 2});
+    auto gathered = lane.Gather(logits.repeat({3, 1, 1}));
+    const auto address = gathered.data_ptr();
+    CHECK(torch_api::equal(gathered, expected.repeat({3, 1, 1})));
+    for (const auto batch : {1, 2, 3, 1}) {
+        auto value = lane.Gather(logits.repeat({batch, 1, 1}));
+        CHECK(value.data_ptr() == address);
+        CHECK(torch_api::equal(value, expected.repeat({batch, 1, 1})));
+    }
+    const auto larger = lane.Gather(logits.repeat({4, 1, 1}));
+    CHECK(larger.data_ptr() != address);
+    CHECK(torch_api::equal(larger, expected.repeat({4, 1, 1})));
+    CHECK(lane.Gather(logits).data_ptr() == larger.data_ptr());
+    r::OutputTensors output{.pred_logits = logits, .pred_boxes = torch_api::ones({1, 2, 4})};
+    const auto first = r::select_output_batch_fixed_size(output, 8, 8, 2, false, &lane);
+    const auto labels = first.labels.clone();
+    const auto scores = first.scores.clone();
+    output.pred_logits = -logits;
+    const auto next = r::select_output_batch_fixed_size(output, 8, 8, 2, false, &lane);
+    CHECK(torch_api::equal(first.labels, labels));
+    CHECK(torch_api::equal(first.scores, scores));
+    CHECK(first.labels.data_ptr() != next.labels.data_ptr());
+    CHECK(first.labels[0][0].item<int64_t>() == 1);
+    CHECK(first.labels[0][1].item<int64_t>() == 0);
+    const auto doubled = lane.Gather(logits.to(torch_api::kFloat64));
+    CHECK(doubled.data_ptr() != address);
+    CHECK(torch_api::equal(doubled, expected.to(torch_api::kFloat64)));
+    CHECK(lane.Gather(logits.to(torch_api::kFloat64)).data_ptr() == doubled.data_ptr());
+    CHECK(lane.Gather(torch_api::zeros({0, 2, 3})).numel() == 0);
+    CHECK(lane.Gather(torch_api::zeros({1, 0, 3})).numel() == 0);
+    CHECK_THROWS(lane.Gather(torch_api::zeros({1, 2, 4})));
+    CHECK(lane.Gather(logits.to(torch_api::kFloat64)).data_ptr() == doubled.data_ptr());
+    r::ClassPostprocessLane empty(std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog{})));
+    empty.Prepare(torch_api::kCPU);
+    const auto empty_input = torch_api::zeros({2, 3, 1});
+    CHECK(empty.Gather(empty_input).numel() == 0);
+    r::ClassPostprocessLane dense(std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}))));
+    dense.Prepare(torch_api::kCPU);
+    CHECK(dense.Gather(logits).data_ptr() == logits.data_ptr());
+}
+
+TEST_CASE("Class lane device and stream rebind retains earlier final results", "[model][rfdetr][layout][gpu]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    auto record = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
+    record.slots = {{r::ClassSlotRole::Unused, {}}, {r::ClassSlotRole::Foreground, 0U}};
+    r::ClassPostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
+    lane.Prepare(torch_api::kCPU);
+    const auto cpu = torch_api::tensor({99.F, 3.F}).view({1, 1, 2});
+    auto previous = lane.Gather(cpu);
+    const auto device = torch_api::Device(torch_api::kCUDA, 0);
+    const auto first_stream = c10::cuda::getStreamFromPool(false, 0);
+    const auto second_stream = c10::cuda::getStreamFromPool(false, 0);
+    torch_api::Tensor first_labels, first_scratch;
+    {
+        c10::cuda::CUDAStreamGuard guard(first_stream);
+        lane.Prepare(device);
+        const auto input = cpu.to(device);
+        first_scratch = lane.Gather(input);
+        const auto& scratch = first_scratch;
+        CHECK(scratch.data_ptr() != previous.data_ptr());
+        CHECK(lane.Gather(input).data_ptr() == scratch.data_ptr());
+        first_labels = lane.References(torch_api::zeros({1, 1}, input.options().dtype(torch_api::kInt64)));
+    }
+    {
+        c10::cuda::CUDAStreamGuard guard(second_stream);
+        const auto input = cpu.to(device);
+        CHECK_THROWS(lane.Gather(input));
+        lane.Prepare(device);
+        const auto scratch = lane.Gather(input);
+        CHECK(scratch.data_ptr() != first_scratch.data_ptr());
+        CHECK(scratch.cpu().item<float>() == 3.F);
+        CHECK(lane.Gather(input).data_ptr() == scratch.data_ptr());
+    }
+    {
+        c10::cuda::CUDAStreamGuard guard(first_stream);
+        CHECK(first_labels.cpu().item<int64_t>() == 0);
+    }
+    lane.Prepare(torch_api::kCPU);
+    CHECK(lane.Gather(cpu).item<float>() == 3.F);
+    CHECK(previous.item<float>() == 3.F);
+}

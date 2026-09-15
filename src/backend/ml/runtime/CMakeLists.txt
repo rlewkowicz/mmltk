@@ -69,6 +69,7 @@ endif()
 add_library(mmltk_backend_ml_runtime STATIC)
 add_library(mmltk::backend::ml::runtime ALIAS mmltk_backend_ml_runtime)
 mmltk_configure_component(mmltk_backend_ml_runtime PUBLIC_DECLARATIONS)
+target_link_libraries(mmltk_backend_ml_runtime PUBLIC mmltk::backend::data::catalog)
 
 mmltk_register_public_headers(
     mmltk_backend_ml_runtime

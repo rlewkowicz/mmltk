@@ -1,3 +1,4 @@
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/image_resize.h"
@@ -659,6 +660,10 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
     for (size_t i = 0; i < scan.class_map.size(); ++i) {
         if (!seen_ids[i]) { throw std::runtime_error("class ids must be dense and start at 0 or 1"); }
     }
+
+    std::vector<std::string> ordered_names(scan.class_map.size());
+    for (const auto& [name, index] : scan.class_map) ordered_names[index] = name;
+    const catalog::ClassCatalog validated_catalog(std::move(ordered_names), 31U);
 
     scan.splits.reserve(splits.size());
     for (const std::string& split : splits) {

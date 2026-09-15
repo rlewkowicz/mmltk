@@ -5,6 +5,7 @@
 #include <array>
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "detection_geometry.h"
 #include "detection_types.h"
 #include "torch_api.h"
@@ -15,6 +16,22 @@ namespace postprocess_detail = mmltk::backend::ml::torch_api;
 
 namespace mmltk::backend::models::rfdetr {
 
+class ClassPostprocessLane final {
+ public:
+    explicit ClassPostprocessLane(std::shared_ptr<const ResolvedClassLayout> layout) : layout_(std::move(layout)) { layout_->require_execution(); }
+    void Prepare(const postprocess_detail::Device& device);
+    // Borrowed scratch: consume on the prepared stream before the next Gather.
+    // Postprocessed final scores/labels/boxes never alias this workspace.
+    [[nodiscard]] torch::Tensor Gather(const torch::Tensor& logits);
+    [[nodiscard]] torch::Tensor References(const torch::Tensor& eligible_indices) const;
+    [[nodiscard]] std::size_t eligible_count() const noexcept { return layout_->eligible_slots().size(); }
+ private:
+    std::shared_ptr<const ResolvedClassLayout> layout_;
+    torch::Tensor slots_, references_, gather_;
+    postprocess_detail::CudaStream prepared_stream_ = nullptr;
+    bool prefix_identity_ = false;
+};
+
 // Top-k products retain their originating query until the consumer selects survivors.
 // Mask logits remain at model resolution; selection never expands them.
 struct PostprocessedSelection {
@@ -24,7 +41,7 @@ struct PostprocessedSelection {
     torch::Tensor query_indices;
     std::optional<torch::Tensor> mask_logits;
 };
-PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false);
+PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false, ClassPostprocessLane* classes = nullptr);
 // Complete concurrently live scratch: gathered logits, expanded logits, device
 // bools, and host bools. Dense preview storage and encoded records are separate.
 struct SelectedMaskCapacity final {
@@ -71,14 +88,14 @@ struct PostprocessedBatch {
     [[nodiscard]] int64_t size() const { return scores.defined() ? scores.size(0) : 0; }
 };
 
-std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const torch::Tensor& target_sizes, int64_t num_select);
-std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs, const torch::Tensor& target_sizes, int64_t num_select);
+std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const torch::Tensor& target_sizes, int64_t num_select, ClassPostprocessLane* classes = nullptr);
+std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs, const torch::Tensor& target_sizes, int64_t num_select, ClassPostprocessLane* classes = nullptr);
 
 std::vector<TensorMap> postprocess_outputs_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width,
-                                                      int64_t num_select);
+                                                      int64_t num_select, ClassPostprocessLane* classes = nullptr);
 
 PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width,
-                                                       int64_t num_select);
+                                                       int64_t num_select, ClassPostprocessLane* classes = nullptr);
 PostprocessedBatch postprocessed_batch_from_result(const TensorMap& result);
 std::vector<TensorMap> split_postprocessed_batch(const PostprocessedBatch& batch);
 

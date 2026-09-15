@@ -1,4 +1,5 @@
 #include "detail/benchmark_catalog.h"
+#include "src/backend/data/catalog/coco_catalog.h"
 
 #include <array>
 #include <cstdint>
@@ -14,50 +15,14 @@ namespace mmltk::backend::data::benchmark_internal {
 
 namespace {
 
-constexpr std::array<std::string_view, 80> kCoco80Names{
-    "person",         "bicycle",    "car",           "motorcycle",    "airplane",     "bus",           "train",
-    "truck",          "boat",       "traffic light", "fire hydrant",  "stop sign",    "parking meter", "bench",
-    "bird",           "cat",        "dog",           "horse",         "sheep",        "cow",           "elephant",
-    "bear",           "zebra",      "giraffe",       "backpack",      "umbrella",     "handbag",       "tie",
-    "suitcase",       "frisbee",    "skis",          "snowboard",     "sports ball",  "kite",          "baseball bat",
-    "baseball glove", "skateboard", "surfboard",     "tennis racket", "bottle",       "wine glass",    "cup",
-    "fork",           "knife",      "spoon",         "bowl",          "banana",       "apple",         "sandwich",
-    "orange",         "broccoli",   "carrot",        "hot dog",       "pizza",        "donut",         "cake",
-    "chair",          "couch",      "potted plant",  "bed",           "dining table", "toilet",        "tv",
-    "laptop",         "mouse",      "remote",        "keyboard",      "cell phone",   "microwave",     "oven",
-    "toaster",        "sink",       "refrigerator",  "book",          "clock",        "vase",          "scissors",
-    "teddy bear",     "hair drier", "toothbrush",
-};
-
-constexpr std::array<NumericCategoryMapping, 80> kCocoMappings{{
-    {1, 0, "person"},          {2, 1, "bicycle"},        {3, 2, "car"},
-    {4, 3, "motorcycle"},      {5, 4, "airplane"},       {6, 5, "bus"},
-    {7, 6, "train"},           {8, 7, "truck"},          {9, 8, "boat"},
-    {10, 9, "traffic light"},  {11, 10, "fire hydrant"}, {13, 11, "stop sign"},
-    {14, 12, "parking meter"}, {15, 13, "bench"},        {16, 14, "bird"},
-    {17, 15, "cat"},           {18, 16, "dog"},          {19, 17, "horse"},
-    {20, 18, "sheep"},         {21, 19, "cow"},          {22, 20, "elephant"},
-    {23, 21, "bear"},          {24, 22, "zebra"},        {25, 23, "giraffe"},
-    {27, 24, "backpack"},      {28, 25, "umbrella"},     {31, 26, "handbag"},
-    {32, 27, "tie"},           {33, 28, "suitcase"},     {34, 29, "frisbee"},
-    {35, 30, "skis"},          {36, 31, "snowboard"},    {37, 32, "sports ball"},
-    {38, 33, "kite"},          {39, 34, "baseball bat"}, {40, 35, "baseball glove"},
-    {41, 36, "skateboard"},    {42, 37, "surfboard"},    {43, 38, "tennis racket"},
-    {44, 39, "bottle"},        {46, 40, "wine glass"},   {47, 41, "cup"},
-    {48, 42, "fork"},          {49, 43, "knife"},        {50, 44, "spoon"},
-    {51, 45, "bowl"},          {52, 46, "banana"},       {53, 47, "apple"},
-    {54, 48, "sandwich"},      {55, 49, "orange"},       {56, 50, "broccoli"},
-    {57, 51, "carrot"},        {58, 52, "hot dog"},      {59, 53, "pizza"},
-    {60, 54, "donut"},         {61, 55, "cake"},         {62, 56, "chair"},
-    {63, 57, "couch"},         {64, 58, "potted plant"}, {65, 59, "bed"},
-    {67, 60, "dining table"},  {70, 61, "toilet"},       {72, 62, "tv"},
-    {73, 63, "laptop"},        {74, 64, "mouse"},        {75, 65, "remote"},
-    {76, 66, "keyboard"},      {77, 67, "cell phone"},   {78, 68, "microwave"},
-    {79, 69, "oven"},          {80, 70, "toaster"},      {81, 71, "sink"},
-    {82, 72, "refrigerator"},  {84, 73, "book"},         {85, 74, "clock"},
-    {86, 75, "vase"},          {87, 76, "scissors"},     {88, 77, "teddy bear"},
-    {89, 78, "hair drier"},    {90, 79, "toothbrush"},
-}};
+constexpr auto kCocoMappings = [] {
+    std::array<NumericCategoryMapping, catalog::kCocoCategories.size()> mappings{};
+    for (std::size_t index = 0; index < mappings.size(); ++index) {
+        const auto& category = catalog::kCocoCategories[index];
+        mappings[index] = {category.source_id, static_cast<std::uint8_t>(index), category.name};
+    }
+    return mappings;
+}();
 
 constexpr std::array<NumericCategoryMapping, 102> kObjects365Mappings{{
     {1, 0, "Person"},
@@ -351,7 +316,7 @@ constexpr std::string_view kOpenImagesTrainImageUrlTemplate = "https://open-imag
 
 }  // namespace
 
-const std::array<std::string_view, 80>& coco80_class_names() noexcept { return kCoco80Names; }
+const std::array<std::string_view, 80>& coco80_class_names() noexcept { return catalog::kCocoNames; }
 
 std::span<const NumericCategoryMapping> coco_category_mappings() noexcept { return kCocoMappings; }
 

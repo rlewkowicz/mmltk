@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "detection_types.h"
+#include "model_technical.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 
 namespace mmltk::backend::models::rfdetr {
@@ -48,7 +49,8 @@ struct DenoisingTransform {
 
 class TrainingSupervisionImpl final : public torch::nn::Module {
    public:
-    explicit TrainingSupervisionImpl(const NativeRfDetrConfig& config);
+    explicit TrainingSupervisionImpl(const NativeRfDetrConfig& config, std::int64_t foreground_count);
+    void append_class_axes(std::vector<detail::ClassTensorAxis>& axes) const;
     ~TrainingSupervisionImpl() override;
 
     void initialize(std::uint64_t request_seed);
@@ -89,6 +91,7 @@ class TrainingSupervisionImpl final : public torch::nn::Module {
     [[nodiscard]] TrainingLoss denoising_loss(const DenoisingOutputs& outputs, const DeviceLossNormalizer& normalizer) const;
 
     NativeRfDetrConfig config_;
+    std::int64_t foreground_count_;
     std::shared_ptr<ProbeMlpImpl> ground_truth_mlp_;
     std::shared_ptr<ProbeMlpImpl> query_mlp_;
     torch::nn::Linear query_projection_{nullptr};

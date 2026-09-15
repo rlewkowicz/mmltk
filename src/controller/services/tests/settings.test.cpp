@@ -689,6 +689,10 @@ void test_ui_settings_round_trip() {
     predict.source.kind = SourceKind::SingleImage;
     predict.source.single_image_path = "/tmp/input.png";
     predict.request.weights_path = "/tmp/predict.pt";
+    train.request.class_layout_path = "/tmp/train.classes.json";
+    validate.request.class_layout_path = "/tmp/validate.classes.json";
+    predict.request.class_layout_path = "/tmp/predict.classes.json";
+    export_state.class_layout_path = "/tmp/export.classes.json";
     predict.model_input = ModelArtifactInputKind::Weights;
     predict.request.output_path = "/tmp/predictions.json";
     predict.request.progress_bar = true;
@@ -798,6 +802,10 @@ void test_ui_settings_round_trip() {
     MMLTK_ASSERT(loaded_train.compile_dimensions);
     MMLTK_ASSERT(loaded_train.request.resolution == 512);
     MMLTK_ASSERT(loaded_train.request.weights_path == "/tmp/weights.pt");
+    CHECK(loaded_train.request.class_layout_path == "/tmp/train.classes.json");
+    CHECK(loaded_validate.request.class_layout_path == "/tmp/validate.classes.json");
+    CHECK(loaded_predict.request.class_layout_path == "/tmp/predict.classes.json");
+    CHECK(loaded_export.class_layout_path == "/tmp/export.classes.json");
     MMLTK_ASSERT(loaded_train.request.progress_bar);
     MMLTK_ASSERT(loaded_train.request.device_ids == std::vector<int>({0, 2}));
     MMLTK_ASSERT(loaded_train.request.num_queries == 111);
@@ -1418,16 +1426,16 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
 
 void test_explore_class_catalog_identity_is_ordered_and_deterministic() {
     const std::array first{
-        ArtifactClassName{.value = "person"},
-        ArtifactClassName{.value = "vehicle"},
+        mmltk::backend::data::catalog::ClassName{.value = "person"},
+        mmltk::backend::data::catalog::ClassName{.value = "vehicle"},
     };
     const std::array same = first;
     const std::array reordered{
-        ArtifactClassName{.value = "vehicle"},
-        ArtifactClassName{.value = "person"},
+        mmltk::backend::data::catalog::ClassName{.value = "vehicle"},
+        mmltk::backend::data::catalog::ClassName{.value = "person"},
     };
     const std::array repartitioned{
-        ArtifactClassName{.value = "personvehicle"},
+        mmltk::backend::data::catalog::ClassName{.value = "personvehicle"},
     };
     CHECK(mmltk::controller::explore_class_catalog_identity(first) == mmltk::controller::explore_class_catalog_identity(same));
     CHECK(mmltk::controller::explore_class_catalog_identity(first) != mmltk::controller::explore_class_catalog_identity(reordered));

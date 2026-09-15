@@ -390,7 +390,7 @@ mod tests {
         snapshot.scene.framewidth = 640;
         snapshot.scene.frameheight = 480;
         snapshot.scene.objects = vec![crate::view_model::test_support::annotation_object(0); 4096];
-        snapshot.scene.categories = vec![crate::generated::ArtifactClassName {
+        snapshot.scene.categories = vec![crate::generated::ClassName {
             value: "person".into(),
         }];
         snapshot.scene.palette = vec![crate::generated::AnnotationColor {

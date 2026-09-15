@@ -21,6 +21,7 @@
 
 #include "archive_utils.h"
 #include "catch2_compat.hpp"
+#include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "cuda_test_utils.hpp"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
@@ -101,8 +102,8 @@ rfdetr::NativeRfDetrConfig supervision_config() {
 
 void test_training_supervision_runtime_replication_is_one_shot() {
     const auto config = supervision_config();
-    rfdetr::TrainingSupervisionImpl source(config);
-    rfdetr::TrainingSupervisionImpl replica(config);
+    rfdetr::TrainingSupervisionImpl source(config, config.num_classes - 1);
+    rfdetr::TrainingSupervisionImpl replica(config, config.num_classes - 1);
     source.initialize(71U);
 
     replica.install_replicated_initialized_runtime(config.training_supervision);
@@ -112,7 +113,7 @@ void test_training_supervision_runtime_replication_is_one_shot() {
 
     auto incompatible_config = config;
     incompatible_config.training_supervision.match_free.rho = 0.75F;
-    rfdetr::TrainingSupervisionImpl incompatible(incompatible_config);
+    rfdetr::TrainingSupervisionImpl incompatible(incompatible_config, incompatible_config.num_classes - 1);
     REQUIRE_THROWS(incompatible.install_replicated_initialized_runtime(config.training_supervision));
 }
 
@@ -134,8 +135,10 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     torch_api::InputArchive input;
     input.load_from(path.string());
     MMLTK_ASSERT(rfdetr::detail::read_training_supervision_config(input) == config);
-    rfdetr::detail::require_resume_training_supervision_config(path, config);
-    REQUIRE_THROWS(rfdetr::detail::require_resume_training_supervision_config(path, rfdetr::TrainingSupervisionConfig{}));
+    torch_api::InputArchive resume_archive;
+    resume_archive.load_from(path.string(), torch_api::Device(torch_api::kCPU));
+    rfdetr::detail::require_resume_training_supervision_config(resume_archive, config);
+    REQUIRE_THROWS(rfdetr::detail::require_resume_training_supervision_config(resume_archive, rfdetr::TrainingSupervisionConfig{}));
     torch_api::InputArchive state;
     input.read("state", state);
     MMLTK_ASSERT(rfdetr::require_int(state, "entry_count") == 1);
@@ -1303,12 +1306,13 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     config.num_queries = 2;
     config.num_select = 2;
     config.segmentation = false;
-    rfdetr::NativeRfDetrModel seed_model(config);
+    rfdetr::NativeRfDetrModel seed_model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
     rfdetr::DecodedNativeModelState checkpoint;
     checkpoint.metadata.preset_name = config.preset_name;
     checkpoint.metadata.source_kind = "training-route-test";
     checkpoint.metadata.source_path = (root / "seed.pt").string();
     checkpoint.metadata.num_classes = config.num_classes;
+    checkpoint.metadata.class_layout = seed_model.class_layout()->record();
     checkpoint.metadata.num_queries = config.num_queries;
     checkpoint.metadata.num_select = config.num_select;
     const auto& seed_module = rfdetr::detail::native_model_owner(seed_model).module();
@@ -1371,7 +1375,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
 
             auto deployment_config = result.artifacts.config;
             deployment_config.training_supervision = {};
-            rfdetr::NativeRfDetrModel deployment_model(deployment_config);
+            rfdetr::NativeRfDetrModel deployment_model(deployment_config, rfdetr::testsupport::synthetic_training_layout(deployment_config.num_classes - 1));
             const auto deployment_summary = rfdetr::load_model_weights(deployment_model, *result.best_checkpoint_path, false);
             REQUIRE(deployment_summary.unexpected_names.empty());
             REQUIRE(deployment_summary.incompatible_names.empty());

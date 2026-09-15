@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include <unistd.h>
 #include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
@@ -40,7 +41,7 @@ void test_prediction_json_writer_emits_expected_payload() {
 
     Prediction prediction;
     prediction.image_id = 42;
-    prediction.category_id = 3;
+    prediction.class_reference = 2;
     prediction.score = 0.9f;
     prediction.bbox_xyxy = {1.0f, 2.0f, 3.0f, 4.0f};
     prediction.has_mask = true;
@@ -53,6 +54,7 @@ void test_prediction_json_writer_emits_expected_payload() {
     record.detections.push_back(prediction);
 
     PredictionRunResult result;
+    result.artifacts.class_layout = unresolved_class_layout(91);
     result.backend_name = "weights";
     result.artifacts.input_kind = "weights";
     result.artifacts.input_path = "/tmp/model.pt";
@@ -70,11 +72,13 @@ void test_prediction_json_writer_emits_expected_payload() {
     MMLTK_ASSERT(payload.at("input_image_count") == 1);
     MMLTK_ASSERT(!payload.contains("compiled_path"));
     MMLTK_ASSERT(payload.at("records").at(0).at("source_name") == "camera0/frame-000001.png");
-    MMLTK_ASSERT(payload.at("records").at(0).at("detections").at(0).at("label") == "3");
+    MMLTK_ASSERT(payload.at("records").at(0).at("detections").at(0).at("label") == "2");
 
     MMLTK_ASSERT(payload.at("records").at(0).at("detections").at(0).at("mask_rle") == "1:2 5:1");
-    result.class_names = {"first", "middle", "last"};
-    record.detections.front().category_id = 1;
+    result.class_catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"first", "middle", "last"});
+    result.class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
+    result.artifacts.class_layout = native_training_class_layout(*result.class_catalog);
+    record.detections.front().class_reference = 0;
     record.detections.push_back(prediction);
     {
         PredictionJsonWriter named_writer(options);
@@ -102,7 +106,7 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
     PredictionJsonWriter writer(request);
     writer.Begin({});
     PredictionRecord record{.image_id = 9};
-    record.detections.push_back({.category_id = 1, .score = .9F, .has_mask = true});
+    record.detections.push_back({.class_reference = 0, .score = .9F, .has_mask = true});
     encode_mask_values_into(2U, 2U, record.detections.front().mask, [](auto) { return true; });
     runtime::AnalysisAnnotationStorage annotation;
     std::string failure;
@@ -113,7 +117,7 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
         annotation.source_region = {.width = 2U, .height = 2U};
         annotation.value_count = 1U;
         annotation.boxes_xyxy.address = 11U;
-        annotation.category_ids.address = 12U;
+        annotation.class_references.address = 12U;
         annotation.confidences.address = 13U;
         annotation.masks.address = 14U;
         failure.clear();
@@ -127,7 +131,7 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
         CHECK_FALSE(failure.empty());
         CHECK(annotation.value_count == 0U);
         CHECK(annotation.boxes_xyxy.address == 0U);
-        CHECK(annotation.category_ids.address == 0U);
+        CHECK(annotation.class_references.address == 0U);
         CHECK(annotation.confidences.address == 0U);
         CHECK(annotation.masks.address == 0U);
         CHECK(annotation.source_region.width == 2U);

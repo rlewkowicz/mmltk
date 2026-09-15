@@ -386,9 +386,10 @@ uint32_t DatasetLoader::image_width() const { return impl_->source.header().imag
 uint32_t DatasetLoader::image_height() const { return impl_->source.header().image_height; }
 uint32_t DatasetLoader::num_classes() const { return impl_->source.header().num_classes; }
 uint32_t DatasetLoader::max_instances_per_image() const { return impl_->source.header().max_instances_per_image; }
+const std::shared_ptr<const catalog::ClassCatalog>& DatasetLoader::class_catalog() const noexcept { return impl_->source.class_catalog(); }
 const char* DatasetLoader::class_name(uint32_t id) const {
     if (id >= num_classes()) throw std::out_of_range("class id out of range");
-    return impl_->source.header().class_names[id].data();
+    return impl_->source.class_names()[id].c_str();
 }
 size_t DatasetLoader::image_stride() const { return impl_->source.header().image_stride; }
 size_t DatasetLoader::num_label_instances() const { return impl_->source.labels().size(); }

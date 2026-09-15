@@ -21,6 +21,7 @@ module;
 #include <string_view>
 #include <tuple>
 #include <unordered_set>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -45,7 +46,8 @@ using mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd;
 using mmltk::backend::ml::layers::ms_deform_attn_reference;
 
 struct NativeRfDetrModel::Impl final : torch::nn::Module, detail::NativeModelTechnicalOwner {
-    explicit Impl(const NativeRfDetrConfig& config);
+    explicit Impl(const NativeRfDetrConfig& config, ModelClassLayout layout);
+    std::shared_ptr<const ResolvedClassLayout> layout_;
 
     [[nodiscard]] torch::nn::Module& module() noexcept override { return *this; }
     [[nodiscard]] const torch::nn::Module& module() const noexcept override { return *this; }
@@ -60,9 +62,9 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module, detail::NativeModelTec
     void begin_criterion_timing() override;
     void end_criterion_timing() override;
     SupervisionTimingHandoff harvest_supervision_timing() override;
-    ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict = false) override;
+    ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict = false, const ModelClassLayout* admitted_layout = nullptr) override;
     detail::NormalizedModelStateCandidate stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state,
-                                                                 detail::NormalizedModelStateAdmission admission) override;
+                                                                 detail::NormalizedModelStateAdmission admission, const ResolvedClassLayout* source_layout = nullptr) override;
     void commit_normalized_state(detail::NormalizedModelStateCandidate candidate) override;
     void optimize_for_inference(int batch_size, bool for_training, CompilationMode mode);
     void set_force_pytorch_deformable_attn(bool value) override;
@@ -74,7 +76,7 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module, detail::NativeModelTec
     void import_training_supervision_runtime(const TrainingSupervisionRuntimeState& state) override;
 
    private:
-    void reinitialize_detection_head(int64_t output_classes);
+    [[nodiscard]] std::vector<detail::ClassTensorAxis> class_axes() const;
     ModelOutputs forward_impl(const NestedTensor& batch, bool include_masks, bool capture_match_free_features,
                               const DenoisingQueryBatch* denoising = nullptr);
     ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets,
@@ -140,56 +142,11 @@ struct NativeTransformerOutput {
     torch::Tensor enc_boxes;
 };
 
-torch::Tensor resize_repeated_rows(const torch::Tensor& tensor, int64_t rows) {
-    if (!tensor.defined()) { return tensor; }
-    if (rows <= 0) { throw std::runtime_error("RF-DETR detection head output classes must be positive"); }
-    if (tensor.size(0) == rows) { return tensor.detach().clone(); }
-    const int64_t repeats = std::max<int64_t>(1, (rows + tensor.size(0) - 1) / tensor.size(0));
-    std::vector<int64_t> repeat_dims(static_cast<size_t>(tensor.dim()), 1);
-    repeat_dims[0] = repeats;
-    return tensor.repeat(repeat_dims).narrow(0, 0, rows).contiguous();
-}
-
-bool is_detection_class_head_parameter(const std::string_view name) {
-    if (name == "class_embed.weight" || name == "class_embed.bias") { return true; }
-
-    constexpr std::string_view prefix = "transformer.enc_out_class_embed.";
-    if (!name.starts_with(prefix)) { return false; }
-    const std::string_view tail = name.substr(prefix.size());
-    const size_t separator = tail.find('.');
-    if (separator == 0 || separator == std::string_view::npos) { return false; }
-    for (const char character : tail.substr(0, separator)) {
-        if (character < '0' || character > '9') { return false; }
-    }
-    const std::string_view field = tail.substr(separator + 1);
-    return field == "weight" || field == "bias";
-}
-
-bool can_resize_detection_class_head(const std::string_view name, const torch::Tensor& source, const torch::Tensor& destination) {
-    if (!is_detection_class_head_parameter(name) || !source.defined() || !destination.defined() || source.dim() == 0 ||
-        source.dim() != destination.dim() || source.size(0) <= 0) {
-        return false;
-    }
-    for (int64_t dimension = 1; dimension < source.dim(); ++dimension) {
-        if (source.size(dimension) != destination.size(dimension)) { return false; }
-    }
-    return true;
-}
-
-torch::Tensor adapt_normalized_state_tensor(const std::string_view name, const torch::Tensor& source, const torch::Tensor& destination,
-                                            const bool adapt_detection_class_head) {
-    if (adapt_detection_class_head && source.defined() && source.sizes() != destination.sizes() &&
-        can_resize_detection_class_head(name, source, destination)) {
-        return resize_repeated_rows(source, destination.size(0));
-    }
-    return source;
-}
-
-void resize_linear_output(torch::nn::LinearImpl& linear, int64_t rows) {
-    torch::NoGradGuard no_grad;
-    linear.weight.set_data(resize_repeated_rows(linear.weight, rows).to(linear.weight.device(), linear.weight.scalar_type()));
-    if (linear.bias.defined()) {
-        linear.bias.set_data(resize_repeated_rows(linear.bias, rows).to(linear.bias.device(), linear.bias.scalar_type()));
+void append_classifier_axes(std::vector<detail::ClassTensorAxis>& axes, const torch::nn::Module& module, const detail::ClassTensorFamily& family) {
+    const auto prefix = family.prefix();
+    for (const auto& parameter : module.named_parameters(true)) {
+        const auto name = prefix + parameter.key();
+        if (const auto axis = family.Match(name)) axes.push_back({name, axis->dimension, axis->coordinates});
     }
 }
 
@@ -1029,7 +986,7 @@ class NativeTransformerImpl : public torch::nn::Module {
         : decoder(register_module("decoder", std::make_shared<NativeDecoderImpl>(config))),
           enc_output(register_module("enc_output", torch::nn::ModuleList())),
           enc_output_norm(register_module("enc_output_norm", torch::nn::ModuleList())),
-          enc_out_class_embed(register_module("enc_out_class_embed", torch::nn::ModuleList())),
+          enc_out_class_embed(register_module(std::string(detail::kEncoderClassAxis.module_name()), torch::nn::ModuleList())),
           enc_out_bbox_embed(register_module("enc_out_bbox_embed", torch::nn::ModuleList())),
           config_(config) {
         const int64_t groups = std::max<int64_t>(1, config.group_detr);
@@ -1051,11 +1008,8 @@ class NativeTransformerImpl : public torch::nn::Module {
 
     void set_decoder_bbox_embed(const std::shared_ptr<RfDetrMlpImpl>& bbox_embed) { decoder->set_bbox_embed(bbox_embed); }
 
-    void resize_output_classes(int64_t output_classes) {
-        for (auto& module : *enc_out_class_embed) {
-            auto linear = module->as<torch::nn::Linear>();
-            resize_linear_output(*linear, output_classes);
-        }
+    void append_class_axes(std::vector<detail::ClassTensorAxis>& axes) const {
+        append_classifier_axes(axes, *enc_out_class_embed, detail::kEncoderClassAxis);
     }
 
     torch::Tensor encoder_class_logits(const torch::Tensor& hs_enc, bool training_mode) {
@@ -1245,18 +1199,23 @@ class NativeTransformerImpl : public torch::nn::Module {
 
 }  // namespace
 
-NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config)
+NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config, ModelClassLayout layout)
     : config_(config.num_queries > 0 ? config : native_config_from_preset(model_presets().front())),
       backbone_(register_module("backbone", torch::nn::ModuleList())),
-      class_embed(register_module("class_embed", torch::nn::Linear(config_.hidden_dim, std::max(1, config_.num_classes)))),
+      class_embed(register_module(std::string(detail::kDecoderClassAxis.module_name()), torch::nn::Linear(config_.hidden_dim, std::max(1, config_.num_classes)))),
       refpoint_embed(
           register_module("refpoint_embed", torch::nn::Embedding(std::max(1, config_.num_queries * std::max(1, config_.group_detr)), 4))),
       query_feat(register_module(
           "query_feat", torch::nn::Embedding(std::max(1, config_.num_queries * std::max(1, config_.group_detr)), config_.hidden_dim))) {
+    if (layout.slots.empty()) layout = unresolved_class_layout(static_cast<std::size_t>(config_.num_classes));
+    layout_ = std::make_shared<const ResolvedClassLayout>(std::move(layout));
+    if (layout_->output_width() != static_cast<std::size_t>(config_.num_classes))
+        throw std::invalid_argument("model class layout disagrees with configured output width");
+    if (training_supervision_enabled(config_.training_supervision)) layout_->require_execution(true);
     backbone_->push_back(std::make_shared<NativeBackboneImpl>(config_));
     backbone_->push_back(PositionEmbeddingSine(config_.hidden_dim / 2, 10000.0, true, 2.0 * M_PI));
 
-    transformer_ = register_module("transformer", std::make_shared<NativeTransformerImpl>(config_));
+    transformer_ = register_module(std::string(detail::kTransformerModule), std::make_shared<NativeTransformerImpl>(config_));
     bbox_embed_ = register_module("bbox_embed", std::make_shared<RfDetrMlpImpl>(config_.hidden_dim, config_.hidden_dim, 4, 3));
     if (config_.segmentation) {
         segmentation_head_ = register_module(
@@ -1284,7 +1243,7 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config)
         auto generator = at::detail::getDefaultCPUGenerator();
         const auto rng_state = generator.get_state();
         try {
-            training_supervision_ = register_module("training_supervision", std::make_shared<TrainingSupervisionImpl>(config_));
+            training_supervision_ = register_module(std::string(detail::kTrainingSupervisionModule), std::make_shared<TrainingSupervisionImpl>(config_, layout_->catalog()->size()));
         } catch (...) {
             generator.set_state(rng_state);
             throw;
@@ -1293,14 +1252,12 @@ NativeRfDetrModel::Impl::Impl(const NativeRfDetrConfig& config)
     }
 }
 
-void NativeRfDetrModel::Impl::reinitialize_detection_head(int64_t output_classes) {
-    if (output_classes <= 0) { throw std::runtime_error("RF-DETR detection head output classes must be positive"); }
-
-    resize_linear_output(*class_embed, output_classes);
-
-    auto transformer = std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_);
-    if (!transformer) { throw std::runtime_error("RF-DETR transformer is not initialized"); }
-    transformer->resize_output_classes(output_classes);
+std::vector<detail::ClassTensorAxis> NativeRfDetrModel::Impl::class_axes() const {
+    std::vector<detail::ClassTensorAxis> axes;
+    append_classifier_axes(axes, *class_embed, detail::kDecoderClassAxis);
+    std::dynamic_pointer_cast<NativeTransformerImpl>(transformer_)->append_class_axes(axes);
+    if (training_supervision_) training_supervision_->append_class_axes(axes);
+    return axes;
 }
 
 ModelOutputs NativeRfDetrModel::Impl::forward(const NestedTensor& batch, bool include_masks) {
@@ -1630,54 +1587,49 @@ ModelOutputs NativeRfDetrModel::Impl::forward_impl(const NestedTensor& batch, co
 }
 
 ModelStateLoadSummary NativeRfDetrModel::Impl::load_normalized_state(const std::vector<NormalizedModelStateEntry>& state,
-                                                                     const bool strict) {
-    torch::NoGradGuard no_grad;
-    auto parameters = named_parameters(true);
-    auto buffers = named_buffers(true);
-    if (strict) {
-        auto candidate = stage_normalized_state(state, detail::NormalizedModelStateAdmission::AdaptDetectionClassHead);
-        auto summary = candidate.summary;
-        commit_normalized_state(std::move(candidate));
-        return summary;
-    }
-
-    ModelStateLoadSummary summary;
-    std::unordered_set<std::string> supplied;
-    supplied.reserve(state.size());
-    for (const auto& entry : state) {
-        supplied.insert(entry.name);
-        torch::Tensor* destination = parameters.find(entry.name);
-        if (destination == nullptr) { destination = buffers.find(entry.name); }
-        if (destination == nullptr) {
-            summary.unexpected_names.push_back(entry.name);
-            continue;
-        }
-
-        torch::Tensor source = adapt_normalized_state_tensor(entry.name, entry.tensor, *destination, true);
-        if (!source.defined() || source.sizes() != destination->sizes()) {
-            summary.incompatible_names.push_back(entry.name);
-            continue;
-        }
-        destination->copy_(source.to(destination->device(), destination->scalar_type()));
-        summary.loaded_names.push_back(entry.name);
-    }
-    for (const auto& parameter : parameters) {
-        if (!supplied.contains(parameter.key())) { summary.missing_names.push_back(parameter.key()); }
-    }
-    for (const auto& buffer : buffers) {
-        if (!supplied.contains(buffer.key())) { summary.missing_names.push_back(buffer.key()); }
-    }
-    std::ranges::sort(summary.loaded_names);
-    std::ranges::sort(summary.missing_names);
-    std::ranges::sort(summary.unexpected_names);
-    std::ranges::sort(summary.incompatible_names);
+                                                                     const bool strict, const ModelClassLayout* admitted_layout) {
+    auto next_layout = admitted_layout ? std::make_shared<const ResolvedClassLayout>(*admitted_layout) : layout_;
+    if (next_layout->output_width() != static_cast<std::size_t>(config_.num_classes))
+        throw std::invalid_argument("checkpoint layout disagrees with model output width");
+    if (training_supervision_ && next_layout->record() != layout_->record())
+        throw std::invalid_argument("active supervision checkpoint requires the exact admitted layout");
+    auto candidate = stage_normalized_state(state, strict ? detail::NormalizedModelStateAdmission::Exact :
+        detail::NormalizedModelStateAdmission::PartialExact);
+    auto summary = candidate.summary;
+    commit_normalized_state(std::move(candidate));
+    layout_ = std::move(next_layout);
     return summary;
 }
 
 detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_state(
-    const std::vector<NormalizedModelStateEntry>& state, const detail::NormalizedModelStateAdmission admission) {
+    const std::vector<NormalizedModelStateEntry>& state, const detail::NormalizedModelStateAdmission admission,
+    const ResolvedClassLayout* source_layout) {
     auto parameters = named_parameters(true);
     auto buffers = named_buffers(true);
+    const bool transfer = admission == detail::NormalizedModelStateAdmission::FreshTransfer ||
+        admission == detail::NormalizedModelStateAdmission::PartialFreshTransfer;
+    if (transfer && !source_layout) throw std::invalid_argument("fresh transfer requires the admitted source layout");
+    if (transfer) layout_->require_execution(true);
+    const auto axes = class_axes();
+    std::unordered_map<std::string_view, const detail::ClassTensorAxis*> axis_by_name;
+    for (const auto& axis : axes) axis_by_name.emplace(axis.name, &axis);
+    std::vector<std::pair<std::int64_t, std::int64_t>> foreground_matches, output_matches;
+    if (transfer && source_layout->semantic()) {
+        std::vector<std::int64_t> source_slots(source_layout->catalog()->size());
+        for (std::size_t slot = 0; slot < source_layout->record().slots.size(); ++slot) {
+            const auto& role = source_layout->record().slots[slot];
+            if (role.foreground_index) source_slots[*role.foreground_index] = static_cast<std::int64_t>(slot);
+        }
+        for (std::size_t destination_slot = 0; destination_slot < layout_->record().slots.size(); ++destination_slot) {
+            const auto& role = layout_->record().slots[destination_slot];
+            if (!role.foreground_index) continue;
+            const auto destination_index = *role.foreground_index;
+            const auto source_index = source_layout->catalog()->resolve(layout_->catalog()->names()[destination_index]);
+            if (!source_index) continue;
+            foreground_matches.emplace_back(*source_index, destination_index);
+            output_matches.emplace_back(source_slots[*source_index], destination_slot);
+        }
+    }
     detail::NormalizedModelStateCandidate candidate;
     candidate.destinations.reserve(state.size());
     candidate.tensors.reserve(state.size());
@@ -1693,9 +1645,35 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
             candidate.summary.unexpected_names.push_back(entry.name);
             continue;
         }
-        torch::Tensor source = adapt_normalized_state_tensor(entry.name, entry.tensor, *destination,
-                                                             admission == detail::NormalizedModelStateAdmission::AdaptDetectionClassHead);
+        torch::Tensor source = entry.tensor;
+        if (transfer) {
+            if (const auto found = axis_by_name.find(entry.name); found != axis_by_name.end()) {
+                const auto& axis = *found->second;
+                const bool classifier = axis.coordinates == detail::ClassTensorCoordinates::OutputSlots;
+                const bool boxes = axis.coordinates == detail::ClassTensorCoordinates::ForegroundWithBoxes;
+                const bool known_axis = classifier || source_layout->record().supervision_in_foreground_order;
+                bool compatible = source.defined() && source.dim() == destination->dim();
+                for (std::int64_t dimension = 0; compatible && dimension < source.dim(); ++dimension)
+                    if (dimension != axis.dimension && source.size(dimension) != destination->size(dimension)) compatible = false;
+                const auto source_classes = classifier ? source_layout->output_width() : source_layout->catalog()->size();
+                if (compatible && known_axis && source.size(axis.dimension) != static_cast<std::int64_t>(source_classes + (boxes ? 4 : 0)))
+                    throw std::invalid_argument("class-dependent tensor disagrees with admitted layout: " + entry.name);
+                if (compatible) {
+                    auto adapted = destination->detach().clone();
+                    if (known_axis && source_layout->semantic()) {
+                        const auto converted = source.to(destination->device(), destination->scalar_type());
+                        for (const auto& [from, to] : classifier ? output_matches : foreground_matches)
+                            adapted.select(axis.dimension, to).copy_(converted.select(axis.dimension, from));
+                        if (boxes) adapted.narrow(axis.dimension, layout_->catalog()->size(), 4).copy_(
+                            converted.narrow(axis.dimension, source_layout->catalog()->size(), 4));
+                    }
+                    source = std::move(adapted);
+                }
+            }
+        }
         if (!source.defined() || source.sizes() != destination->sizes()) {
+            if (axis_by_name.contains(entry.name))
+                throw std::invalid_argument("class-dependent tensor disagrees with model topology: " + entry.name);
             candidate.summary.incompatible_names.push_back(entry.name);
             continue;
         }
@@ -1713,8 +1691,11 @@ detail::NormalizedModelStateCandidate NativeRfDetrModel::Impl::stage_normalized_
     std::ranges::sort(candidate.summary.missing_names);
     std::ranges::sort(candidate.summary.unexpected_names);
     std::ranges::sort(candidate.summary.incompatible_names);
-    if (!candidate.summary.missing_names.empty() || !candidate.summary.unexpected_names.empty() ||
-        !candidate.summary.incompatible_names.empty()) {
+    const bool missing_required = std::ranges::any_of(candidate.summary.missing_names, [&](const auto& name) {
+        return !transfer || !name.starts_with("training_supervision.");
+    });
+    if (admission != detail::NormalizedModelStateAdmission::PartialFreshTransfer && admission != detail::NormalizedModelStateAdmission::PartialExact &&
+        (missing_required || !candidate.summary.unexpected_names.empty() || !candidate.summary.incompatible_names.empty())) {
         throw std::runtime_error("normalized RF-DETR model state does not match the model");
     }
     return candidate;
@@ -1895,7 +1876,8 @@ void NativeRfDetrModel::Impl::set_force_pytorch_deformable_attn(bool value) {
     }
 }
 
-NativeRfDetrModel::NativeRfDetrModel(const NativeRfDetrConfig& config) : impl_(std::make_unique<Impl>(config)) {}
+NativeRfDetrModel::NativeRfDetrModel(const NativeRfDetrConfig& config, ModelClassLayout layout) : impl_(std::make_unique<Impl>(config, std::move(layout))) {}
+const std::shared_ptr<const ResolvedClassLayout>& NativeRfDetrModel::class_layout() const noexcept { return impl_->layout_; }
 
 NativeRfDetrModel::~NativeRfDetrModel() = default;
 NativeRfDetrModel::NativeRfDetrModel(NativeRfDetrModel&&) noexcept = default;

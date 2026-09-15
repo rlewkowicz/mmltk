@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/backend/data/catalog/class_catalog.h"
 #include "detail/writable_pixel_range.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
@@ -306,6 +307,7 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
     if (request.split.images.empty() || request.split.class_names.empty()) {
         throw std::runtime_error("benchmark split must contain images and classes");
     }
+    const catalog::ClassCatalog class_catalog(request.split.class_names, 31U);
     if (request.split.class_names.size() > MAX_CLASSES) { throw std::runtime_error("benchmark split exceeds the compiled class limit"); }
     if (request.split.sources.empty()) { throw std::runtime_error("benchmark split has no cached image sources"); }
 

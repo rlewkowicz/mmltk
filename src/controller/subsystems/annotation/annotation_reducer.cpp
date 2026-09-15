@@ -78,8 +78,8 @@ struct JournalEntry final {
         std::uint16_t index = 0U;
         bool before_present = true;
         bool after_present = true;
-        domain::ArtifactClassName before{};
-        domain::ArtifactClassName after{};
+        mmltk::backend::data::catalog::ClassName before{};
+        mmltk::backend::data::catalog::ClassName after{};
     };
     struct Objects final {
         std::vector<domain::AnnotationObject> before;
@@ -505,8 +505,8 @@ template <class Mutate>
 
 [[nodiscard]] JournalEntry category_entry(const AnnotationEditorFacts& before, const AnnotationEditorFacts& after,
                                           const std::uint16_t index, const bool before_present,
-                                          const domain::ArtifactClassName& before_category, const bool after_present,
-                                          const domain::ArtifactClassName& after_category) {
+                                          const mmltk::backend::data::catalog::ClassName& before_category, const bool after_present,
+                                          const mmltk::backend::data::catalog::ClassName& after_category) {
     return journal_entry(before, after,
                          JournalEntry::Category{.index = index,
                                                 .before_present = before_present,
@@ -930,6 +930,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
 [[nodiscard]] DocumentOutcome reduce_category(DocumentState& state, const domain::AnnotationText& category) {
     if (!current(state) || !category.valid()) return refused(state);
     const auto& scene = state.ui.scene;
+    if (std::ranges::any_of(scene.categories, [&](const auto& existing) { return existing.value == category.view(); }))
+        return refused(state, "Class name is already present");
     if (scene.categories.size() >= domain::kAnnotationCategoryCapacity) return capacity(state);
     auto after = state.ui.editor;
     after.selected_category = static_cast<std::uint16_t>(scene.categories.size());
@@ -1153,6 +1155,10 @@ class AnnotationDocument::Impl final {
    public:
     [[nodiscard]] DocumentResult Open(domain::AnnotationSceneContent content) {
         if (!content.valid()) return Result(DocumentOutcome::Rejected, "open");
+        try {
+            const mmltk::backend::data::catalog::ClassCatalog catalog(
+                mmltk::backend::data::catalog::OrderedClassCatalog{content.categories});
+        } catch (...) { return Result(DocumentOutcome::Rejected, "open"); }
         for (auto& object : content.objects)
             if (object.shape == domain::AnnotationShape::Mask) normalize_mask(object);
         if (content.palette.empty()) content.palette = domain::annotation_class_palette(content.categories.size());

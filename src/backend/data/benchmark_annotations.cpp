@@ -28,6 +28,7 @@
 
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/concurrency/parallel_range.h"
@@ -1306,7 +1307,7 @@ std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(
             std::string_view(header.split.data(), ::strnlen(header.split.data(), header.split.size())) != expected_split ||
             std::string_view(header.mapping_revision.data(), ::strnlen(header.mapping_revision.data(), header.mapping_revision.size())) !=
                 kBenchmarkMappingRevision ||
-            header.annotation_sha256 != parse_sha256_hex(std::string(expected_annotation_sha256)) ||
+            header.annotation_sha256 != mmltk::common::io::parse_sha256_hex(std::string(expected_annotation_sha256)) ||
             manifest.value("size", 0ULL) != file.size() || manifest.value("identity", std::string{}).empty()) {
             return std::nullopt;
         }
@@ -1368,7 +1369,7 @@ void store_normalized_annotation_index(const std::filesystem::path& path, const 
     header.box_offset = box_offset;
     header.mask_rle_offset = mask_rle_offset;
     header.total_file_size = total_size;
-    header.annotation_sha256 = parse_sha256_hex(index.annotation_sha256);
+    header.annotation_sha256 = mmltk::common::io::parse_sha256_hex(index.annotation_sha256);
     std::memcpy(header.split.data(), index.split.data(), index.split.size());
     std::memcpy(header.mapping_revision.data(), kBenchmarkMappingRevision.data(), kBenchmarkMappingRevision.size());
     header.rejected = encode_rejected(index.rejected);
@@ -1394,7 +1395,7 @@ void store_normalized_annotation_index(const std::filesystem::path& path, const 
                                         std::to_string(index.boxes.size());
         identity_material += "\n" + std::to_string(index.mask_rle_pairs.size());
         const std::string identity =
-            sha256_hex(sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
+            mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(identity_material.data()), identity_material.size())));
         const std::filesystem::path completion = normalized_manifest_path(path);
         std::error_code error;
         const bool removed = std::filesystem::remove(completion, error);

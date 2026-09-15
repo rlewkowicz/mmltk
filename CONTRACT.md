@@ -253,7 +253,27 @@ and become typed failures once at the nearest operation, worker, or external
 service boundary. A failed system preserves valid snapshots, reports failure,
 and retires its failed resources safely. Recoverable runtimes reconstruct
 lazily within that system, while independent systems continue operating.
-Persisted settings, dataset, model, and artifact formats remain stable.
+Persisted settings and the format-7 compiled dataset remain stable. Native RF-DETR
+checkpoints use only the current version-3 format; external upstream assets retain
+their independent import formats.
+
+An independent immutable data catalog owns exact foreground names and dense
+zero-based foreground references. Source category IDs, foreground references,
+physical model output slots, and external output IDs are distinct domains. Model
+artifacts carry validated output roles, score encoding, class layout, and
+provenance. Unknown external identities remain visibly raw and cannot enter
+semantic evaluation. Artifact and descriptor identity is checked at admission
+and replacement, never per prediction.
+
+Fresh native training retains sigmoid outputs, one reserved trailing slot, and
+all-negative no-object supervision. Explicit background and unused slots are
+excluded before detection ranking. Fresh transfer maps verified class-dependent
+state by semantic identity while preserving unmatched initialized values; resume
+requires exact layout and state. Training splits share exact ordered catalogs;
+standalone evaluation admits an explicitly verified catalog permutation.
+Prediction, analysis, annotation, and presentation preserve the declared reference
+domain and catalog with their owned data. Mask storage is consumed only when
+the current result explicitly declares masks available.
 
 RAII protects complete and partial construction, borrowed views, mappings,
 asynchronous GPU work, and external consumers. Resource release respects GPU

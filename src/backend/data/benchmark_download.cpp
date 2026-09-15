@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "src/backend/data/benchmark_hash.h"
+#include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/common/types/string_utils.h"
@@ -87,7 +88,7 @@ class CurlGlobal {
     material.append(etag);
     material.push_back('\n');
     material.append(last_modified);
-    return sha256_hex(sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
+    return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(material.data()), material.size())));
 }
 
 [[nodiscard]] std::uint64_t checked_u64_add(const std::uint64_t left, const std::uint64_t right, const char* context) {
@@ -1119,7 +1120,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
             request.maximum_attempts == 0U) {
             throw std::runtime_error("benchmark download request is incomplete");
         }
-        if (request.expected_sha256) { (void)parse_sha256_hex(*request.expected_sha256); }
+        if (request.expected_sha256) { (void)mmltk::common::io::parse_sha256_hex(*request.expected_sha256); }
     }
 
     std::unordered_set<std::string> unique_lock_paths;
@@ -1136,7 +1137,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
     std::vector<ArtifactLease> leases;
     leases.reserve(requests.size());
     for (const std::size_t index : lock_order) {
-        leases.push_back(ArtifactLease::acquire(requests[index].lock_path, cancel_requested));
+        leases.push_back(ArtifactLease::acquire(requests[index].lock_path, [&] { return cancel_requested.requested(); }));
     }
 
     std::vector<std::optional<DownloadResult>> results(requests.size());

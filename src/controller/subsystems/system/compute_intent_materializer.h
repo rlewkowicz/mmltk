@@ -6,7 +6,7 @@
 
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/contracts/artifact.h"
-#include "src/controller/contracts/artifact_catalog.h"
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/model.h"
 #include "src/controller/contracts/workflows.h"
@@ -23,6 +23,7 @@ struct ComputeIntentMaterializer final {
     struct ModelInput final {
         mmltk::controller::contracts::ModelSelectionKey key{};
         std::string custom_artifact;
+        int inspection_device = 0;
     };
     [[nodiscard]] static std::expected<ModelInput, Refusal> ModelInputFor(const mmltk::controller::contracts::GuiSettingsState& settings,
                                                                           mmltk::controller::contracts::FeatureId workflow) noexcept;

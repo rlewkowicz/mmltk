@@ -141,6 +141,7 @@ struct UiSettingsState {
 };
 
 struct ModelArtifactSelectionState {
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string class_layout_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string weights_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string onnx_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string tensorrt_path;
@@ -259,6 +260,9 @@ struct AnnotateViewState : WorkflowModelSelectionState {
 
 // CLEANUP-IGNORE: Export owns distinct reflected artifact inputs that share the canonical path constraint.
 struct ExportViewState : WorkflowModelSelectionState {
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
+    [[= reflection::FileDialog<"Select class layout", "Class descriptors", "*.classes.json *.json">{.mode = FileDialogMode::OpenFile}]]
+    std::string class_layout_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string weights_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string onnx_input_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
@@ -344,13 +348,14 @@ template <ModelArtifactSelectionView State>
         else
             return s.model_resolution;
     }();
-    ModelArtifactSelectionState artifact_state{.weights_path = path_text(source.weights_path),
+    ModelArtifactSelectionState artifact_state{.class_layout_path = {}, .weights_path = path_text(source.weights_path),
                                                .onnx_path = {},
                                                .tensorrt_path = {},
                                                .preset_name = preset_name,
                                                .resolution = resolution,
                                                .source = s.model_source,
                                                .input = s.model_input};
+    if constexpr (requires { source.class_layout_path; }) { artifact_state.class_layout_path = path_text(source.class_layout_path); }
     if constexpr (requires { source.onnx_input_path; }) {
         artifact_state.onnx_path = path_text(source.onnx_input_path);
     } else if constexpr (requires { source.onnx_path; }) {
@@ -364,6 +369,7 @@ template <ModelArtifactSelectionView State>
 inline void apply_model_artifacts(State& s, const ModelArtifactSelectionState& artifact_state) {
     auto& destination = canonical_request_or_state(s);
     destination.weights_path = artifact_state.weights_path;
+    if constexpr (requires { destination.class_layout_path; }) { destination.class_layout_path = artifact_state.class_layout_path; }
     if constexpr (requires { s.request; }) {
         destination.preset_name = artifact_state.preset_name;
         destination.resolution = static_cast<decltype(destination.resolution)>(artifact_state.resolution);

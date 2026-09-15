@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -14,6 +15,7 @@
 #include "src/common/concurrency/cancellation_observation.h"
 
 #include "src/backend/data/compiled_format.h"
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data {
@@ -37,7 +39,8 @@ struct CompiledDatasetInfo {
     std::uint32_t height = 0;
     std::uint32_t channels = 0;
     std::uint32_t max_instances_per_image = 0;
-    std::vector<std::string> class_names;
+    std::shared_ptr<const catalog::ClassCatalog> class_catalog;
+    [[nodiscard]] std::span<const std::string> class_names() const noexcept { return class_catalog ? class_catalog->names() : std::span<const std::string>{}; }
 };
 
 inline void validate_compiled_header(const FileHeader& header) {
@@ -206,6 +209,21 @@ inline void validate_compiled_rle_pairs(const std::span<const PackedInstance> la
     }
 }
 
+inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
+    std::vector<std::string> names;
+    names.reserve(header.num_classes);
+    for (std::uint32_t index = 0U; index < header.num_classes; ++index) {
+        const auto& stored_name = header.class_names[index];
+        const std::size_t length = ::strnlen(stored_name.data(), stored_name.size());
+        if (length == 0U || length == stored_name.size()) {
+            throw std::runtime_error("compiled file contains an empty or unterminated class name at index " + std::to_string(index));
+        }
+        std::string name(stored_name.data(), length);
+        names.push_back(std::move(name));
+    }
+    return catalog::ClassCatalog(std::move(names), 31U);
+}
+
 inline CompiledDatasetInfo inspect_compiled_dataset(const std::filesystem::path& path) {
     const mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::open_readonly(path.string());
     const FileHeader header = read_compiled_header(file);
@@ -218,19 +236,7 @@ inline CompiledDatasetInfo inspect_compiled_dataset(const std::filesystem::path&
     info.height = header.image_height;
     info.channels = header.channels;
     info.max_instances_per_image = header.max_instances_per_image;
-    info.class_names.reserve(header.num_classes);
-    for (std::uint32_t index = 0U; index < header.num_classes; ++index) {
-        const auto& stored_name = header.class_names[index];
-        const std::size_t length = ::strnlen(stored_name.data(), stored_name.size());
-        if (length == 0U || length == stored_name.size()) {
-            throw std::runtime_error("compiled file contains an empty or unterminated class name at index " + std::to_string(index));
-        }
-        std::string name(stored_name.data(), length);
-        if (std::ranges::find(info.class_names, name) != info.class_names.end()) {
-            throw std::runtime_error("compiled file contains duplicate class name '" + name + "'");
-        }
-        info.class_names.push_back(std::move(name));
-    }
+    info.class_catalog = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(header));
     return info;
 }
 

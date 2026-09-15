@@ -49,7 +49,6 @@ mmltk_register_public_headers(
     FILES
         annotation.h
         artifact.h
-        artifact_catalog.h
         compute.h
         default_state.h
         diagnostic_context.h
@@ -85,6 +84,7 @@ target_include_directories(mmltk_controller_contracts PRIVATE
 )
 target_link_libraries(mmltk_controller_contracts
     PUBLIC
+        mmltk::backend::data::catalog
         mmltk::backend::data
         mmltk::controller::application_boundary
         mmltk::backend::models::catalog

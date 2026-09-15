@@ -4,6 +4,7 @@
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/chw_image.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
+#include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/controller/contracts/annotation.h"
@@ -74,7 +75,7 @@ struct PredictionPreviewFrame::State final {
     std::size_t boxes_offset{}, labels_offset{}, masks_offset{}, colors_offset{};
     bool masks = false;
     int category_count = 0;
-    std::shared_ptr<const std::vector<std::string>> catalog;
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog;
     std::vector<rfdetr::Prediction> predictions;
 };
 PredictionPreviewFrame::PredictionPreviewFrame(const gpu::DeviceContext& context,
@@ -126,7 +127,7 @@ void PredictionPreviewFrame::RetainUnsafe(cudaError_t failure) const noexcept {
     }
 }
 std::span<const rfdetr::Prediction> PredictionPreviewFrame::predictions() const noexcept { return state_->predictions; }
-const std::vector<std::string>& PredictionPreviewFrame::classes() const noexcept { return *state_->catalog; }
+std::span<const std::string> PredictionPreviewFrame::classes() const noexcept { return state_->catalog->names(); }
 int PredictionPreviewFrame::class_count() const noexcept { return state_->category_count; }
 PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu::DeviceContext context, TransferOperations operations,
                                            std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement)
@@ -140,24 +141,30 @@ PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu
 }
 std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(const float* pixels, VisualExtent extent,
     std::uintptr_t source_stream, std::span<const rfdetr::Prediction> predictions,
-    const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations, std::shared_ptr<const std::vector<std::string>> catalog, int classes, const std::uint8_t* rgb8,
+    const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog, int classes, const std::uint8_t* rgb8,
     std::shared_ptr<void> source_custody, void (*stop_source)(void*), void* source_control) {
     if (!retirement_->admission_open()) throw std::runtime_error("prediction preview CUDA retirement failed");
     auto available = std::ranges::find_if(slots_, [](const auto& slot) {
         return !slot || (slot.use_count() == 1 && slot->state_->unsafe == cudaSuccess);
     });
     if (available == slots_.end()) return {};
-    if ((!pixels && !rgb8) || (pixels && rgb8) || !source_custody || !extent.valid() || predictions.size() > contracts::kAnnotationObjectCapacity || !catalog || classes <= 0 || static_cast<std::size_t>(classes) > contracts::kAnnotationCategoryCapacity)
+    if ((!pixels && !rgb8) || (pixels && rgb8) || !source_custody || !extent.valid() || predictions.size() > contracts::kAnnotationObjectCapacity || !catalog || classes < 0 || static_cast<std::size_t>(classes) > rfdetr::kMaximumClassOutputSlots)
         throw std::invalid_argument("prediction preview source is invalid");
     const auto count = predictions.size();
     for (const auto& prediction : predictions) {
-        const auto category = prediction.category_id - 1;
-        if (category >= 0 && static_cast<std::size_t>(category) < catalog->size() && (*catalog)[category].size() > mmltk::frameworks::reflection::kMaximumNameBytes)
+        const auto category = prediction.class_reference;
+        if (category < 0 || category >= classes || prediction.class_domain != annotations.class_domain ||
+            (prediction.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground &&
+                static_cast<std::size_t>(category) >= catalog->size()))
+            throw std::invalid_argument("prediction reference disagrees with its declared domain");
+        if (category >= 0 && static_cast<std::size_t>(category) < catalog->size() && catalog->names()[category].size() > mmltk::frameworks::reflection::kMaximumNameBytes)
             throw std::invalid_argument("prediction label exceeds the visual name capacity");
     }
+    if (count && (annotations.value_count != count || (annotations.masks_available && !annotations.masks.address)))
+        throw std::invalid_argument("prediction annotations disagree with produced values");
     const auto pixel_count = rfdetr::checked_prediction_extent(extent.width, extent.height, rfdetr::kMaximumEncodedMaskPixels);
     const auto pixel_bytes = rfdetr::checked_prediction_extent(pixel_count, 3U * sizeof(float), rfdetr::kMaximumPredictionTensorBytes);
-    const auto mask_bytes = annotations.masks.address && count ? rfdetr::checked_prediction_extent(pixel_count, count, rfdetr::kMaximumPredictionTensorBytes) : 0U;
+    const auto mask_bytes = annotations.masks_available && annotations.masks.address && count ? rfdetr::checked_prediction_extent(pixel_count, count, rfdetr::kMaximumPredictionTensorBytes) : 0U;
     const auto bytes = pixel_bytes + count * (4U * sizeof(float) + sizeof(std::int32_t) + 3U) + mask_bytes;
     if (bytes > rfdetr::kMaximumPredictionTensorBytes) throw std::invalid_argument("prediction raw preview exceeds storage capacity");
     try {
@@ -203,7 +210,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
             state.predictions.clear();
             state.predictions.reserve(count);
             for (const auto& prediction : predictions)
-                state.predictions.push_back({.category_id = prediction.category_id, .score = prediction.score, .bbox_xyxy = prediction.bbox_xyxy});
+                state.predictions.push_back({.class_reference = prediction.class_reference, .class_domain = prediction.class_domain, .score = prediction.score, .bbox_xyxy = prediction.bbox_xyxy});
             auto* destination = static_cast<std::uint8_t*>(state.storage.active());
             bool source_submitted = false;
             try {
@@ -224,7 +231,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
                     if (pixels) copy(destination, pixels, pixel_bytes);
                     if (count) {
                         copy(destination + state.boxes_offset, reinterpret_cast<const void*>(annotations.boxes_xyxy.address), count * 4U * sizeof(float));
-                        copy(destination + state.labels_offset, reinterpret_cast<const void*>(annotations.category_ids.address), count * sizeof(std::int32_t));
+                        copy(destination + state.labels_offset, reinterpret_cast<const void*>(annotations.class_references.address), count * sizeof(std::int32_t));
                         if (mask_bytes) copy(destination + state.masks_offset, reinterpret_cast<const void*>(annotations.masks.address), mask_bytes);
                     }
                     checked(operations_.record(state.source_ready, reinterpret_cast<cudaStream_t>(source_stream)));

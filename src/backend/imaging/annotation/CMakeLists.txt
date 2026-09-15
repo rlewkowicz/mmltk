@@ -45,6 +45,7 @@ target_include_directories(mmltk_backend_imaging_annotation PRIVATE
 )
 target_link_libraries(mmltk_backend_imaging_annotation
     PRIVATE
+        mmltk::backend::data::catalog
         CUDA::cudart
         mmltk::common::io
         nlohmann_json

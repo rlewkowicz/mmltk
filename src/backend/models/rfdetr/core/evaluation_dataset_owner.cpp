@@ -46,19 +46,20 @@ namespace mmltk::backend::models::rfdetr {
 
 struct EvaluationDatasetOwner::Impl final {
     Impl(mmltk::backend::data::DatasetLoader& loader, const EvaluationMetricSet metric_set)
-        : dataset(CocoDataset::load_from_loader(loader, metric_set)) {}
+        : dataset(CocoDataset::load_from_loader(loader, metric_set)), catalog(loader.class_catalog()) {}
 
-    explicit Impl(const CocoDataset& source) : dataset(source) {}
+    Impl(const Impl&) = default;
 
     CocoDataset dataset;
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog;
 };
 
 EvaluationDatasetOwner::EvaluationDatasetOwner(mmltk::backend::data::DatasetLoader& loader, const EvaluationMetricSet metric_set)
     : impl_(std::make_unique<Impl>(loader, metric_set)) {}
 EvaluationDatasetOwner::~EvaluationDatasetOwner() = default;
-EvaluationDatasetOwner::EvaluationDatasetOwner(const EvaluationDatasetOwner& other) : impl_(std::make_unique<Impl>(other.impl_->dataset)) {}
+EvaluationDatasetOwner::EvaluationDatasetOwner(const EvaluationDatasetOwner& other) : impl_(std::make_unique<Impl>(*other.impl_)) {}
 EvaluationDatasetOwner& EvaluationDatasetOwner::operator=(const EvaluationDatasetOwner& other) {
-    if (this != &other) impl_ = std::make_unique<Impl>(other.impl_->dataset);
+    if (this != &other) impl_ = std::make_unique<Impl>(*other.impl_);
     return *this;
 }
 EvaluationDatasetOwner::EvaluationDatasetOwner(EvaluationDatasetOwner&&) noexcept = default;
@@ -86,6 +87,7 @@ EvalSummary EvaluationDatasetOwner::evaluate(const std::size_t max_dets_per_imag
 }
 std::vector<int> EvaluationDatasetOwner::image_ids() const { return impl_->dataset.image_ids(); }
 std::size_t EvaluationDatasetOwner::image_count() const noexcept { return impl_->dataset.num_images(); }
+const std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>& EvaluationDatasetOwner::class_catalog() const noexcept { return impl_->catalog; }
 std::size_t EvaluationDatasetOwner::category_count() const noexcept { return impl_->dataset.num_categories(); }
 EvaluationDatasetOwner::Facts EvaluationDatasetOwner::facts() const noexcept {
     return Facts{

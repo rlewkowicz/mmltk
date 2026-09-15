@@ -13,7 +13,7 @@
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/controller/contracts/artifact.h"
-#include "src/controller/contracts/artifact_catalog.h"
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/model.h"
 

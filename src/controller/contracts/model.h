@@ -12,6 +12,7 @@
 
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/model_selection.h"
+#include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/controller/contracts/terminal_presentation.h"
 
 #include "src/controller/contracts/workflows.h"
@@ -52,9 +53,11 @@ struct ModelSelectionKey final {
     ModelArtifactInputKind input = ModelArtifactInputKind::None;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string preset;
     std::uint32_t resolution = 0U;
+    [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string class_layout_path;
     [[nodiscard]] bool valid() const noexcept {
         return model_selection_compatible(workflow, source, input) && !preset.empty() &&
-               preset.size() <= mmltk::frameworks::reflection::kMaximumNameBytes && resolution != 0U;
+               preset.size() <= mmltk::frameworks::reflection::kMaximumNameBytes && resolution != 0U &&
+               class_layout_path.size() <= kModelArtifactCapacity && class_layout_path.find('\0') == std::string::npos;
     }
     bool operator==(const ModelSelectionKey&) const = default;
 };
@@ -68,6 +71,7 @@ struct[[= reflection::feature_scope(FeatureId::Train, FeatureId::Validate, Featu
 struct ModelSelection final {
     ModelSelectionKey key{};
     [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string artifact;
+    mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout;
     [[nodiscard]] bool valid() const noexcept { return key.valid() && !artifact.empty() && artifact.size() <= kModelArtifactCapacity; }
     bool operator==(const ModelSelection&) const = default;
 };

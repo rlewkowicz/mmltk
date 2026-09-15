@@ -43,6 +43,8 @@ mmltk_register_public_headers(
     mmltk_backend_models_rfdetr_core
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        artifact_publication.h
+        class_layout.h
         evaluation.h
         model_info.h
         model_state.h)
@@ -56,6 +58,8 @@ mmltk_register_retained_module_implementation_units(
 )
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
+    artifact_publication.cpp
+    class_layout.cpp
     native_library_anchor.cpp
     python_checkpoint_bridge.cpp
     model_state.cpp)
@@ -96,6 +100,7 @@ mmltk_register_private_headers(
     detail/model_access.h
     detail/model_state_access.h
     detail/model_state_technical.h
+    detail/class_tensor_axes.h
     detail/model_technical.h
     detail/modules_technical.h
     detail/postprocess.h
@@ -142,6 +147,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_core
         mmltk::common::types
         mmltk::frameworks::process
         mmltk::frameworks::reflection
+        mmltk::frameworks::serialization
         CUDA::cudart
         nlohmann_json
         stb
@@ -196,6 +202,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
     set(sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/matcher_workspace.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/native_ops.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/class_layout.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_supervision.test.cpp)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         list(APPEND sources
@@ -234,7 +241,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
             mmltk_entrypoints_tools_onnx_info)
         target_link_libraries(
             mmltk_backend_models_rfdetr_core_tests PRIVATE
-            mmltk_backend_models_rfdetr_checkpoint_test_support)
+            mmltk_backend_models_rfdetr_checkpoint_test_support
+            mmltk::backend::models::rfdetr::export)
     endif()
     mmltk_target_cuda_architectures(
         mmltk_backend_models_rfdetr_core_tests)

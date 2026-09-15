@@ -46,6 +46,8 @@ target_link_libraries(mmltk_backend_models_rfdetr_inference
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::core
     PRIVATE
+        mmltk::backend::models::rfdetr::export
+        mmltk::common::io
         mmltk::backend::media::video
         mmltk::backend::data
         mmltk::backend::ml::cuda
@@ -69,7 +71,8 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/eval_sample_writer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_artifact_resolution.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_json.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_session.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_session.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/class_layout_roundtrip.test.cpp)
     mmltk_configure_component(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE_DECLARATIONS)
     target_include_directories(

@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "src/backend/ml/runtime/backend_factory.h"
+#include "src/backend/data/catalog/class_catalog.h"
 namespace mmltk::backend::ml::runtime {
 
 inline constexpr std::size_t kMaximumAnalysisRank = 4U;
@@ -80,10 +81,15 @@ struct AnalysisAnnotationStorage final {
     std::size_t value_capacity = 0U;
     std::size_t value_count = 0U;
     AnalysisDeviceBuffer boxes_xyxy{};
-    AnalysisDeviceBuffer category_ids{};
+    AnalysisDeviceBuffer class_references{};
     AnalysisDeviceBuffer confidences{};
     AnalysisDeviceBuffer colors_rgb{};
     AnalysisDeviceBuffer masks{};
+    // Capacity does not establish that a provider initialized a mask product.
+    bool masks_available = false;
+    mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot;
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
+
 };
 
 struct AnalysisRequest final {
@@ -348,7 +354,7 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
             output.source_region.width,
         };
         return ValidateBuffer(output.boxes_xyxy, 2U, boxes, AnalysisElementType::Float32) &&
-               ValidateBuffer(output.category_ids, 1U, values, AnalysisElementType::Int32) &&
+               ValidateBuffer(output.class_references, 1U, values, AnalysisElementType::Int32) &&
                ValidateBuffer(output.confidences, 1U, values, AnalysisElementType::Float32) &&
                ValidateBuffer(output.colors_rgb, 2U, colors, AnalysisElementType::Uint8) &&
                ValidateBuffer(output.masks, 3U, masks, AnalysisElementType::Uint8, true);

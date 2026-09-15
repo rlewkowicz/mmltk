@@ -88,7 +88,10 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered
     header.total_file_size = layout.total_size;
     header.image_stride = inputs.image_stride;
     for (const auto& [name, id] : class_map) {
-        std::strncpy(header.class_names[id].data(), name.c_str(), header.class_names[id].size() - 1);
+        if (id >= header.num_classes || name.empty() || name.size() >= header.class_names[id].size() ||
+            name.find('\0') != std::string::npos)
+            throw std::runtime_error("invalid compiled class name or index");
+        std::memcpy(header.class_names[id].data(), name.data(), name.size());
     }
     return header;
 }

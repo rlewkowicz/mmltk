@@ -24,8 +24,7 @@
 
 #include "src/controller/contracts/workflows.h"
 #include "src/controller/contracts/workspace.h"
-#include "src/controller/contracts/artifact_catalog.h"
-#include "src/backend/data/compiled_format_limits.h"
+#include "src/backend/data/catalog/class_catalog.h"
 namespace mmltk::controller::contracts {
 
 inline constexpr int kMinAnnotationBrushRadius = 1;
@@ -37,7 +36,7 @@ inline constexpr int kDefaultAnnotationMaskCleanupRadius = 2;
 
 inline constexpr std::size_t kAnnotationNameCapacity = 96U;
 inline constexpr std::size_t kAnnotationObjectCapacity = 4096U;
-inline constexpr std::size_t kAnnotationCategoryCapacity = mmltk::backend::data::MAX_CLASSES;
+inline constexpr std::size_t kAnnotationCategoryCapacity = mmltk::backend::data::catalog::kClassCatalogCapacity;
 inline constexpr std::size_t kAnnotationMaskRunCapacity = 32768U;
 inline constexpr std::size_t kAnnotationGeometryCapacity = 8U;
 inline constexpr std::size_t kAnnotationUiStateByteBudget = 8U * 1024U * 1024U;
@@ -269,7 +268,7 @@ struct AnnotationEditorFacts final {
 // persistence. It deliberately has no history or operation identity.
 struct AnnotationSceneContent final {
     WorkspaceResource document{};
-    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationCategoryCapacity}]] std::vector<ArtifactClassName> categories{};
+    [[= mmltk::frameworks::reflection::MaxItems{kAnnotationCategoryCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName> categories{};
     [[= mmltk::frameworks::reflection::MaxItems{kAnnotationCategoryCapacity}]] std::vector<AnnotationColor> palette{};
     [[= mmltk::frameworks::reflection::MaxItems{kAnnotationObjectCapacity}]] std::vector<AnnotationObject> objects{};
     std::uint16_t frame_width = 0U;

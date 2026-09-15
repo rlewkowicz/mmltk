@@ -105,10 +105,19 @@ def _coerce_float(value):
 
 def _extract_checkpoint_metadata(checkpoint) -> dict:
     args_obj = checkpoint.get("args")
-    if args_obj is None:
-        return {}
-
     metadata = {}
+    layout = checkpoint.get("class_layout")
+    if layout is not None:
+        if not isinstance(layout, dict):
+            raise RuntimeError("RF-DETR class_layout must be a canonical object")
+        metadata["class_layout"] = layout
+    class_names = checkpoint.get("class_names", _checkpoint_arg_value(args_obj, "class_names"))
+    if class_names is not None:
+        if not isinstance(class_names, (list, tuple)) or len(class_names) > 256 or any(
+            not isinstance(name, str) or len(name.encode("utf-8")) > 256 or "\0" in name for name in class_names
+        ):
+            raise RuntimeError("RF-DETR class-name evidence exceeds its supported schema")
+        metadata["class_name_evidence"] = list(class_names)
     field_specs = {
         "num_queries": _coerce_int,
         "num_select": _coerce_int,
@@ -218,7 +227,11 @@ def write_upstream(args: argparse.Namespace) -> None:
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": model}, str(output_path))
+    metadata = payload.get("metadata", {})
+    checkpoint = {"model": model, "args": {key: value for key, value in metadata.items() if key != "class_layout"}}
+    if "class_layout" in metadata:
+        checkpoint["class_layout"] = metadata["class_layout"]
+    torch.save(checkpoint, str(output_path))
 
 
 def build_parser() -> argparse.ArgumentParser:

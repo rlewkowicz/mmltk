@@ -51,7 +51,7 @@ bool StopGate::Wait(std::stop_token stop) {
     return condition_.wait(lock, stop, [this] { return released_; });
 }
 PredictionSource::PredictionSource(VisualExtent extent, Catalog classes)
-    : extent_(extent), classes_(classes ? std::move(classes) : std::make_shared<const std::vector<std::string>>()) {}
+    : extent_(extent), classes_(classes ? std::move(classes) : std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>()) {}
 PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution, VisualExtent extent,
     std::span<const float> pixels, std::vector<Detection> detections, Catalog classes) {
     const auto values = pixel_values(extent);
@@ -66,7 +66,7 @@ PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution,
     std::memcpy(packed.data(), pixels.data(), pixel_bytes);
     for (std::size_t index = 0; index < detections.size(); ++index) {
         std::memcpy(packed.data() + pixel_bytes + index * 4U * sizeof(float), detections[index].bbox_xyxy.data(), 4U * sizeof(float));
-        const std::int32_t category = detections[index].category_id - 1;
+        const std::int32_t category = detections[index].class_reference;
         std::memcpy(packed.data() + pixel_bytes + boxes_bytes + index * sizeof(category), &category, sizeof(category));
     }
     checked(cudaSetDevice(execution.device));
@@ -83,7 +83,10 @@ PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution,
         .source_region = {.width = extent.width, .height = extent.height},
         .value_capacity = result.detections_.size(), .value_count = result.detections_.size(),
         .boxes_xyxy = {.address = address + pixel_bytes, .capacity_bytes = boxes_bytes},
-        .category_ids = {.address = address + pixel_bytes + boxes_bytes, .capacity_bytes = label_bytes}};
+        .class_references = {.address = address + pixel_bytes + boxes_bytes, .capacity_bytes = label_bytes}};
+    result.annotations_.class_catalog = result.classes_;
+    result.annotations_.class_domain = result.classes_->empty() ? mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot :
+        mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
     return result;
 }
 PredictionSource PredictionSource::Decoded(VisualExtent extent, std::span<const std::uint8_t> pixels, Catalog classes) {
@@ -219,8 +222,8 @@ contracts::ComputeTerminal FakePredictRuntime::Run(rfdetr::PredictRequest, std::
     std::array<float, 48U> white;
     white.fill(1.0F);
     auto source = PredictionSource::Device(execution, {4U, 4U}, white,
-        std::vector<rfdetr::Prediction>(scenario_.labels, {.category_id = 1, .score = .75F, .bbox_xyxy = {0.0F, 0.0F, 3.0F, 3.0F}}),
-        std::make_shared<const std::vector<std::string>>(std::vector<std::string>{std::string(256U, 'p')}));
+        std::vector<rfdetr::Prediction>(scenario_.labels, {.class_reference = 0, .score = .75F, .bbox_xyxy = {0.0F, 0.0F, 3.0F, 3.0F}}),
+        std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{std::string(256U, 'p')}));
     auto raw = preview_->Capture(source.pixels(), source.extent(), 0U, source.detections(), source.annotations(),
         source.classes(), 1, nullptr, source.custody());
     products(Product{.extent = source.extent(), .raw = std::move(raw), .image_id = 41,

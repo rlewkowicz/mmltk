@@ -6811,7 +6811,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     CHECK(compiled.width == static_cast<std::uint32_t>(kCompiledResolution));
     CHECK(compiled.height == static_cast<std::uint32_t>(kCompiledResolution));
     CHECK(compiled.channels != 0U);
-    CHECK_FALSE(compiled.class_names.empty());
+    CHECK_FALSE(compiled.class_names().empty());
 
     if (!last) AdvanceScenario();
 }

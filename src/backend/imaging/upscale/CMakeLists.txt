@@ -81,7 +81,7 @@ target_link_libraries(mmltk_backend_imaging_upscale
     PRIVATE
         mmltk::backend::ml::runtime
         CUDA::cudart
-        mmltk::backend::data
+        mmltk::common::io
         mmltk::common::logging
         mmltk::common::system
         mmltk::common::types

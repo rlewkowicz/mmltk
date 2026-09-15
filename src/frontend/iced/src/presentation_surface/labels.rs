@@ -31,7 +31,10 @@ struct CachedLabel {
 impl PredictionContent {
     pub(crate) fn new(metadata: crate::generated::PredictImageMetadata) -> Self {
         let labels = metadata.labels.iter().map(|item| {
-            let text = format!("{} {}", item.name, item.confidence);
+            let text = match item.classdomain {
+                crate::generated::ClassReferenceDomain::Foreground => format!("{} {}", item.name, item.confidence),
+                crate::generated::ClassReferenceDomain::RawOutputSlot => format!("Raw slot {} {}", item.classreference, item.confidence),
+            };
             let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
             let paragraph = iced::advanced::graphics::text::Paragraph::with_text(text::Text {
                 content: &text, bounds: Size::new(width - 6.0, 19.0), size: iced::Pixels(12.0),
@@ -116,7 +119,7 @@ impl Source {
             }
             Self::Prediction(snapshot) => {
                 for (item, cached) in snapshot.metadata.labels.iter().zip(&snapshot.labels) {
-                    label(item.category as u16, &item.box_, &cached.text, &item.color, 0, None, Some(cached));
+                    label(item.classreference as u16, &item.box_, &cached.text, &item.color, 0, None, Some(cached));
                 }
             }
             _ => {}
@@ -391,15 +394,16 @@ mod tests {
                 first: crate::generated::AnnotationPoint { x: index as f32, y: 2.0 },
                 second: crate::generated::AnnotationPoint { x: index as f32 + 10.0, y: 12.0 },
             },
-            category: if index == 0 { 0 } else { 79 },
+            classreference: if index == 0 { 0 } else { 79 },
+            classdomain: if index == 0 { crate::generated::ClassReferenceDomain::Foreground } else { crate::generated::ClassReferenceDomain::RawOutputSlot },
             confidence: 0.75,
             color: crate::generated::AnnotationColor { hue: 120.0, saturation: 1.0, value: 0.8 },
-            name: if index == 0 { "person".into() } else { "80".into() },
+            name: if index == 0 { "person".into() } else { String::new() },
         }).collect();
         let retained = std::sync::Arc::new(PredictionContent::new(crate::generated::PredictImageMetadata::from(&snapshot)));
         assert_eq!(retained.labels.len(), 4096);
         assert_eq!(retained.labels[0].text, "person 0.75");
-        assert_eq!(retained.labels[4095].text, "80 0.75");
+        assert_eq!(retained.labels[4095].text, "Raw slot 79 0.75");
         let pointer = retained.labels[0].text.as_ptr();
         let source = Source::Prediction(retained.clone());
         for _ in 0..3 {
@@ -423,7 +427,7 @@ mod tests {
         super::super::reset_test_releases();
         let (mut model, frame) = crate::view_model::test_support::explore_presentation();
         let snapshot = model.explore.snapshot.as_mut().unwrap();
-        snapshot.scene.categories = vec![crate::generated::ArtifactClassName {
+        snapshot.scene.categories = vec![crate::generated::ClassName {
             value: "person".into(),
         }];
         snapshot.scene.palette = vec![crate::generated::AnnotationColor {
@@ -657,7 +661,7 @@ mod tests {
     #[test]
     fn detail_uses_its_own_catalog_geometry_and_visibility_without_gallery_labels() {
         let mut snapshot = crate::view_model::test_support::explore_snapshot();
-        snapshot.scene.categories = vec![crate::generated::ArtifactClassName {
+        snapshot.scene.categories = vec![crate::generated::ClassName {
             value: "人".into(),
         }];
         snapshot.scene.palette = vec![crate::generated::AnnotationColor {

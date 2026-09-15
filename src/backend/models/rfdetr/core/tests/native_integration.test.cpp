@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,6 +22,16 @@
 #include "model_state_technical.h"
 #include "parity_fixture_support.h"
 
+import mmltk.backend.models.rfdetr.model_export;
+namespace mmltk::backend::models::rfdetr::testsupport {
+bool validate_onnx_model(const std::filesystem::path& path) {
+    try {
+        const auto info = load_onnx_model_info(path);
+        return info.class_layout && ResolvedClassLayout(*info.class_layout).semantic() &&
+            ResolvedClassLayout(*info.class_layout).output_width() == static_cast<std::size_t>(info.num_classes);
+    } catch (const std::exception&) { return false; }
+}
+}
 namespace fs = std::filesystem;
 
 namespace {
@@ -131,3 +142,42 @@ void test_native_rfdetr_cached_nano_export_pipeline() {
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]", test_native_rfdetr_cli_checkpoint_smoke);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]", test_native_rfdetr_cached_nano_export_pipeline);
+
+TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names raw after renaming", "[model][rfdetr][layout][python]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace c = mmltk::backend::data::catalog;
+    const mmltk::testsupport::ScopedTempDir directory("rfdetr-class-layout-python");
+    const auto& fixture = r::testsupport::parity_fixture_cases().front();
+    auto source = r::testsupport::make_native_parity_fixture(fixture);
+    source.metadata.class_layout = r::coco_class_layout({r::ClassLayoutOrigin::Embedded, "explicit test producer", {}});
+    const auto path = directory.path() / "custom.pth";
+    r::write_upstream_model_state(path, source);
+    const auto renamed = directory.path() / "unrelated-name.pth";
+    fs::rename(path, renamed);
+    const auto admitted = r::decode_model_state(renamed);
+    CHECK(admitted.metadata.class_layout == source.metadata.class_layout);
+    const r::ResolvedClassLayout semantic(admitted.metadata.class_layout);
+    CHECK(semantic.catalog()->names()[79] == "toothbrush");
+    CHECK(semantic.class_references().back() == 79);
+    r::detail::model_state_owner(source).entries.push_back({"training_supervision.retained_fixture", torch::ones({1})});
+    source.metadata.class_layout = r::unresolved_class_layout(r::testsupport::kParityFixtureNumClasses);
+    source.metadata.class_layout.class_name_evidence.names = {{"background"}, {"person"}, {"person"}};
+    const auto ambiguous = directory.path() / "rf-detr-nano.pth";
+    r::write_upstream_model_state(ambiguous, source);
+    const auto raw = r::decode_model_state(ambiguous);
+    CHECK(raw.metadata.class_layout.class_name_evidence == source.metadata.class_layout.class_name_evidence);
+    CHECK(r::ResolvedClassLayout(raw.metadata.class_layout).domain() == c::ClassReferenceDomain::RawOutputSlot);
+    CHECK(r::ResolvedClassLayout(raw.metadata.class_layout).catalog()->empty());
+    const auto descriptor_path = directory.path() / "binding.classes.json";
+    const auto binding = r::coco_class_layout({r::ClassLayoutOrigin::DigestDescriptor, "selected descriptor", {}});
+    { std::ofstream output(descriptor_path); output << r::encode_class_descriptor({1U,
+        mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(ambiguous)), binding}); }
+    const auto normalized = directory.path() / "normalized.pt";
+    run_subprocess({mmltk_cli_path().string(), "rfdetr", "normalize-weights", "--input", ambiguous.string(),
+        "--output", normalized.string(), "--class-layout", descriptor_path.string()});
+    const auto native = r::decode_model_state(normalized);
+    CHECK(r::ResolvedClassLayout(native.metadata.class_layout).domain() == c::ClassReferenceDomain::Foreground);
+    CHECK(native.metadata.class_layout.foreground == binding.foreground);
+    CHECK(native.metadata.class_layout.class_name_evidence == source.metadata.class_layout.class_name_evidence);
+    CHECK(native.tensor_count() == raw.tensor_count());
+}

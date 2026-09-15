@@ -12,7 +12,7 @@
 
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/contracts/artifact.h"
-#include "src/controller/contracts/artifact_catalog.h"
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/model.h"
 #include "src/controller/contracts/model_selection.h"
@@ -66,6 +66,7 @@ current_training_split(const mmltk::controller::contracts::GuiSettingsState& set
 
 void assign_model_artifact(mmltk::backend::models::rfdetr::ModelArtifactRequest& request,
                            const mmltk::controller::contracts::ModelSelection& model) {
+    request.class_layout_path = model.key.class_layout_path;
     request.weights_path.clear();
     request.onnx_path.clear();
     request.tensorrt_path.clear();
@@ -122,6 +123,7 @@ std::expected<ComputeIntentMaterializer::ModelInput, ComputeIntentMaterializer::
                 .input = row.input,
                 .preset = Relation::preset(settings),
                 .resolution = static_cast<std::uint32_t>(Relation::resolution(settings)),
+                .class_layout_path = std::filesystem::path(Relation::class_layout(settings)).string(),
             };
             materialized = ModelInput{
                 .key = std::move(key),
@@ -134,6 +136,12 @@ std::expected<ComputeIntentMaterializer::ModelInput, ComputeIntentMaterializer::
             materialized->custom_artifact.size() > mmltk::controller::contracts::kModelArtifactCapacity)
             return std::unexpected(refused("custom model artifact is unavailable"));
     }
+    if (workflow == mmltk::controller::contracts::FeatureId::Validate)
+        materialized->inspection_device = settings.workflows.validate.request.device_id;
+    else if (workflow == mmltk::controller::contracts::FeatureId::Predict)
+        materialized->inspection_device = settings.workflows.predict.request.device_id;
+    else if (workflow == mmltk::controller::contracts::FeatureId::Export)
+        materialized->inspection_device = settings.workflows.export_state.device_id;
     if (!materialized->key.valid()) return std::unexpected(refused("model selection key is invalid"));
     return std::move(*materialized);
 }
@@ -148,6 +156,8 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
     if (!training) return std::unexpected(training.error());
     const auto validation = current_artifact_split(artifact, request.val_compiled_path, "validation artifact is unavailable");
     if (!validation) return std::unexpected(validation.error());
+    if ((*training)->class_names != (*validation)->class_names)
+        return std::unexpected(refused("training and validation class order differs"));
     request.train_compiled_path = (*training)->path;
     request.weights_path = model.artifact;
     request.val_compiled_path = (*validation)->path;
@@ -156,6 +166,8 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
     } else {
         const auto test = current_artifact_split(artifact, request.test_compiled_path, "test artifact is unavailable");
         if (!test) return std::unexpected(test.error());
+        if ((*training)->class_names != (*test)->class_names)
+            return std::unexpected(refused("training and test class order differs"));
         request.test_compiled_path = (*test)->path;
     }
     try {

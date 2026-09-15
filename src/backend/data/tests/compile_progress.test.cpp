@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
@@ -479,4 +480,47 @@ TEST_CASE("compiler progress remains monotonic", "[backend][data][compile_progre
     test_snapshot_overlaps_compile_reset();
     test_compile_observes_event_cancellation_without_progress();
     test_compile_reobserves_cancellation_after_publishing_event();
+}
+
+TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense tables", "[data][catalog]") {
+    const auto root = mmltk::testsupport::make_temp_root("compiler-class-catalog");
+    const mmltk::testsupport::ScopedTestCleanup cleanup{[&] { fs::remove_all(root); }};
+    for (const int base : {0, 1}) {
+        FixtureSpec fixture{.root_dir=(root / std::to_string(base)).string(), .num_images=12, .first_class_id=base};
+        create_synthetic_dataset(fixture);
+        const auto path = fs::path(dataset_dir(fixture)) / "categories.json";
+        std::ifstream input(path);
+        auto categories = nlohmann::json::parse(input);
+        input.close();
+        auto& classes = categories.at("classes");
+        std::reverse(classes.begin(), classes.end());
+        const auto write = [&] { std::ofstream output(path); output << categories; };
+        write();
+        CompilerConfig config;
+        config.source_dir = dataset_dir(fixture);
+        config.output_dir = compiled_dir(fixture);
+        config.split = fixture.split;
+        config.target_width = fixture.width;
+        config.target_height = fixture.height;
+        const auto plan = DatasetCompiler::prepare(config, {fixture.split});
+        CHECK(plan.class_map.at("person") == 0);
+        CHECK(plan.class_map.at("ret") == 1);
+        CHECK(plan.class_map.at("glint") == 5);
+        const auto original = classes;
+        classes.push_back({{"id", base + 6}, {"name", std::string(31, 'x')}});
+        write();
+        CHECK(DatasetCompiler::prepare(config, {fixture.split}).class_map.at(std::string(31, 'x')) == 6);
+        classes.back()["name"] = std::string(32, 'x');
+        write();
+        CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
+        for (int invalid = 0; invalid < 3; ++invalid) {
+            classes = original;
+            if (invalid == 0) classes[0]["id"] = classes[1]["id"];
+            if (invalid == 1) classes[0]["id"] = base + 8;
+            if (invalid == 2) classes[0]["name"] = classes[1]["name"];
+            write();
+            CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
+        }
+        CHECK_FALSE(fs::exists(fs::path(compiled_dir(fixture)) / "train.bin"));
+    }
 }

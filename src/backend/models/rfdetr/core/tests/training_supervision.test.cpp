@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "catch2_compat.hpp"
+#include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "cuda_test_utils.hpp"
 #include "detail/detection_geometry.h"
 #include "detail/detection_ops.h"
@@ -331,7 +332,7 @@ void test_geometry_preserves_consumer_policies_and_batch_isolation() {
 
 void test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d() {
     auto config = match_free_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(17);
     install_oracle_projections(supervision);
     const auto labels = torch_api::tensor({{0, 1}}, torch_api::TensorOptions().dtype(torch_api::kInt64));
@@ -358,7 +359,7 @@ void test_rectangular_supervision_retains_404_targets_with_300_queries() {
     config.num_select = 300;
     config.training_supervision.denoising.enabled = true;
     config.training_supervision.denoising.groups = 2;
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(404);
     const auto integers = torch_api::TensorOptions().dtype(torch_api::kInt64);
     const auto targets = batched_targets({torch_api::full({404, 4}, 0.2F), torch_api::zeros({0, 4})},
@@ -417,7 +418,7 @@ void test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradient
 
 void test_complete_focal_cost_and_both_objectives_keep_prediction_and_probe_gradients() {
     auto config = match_free_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(31);
     install_oracle_projections(supervision);
     auto features = torch_api::tensor({{{{0.8F, 0.1F}, {0.2F, 0.9F}, {0.4F, 0.3F}}}}).set_requires_grad(true);
@@ -445,7 +446,7 @@ void test_focal_broadcast_cost_sums_every_channel_and_places_coefficients_once()
     auto config = match_free_config();
     config.training_supervision.match_free.correspondence_weight = 0.7F;
     config.training_supervision.match_free.query_weight = 1.3F;
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(37);
     install_oracle_projections(supervision);
     const auto features = torch_api::tensor({{{{0.8F, 0.1F}, {0.2F, 0.9F}, {0.4F, 0.3F}}}});
@@ -475,7 +476,7 @@ void test_focal_broadcast_cost_sums_every_channel_and_places_coefficients_once()
 
 void test_layer_group_and_device_target_reductions_follow_declared_gating() {
     auto one_group_config = match_free_config();
-    rfdetr::TrainingSupervisionImpl one_group(one_group_config);
+    rfdetr::TrainingSupervisionImpl one_group(one_group_config, one_group_config.num_classes - 1);
     one_group.initialize(41);
     install_oracle_projections(one_group);
     const auto features = torch_api::tensor({{{{0.8F, 0.1F}, {0.2F, 0.9F}, {0.4F, 0.3F}}}});
@@ -496,7 +497,7 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
     auto layered_config = one_group_config;
     layered_config.aux_loss = true;
     layered_config.two_stage = true;
-    rfdetr::TrainingSupervisionImpl layered(layered_config);
+    rfdetr::TrainingSupervisionImpl layered(layered_config, layered_config.num_classes - 1);
     layered.initialize(41);
     install_oracle_projections(layered);
     rfdetr::ModelOutputs layered_outputs;
@@ -517,7 +518,7 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
 
     auto grouped_config = one_group_config;
     grouped_config.group_detr = 2;
-    rfdetr::TrainingSupervisionImpl grouped(grouped_config);
+    rfdetr::TrainingSupervisionImpl grouped(grouped_config, grouped_config.num_classes - 1);
     grouped.initialize(41);
     install_oracle_projections(grouped);
     rfdetr::ModelOutputs grouped_outputs;
@@ -530,7 +531,7 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
 
     auto summed_group_config = grouped_config;
     summed_group_config.sum_group_losses = true;
-    rfdetr::TrainingSupervisionImpl summed_groups(summed_group_config);
+    rfdetr::TrainingSupervisionImpl summed_groups(summed_group_config, summed_group_config.num_classes - 1);
     summed_groups.initialize(41);
     install_oracle_projections(summed_groups);
     const auto summed_group_loss = summed_groups.loss(grouped_outputs, targets, {torch_api::tensor(1.0F)}, true).total.detach();
@@ -545,7 +546,7 @@ void test_layer_group_and_device_target_reductions_follow_declared_gating() {
 void test_complete_match_free_loss_is_fp32_inside_cuda_autocast() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     auto config = match_free_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(43);
     install_oracle_projections(supervision);
     supervision.to(torch::Device(torch::kCUDA));
@@ -587,7 +588,7 @@ void test_complete_match_free_loss_is_fp32_inside_cuda_autocast() {
 
 void test_timing_leases_are_explicit_bounded_and_harvested_once() {
     auto disabled_config = match_free_config();
-    rfdetr::TrainingSupervisionImpl disabled(disabled_config);
+    rfdetr::TrainingSupervisionImpl disabled(disabled_config, disabled_config.num_classes - 1);
     disabled.initialize(45);
     install_oracle_projections(disabled);
     disabled.configure_timing({torch::Device(torch::kCPU), 1, false});
@@ -603,7 +604,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
 
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     auto config = match_free_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(45);
     install_oracle_projections(supervision);
     supervision.to(torch::Device(torch::kCUDA));
@@ -652,7 +653,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
     dn_config.aux_loss = true;
     dn_config.two_stage = true;
     torch_api::manual_seed(46);
-    rfdetr::NativeRfDetrModel dn_model(dn_config);
+    rfdetr::NativeRfDetrModel dn_model(dn_config, rfdetr::testsupport::synthetic_training_layout(dn_config.num_classes - 1));
     auto& dn_owner = rfdetr::detail::native_model_owner(dn_model);
     dn_owner.initialize_training_supervision(46);
     dn_owner.module().to(torch::Device(torch::kCUDA));
@@ -691,7 +692,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
 
     auto combined_config = production_denoising_config(rfdetr::TrainAssignmentKind::MatchFree, true);
     torch_api::manual_seed(47);
-    rfdetr::NativeRfDetrModel combined_model(combined_config);
+    rfdetr::NativeRfDetrModel combined_model(combined_config, rfdetr::testsupport::synthetic_training_layout(combined_config.num_classes - 1));
     auto& combined_owner = rfdetr::detail::native_model_owner(combined_model);
     combined_owner.initialize_training_supervision(47);
     combined_owner.module().to(torch::Device(torch::kCUDA));
@@ -733,7 +734,7 @@ void test_timing_leases_are_explicit_bounded_and_harvested_once() {
 
 void test_empty_and_retained_graphs_are_finite_and_independent() {
     auto config = match_free_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(47);
     install_oracle_projections(supervision);
 
@@ -779,7 +780,7 @@ void test_production_match_free_boundary_captures_layers_and_empty_gradient_anch
         config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
 
         torch_api::manual_seed(include_auxiliary_and_encoder ? 71 : 67);
-        rfdetr::NativeRfDetrModel model(config);
+        rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
         auto& owner = rfdetr::detail::native_model_owner(model);
         owner.module().train(true);
         owner.initialize_training_supervision(0xabcdefULL);
@@ -826,7 +827,7 @@ void test_production_match_free_boundary_captures_layers_and_empty_gradient_anch
 
 void test_mixed_empty_images_use_safe_internal_padding_without_loss_contribution() {
     auto config = match_free_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(53);
     install_oracle_projections(supervision);
     // CLEANUP-IGNORE: This populated baseline is independent from the full-gradient prediction fixture.
@@ -869,10 +870,10 @@ void test_conditional_model_construction_preserves_rng_and_default_state_topolog
     active_config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
 
     torch_api::manual_seed(101);
-    rfdetr::NativeRfDetrModel inactive(inactive_config);
+    rfdetr::NativeRfDetrModel inactive(inactive_config, rfdetr::testsupport::synthetic_training_layout(inactive_config.num_classes - 1));
     const auto inactive_rng = at::detail::getDefaultCPUGenerator().get_state().clone();
     torch_api::manual_seed(101);
-    rfdetr::NativeRfDetrModel active(active_config);
+    rfdetr::NativeRfDetrModel active(active_config, rfdetr::testsupport::synthetic_training_layout(active_config.num_classes - 1));
     const auto active_rng = at::detail::getDefaultCPUGenerator().get_state().clone();
     REQUIRE(torch_api::equal(inactive_rng, active_rng));
 
@@ -951,7 +952,7 @@ void test_conditional_model_construction_preserves_rng_and_default_state_topolog
 void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
     auto config = denoising_config();
     config.training_supervision.denoising.label_noise_ratio = 1.0F;
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(101);
     const auto boxes =
         std::vector<torch::Tensor>{torch_api::tensor({{0.02F, 0.98F, 0.2F, 0.4F}, {0.5F, 0.5F, 0.1F, 0.2F}}), torch_api::zeros({0, 4})};
@@ -1042,7 +1043,7 @@ void test_dn_endpoint_transform_mapping_padding_and_one_class_behavior() {
 
     auto one_class_config = denoising_config(1);
     one_class_config.training_supervision.denoising.label_noise_ratio = 1.0F;
-    rfdetr::TrainingSupervisionImpl one_class(one_class_config);
+    rfdetr::TrainingSupervisionImpl one_class(one_class_config, one_class_config.num_classes - 1);
     // CLEANUP-IGNORE: The one-class noise oracle and reference-convention test exercise different invariants.
     one_class.initialize(102);
     const auto one_targets = batched_targets({torch_api::tensor({{0.5F, 0.5F, 0.2F, 0.2F}})},
@@ -1077,7 +1078,7 @@ void test_dn_center_underflow_other_label_bijection_and_step_determinism() {
     auto config = denoising_config();
     config.training_supervision.denoising.center_noise_scale = rfdetr::kSupervisionOpenUnitMinimum;
     config.training_supervision.denoising.label_noise_ratio = 1.0F;
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(103);
     const auto targets =
         batched_targets({torch_api::tensor({{0.5F, 0.5F, 0.2F, 0.3F}, {0.4F, 0.6F, 0.1F, 0.15F}, {0.7F, 0.3F, 0.25F, 0.2F}})},
@@ -1100,7 +1101,7 @@ void test_dn_center_underflow_other_label_bijection_and_step_determinism() {
     REQUIRE(noised_labels.size(0) == 3);
 
     auto deterministic_config = denoising_config();
-    rfdetr::TrainingSupervisionImpl deterministic(deterministic_config);
+    rfdetr::TrainingSupervisionImpl deterministic(deterministic_config, deterministic_config.num_classes - 1);
     deterministic.initialize(104);
     const rfdetr::TrainingStepIdentity identity{55, 8, 3, 144};
     const auto first = deterministic.prepare_denoising(targets, identity, torch::Device(torch::kCPU), torch::kFloat32);
@@ -1184,7 +1185,7 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
     config.cls_loss_coef = 2.0;
     config.bbox_loss_coef = 5.0;
     config.giou_loss_coef = 2.0;
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(106);
     const auto targets = batched_targets({torch_api::tensor({{0.5F, 0.5F, 0.2F, 0.2F}}), torch_api::zeros({0, 4})},
                                          {torch_api::tensor({1}, torch_api::TensorOptions().dtype(torch_api::kInt64)),
@@ -1234,7 +1235,7 @@ void test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs() {
 
     auto auxiliary_config = config;
     auxiliary_config.aux_loss = true;
-    rfdetr::TrainingSupervisionImpl auxiliary_supervision(auxiliary_config);
+    rfdetr::TrainingSupervisionImpl auxiliary_supervision(auxiliary_config, auxiliary_config.num_classes - 1);
     auxiliary_supervision.initialize(106);
     auto auxiliary_outputs = make_outputs(*prepared, 0.05F);
     const auto auxiliary_loss = auxiliary_supervision.loss(auxiliary_outputs, targets, {torch_api::tensor(1.0F)}, true);
@@ -1267,7 +1268,7 @@ void test_production_dn_forward_preserves_reference_and_output_boundaries() {
                              const std::uint64_t seed) {
         auto config = production_denoising_config(assignment, bbox_reparam, segmentation);
         torch_api::manual_seed(seed);
-        rfdetr::NativeRfDetrModel model(config);
+        rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
         auto& owner = rfdetr::detail::native_model_owner(model);
         owner.module().train(true);
         owner.initialize_training_supervision(seed + 1U);
@@ -1298,7 +1299,7 @@ void test_production_dn_forward_preserves_reference_and_output_boundaries() {
         REQUIRE(outputs.main.sparse_pred_masks.has_value() == segmentation);
         if (outputs.main.sparse_pred_masks) { REQUIRE(outputs.main.sparse_pred_masks->query_features.size(1) == config.num_queries); }
 
-        rfdetr::TrainingSupervisionImpl oracle(config);
+        rfdetr::TrainingSupervisionImpl oracle(config, config.num_classes - 1);
         oracle.initialize(seed + 1U);
         const auto prepared = oracle.prepare_denoising(targets, identity, torch::Device(torch::kCPU), torch::kFloat32);
         REQUIRE(prepared.has_value());
@@ -1338,7 +1339,7 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
     config.aux_loss = true;
     config.dec_layers = 2;
     torch_api::manual_seed(114);
-    rfdetr::NativeRfDetrModel model(config);
+    rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
     auto& owner = rfdetr::detail::native_model_owner(model);
     owner.module().train(true);
     owner.initialize_training_supervision(0x5a5aULL);
@@ -1446,7 +1447,7 @@ void test_production_dn_retained_graph_scratch_padding_and_gradients() {
 
 void test_dn_reference_conventions_inference_removal_and_disabled_exact_path() {
     auto dn_config = denoising_config();
-    rfdetr::TrainingSupervisionImpl supervision(dn_config);
+    rfdetr::TrainingSupervisionImpl supervision(dn_config, dn_config.num_classes - 1);
     supervision.initialize(108);
     const auto targets = batched_targets({torch_api::tensor({{0.25F, 0.75F, 0.2F, 0.4F}})},
                                          {torch_api::tensor({1}, torch_api::TensorOptions().dtype(torch_api::kInt64))});
@@ -1478,9 +1479,9 @@ void test_dn_reference_conventions_inference_removal_and_disabled_exact_path() {
     auto active_config = inactive_config;
     active_config.training_supervision.denoising.enabled = true;
     torch_api::manual_seed(109);
-    rfdetr::NativeRfDetrModel inactive(inactive_config);
+    rfdetr::NativeRfDetrModel inactive(inactive_config, rfdetr::testsupport::synthetic_training_layout(inactive_config.num_classes - 1));
     torch_api::manual_seed(109);
-    rfdetr::NativeRfDetrModel active(active_config);
+    rfdetr::NativeRfDetrModel active(active_config, rfdetr::testsupport::synthetic_training_layout(active_config.num_classes - 1));
     auto& inactive_owner = rfdetr::detail::native_model_owner(inactive);
     auto& active_owner = rfdetr::detail::native_model_owner(active);
     inactive_owner.module().eval();
@@ -1503,7 +1504,7 @@ void test_dn_reference_conventions_inference_removal_and_disabled_exact_path() {
 
 void test_dn_all_empty_loss_is_finite_and_parameter_anchored() {
     auto config = denoising_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(110);
     rfdetr::ModelOutputs outputs;
     outputs.main.pred_logits = torch_api::zeros({2, 4, 4}).set_requires_grad(true);
@@ -1530,7 +1531,7 @@ void test_active_empty_loss_anchors_every_selected_mask_operand() {
         config.aux_loss = auxiliary_and_encoder;
         config.two_stage = auxiliary_and_encoder;
         config.dec_layers = auxiliary_and_encoder ? 2 : 1;
-        rfdetr::TrainingSupervisionImpl supervision(config);
+        rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
         supervision.initialize(112);
 
         const auto make_layer = [](const bool dense) {
@@ -1583,7 +1584,7 @@ void test_active_empty_loss_anchors_every_selected_mask_operand() {
 void test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     auto config = denoising_config();
-    rfdetr::TrainingSupervisionImpl supervision(config);
+    rfdetr::TrainingSupervisionImpl supervision(config, config.num_classes - 1);
     supervision.initialize(111);
     // CLEANUP-OFF: This CUDA-autocast fixture proves DN dtype boundaries, not timing-lease setup.
     supervision.to(torch::Device(torch::kCUDA));
@@ -1625,9 +1626,9 @@ void test_feature_initialization_is_reproducible_and_independent_of_dn_toggle() 
     combined_config.training_supervision.denoising.enabled = true;
     auto dn_only_config = combined_config;
     dn_only_config.training_supervision.assignment = rfdetr::TrainAssignmentKind::Hungarian;
-    rfdetr::TrainingSupervisionImpl match_only(match_only_config);
-    rfdetr::TrainingSupervisionImpl combined(combined_config);
-    rfdetr::TrainingSupervisionImpl dn_only(dn_only_config);
+    rfdetr::TrainingSupervisionImpl match_only(match_only_config, match_only_config.num_classes - 1);
+    rfdetr::TrainingSupervisionImpl combined(combined_config, combined_config.num_classes - 1);
+    rfdetr::TrainingSupervisionImpl dn_only(dn_only_config, dn_only_config.num_classes - 1);
     const auto rng_before = at::detail::getDefaultCPUGenerator().get_state().clone();
     match_only.initialize(0x12345678ULL);
     combined.initialize(0x12345678ULL);

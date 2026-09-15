@@ -1,3 +1,4 @@
+#include <ATen/CPUGeneratorImpl.h>
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -5,10 +6,12 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <span>
 
 #include "catch2_compat.hpp"
+#include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "filesystem_test_utils.hpp"
 
 // Import-bearing support follows every textual standard-library test helper.
@@ -24,6 +27,7 @@
 #include "torch_api.h"
 
 import mmltk.backend.models.rfdetr.training.checkpoint;
+import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.core.model;
 
 namespace fs = std::filesystem;
@@ -69,12 +73,12 @@ void write_archive_int(tensor_api::serialize::OutputArchive& archive, const char
     archive.write(key, tensor_api::IValue(value));
 }
 
-void write_legacy_native_checkpoint(const fs::path& output_path) {
+void write_legacy_native_checkpoint(const fs::path& output_path, int version = 1, std::string_view format = "fastloader.rfdetr.native_checkpoint") {
     fs::create_directories(output_path.parent_path());
 
     tensor_api::serialize::OutputArchive archive;
-    write_archive_string(archive, "format", "fastloader.rfdetr.native_checkpoint");
-    write_archive_int(archive, "format_version", mmltk::backend::models::rfdetr::kLegacyNativeCheckpointFormatVersion);
+    write_archive_string(archive, "format", format);
+    write_archive_int(archive, "format_version", version);
     write_archive_string(archive, "preset_name", "rf-detr-seg-medium");
     write_archive_string(archive, "source_kind", "legacy-native-test");
     write_archive_string(archive, "source_path", output_path.string());
@@ -177,6 +181,7 @@ void test_native_checkpoint_tensor_preparation() {
     checkpoint.metadata.source_kind = "unit-test";
     checkpoint.metadata.source_path = output_path.string();
     checkpoint.metadata.num_classes = 1;
+    checkpoint.metadata.class_layout = mmltk::backend::models::rfdetr::unresolved_class_layout(1);
     checkpoint.metadata.num_queries = 1;
     checkpoint.metadata.num_select = 1;
 
@@ -241,20 +246,14 @@ void test_upstream_checkpoint_scalar_type_bridge() {
 
 void test_legacy_native_checkpoint_format_support() {
     const fs::path legacy_path = fixture_root() / "legacy" / "legacy-format.pt";
-    write_legacy_native_checkpoint(legacy_path);
-
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::is_native_checkpoint_file(legacy_path));
-    const auto checkpoint = mmltk::backend::models::rfdetr::decode_model_state(legacy_path);
-    MMLTK_ASSERT(checkpoint.metadata.preset_name == "rf-detr-seg-medium");
-    MMLTK_ASSERT(checkpoint.metadata.source_kind == "legacy-native-test");
-    MMLTK_ASSERT(checkpoint.metadata.num_classes == 7);
-    MMLTK_ASSERT(checkpoint.metadata.num_queries == 200);
-    MMLTK_ASSERT(checkpoint.metadata.num_select == 200);
-    MMLTK_ASSERT(state_entries(checkpoint).size() == 1);
-
-    const auto* class_bias = find_entry(checkpoint, "class_embed.bias");
-    MMLTK_ASSERT(class_bias != nullptr);
-    MMLTK_ASSERT(tensor_api::equal(class_bias->tensor, tensor_api::arange(7, tensor_api::TensorOptions().dtype(tensor_api::kFloat32))));
+    for (const int version : {1, 2}) {
+        for (const auto format : {"fastloader.rfdetr.native_checkpoint", mmltk::backend::models::rfdetr::kNativeCheckpointFormat}) {
+            write_legacy_native_checkpoint(legacy_path, version, format);
+            REQUIRE(mmltk::backend::models::rfdetr::is_native_checkpoint_file(legacy_path));
+            REQUIRE_THROWS(mmltk::backend::models::rfdetr::decode_model_state(legacy_path));
+            REQUIRE_THROWS(mmltk::backend::models::rfdetr::normalize_checkpoint_to_native(legacy_path, legacy_path.string() + ".normalized"));
+        }
+    }
 }
 
 auto round_trip_training_supervision_config(const fs::path& path, const mmltk::backend::models::rfdetr::TrainingSupervisionConfig& config) {
@@ -384,7 +383,7 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
     config.num_select = 3;
     config.group_detr = 1;
     config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-    rfdetr::NativeRfDetrModel model(config);
+    rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
     auto& module = rfdetr::detail::native_model_owner(model).module();
 
     auto state = clone_normalized_model_state(module);
@@ -427,10 +426,10 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
                                                                                     rfdetr::detail::NormalizedModelStateAdmission::Exact));
     REQUIRE(tensor_api::equal(*class_head_destination, class_head_before));
 
-    auto adapted = rfdetr::detail::native_model_owner(model).stage_normalized_state(
-        mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::AdaptDetectionClassHead);
-    rfdetr::detail::native_model_owner(model).commit_normalized_state(std::move(adapted));
-    REQUIRE(tensor_api::equal(*class_head_destination, mismatched_entry.tensor.repeat({class_head_before.size(0), 1})));
+    const auto source_layout = rfdetr::ResolvedClassLayout(model.class_layout()->record());
+    REQUIRE_THROWS(rfdetr::detail::native_model_owner(model).stage_normalized_state(
+        mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
+    REQUIRE(tensor_api::equal(*class_head_destination, class_head_before));
 }
 
 }  // namespace
@@ -460,3 +459,145 @@ void test_checkpoint_tensor_and_legacy_support() {
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint]", test_checkpoint_roundtrip_and_fixture_loading);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint][training_supervision]", test_checkpoint_tensor_and_legacy_support);
+
+TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class identity", "[model][rfdetr][checkpoint][layout]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace c = mmltk::backend::data::catalog;
+    auto config = r::native_config_from_preset(r::model_presets().front());
+    config.resolution = 64;
+    config.num_classes = 4;
+    config.num_queries = config.num_select = 3;
+    config.group_detr = 1;
+    config.dec_layers = 1;
+    config.segmentation = false;
+    config.training_supervision.assignment = r::TrainAssignmentKind::MatchFree;
+    config.training_supervision.denoising.enabled = true;
+    const r::ResolvedClassLayout source_layout(r::native_training_class_layout(c::ClassCatalog({"a", "b", "c"})));
+    r::NativeRfDetrModel model(config, r::native_training_class_layout(c::ClassCatalog({"c", "a", "new"})));
+    auto& owner = r::detail::native_model_owner(model);
+    owner.initialize_training_supervision(29);
+    const auto before = r::testsupport::clone_normalized_model_state(owner.module());
+    auto source = r::testsupport::clone_normalized_model_state(owner.module());
+    // Independent expected axes cover both classifier owners and distinct
+    // supervision coordinates, rather than consulting the production inventory.
+    const std::array axes{
+        std::pair{"class_embed.weight", 0}, std::pair{"class_embed.bias", 0},
+        std::pair{"transformer.enc_out_class_embed.0.weight", 0}, std::pair{"transformer.enc_out_class_embed.0.bias", 0},
+        std::pair{"training_supervision.denoising_label_embedding.weight", 0},
+        std::pair{"training_supervision.ground_truth_mlp.linear1.weight", 1}};
+    for (const auto& [name, dimension] : axes) {
+        auto entry = std::ranges::find(source, name, &r::NormalizedModelStateEntry::name);
+        REQUIRE(entry != source.end());
+        for (std::int64_t row = 0; row < entry->tensor.size(dimension); ++row) entry->tensor.select(dimension, row).fill_(10. + row);
+    }
+    const auto random_before = at::detail::getDefaultCPUGenerator().get_state();
+    auto candidate = owner.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
+    owner.commit_normalized_state(std::move(candidate));
+    CHECK(tensor_api::equal(random_before, at::detail::getDefaultCPUGenerator().get_state()));
+    const auto after = owner.module().named_parameters(true);
+    for (const auto& [name, dimension] : axes) {
+        const auto* actual = after.find(name);
+        REQUIRE(actual);
+        const auto seeded = std::ranges::find(before, name, &r::NormalizedModelStateEntry::name);
+        REQUIRE(seeded != before.end());
+        CHECK(tensor_api::equal(actual->select(dimension, 0), tensor_api::full_like(actual->select(dimension, 0), 12.)));
+        CHECK(tensor_api::equal(actual->select(dimension, 1), tensor_api::full_like(actual->select(dimension, 1), 10.)));
+        CHECK(tensor_api::equal(actual->select(dimension, 2), seeded->tensor.select(dimension, 2)));
+        if (dimension == 1) {
+            for (std::int64_t box = 3; box < 7; ++box)
+                CHECK(tensor_api::equal(actual->select(1, box), tensor_api::full_like(actual->select(1, box), 10. + box)));
+        } else if (actual->size(0) == 4) {
+            CHECK(tensor_api::equal(actual->select(0, 3), seeded->tensor.select(0, 3)));
+        }
+    }
+    const auto admitted = r::testsupport::clone_normalized_model_state(owner.module());
+    const r::ResolvedClassLayout unknown(r::unresolved_class_layout(4));
+    auto unbound = owner.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &unknown);
+    owner.commit_normalized_state(std::move(unbound));
+    const auto retained = owner.module().named_parameters(true);
+    for (const auto& [name, dimension] : axes) {
+        const auto expected = std::ranges::find(admitted, name, &r::NormalizedModelStateEntry::name);
+        CHECK(tensor_api::equal(*retained.find(name), expected->tensor));
+    }
+    config.num_classes = 3;
+    for (const bool overlap : {true, false}) {
+        r::NativeRfDetrModel smaller(config, r::native_training_class_layout(c::ClassCatalog({overlap ? "b" : "fresh", "new"})));
+        auto& destination = r::detail::native_model_owner(smaller);
+        destination.initialize_training_supervision(31);
+        const auto seed = r::testsupport::clone_normalized_model_state(destination.module());
+        const auto random_state = at::detail::getDefaultCPUGenerator().get_state();
+        auto mapped = destination.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
+        destination.commit_normalized_state(std::move(mapped));
+        CHECK(tensor_api::equal(random_state, at::detail::getDefaultCPUGenerator().get_state()));
+        const auto parameters = destination.module().named_parameters(true);
+        for (const auto& [name, dimension] : axes) {
+            const auto* actual = parameters.find(name);
+            const auto original = std::ranges::find(seed, name, &r::NormalizedModelStateEntry::name);
+            REQUIRE(actual);
+            REQUIRE(original != seed.end());
+            const auto first = actual->select(dimension, 0);
+            CHECK(tensor_api::equal(first, overlap ? tensor_api::full_like(first, 11.) : original->tensor.select(dimension, 0)));
+            CHECK(tensor_api::equal(actual->select(dimension, 1), original->tensor.select(dimension, 1)));
+            if (dimension == 1) {
+                for (std::int64_t box = 0; box < 4; ++box)
+                    CHECK(tensor_api::equal(actual->select(1, 2 + box), tensor_api::full_like(actual->select(1, 2 + box), 13. + box)));
+            } else if (actual->size(0) == 3) {
+                CHECK(tensor_api::equal(actual->select(0, 2), original->tensor.select(0, 2)));
+            }
+        }
+    }
+
+}
+
+TEST_CASE("Native replacement and normalization retire old automatic companions", "[model][rfdetr][checkpoint][publication]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace io = mmltk::common::io;
+    const mmltk::testsupport::ScopedTempDir root("native-class-bundle");
+    const auto input = root.path() / "input.pt", output = root.path() / "output.pt";
+    const auto companion = fs::path(output.string() + ".classes.json");
+    auto source = make_native_parity_fixture(parity_fixture_cases().front());
+    source.metadata.class_layout = synthetic_training_layout(kParityFixtureNumClasses - 1);
+    r::save_native_checkpoint(input, source);
+    const auto restore_output = [&] {
+        fs::copy_file(input, output, fs::copy_options::overwrite_existing);
+        std::ofstream descriptor(companion);
+        descriptor << r::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(output)), source.metadata.class_layout});
+    };
+    restore_output();
+    const auto previous = io::sha256_file(output);
+    CHECK_THROWS(r::normalize_checkpoint_to_native(input, output, companion));
+    CHECK(io::sha256_file(output) == previous);
+    CHECK(fs::exists(companion));
+    r::save_native_checkpoint(output, source);
+    CHECK_FALSE(fs::exists(companion));
+    CHECK(r::decode_model_state(output).metadata.class_layout == source.metadata.class_layout);
+    restore_output();
+    r::normalize_checkpoint_to_native(input, output);
+    CHECK_FALSE(fs::exists(companion));
+    CHECK(r::decode_model_state(output).metadata.class_layout == source.metadata.class_layout);
+}
+
+TEST_CASE("Direct ONNX export replaces an old automatic companion with embedded layout", "[model][rfdetr][layout][gpu]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace io = mmltk::common::io;
+    const mmltk::testsupport::ScopedTempDir root("onnx-export-bundle");
+    auto source = make_native_parity_fixture(parity_fixture_cases().front());
+    source.metadata.class_layout = synthetic_training_layout(kParityFixtureNumClasses - 1);
+    const auto weights = root.path() / "model.native.pt";
+    const auto output = root.path() / "model.onnx";
+    const auto companion = std::filesystem::path(output.string() + ".classes.json");
+    r::save_native_checkpoint(weights, source);
+    { std::ofstream old(output); old << "old producer bytes"; }
+    { std::ofstream descriptor(companion); descriptor << r::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(output)), source.metadata.class_layout}); }
+    r::ExportOnnxRequest request;
+    request.weights_path = weights;
+    request.output_path = output;
+    request.resolution = 64;
+    request.simplify = true;
+    r::export_onnx(request);
+    CHECK_FALSE(std::filesystem::exists(companion));
+    const auto info = r::load_onnx_model_info(output);
+    CHECK(info.class_layout == source.metadata.class_layout);
+    CHECK(r::admit_artifact_class_layout(output, info.num_classes, info.class_layout, *io::try_file_digests(output, false)) == source.metadata.class_layout);
+    CHECK(r::rfdetr_output_roles(info).size() == info.outputs.size());
+}

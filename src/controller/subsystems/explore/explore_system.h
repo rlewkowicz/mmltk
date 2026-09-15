@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "src/controller/contracts/application_boundary.h"
-#include "src/controller/contracts/artifact_catalog.h"
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/controller/contracts/explore_filter.h"
 #include "src/controller/contracts/integration_control.h"
 #include "src/controller/presentation/visual_system_types.h"
@@ -93,7 +93,7 @@ struct ExploreDatasetFacts final {
     std::uint32_t image_width = 0U;
     std::uint32_t image_height = 0U;
     ExploreClassCatalogIdentity class_catalog_identity = 0U;
-    [[= mmltk::frameworks::reflection::MaxItems{kExploreClassCapacity}]] std::vector<contracts::ArtifactClassName> class_names{};
+    [[= mmltk::frameworks::reflection::MaxItems{kExploreClassCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName> class_names{};
     [[= mmltk::frameworks::reflection::MaxItems{kExploreClassCapacity}]] std::vector<contracts::AnnotationColor> palette{};
 };
 struct ExploreLabel final {

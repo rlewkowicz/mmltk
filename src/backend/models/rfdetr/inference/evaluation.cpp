@@ -36,8 +36,7 @@ EvaluationRunResult run_evaluation(const EvaluateRequest& request) {
     result.image_count = validation_result.images;
     result.category_count = validation_result.categories;
     result.result = backend_result;
-    result.artifacts = describe_inference_artifact(options, resolve_inference_artifact(options, backend_name),
-                                                   static_cast<std::uint32_t>(options.resolution));
+    result.artifacts = backend_result.artifacts;
     return result;
 }
 

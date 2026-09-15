@@ -161,8 +161,8 @@ bool LiveCompositor::process_latest() {
                             static_cast<int>(source.height)},
                 .instances = {reinterpret_cast<const float*>(annotation.boxes_xyxy.address),
                               reinterpret_cast<const std::uint8_t*>(annotation.colors_rgb.address),
-                              reinterpret_cast<const int*>(annotation.category_ids.address), static_cast<int>(annotation.value_count)},
-                .masks = annotation.masks.address == 0U ? nullptr : reinterpret_cast<const bool*>(annotation.masks.address),
+                              reinterpret_cast<const int*>(annotation.class_references.address), static_cast<int>(annotation.value_count)},
+                .masks = !annotation.masks_available ? nullptr : reinterpret_cast<const bool*>(annotation.masks.address),
                 .mask_alpha = 115U,
                 .box_thickness = 2,
                 .stream = slot->stream};

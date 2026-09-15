@@ -23,6 +23,7 @@ module;
 #include <vector>
 
 #include "src/common/io/json_file.h"
+#include "src/backend/data/catalog/class_catalog.h"
 
 module mmltk.backend.imaging.annotation.core;
 
@@ -432,6 +433,21 @@ AnnotationObject annotation_object_from_scene_record(const json& record, Annotat
     return object;
 }
 
+int validate_categories(const AnnotationCategories& categories) {
+    std::vector<std::string> names;
+    names.reserve(categories.items.size());
+    int base = 1;
+    for (const auto& item : categories.items) { names.push_back(item.name); if (item.id == 0) base = 0; }
+    const mmltk::backend::data::catalog::ClassCatalog catalog(std::move(names));
+    std::array<bool, mmltk::backend::data::catalog::kClassCatalogCapacity> ids{};
+    for (const auto& item : categories.items) {
+        if (item.id < base || static_cast<std::size_t>(item.id - base) >= categories.items.size() || ids[item.id - base])
+            throw std::invalid_argument("annotation category IDs must be unique, dense, and start at zero or one");
+        ids[item.id - base] = true;
+    }
+    return base;
+}
+
 std::string normalized_path_string(const std::filesystem::path& path) {
     if (path.empty()) { return {}; }
     try {
@@ -450,20 +466,24 @@ AnnotationCategories load_annotation_categories(const std::filesystem::path& out
     if (!stream.is_open()) { throw std::runtime_error("failed to open annotation categories: " + categories_path.string()); }
     const json parsed = json::parse(stream);
     const auto meta = parsed.find("meta");
-    if (meta == parsed.end() || !meta->is_object()) { throw std::runtime_error("annotation categories file is missing object `meta`"); }
-    validate_annotation_categories_meta(*meta);
-    if (const auto dataset_name = meta->find("dataset_name"); dataset_name != meta->end() && dataset_name->is_string()) {
-        categories.dataset_name = dataset_name->get<std::string>();
+    if (meta != parsed.end()) {
+        if (!meta->is_object()) throw std::runtime_error("annotation categories meta must be an object");
+        validate_annotation_categories_meta(*meta);
+        if (const auto dataset_name = meta->find("dataset_name"); dataset_name != meta->end() && dataset_name->is_string())
+            categories.dataset_name = dataset_name->get<std::string>();
     }
 
     const auto classes = parsed.find("classes");
     if (classes == parsed.end() || !classes->is_array()) {
         throw std::runtime_error("annotation categories file is missing array `classes`");
     }
+    if (classes->size() > mmltk::backend::data::catalog::kClassCatalogCapacity)
+        throw std::invalid_argument("annotation category catalog exceeds capacity");
     categories.items.clear();
+    categories.items.reserve(classes->size());
     for (const auto& entry : *classes) {
         AnnotationCategory category;
-        category.id = entry.value("id", static_cast<int>(categories.items.size()) + 1);
+        category.id = entry.at("id").get<int>();
         category.name = entry.value("name", std::string{});
         if (const auto keypoints = entry.find("keypoints"); keypoints != entry.end() && keypoints->is_array()) {
             category.keypoints = keypoints->get<std::vector<std::string>>();
@@ -479,18 +499,24 @@ AnnotationCategories load_annotation_categories(const std::filesystem::path& out
         }
         categories.items.push_back(std::move(category));
     }
+    static_cast<void>(validate_categories(categories));
     return categories;
 }
 
 std::size_t ensure_annotation_category(AnnotationCategories& categories, const std::string& class_name) {
     const auto found = std::ranges::find_if(categories.items, [&](const AnnotationCategory& item) { return item.name == class_name; });
     if (found != categories.items.end()) { return static_cast<std::size_t>(std::distance(categories.items.begin(), found)); }
-    const int next_id = categories.items.empty() ? 1 : categories.items.back().id + 1;
+    const int base = validate_categories(categories);
+    if (!mmltk::backend::data::catalog::ClassName{class_name}.valid() ||
+        categories.items.size() == mmltk::backend::data::catalog::kClassCatalogCapacity)
+        throw std::invalid_argument("invalid annotation category addition");
+    const int next_id = base + static_cast<int>(categories.items.size());
     categories.items.emplace_back(next_id, class_name);
     return categories.items.size() - 1U;
 }
 
 void write_annotation_categories(const std::filesystem::path& output_root, const AnnotationCategories& categories) {
+    static_cast<void>(validate_categories(categories));
     std::filesystem::create_directories(output_root);
     json payload;
     payload["meta"] = {
@@ -526,15 +552,18 @@ std::vector<AnnotationObject> load_annotation_scene_objects(const std::filesyste
     std::ifstream stream(scene_jsonl_path);
     if (!stream.is_open()) { throw std::runtime_error("failed to open annotation scene JSONL: " + scene_jsonl_path.string()); }
 
+    std::optional<AnnotationCategories> candidate;
+    if (categories) candidate = *categories;
     std::vector<AnnotationObject> objects;
     std::string line;
     while (std::getline(stream, line)) {
         if (line.empty()) { continue; }
         const json record = json::parse(line);
-        AnnotationObject object = annotation_object_from_scene_record(record, categories);
+        AnnotationObject object = annotation_object_from_scene_record(record, candidate ? &*candidate : nullptr);
         object.object_id = next_annotation_object_id(objects.size());
         objects.push_back(std::move(object));
     }
+    if (candidate) *categories = std::move(*candidate);
     return objects;
 }
 
@@ -573,6 +602,7 @@ std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_fra
 AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, const AnnotationFrame& frame,
                                            AnnotationCategories& categories, const std::vector<AnnotationObject>& objects,
                                            const bool live_mode, const AnnotationProjectedScene* projected_scene) {
+    static_cast<void>(validate_categories(categories));
     if (config.output_root.empty()) { throw std::runtime_error("annotation output root must not be empty"); }
     const std::vector<AnnotationResolvedObject> resolved_objects =
         resolve_annotation_objects(frame, categories, objects, live_mode, projected_scene);

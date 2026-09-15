@@ -79,6 +79,7 @@ struct InfoCliRequest final {
 };
 
 struct NormalizeWeightsRequest final {
+    [[= reflection::MaxBytes{reflection::kMaximumPathBytes}]] std::filesystem::path class_layout_path;
     [[= reflection::MaxBytes{reflection::kMaximumPathBytes}]] std::filesystem::path input_path;
     [[= reflection::MaxBytes{reflection::kMaximumPathBytes}]] std::filesystem::path output_path;
 };
@@ -116,12 +117,14 @@ inline constexpr std::array kInfoOptions{
     reflection::option<InfoCliRequest, &InfoCliRequest::tensorrt_path>("--tensorrt", "TensorRT engine path", "Model input"),
     reflection::option<InfoCliRequest, &InfoCliRequest::device_id>("--device-id", "CUDA device id", "Execution")};
 
-inline constexpr std::array kNormalizeOptions{reflection::option<NormalizeWeightsRequest, &NormalizeWeightsRequest::input_path>(
+inline constexpr std::array kNormalizeOptions{reflection::option<NormalizeWeightsRequest, &NormalizeWeightsRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
+                                              reflection::option<NormalizeWeightsRequest, &NormalizeWeightsRequest::input_path>(
                                                   "--input", "Input upstream checkpoint", "Input and output"),
                                               reflection::option<NormalizeWeightsRequest, &NormalizeWeightsRequest::output_path>(
                                                   "--output", "Output native checkpoint", "Input and output")};
 
 inline constexpr std::array kBuildEngineOptions{
+    reflection::option<rfdetr::BuildEngineRequest, &rfdetr::BuildEngineRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::option<rfdetr::BuildEngineRequest, &rfdetr::BuildEngineRequest::onnx_path>("--onnx", "ONNX model path", "Input and output"),
     reflection::option<rfdetr::BuildEngineRequest, &rfdetr::BuildEngineRequest::output_path>("--output", "Output TensorRT engine path",
                                                                                              "Input and output"),
@@ -134,6 +137,7 @@ inline constexpr std::array kBuildEngineOptions{
                                                                                             "Execution", {}, "--no-fp16")};
 
 inline constexpr std::array kExportOnnxOptions{
+    reflection::option<rfdetr::ExportOnnxRequest, &rfdetr::ExportOnnxRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::option<rfdetr::ExportOnnxRequest, &rfdetr::ExportOnnxRequest::weights_path>("--weights", "RF-DETR checkpoint path",
                                                                                             "Input and output"),
     reflection::option<rfdetr::ExportOnnxRequest, &rfdetr::ExportOnnxRequest::output_path>(
@@ -152,6 +156,7 @@ inline constexpr std::array kExportOnnxOptions{
         "--simplify", "Run ONNX validation", "Execution")};
 
 inline constexpr std::array kEvaluateOptions{
+    reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::negative_flag<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading",
                                                                                                  "Execution"),
     reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::numa_node>("--numa-node", "GPU-local NUMA node (-1 automatic)",
@@ -183,6 +188,7 @@ inline constexpr std::array kEvaluateOptions{
                                                                                             "Execution")};
 
 inline constexpr std::array kPredictOptions{
+    reflection::option<rfdetr::PredictRequest, &rfdetr::PredictRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::option<PredictCliRequest, reflection::member_path<&PredictCliRequest::request, &rfdetr::PredictRequest::numa_node>>(
         "--numa-node", "GPU-local NUMA node (-1 automatic)", "Execution"),
     reflection::negative_flag<PredictCliRequest,
@@ -229,6 +235,7 @@ inline constexpr std::array kPredictOptions{
         "--compile-mode", "Native compilation mode", "Execution")};
 
 inline constexpr std::array kValidateOptions{
+    reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::negative_flag<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading",
                                                                                                  "Execution"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::numa_node>("--numa-node", "GPU-local NUMA node (-1 automatic)",
@@ -318,6 +325,7 @@ void emit_train_integer_list(std::vector<std::string>& arguments, const TrainCli
 }
 
 inline constexpr std::array kTrainOptions{
+    reflection::option<TrainCliRequest, &TrainCliRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::negative_flag<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::h2d_dataloader>>(
         "--gdrcopy", "Use GDRCopy image loading", "Execution"),
     reflection::custom_option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::numa_nodes>,
@@ -541,7 +549,7 @@ inline constexpr std::array kTrainOptions{
         "--dist-store-file", "Rendezvous file", "Distributed (internal)")};
 
 [[nodiscard]] consteval bool train_descriptor_relation_is_complete() {
-    static_assert(kTrainOptions.size() == 81U);
+    static_assert(kTrainOptions.size() == 82U);
     using Relation = reflection::catalog_provider_relation<rfdetr::TrainRecipeCatalog>;
     constexpr auto selector = reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::optimizer>;
     std::array<reflection::ReflectedMemberIdentity, Relation::member_count> relation_identities{};
@@ -1019,7 +1027,7 @@ int dispatch_command(const rfdetr::RfdetrCommandDescriptor& descriptor, const st
             }
             request.input_path = std::filesystem::absolute(request.input_path).lexically_normal();
             request.output_path = std::filesystem::absolute(request.output_path).lexically_normal();
-            const auto checkpoint = rfdetr::normalize_checkpoint_to_native(request.input_path, request.output_path);
+            const auto checkpoint = rfdetr::normalize_checkpoint_to_native(request.input_path, request.output_path, request.class_layout_path);
             if (logging::enabled(spdlog::level::info)) {
                 logging::info("rfdetr.cli", [&](auto& current) {
                     current.info("rfdetr.normalize-weights: wrote {} tensors for preset={} to {}", checkpoint.tensor_count(),

@@ -16,7 +16,7 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/terminal_presentation.h"
 
-#include "src/controller/contracts/artifact_catalog.h"
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/controller/contracts/workflows.h"
 namespace mmltk::controller::contracts {
 
@@ -38,13 +38,13 @@ struct ArtifactSplitFact final {
     std::uint32_t height = 0U;
     std::uint32_t channels = 0U;
     std::uint32_t max_instances_per_image = 0U;
-    [[= mmltk::frameworks::reflection::MaxItems{kArtifactCatalogCapacity}]] std::vector<ArtifactClassName> class_names;
+    [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::data::catalog::kClassCatalogCapacity}]] std::vector<mmltk::backend::data::catalog::ClassName> class_names;
     [[nodiscard]] bool valid() const noexcept {
         if (path.empty() || path.size() > kArtifactPathCapacity || image_count == 0U || width == 0U || height == 0U || channels == 0U ||
-            class_names.empty() || class_names.size() > kArtifactCatalogCapacity)
+            class_names.empty() || class_names.size() > mmltk::backend::data::catalog::kClassCatalogCapacity)
             return false;
         for (const auto& name : class_names)
-            if (name.value.empty() || name.value.size() > kArtifactClassNameCapacity) return false;
+            if (!name.valid()) return false;
         return true;
     }
     bool operator==(const ArtifactSplitFact&) const = default;

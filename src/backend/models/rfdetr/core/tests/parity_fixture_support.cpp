@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "checkpoint_fixture_support/parity_fixture_support.h"
 
 #include <stdexcept>
@@ -49,6 +50,7 @@ DecodedNativeModelState make_native_parity_fixture(const ParityFixtureCase& fixt
     checkpoint.metadata.source_kind = "golden-fixture";
     checkpoint.metadata.source_path = fixture.upstream_filename;
     checkpoint.metadata.num_classes = kParityFixtureNumClasses;
+    checkpoint.metadata.class_layout = unresolved_class_layout(kParityFixtureNumClasses);
     checkpoint.metadata.num_queries = fixture.query_rows / 13;
     checkpoint.metadata.num_select = fixture.query_rows / 13;
     auto& entries = detail::model_state_owner(checkpoint).entries;
@@ -66,6 +68,7 @@ void assert_matches_native_parity_fixture(const DecodedNativeModelState& checkpo
     require(checkpoint.metadata.source_kind == "golden-fixture", "fixture source kind mismatch");
     require(checkpoint.metadata.source_path == fixture.upstream_filename, "fixture source path mismatch");
     require(checkpoint.metadata.num_classes == kParityFixtureNumClasses, "fixture class count mismatch");
+    require(checkpoint.metadata.class_layout == unresolved_class_layout(kParityFixtureNumClasses), "fixture class layout mismatch");
     require(checkpoint.metadata.num_queries == fixture.query_rows / 13, "fixture query count mismatch");
     const auto& entries = detail::model_state_owner(checkpoint).entries;
     require(entries.size() == 4, "fixture state_dict size mismatch");

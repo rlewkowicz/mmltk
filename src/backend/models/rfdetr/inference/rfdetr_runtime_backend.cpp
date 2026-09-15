@@ -8,9 +8,13 @@ module;
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
+#include "src/common/io/file_digest.h"
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -37,6 +41,7 @@ import mmltk.backend.ml.cuda.torch_scope;
 // CLEANUP-IGNORE: The runtime backend's artifact resolver starts a distinct import suffix from validation
 // orchestration.
 import mmltk.backend.models.rfdetr.core.artifact_resolution;
+import mmltk.backend.models.rfdetr.model_export;
 
 namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
@@ -119,7 +124,6 @@ namespace {
     for (std::size_t index = 0U; index < runtime_info.output_count; ++index) {
         info.outputs.push_back(project_runtime_tensor(runtime_info.outputs[index]));
     }
-    infer_rfdetr_output_layout(info);
     return info;
 }
 
@@ -216,6 +220,7 @@ ModelArtifactRequest select_inference_artifact(const ModelArtifactRequest& artif
     ModelArtifactRequest selected;
     selected.preset_name = artifacts.preset_name;
     selected.resolution = artifacts.resolution;
+    selected.class_layout_path = artifacts.class_layout_path;
     switch (resolved.kind) {
         case InferenceArtifactKind::Weights:
             selected.weights_path = resolved.path;
@@ -277,6 +282,10 @@ struct OutputStorage final {
 };
 
 struct RfdetrRuntimeBackend::State final {
+    std::shared_ptr<const ResolvedClassLayout> layout;
+    std::vector<RfdetrNamedOutputRole> output_roles;
+    std::string artifact_sha256;
+    std::unique_ptr<ClassPostprocessLane> classes;
     std::optional<std::size_t> masks;
     std::size_t logits = std::numeric_limits<std::size_t>::max();
     std::size_t boxes = std::numeric_limits<std::size_t>::max();
@@ -285,7 +294,7 @@ struct RfdetrRuntimeBackend::State final {
 };
 
 RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBackend> lane, std::string backend_name,
-                                           std::uint32_t static_resolution, std::size_t maximum_detections)
+                                           std::uint32_t static_resolution, std::size_t maximum_detections, std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::string artifact_sha256)
     : lane_(std::move(lane)),
       backend_name_(std::move(backend_name)),
       static_resolution_(static_resolution),
@@ -295,29 +304,23 @@ RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBacke
     if (!lane_) {
         throw std::invalid_argument("invalid RF-DETR runtime options");
     }
+    state_->layout = std::move(layout);
+    state_->output_roles = std::move(output_roles);
+    state_->artifact_sha256 = std::move(artifact_sha256);
+    state_->layout->require_execution();
+    state_->classes = std::make_unique<ClassPostprocessLane>(state_->layout);
+    struct Preparation { ClassPostprocessLane* classes; int device; } preparation{state_->classes.get(), lane_->device()};
+    mmltk::backend::ml::cuda::run_on_torch_cuda_stream(lane_->device(), lane_->command_stream().native_handle, &preparation, [](void* opaque) {
+        auto& call = *static_cast<Preparation*>(opaque);
+        call.classes->Prepare(tensor_api::Device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(call.device)));
+    });
     const auto& model = lane_->model_info();
-    for (std::size_t index = 0U; index < model.output_count; ++index) {
-        const auto& output = model.outputs[index];
-        if (output.shape.rank == 4U && normalized_backend_name(output.name).find("mask") != std::string::npos && !state_->masks) {
-            state_->masks = index;
-            continue;
-        }
-        if (output.shape.rank != 3U) { throw std::invalid_argument("RF-DETR standard outputs must be rank-three"); }
-        const auto name = normalized_backend_name(output.name);
-        if (name.find("box") != std::string::npos && output.shape.extents[2] == 4 &&
-            state_->boxes == std::numeric_limits<std::size_t>::max()) {
-            state_->boxes = index;
-        } else if (name.find("logit") != std::string::npos && output.shape.extents[2] > 0 &&
-                   state_->logits == std::numeric_limits<std::size_t>::max()) {
-            state_->logits = index;
-        } else {
-            throw std::invalid_argument("RF-DETR output layout is not logits plus boxes");
-        }
-    }
-    if (model.output_count != (state_->masks ? 3U : 2U) || state_->logits == std::numeric_limits<std::size_t>::max() ||
-        state_->boxes == std::numeric_limits<std::size_t>::max()) {
-        throw std::invalid_argument("RF-DETR requires exactly logits and boxes outputs");
-    }
+    auto projected = project_runtime_model(model, backend_name_);
+    apply_rfdetr_output_roles(projected, state_->output_roles);
+    const auto roles = validate_rfdetr_output_layout(projected);
+    state_->logits = roles.logits;
+    state_->boxes = roles.boxes;
+    state_->masks = roles.masks;
     const auto& logits = model.outputs[state_->logits];
     const auto& boxes = model.outputs[state_->boxes];
     if ((logits.element_type != runtime::RuntimeElementType::Float16 && logits.element_type != runtime::RuntimeElementType::Float32) ||
@@ -347,6 +350,8 @@ bool RfdetrRuntimeBackend::has_masks() const noexcept { return state_->masks.has
 const runtime::RuntimeShape& RfdetrRuntimeBackend::logits_shape() const noexcept { return model_info().outputs[state_->logits].shape; }
 std::uint32_t RfdetrRuntimeBackend::static_resolution() const noexcept { return static_resolution_; }
 
+const std::string& RfdetrRuntimeBackend::artifact_sha256() const noexcept { return state_->artifact_sha256; }
+const std::shared_ptr<const ResolvedClassLayout>& RfdetrRuntimeBackend::class_layout() const noexcept { return state_->layout; }
 std::int32_t RfdetrRuntimeBackend::device() const noexcept { return lane_->device(); }
 
 std::uintptr_t RfdetrRuntimeBackend::stream() const noexcept { return lane_->command_stream().native_handle; }
@@ -369,17 +374,20 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
         const auto& logits = lane_->model_info().outputs[state_->logits];
         const auto capacity = PredictionCapacity::Resolve(std::min(maximum_detections_, annotation.value_capacity),
             static_cast<std::size_t>(batch), logits.shape.extents[1], logits.shape.extents[2], annotation.source_region.width,
-            annotation.source_region.height, annotation.masks.address != 0U).candidates;
-        if (!annotation.source_region.valid() || capacity == 0U) {
+            annotation.source_region.height, annotation.masks.address != 0U, state_->layout->eligible_slots().size()).candidates;
+        if (!annotation.source_region.valid()) {
             throw std::invalid_argument("RF-DETR annotation region or capacity is invalid");
         }
-        validate_annotation_buffer(annotation.boxes_xyxy, runtime::AnalysisElementType::Float32, capacity * 4U * sizeof(float), 2U,
+        if (capacity != 0U) validate_annotation_buffer(annotation.boxes_xyxy, runtime::AnalysisElementType::Float32, capacity * 4U * sizeof(float), 2U,
                                    static_cast<std::uint32_t>(capacity), 4U, "box");
-        validate_annotation_buffer(annotation.category_ids, runtime::AnalysisElementType::Int32, capacity * sizeof(std::int32_t), 1U,
+        if (capacity != 0U) validate_annotation_buffer(annotation.class_references, runtime::AnalysisElementType::Int32, capacity * sizeof(std::int32_t), 1U,
                                    static_cast<std::uint32_t>(capacity), 0U, "category");
-        validate_annotation_buffer(annotation.confidences, runtime::AnalysisElementType::Float32, capacity * sizeof(float), 1U,
+        if (capacity != 0U) validate_annotation_buffer(annotation.confidences, runtime::AnalysisElementType::Float32, capacity * sizeof(float), 1U,
                                    static_cast<std::uint32_t>(capacity), 0U, "confidence");
         annotation.value_count = 0U;
+        annotation.masks_available = false;
+        annotation.class_domain = state_->layout->domain();
+        annotation.class_catalog = state_->layout->catalog();
     }
 
     struct Context final {
@@ -444,7 +452,8 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                     for (std::size_t index = 0U; index < bound_call.annotations.size(); ++index) {
                         auto& annotation = bound_call.annotations[index];
                         const auto limit = std::min({bound_owner.maximum_detections_, annotation.value_capacity,
-                                                     static_cast<std::size_t>(logits.size(1) * logits.size(2))});
+                                                     static_cast<std::size_t>(logits.size(1) * bound_owner.state_->layout->eligible_slots().size())});
+                        if (limit == 0) { if (!bound_call.selections.empty()) bound_call.selections[index] = {}; continue; }
                         const auto& region = annotation.source_region;
                         auto selected = select_output_batch_fixed_size(
                             OutputTensors{
@@ -452,7 +461,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                                 .pred_boxes = all_boxes.narrow(0, static_cast<std::int64_t>(index), 1),
                                 .pred_masks = bound_call.include_masks && bound_owner.state_->masks ? std::optional{bound_call.outputs->tensors[*bound_owner.state_->masks].narrow(0, static_cast<std::int64_t>(index), 1)} : std::nullopt,
                             },
-                            region.height, region.width, static_cast<std::int64_t>(limit));
+                            region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->classes.get());
                         PostprocessedBatch processed{selected.scores, selected.labels, selected.boxes, std::nullopt};
                         if (!bound_call.selections.empty()) {
                             auto& custody = bound_owner.state_->selections[index];
@@ -476,6 +485,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                         auto labels = processed.labels[0].to(tensor_api::kInt);
                         auto xyxy = processed.boxes[0].to(tensor_api::kFloat);
                         const auto count = static_cast<std::size_t>(scores.size(0));
+                        if (count == 0U) continue;
 
                         const auto cuda_options = tensor_api::TensorOptions().device(tensor_api::kCUDA, bound_device);
                         const std::array<std::int64_t, 2> boxes_shape{static_cast<std::int64_t>(count), 4};
@@ -483,7 +493,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                         tensor_api::from_blob(reinterpret_cast<void*>(annotation.boxes_xyxy.address), tensor_api::IntArrayRef{boxes_shape},
                                               cuda_options.dtype(tensor_api::kFloat))
                             .copy_(xyxy);
-                        tensor_api::from_blob(reinterpret_cast<void*>(annotation.category_ids.address),
+                        tensor_api::from_blob(reinterpret_cast<void*>(annotation.class_references.address),
                                               tensor_api::IntArrayRef{values_shape}, cuda_options.dtype(tensor_api::kInt))
                             .copy_(labels);
                         tensor_api::from_blob(reinterpret_cast<void*>(annotation.confidences.address),
@@ -498,17 +508,18 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                             const std::array<std::int64_t, 3> mask_shape{static_cast<std::int64_t>(count), region.height, region.width};
                             tensor_api::from_blob(reinterpret_cast<void*>(annotation.masks.address), tensor_api::IntArrayRef{mask_shape},
                                                   cuda_options.dtype(tensor_api::kUInt8)).copy_((*processed.masks)[0]);
+                            annotation.masks_available = true;
                         }
                         if (annotation.colors_rgb.address != 0U) {
-                            build_instance_colors_async(reinterpret_cast<const std::int32_t*>(annotation.category_ids.address), count,
-                                                        static_cast<int>(logits.size(2)),
+                            build_instance_colors_async(reinterpret_cast<const std::int32_t*>(annotation.class_references.address), count,
+                                                        static_cast<int>(bound_owner.state_->layout->semantic() ? bound_owner.state_->layout->catalog()->size() : bound_owner.state_->layout->output_width()),
                                                         reinterpret_cast<std::uint8_t*>(annotation.colors_rgb.address),
                                                         reinterpret_cast<cudaStream_t>(bound_stream));
                         }
                     }
                     for (auto& annotation : bound_call.annotations) {
                         annotation.value_count = std::min({bound_owner.maximum_detections_, annotation.value_capacity,
-                                                           static_cast<std::size_t>(logits.size(1) * logits.size(2))});
+                                                           static_cast<std::size_t>(logits.size(1) * bound_owner.state_->layout->eligible_slots().size())});
                     }
                 });
             },
@@ -530,12 +541,15 @@ void RfdetrRuntimeBackend::ReleaseAfterCompletion(runtime::RuntimeSubmission&& s
 
 runtime::RuntimeStatus RfdetrRuntimeBackend::Close() noexcept { return lane_->Close(); }
 
+std::span<const RfdetrNamedOutputRole> RfdetrRuntimeBackend::output_roles() const noexcept { return state_->output_roles; }
+
 std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane() const {
     return std::shared_ptr<RfdetrRuntimeBackend>(
-        new RfdetrRuntimeBackend(lane_->MakeLane(), backend_name_, static_resolution_, maximum_detections_));
+        new RfdetrRuntimeBackend(lane_->MakeLane(), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->artifact_sha256));
 }
 
 std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options) {
+    if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};
     if (!options.command_stream) { throw std::invalid_argument("RF-DETR runtime command stream is invalid"); }
     const auto artifact = resolve_inference_artifact(options.artifacts, options.backend);
     runtime::RuntimeBackendKind kind;
@@ -551,16 +565,44 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
         default:
             throw_invalid_artifact_kind();
     }
+    const auto digests = options.admitted_file ? std::optional{*options.admitted_file} : mmltk::common::io::try_file_digests(artifact.path, false, [&] { return options.stop.stop_requested(); });
+    if (!digests) throw ArtifactPublicationCancelled{};
+    digests->snapshot.RequireUnchanged(artifact.path);
+    std::optional<ModelClassLayout> embedded;
+    const auto descriptors = read_artifact_class_descriptors(artifact.path, *digests, options.artifacts.class_layout_path);
+    auto output_roles = class_descriptor_output_roles(descriptors);
+    if (artifact.kind == InferenceArtifactKind::Onnx || artifact.compile_onnx_to_tensorrt) {
+        const auto inspected = load_onnx_model_info(artifact.path, output_roles);
+        embedded = inspected.class_layout;
+        output_roles = rfdetr_output_roles(inspected);
+    }
+    std::unique_ptr<ClassArtifactPublication> publication;
+    std::filesystem::path staged_engine;
+    if (!options.save_compiled_model_path.empty()) {
+        publication = std::make_unique<ClassArtifactPublication>(options.save_compiled_model_path, options.artifacts.class_layout_path);
+        staged_engine = publication->staged_artifact();
+    }
+    if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};
     auto lane = runtime::make_runtime_backend({.kind = kind,
                                                .model_path = artifact.path,
-                                               .save_compiled_model_path = options.save_compiled_model_path,
+                                               .save_compiled_model_path = staged_engine,
                                                .device = options.device,
                                                .command_stream = options.command_stream,
                                                .allow_fp16 = options.allow_fp16});
+    if (options.stop.stop_requested()) throw ArtifactPublicationCancelled{};
     validate_static_resolution(lane->model_info(), options.static_resolution);
     const auto resolution = static_cast<std::uint32_t>(lane->model_info().input.shape.extents[2]);
-    return std::shared_ptr<RfdetrRuntimeBackend>(
-        new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections));
+    auto info = project_runtime_model(lane->model_info(), artifact.backend_name);
+    apply_rfdetr_output_roles(info, output_roles);
+    static_cast<void>(validate_rfdetr_output_layout(info));
+    output_roles = rfdetr_output_roles(info);
+    auto layout = std::make_shared<const ResolvedClassLayout>(admit_artifact_class_layout(artifact.path,
+        info.num_classes, embedded, *digests, options.artifacts.class_layout_path, &descriptors));
+    auto result = std::shared_ptr<RfdetrRuntimeBackend>(
+        new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, mmltk::common::io::sha256_hex(digests->sha256)));
+    if (publication) publication->Publish(ModelClassDescriptor{1U, {}, layout->record(), output_roles}, [&] { return options.stop.stop_requested(); });
+
+    return result;
 }
 
 std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(const RfdetrRuntimeBackendOptions& options,
@@ -600,6 +642,9 @@ ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, const in
     ModelInfo info;
     try {
         info = project_runtime_model(backend->model_info(), backend->backend_name());
+        apply_rfdetr_output_roles(info, backend->output_roles());
+        static_cast<void>(validate_rfdetr_output_layout(info));
+        info.class_layout = backend->class_layout()->record();
     } catch (...) {
         close_runtime_backend(*backend, "RF-DETR TensorRT inspection close");
         throw;
@@ -615,19 +660,27 @@ void build_tensorrt_engine(const BuildEngineRequest& request) {
     build_tensorrt_engine(request, {.native_handle = stream, .valid = true});
 }
 
-void build_tensorrt_engine(const BuildEngineRequest& request, const runtime::BorrowedCommandStream command_stream) {
+void build_tensorrt_engine(const BuildEngineRequest& request, const runtime::BorrowedCommandStream command_stream,
+    std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file, const std::stop_token stop) {
+    if (stop.stop_requested()) return;
     validate_build_engine_request(request);
-    auto backend = make_rfdetr_runtime_backend({
-        .artifacts = request,
-        .backend = "tensorrt",
-        .device = request.device_id,
-        .command_stream = command_stream,
-        .static_resolution = request.resolution > 0 ? static_cast<std::uint32_t>(request.resolution) : 0U,
-        .maximum_detections = 500U,
-        .save_compiled_model_path = std::filesystem::absolute(request.output_path),
-        .allow_fp16 = request.allow_fp16,
-    });
-    close_runtime_backend(*backend, "RF-DETR TensorRT engine close");
+    try {
+        auto backend = make_rfdetr_runtime_backend({
+            .artifacts = request,
+            .backend = "tensorrt",
+            .device = request.device_id,
+            .command_stream = command_stream,
+            .static_resolution = request.resolution > 0 ? static_cast<std::uint32_t>(request.resolution) : 0U,
+            .maximum_detections = 500U,
+            .save_compiled_model_path = std::filesystem::absolute(request.output_path),
+            .allow_fp16 = request.allow_fp16,
+            .admitted_file = std::move(admitted_file),
+            .stop = stop,
+        });
+        close_runtime_backend(*backend, "RF-DETR TensorRT engine close");
+    } catch (const ArtifactPublicationCancelled&) {
+        // Staging is discarded; the caller translates its stop into cancellation.
+    }
 }
 
 }  // namespace mmltk::backend::models::rfdetr

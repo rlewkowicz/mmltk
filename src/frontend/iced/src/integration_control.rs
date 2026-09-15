@@ -3204,7 +3204,7 @@ pub struct Controller {
     copy_before: Option<crate::generated::AnnotationObject>,
     copy_after: Option<crate::generated::AnnotationObject>,
     copy_objects: usize,
-    copy_categories: Vec<crate::generated::ArtifactClassName>,
+    copy_categories: Vec<crate::generated::ClassName>,
     gallery_completion_held: Option<(u64, u32)>,
     sweep_baseline: Option<(u64, crate::generated::ExploreViewport)>,
     explore_dataset_pane: Option<Rectangle>,

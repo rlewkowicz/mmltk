@@ -429,7 +429,7 @@ ANNOTATION_TEST_CASE(test_load_annotation_categories_rejects_missing_required_sc
     const fs::path categories_path = temp_root / "categories.json";
 
     write_text_file(categories_path, R"({"classes":[]})");
-    expect_runtime_error_contains([&]() { (void)load_annotation_categories(temp_root); }, "missing object `meta`");
+    REQUIRE(load_annotation_categories(temp_root).items.empty());
 
     write_text_file(categories_path,
                     R"({
@@ -582,3 +582,31 @@ ANNOTATION_TEST_CASE(test_scene_round_trip_preserves_skeleton_topology) {
 }
 
 }  // namespace
+
+ANNOTATION_TEST_CASE(test_dense_source_catalog_reorder_preserves_jsonl_meaning) {
+    const ScopedTempDir temporary{"mmltk-test-source-catalog"};
+    const auto root = temporary.path();
+    write_text_file(root / "categories.json", R"({"classes":[{"id":2,"name":"dog","keypoints":["nose"],"skeleton_edges":[]},{"id":1,"name":"background"}]})");
+    auto categories = load_annotation_categories(root);
+    REQUIRE(categories.items[0].id == 2);
+    REQUIRE(categories.items[1].id == 1);
+    REQUIRE(categories.items[0].keypoints == std::vector<std::string>{"nose"});
+    REQUIRE(ensure_annotation_category(categories, "cat") == 2U);
+    REQUIRE(categories.items[2].id == 3);
+    write_annotation_categories(root, categories);
+    const auto reopened = load_annotation_categories(root);
+    REQUIRE(reopened.items[0].id == 2);
+    REQUIRE(reopened.items[1].name == "background");
+    REQUIRE(reopened.items[2].name == "cat");
+    write_text_file(root / "empty.jsonl", "");
+    REQUIRE(load_annotation_scene_objects(root / "empty.jsonl", &categories).empty());
+    REQUIRE(categories.items.size() == 3U);
+    for (const auto text : {
+        R"({"classes":[{"id":0,"name":"same"},{"id":1,"name":"same"}]})",
+        R"({"classes":[{"id":1,"name":"a"},{"id":1,"name":"b"}]})",
+        R"({"classes":[{"id":1,"name":"a"},{"id":3,"name":"b"}]})",
+        R"({"classes":[{"id":0,"name":""}]})"}) {
+        write_text_file(root / "categories.json", text);
+        REQUIRE_THROWS(load_annotation_categories(root));
+    }
+}

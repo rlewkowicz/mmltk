@@ -51,7 +51,7 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
     return impl_->resources.Run(
         [this, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
             operation.device_id = impl_->resources.device();
-            std::shared_ptr<const std::vector<std::string>> classes;
+            std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
             int class_count = 0;
             std::uint64_t sequence = 0U;
             const auto result = impl_->session.RunAndWrite(operation, stream, {
@@ -63,8 +63,8 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
                 .begin = [&](const auto& summary) {
                     if (!products) return;
                     try {
-                        classes = std::make_shared<const std::vector<std::string>>(summary.class_names);
-                        class_count = summary.artifacts.config.num_classes;
+                        classes = summary.class_catalog;
+                        class_count = summary.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground ? static_cast<int>(summary.class_catalog->size()) : summary.artifacts.config.num_classes;
                     } catch (const std::exception& error) {
                         if (products) products(std::unexpected{std::string{error.what()}});
                     }
@@ -349,10 +349,10 @@ class PredictSystem::Impl final {
             const auto& classes = product.raw->classes();
             labels.reserve(product.raw->predictions().size());
             for (const auto& detection : product.raw->predictions()) {
-                const auto category = detection.category_id - 1;
-                labels.push_back({{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.score,
+                const auto category = detection.class_reference;
+                labels.push_back({{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.class_domain, detection.score,
                     category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
-                    category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category] : std::to_string(detection.category_id)});
+                    detection.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground && category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category] : std::string{}});
                 const auto& label = labels.back();
                 if (!label.box.valid() || !label.color.valid() || !std::isfinite(label.confidence) || label.name.size() > mmltk::frameworks::reflection::kMaximumNameBytes)
                     throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");

@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "src/backend/data/benchmark_hash.h"
+#include "src/common/io/file_digest.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "worker_queue.h"
@@ -350,7 +351,7 @@ void require_archive_setup(archive* reader, const int status, const char* operat
 }  // namespace
 
 std::string cached_image_selection_digest(const std::span<const std::uint64_t> image_ids) {
-    return sha256_hex(sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(image_ids.data()), image_ids.size_bytes())));
+    return mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(image_ids.data()), image_ids.size_bytes())));
 }
 
 std::filesystem::path cached_image_path(const std::filesystem::path& root, const std::uint64_t image_id) {

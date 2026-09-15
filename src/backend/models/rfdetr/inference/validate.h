@@ -19,6 +19,7 @@
 namespace mmltk::backend::models::rfdetr {
 
 struct ValidationBackendResult {
+    ResolvedModelArtifacts artifacts;
     ModelInfo model_info;
     EvalSummary summary;
     PhaseTiming timing;

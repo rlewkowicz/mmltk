@@ -4195,7 +4195,7 @@ mod tests {
                 let previous = model.explore.snapshot.as_mut().unwrap();
                 previous.dataset.identity = 9;
                 previous.overlay.showlabels = true;
-                previous.scene.categories = vec![crate::generated::ArtifactClassName {
+                previous.scene.categories = vec![crate::generated::ClassName {
                     value: "predecessor".into(),
                 }];
                 previous.scene.objects = vec![annotation_object(0)];

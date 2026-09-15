@@ -80,13 +80,14 @@ struct ModelSelectionArtifactTransform final {
     }
 };
 
-template <auto Source, auto Input, auto Preset, auto Resolution, auto Artifact, auto... Predicate>
+template <auto Source, auto Input, auto Preset, auto Resolution, auto Artifact, auto Layout, auto... Predicate>
 struct ModelSelectionRelationRow {
     static constexpr auto source = Source;
     static constexpr auto input = Input;
     static constexpr auto preset = Preset;
     static constexpr auto resolution = Resolution;
     static constexpr auto artifact = Artifact;
+    static constexpr auto class_layout = Layout;
     static constexpr auto predicate = std::tuple{Predicate...};
     using artifact_relation = mmltk::frameworks::reflection::StaticMemberRelation<
         GuiSettingsState, GuiSettingsState, 1U,
@@ -105,7 +106,9 @@ struct TrainWeightsModelSelection final
                                 member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
                                             &mmltk::backend::models::rfdetr::TrainRequest::resolution>,
                                 member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                            &mmltk::backend::models::rfdetr::TrainRequest::weights_path>> {
+                                            &mmltk::backend::models::rfdetr::TrainRequest::weights_path>,
+                                member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
+                                            &mmltk::backend::models::rfdetr::TrainRequest::class_layout_path>> {
     inline static constexpr FeatureId workflow = FeatureId::Train;
     inline static constexpr ModelArtifactInputKind input_kind = ModelArtifactInputKind::Weights;
     inline static constexpr ModelSelectionCompatibility compatibility =
@@ -122,7 +125,8 @@ struct ValidateModelSelection
                       &mmltk::backend::models::rfdetr::ValidateRequest::preset_name>,
           member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
                       &mmltk::backend::models::rfdetr::ValidateRequest::resolution>,
-          Artifact> {
+          Artifact, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
+                      &mmltk::backend::models::rfdetr::ValidateRequest::class_layout_path>> {
     inline static constexpr FeatureId workflow = FeatureId::Validate;
     inline static constexpr ModelArtifactInputKind input_kind = Input;
 };
@@ -161,7 +165,8 @@ struct PredictModelSelection
                                             &mmltk::backend::models::rfdetr::PredictRequest::preset_name>,
                                 member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
                                             &mmltk::backend::models::rfdetr::PredictRequest::resolution>,
-                                Artifact> {
+                                Artifact, member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
+                                            &mmltk::backend::models::rfdetr::PredictRequest::class_layout_path>> {
     inline static constexpr FeatureId workflow = FeatureId::Predict;
     inline static constexpr ModelArtifactInputKind input_kind = Input;
 };
@@ -199,7 +204,7 @@ struct ExportModelSelection
           member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_input>,
           member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::preset_name>,
           member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::model_resolution>, Artifact,
-          Predicate> {
+          member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::class_layout_path>, Predicate> {
     inline static constexpr FeatureId workflow = FeatureId::Export;
     inline static constexpr ModelArtifactInputKind input_kind = Input;
 };

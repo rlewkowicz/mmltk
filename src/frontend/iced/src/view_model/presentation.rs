@@ -1011,7 +1011,7 @@ mod tests {
             box_: crate::generated::AnnotationBox {
                 first: crate::generated::AnnotationPoint { x: 0.0, y: 0.0 },
                 second: crate::generated::AnnotationPoint { x: 4.0, y: 4.0 },
-            }, category: 0, confidence: 0.75,
+            }, classreference: 0, classdomain: crate::generated::ClassReferenceDomain::Foreground, confidence: 0.75,
             color: crate::generated::AnnotationColor { hue: 0.0, saturation: 1.0, value: 1.0 },
             name: "retained".into(),
         };

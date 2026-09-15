@@ -112,6 +112,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
+        mmltk::backend::models::rfdetr::export
         mmltk_acceptance_support
         mmltk::backend::models::rfdetr::augmentation
         mmltk::backend::models::rfdetr::contract

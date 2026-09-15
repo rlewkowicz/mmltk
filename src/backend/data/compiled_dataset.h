@@ -9,6 +9,8 @@
 #include <system_error>
 #include <vector>
 #include "src/backend/data/compiled_format.h"
+#include "src/backend/data/catalog/class_catalog.h"
+#include <memory>
 #include "src/backend/data/image_resize.h"
 #include "src/common/io/file_memory.h"
 
@@ -42,6 +44,7 @@ class CompiledDataset {
     [[nodiscard]] const std::filesystem::path& path() const noexcept;
     [[nodiscard]] const mmltk::backend::data::FileHeader& header() const noexcept;
     [[nodiscard]] std::span<const std::string> class_names() const noexcept;
+    [[nodiscard]] const std::shared_ptr<const catalog::ClassCatalog>& class_catalog() const noexcept { return catalog_; }
     [[nodiscard]] std::span<const mmltk::backend::data::ImageEntry> image_entries() const noexcept;
     [[nodiscard]] std::span<const mmltk::backend::data::PackedInstance> labels() const noexcept;
     [[nodiscard]] std::span<const mmltk::backend::data::RLEPair> rle_pairs() const noexcept;
@@ -77,7 +80,7 @@ class CompiledDataset {
     std::span<const mmltk::backend::data::ImageEntry> image_entries_;
     std::span<const mmltk::backend::data::PackedInstance> labels_;
     std::span<const mmltk::backend::data::RLEPair> rle_pairs_;
-    std::vector<std::string> class_names_;
+    std::shared_ptr<const catalog::ClassCatalog> catalog_;
     std::vector<LabelIndexEntry> label_index_;
 };
 

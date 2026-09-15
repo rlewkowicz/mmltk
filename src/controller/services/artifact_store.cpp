@@ -2,7 +2,7 @@
 
 #include <curl/curl.h>
 #include <fcntl.h>
-#include <openssl/evp.h>
+#include "src/common/io/file_digest.h"
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -205,21 +205,13 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
 }
 
 [[nodiscard]] std::optional<std::string_view> invalid_inspected_split(const mmltk::backend::data::CompiledDatasetInfo& info) {
-    constexpr std::size_t kCompiledClassNameCapacity =
-        std::tuple_size_v<decltype(mmltk::backend::data::FileHeader::class_names)::value_type> - 1U;
     const std::string path = info.path.string();
     if (path.empty() || path.size() > contracts::kArtifactPathCapacity)
         return "compiled artifact path exceeds the reflected protocol capacity";
     if (info.image_count == 0U || info.width == 0U || info.height == 0U || info.channels == 0U) {
         return "compiled artifact has invalid image geometry";
     }
-    if (info.class_names.empty() || info.class_names.size() > contracts::kArtifactCatalogCapacity ||
-        info.class_names.size() > mmltk::backend::data::MAX_CLASSES) {
-        return "compiled artifact class catalog exceeds the protocol capacity";
-    }
-    for (const std::string& name : info.class_names) {
-        if (name.empty() || name.size() > kCompiledClassNameCapacity) { return "compiled artifact class name exceeds the format capacity"; }
-    }
+    if (!info.class_catalog || info.class_catalog->empty()) return "compiled artifact class catalog is empty";
     return std::nullopt;
 }
 
@@ -234,7 +226,7 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
     }
     const auto* catalog = mmltk::backend::models::rfdetr::find_preset_catalog_entry(preset);
     if (catalog == nullptr) return rejected_inspection("unknown RF-DETR preset");
-    std::vector<std::string> classes;
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> classes;
     for (const auto& path : paths) {
         if (path.empty()) continue;
         if (cancellation.requested()) return rejected_inspection("artifact inspection cancelled");
@@ -244,8 +236,8 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
             if (info.width != info.height || info.channels != 3U || (resolution != 0U && info.width != resolution)) {
                 return rejected_inspection("compiled artifact does not match the configured square RGB resolution");
             }
-            if (!classes.empty() && classes != info.class_names) return rejected_inspection("compiled artifact class catalogs differ");
-            classes = info.class_names;
+            if (classes && !classes->ordered_equal(*info.class_catalog)) return rejected_inspection("compiled artifact class catalogs differ");
+            classes = info.class_catalog;
             if (result.splits.size() >= contracts::kArtifactSplitCapacity) {
                 return rejected_inspection("compiled artifact split count exceeds fixed capacity");
             }
@@ -257,7 +249,7 @@ const RuntimeArtifactCompilerOperations kRuntimeArtifactCompilerOperations;
                                                                 .channels = info.channels,
                                                                 .max_instances_per_image = info.max_instances_per_image,
                                                                 .class_names = {}});
-            for (const std::string& name : info.class_names)
+            for (const std::string& name : info.class_names())
                 split.class_names.push_back({.value = name});
         } catch (const std::exception& error) { return rejected_inspection(error.what()); }
     }
@@ -369,31 +361,9 @@ void RuntimeArtifactWeightOperations::download(const std::string_view url, const
                                                           : std::string("canonical weight download failed: ") + curl_easy_strerror(result));
 }
 std::string md5_file(const std::filesystem::path& path, const ArtifactCancellationToken& cancellation) {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) throw std::runtime_error("cannot open staged RF-DETR weights");
-    EVP_MD_CTX* context = EVP_MD_CTX_new();
-    if (!context) throw std::runtime_error("cannot allocate weight checksum context");
-    const auto cleanup = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>{context, EVP_MD_CTX_free};
-    if (EVP_DigestInit_ex(context, EVP_md5(), nullptr) != 1) throw std::runtime_error("cannot initialize weight checksum");
-    std::array<char, 64U * 1024U> buffer{};
-    while (input) {
-        if (cancellation.cancelled()) throw std::runtime_error("canonical weight acquisition cancelled");
-        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-        const auto size = input.gcount();
-        if (size > 0 && EVP_DigestUpdate(context, buffer.data(), static_cast<std::size_t>(size)) != 1)
-            throw std::runtime_error("cannot update weight checksum");
-    }
-    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
-    unsigned int length = 0U;
-    if (EVP_DigestFinal_ex(context, digest.data(), &length) != 1) throw std::runtime_error("cannot finalize weight checksum");
-    static constexpr char hex[] = "0123456789abcdef";
-    std::string result;
-    result.reserve(length * 2U);
-    for (unsigned int i = 0; i < length; ++i) {
-        result.push_back(hex[digest[i] >> 4U]);
-        result.push_back(hex[digest[i] & 0x0fU]);
-    }
-    return result;
+    const auto digests = mmltk::common::io::try_file_digests(path, true, [&] { return cancellation.cancelled(); });
+    if (!digests) throw std::runtime_error("canonical weight acquisition cancelled");
+    return digests->md5;
 }
 }  // namespace
 

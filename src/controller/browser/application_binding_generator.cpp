@@ -821,12 +821,12 @@ class BindingEmitter final {
         output_ << "];\n";
         ReserveGeneratedStruct("ModelArtifactDialogFact", "canonical model artifact dialogs",
                                {"target", "stable_field_id", "source_field_id", "input_field_id", "preset_field_id", "resolution_field_id",
-                                "predicate_field_id", "field_path", "title", "filter", "pattern"});
+                                "class_layout_field_id", "predicate_field_id", "field_path", "title", "filter", "pattern"});
         symbols_.Reserve("module", "MODEL_ARTIFACT_DIALOGS", "canonical model artifact dialogs");
         output_ << "#[derive(Debug, Clone, PartialEq)]\n"
                    "pub struct ModelArtifactDialogFact { pub target: ModelArtifactTarget, "
                    "pub stable_field_id: u64, pub source_field_id: u64, pub input_field_id: u64, "
-                   "pub preset_field_id: u64, pub resolution_field_id: u64, "
+                   "pub preset_field_id: u64, pub resolution_field_id: u64, pub class_layout_field_id: u64, "
                    "pub predicate_field_id: Option<u64>, "
                    "pub field_path: &'static str, pub title: &'static str, "
                    "pub filter: &'static str, pub pattern: &'static str }\n"
@@ -838,6 +838,7 @@ class BindingEmitter final {
             constexpr auto input_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::input>();
             constexpr auto preset_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::preset>();
             constexpr auto resolution_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::resolution>();
+            constexpr auto layout_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::class_layout>();
             output_ << "ModelArtifactDialogFact { target: ModelArtifactTarget { stableid: " << stable_id
                     << ", workflow: FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.workflow), true)
                     << ", input: ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
@@ -846,6 +847,7 @@ class BindingEmitter final {
                     << ", input_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(input_path.view())
                     << ", preset_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(preset_path.view())
                     << ", resolution_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(resolution_path.view())
+                    << ", class_layout_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(layout_path.view())
                     << ", predicate_field_id: ";
             if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U) {
                 output_ << "None";

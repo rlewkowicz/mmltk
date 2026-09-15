@@ -14,6 +14,8 @@
 #include "subprocess_test_utils.hpp"
 #include "filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/contract/weight_catalog.h"
 
 namespace mmltk::backend::models::rfdetr::testsupport {
@@ -71,11 +73,6 @@ inline void remove_if_exists(const fs::path& path) {
     fs::remove(path, error);
 }
 
-inline std::string first_whitespace_delimited_token(const std::string& text) {
-    const size_t end = text.find_first_of(" \t\r\n");
-    return end == std::string::npos ? text : text.substr(0, end);
-}
-
 inline void run_checked(const std::vector<std::string>& args, std::string_view step_name) {
     const auto result = mmltk::testsupport::run_subprocess_capture_output(args);
     if (result.exit_code == 0) { return; }
@@ -84,34 +81,18 @@ inline void run_checked(const std::vector<std::string>& args, std::string_view s
 }
 
 inline std::string md5_of_file(const fs::path& path) {
-    const auto result = mmltk::testsupport::run_subprocess_capture_output({"md5sum", path.string()});
-    if (result.exit_code != 0) { throw std::runtime_error("md5sum failed for " + path.string() + "\n" + result.output_text); }
-    return first_whitespace_delimited_token(result.output_text);
+    return mmltk::common::io::try_file_digests(path, true)->md5;
 }
 
-inline bool validate_onnx_model(const fs::path& onnx_path) {
-    if (!is_nonempty_regular_file(onnx_path)) { return false; }
-    const mmltk::testsupport::ScopedTempDir diagnostics("mmltk_onnx_validation");
-    const auto diagnostic_path = diagnostics.path() / "metadata.log";
-    const auto result = mmltk::testsupport::run_subprocess_capture_output({
-        mmltk::testsupport::mmltk_cli_path(),
-        "--log-level=info",
-        "--log-file=" + diagnostic_path.string(),
-        "rfdetr",
-        "info",
-        "--onnx",
-        onnx_path.string(),
-    });
-    if (result.exit_code != 0) return false;
-    std::ifstream stream(diagnostic_path);
-    if (!stream.is_open()) return false;
-    const std::string metadata{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
-    return !stream.bad() && metadata.find("output: pred_logits ") != std::string::npos &&
-           metadata.find("output: pred_boxes ") != std::string::npos;
-}
+bool validate_onnx_model(const fs::path& onnx_path);
 
 inline bool validate_tensorrt_engine(const fs::path& tensorrt_path) {
     if (!is_nonempty_regular_file(tensorrt_path)) { return false; }
+    try {
+        const auto descriptor = read_class_descriptor(tensorrt_path.string() + ".classes.json");
+        if (descriptor.artifact_sha256 != mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(tensorrt_path)) ||
+            !ResolvedClassLayout(descriptor.layout).semantic()) return false;
+    } catch (const std::exception&) { return false; }
     const auto result = mmltk::testsupport::run_subprocess_capture_output({
         mmltk::testsupport::mmltk_cli_path(),
         "rfdetr",
@@ -165,7 +146,12 @@ inline void ensure_downloaded_weight(const fs::path& output_path, const WeightAs
 }
 
 inline void ensure_native_checkpoint(const fs::path& upstream_weights_path, const fs::path& native_checkpoint_path) {
-    if (is_nonempty_regular_file_newer_than(native_checkpoint_path, upstream_weights_path)) { return; }
+    if (is_nonempty_regular_file_newer_than(native_checkpoint_path, upstream_weights_path)) {
+        try {
+            const auto checkpoint = decode_model_state(native_checkpoint_path);
+            if (is_native_checkpoint_file(native_checkpoint_path) && ResolvedClassLayout(checkpoint.metadata.class_layout).semantic()) return;
+        } catch (const std::exception&) {}
+    }
 
     regenerate_file_atomically(native_checkpoint_path, "RF-DETR native checkpoint export",
                                [&upstream_weights_path](const fs::path& temp_path) {
@@ -205,19 +191,10 @@ inline void ensure_exported_onnx(const fs::path& native_checkpoint_path, const f
 inline void ensure_built_tensorrt_engine(const fs::path& onnx_path, const fs::path& tensorrt_path) {
     if (is_nonempty_regular_file_newer_than(tensorrt_path, onnx_path) && validate_tensorrt_engine(tensorrt_path)) { return; }
 
-    regenerate_file_atomically(tensorrt_path, "RF-DETR TensorRT build", [&onnx_path](const fs::path& temp_path) {
-        return std::vector<std::string>{
-            mmltk::testsupport::mmltk_cli_path(),
-            "rfdetr",
-            "build-engine",
-            "--onnx",
-            onnx_path.string(),
-            "--output",
-            temp_path.string(),
-            "--device-id",
-            "0",
-        };
-    });
+    // The RF-DETR writer owns engine/companion publication as one checked bundle.
+    run_checked({mmltk::testsupport::mmltk_cli_path(), "rfdetr", "build-engine", "--onnx", onnx_path.string(),
+        "--output", tensorrt_path.string(), "--device-id", "0"}, "RF-DETR TensorRT build");
+    if (!validate_tensorrt_engine(tensorrt_path)) throw std::runtime_error("invalid generated RF-DETR engine bundle");
 }
 
 inline CachedModelAssets ensure_cached_model_assets(std::string_view preset_name = "rf-detr-nano") {

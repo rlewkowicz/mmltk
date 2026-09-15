@@ -24,6 +24,8 @@ pub enum Message {
     SourceSelected(ModelSelectionSource),
     InputSelected(ModelArtifactInputKind),
     BrowseRequested,
+    BrowseClassLayout,
+    ClassLayoutEdited(String),
     ConfirmArtifact { path: String, generation: u64 },
     CancelArtifact(u64),
     ExportBuildChanged(bool),
@@ -170,6 +172,20 @@ impl Component {
                     )],
                 )?)
             }
+            Message::ClassLayoutEdited(value) => {
+                let draft = settings.draft.as_ref().ok_or_else(|| "Model settings are unavailable.".to_owned())?;
+                let projection = projection(draft, self.workflow)?;
+                Outcome::SettingsEdited(settings.edit_fields(EditCadence::Debounced, [(
+                    projection.fields.class_layout_field_id, crate::generated::SettingsFieldValue::String(value)
+                )])?)
+            }
+            Message::BrowseClassLayout => {
+                let draft = settings.draft.as_ref().ok_or_else(|| "Model settings are unavailable.".to_owned())?;
+                let projection = projection(draft, self.workflow)?;
+                Outcome::BrowseRequested(crate::generated::FileDialogTarget::SettingsFieldTarget(
+                    crate::generated::SettingsFieldTarget { stableid: projection.fields.class_layout_field_id }
+                ))
+            }
             Message::BrowseRequested => {
                 let draft = settings
                     .draft
@@ -290,6 +306,7 @@ pub struct State<'a> {
     pub source: ModelSelectionSource,
     pub input: ModelArtifactInputKind,
     pub artifact: String,
+    pub class_layout_path: String,
     pub artifact_field_id: u64,
     pub build_tensorrt: bool,
     pub model: Option<&'a ModelUiState>,
@@ -343,6 +360,7 @@ impl<'a> State<'a> {
             .and_then(|value| value.artifact_field)
             .or_else(|| train_custom_row.and_then(|row| dialog_for_row(row).ok()))
             .map_or(0, |dialog| dialog.stable_field_id);
+        let class_layout_path = projection.as_ref().map_or_else(String::new, |value| value.class_layout_path.clone());
         let artifact = projection.map_or_else(String::new, |value| value.artifact);
         Self {
             workflow,
@@ -351,6 +369,7 @@ impl<'a> State<'a> {
             input,
             artifact,
             artifact_field_id,
+            class_layout_path,
             build_tensorrt,
             model,
             file_dialog,
@@ -508,7 +527,15 @@ pub(crate) fn status_presentation(state: Option<&ModelUiState>) -> StatusPresent
     };
     StatusPresentation {
         label: label.to_owned(),
-        detail: state.terminal.detail.clone(),
+        detail: if state.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted {
+            let layout = &state.selection.classlayout;
+            let meaning = match layout.domain {
+                crate::generated::ClassReferenceDomain::Foreground => format!("{} foreground classes", layout.foregroundcount),
+                crate::generated::ClassReferenceDomain::RawOutputSlot => "Raw output slots; class identity unresolved".to_owned(),
+            };
+            format!("{meaning} · {} outputs · {} background · {} unused · {:?}",
+                layout.outputcount, layout.backgroundcount, layout.unusedcount, layout.provenance.origin)
+        } else { state.terminal.detail.clone() },
         tone,
     }
 }
@@ -739,12 +766,19 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
             )
         },
     );
+    let class_layout = column![
+        text("Class layout (optional)"),
+        iced::widget::text_input("Embedded or companion metadata", &state.class_layout_path)
+            .on_input_maybe(state.settings_enabled.then_some(Message::ClassLayoutEdited)),
+        button("Browse class layout").on_press_maybe(state.settings_enabled.then_some(Message::BrowseClassLayout)),
+    ].spacing(super::FIELD_SPACING);
     let title = card_title(state.workflow);
     let body = if state.workflow == FeatureId::Train {
         column![
             train_selector.expect("Train has one weights selector"),
             status(state.model),
             artifact,
+            class_layout,
             iced::widget::container(progress)
                 .id(progress_id(state.workflow))
                 .padding(iced::Padding {
@@ -761,6 +795,7 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
             source,
             inputs,
             artifact,
+            class_layout,
             iced::widget::container(progress)
                 .id(progress_id(state.workflow))
                 .padding(iced::Padding {
