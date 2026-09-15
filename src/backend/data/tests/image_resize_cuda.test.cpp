@@ -3,6 +3,8 @@
 #include "src/backend/data/image_resize_cuda.h"
 #include "src/backend/data/detail/perceptual_downscale_completion.h"
 #include "src/backend/data/tests/perceptual_downscale_reference.h"
+#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
@@ -190,6 +192,25 @@ TEST_CASE("CUDA perceptual custody survives caller release and teardown", "[back
     }
     REQUIRE(weak.expired());
     REQUIRE(maximum_error(fixture.download(output,fixture.stream),reference(source,2,3))<=1.0/255+1e-12);
+}
+TEST_CASE("CUDA perceptual identity preserves aliases and padded copies in every format", "[backend][data][image_resize][perceptual][cuda]") {
+    if(!has_cuda()) SKIP("CUDA unavailable; identity-copy acceptance is not established");
+    CudaFixture fixture;
+    GpuPerceptualDownscaler resizer(*fixture.context_owner,fixture.retirement);
+    for(auto format:formats) {
+        Image source(17,13,format,3),shape(17,13,format,5);
+        source.fill(7);
+        auto input=fixture.upload(source),output=std::make_shared<DeviceImage>(shape.layout);
+        resizer.downscale(input->read(),input->write(),fixture.stream,input,input);
+        const auto alias=fixture.download(input,fixture.stream);
+        REQUIRE(std::memcmp(alias.storage.data(),source.storage.data(),source.layout.capacity_bytes)==0);
+        cuda_check(cudaMemsetAsync(output->pixels,0xCD,output->layout.capacity_bytes,fixture.stream));
+        resizer.downscale(input->read(),output->write(),fixture.stream,input,output);
+        const auto actual=fixture.download(output,fixture.stream);
+        REQUIRE(maximum_error(actual,source)==0);
+        REQUIRE(padding_intact(actual));
+        resizer.finish();
+    }
 }
 TEST_CASE("CUDA perceptual central variance keeps both threshold branches", "[backend][data][image_resize][perceptual][cuda]") {
     if(!has_cuda()) SKIP("CUDA unavailable; numerical acceptance is not established");

@@ -1,5 +1,7 @@
 #include "src/backend/data/image_resize.h"
 #include "src/backend/data/detail/perceptual_downscale.h"
+#include "src/backend/data/detail/perceptual_downscale_views.h"
+#include "src/common/math/checked_arithmetic.h"
 
 #include <immintrin.h>
 
@@ -228,15 +230,18 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
         throw std::runtime_error("RgbImageResizer dimensions must be positive");
     }
     if (src_width == dst_width && src_height == dst_height) {
-        if (dst != src) std::memcpy(dst, src, perceptual::checked_product(perceptual::checked_product(src_width,src_height),3));
+        if (dst != src) {
+            const auto pixels=common::math::checked_multiply<std::size_t>(src_width,src_height,"perceptual image extent overflow");
+            std::memcpy(dst,src,common::math::checked_multiply(pixels,3,"perceptual image extent overflow"));
+        }
         return;
     }
 
     if (impl_->perceptual_enabled && dst_width <= src_width && dst_height <= src_height) {
         const auto layout = [](int width,int height) {
-            const auto row=perceptual::checked_product(width,3);
+            const auto row=common::math::checked_multiply<std::size_t>(width,3,"perceptual image extent overflow");
             return RgbImageLayout{static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height),row,0,
-                                  perceptual::checked_product(row,height),RgbPixelFormat::RGB8};
+                                  common::math::checked_multiply(row,height,"perceptual image extent overflow"),RgbPixelFormat::RGB8};
         };
         downscale({src,layout(src_width,src_height)},{dst,layout(dst_width,dst_height)});
         return;

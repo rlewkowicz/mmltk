@@ -75,6 +75,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     dataset_compiler_progress.cpp
     image_resize.cpp
     detail/perceptual_downscale.cpp
+    detail/perceptual_downscale_views.cpp
     mask_rle_utils.cpp
     staging_file_cleanup.cpp)
 mmltk_register_retained_module_importers(mmltk_backend_data
@@ -101,6 +102,7 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_writer.h
     detail/worker_queue.h
     detail/perceptual_downscale.h
+    detail/perceptual_downscale_views.h
     detail/perceptual_downscale_math.h
     detail/perceptual_downscale_completion.h
     detail/dataset_compiler_cuda.h
@@ -145,6 +147,7 @@ target_link_libraries(mmltk_backend_data
         mmltk::common::math
         mmltk::frameworks::reflection
         Threads::Threads
+        CUDA::cudart
     PRIVATE
         mmltk::common::concurrency
         mmltk::common::logging
@@ -159,7 +162,6 @@ target_link_libraries(mmltk_backend_data
         rapidgzip::rapidgzip
         simdjson::simdjson
         stb
-        CUDA::cudart
         CUDA::cuda_driver
         ${MMLTK_TURBOJPEG_LIBRARY}
 )

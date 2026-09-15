@@ -4,8 +4,11 @@
 #include <cuda_runtime_api.h>
 #include <memory>
 #include "src/backend/data/image_resize.h"
-#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
-#include "src/frameworks/gpu/image_buffer.h"
+
+namespace mmltk::frameworks::gpu {
+class DeviceContext;
+class TerminalCudaRetirementAuthority;
+}
 
 namespace mmltk::backend::data {
 // Single issuing thread, with the supplied DeviceContext bound. Pixels and

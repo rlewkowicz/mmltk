@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: MIT
 // Öztireli/Gross (2015) perceptual downscaling; provenance in detail/perceptual_downscale_math.h.
 #include "src/backend/data/image_resize_cuda.h"
-#include "src/backend/data/detail/perceptual_downscale.h"
+#include "src/backend/data/detail/perceptual_downscale_views.h"
+#include "src/backend/data/detail/perceptual_downscale_math.h"
 #include "src/backend/data/detail/perceptual_downscale_completion.h"
+#include "src/common/math/checked_arithmetic.h"
+#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -32,9 +37,11 @@ struct Workspace {
     float* alpha;
 };
 std::size_t workspace_bytes(std::uint32_t width, std::uint32_t height, bool alpha) {
-    const auto axes = checked_product(std::size_t(width)+height,sizeof(Footprint));
-    const auto pixels = checked_product(width,height);
-    const auto planes = checked_product(pixels,sizeof(Moment)+sizeof(Coefficient)+(alpha ? sizeof(float):0));
+    const auto axis_count = common::math::checked_add<std::size_t>(width,height,"perceptual image offset overflow");
+    const auto axes = common::math::checked_multiply(axis_count,sizeof(Footprint),"perceptual image extent overflow");
+    const auto pixels = common::math::checked_multiply<std::size_t>(width,height,"perceptual image extent overflow");
+    const auto planes = common::math::checked_multiply(pixels,sizeof(Moment)+sizeof(Coefficient)+(alpha ? sizeof(float):0),
+                                                      "perceptual image extent overflow");
     if (axes > workspace_limit-sizeof(TransferTable) || planes > workspace_limit-sizeof(TransferTable)-axes)
         throw std::length_error("perceptual CUDA workspace exceeds 256 MiB");
     return sizeof(TransferTable)+axes+planes;
@@ -306,12 +313,11 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
         require_cuda(impl_->completion.order(slot));
         if (identity) {
             if (source.data!=destination.data) {
-                const unsigned planes=source.layout.format==RgbPixelFormat::PlanarUnitSrgbF32 ? 3:1;
-                const unsigned channels=source.layout.format==RgbPixelFormat::RGB8 ? 3:4;
-                for (unsigned plane=0;plane<planes;++plane)
+                const auto geometry=identity_geometry(source.layout);
+                for (unsigned plane=0;plane<geometry.planes;++plane)
                     require_cuda(cudaMemcpy2DAsync(static_cast<std::uint8_t*>(destination.data)+plane*destination.layout.plane_stride_bytes,
                         destination.layout.row_stride_bytes,static_cast<const std::uint8_t*>(source.data)+plane*source.layout.plane_stride_bytes,
-                        source.layout.row_stride_bytes,std::size_t(source.layout.width)*channels,source.layout.height,cudaMemcpyDeviceToDevice,stream));
+                        source.layout.row_stride_bytes,geometry.row_bytes,source.layout.height,cudaMemcpyDeviceToDevice,stream));
             }
         } else {
             const bool grow=required>impl_->capacity;

@@ -1,31 +1,16 @@
 // SPDX-License-Identifier: MIT
 // Öztireli/Gross (2015) perceptual downscaling; provenance in perceptual_downscale_math.h.
 #include "src/backend/data/detail/perceptual_downscale.h"
+#include "src/backend/data/detail/perceptual_downscale_views.h"
+#include "src/common/math/checked_arithmetic.h"
 
 #include <algorithm>
 #include <cstring>
 #include <immintrin.h>
-#include <limits>
-#include <stdexcept>
+#include <new>
 
 namespace mmltk::backend::data::perceptual {
-std::size_t checked_product(std::size_t a, std::size_t b) {
-    if (b && a > std::numeric_limits<std::size_t>::max() / b) throw std::overflow_error("perceptual image extent overflow");
-    return a * b;
-}
 namespace {
-std::size_t checked_add(std::size_t a, std::size_t b) {
-    if (b > std::numeric_limits<std::size_t>::max() - a) throw std::overflow_error("perceptual image offset overflow");
-    return a + b;
-}
-std::size_t row_bytes(const RgbImageLayout& l) {
-    switch(l.format) {
-        case RgbPixelFormat::RGB8: return checked_product(l.width, 3);
-        case RgbPixelFormat::RGBA8:
-        case RgbPixelFormat::PlanarUnitSrgbF32: return checked_product(l.width, 4);
-    }
-    throw std::invalid_argument("unknown perceptual image format");
-}
 void vector_add(__m256 value,__m256& sum,__m256& error) {
     const auto adjusted=_mm256_sub_ps(value,error),next=_mm256_add_ps(sum,adjusted);
     error=_mm256_sub_ps(_mm256_sub_ps(next,sum),adjusted);sum=next;
@@ -87,59 +72,59 @@ void integer_moments8(RgbConstImageView source,const TransferTable& transfer,
         _mm256_storeu_ps(alpha_output,_mm256_mul_ps(_mm256_sub_ps(alpha_sum,alpha_error),inverse));
 }
 }
-std::size_t validate_view(const void* pointer, const RgbImageLayout& l) {
-    if (!pointer || !l.width || !l.height) throw std::invalid_argument("perceptual image requires storage and positive dimensions");
-    const std::size_t row = row_bytes(l);
-    if (l.row_stride_bytes < row) throw std::invalid_argument("perceptual image row stride is too small");
-    std::size_t extent = checked_add(checked_product(l.height-1,l.row_stride_bytes),row);
-    if (l.format == RgbPixelFormat::PlanarUnitSrgbF32) {
-        if (reinterpret_cast<std::uintptr_t>(pointer) % alignof(float) || l.row_stride_bytes % sizeof(float) ||
-            l.plane_stride_bytes % sizeof(float) || l.plane_stride_bytes < extent)
-            throw std::invalid_argument("perceptual float planes overlap or are unaligned");
-        extent = checked_add(checked_product(2,l.plane_stride_bytes),extent);
-    } else if (l.plane_stride_bytes) throw std::invalid_argument("packed perceptual image has a plane stride");
-    if (extent > l.capacity_bytes) throw std::invalid_argument("perceptual image storage is too small");
-    if (extent > std::numeric_limits<std::uintptr_t>::max() - reinterpret_cast<std::uintptr_t>(pointer))
-        throw std::overflow_error("perceptual image address overflow");
-    return extent;
-}
-ValidatedResize validate_pair(RgbConstImageView source, RgbMutableImageView destination) {
-    const auto source_bytes = validate_view(source.data,source.layout), destination_bytes = validate_view(destination.data,destination.layout);
-    if (source.layout.format != destination.layout.format) throw std::invalid_argument("perceptual image formats must match");
-    if (source.layout.width < destination.layout.width || source.layout.height < destination.layout.height)
-        throw std::invalid_argument("perceptual resampling cannot enlarge images");
-    const bool identity = source.layout.width == destination.layout.width && source.layout.height == destination.layout.height;
-    const auto a = reinterpret_cast<std::uintptr_t>(source.data), b = reinterpret_cast<std::uintptr_t>(destination.data);
-    if (a < b + destination_bytes && b < a + source_bytes &&
-        !(identity && a == b && source.layout.row_stride_bytes == destination.layout.row_stride_bytes &&
-          source.layout.plane_stride_bytes == destination.layout.plane_stride_bytes))
-        throw std::invalid_argument("perceptual image input/output storage overlaps");
-    return {source_bytes,destination_bytes,identity};
-}
 void copy_identity(RgbConstImageView source, RgbMutableImageView destination) {
     if (source.data == destination.data) return;
-    const unsigned planes = source.layout.format == RgbPixelFormat::PlanarUnitSrgbF32 ? 3 : 1;
-    const std::size_t bytes = row_bytes(source.layout);
-    for (unsigned plane=0; plane<planes; ++plane)
+    const auto geometry = identity_geometry(source.layout);
+    for (unsigned plane=0; plane<geometry.planes; ++plane)
         for (std::uint32_t y=0; y<source.layout.height; ++y)
             std::memcpy(static_cast<std::uint8_t*>(destination.data)+plane*destination.layout.plane_stride_bytes+y*destination.layout.row_stride_bytes,
-                        static_cast<const std::uint8_t*>(source.data)+plane*source.layout.plane_stride_bytes+y*source.layout.row_stride_bytes,bytes);
+                        static_cast<const std::uint8_t*>(source.data)+plane*source.layout.plane_stride_bytes+y*source.layout.row_stride_bytes,geometry.row_bytes);
 }
 CpuDownscaler::CpuDownscaler() {
     for (unsigned i=0; i<256; ++i) transfer_.linear[i] = decode(float(i)*(1.0F/255.0F));
 }
+void CpuDownscaler::preparation_checkpoint(PreparationStep step) {
+    if (fail_before_ == step) {
+        fail_before_ = PreparationStep::None;
+        throw std::bad_alloc();
+    }
+}
 void CpuDownscaler::prepare(const RgbImageLayout& source, const RgbImageLayout& destination) {
     const auto width = destination.width, height = destination.height;
-    (void)checked_product(width,sizeof(Moment)*2 + sizeof(Coefficient)*2 + sizeof(float)*2);
-    if (source_width_ != source.width || source_height_ != source.height || width_ != width || height_ != height) {
-        x_.resize(width); y_.resize(height);
+    (void)common::math::checked_multiply<std::size_t>(width,sizeof(Moment)*2 + sizeof(Coefficient)*2 + sizeof(float)*2,
+                                                   "perceptual image extent overflow");
+    const bool geometry_changed = !prepared_ || source_width_ != source.width || source_height_ != source.height ||
+                                  width_ != width || height_ != height;
+    const bool alpha_needed = source.format == RgbPixelFormat::RGBA8 &&
+                              (alpha_[0].size() != width || alpha_[1].size() != width);
+    if (!geometry_changed && !alpha_needed) return;
+    // In-place preparation retains useful capacity. Any exception after this
+    // point must force complete axis/row preparation, even for the old key.
+    prepared_ = false;
+    if (geometry_changed) {
+        preparation_checkpoint(PreparationStep::HorizontalAxis);
+        x_.resize(width);
+        preparation_checkpoint(PreparationStep::VerticalAxis);
+        y_.resize(height);
         for (std::uint32_t x=0; x<width; ++x) x_[x] = footprint(source.width,width,x);
         for (std::uint32_t y=0; y<height; ++y) y_[y] = footprint(source.height,height,y);
-        for (auto& row : moments_) row.resize(width);
-        for (auto& row : coefficients_) row.resize(width);
-        source_width_=source.width; source_height_=source.height; width_=width; height_=height;
+        for (unsigned row=0; row<2; ++row) {
+            preparation_checkpoint(row == 0 ? PreparationStep::FirstMoment : PreparationStep::SecondMoment);
+            moments_[row].resize(width);
+        }
+        for (unsigned row=0; row<2; ++row) {
+            preparation_checkpoint(row == 0 ? PreparationStep::FirstCoefficient : PreparationStep::SecondCoefficient);
+            coefficients_[row].resize(width);
+        }
     }
-    if (source.format == RgbPixelFormat::RGBA8) for (auto& row : alpha_) row.resize(width);
+    if (source.format == RgbPixelFormat::RGBA8) {
+        for (unsigned row=0; row<2; ++row) {
+            preparation_checkpoint(row == 0 ? PreparationStep::FirstAlpha : PreparationStep::SecondAlpha);
+            alpha_[row].resize(width);
+        }
+    }
+    source_width_=source.width; source_height_=source.height; width_=width; height_=height;
+    prepared_ = true;
 }
 template<RgbPixelFormat Format, bool Integer>
 void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destination) {
