@@ -3,8 +3,10 @@
 #include <functional>
 #include <optional>
 #include <span>
-#include "src/controller/subsystems/system/compute_systems.h"
-#include "prediction_preview.h"
+#include "src/controller/subsystems/validate/validation_types.h"
+#include "src/controller/presentation/visual_runtime.h"
+#include "src/backend/models/rfdetr/inference/validate.h"
+#include "src/controller/subsystems/system/detail/prediction_preview.h"
 namespace mmltk::controller::detail {
 // Domain storage and rendering only. The validation session remains with its
 // existing CudaSessionRuntimeState execution owner.

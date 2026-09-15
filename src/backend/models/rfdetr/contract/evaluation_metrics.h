@@ -16,6 +16,8 @@
 
 namespace mmltk::backend::models::rfdetr {
 
+inline constexpr std::size_t kValidationSampleCapacity = 6U;
+
 enum class EvaluationMetricKind : std::uint8_t { Box, Mask };
 enum class EvaluationArea : std::uint8_t { All, Small, Medium, Large };
 MMLTK_REFLECT_ENUM(EvaluationMetricKind)

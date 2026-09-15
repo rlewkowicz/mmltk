@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 
@@ -51,16 +52,23 @@ bool StopGate::Wait(std::stop_token stop) {
     return condition_.wait(lock, stop, [this] { return released_; });
 }
 PredictionSource::PredictionSource(VisualExtent extent, Catalog classes)
-    : extent_(extent), classes_(classes ? std::move(classes) : std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>()) {}
+    : extent_(extent), classes_(classes ? std::move(classes) : std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>()) {
+    annotations_.source_region = {.width = extent.width, .height = extent.height};
+    annotations_.class_catalog = classes_;
+    annotations_.class_domain = classes_->empty() ? mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot :
+        mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
+}
 PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution, VisualExtent extent,
-    std::span<const float> pixels, std::vector<Detection> detections, Catalog classes) {
+    std::span<const float> pixels, std::vector<Detection> detections, Catalog classes, std::span<const std::uint8_t> masks) {
     const auto values = pixel_values(extent);
     if (pixels.size() != values || detections.size() > contracts::kAnnotationObjectCapacity)
         throw std::invalid_argument("test source data does not match its geometry");
     const auto pixel_bytes = values * sizeof(float);
     const auto boxes_bytes = detections.size() * 4U * sizeof(float);
     const auto label_bytes = detections.size() * sizeof(std::int32_t);
-    const auto bytes = pixel_bytes + boxes_bytes + label_bytes;
+    if (!masks.empty() && masks.size() != static_cast<std::size_t>(extent.width) * extent.height * detections.size())
+        throw std::invalid_argument("test mask data does not match its geometry");
+    const auto bytes = pixel_bytes + boxes_bytes + label_bytes + masks.size();
     if (bytes > rfdetr::kMaximumPredictionTensorBytes) throw std::invalid_argument("test source is too large");
     std::vector<std::byte> packed(bytes);
     std::memcpy(packed.data(), pixels.data(), pixel_bytes);
@@ -69,6 +77,7 @@ PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution,
         const std::int32_t category = detections[index].class_reference;
         std::memcpy(packed.data() + pixel_bytes + boxes_bytes + index * sizeof(category), &category, sizeof(category));
     }
+    if (!masks.empty()) std::memcpy(packed.data() + pixel_bytes + boxes_bytes + label_bytes, masks.data(), masks.size());
     checked(cudaSetDevice(execution.device));
     auto allocation = std::shared_ptr<DeviceAllocation>(new DeviceAllocation(execution), &DeviceAllocation::Release);
     allocation->context.Bind();
@@ -79,14 +88,11 @@ PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution,
     result.custody_ = std::shared_ptr<void>(allocation, allocation->address);
     result.detections_ = std::move(detections);
     const auto address = reinterpret_cast<std::uintptr_t>(allocation->address);
-    result.annotations_ = {
-        .source_region = {.width = extent.width, .height = extent.height},
-        .value_capacity = result.detections_.size(), .value_count = result.detections_.size(),
-        .boxes_xyxy = {.address = address + pixel_bytes, .capacity_bytes = boxes_bytes},
-        .class_references = {.address = address + pixel_bytes + boxes_bytes, .capacity_bytes = label_bytes}};
-    result.annotations_.class_catalog = result.classes_;
-    result.annotations_.class_domain = result.classes_->empty() ? mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot :
-        mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
+    result.annotations_.value_capacity = result.annotations_.value_count = result.detections_.size();
+    result.annotations_.boxes_xyxy = {.address = address + pixel_bytes, .capacity_bytes = boxes_bytes};
+    result.annotations_.class_references = {.address = address + pixel_bytes + boxes_bytes, .capacity_bytes = label_bytes};
+    result.annotations_.masks_available = !masks.empty();
+    if (!masks.empty()) result.annotations_.masks = {.address = address + pixel_bytes + boxes_bytes + label_bytes, .capacity_bytes = masks.size()};
     return result;
 }
 PredictionSource PredictionSource::Decoded(VisualExtent extent, std::span<const std::uint8_t> pixels, Catalog classes) {
@@ -105,7 +111,9 @@ cudaError_t PredictionReceiverFault::Upload(void* destination, const void* sourc
     const auto copied = cudaMemcpyAsync(destination, source, bytes, kind, stream);
     if (copied != cudaSuccess) return copied;
     auto* fault = receiver_fault.load();
-    if (!fault || !fault->enabled) return cudaSuccess;
+    if (!fault) return cudaSuccess;
+    const auto ordinal = ++fault->uploads;
+    if (!fault->enabled || (fault->fail_upload_at != 0U && fault->fail_upload_at != ordinal)) return cudaSuccess;
     // Actual upload/pinned allocation precede injection; physical test work is
     // settled before the deliberately unobservable receiver outcome is reported.
     const auto settled = cudaStreamSynchronize(stream);
@@ -137,6 +145,91 @@ int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, s
 detail::PredictionPreviewPool::TransferOperations PredictionReceiverFault::Operations() {
     return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &Upload, {}, &Convert};
 }
+namespace {
+class SettlementBackend final : public gpu::ImageCopyBackend {
+ public:
+    explicit SettlementBackend(PredictionSettlementFault& fault) : fault_(fault) {}
+    std::optional<gpu::DeviceExecution> ResolveExecution(int device, int numa)  override {
+        return native_->ResolveExecution(device, numa);
+    }
+    std::uintptr_t CreateContext(int device, gpu::DeviceContextMode mode)  override {
+        return native_->CreateContext(device, mode);
+    }
+    void DestroyContext(int device, gpu::DeviceContextMode mode, std::uintptr_t context) noexcept override {
+        return native_->DestroyContext(device, mode, context);
+    }
+    void BindContext(std::uintptr_t context)  override {
+        return native_->BindContext(context);
+    }
+    std::uintptr_t CreateStream(std::uintptr_t context)  override {
+        const auto stream = native_->CreateStream(context);
+        ++fault_.streams_created;
+        return stream;
+    }
+    void DestroyStream(std::uintptr_t context, std::uintptr_t stream) noexcept override {
+        ++fault_.streams_destroyed;
+        return native_->DestroyStream(context, stream);
+    }
+    std::uintptr_t CreateEvent(std::uintptr_t context)  override {
+        return native_->CreateEvent(context);
+    }
+    void DestroyEvent(std::uintptr_t context, std::uintptr_t event) noexcept override {
+        return native_->DestroyEvent(context, event);
+    }
+    gpu::ImagePlaneView AllocatePlane(std::uintptr_t context, gpu::ImagePlaneKind kind, std::uint32_t width, std::uint32_t height)  override {
+        return native_->AllocatePlane(context, kind, width, height);
+    }
+    void FreePlane(std::uintptr_t context, CUdeviceptr data) noexcept override {
+        return native_->FreePlane(context, data);
+    }
+    void ClearPlane(std::uintptr_t context, std::uintptr_t stream, const gpu::ImagePlaneView& plane)  override {
+        return native_->ClearPlane(context, stream, plane);
+    }
+    std::shared_ptr<void> AllocatePinned(std::uintptr_t context, const mmltk::common::system::ExecutionPlacement* placement, std::size_t bytes)  override {
+        return native_->AllocatePinned(context, placement, bytes);
+    }
+    bool CanAccessPeer(int receiver, int source)  override {
+        return native_->CanAccessPeer(receiver, source);
+    }
+    void WaitEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event)  override {
+        return native_->WaitEvent(context, stream, event);
+    }
+    void CopySameDevice(std::uintptr_t context, std::uintptr_t stream, const gpu::ImagePlaneView& destination, std::uintptr_t source_context, const gpu::ImagePlaneView& source)  override {
+        return native_->CopySameDevice(context, stream, destination, source_context, source);
+    }
+    void CopyPeer(std::uintptr_t context, std::uintptr_t stream, int device, const gpu::ImagePlaneView& destination, std::uintptr_t source_context, int source_device, const gpu::ImagePlaneView& source)  override {
+        return native_->CopyPeer(context, stream, device, destination, source_context, source_device, source);
+    }
+    void CopyDeviceToHost(std::uintptr_t context, const gpu::ImagePlaneView& source, void* destination, std::size_t pitch)  override {
+        return native_->CopyDeviceToHost(context, source, destination, pitch);
+    }
+    void CopyHostToDevice(std::uintptr_t context, std::uintptr_t stream, const void* source, std::size_t pitch, const gpu::ImagePlaneView& destination)  override {
+        return native_->CopyHostToDevice(context, stream, source, pitch, destination);
+    }
+    void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event)  override {
+        return native_->SynchronizeEvent(context, event);
+    }
+    void NotifyStream(std::uintptr_t context, std::uintptr_t stream, StreamNotification& notification)  override {
+        return native_->NotifyStream(context, stream, notification);
+    }
+    void RecordEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) override {
+        native_->RecordEvent(context, stream, event);
+        if (fault_.enabled) fault_.callback_returned = true;
+    }
+    StreamSettlement SettleStream(std::uintptr_t context, std::uintptr_t stream) noexcept override {
+        auto result = native_->SettleStream(context, stream);
+        if (fault_.enabled) {
+            fault_.settlement.receipt().ArriveAndWait();
+            return {.completion_reached = false, .failure = std::make_exception_ptr(std::runtime_error("injected outer settlement"))};
+        }
+        return result;
+    }
+ private:
+    PredictionSettlementFault& fault_;
+    std::shared_ptr<gpu::ImageCopyBackend> native_ = gpu::cuda_image_copy_backend();
+};
+}
+std::shared_ptr<gpu::ImageCopyBackend> PredictionSettlementFault::Backend() { return std::make_shared<SettlementBackend>(*this); }
 PredictionTransferFault::PredictionTransferFault() : previous_(std::exchange(transfer_fault, this)) {}
 PredictionTransferFault::~PredictionTransferFault() { transfer_fault = previous_; }
 void PredictionTransferFault::Reset() { Reset(Selection{}); }

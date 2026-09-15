@@ -1,7 +1,7 @@
 #include "src/common/io/file_digest.h"
 #include "prediction_test_support.h"
+#include "application_data_test_support.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
-#include "src/controller/subsystems/system/detail/validation_samples.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/backend/ml/runtime/backend_factory.h"
@@ -46,7 +46,8 @@
 #include "src/controller/services/file_dialog_system.h"
 #include "src/controller/services/persistence_storage.h"
 #include "src/controller/services/settings_system.h"
-#include "src/controller/subsystems/system/compute_systems.h"
+#include "src/controller/subsystems/validate/validation_system.h"
+#include "src/controller/subsystems/export/export_system.h"
 #include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/detail/predict_revision.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
@@ -123,40 +124,6 @@ class TrainingTerminals final {
     std::atomic_size_t next_ = 0U;
 };
 
-[[nodiscard]] services::SettingsLocation install_settings(const std::filesystem::path& root) {
-    auto settings = contracts::default_gui_settings_state();
-    settings.workflows.train.dataset_source_dir = root / "source";
-    settings.workflows.train.compiled_dataset_dir = root / "compiled";
-    settings.workflows.train.request.train_compiled_path = root / "train.bin";
-    settings.workflows.train.request.val_compiled_path = root / "val.bin";
-    settings.workflows.train.request.test_compiled_path.clear();
-    settings.workflows.train.request.weights_path = root / "weights.pt";
-    settings.workflows.train.request.output_dir = root / "training";
-    settings.workflows.train.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.train.model_input = contracts::ModelArtifactInputKind::Weights;
-    settings.workflows.train.remote_container_image = "mmltk-test";
-    settings.workflows.train.remote_launch_template = "mmltk-test";
-    settings.workflows.validate.request.compiled_path = root / "val.bin";
-    settings.workflows.validate.request.weights_path = root / "weights.pt";
-    settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.validate.model_input = contracts::ModelArtifactInputKind::Weights;
-    settings.workflows.predict.source.compiled_path = (root / "train.bin").string();
-    settings.workflows.predict.request.output_path = root / "prediction.json";
-    settings.workflows.predict.request.weights_path = root / "weights.pt";
-    settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.predict.model_input = contracts::ModelArtifactInputKind::Weights;
-    settings.workflows.export_state.weights_path = root / "weights.pt";
-    settings.workflows.export_state.onnx_input_path = root / "model-input.onnx";
-    settings.workflows.export_state.onnx_output_path = root / "model-output.onnx";
-    settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Onnx;
-    REQUIRE(contracts::gui_settings_valid(settings));
-    const services::SettingsLocation location{(root / "settings.json").string()};
-    REQUIRE(
-        services::save_persistence_settings(location, services::make_persistence_settings_snapshot(std::move(settings)), 1U).succeeded());
-    return location;
-}
-
 void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesystem::path& root) {
     const auto settings_path = root / "settings.json";
     REQUIRE(std::filesystem::remove(settings_path));
@@ -168,16 +135,6 @@ void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesyst
     });
     CHECK_THROWS_AS(settings.Update(std::move(request)), contracts::FailedError);
     CHECK_FALSE(settings.snapshot().settings_state.ui.dark_mode);
-}
-
-[[nodiscard]] contracts::ArtifactSplitFact split(const std::filesystem::path& path) {
-    return {.path = path.string(),
-            .image_count = 1U,
-            .width = 16U,
-            .height = 16U,
-            .channels = 3U,
-            .max_instances_per_image = 1U,
-            .class_names = {{.value = "object"}}};
 }
 
 [[nodiscard]] contracts::ModelSelection export_model_selection(const contracts::GuiSettingsState& settings,
@@ -491,165 +448,6 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
             .location = "US",
             .family = contracts::ProviderGpuFamily::A100};
 }
-
-class FakeDatasetRuntime final : public DatasetRuntime {
-   public:
-    FakeDatasetRuntime(std::shared_ptr<StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
-
-    services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest& request, const std::stop_token stop,
-                                            const std::function<void(const contracts::ArtifactProgress&)>& progress) override {
-        progress(fail_ ? contracts::ArtifactProgress{.phase = static_cast<contracts::ArtifactCompilePhase>(255U),
-                                                     .activity = std::string(contracts::kArtifactProgressTextCapacity + 1U, 'x'),
-                                                     .completed = 2U,
-                                                     .total = 1U}
-                       : contracts::ArtifactProgress{
-                             .phase = contracts::ArtifactCompilePhase::Pixels, .activity = "compiling", .completed = 1U, .total = 2U});
-        if (!gate_->Wait(stop)) return {.output = request.output, .cancelled = true};
-        if (fail_)
-            return {.output = request.output,
-                    .inspection = {.compatible = true,
-                                   .splits = {split(request.output / "train.bin"), split(request.output / "val.bin"),
-                                              split(request.output / "test.bin"), split(request.output / "overflow.bin")},
-                                   .detail = {}}};
-        return {.output = request.output,
-                .inspection = {.compatible = true, .splits = {split(request.output / "train.bin")}, .detail = {}}};
-    }
-
-    contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
-                                          std::string_view, std::uint32_t, std::stop_token) override {
-        contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
-        for (const auto& path : paths)
-            if (!path.empty()) result.splits.push_back(split(path));
-        return result;
-    }
-
-   private:
-    std::shared_ptr<StopGate> gate_;
-    bool fail_ = false;
-};
-
-class BlockingModelRuntime final : public ModelRuntime {
-   public:
-    explicit BlockingModelRuntime(std::shared_ptr<StopGate> gate) : gate_(std::move(gate)) {}
-    ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& custom, int, const std::stop_token stop,
-                        const std::function<void(const contracts::ModelProgress&)>& progress) override {
-        progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "verifying fixture model"});
-        if (!gate_->Wait(stop)) throw std::runtime_error("fixture model selection cancelled");
-        return {.artifact = custom.string()};
-    }
-
-   private:
-    std::shared_ptr<StopGate> gate_;
-};
-
-class ApplicationDataFixture final {
-   public:
-    explicit ApplicationDataFixture(std::filesystem::path root)
-        : root_(std::move(root)),
-          loaded_(root_),
-          dataset_gate_(std::make_shared<StopGate>()),
-          dataset_(loaded_.settings, [gate = dataset_gate_] { return std::make_unique<FakeDatasetRuntime>(gate, false); }),
-          model_(
-              loaded_.settings, [] { auto gate = std::make_shared<StopGate>(); gate->Release(); return std::make_unique<BlockingModelRuntime>(std::move(gate)); },
-              [this](ModelSystem::event_type event) {
-                  if (std::holds_alternative<ModelChanged>(event)) {
-                      {
-                          std::scoped_lock lock(model_mutex_);
-                          model_terminals_.push_back(std::get<ModelChanged>(std::move(event)).snapshot);
-                      }
-                      model_changed_.notify_all();
-                  }
-              }) {
-        dataset_gate_->Release();
-    }
-
-    void PrepareModel(const contracts::FeatureId workflow = contracts::FeatureId::Train) {
-        std::ofstream(root_ / "train.bin").put('\0');
-        std::ofstream(root_ / "val.bin").put('\0');
-        std::ofstream(root_ / "weights.pt").put('\0');
-        std::ofstream(root_ / "model-input.onnx").put('\0');
-        const auto settings = loaded_.settings.materialization_facts();
-        REQUIRE(settings.loaded);
-        const auto expected = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings.settings, workflow);
-        REQUIRE(expected.has_value());
-        REQUIRE(expected->key.source == contracts::ModelSelectionSource::Custom);
-        std::size_t terminal_index = 0U;
-        {
-            std::scoped_lock lock(model_mutex_);
-            terminal_index = model_terminals_.size();
-        }
-        const auto admitted = model_.Select({.workflow = workflow});
-        REQUIRE(admitted.active);
-        std::unique_lock lock(model_mutex_);
-        model_changed_.wait(lock, [&] { return model_terminals_.size() > terminal_index; });
-        const auto accepted = model_terminals_[terminal_index];
-        REQUIRE(accepted.terminal.outcome == contracts::ModelSelectionOutcome::Accepted);
-        CHECK(accepted.selection.key == expected->key);
-        CHECK(accepted.selection.artifact == expected->custom_artifact);
-    }
-
-    [[nodiscard]] auto systems() noexcept { return std::tie(loaded_.settings, dataset_, model_); }
-
-   private:
-    class LoadedSettings final {
-       public:
-        explicit LoadedSettings(const std::filesystem::path& root) { REQUIRE(settings.Load(install_settings(root)).applied()); }
-        SettingsSystem settings;
-    };
-
-    std::filesystem::path root_;
-    LoadedSettings loaded_;
-    std::shared_ptr<StopGate> dataset_gate_;
-    DatasetSystem dataset_;
-    std::mutex model_mutex_;
-    std::condition_variable model_changed_;
-    std::vector<contracts::ModelUiState> model_terminals_;
-    ModelSystem model_;
-};
-
-struct DatasetRuntimeObservation final {
-    std::shared_ptr<StopGate> inspect_gate = std::make_shared<StopGate>();
-    std::promise<void> inspect_started;
-    std::atomic_int active_calls = 0;
-    std::atomic_int maximum_active_calls = 0;
-    std::atomic_int compile_calls = 0;
-};
-
-class BlockingInspectRuntime final : public DatasetRuntime {
-   public:
-    explicit BlockingInspectRuntime(std::shared_ptr<DatasetRuntimeObservation> observation) : observation_(std::move(observation)) {}
-
-    services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest& request, std::stop_token,
-                                            const std::function<void(const contracts::ArtifactProgress&)>&) override {
-        ++observation_->compile_calls;
-        Enter();
-        const auto result = services::ArtifactCompileResult{
-            .output = request.output, .inspection = {.compatible = true, .splits = {split(request.output / "train.bin")}, .detail = {}}};
-        Leave();
-        return result;
-    }
-
-    contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
-                                          std::string_view, std::uint32_t, const std::stop_token stop) override {
-        Enter();
-        observation_->inspect_started.set_value();
-        static_cast<void>(observation_->inspect_gate->Wait(stop));
-        contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
-        for (const auto& path : paths)
-            if (!path.empty()) result.splits.push_back(split(path));
-        Leave();
-        return result;
-    }
-
-   private:
-    void Enter() noexcept {
-        const int active = observation_->active_calls.fetch_add(1) + 1;
-        int maximum = observation_->maximum_active_calls.load();
-        while (maximum < active && !observation_->maximum_active_calls.compare_exchange_weak(maximum, active)) {}
-    }
-    void Leave() noexcept { --observation_->active_calls; }
-    std::shared_ptr<DatasetRuntimeObservation> observation_;
-};
 
 class UnsafePredictRuntime final : public PredictRuntime {
    public:
@@ -1450,34 +1248,6 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     CHECK_FALSE(retained.rows[1].available); // No-GT category still has its evaluated name.
 }
 
-TEST_CASE("validation admits asynchronous selected-path inspection and cancels before compute", "[controller][systems][compute][admission]") {
-    const auto root = mmltk::testsupport::make_temp_root("validation-inspection-admission");
-    ApplicationDataFixture fixture{root};
-    fixture.PrepareModel(contracts::FeatureId::Validate);
-    auto [settings, unused_dataset, model] = fixture.systems();
-    auto observation = std::make_shared<DatasetRuntimeObservation>();
-    DatasetSystem dataset{settings, [observation] { return std::make_unique<BlockingInspectRuntime>(observation); }};
-    auto gate = std::make_shared<StopGate>();
-    std::atomic_size_t constructions = 0;
-    std::promise<ValidationSystem::event_type> settled;
-    ValidationSystem validation{settings, dataset, model, [&] {
-        ++constructions;
-        return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate});
-    }, [&](ValidationSystem::event_type event) {
-        if (std::holds_alternative<ValidationChanged>(event)) settled.set_value(std::move(event));
-    }};
-    const auto admitted = validation.Start({});
-    CHECK(admitted.operation.active);
-    observation->inspect_started.get_future().wait();
-    CHECK(constructions == 0U);
-    CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
-    static_cast<void>(validation.Stop());
-    const auto terminal = settled.get_future().get();
-    CHECK(std::get<ValidationChanged>(terminal).snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
-    CHECK(constructions == 0U);
-    CHECK(observation->compile_calls == 0);
-}
-
 struct PredictReaderComposition final { SettingsSystem* settings; PredictSystem* predict; };
 
 // Exercises real source observation/borrowing/paired metadata and Presentation
@@ -1809,7 +1579,7 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
     if (terminal) {
         const auto facts = fault->retirement->fact();
         CHECK(facts.occupancy == 1U);
-        CHECK(facts.occupancy + facts.reservations <= detail::PredictionPreviewPool::kSlotCapacity + 3U);
+        CHECK(facts.occupancy + facts.reservations <= detail::PredictionPreviewPool::kSlotCapacity + 4U);
     }
 }
 
@@ -2849,110 +2619,4 @@ TEST_CASE("artifact model inspection observes cancellation before each opaque in
         }), "model selection cancelled");
         CHECK(verified);
     }
-}
-
-TEST_CASE("validation retains the limited sample atlas and selects detail without a producer", "[controller][gpu][validation]") {
-    namespace gpu = mmltk::frameworks::gpu;
-    namespace rfdetr = mmltk::backend::models::rfdetr;
-    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
-    REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    std::mutex mutex;
-    std::condition_variable changed;
-    PredictionReceiverFault fault;
-    ScopedPredictionReceiverFault receiver(fault);
-    std::size_t notifications = 0U;
-    detail::ValidationSamples samples({.device = 0, .maximum_width = 768U, .maximum_height = 512U},
-        [&] { std::scoped_lock lock(mutex); ++notifications; changed.notify_all(); }, PredictionReceiverFault::Operations());
-    const std::array<std::uint32_t, 2> indices{1U, 3U};
-    samples.Begin(7U, indices);
-    const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"empty"});
-    const std::array<float, 12> pixels{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
-    auto source = PredictionSource::Device(execution, {2U, 2U}, pixels, {}, classes);
-    for (const auto index : indices) {
-        const rfdetr::PredictionRecord record{.dataset_index = index};
-        samples.Capture({record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
-    }
-    const auto await = [&](auto predicate) {
-        std::unique_lock lock(mutex);
-        REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
-    };
-    await([&] { const auto snapshot = samples.snapshot(); return snapshot.sample_available[0] && snapshot.sample_available[1]; });
-    const auto atlas = samples.snapshot();
-    CHECK_FALSE(atlas.detail);
-    CHECK(std::count(atlas.sample_available.begin(), atlas.sample_available.end(), true) == 2);
-    REQUIRE(samples.ImageSnapshot(atlas.frame));
-    CHECK(samples.ImageSnapshot(atlas.frame)->samples[0].labels.empty());
-    CHECK_THROWS_AS(samples.Select({6U, 1U}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(samples.Select({7U, 2U}), contracts::InvalidIntentError);
-    samples.Select({7U, 3U});
-    await([&] { return samples.snapshot().detail; });
-    const auto detail = samples.snapshot();
-    CHECK(detail.content_identity != atlas.content_identity);
-    CHECK(detail.frame.extent == VisualExtent{2U, 2U});
-    auto retained = samples.BorrowFrame();
-    REQUIRE(retained.valid());
-    samples.Begin(8U, indices); // Empty newer run cannot replace the retained detail's atlas.
-    samples.CloseDetail();
-    await([&] { return !samples.snapshot().detail; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    auto atlas_reader = samples.BorrowFrame();
-    REQUIRE(atlas_reader.valid());
-    const auto before = samples.snapshot();
-    samples.SetOverlays({false, false, false, false});
-    CHECK(samples.snapshot().frame == before.frame); // Both outputs have physical readers.
-    CHECK(samples.snapshot().overlays == before.overlays);
-    retained = {};
-    await([&] { return samples.snapshot().frame.revision > before.frame.revision; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    CHECK(samples.snapshot().overlays == ValidationOverlays{false, false, false, false});
-    CHECK(samples.ImageSnapshot(samples.snapshot().frame)->overlays == samples.snapshot().overlays);
-    atlas_reader = {};
-    samples.Select({7U, 1U});
-    await([&] { return samples.snapshot().detail; });
-    samples.Begin(9U, indices);
-    const auto capture = [&](std::uint32_t index) {
-        const rfdetr::PredictionRecord record{.dataset_index = index};
-        samples.Capture({record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
-    };
-    capture(1U); // A partial newer set stays pending while old detail is selected.
-    samples.CloseDetail();
-    await([&] { return !samples.snapshot().detail; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    for (const auto overlays : {ValidationOverlays{true, false, false, false}, ValidationOverlays{false, true, false, false},
-                               ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
-        const auto revision = samples.snapshot().frame.revision;
-        samples.SetOverlays(overlays);
-        await([&] { return samples.snapshot().frame.revision > revision; });
-        CHECK(samples.snapshot().content_identity == atlas.content_identity);
-        CHECK(samples.snapshot().overlays == overlays);
-    }
-    const auto preserved = samples.snapshot();
-    std::size_t failure_notifications = 0U;
-    { std::scoped_lock lock(mutex); failure_notifications = notifications + 2U; }
-    fault.partial_draw = true;
-    samples.SetOverlays({true, true, true, true});
-    await([&] { return notifications >= failure_notifications; });
-    CHECK(samples.snapshot().frame == preserved.frame);
-    CHECK(samples.snapshot().overlays == preserved.overlays);
-    CHECK(samples.ImageSnapshot(preserved.frame)->overlays == preserved.overlays);
-    fault.partial_draw = false;
-    samples.SetOverlays({true, true, true, true}); // Repeating a refused request is an explicit retry.
-    await([&] { return samples.snapshot().frame.revision > preserved.frame.revision; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    fault.draw_failures_remaining = 1U;
-    capture(3U); // Last capture's ordinary draw failure retries without another producer callback.
-    await([&] { return samples.snapshot().sample_identities[0].generation == 9U; });
-    CHECK(samples.snapshot().sample_available[0]);
-    CHECK(samples.snapshot().sample_available[1]);
-    CHECK_THROWS_AS(samples.Select({7U, 1U}), contracts::InvalidIntentError);
-    auto final_reader = samples.BorrowFrame();
-    REQUIRE(final_reader.valid());
-    samples.Shutdown();
-}
-
-TEST_CASE("validation requires a nonzero three by two atlas envelope", "[controller][validation]") {
-    CHECK_THROWS_AS(detail::ValidationSamples({.device = 0, .maximum_width = 2U, .maximum_height = 2U}, {}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(detail::ValidationSamples({.device = 0, .maximum_width = 3U, .maximum_height = 1U}, {}), contracts::InvalidIntentError);
-    detail::ValidationSamples minimum({.device = 0, .maximum_width = 3U, .maximum_height = 2U}, {});
-    minimum.Shutdown();
 }

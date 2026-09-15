@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -139,6 +140,29 @@ struct ComputeUiState final {
     [[= reflection::OperationStateField{reflection::OperationStateSemantic::Terminal}]] ComputeTerminal terminal{};
     bool operator==(const ComputeUiState&) const = default;
 };
+
+// Value transitions only. The caller owns admission, locking and publication.
+inline void begin_compute(ComputeUiState& state, std::uint64_t generation, std::string_view detail = {}) {
+    auto terminal = make_compute_terminal(ComputeOperationOutcome::Running, generation, 0U, {}, detail);
+    state.generation_frontier = generation;
+    state.active = true;
+    state.progress = {};
+    state.terminal = std::move(terminal);
+}
+inline void cancel_compute(ComputeUiState& state) {
+    if (state.active)
+        state.terminal = make_compute_terminal(ComputeOperationOutcome::CancellationRequested, state.generation_frontier);
+}
+[[nodiscard]] inline bool advance_compute(ComputeUiState& state, const ComputeProgress& progress) {
+    if (!state.active || !compute_progress_follows(progress, state.progress.sequence)) return false;
+    state.progress = progress;
+    if (state.terminal.outcome == ComputeOperationOutcome::Running) state.terminal.detail.clear();
+    return true;
+}
+inline void complete_compute(ComputeUiState& state, ComputeTerminal terminal) {
+    state.active = false;
+    state.terminal = std::move(terminal);
+}
 
 MMLTK_REFLECT_FIELDS(ComputeTerminal)
 MMLTK_REFLECT_FIELDS(ComputeProgress)

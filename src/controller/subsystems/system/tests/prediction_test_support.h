@@ -1,7 +1,9 @@
 #pragma once
 
 #include "src/acceptance/tests/async_test_utils.hpp"
-#include "src/controller/subsystems/system/compute_systems.h"
+#include "src/controller/subsystems/validate/validation_system.h"
+#include "src/controller/subsystems/validate/validation_runtime.h"
+#include "src/controller/subsystems/export/export_system.h"
 #include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
 #include <atomic>
@@ -37,7 +39,8 @@ class PredictionSource final {
     using Detection = mmltk::backend::models::rfdetr::Prediction;
     using Catalog = std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>;
     static PredictionSource Device(const mmltk::frameworks::gpu::DeviceExecution&, VisualExtent,
-        std::span<const float> pixels, std::vector<Detection> detections = {}, Catalog = {});
+        std::span<const float> pixels, std::vector<Detection> detections = {}, Catalog = {},
+        std::span<const std::uint8_t> masks = {});
     static PredictionSource Decoded(VisualExtent, std::span<const std::uint8_t> pixels, Catalog = {});
     [[nodiscard]] const float* pixels() const noexcept { return pixels_; }
     [[nodiscard]] const std::uint8_t* rgb8() const noexcept { return rgb8_; }
@@ -65,6 +68,8 @@ class PredictionReceiverFault final {
     std::atomic_bool partial_draw = false;
     std::atomic_uint draw_failures_remaining = 0U;
     std::atomic_size_t draws = 0U;
+    std::atomic_size_t uploads = 0U;
+    std::size_t fail_upload_at = 0U;
     PredictRuntime::PreviewRetirement retirement;
     std::weak_ptr<void> decoded;
     [[nodiscard]] static detail::PredictionPreviewPool::TransferOperations Operations();
@@ -83,6 +88,18 @@ class ScopedPredictionReceiverFault final {
     ScopedPredictionReceiverFault& operator=(const ScopedPredictionReceiverFault&) = delete;
  private:
     PredictionReceiverFault* previous_;
+};
+
+// Delegates real allocations/events/streams to CUDA. Failure is reported only
+// after the actual output stream settles, preserving a safe test process.
+class PredictionSettlementFault final {
+ public:
+    mmltk::testsupport::TestGate settlement{"composed outer settlement"};
+    std::atomic_bool enabled = false;
+    std::atomic_bool callback_returned = false;
+    std::atomic_size_t streams_created = 0U;
+    std::atomic_size_t streams_destroyed = 0U;
+    [[nodiscard]] std::shared_ptr<mmltk::frameworks::gpu::ImageCopyBackend> Backend();
 };
 
 class PredictionTransferFault final {

@@ -1,5 +1,5 @@
 #include "validation_samples.h"
-#include "prediction_preview.h"
+#include "src/controller/subsystems/system/detail/prediction_preview.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include <algorithm>
@@ -20,7 +20,7 @@ class ValidationSamples::Impl final {
         std::shared_ptr<const PredictionPreviewFrame> raw;
     };
     struct Set final {
-        std::array<Sample, 6> samples;
+        std::array<Sample, rfdetr::kValidationSampleCapacity> samples;
         std::uint64_t generation = 0;
         std::uint64_t atlas_identity = 0;
     };
@@ -51,17 +51,17 @@ class ValidationSamples::Impl final {
         execution_ = resolve_visual_device_execution(visual_);
         context_ = CreatePredictionPreviewContext(*execution_, retirement_);
         pool_ = std::make_unique<PredictionPreviewPool>(*execution_, *context_,
-            transfers_, retirement_, 18U);
+            transfers_, retirement_, kRawCapacity);
     }
     void Notify() noexcept { if (changed_) { try { changed_(); } catch (...) {} } }
     void Begin(std::uint64_t generation, std::span<const std::uint32_t> indices) {
-        if (indices.size() > 6U) throw contracts::InvalidIntentError("validation sample count exceeds six");
+        if (indices.size() > rfdetr::kValidationSampleCapacity) throw contracts::InvalidIntentError("validation sample count exceeds six");
         auto next = std::make_shared<Set>();
         next->generation = generation;
         for (std::size_t index = 0; index < indices.size(); ++index) next->samples[index].metadata.identity = {generation, indices[index]};
         {
             std::scoped_lock lock(mutex_);
-            if (content_frontier_ > std::numeric_limits<std::uint64_t>::max() - 7U) throw contracts::FailedError("validation content identities exhausted");
+            if (content_frontier_ > std::numeric_limits<std::uint64_t>::max() - (rfdetr::kValidationSampleCapacity + 1U)) throw contracts::FailedError("validation content identities exhausted");
             next->atlas_identity = ++content_frontier_;
             for (auto& sample : next->samples) sample.content_identity = ++content_frontier_;
             current_ = std::move(next);
@@ -199,30 +199,19 @@ class ValidationSamples::Impl final {
                 extent = found->metadata.original_extent;
                 image.content_identity = found->content_identity;
             }
-            const auto plane_region = [](gpu::ImagePlaneView plane, VisualRegion region) {
-                plane.data += static_cast<std::size_t>(region.y) * plane.descriptor.pitch_bytes + static_cast<std::size_t>(region.x) * 4U;
-                plane.descriptor.width = region.width; plane.descriptor.height = region.height;
-                return plane;
-            };
-            runtime.PublishRetained(candidate, extent.width, extent.height, [&](auto clean, auto semantic, auto stream) {
-                const auto clear = [&](auto plane) {
-                    const auto status = cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0,
-                        plane.descriptor.row_bytes(), plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream));
-                    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-                };
-                clear(clean); clear(semantic);
-                for (std::size_t index = 0; index < drawing->samples.size(); ++index) {
-                    const auto& sample = drawing->samples[index];
-                    if (!sample.raw || (selected && sample.metadata.identity != *selected)) continue;
-                    if (!sample.raw->CompatibleWith(runtime)) throw std::runtime_error("validation sample context was retired");
-                    auto metadata = sample.metadata;
-                    metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height} :
-                        VisualRegion{static_cast<std::uint32_t>(index % 3U) * cell_width, static_cast<std::uint32_t>(index / 3U) * cell_height, cell_width, cell_height};
-                    sample.raw->DrawRegion(runtime, plane_region(clean, metadata.crop), plane_region(semantic, metadata.crop), stream,
-                                          overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks);
-                    image.samples[index] = std::move(metadata);
-                }
-            });
+            std::array<PredictionPreviewComposition::Region, rfdetr::kValidationSampleCapacity> regions;
+            std::size_t region_count = 0U;
+            for (std::size_t index = 0; index < drawing->samples.size(); ++index) {
+                const auto& sample = drawing->samples[index];
+                if (!sample.raw || (selected && sample.metadata.identity != *selected)) continue;
+                auto metadata = sample.metadata;
+                metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height} :
+                    VisualRegion{static_cast<std::uint32_t>(index % 3U) * cell_width, static_cast<std::uint32_t>(index / 3U) * cell_height, cell_width, cell_height};
+                regions[region_count++] = {sample.raw, metadata.crop};
+                image.samples[index] = std::move(metadata);
+            }
+            PredictionPreviewComposition::Draw(runtime, candidate, extent, std::span(regions).first(region_count),
+                {overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks});
             image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
             static_cast<void>(runtime.CommitOutput(std::move(candidate)));
             return [this, attempt, drawing = std::move(drawing), image = std::move(image)]() mutable {
@@ -282,7 +271,13 @@ class ValidationSamples::Impl final {
     PredictionPreviewPool::TransferOperations transfers_;
     std::optional<gpu::DeviceExecution> execution_;
     std::optional<gpu::DeviceContext> context_;
-    std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement_ = std::make_shared<gpu::TerminalCudaRetirementOwner>(20U);
+    // Current capture set, displayed immutable set and one pending/in-flight set.
+    // Each raw slot reserves its own lease; composition and context construction
+    // each reserve one additional exact aggregate before doing device work.
+    static_assert(rfdetr::kValidationSampleCapacity == 3U * 2U);
+    static constexpr std::size_t kRawCapacity = 3U * rfdetr::kValidationSampleCapacity;
+    static_assert(kRawCapacity + 2U <= gpu::TerminalCudaRetirementOwner::kMaximumCapacity);
+    std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement_ = std::make_shared<gpu::TerminalCudaRetirementOwner>(kRawCapacity + 2U);
     std::unique_ptr<PredictionPreviewPool> pool_;
     std::shared_ptr<Set> current_, displayed_;
     Composition requested_;

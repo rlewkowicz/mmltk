@@ -24,6 +24,11 @@ namespace raster = mmltk::backend::imaging::raster;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace {
 void checked(cudaError_t status) { if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status)); }
+std::size_t preview_slot_count(std::size_t slots) {
+    if (slots == 0U || slots > PredictionPreviewComposition::kMaximumFrames)
+        throw std::invalid_argument("preview slot capacity is outside its bound");
+    return slots;
+}
 }
 gpu::DeviceContext CreatePredictionPreviewContext(const gpu::DeviceExecution& execution,
     const std::shared_ptr<gpu::TerminalCudaRetirementOwner>& retirement, gpu::CudaContextApi api) {
@@ -99,6 +104,13 @@ gpu::CudaContextScope PredictionPreviewFrame::ContextScope() const noexcept {
         static_cast<PredictionPreviewFrame*>(owner)->RetainUnsafe(cudaErrorUnknown);
     }}, state_->context_api);
 }
+gpu::CudaContextScope PredictionPreviewFrame::CompositionScope() const noexcept {
+    // The enclosing submission has already reserved custody of this actual state
+    // and every other participant. A context failure marks it for that aggregate.
+    return gpu::CudaContextScope({state_.get(), [](void* owner) noexcept {
+        static_cast<State*>(owner)->unsafe.store(cudaErrorUnknown);
+    }}, state_->context_api);
+}
 PredictionPreviewFrame::~PredictionPreviewFrame() {
     if (!state_ || state_->unsafe != cudaSuccess) return;
     try {
@@ -140,12 +152,14 @@ int PredictionPreviewFrame::class_count() const noexcept { return state_->catego
 PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu::DeviceContext context, TransferOperations operations,
                                            std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement, std::size_t slots)
     : operations_(operations), execution_(std::move(execution)), context_(std::move(context)),
-      retirement_(retirement ? std::move(retirement) : std::make_shared<gpu::TerminalCudaRetirementOwner>(slots)), slots_(slots) {
-    if (slots == 0U || slots > 18U) throw std::invalid_argument("preview slot capacity is outside its bound");
+      retirement_(retirement ? std::move(retirement) : std::make_shared<gpu::TerminalCudaRetirementOwner>(preview_slot_count(slots) + 1U)),
+      slots_(preview_slot_count(slots)) {
     if (!retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
     if (!operations_.wait || !operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host || !operations_.upload || !operations_.convert || !operations_.context_api.get || !operations_.context_api.set)
         throw std::invalid_argument("prediction transfer operations are incomplete");
-    context_.ValidateSelection(execution_.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated,
+    // Compatibility follows the retained context, device and execution owner.
+    // A backend decorating CUDA operations does not create a different context.
+    context_.ValidateSelection(execution_.device, {}, gpu::DeviceContextMode::Isolated,
                                execution_.placement.numa_node, execution_);
 }
 std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(const float* pixels, VisualExtent extent,
@@ -322,30 +336,83 @@ bool PredictionPreviewFrame::CompatibleWith(const gpu::SystemImageRuntime& runti
     return runtime.UsesContext(state_->context);
 }
 void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate) const {
+    const std::array regions{PredictionPreviewComposition::Region{shared_from_this(), {0U, 0U, state_->extent.width, state_->extent.height}}};
+    PredictionPreviewComposition::Draw(runtime, candidate, state_->extent, regions, {});
+}
+void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate,
+    VisualExtent extent, std::span<const Region> regions, Options options) {
+    if (!extent.valid() || regions.size() > kMaximumFrames) throw std::invalid_argument("preview composition extent or count is invalid");
+    std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement;
+    for (const auto& region : regions) {
+        if (!region.frame || !region.crop.width || !region.crop.height ||
+            region.crop.x > extent.width || region.crop.width > extent.width - region.crop.x ||
+            region.crop.y > extent.height || region.crop.height > extent.height - region.crop.y)
+            throw std::invalid_argument("preview composition region is invalid");
+        if (!region.frame->CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
+        if (retirement && retirement != region.frame->retirement_) throw std::invalid_argument("preview composition spans resource owners");
+        retirement = region.frame->retirement_;
+    }
+    // Reserve before reads, and allocate/capture the complete real aggregate before
+    // publishing. Installation after failure cannot allocate or lose an earlier tile.
+    gpu::TerminalCudaRetirementLease lease;
+    if (retirement) lease = gpu::ReserveTerminalCudaLease(*retirement);
+    struct Submission final {
+        VisualExtent extent;
+        Options options;
+        std::vector<Region> regions;
+        gpu::SystemImageRuntime::UnsafeCustody output;
+    };
+    auto submission = std::make_shared<Submission>(extent, options, std::vector<Region>(regions.begin(), regions.end()), gpu::SystemImageRuntime::UnsafeCustody{});
     try {
-        runtime.PublishRetained(candidate, state_->extent.width, state_->extent.height, [&](auto clean, auto semantic, auto stream) {
-            DrawRegion(runtime, clean, semantic, stream, true, true, false, false);
-        });
-        std::lock_guard lock(state_->mutex);
-        auto scope = ContextScope();
-        scope.Run([&] {
-            state_->rgb8 = nullptr;
-            if (state_->decoded_source) {
-                state_->source_context->Bind();
-                state_->decoded_source.reset();
+        runtime.PublishRetained(candidate, extent.width, extent.height, [submission, &runtime](auto clean, auto semantic, auto stream) {
+            const auto clear = [&](auto plane) {
+                checked(cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0,
+                    plane.descriptor.row_bytes(), plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream)));
+            };
+            if (submission->regions.size() != 1U || submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height}) {
+                clear(clean); clear(semantic);
             }
+            const auto plane_region = [](gpu::ImagePlaneView plane, VisualRegion crop) {
+                plane.data += static_cast<std::size_t>(crop.y) * plane.descriptor.pitch_bytes + static_cast<std::size_t>(crop.x) * 4U;
+                plane.descriptor.width = crop.width; plane.descriptor.height = crop.height;
+                return plane;
+            };
+            const auto& overlays = submission->options;
+            for (const auto& region : submission->regions)
+                region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream,
+                    overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks);
         });
-    } catch (const gpu::CudaContextFailure& error) {
-        if (error.terminal()) {
-            static_cast<void>(runtime.Retire(std::current_exception()));
-            throw gpu::ImageStreamExecutionFailure(std::current_exception());
+        // PublishRetained's completion, including its outer stream settlement,
+        // proves every source read and staging upload complete before release.
+        for (const auto& region : submission->regions) {
+            const auto& frame = *region.frame;
+            std::lock_guard lock(frame.state_->mutex);
+            auto scope = frame.CompositionScope();
+            scope.Run([&] {
+                frame.state_->rgb8 = nullptr;
+                if (frame.state_->decoded_source) {
+                    frame.state_->source_context->Bind();
+                    frame.state_->decoded_source.reset();
+                }
+            });
         }
-        throw;
     } catch (...) {
         const auto failure = std::current_exception();
-        if (gpu::is_image_execution_failure(failure)) RetainUnsafe(cudaErrorUnknown);
-        if (state_->unsafe != cudaSuccess) static_cast<void>(runtime.Retire(failure));
-        throw;
+        const bool unsafe_frame = std::ranges::any_of(submission->regions, [](const auto& region) {
+            return region.frame->state_->unsafe.load() != cudaSuccess;
+        });
+        if (gpu::is_image_execution_failure(failure) || unsafe_frame || (retirement && !retirement->admission_open())) {
+            submission->output = runtime.Retire(failure).custody;
+            if (retirement) {
+                // These are the actual shared frame owners, retaining raw storage,
+                // pinned staging, scratch, source contexts and decoded sources.
+                // Install closes pool admission before the transaction can release.
+                for (const auto& region : submission->regions) region.frame->state_->unsafe.store(cudaErrorUnknown);
+                std::move(lease).Install(gpu::TerminalCudaCustody::Share(std::move(submission)), cudaErrorUnknown);
+            }
+            if (!gpu::is_image_execution_failure(failure)) throw gpu::ImageStreamExecutionFailure(failure);
+        }
+        std::rethrow_exception(failure);
     }
 }
 void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic,
@@ -354,8 +421,8 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
     auto& state = *state_;
     std::lock_guard state_lock(state.mutex);
     checked(state.unsafe);
-    try {
-        auto scope = ContextScope();
+    {
+        auto scope = CompositionScope();
         scope.Run([&] {
             state.context.Bind();
             const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
@@ -424,17 +491,6 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
         });
         // The enclosing PublishRetained owns completion and partial-write settlement.
         // Keep staging and decoded custody alive until that actual boundary.
-    } catch (const gpu::CudaContextFailure& error) {
-        if (error.terminal()) {
-            static_cast<void>(runtime.Retire(std::current_exception()));
-            throw gpu::ImageStreamExecutionFailure(std::current_exception());
-        }
-        throw;
-    } catch (...) {
-        const auto failure = std::current_exception();
-        if (gpu::is_image_execution_failure(failure)) RetainUnsafe(cudaErrorUnknown);
-        if (state.unsafe != cudaSuccess) static_cast<void>(runtime.Retire(failure));
-        throw;
     }
 }
 }

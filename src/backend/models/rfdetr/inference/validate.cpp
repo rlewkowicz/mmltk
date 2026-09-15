@@ -369,7 +369,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
     if (delivery.sample) {
         // Floyd selection uses at most six entries, independent of population.
         std::mt19937_64 random(std::random_device{}());
-        const auto count = std::min<std::size_t>(6U, population);
+        const auto count = std::min<std::size_t>(kValidationSampleCapacity, population);
         for (std::size_t index = population - count; index < population; ++index) {
             auto selected = static_cast<std::uint32_t>(std::uniform_int_distribution<std::size_t>(0U, index)(random));
             if (std::ranges::find(samples, selected) != samples.end()) selected = static_cast<std::uint32_t>(index);

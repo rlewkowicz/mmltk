@@ -9,7 +9,10 @@ mmltk_register_public_headers(
     FILES
         compute_intent_materializer.h
         compute_runtime.h
-        compute_systems.h
+        ../validate/validation_system.h
+        ../validate/validation_types.h
+        ../validate/validation_runtime.h
+        ../export/export_system.h
         predict_system.h
         dataset_system.h
         local_run.h
@@ -26,25 +29,25 @@ mmltk_register_ordinary_sources(
     local_run.cpp
     ../../services/file_dialog_system.cpp
     ../../services/settings_system.cpp
+    ../validate/validation_system.cpp
+    ../validate/detail/validation_samples.cpp
     ../train/training_system.cpp)
 mmltk_register_retained_module_importers(
     mmltk_controller_data_compute_systems
-    compute_systems.cpp
+    ../export/export_system.cpp
     model_system.cpp
     predict_system.cpp
-    detail/prediction_preview.cpp
-    detail/validation_samples.cpp)
+    detail/prediction_preview.cpp)
 mmltk_register_private_headers(
     mmltk_controller_data_compute_systems detail/cuda_runtime_resources.h
         detail/predict_revision.h
         detail/prediction_playback.h
         detail/prediction_preview.h
-        detail/validation_samples.h)
+        ../validate/detail/validation_samples.h)
 target_include_directories(mmltk_controller_data_compute_systems PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(mmltk_controller_data_compute_systems
     PUBLIC
         mmltk::backend::models::rfdetr::contract
-        mmltk::backend::models::rfdetr::inference
         mmltk::common::types
         mmltk::common::system
         mmltk::controller::application_boundary
@@ -54,13 +57,15 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection
     PRIVATE
+        mmltk::backend::models::rfdetr::inference
         mmltk::controller::visual_runtime
         mmltk::backend::imaging::raster
         mmltk::backend::imaging::explore
         mmltk::backend::ml::runtime
         mmltk::backend::models::rfdetr::export)
 mmltk_link_declarations(mmltk_controller_data_compute_systems PUBLIC
-    mmltk::controller::visual_runtime)
+    mmltk::controller::visual_runtime
+    mmltk::backend::models::rfdetr::inference)
 mmltk_register_header_isolation(mmltk_controller_data_compute_systems)
 
 function(mmltk_add_controller_subsystems_system_tests)
@@ -69,12 +74,14 @@ function(mmltk_add_controller_subsystems_system_tests)
     mmltk_register_ordinary_sources(
         mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_compute_systems.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../validate/tests/validation_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_playback.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.cpp
         ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.cpp)
     mmltk_register_private_headers(mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_test_support.h
         ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.h)
     mmltk_configure_component(mmltk_controller_data_compute_systems_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_data_compute_systems_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

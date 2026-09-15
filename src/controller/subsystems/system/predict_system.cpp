@@ -174,15 +174,11 @@ class PredictSystem::Impl final {
             const auto generation = contracts::next_compute_generation(state_.operation.generation_frontier);
             if (!generation) throw contracts::FailedError("prediction operation generation exhausted");
             state_.revision = detail::PredictRevision::Admit(state_.revision);
-            state_.operation.generation_frontier = *generation;
-            state_.operation.active = true;
-            state_.operation.progress = {};
+            contracts::begin_compute(state_.operation, *generation, "Preparing selected prediction inputs");
             state_.paused = false;
             preview_failure_.clear();
             state_.video = source.kind == contracts::SourceKind::VideoFile;
             playback_.Reset();
-            state_.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, *generation,
-                                                                         0U, {}, "Preparing selected prediction inputs");
             try {
                 run_.Start({
                     .work = [this, settings = settings.settings, selection, source_key = key, video = state_.video, generation = *generation](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
@@ -243,8 +239,7 @@ class PredictSystem::Impl final {
                 // Admission and progress preserve this identity while Running.
                 if (!revision) return state_;
                 state_.revision = *revision;
-                state_.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::CancellationRequested,
-                                                                             state_.operation.generation_frontier);
+                contracts::cancel_compute(state_.operation);
             }
         }
         if (active) static_cast<void>(run_.Stop());
@@ -409,8 +404,7 @@ class PredictSystem::Impl final {
                 state_.revision, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
             if (!revision) return;
             state_.revision = *revision;
-            state_.operation.progress = progress;
-            if (state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.operation.terminal.detail.clear();
+            static_cast<void>(contracts::advance_compute(state_.operation, progress));
             changed = mmltk::frameworks::reflection::project_record<PredictProgressState>(state_);
         }
         Publish(PredictProgress{std::move(changed)});
@@ -443,9 +437,8 @@ class PredictSystem::Impl final {
             const auto revision = detail::PredictRevision::Complete(state_.revision);
             if (!revision) return;
             state_.revision = *revision;
-            state_.operation.active = false;
+            contracts::complete_compute(state_.operation, std::move(terminal));
             state_.paused = false;
-            state_.operation.terminal = std::move(terminal);
             changed = state_;
         }
         Publish(PredictChanged{std::move(changed)});
@@ -488,9 +481,9 @@ class PredictSystem::Impl final {
     PredictRuntimeFactory factory_;
     mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
     mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
-    // Current pool, in-flight Draw, pending old product, and context construction.
+    // Current pool, in-flight/old pending frames, context construction, and whole submission.
     PredictRuntime::PreviewRetirement preview_retirement_ =
-        std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 3U);
+        std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 4U);
     std::shared_ptr<PredictRuntime> runtime_;
     direct::LocalRun run_;
     detail::VisualRuntimeOwner worker_;

@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <cstddef>
 #include "src/backend/imaging/raster/chw_image.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include <cstdint>
@@ -20,29 +21,50 @@ namespace mmltk::controller::detail {
     const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>&,
     mmltk::frameworks::gpu::CudaContextApi = {});
 // A slot owns raw model-space products. Only the visual worker draws it.
-class PredictionPreviewFrame final {
+class PredictionPreviewFrame final : public std::enable_shared_from_this<PredictionPreviewFrame> {
    public:
     ~PredictionPreviewFrame();
     PredictionPreviewFrame(const PredictionPreviewFrame&) = delete;
     PredictionPreviewFrame& operator=(const PredictionPreviewFrame&) = delete;
     [[nodiscard]] bool CompatibleWith(const mmltk::frameworks::gpu::SystemImageRuntime&) const noexcept;
     void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&) const;
-    void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean,
-                    mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream,
-                    bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks) const;
     [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> ground_truth() const noexcept;
     [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> predictions() const noexcept;
     [[nodiscard]] std::span<const std::string> classes() const noexcept;
     [[nodiscard]] int class_count() const noexcept;
    private:
     friend class PredictionPreviewPool;
+    friend class PredictionPreviewComposition;
+    void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean,
+                    mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream,
+                    bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks) const;
+
     struct State;
     PredictionPreviewFrame(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>, std::shared_ptr<void>, mmltk::frameworks::gpu::CudaContextApi);
     void RetainUnsafe(cudaError_t) const noexcept;
     [[nodiscard]] mmltk::frameworks::gpu::CudaContextScope ContextScope() const noexcept;
+    [[nodiscard]] mmltk::frameworks::gpu::CudaContextScope CompositionScope() const noexcept;
     std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_;
     mutable mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_;
     std::shared_ptr<State> state_;
+};
+// One transaction retains the exact drawing set until outer publication settles.
+// Regions and options are renderer facts; sample-selection policy stays native to
+// the domain. The generic resource bound follows the terminal authority.
+class PredictionPreviewComposition final {
+ public:
+    static constexpr std::size_t kMaximumFrames = mmltk::frameworks::gpu::TerminalCudaRetirementOwner::kMaximumCapacity - 1U;
+    struct Region final {
+        std::shared_ptr<const PredictionPreviewFrame> frame;
+        VisualRegion crop;
+    };
+    struct Options final {
+        bool prediction_boxes = true, prediction_masks = true;
+        bool ground_truth_boxes = false, ground_truth_masks = false;
+    };
+    static void Draw(mmltk::frameworks::gpu::SystemImageRuntime&,
+        mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&, VisualExtent,
+        std::span<const Region>, Options);
 };
 class PredictionPreviewPool final {
    public:
