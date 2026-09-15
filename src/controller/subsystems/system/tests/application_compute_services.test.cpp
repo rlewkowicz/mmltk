@@ -1036,3 +1036,18 @@ TEST_CASE("Train process client destructor reaps a live process group", "[gui][s
 }
 
 }  // namespace mmltk::controller::subsystems::system
+
+TEST_CASE("Train observes persistence failure beyond bounded console output without a progress file", "[gui][services][train]") {
+    mmltk::testsupport::ScopedTempDir temp("mmltk-train-persistence-marker");
+    const auto executable = script(temp,
+        "head -c 131064 /dev/zero\n"
+        "printf '\\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\\n'\n");
+    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
+    auto [source, token] = TrainProcessStopSource::Mint();
+    const auto result = client.Run(std::move(token));
+    CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded);
+    REQUIRE(result.terminal.final_progress.has_value());
+    CHECK(result.terminal.final_progress->persistence.degraded);
+    CHECK(result.output.size() <= kTrainProcessReadBudget);
+    CHECK_FALSE(result.terminal.final_progress->persistence.error.empty());
+}

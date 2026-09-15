@@ -70,6 +70,7 @@ static_assert(EvaluationAxisCatalog::valid());
 inline constexpr std::size_t kEvaluationDetailPageSize = 4U;
 
 struct ConfidenceMetrics final {
+    bool operator==(const ConfidenceMetrics&) const = default;
     double precision = 0.0;
     double recall = 0.0;
     double f1 = 0.0;
@@ -78,6 +79,7 @@ MMLTK_REFLECT_FIELDS(ConfidenceMetrics)
 
 // Compact epoch/snapshot facts. Detailed curves never enter training history.
 struct MetricSummary final {
+    bool operator==(const MetricSummary&) const = default;
     double ap = 0.0;
     double ap50 = 0.0;
     double ap75 = 0.0;
@@ -92,6 +94,7 @@ struct MetricSummary final {
 MMLTK_REFLECT_FIELDS(MetricSummary)
 
 struct EvalSummary final {
+    bool operator==(const EvalSummary&) const = default;
     MetricSummary bbox;
     std::optional<MetricSummary> mask;
     std::uint32_t model_detection_budget = 0U;

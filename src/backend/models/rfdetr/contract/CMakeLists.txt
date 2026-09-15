@@ -14,6 +14,7 @@ mmltk_register_public_headers(
     FILES
         class_layout.h
         evaluation_metrics.h
+        training_metrics.h
         output_roles.h
         artifacts.h
         cli.h

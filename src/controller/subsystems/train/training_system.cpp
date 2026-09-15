@@ -7,6 +7,8 @@
 #include <utility>
 
 #include "src/controller/services/train_process_client.h"
+#include "src/controller/services/train_run_store.h"
+#include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 
 namespace mmltk::controller {
@@ -31,16 +33,16 @@ auto cancellation_bridge(Source& source, const std::stop_token stop) {
 NativeTrainingRuntime::NativeTrainingRuntime(NativeTrainingConfiguration configuration) : config_(std::move(configuration)) {}
 
 contracts::ComputeTerminal NativeTrainingRuntime::Train(mmltk::backend::models::rfdetr::TrainRequest request, const std::stop_token stop,
-                                                        const std::function<void(const contracts::ComputeProgress&)>& progress) {
+                                                        const std::function<void(const services::TrainProcessProgress&)>& progress) {
     if (config_.training_executable.empty()) throw contracts::UnavailableError("local training executable is unavailable");
     auto process = services::TrainProcessClient::launch(request, config_.training_executable);
     auto [source, token] = services::TrainProcessStopSource::Mint();
     auto cancellation = cancellation_bridge(source, stop);
     struct Observer final {
-        const std::function<void(const contracts::ComputeProgress&)>* sink;
+        const std::function<void(const services::TrainProcessProgress&)>* sink;
         static void Report(void* context, const services::TrainProcessProgress& value) noexcept {
             try {
-                (*static_cast<Observer*>(context)->sink)(value.progress);
+                (*static_cast<Observer*>(context)->sink)(value);
             } catch (...) {}
         }
     } observer{&progress};
@@ -144,9 +146,15 @@ class TrainingSystem::Impl final {
         };
     }
 
-    [[nodiscard]] TrainingSnapshot Start() {
-        const auto facts = settings_.materialization_facts();
+    services::TrainRunStore run_store_;
+    std::mutex run_store_mutex_;
+
+    [[nodiscard]] TrainingSnapshot Start(std::filesystem::path resume = {}) {
+        auto facts = settings_.materialization_facts();
         if (!facts.loaded) throw contracts::UnavailableError("settings are unavailable");
+        if (resume.empty()) facts.settings.workflows.train.request.resume_path.clear();
+        else if (facts.settings.workflows.train.request.resume_path != resume)
+            throw contracts::InvalidIntentError("Resume settings no longer match the selected checkpoint");
         const auto selection = model_.selection();
         run_.Start({
             .prepare =
@@ -180,8 +188,20 @@ class TrainingSystem::Impl final {
                     } else {
                         auto request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, selection);
                         if (!request) throw contracts::InvalidIntentError(request.error().detail);
+                        request->output_dir = services::TrainRunStore::ResolveOutput(request->output_dir, request->resume_path.empty() ?
+                            std::optional<mmltk::backend::models::rfdetr::TrainingCheckpoint>{} :
+                            std::optional{mmltk::backend::models::rfdetr::inspect_training_checkpoint(request->resume_path)});
+                        {
+                            std::scoped_lock lock(mutex_);
+                            state_.output_directory = request->output_dir;
+                            state_.metrics.reset();
+                            state_.persistence = {};
+                            AdvanceObservation();
+                        }
+                        direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
                         terminal =
-                            runtime().Train(std::move(*request), stop, [this, &malformed_progress](const contracts::ComputeProgress& progress) {
+                            runtime().Train(std::move(*request), stop, [this, &malformed_progress](const services::TrainProcessProgress& update) {
+                                const auto& progress = update.progress;
                                 if (!progress.valid()) {
                                     malformed_progress.store(true, std::memory_order_relaxed);
                                     return;
@@ -192,6 +212,8 @@ class TrainingSystem::Impl final {
                                     if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence))
                                         return;
                                     state_.local.progress = progress;
+                                    if (update.metrics) state_.metrics = update.metrics;
+                                    state_.persistence = update.persistence;
                                     if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running)
                                         state_.local.terminal.detail.clear();
                                     AdvanceObservation();
@@ -199,6 +221,8 @@ class TrainingSystem::Impl final {
                                         .revision = state_.revision,
                                         .activity = state_.activity,
                                         .local = state_.local,
+                                        .metrics = state_.metrics,
+                                        .persistence = state_.persistence,
                                     };
                                 }
                                 direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
@@ -460,6 +484,37 @@ TrainingSystem::TrainingSystem(SettingsSystem& settings, DatasetSystem& dataset,
                                SystemEventSink<event_type> events)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events))) {}
 TrainingSystem::~TrainingSystem() = default;
+mmltk::backend::models::rfdetr::TrainingOpenedRun TrainingSystem::OpenRun(mmltk::backend::models::rfdetr::TrainingDirectoryQuery query) {
+    std::lock_guard store_lock(impl_->run_store_mutex_);
+    auto run = impl_->run_store_.Open(query.directory);
+    {
+        std::lock_guard lock(impl_->mutex_);
+        impl_->state_.output_directory = impl_->run_store_.directory();
+        impl_->state_.history_generation = impl_->run_store_.generation();
+        impl_->AdvanceObservation();
+    }
+    direct::PublishLazyNoexcept(impl_->events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
+    return {impl_->run_store_.generation(), impl_->run_store_.directory(), std::move(run)};
+}
+mmltk::backend::models::rfdetr::TrainingHistoryPage TrainingSystem::History(mmltk::backend::models::rfdetr::TrainingHistoryQuery query) {
+    std::lock_guard lock(impl_->run_store_mutex_);
+    return impl_->run_store_.Read(query);
+}
+mmltk::backend::models::rfdetr::TrainingCheckpoint TrainingSystem::InspectCheckpoint(mmltk::backend::models::rfdetr::TrainingCheckpointQuery query) {
+    return mmltk::backend::models::rfdetr::inspect_training_checkpoint(query.path);
+}
+mmltk::backend::models::rfdetr::TrainingCheckpoint TrainingSystem::PrepareResume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery query) {
+    if (snapshot().activity != TrainingActivity::Idle) throw contracts::BusyError("training is active");
+    auto checkpoint = InspectCheckpoint(std::move(query));
+    if (!checkpoint.resumable || !checkpoint.configuration) throw contracts::InvalidIntentError("selected artifact is not a full resumable checkpoint");
+    impl_->settings_.RestoreTrainingCheckpoint(*checkpoint.configuration, checkpoint.path);
+    return checkpoint;
+}
+TrainingSnapshot TrainingSystem::Resume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery query) {
+    auto checkpoint = InspectCheckpoint(std::move(query));
+    if (!checkpoint.resumable) throw contracts::InvalidIntentError("selected artifact is not resumable");
+    return impl_->Start(checkpoint.path);
+}
 TrainingSnapshot TrainingSystem::Start(contracts::WorkflowIntent<contracts::FeatureId::Train>) { return impl_->Start(); }
 TrainingSnapshot TrainingSystem::Stop(contracts::WorkflowIntent<contracts::FeatureId::Train>) noexcept {
     TrainingSnapshot result;

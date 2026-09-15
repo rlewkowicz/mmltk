@@ -11,6 +11,7 @@ mmltk_register_public_headers(
     FILES
         serialization.h
         json_scalar.h
+        reflected_json.h
         cbor_field_annotations.h
         reflected_cbor.h
         reflected_cbor_detail.h

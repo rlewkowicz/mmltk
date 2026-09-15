@@ -6,12 +6,14 @@
 #include <cstdint>
 #include <filesystem>
 #include <inplace_vector>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
@@ -26,6 +28,8 @@ inline constexpr std::size_t kTrainProcessReadBudget = std::size_t{64U} * 1024U;
 struct TrainProcessProgress final {
     mmltk::controller::contracts::ComputeProgress progress;
     std::filesystem::path checkpoint_path;
+    std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
+    mmltk::backend::models::rfdetr::TrainingPersistence persistence;
 };
 
 // This is a service-process exit observation, not a second public compute
@@ -88,9 +92,10 @@ class TrainProcessClient final {
     [[nodiscard]] bool request_stop(bool force) noexcept;
     [[nodiscard]] bool consume_stop_request();
     [[nodiscard]] bool consume_escalation();
-    void consume_output(std::string& output, std::size_t budget = kTrainProcessReadBudget);
+    std::size_t consume_output(std::string& output, std::size_t budget = kTrainProcessReadBudget,
+                               std::size_t retention_limit = std::numeric_limits<std::size_t>::max());
     [[nodiscard]] std::optional<TrainProcessProgress> consume_progress();
-    [[nodiscard]] std::optional<TrainProcessExit> consume_exit();
+    [[nodiscard]] std::optional<TrainProcessExit> consume_exit(std::string* retained_output = nullptr);
     void force_reap() noexcept;
     [[nodiscard]] TrainProcessRunResult Run(TrainProcessStopToken token, TrainProcessProgressObserver progress = {});
 
@@ -120,6 +125,9 @@ class TrainProcessClient final {
         std::filesystem::path output_directory;
         int progress_watch = -1;
         std::uint64_t progress_sequence = 0U;
+        std::size_t persistence_marker = 0;
+        bool persistence_failed = false;
+        bool status_dirty = false;
         int wait_status = 0;
         bool stop_requested = false;
         bool force_requested = false;
@@ -133,6 +141,7 @@ class TrainProcessClient final {
     };
 
     explicit TrainProcessClient(State state) noexcept;
+    [[nodiscard]] std::optional<TrainProcessProgress> read_progress();
     std::optional<State> state_;
 };
 

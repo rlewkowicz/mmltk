@@ -7,8 +7,10 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <unordered_map>
 
 #include "src/backend/ml/torch/detail/torch_api.h"
+#include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 
 namespace mmltk::backend::models::rfdetr {
@@ -86,6 +88,7 @@ class NativeOptimizerStorage {
 
 class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState> {
    public:
+    [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch_api::InputArchive&, const std::unordered_map<std::string, torch_api::Tensor>&);
     NativeAdamW() = default;
     NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, NativeOptimizerBackend backend);
 
@@ -96,7 +99,8 @@ class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, Native
     void set_lrs(const std::vector<double>& base_lrs, double scale);
     void step();
 
-    void save(torch_api::OutputArchive& archive) const;
+    void reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
+    void save(torch_api::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
     void load(torch_api::InputArchive& archive);
     void commit(NativeAdamW candidate) noexcept;
 
@@ -122,13 +126,15 @@ const char* native_optimizer_backend_name(NativeOptimizerBackend backend);
     X(set_lrs, (const std::vector<double>& base_lrs, double scale), ) \
     X(set_muon_momentum, (double momentum), )                         \
     X(step, (), )                                                     \
-    X(save, (torch_api::OutputArchive & archive), const)              \
+    X(reserve_checkpoint, (mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot), const) \
+    X(save, (torch_api::OutputArchive & archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot), const)              \
     X(load, (torch_api::InputArchive & archive), )
 
 #define MMLTK_DECLARE_NATIVE_OPTIMIZER_OPERATION(name, params, qualifier) void name params qualifier;
 
 class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState> {
    public:
+    [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch_api::InputArchive&, const std::unordered_map<std::string, torch_api::Tensor>&);
     NativeMuonWithAuxAdam() = default;
     NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params);
 

@@ -1,3 +1,6 @@
+#include <unordered_set>
+#include <meta>
+#include <type_traits>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -438,6 +441,43 @@ torch_api::Tensor adam_update(const torch_api::Tensor& grad, torch_api::Tensor& 
     return exp_avg_corrected.div(exp_avg_sq_corrected.sqrt().add(kAuxAdamEps));
 }
 
+// Reconstruct only the saved CPU layout, then reuse the optimizer's complete
+// continuation parser. No model construction, zero-state allocation, or CUDA.
+template <class Groups, class Parameters>
+void read_inspection_layout(torch_api::InputArchive& archive,
+                            const std::unordered_map<std::string, torch_api::Tensor>& tensors,
+                            Groups& groups, Parameters& parameters) {
+    const auto count = require_int(archive, "param_count");
+    const auto group_count = require_int(archive, "group_count");
+    if (count <= 0 || static_cast<std::uint64_t>(count) > tensors.size() || group_count <= 0 || group_count > count)
+        throw std::runtime_error("invalid optimizer inspection inventory");
+    std::unordered_set<std::string> names;
+    parameters.reserve(static_cast<std::size_t>(count));
+    read_indexed_optimizer_archive(archive, "param", static_cast<std::size_t>(count), [&](auto, auto& parameter) {
+        const auto name = require_string(parameter, "name");
+        const auto found = tensors.find(name);
+        if (found == tensors.end() || !names.insert(name).second || !found->second.is_cpu())
+            throw std::runtime_error("optimizer parameter has no unique CPU model tensor");
+        parameters.push_back({name, found->second});
+    });
+    groups.resize(static_cast<std::size_t>(group_count));
+    std::vector<bool> assigned(static_cast<std::size_t>(count));
+    read_indexed_optimizer_archive(archive, "group", groups.size(), [&](std::size_t index, auto& group) {
+        const auto members = require_int(group, "param_index_count");
+        if (members <= 0 || members > count) throw std::runtime_error("invalid optimizer group inventory");
+        auto& indices = groups[index].param_indices;
+        indices.reserve(static_cast<std::size_t>(members));
+        for (int64_t ordinal = 0; ordinal < members; ++ordinal) {
+            const auto value = require_int(group, archive_entry_name("param_index", ordinal).c_str());
+            if (value < 0 || value >= count || assigned[static_cast<std::size_t>(value)])
+                throw std::runtime_error("optimizer groups do not partition the parameter inventory");
+            assigned[static_cast<std::size_t>(value)] = true;
+            indices.push_back(static_cast<std::size_t>(value));
+        }
+    });
+    if (std::ranges::find(assigned, false) != assigned.end()) throw std::runtime_error("optimizer group inventory is incomplete");
+}
+
 }  // namespace
 
 const char* native_optimizer_backend_name(const NativeOptimizerBackend backend) {
@@ -545,7 +585,35 @@ void NativeAdamW::step_group_foreach(const Group& group) {
 
 void NativeAdamW::step_group_fused(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::fused); }
 
-void NativeAdamW::save(torch_api::OutputArchive& archive) const {
+namespace {
+template <class State>
+void reserve_optimizer_readback(const std::vector<State>& states, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
+                                std::size_t first_slot) {
+    std::vector<torch_api::Tensor> tensors;
+    for (const auto& state : states) {
+        template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^State, std::meta::access_context::current()))) {
+            if constexpr (std::is_same_v<std::remove_cvref_t<decltype(state.[:member:])>, torch_api::Tensor>) {
+                if (state.[:member:].defined()) tensors.push_back(state.[:member:]);
+            }
+        }
+    }
+    readback.Reserve(tensors, first_slot);
+}
+template <class State>
+void write_optimizer_state(torch_api::OutputArchive& archive, const State& state,
+                           mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t& slot) {
+    template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^State, std::meta::access_context::current()))) {
+        if constexpr (std::is_same_v<std::remove_cvref_t<decltype(state.[:member:])>, torch_api::Tensor>) {
+            if (state.[:member:].defined()) archive.write(std::string(std::meta::identifier_of(member)), readback.Stage(slot++));
+        }
+    }
+}
+}  // namespace
+
+void NativeAdamW::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
+    reserve_optimizer_readback(state_, readback, first_slot);
+}
+void NativeAdamW::save(torch_api::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     write_string(archive, "format", kNativeAdamWFormat);
     write_int(archive, "format_version", kNativeAdamWFormatVersion);
     write_string(archive, "backend", backend_name());
@@ -562,13 +630,8 @@ void NativeAdamW::save(torch_api::OutputArchive& archive) const {
 
     write_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
         write_named_parameter_archive(param_archive, params_[index].name);
-        param_archive.write("step", detail::prepare_tensor_for_checkpoint_write(state_[index].step));
-        param_archive.write("exp_avg", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg));
-        param_archive.write("exp_avg_sq", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg_sq));
+        write_optimizer_state(param_archive, state_[index], readback, first_slot);
         write_int(param_archive, "has_max_exp_avg_sq", state_[index].max_exp_avg_sq.defined() ? 1 : 0);
-        if (state_[index].max_exp_avg_sq.defined()) {
-            param_archive.write("max_exp_avg_sq", detail::prepare_tensor_for_checkpoint_write(state_[index].max_exp_avg_sq));
-        }
     });
 }
 
@@ -637,6 +700,15 @@ void NativeAdamW::load(torch_api::InputArchive& archive) {
     });
     groups_.swap(candidate_groups);
     state_.swap(candidate_state);
+}
+
+std::vector<std::string> NativeAdamW::InspectCheckpoint(torch_api::InputArchive& archive,
+    const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
+    NativeAdamW candidate;
+    read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
+    populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
+    candidate.load(archive);
+    return std::move(candidate.all_param_names_);
 }
 
 void NativeAdamW::commit(NativeAdamW candidate) noexcept {
@@ -713,7 +785,10 @@ void NativeMuonWithAuxAdam::step() {
     }
 }
 
-void NativeMuonWithAuxAdam::save(torch_api::OutputArchive& archive) const {
+void NativeMuonWithAuxAdam::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
+    reserve_optimizer_readback(state_, readback, first_slot);
+}
+void NativeMuonWithAuxAdam::save(torch_api::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     write_string(archive, "format", kNativeMuonFormat);
     write_int(archive, "format_version", kNativeMuonFormatVersion);
     write_int(archive, "ns_steps", kMuonNsSteps);
@@ -739,13 +814,8 @@ void NativeMuonWithAuxAdam::save(torch_api::OutputArchive& archive) const {
     write_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
         write_named_parameter_archive(param_archive, params_[index].name);
         write_int(param_archive, "use_muon", use_muon[index] ? 1 : 0);
-        if (use_muon[index]) {
-            param_archive.write("momentum_buffer", detail::prepare_tensor_for_checkpoint_write(state_[index].momentum_buffer));
-        } else {
-            write_int(param_archive, "step", state_[index].step);
-            param_archive.write("exp_avg", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg));
-            param_archive.write("exp_avg_sq", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg_sq));
-        }
+        if (!use_muon[index]) write_int(param_archive, "step", state_[index].step);
+        write_optimizer_state(param_archive, state_[index], readback, first_slot);
     });
 }
 
@@ -829,6 +899,15 @@ void NativeMuonWithAuxAdam::load(torch_api::InputArchive& archive) {
     state_.swap(candidate_state);
 }
 
+std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch_api::InputArchive& archive,
+    const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
+    NativeMuonWithAuxAdam candidate;
+    read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
+    populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
+    candidate.load(archive);
+    return std::move(candidate.all_param_names_);
+}
+
 void NativeMuonWithAuxAdam::commit(NativeMuonWithAuxAdam candidate) noexcept {
     groups_.swap(candidate.groups_);
     state_.swap(candidate.state_);
@@ -899,8 +978,11 @@ void NativeOptimizer::step() {
     std::visit([](auto& optimizer) { optimizer.step(); }, storage_);
 }
 
-void NativeOptimizer::save(torch_api::OutputArchive& archive) const {
-    std::visit([&](const auto& optimizer) { optimizer.save(archive); }, storage_);
+void NativeOptimizer::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
+    std::visit([&](const auto& optimizer) { optimizer.reserve_checkpoint(readback, first_slot); }, storage_);
+}
+void NativeOptimizer::save(torch_api::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
+    std::visit([&](const auto& optimizer) { optimizer.save(archive, readback, first_slot); }, storage_);
 }
 
 void NativeOptimizer::load(torch_api::InputArchive& archive) {

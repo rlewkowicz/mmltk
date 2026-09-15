@@ -134,7 +134,13 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
     if ((*training)->class_names != (*validation)->class_names)
         return std::unexpected(refused("training and validation class order differs"));
     request.train_compiled_path = (*training)->path;
-    request.weights_path = model.artifact;
+    if (request.resume_path.empty()) {
+        request.weights_path = model.artifact;
+    } else {
+        if (request.resume_path != model.artifact)
+            return std::unexpected(refused("prepared training model does not match the selected resume checkpoint"));
+        request.weights_path.clear();
+    }
     request.val_compiled_path = (*validation)->path;
     if (request.test_compiled_path.empty()) {
         request.test_compiled_path.clear();

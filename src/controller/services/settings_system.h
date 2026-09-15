@@ -48,6 +48,7 @@ class SettingsSystem final {
     void require_loaded() const;
     [[nodiscard]] contracts::SettingsMaterializationFacts materialization_facts() const;
     [[nodiscard]] contracts::ProviderPreferences provider_preferences() const;
+    void RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::TrainRequest, const std::filesystem::path&);
     [[nodiscard]] ExploreSettingsCandidate explore_settings_candidate() const;
     [[nodiscard]] ExploreSettingsCandidate persist_explore_filter(const ExploreSettingsCandidate&, const ExploreFilterUpdate&);
     [[nodiscard]] ExploreSettingsCandidate persist_explore_augmentation(const ExploreSettingsCandidate&, bool);

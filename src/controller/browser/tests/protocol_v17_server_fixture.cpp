@@ -263,6 +263,30 @@ int main(const int argument_count, char* const* const arguments) {
         if (mmltk::frameworks::serialization::decode_into(rejected, invalid_query)) return EXIT_FAILURE;
     }
 
+    validation_correlation = 700U;
+    rfdetr::TrainingRecord training_record;
+    training_record.run_id = "run-native";
+    training_record.attempt_id = "attempt-native";
+    training_record.sequence = 17;
+    training_record.dropped_before = 2;
+    training_record.role = rfdetr::TrainingRecordRole::Epoch;
+    training_record.evaluated_weights = rfdetr::EvaluatedWeights::Ema;
+    training_record.progress.phase = rfdetr::TrainingPhase::EpochComplete;
+    training_record.progress.scalars.total = 1.25;
+    training_record.progress.val.emplace();
+    training_record.progress.val->bbox.ap = 0.625;
+    rfdetr::TrainingHistoryPage training_page;
+    training_page.generation = 9;
+    training_page.next_cursor = 123;
+    training_page.records.push_back(training_record);
+    if (!append_validation(training_record) || !append_validation(training_page)) return EXIT_FAILURE;
+    for (const std::uint32_t count : {0U, static_cast<std::uint32_t>(rfdetr::kTrainingHistoryPageSize + 1U)}) {
+        auto invalid_query = *mmltk::frameworks::serialization::reflected_value(rfdetr::TrainingHistoryQuery{});
+        named_member(invalid_query, "count").storage = static_cast<std::uint64_t>(count);
+        rfdetr::TrainingHistoryQuery rejected;
+        if (mmltk::frameworks::serialization::decode_into(rejected, invalid_query)) return EXIT_FAILURE;
+    }
+
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
         complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {

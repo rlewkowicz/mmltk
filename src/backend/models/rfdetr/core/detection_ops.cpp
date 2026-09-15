@@ -1,3 +1,4 @@
+#include <cctype>
 #include "detail/detection_ops.h"
 
 #include <ATen/TensorIndexing.h>
@@ -965,8 +966,7 @@ TensorMap loss_cardinality(const OutputLayer& layer, const PreparedTargets& targ
     const auto target_lengths = targets.target_counts.defined()
                                     ? targets.target_counts.to(pred_logits.device())
                                     : make_cpu_int64_tensor(targets.counts).to(pred_logits.device(), torch::kInt64, false, false);
-    const auto card_pred = pred_logits.argmax(-1).ne(pred_logits.size(-1) - 1).sum(1);
-    losses["cardinality_error"] = F::l1_loss(card_pred.to(torch::kFloat32), target_lengths.to(torch::kFloat32));
+    losses["cardinality_error"] = cardinality_error(pred_logits, target_lengths);
     return losses;
 }
 
@@ -1037,6 +1037,12 @@ void update_losses(TensorMap& destination, TensorMap source, const std::string& 
 }
 
 }  // namespace
+
+torch::Tensor cardinality_error(const torch::Tensor& logits, const torch::Tensor& target_counts) {
+    torch::NoGradGuard no_grad;
+    const auto confident_queries = std::get<0>(logits.sigmoid().max(-1)).gt(0.5).sum(1);
+    return F::l1_loss(confident_queries.to(torch::kFloat32), target_counts.to(torch::kFloat32));
+}
 
 std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(const ModelOutputs& outputs, const PreparedTargets& targets,
                                                                      const DetectionConfig& config, bool training_mode) {
@@ -1121,18 +1127,23 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets
     return losses;
 }
 
-torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const DetectionConfig& config, const torch::Device& device) {
+torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const DetectionConfig& config, const torch::Device& device, torch::Tensor* auxiliary_weighted) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_criterion_weighted_total{"rfdetr.criterion.weighted_total"};
     auto total = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
     bool has_loss = false;
     for (const auto& item : config.weight_dict) {
         auto found = loss_dict.find(item.first);
         if (found == loss_dict.end()) { continue; }
+        auto weighted = found->second * item.second;
+        if (auxiliary_weighted && (item.first.ends_with("_enc") ||
+            (!item.first.empty() && std::isdigit(static_cast<unsigned char>(item.first.back()))))) {
+            *auxiliary_weighted = auxiliary_weighted->defined() ? *auxiliary_weighted + weighted : weighted;
+        }
         if (!has_loss) {
-            total = found->second * item.second;
+            total = weighted;
             has_loss = true;
         } else {
-            total = total + found->second * item.second;
+            total = total + weighted;
         }
     }
     if (!has_loss) { throw std::runtime_error("native RF-DETR criterion returned no weighted losses"); }

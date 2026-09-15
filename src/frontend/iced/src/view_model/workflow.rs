@@ -6,6 +6,10 @@ use crate::generated::{
 pub struct WorkflowModel {
     pub dataset: Option<ArtifactUiState>,
     pub training: Option<TrainingSnapshot>,
+    pub training_run: Option<crate::generated::TrainingOpenedRun>,
+    pub training_history: Option<crate::generated::TrainingHistoryPage>,
+    pub training_checkpoint: Option<crate::generated::TrainingCheckpoint>,
+    pub resume_ready: Option<crate::generated::TrainingCheckpoint>,
     pub validation: Option<crate::generated::ValidationSnapshot>,
     pub validation_details: Option<crate::generated::EvaluationDetailPage>,
     pub export: Option<ComputeUiState>,
@@ -45,6 +49,7 @@ pub struct PendingStart {
     pub feature: FeatureId,
     pub inputs: StartInputs,
     pub preparation: StartPreparation,
+    pub resume_checkpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +78,10 @@ impl Default for WorkflowModel {
         Self {
             dataset: None,
             training: None,
+            training_run: None,
+            training_history: None,
+            training_checkpoint: None,
+            resume_ready: None,
             validation: None,
             validation_details: None,
             export: None,
@@ -229,7 +238,29 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
 
     fn project_training_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         let snapshot = match reply {
-            ApplicationReply::TrainingStart(snapshot)
+            ApplicationReply::TrainingOpenRun(value) => {
+                if self.workflow.training_run.as_ref().is_none_or(|current| value.generation >= current.generation) {
+                    self.workflow.training_run = Some(value);
+                    self.workflow.training_history = None;
+                }
+                return;
+            }
+            ApplicationReply::TrainingHistory(value) => {
+                if self.workflow.training_run.as_ref().is_some_and(|run| run.generation == value.generation) {
+                    self.workflow.training_history = Some(value);
+                }
+                return;
+            }
+            ApplicationReply::TrainingInspectCheckpoint(value) => {
+                self.workflow.training_checkpoint = Some(value);
+                return;
+            }
+            ApplicationReply::TrainingPrepareResume(value) => {
+                self.workflow.resume_ready = Some(value);
+                return;
+            }
+            ApplicationReply::TrainingResume(snapshot)
+            | ApplicationReply::TrainingStart(snapshot)
             | ApplicationReply::TrainingStop(snapshot)
             | ApplicationReply::TrainingQuery(snapshot)
             | ApplicationReply::TrainingSelect(snapshot)
@@ -589,4 +620,33 @@ mod validation_tests {
         assert_eq!(model.workflow.validation.as_ref().unwrap().operation.generationfrontier, 3);
     }
 
+}
+
+#[cfg(test)]
+mod training_history_tests {
+    use super::*;
+    use crate::generated::TrainingApplicationProjection;
+
+    #[test]
+    fn browsing_checkpoint_and_unopened_history_does_not_start_training() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let before = model.workflow.training.clone();
+        let checkpoint = crate::generated::TrainingCheckpoint {
+            path: "/run/checkpoint.pt".into(), attemptid: "saved-attempt".into(),
+            originalweights: "/original/weights.pt".into(), originalclassdescriptor: String::new(),
+            resumable: true, epoch: 4, configuration: None, classlayout: None,
+            evaluatedweights: crate::generated::EvaluatedWeights::Ema,
+        };
+        model.project_training_reply(1, ApplicationReply::TrainingInspectCheckpoint(checkpoint.clone()));
+        assert_eq!(model.workflow.training, before);
+        assert_eq!(model.workflow.training_checkpoint, Some(checkpoint.clone()));
+        assert!(model.workflow.resume_ready.is_none());
+        model.project_training_reply(2, ApplicationReply::TrainingHistory(crate::generated::TrainingHistoryPage {
+            generation: 7, nextcursor: 4096, more: true, records: vec![],
+        }));
+        assert!(model.workflow.training_history.is_none());
+        model.project_training_reply(3, ApplicationReply::TrainingPrepareResume(checkpoint.clone()));
+        assert_eq!(model.workflow.resume_ready, Some(checkpoint));
+        assert_eq!(model.workflow.training, before);
+    }
 }

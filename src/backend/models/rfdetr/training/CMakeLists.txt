@@ -23,6 +23,8 @@ mmltk_register_public_headers(
     FILES
         distributed_train_launcher.h
         train.h
+        telemetry_writer.h
+        checkpoint.h
         train_recipe.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_training detail/evaluation_runtime.h)
 mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training)
@@ -47,12 +49,14 @@ mmltk_register_retained_module_importers(
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
     distributed_train_launcher.cpp
-    training_ops.cpp)
+    training_ops.cpp
+    telemetry_writer.cpp)
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
     detail/target_builder_private.h
     detail/gpu_augment_private.h
     detail/native_optimizer_private.h
+    detail/training_scalar_packet.h
     detail/training_ops_private.h
     detail/checkpoint_private.h)
 target_include_directories(mmltk_backend_models_rfdetr_training PRIVATE
@@ -105,7 +109,8 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk_backend_models_rfdetr_training_tests ${sources})
     mmltk_register_ordinary_sources(
         mmltk_backend_models_rfdetr_training_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp)
     target_include_directories(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         ${CMAKE_SOURCE_DIR}

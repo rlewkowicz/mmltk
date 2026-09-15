@@ -1,4 +1,6 @@
 module;
+#include "src/backend/ml/cuda/tensor_readback.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
@@ -108,7 +110,8 @@ void assign_onnx_tensor_names(const std::shared_ptr<torch::jit::Graph>& graph, c
 }  // namespace
 
 void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& output_path, const int opset_version, const int batch_size,
-                       const bool simplify, const std::filesystem::path& explicit_descriptor, const std::stop_token stop) {
+                       const bool simplify, const std::filesystem::path& explicit_descriptor, const std::stop_token stop,
+                       torch_cuda::TensorReadbackBuffers& readback) {
     if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     validate_supported_onnx_export_opset(opset_version);
     ClassArtifactPublication publication(output_path, explicit_descriptor);
@@ -170,6 +173,7 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
                 const auto found = values.find(name);
                 return found == values.end() ? nullptr : std::addressof(found->second);
             },
+            .readback = &readback,
         });
         erase_unused_module_self_input(graph);
         assign_onnx_tensor_names(graph, has_masks);
@@ -196,7 +200,8 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
 
 void export_onnx(NativeRfDetrModel& model, const ExportOnnxRequest& request) {
     validate_export_onnx_request(request);
-    export_model_onnx(model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, {});
+    torch_cuda::TensorReadbackBuffers readback;
+    export_model_onnx(model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, {}, readback);
 }
 
 void export_onnx(const ExportOnnxRequest& request) {
@@ -206,6 +211,9 @@ void export_onnx(const ExportOnnxRequest& request) {
 }
 
 struct ExportOnnxSession::State final {
+    mmltk::frameworks::gpu::TerminalCudaRetirementOwner terminal{1};
+    mmltk::frameworks::gpu::TerminalCudaRetirementLease lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(terminal);
+    torch_cuda::TensorReadbackBuffers readback;
     std::unique_ptr<NativeRfDetrModel> model;
     std::filesystem::path weights_path;
     std::shared_ptr<const ClassArtifactAdmission> admission;
@@ -218,10 +226,18 @@ struct ExportOnnxSession::State final {
     void Run(const ExportOnnxRequest& request, runtime::BorrowedCommandStream execution_stream, std::stop_token stop);
 };
 
-ExportOnnxSession::ExportOnnxSession() : state_(std::make_unique<State>()) {}
+ExportOnnxSession::ExportOnnxSession() : state_(std::make_shared<State>()) {}
 ExportOnnxSession::~ExportOnnxSession() { static_cast<void>(Close()); }
 
-ModelExportStatus ExportOnnxSession::Close() noexcept { return static_cast<ModelExportStatus>(state_->Close()); }
+ModelExportStatus ExportOnnxSession::Close() noexcept {
+    if (!state_) return static_cast<ModelExportStatus>(cudaErrorUnknown);
+    const auto status = state_->Close();
+    if (status != cudaSuccess) {
+        auto* owner = state_.get();
+        std::move(owner->lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state_)), status);
+    }
+    return static_cast<ModelExportStatus>(status);
+}
 
 cudaError_t ExportOnnxSession::State::Close() noexcept {
     if (!model) return cudaSuccess;
@@ -229,11 +245,13 @@ cudaError_t ExportOnnxSession::State::Close() noexcept {
     if (selected != cudaSuccess) return selected;
     const auto settled = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
     if (settled != cudaSuccess) return settled;
+    try { readback.ReleaseSettled(); } catch (...) { return cudaErrorUnknown; }
     model.reset();
     return cudaSuccess;
 }
 
 void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream command_stream, const std::stop_token stop) {
+    if (!state_) throw std::runtime_error("RF-DETR export session is terminally closed");
     if (stop.stop_requested()) return;
     if (!command_stream) throw std::invalid_argument("RF-DETR ONNX export command stream is invalid");
     validate_export_onnx_request(request);
@@ -254,7 +272,11 @@ void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::Bor
             bound.state->Run(*bound.request, bound.command_stream, bound.stop);
         });
     } catch (const ArtifactPublicationCancelled&) {
-        // The synchronous caller owns the stop token and its terminal outcome.
+        static_cast<void>(Close());
+    } catch (...) {
+        const auto failure = std::current_exception();
+        static_cast<void>(Close());
+        std::rethrow_exception(failure);
     }
 }
 
@@ -284,7 +306,8 @@ void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runti
         // Close can now settle this exact candidate even when completion rejects it.
         admission->RequireUnchanged(stop);
     }
-    export_model_onnx(*model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, stop);
+    export_model_onnx(*model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, stop, readback);
+    readback.Release();
 }
 
 }  // namespace mmltk::backend::models::rfdetr

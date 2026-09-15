@@ -28,6 +28,7 @@ mmltk_register_public_headers(
         settings_types.h
         train_command.h
         train_process_client.h
+        train_run_store.h
         vast_client.h
         vast_provider_owner.h)
 mmltk_register_ordinary_sources(
@@ -42,6 +43,7 @@ mmltk_register_ordinary_sources(
     settings_store.cpp
     train_command.cpp
     train_process_client.cpp
+    train_run_store.cpp
     vast_client.cpp
     vast_provider_owner.cpp
     vast_runtime.cpp)
@@ -95,7 +97,8 @@ function(mmltk_add_controller_services_tests)
     )
     if(TARGET mmltk_backend_models_rfdetr_training)
         list(APPEND mmltk_controller_services_ordinary_test_sources
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/train_command.test.cpp)
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/train_command.test.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/train_run_store.test.cpp)
     endif()
     add_executable(mmltk_controller_services_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(

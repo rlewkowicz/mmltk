@@ -23,6 +23,7 @@ module;
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "src/backend/ml/cuda/tensor_readback.h"
 
 module mmltk.backend.models.rfdetr.model_export.onnx_lowering;
 
@@ -36,6 +37,7 @@ struct LoweringContext {
     torch::jit::Graph* graph = nullptr;
     const void* initializer_context = nullptr;
     OnnxInitializerLookup find_initializer = nullptr;
+    const std::unordered_map<const torch::jit::Value*, at::Tensor>* staged_initializers = nullptr;
 };
 
 thread_local const LoweringContext* g_current_lowering_context = nullptr;
@@ -353,6 +355,7 @@ bool is_none_value(const torch::jit::Value* value) { return value == nullptr || 
 template <typename Value>
 std::optional<Value> tensor_item(const at::Tensor& tensor) {
     if (!tensor.defined() || tensor.numel() != 1) { return std::nullopt; }
+    if (!tensor.is_cpu()) throw std::runtime_error("ONNX scalar reader requires completed CPU staging");
     return tensor.item<Value>();
 }
 
@@ -385,8 +388,16 @@ std::optional<std::string> full_attribute_name(const torch::jit::Value* value, c
 
 std::optional<at::Tensor> lookup_initializer_tensor(const torch::jit::Value* value, const LoweringContext& context) {
     if (value == nullptr) { return std::nullopt; }
+    if (context.staged_initializers) {
+        const auto found = context.staged_initializers->find(value);
+        if (found != context.staged_initializers->end()) return found->second;
+    }
     const auto ivalue = torch::jit::toIValue(value);
-    if (ivalue.has_value() && ivalue->isTensor()) { return ivalue->toTensor(); }
+    if (ivalue.has_value() && ivalue->isTensor()) {
+        if (context.staged_initializers && !ivalue->toTensor().is_cpu()) throw std::runtime_error("unstaged ONNX tensor constant");
+        return ivalue->toTensor();
+    }
+    if (context.staged_initializers) return std::nullopt;
     if (context.find_initializer == nullptr) { return std::nullopt; }
 
     if (const auto* by_debug_name =
@@ -965,9 +976,20 @@ bool is_trivially_removable_prim_node(const torch::jit::Node* node) {
 
 bool is_safe_to_erase_if_unused(const torch::jit::Node* node) {
     if (node == nullptr || !node->blocks().empty() || node->kind() == c10::prim::Return) { return false; }
+    // A graph-valued container is removable only when its entire nested body
+    // obeys the same safe policy; unused outer outputs do not erase effects.
+    for (const auto attribute : node->attributeNames()) {
+        const auto safe_graph = [](const std::shared_ptr<torch::jit::Graph>& graph) {
+            for (const auto* child : graph->nodes()) if (!is_safe_to_erase_if_unused(child)) return false;
+            return true;
+        };
+        if (node->kindOf(attribute) == torch::jit::AttributeKind::g && !safe_graph(node->g(attribute))) return false;
+        if (node->kindOf(attribute) == torch::jit::AttributeKind::gs)
+            for (const auto& graph : node->gs(attribute)) if (!safe_graph(graph)) return false;
+    }
     if (is_onnx_node(node) || is_trivially_removable_prim_node(node)) { return true; }
     const auto* op = node->maybeOperator();
-    if (op == nullptr) { return false; }
+    if (op == nullptr || node->hasSideEffects() || op->schema().is_mutable()) { return false; }
     switch (op->aliasAnalysisKind()) {
         case c10::AliasAnalysisKind::PURE_FUNCTION:
         case c10::AliasAnalysisKind::FROM_SCHEMA:
@@ -1042,6 +1064,12 @@ void erase_trivially_dead_nodes(torch::jit::Block* block) {
             ++it;
             for (auto* child : node->blocks()) {
                 erase_trivially_dead_nodes(child);
+            }
+            for (const auto attribute : node->attributeNames()) {
+                if (node->kindOf(attribute) == torch::jit::AttributeKind::g)
+                    erase_trivially_dead_nodes(node->g(attribute)->block());
+                else if (node->kindOf(attribute) == torch::jit::AttributeKind::gs)
+                    for (const auto& graph : node->gs(attribute)) erase_trivially_dead_nodes(graph->block());
             }
             bool has_uses = false;
             for (const auto* output : node->outputs()) {
@@ -2420,14 +2448,136 @@ void validate_supported_onnx_export_opset(int opset_version) {
     }
 }
 
+namespace {
+template <class Visitor>
+void visit_export_nodes(torch::jit::Block* block, Visitor& visit) {
+    for (auto* node : block->nodes()) {
+        visit(node);
+        for (auto* child : node->blocks()) visit_export_nodes(child, visit);
+        for (const auto attribute : node->attributeNames()) {
+            if (node->kindOf(attribute) == torch::jit::AttributeKind::g)
+                visit_export_nodes(node->g(attribute)->block(), visit);
+            else if (node->kindOf(attribute) == torch::jit::AttributeKind::gs)
+                for (const auto& graph : node->gs(attribute)) visit_export_nodes(graph->block(), visit);
+        }
+    }
+}
+
+template <bool Replace, class Map>
+c10::IValue map_export_tensors(const c10::IValue& value, Map& map) {
+    if (value.isTensor()) return map(value.toTensor());
+    if (value.isTuple()) {
+        if constexpr (Replace) {
+            std::vector<c10::IValue> elements;
+            elements.reserve(value.toTupleRef().elements().size());
+            for (const auto& element : value.toTupleRef().elements()) elements.push_back(map_export_tensors<true>(element, map));
+            return c10::ivalue::Tuple::createNamed(std::move(elements), value.toTuple()->type());
+        } else {
+            for (const auto& element : value.toTupleRef().elements()) (void)map_export_tensors<false>(element, map);
+        }
+    } else if (value.isList()) {
+        if constexpr (Replace) {
+            auto copy = value.toList().copy();
+            for (std::size_t index = 0; index < copy.size(); ++index) copy.set(index, map_export_tensors<true>(copy.get(index), map));
+            return copy;
+        } else {
+            for (const auto& element : value.toList()) (void)map_export_tensors<false>(element, map);
+        }
+    } else if (value.isGenericDict()) {
+        const auto original = value.toGenericDict();
+        if constexpr (Replace) {
+            c10::impl::GenericDict copy(original.keyType(), original.valueType());
+            for (const auto& item : original) copy.insert(map_export_tensors<true>(item.key(), map), map_export_tensors<true>(item.value(), map));
+            return copy;
+        } else {
+            for (const auto& item : original) {
+                (void)map_export_tensors<false>(item.key(), map);
+                (void)map_export_tensors<false>(item.value(), map);
+            }
+        }
+    }
+    return value;
+}
+
+// One structural tensor-attribute inventory for admission, replacement and the
+// final CPU invariant. Read-only visits do not clone IValue containers.
+template <bool Replace, class Map>
+void map_export_attributes(torch::jit::Node* node, Map& map) {
+    for (const auto attribute : node->attributeNames()) {
+        if (node->kindOf(attribute) == torch::jit::AttributeKind::t) {
+            auto value = map(node->t(attribute));
+            if constexpr (Replace) node->t_(attribute, std::move(value));
+        } else if (node->kindOf(attribute) == torch::jit::AttributeKind::ts) {
+            if constexpr (Replace) {
+                std::vector<at::Tensor> tensors;
+                tensors.reserve(node->ts(attribute).size());
+                for (const auto& tensor : node->ts(attribute)) tensors.push_back(map(tensor));
+                node->ts_(attribute, std::move(tensors));
+            } else {
+                for (const auto& tensor : node->ts(attribute)) (void)map(tensor);
+            }
+        } else if (node->kindOf(attribute) == torch::jit::AttributeKind::ival) {
+            auto value = map_export_tensors<Replace>(node->ival(attribute), map);
+            if constexpr (Replace) node->ival_(attribute, std::move(value));
+        }
+    }
+}
+
+class ExportTensorStaging final {
+   public:
+    ExportTensorStaging(torch::jit::Graph& graph, const LoweringContext& source,
+                        mmltk::backend::ml::cuda::TensorReadbackBuffers& readback) {
+        auto collect = [&](torch::jit::Node* node) {
+            if (node->kind() == c10::prim::GetAttr && node->outputs().size() == 1 && !node->output()->uses().empty()) {
+                auto local = source;
+                local.graph = node->owningGraph();
+                if (auto tensor = lookup_initializer_tensor(node->output(), local))
+                    initializers.emplace_back(node->output(), Admit(*tensor));
+            }
+            auto admit = [&](const at::Tensor& tensor) { Admit(tensor); return tensor; };
+            map_export_attributes<false>(node, admit);
+        };
+        visit_export_nodes(graph.block(), collect);
+        readback.Begin();
+        readback.Reserve(sources);
+        views.reserve(sources.size());
+        for (std::size_t index = 0; index < sources.size(); ++index) views.push_back(readback.Stage(index));
+        readback.Complete();
+        for (const auto& [value, index] : initializers) completed.emplace(value, views[index]);
+        auto replace = [&](torch::jit::Node* node) {
+            auto staged = [&](const at::Tensor& tensor) { return views.at(indices.at(tensor.unsafeGetTensorImpl())); };
+            map_export_attributes<true>(node, staged);
+        };
+        visit_export_nodes(graph.block(), replace);
+    }
+    std::unordered_map<const torch::jit::Value*, at::Tensor> completed;
+   private:
+    std::size_t Admit(const at::Tensor& tensor) {
+        const auto [found, inserted] = indices.try_emplace(tensor.unsafeGetTensorImpl(), sources.size());
+        if (inserted) sources.push_back(tensor);
+        return found->second;
+    }
+    std::unordered_map<const c10::TensorImpl*, std::size_t> indices;
+    std::vector<at::Tensor> sources;
+    std::vector<at::Tensor> views;
+    std::vector<std::pair<const torch::jit::Value*, std::size_t>> initializers;
+};
+}  // namespace
+
 void lower_graph_for_onnx_export(const OnnxLoweringRequest& request) {
     auto* const graph = static_cast<torch::jit::Graph*>(request.graph);
     if (graph == nullptr) { throw std::runtime_error("RF-DETR ONNX export requires a valid TorchScript graph"); }
-    const LoweringContext context{
+    if (!request.readback) throw std::invalid_argument("ONNX lowering requires its serialization readback owner");
+    LoweringContext context{
         .graph = graph,
         .initializer_context = request.initializer_context,
         .find_initializer = request.find_initializer,
     };
+    // Remove safely unused nodes before any pinned reserve or transfer. The
+    // same use-edge policy retains mutations, side effects and lowering inputs.
+    erase_trivially_dead_nodes(graph->block());
+    ExportTensorStaging staging(*graph, context, *request.readback);
+    context.staged_initializers = &staging.completed;
     const LoweringContextScope scope(context);
     lower_block_for_onnx_export(graph->block(), context);
     materialize_initializer_getattrs(graph->block(), context);
@@ -2435,6 +2585,14 @@ void lower_graph_for_onnx_export(const OnnxLoweringRequest& request) {
     erase_trivially_dead_nodes(graph->block());
     topologically_sort_block(graph->block());
     validate_graph_is_onnx_only(graph);
+    auto validate_cpu = [](torch::jit::Node* node) {
+        auto require_cpu = [](const at::Tensor& tensor) {
+            if (!tensor.is_cpu()) throw std::runtime_error("ONNX graph retains an unstaged tensor attribute");
+            return tensor;
+        };
+        map_export_attributes<false>(node, require_cpu);
+    };
+    visit_export_nodes(graph->block(), validate_cpu);
 }
 
 }  // namespace mmltk::backend::models::rfdetr

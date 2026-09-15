@@ -179,6 +179,7 @@ class[[= mmltk::frameworks::reflection::OpaqueRelationStorage{}]] TrainRecipeOve
 
 // CLEANUP-IGNORE: Train is the canonical reflected training request; coincident field shapes remain domain-named.
 struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
+    bool operator==(const TrainRequest&) const = default;
     // Rank-ordered overrides correspond exactly to device_ids; -1 selects automatic locality.
     [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::kMaximumTrainingDevices}]] std::vector<int>
         // CLEANUP-IGNORE: The ranked NUMA vector and following Train paths are distinct canonical generated fields.

@@ -14,6 +14,8 @@
 #include "src/controller/contracts/provider.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/services/vast_client.h"
+#include "src/controller/services/train_process_client.h"
+#include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/model_system.h"
@@ -25,7 +27,7 @@ class TrainingRuntime {
    public:
     virtual ~TrainingRuntime() = default;
     [[nodiscard]] virtual contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
-                                                           const std::function<void(const contracts::ComputeProgress&)>&) = 0;
+                                                           const std::function<void(const services::TrainProcessProgress&)>&) = 0;
     [[nodiscard]] virtual contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) = 0;
     [[nodiscard]] virtual contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&,
                                                                  contracts::ProviderOfferIdentity, int instance_id,
@@ -40,7 +42,7 @@ class NativeTrainingRuntime final : public TrainingRuntime {
    public:
     explicit NativeTrainingRuntime(NativeTrainingConfiguration);
     [[nodiscard]] contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
-                                                   const std::function<void(const contracts::ComputeProgress&)>&) override;
+                                                   const std::function<void(const services::TrainProcessProgress&)>&) override;
     [[nodiscard]] contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) override;
     [[nodiscard]] contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&,
                                                          contracts::ProviderOfferIdentity, int, std::string_view, std::stop_token) override;
@@ -64,12 +66,19 @@ struct TrainingSnapshot final {
     contracts::ComputeUiState local{};
     contracts::ProviderOfferState offers{};
     contracts::RemoteSessionState remote{};
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
+    std::filesystem::path output_directory;
+    std::uint64_t history_generation = 0;
+    std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
+    mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
     bool operator==(const TrainingSnapshot&) const = default;
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] TrainingProgress final {
     std::uint64_t revision = 0U;
     TrainingActivity activity = TrainingActivity::Idle;
     contracts::ComputeUiState local{};
+    std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
+    mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] TrainingChanged final {
     TrainingSnapshot snapshot{};
@@ -82,6 +91,16 @@ class TrainingSystem final {
     ~TrainingSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Start(
         contracts::WorkflowIntent<contracts::FeatureId::Train>);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingOpenedRun OpenRun(
+        mmltk::backend::models::rfdetr::TrainingDirectoryQuery);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingHistoryPage History(
+        mmltk::backend::models::rfdetr::TrainingHistoryQuery);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpoint InspectCheckpoint(
+        mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpoint PrepareResume(
+        mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Resume(
+        mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Stop(
         contracts::WorkflowIntent<contracts::FeatureId::Train>) noexcept;
     void Shutdown() noexcept;

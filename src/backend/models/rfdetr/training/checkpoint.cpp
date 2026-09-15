@@ -63,12 +63,16 @@ void save_checkpoint_state(const std::filesystem::path& checkpoint_path, const D
     std::filesystem::create_directories(canonical_path.parent_path());
 
     validate_decoded_model_state(checkpoint);
+    mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+    readback.Begin();
+    detail::reserve_state_archive(detail::model_state_owner(checkpoint).entries, readback, 0);
     torch_api::OutputArchive archive;
     detail::write_native_checkpoint_metadata(archive, checkpoint.metadata);
-    if (complete) detail::write_resume_state_archive(archive, "state", detail::model_state_owner(checkpoint).entries);
-    else detail::write_state_archive(archive, "state", detail::model_state_owner(checkpoint).entries);
+    if (complete) detail::write_resume_state_archive(archive, "state", detail::model_state_owner(checkpoint).entries, readback, 0);
+    else detail::write_state_archive(archive, "state", detail::model_state_owner(checkpoint).entries, readback, 0);
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_checkpoint_save_archive_save_to{"rfdetr.checkpoint.save.archive_save_to"};
+        readback.Complete();
         detail::publish_native_checkpoint_archive(archive, canonical_path, explicit_descriptor);
     }
 }

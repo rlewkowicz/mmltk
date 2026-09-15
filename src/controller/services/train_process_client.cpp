@@ -1,4 +1,5 @@
 #include "src/controller/services/train_process_client.h"
+#include "src/frameworks/serialization/reflected_json.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -38,7 +39,7 @@
 namespace mmltk::controller::services {
 namespace {
 
-constexpr std::size_t kProgressDocumentLimit = std::size_t{64U} * 1024U;
+constexpr std::size_t kProgressDocumentLimit = 2U * mmltk::backend::models::rfdetr::kTrainingRecordBytes;
 constexpr std::size_t kProgressEdgeReadBudget = std::size_t{16U} * 1024U;
 
 [[nodiscard]] std::string bounded_error(std::string value) { return mmltk::controller::contracts::bounded_compute_error(std::move(value)); }
@@ -317,34 +318,54 @@ bool TrainProcessClient::consume_escalation() {
     return state_->consume_lifecycle();
 }
 
-void TrainProcessClient::consume_output(std::string& output, const std::size_t budget) {
-    if (!state_ || state_->stdout_fd.get() < 0 || budget == 0U) return;
-    std::array<char, 4096U> bytes{};
+std::size_t TrainProcessClient::consume_output(std::string& output, const std::size_t budget, const std::size_t retention_limit) {
     std::size_t read = 0U;
+    if (!state_ || state_->stdout_fd.get() < 0 || budget == 0U) return read;
+    std::array<char, 4096U> bytes{};
     while (read < budget) {
         const ssize_t count = ::read(state_->stdout_fd.get(), bytes.data(), std::min(bytes.size(), budget - read));
         if (count > 0) {
-            output.append(bytes.data(), static_cast<std::size_t>(count));
+            constexpr auto marker = mmltk::backend::models::rfdetr::kTrainingPersistenceFailureLine;
+            for (std::size_t index = 0; index < static_cast<std::size_t>(count); ++index) {
+                const char byte = bytes[index];
+                if (byte == marker[state_->persistence_marker]) ++state_->persistence_marker;
+                else state_->persistence_marker = byte == marker.front() ? 1 : 0;
+                if (state_->persistence_marker == marker.size()) {
+                    state_->persistence_marker = 0;
+                    state_->persistence_failed = true;
+                    state_->status_dirty = true;
+                }
+            }
+            if (output.size() < retention_limit)
+                output.append(bytes.data(), std::min(static_cast<std::size_t>(count), retention_limit - output.size()));
             read += static_cast<std::size_t>(count);
             continue;
         }
         if (count == 0) {
             state_->stdout_fd.reset();
-            return;
+            return read;
         }
         if (errno == EINTR) continue;
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return read;
         throw std::system_error(errno, std::generic_category(), "failed to read train output");
     }
+    return read;
 }
 
 std::optional<TrainProcessProgress> TrainProcessClient::consume_progress() {
-    if (!active() || !consume_progress_edges(state_->progress_fd.get(), state_->progress_watch)) return std::nullopt;
+    if (!active()) return std::nullopt;
+    const bool changed = consume_progress_edges(state_->progress_fd.get(), state_->progress_watch);
+    if (!changed && !state_->status_dirty) return std::nullopt;
+    state_->status_dirty = false;
+    return read_progress();
+}
+
+std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
     if (state_->progress_sequence == std::numeric_limits<std::uint64_t>::max())
         throw std::runtime_error("train progress sequence exhausted");
     const auto progress = nlohmann::json::parse(bounded_file(state_->output_directory / "progress.json"), nullptr, false);
     const auto result = nlohmann::json::parse(bounded_file(state_->output_directory / "results.json"), nullptr, false);
-    if (!progress.is_object() && !result.is_object()) return std::nullopt;
+    if (!progress.is_object() && !result.is_object() && !state_->persistence_failed) return std::nullopt;
     std::string status = "training";
     std::uint64_t completed = 0U;
     std::uint64_t total = 0U;
@@ -368,14 +389,30 @@ std::optional<TrainProcessProgress> TrainProcessClient::consume_progress() {
         read_json_value(result, "best_checkpoint", checkpoint);
         if (checkpoint.empty()) read_json_value(result, "checkpoint", checkpoint);
     }
+    if (state_->persistence_failed) status += " — metrics persistence degraded";
     validate_progress_fields(status, checkpoint);
+    std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
+    if (progress.is_object() && progress.contains("record")) {
+        try {
+            metrics = mmltk::frameworks::serialization::decode_reflected_json<mmltk::backend::models::rfdetr::TrainingRecord>(
+                progress.at("record").dump(), {.max_bytes = kProgressDocumentLimit, .max_items = 8192, .max_depth = 32});
+        } catch (...) { state_->persistence_failed = true; }
+    }
+    bool file_failure = false;
+    if (progress.is_object()) read_json_value(progress, "persistence_degraded", file_failure);
+    state_->persistence_failed = state_->persistence_failed || file_failure;
+    std::uint64_t dropped_records = 0;
+    if (progress.is_object()) read_json_value(progress, "dropped_records", dropped_records);
     ++state_->progress_sequence;
     return TrainProcessProgress{
         .progress = {.sequence = state_->progress_sequence, .completed = completed, .total = total, .status = std::move(status)},
-        .checkpoint_path = std::move(checkpoint)};
+        .checkpoint_path = std::move(checkpoint),
+        .metrics = std::move(metrics),
+        .persistence = {.degraded = state_->persistence_failed, .dropped_records = dropped_records,
+                        .error = state_->persistence_failed ? "Training metric persistence is incomplete" : ""}};
 }
 
-std::optional<TrainProcessExit> TrainProcessClient::consume_exit() {
+std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
     if (!active()) return std::nullopt;
     int status = 0;
     if (!state_->reaped) {
@@ -399,27 +436,14 @@ std::optional<TrainProcessExit> TrainProcessClient::consume_exit() {
     if (!state_->group_quiesced) return std::nullopt;
     const auto setup = mmltk::frameworks::process::read_child_setup_failure(state_->setup_fd.get());
     state_->setup_fd.reset();
-    std::optional<TrainProcessProgress> final_progress;
-    if (state_->progress_sequence != std::numeric_limits<std::uint64_t>::max()) {
-        const auto progress = nlohmann::json::parse(bounded_file(state_->output_directory / "progress.json"), nullptr, false);
-        if (progress.is_object()) {
-            std::string status_text = "training";
-            std::uint64_t completed = 0U;
-            std::uint64_t total = 0U;
-            std::string checkpoint;
-            read_json_value(progress, "phase", status_text);
-            read_json_value(progress, "completed_batches", completed);
-            read_json_value(progress, "total_batches", total);
-            read_json_value(progress, "checkpoint_path", checkpoint);
-            if (total != 0U) completed = std::min(completed, total);
-            validate_progress_fields(status_text, checkpoint);
-            final_progress = TrainProcessProgress{.progress = {.sequence = ++state_->progress_sequence,
-                                                               .completed = completed,
-                                                               .total = total,
-                                                               .status = std::move(status_text)},
-                                                  .checkpoint_path = std::move(checkpoint)};
-        }
+    // Reaped children can still have buffered output, including a late persistence
+    // failure after the visible console budget. Consume every remaining chunk.
+    std::string discarded;
+    auto& output = retained_output ? *retained_output : discarded;
+    while (state_->stdout_fd.get() >= 0) {
+        if (!consume_output(output, kTrainProcessReadBudget, retained_output ? kTrainProcessReadBudget : 0)) break;
     }
+    auto final_progress = read_progress();
     TrainProcessExit exit{.outcome = TrainProcessExitOutcome::Failed,
                           .wait_status = state_->wait_status,
                           .setup_failure = setup.has_value(),
@@ -451,7 +475,7 @@ TrainProcessRunResult TrainProcessClient::Run(TrainProcessStopToken token, const
     std::string output;
     for (;;) {
         if (const auto update = consume_progress()) progress(*update);
-        if (auto terminal = consume_exit()) {
+        if (auto terminal = consume_exit(&output)) {
             if (terminal->final_progress) progress(*terminal->final_progress);
             return {.terminal = std::move(*terminal), .output = std::move(output)};
         }
@@ -473,10 +497,7 @@ TrainProcessRunResult TrainProcessClient::Run(TrainProcessStopToken token, const
             if ((descriptor.revents & POLLNVAL) != 0) { throw std::runtime_error("train readiness source became invalid"); }
         }
         if ((ready[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-            const std::size_t retained = output.size();
-            if (retained < kTrainProcessReadBudget) consume_output(output, kTrainProcessReadBudget - retained);
-            std::string discarded;
-            consume_output(discarded, kTrainProcessReadBudget);
+            consume_output(output, kTrainProcessReadBudget, kTrainProcessReadBudget);
         }
         if ((ready[3].revents & POLLIN) != 0) static_cast<void>(consume_stop_request());
         if ((ready[4].revents & POLLIN) != 0) static_cast<void>(consume_escalation());

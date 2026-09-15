@@ -3,6 +3,8 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
 #include "src/backend/models/rfdetr/training/train.h"
+#include "telemetry_writer.h"
+#include "detail/training_scalar_packet.h"
 
 #include <cuda_runtime.h>
 #include <format>
@@ -60,7 +62,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <nlohmann/json.hpp>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -109,7 +110,6 @@ namespace torch_cuda = mmltk::backend::ml::cuda;
 
 using mmltk::common::math::checked_cast;
 
-using json = nlohmann::json;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 namespace {
 
@@ -153,37 +153,8 @@ struct CapturedEvalSample {
     torch_api::Tensor masks;
 };
 
-struct TrainingDatasetLimits {
-    std::uint32_t train_max_instances = 0;
-    std::uint32_t val_max_instances = 0;
-    std::optional<std::uint32_t> test_max_instances;
-    std::uint32_t largest_max_instances = 0;
-    std::size_t resolved_num_queries = 0;
-    std::size_t required_num_queries = 0;
-    std::size_t automatic_num_queries_cap = 0;
-    std::string query_source;
-    bool requested_override = false;
-    bool automatic = false;
-};
-
-[[nodiscard]] json dataset_limits_json(const TrainingDatasetLimits& limits) {
-    return {
-        {"train", limits.train_max_instances},
-        {"val", limits.val_max_instances},
-        {"test", limits.test_max_instances.has_value() ? json(*limits.test_max_instances) : json(nullptr)},
-        {"largest", limits.largest_max_instances},
-    };
-}
-
-[[nodiscard]] json query_resolution_json(const TrainingDatasetLimits& limits) {
-    return {
-        {"source", limits.query_source},           {"resolved", limits.resolved_num_queries},
-        {"required", limits.required_num_queries}, {"automatic_query_cap", limits.automatic_num_queries_cap},
-        {"automatic", limits.automatic},           {"requested_override", limits.requested_override},
-    };
-}
-
 struct ResumeState {
+    std::string attempt_id;
     int start_epoch = 0;
     double best_regular = -std::numeric_limits<double>::infinity();
     double best_ema = -std::numeric_limits<double>::infinity();
@@ -340,6 +311,7 @@ struct TrainLaneResult {
     torch_api::Tensor loss;
     torch_api::Tensor class_loss;
     torch_api::Tensor box_loss;
+    scalar_packet::Tensors scalars;
     std::vector<torch_api::Tensor> gradients;
     std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> ready_event;
 };
@@ -448,6 +420,7 @@ struct TrainingMetricSnapshot {
     double step_loss = 0.0;
     double step_class_loss = 0.0;
     double step_box_loss = 0.0;
+    TrainingScalars scalars;
     bool loss_finite = true;
     bool gradients_finite = true;
 };
@@ -460,9 +433,11 @@ class TrainingMetricHandoff {
                           this, device_id),
                       1U, retirement_owner_) {
         const auto device_options = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(cuda_device(device_id_));
-        device_values_ = torch_api::zeros({8}, device_options);
+        device_values_ = torch_api::zeros({10 + static_cast<int64_t>(scalar_packet::size)}, device_options);
         device_values_.select(0, 6).fill_(1.0f);
-        host_values_ = torch_cuda::numa_empty({8}, torch_api::kFloat32, device_id_);
+        scalar_values_ = torch_api::empty({static_cast<int64_t>(scalar_packet::size)}, device_options);
+        unavailable_ = torch_api::full({}, std::numeric_limits<float>::quiet_NaN(), device_options);
+        host_values_ = torch_cuda::numa_empty({10 + static_cast<int64_t>(scalar_packet::size)}, torch_api::kFloat32, device_id_);
         torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(device_id_));
         ensure_cuda_ok(cudaStreamCreateWithFlags(&settlement_stream_, cudaStreamNonBlocking), "create training metric settlement stream");
     }
@@ -487,7 +462,11 @@ class TrainingMetricHandoff {
 
     void begin_wave() { device_values_.narrow(0, 3, 3).zero_(); }
 
-    void accumulate(const torch_api::Tensor& loss, const torch_api::Tensor& class_loss, const torch_api::Tensor& box_loss) {
+    void accumulate(const torch_api::Tensor& loss, const torch_api::Tensor& class_loss, const torch_api::Tensor& box_loss, const scalar_packet::Tensors& scalars) {
+        for (std::size_t i = 0; i < scalar_packet::size; ++i)
+            scalar_sources_[i] = scalars[i].defined() ? scalars[i] : unavailable_;
+        at::stack_out(scalar_values_, scalar_sources_);
+        device_values_.narrow(0, 10, scalar_packet::size).add_(scalar_values_);
         const auto detached_loss = loss.detach();
         const auto detached_class_loss = class_loss.detach();
         const auto detached_box_loss = box_loss.detach();
@@ -500,20 +479,12 @@ class TrainingMetricHandoff {
         device_values_.select(0, 6).mul_(torch_api::isfinite(detached_loss).to(torch_api::kFloat32));
     }
 
-    TrainingMetricSnapshot complete_step(const torch_api::Tensor& found_inf, int64_t wave_micro_batches) {
+    TrainingMetricSnapshot complete_step(const torch_api::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches) {
         device_values_.select(0, 7).copy_(found_inf);
-        host_values_.copy_(device_values_, true);
-        const auto device_index = torch_cuda::checked_device_index(device_id_);
-        const auto stream = torch_cuda::current_torch_cuda_stream_object(device_index);
-        auto completion = event_pool_.record(reinterpret_cast<std::uintptr_t>(stream.stream()), "record training metric handoff");
-        if (!completion) { throw std::runtime_error("training metric event pool is unavailable"); }
-        completion->wait(reinterpret_cast<std::uintptr_t>(settlement_stream_), "wait for training metric handoff");
-        ensure_cuda_ok(cudaStreamSynchronize(settlement_stream_), "synchronize training metric settlement stream");
-        completion->retire();
-
-        const auto* values = host_values_.data_ptr<float>();
+        const auto* values = complete_values();
         const double wave_divisor = static_cast<double>(std::max<int64_t>(1, wave_micro_batches));
         TrainingMetricSnapshot snapshot;
+        snapshot.scalars = scalar_packet::project(values + 10, static_cast<double>(epoch_micro_batches));
         snapshot.loss_sum = static_cast<double>(values[0]);
         snapshot.class_loss_sum = static_cast<double>(values[1]);
         snapshot.box_loss_sum = static_cast<double>(values[2]);
@@ -529,10 +500,41 @@ class TrainingMetricHandoff {
 
     [[nodiscard]] torch_api::Tensor loss_sum() const { return device_values_.select(0, 0); }
 
+    [[nodiscard]] torch_api::Tensor epoch_count(std::int64_t count) {
+        auto value = device_values_.select(0, 9);
+        value.fill_(static_cast<float>(count));
+        return value;
+    }
+    [[nodiscard]] double epoch_average() {
+        const auto* values = complete_values();
+        return static_cast<double>(values[0]) / std::max(1.0, static_cast<double>(values[9]));
+    }
+    void begin_validation() { device_values_.select(0, 8).zero_(); }
+    void accumulate_validation(const torch_api::Tensor& loss) { device_values_.select(0, 8).add_(loss.detach()); }
+    [[nodiscard]] double validation_average(std::size_t count) {
+        const auto* values = complete_values();
+        return count ? static_cast<double>(values[8]) / static_cast<double>(count) : 0.0;
+    }
+
    private:
+    const float* complete_values() {
+        host_values_.copy_(device_values_, true);
+        const auto device_index = torch_cuda::checked_device_index(device_id_);
+        const auto stream = torch_cuda::current_torch_cuda_stream_object(device_index);
+        auto completion = event_pool_.record(reinterpret_cast<std::uintptr_t>(stream.stream()), "record training metric handoff");
+        if (!completion) { throw std::runtime_error("training metric event pool is unavailable"); }
+        completion->wait(reinterpret_cast<std::uintptr_t>(settlement_stream_), "wait for training metric handoff");
+        ensure_cuda_ok(cudaStreamSynchronize(settlement_stream_), "synchronize training metric settlement stream");
+        completion->retire();
+
+        return host_values_.data_ptr<float>();
+    }
     int device_id_ = 0;
     torch_api::Tensor device_values_;
     torch_api::Tensor host_values_;
+    torch_api::Tensor scalar_values_;
+    torch_api::Tensor unavailable_;
+    scalar_packet::Tensors scalar_sources_;
     std::atomic<cudaError_t> first_failure_{cudaSuccess};
     mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_owner_{1U};
     mmltk::backend::ml::cuda::CudaEventPool event_pool_;
@@ -579,6 +581,7 @@ void record_lane_result_on_current_stream(const TrainLaneResult& lane_result, in
     record_tensor(lane_result.loss);
     record_tensor(lane_result.class_loss);
     record_tensor(lane_result.box_loss);
+    for (const auto& scalar : lane_result.scalars) record_tensor(scalar);
     for (const auto& gradient : lane_result.gradients) {
         record_tensor(gradient);
     }
@@ -676,11 +679,31 @@ torch_api::Tensor loss_value_or_zero(const TensorMap& loss_dict, const torch_api
     return torch_api::zeros({}, torch_api::TensorOptions().dtype(torch_api::kFloat32).device(device));
 }
 
+scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap& losses, const torch_api::Tensor& total,
+                                                const torch_api::Tensor& auxiliary) {
+    scalar_packet::Tensors values;
+    scalar_packet::set<^^TrainingScalars::total>(values, total);
+    scalar_packet::set<^^TrainingScalars::auxiliary_weighted>(values, auxiliary);
+    const auto assign = [&]<std::meta::info Member>(std::string_view name) {
+        const auto found = losses.find(std::string(name));
+        if (found != losses.end()) scalar_packet::set<Member>(values, found->second);
+    };
+    assign.operator()<^^TrainingScalars::classification>("loss_ce");
+    assign.operator()<^^TrainingScalars::l1>("loss_bbox");
+    assign.operator()<^^TrainingScalars::giou>("loss_giou");
+    assign.operator()<^^TrainingScalars::mask_ce>("loss_mask_ce");
+    assign.operator()<^^TrainingScalars::mask_dice>("loss_mask_dice");
+    assign.operator()<^^TrainingScalars::class_error>("class_error");
+    assign.operator()<^^TrainingScalars::cardinality_error>("cardinality_error");
+    return values;
+}
+
 struct RoutedTrainingLoss {
     torch_api::Tensor total;
     torch_api::Tensor classification;
     torch_api::Tensor box;
     TensorMap ordinary_terms;
+    scalar_packet::Tensors scalars;
 };
 
 RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const TrainingSupervisionRoute route, const ModelOutputs& outputs,
@@ -688,22 +711,34 @@ RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel& model, const 
                                                 const DetectionConfig& detection_config) {
     if (route_uses_match_free(route)) {
         const auto loss = detail::native_model_owner(model).supervision_loss(outputs, targets, normalizer, true);
-        return {loss.total, loss.classification, loss.box + loss.giou, {}};
+        scalar_packet::Tensors scalars;
+        scalar_packet::set<^^TrainingScalars::total>(scalars, loss.total);
+        scalar_packet::set<^^TrainingScalars::classification>(scalars, loss.main.classification);
+        scalar_packet::set<^^TrainingScalars::l1>(scalars, loss.main.box);
+        scalar_packet::set<^^TrainingScalars::giou>(scalars, loss.main.giou);
+        scalar_packet::set<^^TrainingScalars::correspondence_weighted>(scalars, loss.correspondence);
+        scalar_packet::set<^^TrainingScalars::auxiliary_weighted>(scalars, loss.auxiliary);
+        if (route_uses_denoising(route)) scalar_packet::set<^^TrainingScalars::denoising_weighted>(scalars, loss.denoising);
+        return {loss.total, loss.classification, loss.box + loss.giou, {}, std::move(scalars)};
     }
 
     const double group_divisor = detection_config.sum_group_losses ? 1.0 : static_cast<double>(detection_config.group_detr);
     const double num_boxes = torch_api::clamp_min(normalizer.target_count * group_divisor, 1.0).item<double>();
     auto ordinary_terms = detection_loss_dict(outputs, targets, detection_config, true, num_boxes);
-    auto total = weighted_detection_loss(ordinary_terms, detection_config, outputs.main.pred_logits.device());
+    torch_api::Tensor auxiliary;
+    auto total = weighted_detection_loss(ordinary_terms, detection_config, outputs.main.pred_logits.device(), &auxiliary);
+    auto scalars = ordinary_scalar_tensors(ordinary_terms, total, auxiliary);
     auto classification = loss_value_or_zero(ordinary_terms, outputs.main.pred_logits.device(), "loss_ce");
     auto box = loss_value_or_zero(ordinary_terms, outputs.main.pred_logits.device(), "loss_bbox");
     if (route_uses_denoising(route)) {
         const auto denoising = detail::native_model_owner(model).supervision_loss(outputs, targets, normalizer, true);
         total = total + denoising.total;
+        scalar_packet::set<^^TrainingScalars::denoising_weighted>(scalars, denoising.total);
         classification = classification + denoising.classification;
         box = box + denoising.box + denoising.giou;
     }
-    return {std::move(total), std::move(classification), std::move(box), std::move(ordinary_terms)};
+    scalar_packet::set<^^TrainingScalars::total>(scalars, total);
+    return {std::move(total), std::move(classification), std::move(box), std::move(ordinary_terms), std::move(scalars)};
 }
 
 std::string format_nonfinite_loss_report(const TensorMap& loss_dict, const std::vector<torch_api::Tensor>& parameters,
@@ -738,155 +773,6 @@ std::string format_nonfinite_loss_report(const TensorMap& loss_dict, const std::
     return report.str();
 }
 
-void append_json_line(const std::filesystem::path& path, const json& payload) {
-    mmltk::common::io::throw_on_json_write_failure(mmltk::common::io::append_json_line(path, payload), path, "RF-DETR training log");
-}
-
-void write_json_file(const std::filesystem::path& path, const json& payload) {
-    mmltk::common::io::throw_on_json_write_failure(mmltk::common::io::write_json_file_atomic(path, payload), path, "RF-DETR JSON file");
-}
-
-class LatestJsonWriter {
-   public:
-    explicit LatestJsonWriter(std::filesystem::path path, std::chrono::milliseconds minimum_interval = std::chrono::milliseconds(250))
-        : path_(std::move(path)),
-          minimum_interval_(minimum_interval),
-          uncaught_on_entry_(std::uncaught_exceptions()),
-          worker_([this] { run(); }) {}
-
-    ~LatestJsonWriter() { close_noexcept(); }
-
-    LatestJsonWriter(const LatestJsonWriter&) = delete;
-    LatestJsonWriter& operator=(const LatestJsonWriter&) = delete;
-
-    void submit(json payload, bool force) {
-        std::unique_lock<std::mutex> lock(mutex_);
-        rethrow_worker_error();
-        if (pending_.has_value()) {
-            pending_->payload = std::move(payload);
-            pending_->force = pending_->force || force;
-        } else {
-            pending_ = Pending{std::move(payload), force};
-        }
-        wake_.notify_one();
-        if (force) {
-            drained_.wait(lock, [this] { return error_ != nullptr || (!pending_.has_value() && !writing_); });
-            rethrow_worker_error();
-        }
-    }
-
-    void close() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-        }
-        wake_.notify_one();
-        if (worker_.joinable()) { worker_.join(); }
-        std::lock_guard<std::mutex> lock(mutex_);
-        rethrow_worker_error();
-    }
-
-   private:
-    struct Pending {
-        json payload;
-        bool force = false;
-    };
-
-    void rethrow_worker_error() const {
-        if (error_ != nullptr) { std::rethrow_exception(error_); }
-    }
-
-    void run() noexcept {
-        auto last_write = std::chrono::steady_clock::now() - minimum_interval_;
-        std::unique_lock<std::mutex> lock(mutex_);
-        while (true) {
-            wake_.wait(lock, [this] { return stopping_ || pending_.has_value(); });
-            if (stopping_ && !pending_.has_value()) { return; }
-            if (!pending_.has_value()) { continue; }
-            if (!pending_->force && !stopping_) {
-                const auto deadline = last_write + minimum_interval_;
-                // Checkpoint metadata writes use an explicit coalescing deadline; new forced work wakes immediately.
-                wake_.wait_until(lock, deadline, [this] { return stopping_ || (pending_.has_value() && pending_->force); });
-                if (!pending_.has_value()) { continue; }
-            }
-            if (!pending_.has_value()) { continue; }
-
-            Pending next = std::move(*pending_);
-            pending_.reset();
-            writing_ = true;
-            lock.unlock();
-            json completed_payload;
-            try {
-                write_json_file(path_, next.payload);
-                completed_payload = std::move(next.payload);
-            } catch (...) {
-                lock.lock();
-                error_ = std::current_exception();
-                writing_ = false;
-                stopping_ = true;
-                pending_.reset();
-                drained_.notify_all();
-                return;
-            }
-            lock.lock();
-            last_written_ = std::move(completed_payload);
-            last_write = std::chrono::steady_clock::now();
-            writing_ = false;
-            drained_.notify_all();
-        }
-    }
-
-    void close_noexcept() noexcept {
-        if (std::uncaught_exceptions() > uncaught_on_entry_) {
-            try {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (error_ == nullptr) {
-                    json error_payload = pending_.has_value() ? pending_->payload : last_written_.value_or(json::object());
-                    error_payload["phase"] = "error";
-                    pending_ = Pending{std::move(error_payload), true};
-                }
-            } catch (...) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                error_ = std::current_exception();
-            }
-        }
-        try {
-            close();
-        } catch (...) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            error_ = std::current_exception();
-        }
-    }
-
-    std::filesystem::path path_;
-    std::chrono::milliseconds minimum_interval_;
-    std::mutex mutex_;
-    std::condition_variable wake_;
-    std::condition_variable drained_;
-    std::optional<Pending> pending_;
-    std::optional<json> last_written_;
-    std::exception_ptr error_;
-    int uncaught_on_entry_ = 0;
-    bool writing_ = false;
-    bool stopping_ = false;
-    std::thread worker_;
-};
-
-json metric_summary_json(const MetricSummary& summary) {
-    return json{
-        {"ap", summary.ap},
-        {"ap50", summary.ap50},
-        {"ap75", summary.ap75},
-    };
-}
-
-json eval_summary_json(const EvalSummary& summary) {
-    return json{
-        {"bbox", metric_summary_json(summary.bbox)},
-        {"mask", summary.mask.has_value() ? metric_summary_json(*summary.mask) : json(nullptr)},
-    };
-}
-
 double checkpoint_metric(const EvalSummary& summary, const bool include_masks) {
     if (!include_masks) { return summary.bbox.ap; }
     if (!summary.mask.has_value()) { throw std::logic_error("segmentation validation did not produce a mask metric"); }
@@ -895,27 +781,6 @@ double checkpoint_metric(const EvalSummary& summary, const bool include_masks) {
 
 std::string formatted_mask_ap(const EvalSummary& summary) {
     return summary.mask.has_value() ? std::format("{:.4f}", summary.mask->ap) : "null";
-}
-
-json augmentation_group_json(const AugmentationGroupConfig& group) {
-    return json{
-        {"probability", group.probability},
-        {"min_strength", group.min_strength},
-        {"max_strength", group.max_strength},
-    };
-}
-
-json gpu_augmentation_json(const GpuAugmentationConfig& config) {
-    return json{
-        {"enabled", config.enabled},
-        {"geometry", augmentation_group_json(config.geometry)},
-        {"resize", augmentation_group_json(config.resize)},
-        {"color", augmentation_group_json(config.color)},
-        {"noise", augmentation_group_json(config.noise)},
-        {"blur", augmentation_group_json(config.blur)},
-        {"occlusion", augmentation_group_json(config.occlusion)},
-        {"copy_paste_probability", config.copy_paste_probability},
-    };
 }
 
 DistributedContext make_distributed_context(const TrainRequest& options) {
@@ -1201,45 +1066,63 @@ std::vector<NormalizedModelStateEntry> ema_state_entries(const std::vector<std::
     return state;
 }
 
-void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, NativeRfDetrModel& model,
-                            const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& grad_scaler,
+// One immutable epoch snapshot serves each synchronous archive in publication order.
+// The archive-local CPU entries borrow completed slot views until save returns.
+void save_snapshot_checkpoint(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata,
+                              const std::vector<NormalizedModelStateEntry>& ordinary,
+                              const std::vector<NormalizedModelStateEntry>& ema,
+                              torch_cuda::TensorReadbackBuffers& readback,
+                              const std::filesystem::path& descriptor) {
+    DecodedNativeModelState checkpoint;
+    checkpoint.metadata = metadata;
+    auto& entries = detail::model_state_owner(checkpoint).entries;
+    entries.reserve(ordinary.size());
+    std::unordered_map<std::string_view, std::size_t> shadows;
+    for (std::size_t index = 0; index < ema.size(); ++index) shadows.emplace(ema[index].name, ordinary.size() + index);
+    for (std::size_t index = 0; index < ordinary.size(); ++index) {
+        auto entry = ordinary[index];
+        const auto found = shadows.find(entry.name);
+        entry.tensor = readback.Stage(found == shadows.end() ? index : found->second);
+        entries.push_back(std::move(entry));
+    }
+    readback.Complete();
+    save_native_checkpoint(path, checkpoint, descriptor);
+}
+
+void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer, const GradScaler& grad_scaler,
                             const TrainRequest& options, int epoch, double best_regular, double best_ema,
-                            const std::vector<std::string>& param_names, const std::optional<ModelEma>& ema) {
+                            const std::vector<NormalizedModelStateEntry>& model_state,
+                            const std::vector<NormalizedModelStateEntry>& ema_state, std::string_view attempt_id,
+                            const std::filesystem::path& original_descriptor,
+                            torch_cuda::TensorReadbackBuffers& readback) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_total{"rfdetr.train.save.resume.total"};
     std::filesystem::create_directories(checkpoint_path.parent_path());
 
     torch_api::OutputArchive archive;
     detail::write_native_checkpoint_metadata(archive, metadata);
+    detail::write_training_configuration(archive, options);
+    write_string(archive, "training_attempt_id", std::string(attempt_id));
+    write_string(archive, "training_original_descriptor", original_descriptor.string());
     detail::write_training_supervision_config(archive, options.training_supervision);
-    std::vector<NormalizedModelStateEntry> model_state;
-    {
-        mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_collect_state{"rfdetr.train.save.resume.collect_state"};
-        model_state = collect_module_state(model);
-    }
+    optimizer.reserve_checkpoint(readback, model_state.size() + ema_state.size());
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_write_state{"rfdetr.train.save.resume.write_state"};
-        detail::write_resume_state_archive(archive, "state", model_state);
+        detail::write_resume_state_archive(archive, "state", model_state, readback, 0);
     }
 
     torch_api::OutputArchive optimizer_archive;
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_optimizer_state{"rfdetr.train.save.resume.optimizer_state"};
-        optimizer.save(optimizer_archive);
+        optimizer.save(optimizer_archive, readback, model_state.size() + ema_state.size());
     }
     write_string(archive, "optimizer_kind", optimizer.kind_name());
     archive.write("optimizer", optimizer_archive);
 
-    if (ema.has_value()) {
-        std::vector<NormalizedModelStateEntry> ema_state;
-        {
-            mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_ema_collect_state{
-                "rfdetr.train.save.resume.ema_collect_state"};
-            ema_state = ema_state_entries(param_names, *ema);
-        }
+    if (options.use_ema) {
         {
             mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_ema_write_state{
                 "rfdetr.train.save.resume.ema_write_state"};
-            detail::write_resume_state_archive(archive, "ema_state", ema_state);
+            detail::write_resume_state_archive(archive, "ema_state", ema_state, readback, model_state.size());
         }
     }
 
@@ -1271,6 +1154,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, Native
     write_int(archive, "grad_scaler_growth_tracker", grad_scaler.growth_tracker());
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_archive_save_to{"rfdetr.train.save.resume.archive_save_to"};
+        readback.Complete();
         detail::publish_native_checkpoint_archive(archive, checkpoint_path, options.class_layout_path);
     }
 }
@@ -1282,6 +1166,9 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
     if (!retained || !admitted.class_artifact) throw std::invalid_argument("full resume requires an admitted current native archive");
     admitted.class_artifact->RequireUnchanged();
     auto& archive = *retained;
+    const auto saved_configuration = detail::read_training_configuration(archive);
+    if (saved_configuration.use_ema != options.use_ema)
+        throw std::runtime_error("resume EMA selection differs from the saved training configuration");
 
     if (const auto lr_scheduler = read_optional_value<std::string>(archive, "lr_scheduler");
         lr_scheduler.has_value() && *lr_scheduler != cli_enum_spelling(options.lr_scheduler)) {
@@ -1314,6 +1201,8 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
     }
 
     ResumeState state;
+    state.attempt_id = require_string(archive, "training_attempt_id");
+    if (state.attempt_id.empty() || state.attempt_id.size() > 64) throw std::runtime_error("invalid resume attempt identity");
     const auto stored_epoch = read_optional_value<int64_t>(archive, "epoch").value_or(-1);
     if (stored_epoch < -1 || stored_epoch >= static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("native RF-DETR resume checkpoint epoch is outside the supported range");
@@ -1331,24 +1220,22 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
     const bool archive_has_ema = archive.try_read("ema_state", ema_archive);
     validate_resume_continuation_manifest(ResumeContinuationManifest{options.use_ema, archive_has_ema, stored_scale, stored_growth});
     std::optional<ModelEma> staged_ema;
-    std::optional<ModelEma::ShadowCandidate> staged_ema_shadow;
     if (archive_has_ema) {
         auto ema_state = read_state_archive(archive, "ema_state", parameter_names);
-        std::vector<torch_api::Tensor> staged_shadow;
-        if (main_process) { staged_shadow.reserve(ema_state.size()); }
-        for (std::size_t index = 0; index < ema_state.size(); ++index) {
-            const auto& source = ema_state[index].tensor;
-            const auto& destination = parameters[index];
-            if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() || source.sizes() != destination.sizes() ||
-                source.scalar_type() != destination.scalar_type() || source.layout() != destination.layout() ||
-                !torch_api::isfinite(source).all().item<bool>()) {
-                throw std::runtime_error("native RF-DETR resume EMA tensor does not match the active parameter inventory");
-            }
-            if (main_process) { staged_shadow.push_back(source.to(destination.device(), destination.scalar_type())); }
-        }
+        std::vector<torch_api::Tensor> cpu_shadow;
+        cpu_shadow.reserve(ema_state.size());
+        for (const auto& entry : ema_state) cpu_shadow.push_back(entry.tensor);
         if (main_process) {
-            staged_ema.emplace(parameters, options.ema_decay, static_cast<double>(options.ema_tau));
-            staged_ema_shadow = staged_ema->stage_shadow_params(staged_shadow);
+            staged_ema = ModelEma::from_cpu_shadow(parameters, cpu_shadow, options.ema_decay, static_cast<double>(options.ema_tau));
+        } else {
+            for (std::size_t index = 0; index < cpu_shadow.size(); ++index) {
+                const auto& source = cpu_shadow[index];
+                const auto& destination = parameters[index];
+                if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() ||
+                    source.sizes() != destination.sizes() || source.scalar_type() != destination.scalar_type() ||
+                    source.layout() != destination.layout() || !torch_api::isfinite(source).all().item<bool>())
+                    throw std::runtime_error("native RF-DETR resume EMA tensor does not match the active parameter inventory");
+            }
         }
     }
 
@@ -1366,10 +1253,7 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
         state.scaler_scale = static_cast<float>(*stored_scale);
         state.scaler_growth_tracker = static_cast<int>(*stored_growth);
     }
-    if (staged_ema_shadow.has_value()) {
-        staged_ema->commit_shadow_params(std::move(*staged_ema_shadow));
-        state.restored_ema = std::move(staged_ema);
-    }
+    state.restored_ema = std::move(staged_ema);
 
     return state;
 }
@@ -1501,6 +1385,7 @@ std::future<TrainLaneResult> enqueue_train_lane(
             torch_api::Tensor detached_loss;
             torch_api::Tensor detached_class_loss;
             torch_api::Tensor detached_box_loss;
+            scalar_packet::Tensors scalar_values;
             std::vector<torch_api::Tensor> gradients;
             {
                 TensorMap loss_dict;
@@ -1543,6 +1428,7 @@ std::future<TrainLaneResult> enqueue_train_lane(
                     class_loss = std::move(routed.classification);
                     box_loss = std::move(routed.box);
                     loss_dict = std::move(routed.ordinary_terms);
+                    scalar_values = std::move(routed.scalars);
                 } else {
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_dict{"rfdetr.train.parallel.loss_dict"};
                     const double group_divisor = detection_config.sum_group_losses ? 1.0 : detection_config.group_detr;
@@ -1550,7 +1436,9 @@ std::future<TrainLaneResult> enqueue_train_lane(
                         std::max(static_cast<double>(target_count) * group_divisor / std::max<int64_t>(1, detection_config.world_size), 1.0);
                     loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, num_boxes_value);
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_loss_total{"rfdetr.train.parallel.loss_total"};
-                    loss = weighted_detection_loss(loss_dict, detection_config, normalized.device());
+                    torch_api::Tensor auxiliary;
+                    loss = weighted_detection_loss(loss_dict, detection_config, normalized.device(), &auxiliary);
+                    scalar_values = ordinary_scalar_tensors(loss_dict, loss, auxiliary);
                     class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
                     box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
                 }
@@ -1570,6 +1458,7 @@ std::future<TrainLaneResult> enqueue_train_lane(
                 std::move(detached_loss),
                 std::move(detached_class_loss),
                 std::move(detached_box_loss),
+                std::move(scalar_values),
                 std::move(gradients),
                 event_pool.record(reinterpret_cast<std::uintptr_t>(lane.stream.stream()), "record parallel train lane completion event"),
             };
@@ -1582,7 +1471,7 @@ std::future<TrainLaneResult> enqueue_train_lane(
 
 EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model,
                               TrainingEventOwner& event_owner, const DetectionConfig& detection_config, bool calculate_loss,
-                              std::optional<int> current_epoch, std::string progress_label) {
+                              std::optional<int> current_epoch, std::string progress_label, TrainingMetricHandoff* metrics = nullptr) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_total{"rfdetr.train.eval.total"};
     RuntimeContext& runtime = validation.runtime();
     mmltk::backend::data::DatasetLoader& loader = validation.loader();
@@ -1590,6 +1479,11 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
 
     EvalPassResult result;
     torch_api::InferenceMode inference_mode;
+    struct RestoreMode final {
+        torch_api::Module& module;
+        bool training;
+        ~RestoreMode() { module.train(training); }
+    } restore_mode{detail::native_model_owner(model).module(), detail::native_model_owner(model).module().is_training()};
     detail::native_model_owner(model).module().eval();
     validation.begin_pass();
     TrainingEvaluationRunOwner& evaluation_run = validation.evaluation_run();
@@ -1625,7 +1519,8 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     size_t image_count = 0;
     size_t batch_count = 0;
     size_t seen_images = 0;
-    double loss_sum = 0.0;
+    if (calculate_loss && !metrics) throw std::logic_error("validation loss requires the retained scalar handoff");
+    if (calculate_loss) metrics->begin_validation();
     std::optional<CapturedEvalSample> captured_sample;
     const bool capture_eval_sample = current_epoch.has_value() && progress_label.starts_with("val ");
     std::unique_ptr<spdmon::ProgressBar> progress;
@@ -1771,7 +1666,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
             }
             criterion_timing.finish();
             target_consumer->retire();
-            loss_sum += loss.item<double>();
+            metrics->accumulate_validation(loss);
             static_cast<void>(detail::native_model_owner(model).harvest_supervision_timing());
             ++batch_count;
         }
@@ -1853,7 +1748,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
                                    render_options);
     }
     if (progress) { progress->close(); }
-    if (calculate_loss) { result.loss = batch_count > 0 ? loss_sum / static_cast<double>(batch_count) : 0.0; }
+    if (calculate_loss) { result.loss = metrics->validation_average(batch_count); }
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_metric{"rfdetr.train.eval.metric"};
         result.summary = evaluation_run.evaluate(validation.detection_limit().as_size, cpu_pool);
@@ -1982,11 +1877,14 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     artifact_request.resolution = static_cast<int>(train_loader.image_width());
     auto admitted = resolve_model_state(artifact_request.weights_path, artifact_request.preset_name, artifact_request.resolution, options.class_layout_path);
     auto artifacts = admitted.artifacts;
+    auto original_descriptor = options.class_layout_path;
     if (!options.resume_path.empty()) {
         if (!detail::model_state_owner(admitted.model_state).native_archive) {
             throw std::runtime_error("--resume requires a native RF-DETR .pt checkpoint: " + options.resume_path.string());
         }
         detail::require_resume_training_supervision_config(*detail::model_state_owner(admitted.model_state).native_archive, options.training_supervision);
+        original_descriptor = read_optional_value<std::string>(*detail::model_state_owner(admitted.model_state).native_archive,
+            "training_original_descriptor").value_or(options.class_layout_path.string());
     }
     artifacts.config.training_supervision = options.training_supervision;
     dataset_limits.automatic_num_queries_cap =
@@ -2128,6 +2026,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     }
 
     int start_epoch = 0;
+    std::string resume_attempt_id;
     double best_regular = -std::numeric_limits<double>::infinity();
     double best_ema = -std::numeric_limits<double>::infinity();
     if (!options.resume_path.empty()) {
@@ -2145,6 +2044,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         }
         if (resume_state.restored_ema.has_value()) { ema = std::move(resume_state.restored_ema); }
         start_epoch = resume_state.start_epoch;
+        resume_attempt_id = std::move(resume_state.attempt_id);
         best_regular = resume_state.best_regular;
         best_ema = resume_state.best_ema;
     }
@@ -2198,15 +2098,19 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     const TrainingSupervisionRoute training_route = supervision_route(artifacts.config.training_supervision);
 
     if (main_process) { std::filesystem::create_directories(options.output_dir); }
-    const auto progress_path = options.output_dir / "progress.json";
-    const auto log_path = options.output_dir / "log.txt";
-    const auto validation_profile_path = options.output_dir / "validation_profile.jsonl";
-    const auto results_path = options.output_dir / "results.json";
     const auto checkpoint_path = options.output_dir / "checkpoint.pt";
     const auto best_regular_checkpoint_path = options.output_dir / "checkpoint_best_regular.pt";
     const auto best_ema_checkpoint_path = options.output_dir / "checkpoint_best_ema.pt";
-    const NativeCheckpointMetadata metadata = checkpoint_metadata(artifacts, dataset_output_classes);
+    auto metadata = checkpoint_metadata(artifacts, dataset_output_classes);
+    if (!options.resume_path.empty()) {
+        metadata.source_path = admitted.model_state.metadata.source_path;
+        metadata.source_kind = admitted.model_state.metadata.source_kind;
+    }
 
+    auto checkpoint_configuration = options;
+    checkpoint_configuration.resolution = artifacts.config.resolution;
+    checkpoint_configuration.preset_name = artifacts.config.preset_name;
+    torch_cuda::TensorReadbackBuffers checkpoint_readback;
     TrainRunResult result;
     result.artifacts = artifacts;
     result.gpu_augmentation = options.gpu_augmentation;
@@ -2214,49 +2118,35 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     result.checkpoint_path = checkpoint_path;
     result.best_regular_checkpoint_path = best_regular_checkpoint_path;
     result.best_ema_checkpoint_path = best_ema_checkpoint_path;
-    if (main_process && std::isfinite(best_regular) && std::filesystem::exists(best_regular_checkpoint_path)) {
+    if (main_process && !options.use_ema && std::isfinite(best_regular) && std::filesystem::exists(best_regular_checkpoint_path)) {
         result.best_checkpoint_path = best_regular_checkpoint_path;
         result.best_is_ema = false;
     }
-    if (main_process && std::isfinite(best_ema) && std::filesystem::exists(best_ema_checkpoint_path) && best_ema >= best_regular) {
+    if (main_process && options.use_ema && std::isfinite(best_ema) && std::filesystem::exists(best_ema_checkpoint_path)) {
         result.best_checkpoint_path = best_ema_checkpoint_path;
         result.best_is_ema = true;
     }
-    std::unique_ptr<LatestJsonWriter> progress_writer;
+    std::unique_ptr<TrainingTelemetryWriter> progress_writer;
+    TrainingMetricProgress last_training_progress;
     if (main_process) {
-        std::error_code ignored_error;
-        std::filesystem::remove(progress_path, ignored_error);
-        std::filesystem::remove(log_path, ignored_error);
-        std::filesystem::remove(results_path, ignored_error);
-        if (options.validation_profile) { std::filesystem::remove(validation_profile_path, ignored_error); }
-        progress_writer = std::make_unique<LatestJsonWriter>(progress_path);
-        progress_writer->submit(
-            json{
-                {"phase", "starting"},
-                {"epoch", start_epoch},
-                {"total_epochs", options.epochs},
-                {"completed_batches", 0},
-                {"total_batches", usable_full_batches},
-                {"completed_waves", 0},
-                {"optimizer_steps", 0},
-                {"steps_per_epoch", steps_per_epoch},
-                {"train_lanes", train_lane_count},
-                {"dataset_max_instances", dataset_limits_json(dataset_limits)},
-                {"query_resolution", query_resolution_json(dataset_limits)},
-                {"train_loss", 0.0},
-                {"class_loss", 0.0},
-                {"box_loss", 0.0},
-                {"step_loss", 0.0},
-                {"step_class_loss", 0.0},
-                {"step_box_loss", 0.0},
-                {"batches_per_second", 0.0},
-                {"images_per_second", 0.0},
-                {"elapsed_seconds", 0.0},
-                {"checkpoint_path", std::string{}},
-                {"val_loss", nullptr},
-                {"val", json()},
-            },
-            true);
+        TrainingRun run;
+        run.configuration = checkpoint_configuration;
+        run.original_weights = metadata.source_path;
+        run.original_class_descriptor = original_descriptor;
+        run.execution = {train_runtime.split().lane_threads, effective_batch_per_rank(options, train_lane_count),
+                         effective_batch_global(options, distributed, train_lane_count), dataset_limits};
+        run.class_layout = artifacts.class_layout;
+        run.evaluated_weights = options.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
+        run.source_checkpoint_attempt_id = resume_attempt_id;
+        run.resume_epoch = start_epoch - 1;
+        run.resume_optimizer_step = static_cast<std::uint64_t>(start_epoch) * static_cast<std::uint64_t>(steps_per_epoch);
+        progress_writer = std::make_unique<TrainingTelemetryWriter>(std::move(run));
+        last_training_progress.epoch = start_epoch;
+        last_training_progress.total_epochs = options.epochs;
+        last_training_progress.total_batches = usable_full_batches;
+        last_training_progress.steps_per_epoch = steps_per_epoch;
+        last_training_progress.train_lanes = train_lane_count;
+        progress_writer->Submit(last_training_progress, TrainingRecordRole::Boundary);
     }
 
     torch_cuda::TorchCudaDeviceGuard device_guard(cuda_device_index(options.device_id));
@@ -2308,6 +2198,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         detail::native_model_owner(model).module().train();
         optimizer.zero_grad(true);
         metric_handoff.reset_epoch();
+        last_training_progress.scalars = {};
         const auto epoch_started = std::chrono::steady_clock::now();
         int64_t local_micro_batches = 0;
         int64_t reported_micro_batches = 0;
@@ -2317,10 +2208,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         double host_loss_sum = 0.0;
         double host_class_loss_sum = 0.0;
         double host_box_loss_sum = 0.0;
+        std::optional<double> epoch_global_loss;
         double current_step_loss = 0.0;
         double current_step_class_loss = 0.0;
         double current_step_box_loss = 0.0;
-        auto last_progress_submit = epoch_started - std::chrono::milliseconds(250);
+        auto last_progress_submit = epoch_started - std::chrono::seconds(1);
 
         std::unique_ptr<spdmon::ProgressBar> progress;
         if (main_process && options.progress_bar) {
@@ -2330,7 +2222,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             progress->set_postfix("cl=warming, bl=warming, l=warming");
         }
 
-        auto write_progress_snapshot = [&](std::string_view phase, std::optional<double> val_loss, const json& val_summary,
+        auto write_progress_snapshot = [&](TrainingPhase phase, std::optional<double> val_loss, const std::optional<EvalSummary>& val_summary,
                                            const std::filesystem::path& checkpoint_override, bool force) {
             if (!main_process) { return; }
             const double elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - epoch_started).count();
@@ -2343,31 +2235,37 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             const double images_per_second =
                 elapsed_seconds > 0.0 ? static_cast<double>(local_micro_batches) * static_cast<double>(options.batch_size) / elapsed_seconds
                                       : 0.0;
-            progress_writer->submit(
-                json{
-                    {"phase", std::string(phase)},
-                    {"epoch", epoch},
-                    {"total_epochs", options.epochs},
-                    {"completed_batches", local_micro_batches},
-                    {"total_batches", usable_full_batches},
-                    {"completed_waves", local_waves},
-                    {"optimizer_steps", optimizer_steps},
-                    {"steps_per_epoch", steps_per_epoch},
-                    {"train_lanes", train_lane_count},
-                    {"train_loss", average_loss},
-                    {"class_loss", average_class_loss},
-                    {"box_loss", average_box_loss},
-                    {"step_loss", current_step_loss},
-                    {"step_class_loss", current_step_class_loss},
-                    {"step_box_loss", current_step_box_loss},
-                    {"batches_per_second", batches_per_second},
-                    {"images_per_second", images_per_second},
-                    {"elapsed_seconds", elapsed_seconds},
-                    {"checkpoint_path", checkpoint_override.empty() ? std::string{} : checkpoint_override.string()},
-                    {"val_loss", val_loss.has_value() ? json(*val_loss) : json(nullptr)},
-                    {"val", val_summary},
-                },
-                force);
+            TrainingMetricProgress snapshot;
+            snapshot.phase = phase;
+            snapshot.epoch = epoch;
+            snapshot.total_epochs = options.epochs;
+            snapshot.completed_batches = local_micro_batches;
+            snapshot.total_batches = usable_full_batches;
+            snapshot.completed_waves = local_waves;
+            snapshot.optimizer_steps = optimizer_steps;
+            snapshot.global_optimizer_step = static_cast<std::int64_t>(epoch) * steps_per_epoch + optimizer_steps;
+            snapshot.epoch_global_loss = epoch_global_loss;
+            snapshot.steps_per_epoch = steps_per_epoch;
+            snapshot.train_lanes = train_lane_count;
+            snapshot.train_loss = average_loss;
+            snapshot.class_loss = average_class_loss;
+            snapshot.box_loss = average_box_loss;
+            snapshot.step_loss = current_step_loss;
+            snapshot.step_class_loss = current_step_class_loss;
+            snapshot.step_box_loss = current_step_box_loss;
+            snapshot.batches_per_second = batches_per_second;
+            snapshot.images_per_second = images_per_second;
+            snapshot.elapsed_seconds = elapsed_seconds;
+            snapshot.checkpoint_path = checkpoint_override;
+            snapshot.full_checkpoint_path = phase == TrainingPhase::EpochComplete ? checkpoint_path : last_training_progress.full_checkpoint_path;
+            snapshot.val_loss = val_loss;
+            snapshot.val = val_summary;
+            snapshot.scalars = last_training_progress.scalars;
+            snapshot.scalars.total = reported_micro_batches > 0 ? std::optional<double>{average_loss} : std::nullopt;
+            snapshot.scalars.images_per_second = images_per_second;
+            last_training_progress = snapshot;
+            progress_writer->Submit(std::move(snapshot), phase == TrainingPhase::EpochComplete ? TrainingRecordRole::Epoch :
+                                    (force ? TrainingRecordRole::Boundary : TrainingRecordRole::Live));
         };
 
         auto flush_progress = [&](bool force) {
@@ -2389,18 +2287,24 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                                                              steps_per_epoch));
             }
             const auto now = std::chrono::steady_clock::now();
-            if (force || now - last_progress_submit >= std::chrono::milliseconds(250)) {
-                write_progress_snapshot("train", std::nullopt, json{}, std::filesystem::path{}, force);
+            if (force || now - last_progress_submit >= std::chrono::seconds(1)) {
+                write_progress_snapshot(TrainingPhase::Train, std::nullopt, {}, std::filesystem::path{}, force);
                 last_progress_submit = now;
             }
         };
 
-        write_progress_snapshot("train", std::nullopt, json{}, std::filesystem::path{}, true);
+        write_progress_snapshot(TrainingPhase::Train, std::nullopt, {}, std::filesystem::path{}, true);
         last_progress_submit = std::chrono::steady_clock::now();
 
         const auto apply_optimizer_schedule = [&](int64_t current_step) {
             const double lr_scale = compute_lr_scale(lr_config, current_step, steps_per_epoch, total_training_steps);
             set_optimizer_lrs(optimizer, optimizer_build.base_lrs, lr_scale);
+            if (!optimizer_build.base_lrs.empty()) {
+                const auto [minimum, maximum] = std::minmax_element(optimizer_build.base_lrs.begin(), optimizer_build.base_lrs.end());
+                last_training_progress.scalars.learning_rate = optimizer_build.base_lrs.front() * lr_scale;
+                last_training_progress.scalars.learning_rate_min = *minimum * lr_scale;
+                last_training_progress.scalars.learning_rate_max = *maximum * lr_scale;
+            }
             if (options.optimizer == TrainOptimizerKind::Muon) {
                 optimizer.set_muon_momentum(compute_warmup_momentum(lr_config, current_step, steps_per_epoch, options.momentum));
             }
@@ -2413,7 +2317,12 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             const auto found_inf = grad_scaler.check_and_unscale_(optimizer);
             if (options.clip_max_norm > 0.0) { torch_api::clip_grad_norm_(all_params, options.clip_max_norm); }
 
-            const TrainingMetricSnapshot metrics = metric_handoff.complete_step(found_inf, wave_micro_batches);
+            const TrainingMetricSnapshot metrics = metric_handoff.complete_step(found_inf, wave_micro_batches, local_micro_batches);
+            auto scalars = metrics.scalars;
+            scalars.learning_rate = last_training_progress.scalars.learning_rate;
+            scalars.learning_rate_min = last_training_progress.scalars.learning_rate_min;
+            scalars.learning_rate_max = last_training_progress.scalars.learning_rate_max;
+            last_training_progress.scalars = std::move(scalars);
             host_loss_sum = metrics.loss_sum;
             host_class_loss_sum = metrics.class_loss_sum;
             host_box_loss_sum = metrics.box_loss_sum;
@@ -2441,7 +2350,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             grad_scaler.step(optimizer, gradient_overflow);
             grad_scaler.update(gradient_overflow);
             optimizer.zero_grad(true);
-            if (ema.has_value() && !gradient_overflow) { ema->update(all_params, optimizer_steps); }
+            if (ema.has_value() && !gradient_overflow) { ema->update(optimizer_steps); }
             if (gradient_overflow) {
                 mmltk::common::logging::warn(
                     [&](auto& logger) { logger.warn("skipped RF-DETR optimizer update after gradient overflow{}", overflow_details); });
@@ -2496,6 +2405,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 torch_api::Tensor loss;
                 torch_api::Tensor class_loss;
                 torch_api::Tensor box_loss;
+                scalar_packet::Tensors scalar_values;
                 TensorMap loss_dict;
                 auto& model_owner = detail::native_model_owner(model);
                 PreparedTargets prepared;
@@ -2545,6 +2455,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                     class_loss = std::move(routed.classification);
                     box_loss = std::move(routed.box);
                     loss_dict = std::move(routed.ordinary_terms);
+                    scalar_values = std::move(routed.scalars);
                 } else {
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_forward{"rfdetr.train.forward"};
                     outputs = detail::native_model_owner(model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
@@ -2559,11 +2470,13 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 }
                 if (!route_is_active(training_route)) {
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_loss_total{"rfdetr.train.loss_total"};
-                    loss = weighted_detection_loss(loss_dict, detection_config, normalized.device());
+                    torch_api::Tensor auxiliary;
+                    loss = weighted_detection_loss(loss_dict, detection_config, normalized.device(), &auxiliary);
+                    scalar_values = ordinary_scalar_tensors(loss_dict, loss, auxiliary);
                     class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
                     box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
                 }
-                metric_handoff.accumulate(loss, class_loss, box_loss);
+                metric_handoff.accumulate(loss, class_loss, box_loss, scalar_values);
                 ++local_micro_batches;
                 ++local_waves;
                 const auto scaled_loss = grad_scaler.scale(loss.div(static_cast<double>(options.grad_accum_steps)));
@@ -2612,7 +2525,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
 
                 wave.settle(cuda_device(options.device_id), [&](TrainLaneResult& lane_result) {
                     merge_lane_gradients(lane_result, all_params, options.device_id);
-                    metric_handoff.accumulate(lane_result.loss, lane_result.class_loss, lane_result.box_loss);
+                    metric_handoff.accumulate(lane_result.loss, lane_result.class_loss, lane_result.box_loss, lane_result.scalars);
                     ++local_micro_batches;
                     if (progress) { progress->add(static_cast<size_t>(options.batch_size)); }
                 });
@@ -2664,21 +2577,28 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         flush_progress(true);
         if (progress) { progress->close(); }
 
-        auto reduced_loss_sum = metric_handoff.loss_sum().detach().clone();
-        auto reduced_micro_batches =
-            torch_api::tensor({static_cast<float>(local_micro_batches)},
-                              torch_api::TensorOptions().dtype(torch_api::kFloat32).device(cuda_device(options.device_id)));
+        auto reduced_loss_sum = metric_handoff.loss_sum();
+        auto reduced_micro_batches = metric_handoff.epoch_count(local_micro_batches);
         if (distributed.enabled) {
             distributed_all_reduce_tensor(distributed, reduced_loss_sum);
             distributed_all_reduce_tensor(distributed, reduced_micro_batches);
         }
-        const double train_loss = reduced_loss_sum.item<double>() / std::max(1.0, reduced_micro_batches.item<double>());
+        const double train_loss = metric_handoff.epoch_average();
+        epoch_global_loss = train_loss;
         distributed_barrier(distributed);
 
         if (main_process) {
-            write_progress_snapshot("validate", std::nullopt, json{}, std::filesystem::path{}, true);
-            auto val_result = evaluate_model(options, *validation_runtime, model, training_events, detection_config,
-                                             options.validation_loss, epoch, phase_progress_label("val", epoch, options.epochs));
+            write_progress_snapshot(TrainingPhase::Validate, std::nullopt, {}, std::filesystem::path{}, true);
+            EvalPassResult val_result;
+            {
+                std::optional<ModelEma::Selection> selected;
+                if (ema) selected.emplace(*ema, detail::native_model_owner(model).module());
+                val_result = evaluate_model(options, *validation_runtime, model, training_events, detection_config,
+                                             options.validation_loss, epoch,
+                                             phase_progress_label(ema ? "ema" : "val", epoch, options.epochs), &metric_handoff);
+                if (selected) selected->restore();
+                detail::native_model_owner(model).module().train();
+            }
 
             if (val_result.loss.has_value()) {
                 mmltk::common::logging::info([&](auto& logger) {
@@ -2693,14 +2613,15 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 });
             }
 
-            {
-                mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_epoch{"rfdetr.train.save.epoch"};
-                DecodedNativeModelState epoch_checkpoint;
-                epoch_checkpoint.metadata = metadata;
-                detail::model_state_owner(epoch_checkpoint).entries = collect_module_state(model);
-                auto epoch_path = options.output_dir / std::format("checkpoint_epoch_{}.pt", epoch + 1);
-                save_native_checkpoint(epoch_path, epoch_checkpoint, options.class_layout_path);
-            }
+            checkpoint_readback.Begin();
+            const auto ordinary_snapshot = collect_module_state(model);
+            detail::reserve_state_archive(ordinary_snapshot, checkpoint_readback, 0);
+            save_snapshot_checkpoint(options.output_dir / std::format("checkpoint_epoch_{}.pt", epoch + 1),
+                                     metadata, ordinary_snapshot, {}, checkpoint_readback, options.class_layout_path);
+            // Preparing later artifacts must not undo a successfully published epoch.
+            const auto ema_snapshot = ema ? ema_state_entries(all_param_names, *ema) :
+                                            std::vector<NormalizedModelStateEntry>{};
+            detail::reserve_state_archive(ema_snapshot, checkpoint_readback, ordinary_snapshot.size());
 
             TrainEpochSummary epoch_summary;
             epoch_summary.epoch = epoch;
@@ -2708,83 +2629,44 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             epoch_summary.val_loss = val_result.loss;
             epoch_summary.val_summary = val_result.summary;
 
-            const double regular_metric = checkpoint_metric(val_result.summary, detection_config.include_masks);
-            if (regular_metric > best_regular) {
-                best_regular = regular_metric;
-                save_collected_checkpoint(best_regular_checkpoint_path, metadata, model, nullptr, "rfdetr.train.save.best_regular",
-                                          "rfdetr.train.save.best_regular.collect_state", options.class_layout_path);
-                result.best_is_ema = false;
-                result.best_checkpoint_path = best_regular_checkpoint_path;
-            }
-
-            if (ema.has_value()) {
-                std::vector<torch_api::Tensor> saved_params;
-                saved_params.reserve(all_params.size());
-                {
-                    torch_api::NoGradGuard no_grad;
-                    for (const auto& param : all_params) {
-                        saved_params.push_back(param.detach().clone());
-                    }
-                    ema->copy_to(all_params);
-                }
-                auto ema_result = evaluate_model(options, *validation_runtime, model, training_events, detection_config,
-                                                 options.validation_loss, epoch, phase_progress_label("ema", epoch, options.epochs));
-                {
-                    torch_api::NoGradGuard no_grad;
-                    for (size_t index = 0; index < all_params.size(); ++index) {
-                        all_params[index].copy_(saved_params[index]);
-                    }
-                }
-                epoch_summary.ema_val_loss = ema_result.loss;
-                epoch_summary.ema_val_summary = ema_result.summary;
-
-                const double ema_metric = checkpoint_metric(ema_result.summary, detection_config.include_masks);
-                if (ema_metric > best_ema) {
-                    best_ema = ema_metric;
-                    const auto overrides = ema_override_map(all_param_names, *ema);
-                    save_collected_checkpoint(best_ema_checkpoint_path, metadata, model, &overrides, "rfdetr.train.save.best_ema",
-                                              "rfdetr.train.save.best_ema.collect_state", options.class_layout_path);
-                    result.best_is_ema = true;
-                    result.best_checkpoint_path = best_ema_checkpoint_path;
-                }
+            epoch_summary.evaluated_ema = options.use_ema;
+            const double selected_metric = checkpoint_metric(val_result.summary, detection_config.include_masks);
+            auto& best_metric = options.use_ema ? best_ema : best_regular;
+            const auto& selected_path = options.use_ema ? best_ema_checkpoint_path : best_regular_checkpoint_path;
+            if (selected_metric > best_metric) {
+                save_snapshot_checkpoint(selected_path, metadata, ordinary_snapshot, ema_snapshot,
+                                         checkpoint_readback, options.class_layout_path);
+                best_metric = selected_metric;
+                result.best_is_ema = options.use_ema;
+                result.best_checkpoint_path = selected_path;
             }
 
             {
                 mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume{"rfdetr.train.save.resume"};
-                save_resume_checkpoint(checkpoint_path, model, metadata, optimizer, grad_scaler, options, epoch, best_regular, best_ema,
-                                       all_param_names, ema);
+                save_resume_checkpoint(checkpoint_path, metadata, optimizer, grad_scaler, checkpoint_configuration, epoch, best_regular, best_ema,
+                                       ordinary_snapshot, ema_snapshot, progress_writer->attempt_id(), original_descriptor, checkpoint_readback);
+                checkpoint_readback.Release();
             }
 
+            if (result.history.size() == result.history.capacity()) result.history.erase(result.history.begin());
             result.history.push_back(epoch_summary);
-            {
-                mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_log_json{"rfdetr.train.save.log_json"};
-                json epoch_record{
-                    {"epoch", epoch},
-                    {"train_lanes", train_lane_count},
-                    {"eval_lanes", train_runtime.split().lane_threads},
-                    {"effective_batch_per_rank", effective_batch_per_rank(options, train_lane_count)},
-                    {"effective_batch_global", effective_batch_global(options, distributed, train_lane_count)},
-                    {"train_loss", train_loss},
-                    {"val_loss", val_result.loss.has_value() ? json(*val_result.loss) : json(nullptr)},
-                    {"val", eval_summary_json(val_result.summary)},
-                    {"ema_val_loss", epoch_summary.ema_val_loss.has_value() ? json(*epoch_summary.ema_val_loss) : json(nullptr)},
-                    {"ema_val", epoch_summary.ema_val_summary.has_value() ? eval_summary_json(*epoch_summary.ema_val_summary) : json()},
-                };
-                if (route_is_active(training_route)) {
-                    epoch_record["training_supervision"] = {
-                        {"assignment", cli_enum_spelling(options.training_supervision.assignment)},
-                        {"denoising", {{"enabled", options.training_supervision.denoising.enabled}}},
-                    };
-                }
-                append_json_line(log_path, epoch_record);
-            }
-            write_progress_snapshot("epoch_complete", val_result.loss, eval_summary_json(val_result.summary),
+            ++result.completed_epochs;
+            write_progress_snapshot(TrainingPhase::EpochComplete, val_result.loss, val_result.summary,
                                     result.best_checkpoint_path.has_value() ? *result.best_checkpoint_path : checkpoint_path, true);
         }
         distributed_barrier(distributed);
     }
 
-    if (main_process && !result.best_checkpoint_path.has_value()) { result.best_checkpoint_path = checkpoint_path; }
+    if (main_process && !result.best_checkpoint_path.has_value()) {
+        const auto fallback_path = options.output_dir / (options.use_ema ? "checkpoint_fallback_ema.pt" : "checkpoint_fallback_regular.pt");
+        const auto overrides = ema ? ema_override_map(all_param_names, *ema) : std::unordered_map<std::string, torch_api::Tensor>{};
+        save_collected_checkpoint(fallback_path, metadata, model, ema ? &overrides : nullptr,
+                                  "rfdetr.train.save.selected_fallback", "rfdetr.train.save.selected_fallback.collect_state",
+                                  options.class_layout_path);
+        result.best_checkpoint_path = fallback_path;
+        result.best_is_ema = options.use_ema;
+        result.best_is_fallback = true;
+    }
 
     if (main_process && !options.test_compiled_path.empty()) {
         auto test_config = make_loader_config_for(options.test_compiled_path, val_batch_size, false, options.prefetch_factor, false, false);
@@ -2803,26 +2685,15 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     }
 
     if (main_process) {
-        mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_results_json{"rfdetr.train.save.results_json"};
-        write_json_file(results_path, json{
-                                          {"preset_name", artifacts.config.preset_name},
-                                          {"output_dir", options.output_dir.string()},
-                                          {"checkpoint", checkpoint_path.string()},
-                                          {"best_checkpoint", result.best_checkpoint_path->string()},
-                                          {"best_is_ema", result.best_is_ema},
-                                          {"best_regular_metric", best_regular},
-                                          {"best_ema_metric", best_ema},
-                                          {"last_epoch", result.last_epoch},
-                                          {"history_size", result.history.size()},
-                                          {"train_lanes", train_lane_count},
-                                          {"eval_lanes", train_runtime.split().lane_threads},
-                                          {"effective_batch_per_rank", effective_batch_per_rank(options, train_lane_count)},
-                                          {"effective_batch_global", effective_batch_global(options, distributed, train_lane_count)},
-                                          {"dataset_max_instances", dataset_limits_json(dataset_limits)},
-                                          {"query_resolution", query_resolution_json(dataset_limits)},
-                                          {"gpu_augmentation", gpu_augmentation_json(options.gpu_augmentation)},
-                                          {"test", result.test_summary.has_value() ? eval_summary_json(*result.test_summary) : json()},
-                                      });
+        last_training_progress.phase = TrainingPhase::Completed;
+        last_training_progress.checkpoint_path = *result.best_checkpoint_path;
+        TrainingFinalFacts final;
+        if (std::isfinite(best_regular)) final.best_regular = best_regular;
+        if (std::isfinite(best_ema)) final.best_ema = best_ema;
+        final.fallback = result.best_is_fallback;
+        final.history_size = result.completed_epochs;
+        last_training_progress.test = result.test_summary;
+        progress_writer->Finish(last_training_progress, std::move(final));
     }
     distributed_barrier(distributed);
     if (distributed.enabled) {
@@ -2831,7 +2702,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         distributed.store.reset();
 #endif
     }
-    if (main_process) { progress_writer->close(); }
+    if (main_process) { progress_writer->Close(); }
 
     return result;
 }

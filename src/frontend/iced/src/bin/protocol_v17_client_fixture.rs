@@ -516,6 +516,21 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         "positional output decoder accepted named persistence data",
     )?;
     use mmltk_browser_app::generated;
+    let training = generated::TrainingRecord::from_application_value(model_reference(700)?).map_err(io::Error::other)?;
+    let training_transport = generated::TrainingRecord::from_application_transport_value(model_reference(701)?).map_err(io::Error::other)?;
+    require(training == training_transport && training.evaluatedweights == generated::EvaluatedWeights::Ema
+        && training.progress.scalars.total == Some(1.25) && training.progress.scalars.classification.is_none()
+        && training.progress.val.as_ref().is_some_and(|value| value.bbox.ap == 0.625)
+        && training.droppedbefore == 2 && training.sequence == 17,
+        "training metric values, unavailability or selected weight provenance changed")?;
+    let training_page = generated::TrainingHistoryPage::from_application_value(model_reference(702)?).map_err(io::Error::other)?;
+    let transported_training_page = generated::TrainingHistoryPage::from_application_transport_value(model_reference(703)?).map_err(io::Error::other)?;
+    require(training_page == transported_training_page && training_page.generation == 9
+        && training_page.nextcursor == 123 && training_page.records == [training],
+        "bounded training history did not survive both codecs")?;
+    let history = generated::encode_training_History(1, generated::TrainingHistoryQuery { generation: 9, cursor: 123, count: 32 });
+    require(history.record.endpoint_id == 6009522715651029925,
+        "training history endpoint identity changed")?;
     let metric_page = generated::EvaluationDetailPage::from_application_value(model_reference(600)?).map_err(io::Error::other)?;
     let transported_page = generated::EvaluationDetailPage::from_application_transport_value(model_reference(601)?).map_err(io::Error::other)?;
     require(metric_page == transported_page && metric_page.rows.len() == 2 && metric_page.rows[0].precisioncurve[9][100] == 0.125,

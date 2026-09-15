@@ -58,6 +58,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::frameworks::reflection
     PRIVATE
         mmltk::backend::models::rfdetr::inference
+        mmltk::backend::models::rfdetr::training
         mmltk::controller::visual_runtime
         mmltk::backend::imaging::raster
         mmltk::backend::imaging::explore

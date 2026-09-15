@@ -10,10 +10,40 @@
 #include <variant>
 
 #include "src/controller/contracts/default_state.h"
+#include "src/controller/contracts/model_selection.h"
 #include "src/controller/services/persistence_storage.h"
 #include "src/controller/subsystems/system/local_run.h"
 
 namespace mmltk::controller {
+
+void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::TrainRequest request,
+                                               const std::filesystem::path& checkpoint) {
+    services::SettingsMutationResult result;
+    {
+        std::scoped_lock mutation_lock(mutation_mutex_);
+        auto candidate = mutation_candidate();
+        request.output_dir = candidate.workflows.train.request.output_dir;
+        request.resume_path = checkpoint;
+        // Worker launch coordinates are process state, not a reusable GUI run.
+        request.distributed_worker = false;
+        request.distributed_rank = 0;
+        request.distributed_world_size = 1;
+        request.distributed_store_path.clear();
+        if (request.device_ids.empty()) request.device_ids.push_back(request.device_id);
+        candidate.workflows.train.request = std::move(request);
+        using Row = contracts::TrainWeightsModelSelection;
+        Row::source(candidate) = contracts::ModelSelectionSource::Custom;
+        Row::input(candidate) = contracts::ModelArtifactInputKind::Weights;
+        Row::artifact(candidate) = checkpoint;
+        // The old descriptor describes the pretrained bytes, not this checkpoint.
+        Row::class_layout(candidate).clear();
+        if (!contracts::gui_settings_valid(candidate)) throw contracts::InvalidIntentError("checkpoint training settings are invalid");
+        result = persist(std::move(candidate));
+    }
+    publish(result);
+    if (!result.applied()) throw contracts::FailedError(result.detail);
+}
+
 namespace {
 
 [[nodiscard]] bool flat_value_is_null(const mmltk::frameworks::serialization::wire::FlatValue& value) {

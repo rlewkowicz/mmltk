@@ -315,7 +315,8 @@ impl ApplicationModel {
             return Ok(Observation::Stale);
         }
         if progress.revision == installed.revision {
-            if progress.activity != installed.activity || progress.local != installed.local {
+            if progress.activity != installed.activity || progress.local != installed.local
+                || progress.metrics != installed.metrics || progress.persistence != installed.persistence {
                 return Err(UiError::protocol(
                     "inconsistent Training progress observation revision",
                 ));
@@ -325,6 +326,8 @@ impl ApplicationModel {
         installed.revision = progress.revision;
         installed.activity = progress.activity;
         installed.local = progress.local;
+        installed.metrics = progress.metrics;
+        installed.persistence = progress.persistence;
         Ok(Observation::Installed)
     }
 

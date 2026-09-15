@@ -2,7 +2,8 @@
 
 #include <filesystem>
 #include <optional>
-#include <vector>
+#include <inplace_vector>
+#include <cstdint>
 
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -15,8 +16,7 @@ struct TrainEpochSummary {
     double train_loss = 0.0;
     std::optional<double> val_loss;
     EvalSummary val_summary;
-    std::optional<double> ema_val_loss;
-    std::optional<EvalSummary> ema_val_summary;
+    bool evaluated_ema = false;
 };
 
 struct TrainRunResult {
@@ -28,8 +28,10 @@ struct TrainRunResult {
     std::optional<std::filesystem::path> best_regular_checkpoint_path;
     std::optional<std::filesystem::path> best_ema_checkpoint_path;
     bool best_is_ema = false;
+    bool best_is_fallback = false;
     int last_epoch = -1;
-    std::vector<TrainEpochSummary> history;
+    std::uint64_t completed_epochs = 0;
+    std::inplace_vector<TrainEpochSummary, 32> history;
     std::optional<EvalSummary> test_summary;
 };
 

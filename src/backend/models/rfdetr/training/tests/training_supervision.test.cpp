@@ -26,6 +26,7 @@
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 #include "detail/checkpoint_private.h"
+#include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "detail/native_optimizer_private.h"
 #include "detail/training_ops_private.h"
 #include "detail/target_builder_private.h"
@@ -123,13 +124,16 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     config.denoising.enabled = true;
     config.denoising.groups = 7U;
 
+    mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+    readback.Begin();
+    const std::vector<rfdetr::NormalizedModelStateEntry> entries{
+        {"backbone.weight", torch_api::ones({1})},
+        {"training_supervision.query_projection.weight", torch_api::ones({1})}};
+    rfdetr::detail::reserve_state_archive(entries, readback, 0);
     torch_api::OutputArchive output;
     rfdetr::detail::write_training_supervision_config(output, config);
-    rfdetr::detail::write_state_archive(output, "state",
-                                        {
-                                            {"backbone.weight", torch_api::ones({1})},
-                                            {"training_supervision.query_projection.weight", torch_api::ones({1})},
-                                        });
+    rfdetr::detail::write_state_archive(output, "state", entries, readback, 0);
+    readback.Complete();
     output.save_to(path.string());
 
     torch_api::InputArchive input;
@@ -145,7 +149,7 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
 
     torch_api::OutputArchive legacy_output;
     rfdetr::detail::write_training_supervision_config(legacy_output, {});
-    rfdetr::detail::write_state_archive(legacy_output, "state", {});
+    rfdetr::detail::write_state_archive(legacy_output, "state", {}, readback, 0);
     legacy_output.save_to(path.string());
     torch_api::InputArchive legacy_input;
     legacy_input.load_from(path.string());
@@ -193,6 +197,37 @@ void test_ema_shadow_admission_is_transactional() {
     ema.commit_shadow_params(std::move(candidate));
     REQUIRE(torch_api::equal(ema.shadow_params().front(), valid.front()));
     REQUIRE(torch_api::equal(ema.shadow_params().back(), valid.back()));
+}
+
+void test_ema_selection_restores_identity_and_mode() {
+    torch::nn::Linear module(3, 2);
+    module->train();
+    auto parameters = module->parameters();
+    rfdetr::ModelEma ema(parameters, 0.5, 0.0);
+    auto original = parameters.front().detach().clone();
+    auto* identity = parameters.front().unsafeGetTensorImpl();
+    {
+        torch::NoGradGuard guard;
+        parameters.front().add_(2.0);
+    }
+    ema.update(0);
+    const auto ordinary = parameters.front().detach().clone();
+    try {
+        rfdetr::ModelEma::Selection selection(ema, *module);
+        module->eval();
+        REQUIRE(parameters.front().unsafeGetTensorImpl() == identity);
+        REQUIRE(torch_api::allclose(parameters.front(), original + 1.0));
+        REQUIRE_THROWS(ema.update(1));
+        throw std::runtime_error("selected evaluation failed");
+    } catch (const std::runtime_error&) {}
+    REQUIRE(module->is_training());
+    REQUIRE(parameters.front().unsafeGetTensorImpl() == identity);
+    REQUIRE(torch_api::equal(parameters.front(), ordinary));
+    auto adopted = rfdetr::ModelEma::from_cpu_shadow(parameters, ema.shadow_params(), 0.5, 0.0);
+    REQUIRE(torch_api::equal(adopted.shadow_params().front(), ema.shadow_params().front()));
+    auto malformed = ema.shadow_params();
+    malformed.back() = torch_api::full_like(malformed.back(), std::numeric_limits<float>::quiet_NaN());
+    REQUIRE_THROWS(rfdetr::ModelEma::from_cpu_shadow(parameters, malformed, 0.5, 0.0));
 }
 
 void test_native_optimizer_late_failure_preserves_live_state() {
@@ -245,8 +280,12 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     REQUIRE_THROWS(optimizer.load(malformed));
 
     const auto retained_path = root / "retained.pt";
+    mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+    readback.Begin();
+    optimizer.reserve_checkpoint(readback, 0);
     torch_api::OutputArchive retained;
-    optimizer.save(retained);
+    optimizer.save(retained, readback, 0);
+    readback.Complete();
     retained.save_to(retained_path.string());
     torch_api::InputArchive retained_input;
     retained_input.load_from(retained_path.string());
@@ -1368,6 +1407,11 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             }
             request.training_supervision = routes[route_index];
             const auto result = rfdetr::run_training(request);
+            const auto inspection = rfdetr::inspect_training_checkpoint(result.checkpoint_path);
+            REQUIRE(inspection.resumable);
+            REQUIRE(inspection.configuration.has_value());
+            REQUIRE(inspection.configuration->use_ema == request.use_ema);
+            REQUIRE_FALSE(inspection.attempt_id.empty());
             REQUIRE(result.history.size() == 1);
             REQUIRE(std::isfinite(result.history.front().train_loss));
             REQUIRE(result.history.front().val_loss.has_value());
@@ -1484,3 +1528,5 @@ MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][co
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][copy_paste]",
                          test_copy_paste_cache_publication_recovers_without_targets);
+
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][ema]", test_ema_selection_restores_identity_and_mode);

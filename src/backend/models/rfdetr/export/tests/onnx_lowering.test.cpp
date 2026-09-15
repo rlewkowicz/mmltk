@@ -1,3 +1,5 @@
+#include "src/backend/ml/cuda/tensor_readback.h"
+#include "src/common/system/numa_memory.h"
 #include <ATen/TensorIndexing.h>
 #include <ATen/ops/alias.h>
 #include <ATen/ops/arange.h>
@@ -15,6 +17,7 @@
 
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -99,10 +102,12 @@ using OnnxInitializerMap = std::unordered_map<std::string, torch::Tensor>;
 }
 
 void lower_test_graph(const std::shared_ptr<torch::jit::Graph>& graph, const OnnxInitializerMap* const initializers = nullptr) {
+    mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     mmltk::backend::models::rfdetr::lower_graph_for_onnx_export({
         .graph = graph.get(),
         .initializer_context = initializers,
         .find_initializer = initializers == nullptr ? nullptr : &find_test_initializer,
+        .readback = &readback,
     });
 }
 
@@ -423,6 +428,107 @@ MMLTK_ONNX_LOWERING_TEST_CASE(test_lower_integer_bitwise_and_fails_loudly) {
     MMLTK_ASSERT(block_contains_kind(graph->block(), kAtenBitwiseAnd));
 
     mmltk::testsupport::expect_runtime_error_contains([&graph]() { lower_test_graph(graph); }, "integer bitwise_and is not supported");
+}
+
+MMLTK_ONNX_LOWERING_TEST_CASE(test_cuda_constants_stage_once_and_retain_nested_graph_readers) {
+    if (!torch::cuda::is_available()) { SKIP("CUDA unavailable"); }
+    auto source = torch::arange(8, torch::TensorOptions().device(torch::kCUDA)).narrow(0, 2, 3);
+    auto* original_storage = source.const_data_ptr();
+    auto graph = std::make_shared<torch::jit::Graph>();
+    auto nested = std::make_shared<torch::jit::Graph>();
+    auto* first = nested->create(c10::Symbol::fromQualString("onnx::Constant"), 1);
+    first->t_(c10::attr::value, source);
+    nested->appendNode(first);
+    nested->registerOutput(first->output());
+    auto* second = nested->create(c10::Symbol::fromQualString("onnx::Constant"), 1);
+    second->t_(c10::attr::value, source);
+    nested->appendNode(second);
+    nested->registerOutput(second->output());
+    auto* container = graph->create(c10::Symbol::fromQualString("onnx::If"), 1);
+    container->g_(c10::Symbol::attr("then_branch"), nested);
+    graph->appendNode(container);
+    graph->registerOutput(container->output());
+    const auto payload = c10::Symbol::attr("tensor_payload");
+    c10::List<at::Tensor> tensor_list;
+    tensor_list.push_back(source);
+    c10::impl::GenericDict dictionary(c10::StringType::get(), c10::TensorType::get());
+    dictionary.insert("same", source);
+    first->ival_(payload, c10::ivalue::Tuple::create({c10::IValue(tensor_list), c10::IValue(dictionary)}));
+    second->ts_(c10::Symbol::attr("tensor_list"), {source, source});
+    const auto large_dead = torch::empty({65536}, source.options());
+    const auto append_dead = [&](torch::jit::Graph& owner) {
+        auto* dead = owner.create(c10::Symbol::fromQualString("onnx::Constant"), 1);
+        dead->t_(c10::attr::value, large_dead);
+        owner.appendNode(dead);
+    };
+    append_dead(*graph);
+    append_dead(*nested);
+    auto graph_list = std::make_shared<torch::jit::Graph>();
+    auto* list_constant = graph_list->create(c10::Symbol::fromQualString("onnx::Constant"), 1);
+    list_constant->ival_(payload, first->ival(payload));
+    graph_list->appendNode(list_constant);
+    graph_list->registerOutput(list_constant->output());
+    append_dead(*graph_list);
+    container->gs_(c10::Symbol::attr("other_branches"), {graph_list});
+    auto* block = container->addBlock();
+    auto* block_constant = graph->create(c10::Symbol::fromQualString("onnx::Constant"), 1);
+    block_constant->ival_(payload, first->ival(payload));
+    block->appendNode(block_constant);
+    block->registerOutput(block_constant->output());
+    auto* dead_block_constant = graph->create(c10::Symbol::fromQualString("onnx::Constant"), 1);
+    dead_block_constant->t_(c10::attr::value, large_dead);
+    block->appendNode(dead_block_constant);
+    OnnxInitializerMap initializers{{"unused", large_dead}};
+    mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+    mmltk::backend::models::rfdetr::lower_graph_for_onnx_export({
+        .graph = graph.get(), .initializer_context = &initializers, .find_initializer = &find_test_initializer, .readback = &readback});
+    MMLTK_ASSERT(first->t(c10::attr::value).is_cpu());
+    MMLTK_ASSERT(first->t(c10::attr::value).data_ptr() == second->t(c10::attr::value).data_ptr());
+    MMLTK_ASSERT(torch::equal(first->t(c10::attr::value), torch::tensor({2, 3, 4}, source.options().device(torch::kCPU))));
+    MMLTK_ASSERT(source.const_data_ptr() == original_storage);
+    MMLTK_ASSERT(source.is_cuda());
+    // Every live reference names the same TensorImpl. A dead attribute or
+    // unused initializer would add at least another registered page/slot.
+    REQUIRE(readback.capacity_bytes() == mmltk::common::system::page_rounded_bytes(source.nbytes()));
+    REQUIRE(std::distance(graph->nodes().begin(), graph->nodes().end()) == 1);
+    REQUIRE(std::distance(nested->nodes().begin(), nested->nodes().end()) == 2);
+    REQUIRE(std::distance(graph_list->nodes().begin(), graph_list->nodes().end()) == 1);
+    REQUIRE(std::distance(block->nodes().begin(), block->nodes().end()) == 1);
+    for (auto* node : {first, list_constant, block_constant}) {
+        const auto tuple = node->ival(payload).toTuple();
+        const auto from_list = tuple->elements()[0].toTensorList().get(0);
+        const auto from_dictionary = tuple->elements()[1].toGenericDict().at(c10::IValue("same")).toTensor();
+        REQUIRE(from_list.is_cpu());
+        REQUIRE(from_dictionary.is_cpu());
+        REQUIRE(from_list.sizes() == source.sizes());
+        REQUIRE(from_list.scalar_type() == source.scalar_type());
+        REQUIRE(torch::equal(from_list, first->t(c10::attr::value)));
+        REQUIRE(from_list.unsafeGetTensorImpl() == first->t(c10::attr::value).unsafeGetTensorImpl());
+        REQUIRE(from_dictionary.unsafeGetTensorImpl() == from_list.unsafeGetTensorImpl());
+    }
+    REQUIRE(second->ts(c10::Symbol::attr("tensor_list"))[0].unsafeGetTensorImpl() == first->t(c10::attr::value).unsafeGetTensorImpl());
+    REQUIRE_THROWS(readback.Release());
+    graph.reset();
+    nested.reset();
+    graph_list.reset();
+    readback.Release();
+}
+
+MMLTK_ONNX_LOWERING_TEST_CASE(test_pre_staging_cleanup_preserves_unused_mutating_results) {
+    auto graph = trace_unary_graph(torch::randn({2, 3}), [](const torch::Tensor& input) {
+        auto out = input + 1.0;
+        return out.add_(input);
+    });
+    auto* mutation = find_first_node_kind(graph->block(), kAtenAddInplace);
+    REQUIRE(mutation != nullptr);
+    mutation->output()->replaceAllUsesWith(mutation->input(0));
+    REQUIRE_FALSE(mutation->output()->hasUses());
+    lower_test_graph(graph);
+    REQUIRE(graph->outputs()[0]->node()->kind() == kOnnxAdd);
+    // Both the ordinary producer and the mutating add remain necessary.
+    std::size_t additions = 0;
+    for (const auto* node : graph->nodes()) if (node->kind() == kOnnxAdd) ++additions;
+    REQUIRE(additions == 2);
 }
 
 }  // namespace

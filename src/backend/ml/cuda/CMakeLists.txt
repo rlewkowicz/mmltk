@@ -10,7 +10,8 @@ mmltk_register_public_headers(
     FILES
         detail/cuda_launch_common.cuh
         torch_autocast_scope.h
-        numa_host_tensor.h)
+        numa_host_tensor.h
+        tensor_readback.h)
 
 mmltk_register_retained_module_providers(
     mmltk_backend_ml_cuda torch_cuda_scope.cppm)
@@ -30,6 +31,7 @@ mmltk_register_retained_module_implementation_units(mmltk_backend_ml_cuda
 mmltk_register_ordinary_sources(mmltk_backend_ml_cuda
     cuda_utils.cu
     numa_host_tensor.cpp
+    tensor_readback.cpp
     detail/torch_cuda_utils.cpp)
 mmltk_register_private_headers(mmltk_backend_ml_cuda
     detail/cuda_utils_cuda.h
@@ -57,6 +59,9 @@ function(mmltk_add_backend_ml_cuda_tests)
         mmltk_backend_ml_cuda_tests PRIVATE_DECLARATIONS)
     mmltk_register_retained_module_importers(mmltk_backend_ml_cuda_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/cuda_utils.test.cpp)
+    mmltk_register_ordinary_sources(mmltk_backend_ml_cuda_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/tensor_readback.test.cpp)
+    target_link_options(mmltk_backend_ml_cuda_tests PRIVATE "LINKER:--wrap=cudaStreamSynchronize" "LINKER:--wrap=cudaMemcpyAsync")
     mmltk_register_private_headers(mmltk_backend_ml_cuda_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/cuda_test_utils.h)
     target_include_directories(mmltk_backend_ml_cuda_tests PRIVATE

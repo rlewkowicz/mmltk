@@ -39,12 +39,13 @@ impl App {
     }
 
     fn request_start(&mut self, feature: FeatureId) {
+        if feature == FeatureId::Train { self.model.workflow.resume_ready = None; }
         if !self.settings.draft().is_some_and(|draft| self.model.compute_start_available(draft, feature)) { return; }
         let Some(inputs) = self.settings.draft().and_then(|draft| crate::view_model::StartInputs::capture(draft, feature)) else {
             return;
         };
         self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
-            feature, inputs, preparation: StartPreparation::Waiting,
+            feature, inputs, preparation: StartPreparation::Waiting, resume_checkpoint: None,
         });
         self.model.workflow.start_status = Some((feature, "Saving current settings…".to_owned()));
         self.flush_settings_edits();
@@ -52,6 +53,19 @@ impl App {
     }
 
     pub(super) fn advance_start(&mut self) {
+        if self.model.workflow.pending_start.is_none() && self.workspace.active() == FeatureId::Train {
+            if let Some(checkpoint) = self.model.workflow.resume_ready.as_ref() {
+                if self.settings.draft().is_some_and(|draft| draft.workflows.train.request.resumepath == checkpoint.path)
+                    && !self.settings_unsettled() {
+                    let checkpoint = self.model.workflow.resume_ready.take().unwrap();
+                    let inputs = crate::view_model::StartInputs::capture(self.settings.draft().unwrap(), FeatureId::Train).unwrap();
+                    self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
+                        feature: FeatureId::Train, inputs, preparation: StartPreparation::Waiting,
+                        resume_checkpoint: Some(checkpoint.path),
+                    });
+                }
+            }
+        }
         let Some(pending) = self.model.workflow.pending_start.as_ref() else { return; };
         let feature = pending.feature;
         if pending.preparation.cancelled() {
@@ -100,11 +114,16 @@ impl App {
             }
             return;
         }
-        self.model.workflow.pending_start = None;
+        let resume_checkpoint = self.model.workflow.pending_start.take().and_then(|pending| pending.resume_checkpoint);
         self.model.workflow.start_status = Some((feature, "Inspecting selected inputs and starting…".to_owned()));
         let submitted = match feature {
-            FeatureId::Train => self.submit_intent(ApplicationIntentEndpoint::TrainingStart, |correlation|
-                crate::generated::encode_training_Start(correlation, Train {})),
+            FeatureId::Train => if let Some(path) = resume_checkpoint {
+                self.submit_intent(ApplicationIntentEndpoint::TrainingResume, |correlation|
+                    crate::generated::encode_training_Resume(correlation, crate::generated::TrainingCheckpointQuery { path }))
+            } else {
+                self.submit_intent(ApplicationIntentEndpoint::TrainingStart, |correlation|
+                    crate::generated::encode_training_Start(correlation, Train {}))
+            },
             FeatureId::Validate => self.submit_intent(ApplicationIntentEndpoint::ValidationStart, |correlation|
                 crate::generated::encode_validation_Start(correlation, crate::generated::ValidateWorkflowIntent {})),
             FeatureId::Predict => self.submit_intent(ApplicationIntentEndpoint::PredictStart, |correlation|

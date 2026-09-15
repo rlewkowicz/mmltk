@@ -182,6 +182,12 @@ struct TrainingStepIdentity {
     std::uint64_t batch_sequence = 0;
 };
 
+struct TrainingLossComponents {
+    torch::Tensor classification;
+    torch::Tensor box;
+    torch::Tensor giou;
+};
+
 struct TrainingLoss {
     torch::Tensor total;
     torch::Tensor classification;
@@ -189,6 +195,8 @@ struct TrainingLoss {
     torch::Tensor giou;
     torch::Tensor correspondence;
     torch::Tensor denoising;
+    torch::Tensor auxiliary;
+    TrainingLossComponents main;
 };
 
 struct OutputTensors {

@@ -11,6 +11,8 @@ namespace mmltk::backend::models::rfdetr {
 
 using AllReduceTensorFn = std::function<void(torch::Tensor&)>;
 
+[[nodiscard]] torch::Tensor cardinality_error(const torch::Tensor& logits, const torch::Tensor& target_counts);
+
 torch::Tensor sample_target_masks(const PackedTargetMasks& masks, const torch::Tensor& mask_indices, const torch::Tensor& point_coords,
                                   const char* context);
 
@@ -20,6 +22,6 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets
                               bool training_mode, bool distributed_enabled, const AllReduceTensorFn& distributed_all_reduce = {});
 TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets, const DetectionConfig& config,
                               bool training_mode, double num_boxes_value);
-torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const DetectionConfig& config, const torch::Device& device);
+torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const DetectionConfig& config, const torch::Device& device, torch::Tensor* auxiliary_weighted = nullptr);
 
 }  // namespace mmltk::backend::models::rfdetr

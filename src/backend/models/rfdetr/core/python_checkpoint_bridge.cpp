@@ -1,3 +1,5 @@
+#include <limits>
+#include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include <sys/wait.h>
 #include <torch/torch.h>
@@ -49,7 +51,11 @@ void write_child_diagnostic(const char* data, size_t size) noexcept {
 }
 
 size_t tensor_nbytes(const torch::Tensor& tensor) {
-    return static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
+    const auto count = tensor.numel();
+    const auto width = tensor.element_size();
+    if (count < 0 || (width && static_cast<std::uint64_t>(count) > std::numeric_limits<size_t>::max() / width))
+        throw std::overflow_error("RF-DETR raw tensor extent overflows");
+    return static_cast<size_t>(count) * width;
 }
 
 std::string tensor_entry_filename(const size_t index) { return std::format("entry_{:06}.bin", index); }
@@ -93,7 +99,10 @@ void write_raw_tensor_file(const fs::path& path, const torch::Tensor& tensor) {
     std::ofstream stream(path, std::ios::binary);
     if (!stream.is_open()) { throw std::runtime_error("failed to write RF-DETR checkpoint tensor payload: " + path.string()); }
     const size_t bytes = tensor_nbytes(tensor);
+    if (bytes > static_cast<size_t>(std::numeric_limits<std::streamsize>::max()))
+        throw std::overflow_error("RF-DETR raw tensor stream extent overflows");
     if (bytes != 0U) { stream.write(static_cast<const char*>(tensor.data_ptr()), static_cast<std::streamsize>(bytes)); }
+    stream.close();
     if (!stream.good()) { throw std::runtime_error("failed to write RF-DETR checkpoint tensor payload: " + path.string()); }
 }
 
@@ -287,14 +296,32 @@ json manifest_from_model_state(const fs::path& root, const std::vector<Normalize
     manifest["state_dict"] = json::array();
     const fs::path tensor_dir = root / "tensors";
     fs::create_directories(tensor_dir);
+    mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
+    const torch::Tensor* largest_cuda = nullptr;
+    for (const auto& entry : entries) {
+        const auto bytes = tensor_nbytes(entry.tensor);
+        if (entry.tensor.is_cuda() && (!largest_cuda || bytes > tensor_nbytes(*largest_cuda)))
+            largest_cuda = &entry.tensor;
+    }
+    if (largest_cuda) {
+        readback.Begin();
+        readback.Reserve(std::span(largest_cuda, 1));
+        readback.Release();
+    }
     for (size_t index = 0U; index < entries.size(); ++index) {
-        const torch::Tensor tensor = entries[index].tensor.detach().to(torch::kCPU).contiguous();
-        const fs::path tensor_path = tensor_dir / tensor_entry_filename(index);
-        write_raw_tensor_file(tensor_path, tensor);
-        manifest["state_dict"].push_back({{"name", entries[index].name},
-                                          {"tensor_path", fs::relative(tensor_path, root).string()},
-                                          {"dtype", scalar_type_name(tensor.scalar_type())},
-                                          {"sizes", tensor.sizes().vec()}});
+        readback.Begin();
+        readback.Reserve(std::span(&entries[index].tensor, 1));
+        {
+            const torch::Tensor tensor = readback.Stage(0);
+            readback.Complete();
+            const fs::path tensor_path = tensor_dir / tensor_entry_filename(index);
+            write_raw_tensor_file(tensor_path, tensor);
+            manifest["state_dict"].push_back({{"name", entries[index].name},
+                                              {"tensor_path", fs::relative(tensor_path, root).string()},
+                                              {"dtype", scalar_type_name(tensor.scalar_type())},
+                                              {"sizes", tensor.sizes().vec()}});
+        }
+        readback.Release();
     }
     return manifest;
 }

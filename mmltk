@@ -2224,6 +2224,9 @@ run_application_bindings_generation() {
     if (( ! gui_diagnostics_quiet )); then log "generating typed application bindings"; fi
     run_owned_toolchain_command "${release_build_container_name}-application-bindings-generation" \
         'set -euo pipefail
+         cargo fetch --locked \
+             --manifest-path /workspace/src/frontend/iced/Cargo.toml \
+             --target x86_64-unknown-linux-gnu
          /workspace/tools/configure_cmake_graph.sh \
              release "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/application-bindings-release" \
              -DBUILD_MMLTK_BROWSER_HOST=OFF \
@@ -2232,7 +2235,7 @@ run_application_bindings_generation() {
              -DMMLTK_FIREFOX_CACHE_ROOT="${MMLTK_FIREFOX_CACHE_ROOT}"
          cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/application-bindings-release" \
              --parallel "${MMLTK_JOBS}" \
-             --target mmltk_generate_application_bindings
+             --target mmltk_protocol_v17_generation
          python3 /workspace/tools/check_toolchain_invariants.py \
              --repo-root /workspace --build-dir "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/application-bindings-release"'
     release_mutation_locks

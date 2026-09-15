@@ -222,6 +222,14 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     REQUIRE(train_request);
     CHECK(train_request->train_compiled_path == "/tmp/train.bin");
     CHECK(train_request->weights_path == "/tmp/train.pt");
+    auto resume_settings = settings;
+    resume_settings.workflows.train.request.resume_path = train.artifact;
+    const auto resumed = subsystems::system::ComputeIntentMaterializer::LocalTrain(resume_settings, inspection, train);
+    REQUIRE(resumed);
+    CHECK(resumed->weights_path.empty());
+    CHECK(resumed->resume_path == train.artifact);
+    resume_settings.workflows.train.request.resume_path = "/tmp/other-checkpoint.pt";
+    CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(resume_settings, inspection, train));
 
     const auto validation = selected_model(settings, contracts::FeatureId::Validate);
     const auto validation_request = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, validation);
@@ -494,9 +502,9 @@ class FakeTrainingRuntime final : public TrainingRuntime {
         : gate_(std::move(gate)), fail_(fail), inconclusive_(inconclusive) {}
 
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, const std::stop_token stop,
-                                     const std::function<void(const contracts::ComputeProgress&)>& progress) override {
-        progress(fail_ ? contracts::ComputeProgress{.sequence = 0U, .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
-                       : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 1U, .status = "trained"});
+                                     const std::function<void(const services::TrainProcessProgress&)>& progress) override {
+        progress({.progress = fail_ ? contracts::ComputeProgress{.sequence = 0U, .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
+                       : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 1U, .status = "trained"}});
         if (!gate_->Wait(stop)) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
         if (fail_)
             return {.outcome = static_cast<contracts::ComputeOperationOutcome>(255U),
@@ -549,7 +557,7 @@ class BlockingCancellationTrainingRuntime final : public TrainingRuntime {
     explicit BlockingCancellationTrainingRuntime(std::shared_ptr<QueryCancellationProbe> probe) : probe_(std::move(probe)) {}
 
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
-                                     const std::function<void(const contracts::ComputeProgress&)>&) override {
+                                     const std::function<void(const services::TrainProcessProgress&)>&) override {
         return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
     }
     contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, const std::stop_token stop) override {
@@ -595,7 +603,7 @@ class BlockingRemoteRuntime final : public TrainingRuntime {
    public:
     explicit BlockingRemoteRuntime(std::shared_ptr<StopGate> remote_gate) : remote_gate_(std::move(remote_gate)) {}
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
-                                     const std::function<void(const contracts::ComputeProgress&)>&) override {
+                                     const std::function<void(const services::TrainProcessProgress&)>&) override {
         return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
     }
     contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) override {

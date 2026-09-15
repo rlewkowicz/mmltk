@@ -1,6 +1,7 @@
 module;
 #include <cstdint>
 #include <string>
+#include "src/backend/ml/cuda/tensor_readback.h"
 
 export module mmltk.backend.models.rfdetr.model_export.onnx_lowering;
 
@@ -27,6 +28,7 @@ struct OnnxLoweringRequest final {
     void* graph = nullptr;
     const void* initializer_context = nullptr;
     OnnxInitializerLookup find_initializer = nullptr;
+    mmltk::backend::ml::cuda::TensorReadbackBuffers* readback = nullptr;
 };
 
 int onnx_tensor_data_type(OnnxTensorElementType element_type);

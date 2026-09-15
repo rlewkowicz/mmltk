@@ -815,7 +815,7 @@ TrainingLoss TrainingSupervisionImpl::empty_loss(const ModelOutputs& outputs) co
     for (const auto& parameter : parameters()) {
         zero = zero + scalar_edge(parameter);
     }
-    return {zero, zero, zero, zero, zero, zero};
+    return {zero, zero, zero, zero, zero, zero, config_.aux_loss ? zero : torch::Tensor{}, {zero, zero, zero}};
 }
 
 TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& outputs, const DeviceLossNormalizer& normalizer) const {
@@ -835,7 +835,7 @@ TrainingLoss TrainingSupervisionImpl::denoising_loss(const DenoisingOutputs& out
     // CLEANUP-OFF: DN loss layers exclude encoder outputs and have a distinct prediction type.
     auto divisor = (normalizer.target_count.to(torch::kFloat32).reshape({}) * outputs.groups).clamp_min(1.0F);
     auto zero = scalar_edge(outputs.main.pred_logits);
-    TrainingLoss result{zero, zero, zero, zero, zero, zero};
+    TrainingLoss result{zero, zero, zero, zero, zero, zero, {}, {}};
     std::vector<const DenoisingOutputLayer*> layers{&outputs.main};
     if (config_.aux_loss) {
         for (const auto& layer : outputs.aux_outputs) {
@@ -912,7 +912,7 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
     const auto probes = timed(TimingState::Stage::GroundTruthProjection, [&] { return project_ground_truth(padded.labels, padded.boxes); });
 
     auto zero = scalar_edge(outputs.main.pred_logits);
-    TrainingLoss result{zero, zero, zero, zero, zero, zero};
+    TrainingLoss result{zero, zero, zero, zero, zero, zero, {}, {}};
     std::vector<const OutputLayer*> layers{&outputs.main};
     if (config_.aux_loss) {
         for (const auto& layer : outputs.aux_outputs) {
@@ -944,9 +944,14 @@ TrainingLoss TrainingSupervisionImpl::loss(const ModelOutputs& outputs, const Pr
                 objective(costs.box),
                 objective(costs.giou),
                 alpha * (dense * costs.total).sum() / divisor,
-                {},
+                {}, {}, {},
             };
         });
+        if (layer == &outputs.main) result.main = {terms.classification, terms.box, terms.giou};
+        if (layer != &outputs.main) {
+            auto auxiliary = terms.classification + terms.box + terms.giou;
+            result.auxiliary = result.auxiliary.defined() ? result.auxiliary + auxiliary : auxiliary;
+        }
         result.classification = result.classification + terms.classification;
         result.box = result.box + terms.box;
         result.giou = result.giou + terms.giou;

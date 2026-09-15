@@ -49,6 +49,29 @@ namespace F = torch_api::nn::functional;
 
 using mmltk::testsupport::require_optional_ref;
 
+TEST_CASE("Cardinality measures computed sigmoid confidence and actual target counts", "[model][rfdetr][criterion]") {
+    using mmltk::backend::models::rfdetr::cardinality_error;
+    for (const auto dtype : {torch_api::kFloat32, torch_api::kFloat16, torch_api::kBFloat16}) {
+        const auto options = torch_api::TensorOptions().dtype(dtype);
+        // The last slot contributes to this diagnostic, independently of semantic layout.
+        auto logits = torch_api::tensor({{{0.F, 0.F}, {-2.F, -1.F}, {-1.F, 2.F}},
+                                        {{1.F, -1.F}, {-1.F, 1.F}, {-1.F, -1.F}}}, options);
+        auto counts = torch_api::tensor({0, 4}, torch_api::kInt64);
+        CHECK(cardinality_error(logits, counts).item<float>() == 1.5F);
+        CHECK(cardinality_error(torch_api::zeros({1, 300, 2}, options),
+                                torch_api::tensor({404}, torch_api::kInt64)).item<float>() == 404.F);
+        CHECK(cardinality_error(torch_api::ones({1, 300, 2}, options),
+                                torch_api::tensor({404}, torch_api::kInt64)).item<float>() == 104.F);
+        CHECK(cardinality_error(torch_api::empty({1, 0, 2}, options),
+                                torch_api::tensor({0}, torch_api::kInt64)).item<float>() == 0.F);
+        // All three dtypes round this computed sigmoid to exactly 0.5.
+        CHECK(cardinality_error(torch_api::full({1, 1, 2}, 1.0e-9F, options),
+                                torch_api::tensor({0}, torch_api::kInt64)).item<float>() == 0.F);
+    }
+    auto differentiable = torch_api::ones({1, 1, 2}, torch_api::TensorOptions().requires_grad(true));
+    CHECK_FALSE(cardinality_error(differentiable, torch_api::tensor({0}, torch_api::kInt64)).requires_grad());
+}
+
 mmltk::backend::models::rfdetr::PackedTargetMasks pack_dense_masks(const torch_api::Tensor& dense_masks) {
     const auto dense = dense_masks.to(torch_api::kCPU, torch_api::kFloat32).contiguous();
     const int64_t height = dense.size(1);

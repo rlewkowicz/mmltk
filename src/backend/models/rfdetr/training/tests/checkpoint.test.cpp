@@ -249,6 +249,35 @@ void test_upstream_checkpoint_scalar_type_bridge() {
     MMLTK_ASSERT(class_bias->tensor.scalar_type() == tensor_api::kInt64);
 }
 
+void test_cuda_upstream_raw_state_preserves_logical_values() {
+    if (!tensor_api::cuda::is_available()) { SKIP("CUDA unavailable"); }
+    mmltk::testsupport::ScopedTempDir temp{"mmltk-upstream-cuda-readback"};
+    mmltk::backend::models::rfdetr::DecodedNativeModelState state;
+    auto& entries = state_entries(state);
+    entries = {
+        {"query_feat.weight", tensor_api::ones({4, kParityFixtureHiddenDim}, tensor_api::TensorOptions().dtype(tensor_api::kFloat16).device(tensor_api::kCUDA))},
+        {"refpoint_embed.weight", tensor_api::zeros({4, 4}, tensor_api::TensorOptions().device(tensor_api::kCUDA))},
+        {"class_embed.weight", tensor_api::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim}, tensor_api::TensorOptions().device(tensor_api::kCUDA))},
+        {"class_embed.bias", tensor_api::arange(kParityFixtureNumClasses, tensor_api::TensorOptions().dtype(tensor_api::kInt64).device(tensor_api::kCUDA))},
+        {"extra_view", tensor_api::arange(12, tensor_api::TensorOptions().dtype(tensor_api::kBFloat16).device(tensor_api::kCUDA)).view({3, 4}).transpose(0, 1)},
+        {"extra_empty", tensor_api::empty({0}, tensor_api::TensorOptions().dtype(tensor_api::kBool))},
+    };
+    std::vector<const void*> pointers;
+    for (const auto& entry : entries) pointers.push_back(entry.tensor.const_data_ptr());
+    const auto path = temp.path() / "rf-detr-nano-readback.pth";
+    mmltk::backend::models::rfdetr::write_upstream_model_state(path, state);
+    const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(path);
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        const auto& expected = entries[index];
+        const auto* actual = find_entry(loaded, expected.name.c_str());
+        REQUIRE(actual != nullptr);
+        REQUIRE(actual->tensor.scalar_type() == expected.tensor.scalar_type());
+        REQUIRE(actual->tensor.sizes() == expected.tensor.sizes());
+        REQUIRE(tensor_api::equal(actual->tensor, expected.tensor.cpu()));
+        REQUIRE(expected.tensor.const_data_ptr() == pointers[index]);
+    }
+}
+
 void test_legacy_native_checkpoint_format_support() {
     const fs::path legacy_path = fixture_root() / "legacy" / "legacy-format.pt";
     for (const int version : {1, 2}) {
@@ -463,6 +492,7 @@ void test_checkpoint_tensor_and_legacy_support() {
 }
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint]", test_checkpoint_roundtrip_and_fixture_loading);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint][cuda]", test_cuda_upstream_raw_state_preserves_logical_values);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint][training_supervision]", test_checkpoint_tensor_and_legacy_support);
 
 TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class identity", "[model][rfdetr][checkpoint][layout]") {
