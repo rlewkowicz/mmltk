@@ -26,10 +26,12 @@
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/numa_topology.h"
 #include "detail/postprocess.h"
+#include "detail/model_access.h"
 #include "require_test_utils.hpp"
 #include "torch_api.h"
 
 import mmltk.backend.models.rfdetr.core.runtime;
+import mmltk.backend.models.rfdetr.core.model;
 
 namespace torch_api = mmltk::backend::ml::torch_api;
 
@@ -720,4 +722,52 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
     REQUIRE(observed.statistics.uploads == 1);
     REQUIRE(observed.statistics.h2d_submissions == (selected_h2d ? 1 : 0));
     REQUIRE(observed.statistics.gdr_writes == (selected_h2d ? 0 : 1));
+}
+
+TEST_CASE("native inference requests valid optional mask outputs", "[model][rfdetr][native_ops]") {
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
+    config.resolution = 64;
+    config.segmentation = true;
+    config.num_queries = 3;
+    config.num_select = 3;
+    config.group_detr = 1;
+    config.dec_layers = 1;
+    config.aux_loss = false;
+    rfdetr::NativeRfDetrModel model(config);
+    auto& owner = rfdetr::detail::native_model_owner(model);
+    owner.module().eval();
+    torch::NoGradGuard no_grad;
+    const auto image = torch_api::zeros({3, 64, 64});
+    const auto input = rfdetr::nested_tensor_from_tensor_list({image});
+    CHECK_FALSE(owner.forward(input, false).main.pred_masks.has_value());
+    const auto output = owner.forward(input, true);
+    REQUIRE(output.main.pred_masks.has_value());
+    CHECK(output.main.pred_masks->size(1) == config.num_queries);
+}
+
+TEST_CASE("mask materialization follows selected query identity and bounded reusable chunks", "[model][rfdetr][native_ops]") {
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    rfdetr::OutputTensors output;
+    output.pred_logits = torch_api::tensor({{{-10.F, 8.F}, {10.F, -10.F}, {-10.F, -10.F}}});
+    output.pred_boxes = torch_api::ones({1, 3, 4});
+    CHECK_THROWS_AS(rfdetr::select_output_batch_fixed_size(output, 1080, 1920, 500, true), std::runtime_error);
+    output.pred_masks = torch_api::tensor({1.F, -1.F, 1.F}).view({1, 3, 1, 1});
+    auto selected = rfdetr::select_output_batch_fixed_size(output, 1080, 1920, 500, true);
+    CHECK(selected.scores.size(1) == 6);
+    CHECK(selected.labels[0][0].item<int64_t>() == 0);
+    CHECK(selected.labels[0][1].item<int64_t>() == 1);
+    CHECK(selected.query_indices[0][0].item<int64_t>() == 1);
+    CHECK(selected.query_indices[0][1].item<int64_t>() == 0);
+    CHECK(selected.mask_logits->numel() == 3);
+    rfdetr::SelectedMaskWorkspace workspace;
+    auto masks = workspace.Materialize(*selected.mask_logits, selected.query_indices.narrow(1, 0, 2), 1080, 1920);
+    CHECK(masks.numel() == 2 * 1080 * 1920);
+    CHECK_FALSE(masks[0][0].any().item<bool>());
+    CHECK(masks[0][1].all().item<bool>());
+    const auto address = masks.data_ptr();
+    CHECK(workspace.Materialize(*selected.mask_logits, selected.query_indices.narrow(1, 0, 2), 1080, 1920).data_ptr() == address);
+    CHECK_THROWS_AS(workspace.Materialize(*selected.mask_logits, selected.query_indices.narrow(1, 0, 2), 65536, 65536), std::invalid_argument);
+    output.pred_masks = torch_api::ones({1, 2, 1, 1});
+    CHECK_THROWS_AS(rfdetr::select_output_batch_fixed_size(output, 2, 2, 2, true), std::invalid_argument);
 }

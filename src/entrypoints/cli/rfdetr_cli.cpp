@@ -581,6 +581,8 @@ inline constexpr std::array kExportOnnxUnexposed{
     reflection::unexposed<rfdetr::ExportOnnxRequest, &rfdetr::ExportOnnxRequest::tensorrt_path>(
         "export-onnx accepts the selected native-weights artifact kind")};
 inline constexpr std::array kPredictUnexposed{
+    reflection::unexposed<PredictCliRequest, reflection::member_path<&PredictCliRequest::request, &rfdetr::PredictRequest::video_path>>(
+        "local video selection belongs to the GUI prediction workflow"),
     reflection::unexposed<PredictCliRequest, reflection::member_path<&PredictCliRequest::request, &rfdetr::PredictRequest::image_inputs>>(
         "the CLI bounded image_paths collection derives the final image-input "
         "records once in finalize_predict_request")};
@@ -966,7 +968,6 @@ int dispatch_command(const rfdetr::RfdetrCommandDescriptor& descriptor, const st
             auto state = RfdetrCommandParser::Predict(arguments);
             finalize_predict_request(state);
             const auto result = rfdetr::run_prediction(state.request);
-            rfdetr::write_prediction_json(state.request, result);
             rfdetr::print_prediction_summary(state.request, result);
             return 0;
         }

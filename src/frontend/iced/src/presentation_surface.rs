@@ -1807,6 +1807,20 @@ pub(crate) fn drawable_annotation(requested: Surface) -> Option<(Surface, Annota
     })
 }
 
+pub(crate) fn drawable_prediction(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::PredictionContent>)> {
+    if requested.frame?.content_session != crate::generated::presentation_source_session(crate::generated::PresentationSourceKind::Predict) { return None; }
+    RENDERER.with(|renderer| {
+        let renderer = renderer.borrow();
+        let renderer = renderer.as_ref()?;
+        SurfaceRenderer::submitted_draws(&renderer.pending, &renderer.imported, requested)
+            .find_map(|(_, pending)| Some((requested, pending.prediction.clone()?)))
+            .or_else(|| {
+                let image = &renderer.imported.as_ref()?.image;
+                Some((image.retained()?, image.prediction.clone()?))
+            })
+    })
+}
+
 pub(crate) struct Pipeline {
     format: wgpu::TextureFormat,
 }
@@ -1851,6 +1865,7 @@ struct ImagePublication {
     gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
     detail: Option<DetailContent>,
     annotation: Option<AnnotationContent>,
+    prediction: Option<std::sync::Arc<labels::PredictionContent>>,
     placement: Placement,
 }
 
@@ -1919,6 +1934,7 @@ struct PendingImage {
     gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
     detail: Option<DetailContent>,
     annotation: Option<AnnotationContent>,
+    prediction: Option<std::sync::Arc<labels::PredictionContent>>,
     placement: Placement,
     complete: bool,
     view_ready: bool,
@@ -2384,6 +2400,7 @@ impl SurfaceRenderer {
                 gallery: gallery::matching(surface.frame),
                 detail: None,
                 annotation: None,
+                prediction: None,
                 placement,
             },
             views,
@@ -2787,6 +2804,7 @@ impl ImagePublication {
         self.gallery = None;
         self.detail = None;
         self.annotation = None;
+        self.prediction = None;
         (self.pending_sample.take(), self.retained_read.take())
     }
 
@@ -2876,6 +2894,7 @@ impl ImagePublication {
         self.gallery = pending.gallery;
         self.detail = pending.detail;
         self.annotation = pending.annotation;
+        self.prediction = pending.prediction;
         self.placement = pending.placement;
         self.completed = Some(frame);
         self.retained_read = pending.read;
@@ -3574,6 +3593,7 @@ mod tests {
                     gallery: initial.gallery,
                     detail: initial.detail,
                     annotation: None,
+                    prediction: None,
                     placement: initial.placement,
                 };
                 let mut empty = model.explore.snapshot.clone().unwrap();
@@ -3653,6 +3673,7 @@ mod tests {
                     gallery: initial.gallery,
                     detail: initial.detail,
                     annotation: None,
+                    prediction: None,
                     placement: initial.placement,
                 };
                 let mut source = crate::generated::ExploreImageMetadata::from(
@@ -3985,6 +4006,7 @@ mod tests {
                         gallery: initial.gallery,
                         detail: initial.detail,
                         annotation: None,
+                        prediction: None,
                         placement: initial.placement,
                     };
                     snapshot.mode = if from_gallery {
@@ -4200,6 +4222,7 @@ mod tests {
                     gallery: previous.gallery,
                     detail: previous.detail,
                     annotation: previous.annotation,
+                    prediction: previous.prediction,
                     placement: previous.placement,
                 };
                 let mut copy_notified = false;
@@ -4418,6 +4441,7 @@ mod tests {
                     gallery: None,
                     detail: None,
                     annotation: None,
+                    prediction: None,
                     placement: Placement::Contain,
                     complete: true,
                     view_ready: true,
@@ -4427,6 +4451,7 @@ mod tests {
                 gallery: None,
                 detail: metadata::pending(frame).and_then(|image| image.detail),
                 annotation: None,
+                prediction: None,
                 placement: Placement::Contain,
             };
             DRAW_AUTHORIZATION.with(|authorization| {

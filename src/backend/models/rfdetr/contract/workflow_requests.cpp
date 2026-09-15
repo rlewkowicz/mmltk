@@ -38,10 +38,11 @@ void validate_export_onnx_request(const ExportOnnxRequest& request) {
 void validate_predict_request(const PredictRequest& request) {
     require_valid_fields(request, "invalid RF-DETR predict fields");
     const bool compiled_source =
-        request.source_kind == PredictSourceKind::CompiledDataset && !request.compiled_path.empty() && request.image_inputs.empty();
+        request.source_kind == PredictSourceKind::CompiledDataset && !request.compiled_path.empty() && request.image_inputs.empty() && request.video_path.empty();
     const bool image_source =
-        request.source_kind == PredictSourceKind::ImageFiles && request.compiled_path.empty() && !request.image_inputs.empty();
-    if ((!compiled_source && !image_source) || request.output_path.empty() || request.selected_input_count() != 1U) {
+        request.source_kind == PredictSourceKind::ImageFiles && request.compiled_path.empty() && !request.image_inputs.empty() && request.video_path.empty();
+    const bool video_source = request.source_kind == PredictSourceKind::VideoFile && !request.video_path.empty() && request.compiled_path.empty() && request.image_inputs.empty();
+    if ((!compiled_source && !image_source && !video_source) || request.output_path.empty() || request.selected_input_count() != 1U) {
         throw std::runtime_error("rfdetr predict requires compiled input, output, and one model artifact");
     }
 }

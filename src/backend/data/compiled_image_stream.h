@@ -99,6 +99,8 @@ class CompiledImageStream final {
     void synchronize(std::size_t slot);
     void synchronize();
     // Terminal physical release, called before the owning CUDA context leaves scope.
+    // Terminal CPU quiescence, independent of retained GPU slots and their external consumers.
+    void stop_workers();
     void close();
     [[nodiscard]] int reset_storage() noexcept;
     [[nodiscard]] bool owns_allocation() const noexcept;

@@ -275,13 +275,26 @@ void ImageProductPool::PublishRetained(ImageStream& stream, Candidate& candidate
     } catch (...) { stream.RethrowAfterSettlement(std::current_exception()); }
     candidate.revision_ = revision;
 }
-std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source, std::uint64_t revision) {
+void ImageProductPool::ValidateCopySource(const BorrowedImageProductReadView& source, std::uint64_t revision) const {
     if (revision == 0U) throw std::invalid_argument("image product revision is invalid");
     const auto planes = slots_.front()->buffer.layout() == ImageProductLayout::Clean ? 1U : 2U;
     if (!source.valid() || source.plane_count() < planes) throw std::invalid_argument("source image product lacks a receiver plane");
     for (const auto& slot : slots_)
         if (slot->buffer.Owns(source)) throw std::invalid_argument("an image product cannot copy from its own pool");
+}
+std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source, std::uint64_t revision) {
+    ValidateCopySource(source, revision);
     auto candidate = Acquire();
+    auto paths = CopyFrom(stream, candidate, std::move(source), revision);
+    candidate.slot_->buffer.FinalizeWorkspace();
+    static_cast<void>(Commit(std::move(candidate)));
+    return paths;
+}
+std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Candidate& candidate,
+                                                      BorrowedImageProductReadView source, std::uint64_t revision) {
+    if (revision == 0U || !candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U)
+        throw std::invalid_argument("image copy candidate is invalid");
+    ValidateCopySource(source, revision);
     auto& slot = *candidate.slot_;
     {
         std::scoped_lock lock(admission_->mutex);
@@ -290,8 +303,6 @@ std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Bo
     }
     auto paths = slot.buffer.CopyFromAs(stream, std::move(source), {}, revision);
     candidate.revision_ = revision;
-    slot.buffer.FinalizeWorkspace();
-    static_cast<void>(Commit(std::move(candidate)));
     return paths;
 }
 bool ImageProductPool::DetachDisplay(ImageStream& stream, const std::shared_ptr<ImageWorkspace>& workspace) {

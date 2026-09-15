@@ -3036,5 +3036,63 @@ TEST_CASE("Workspace damage accumulates skipped raw revisions for each display b
     CHECK_FALSE(damage.Since({7U, 98U}, {7U, 99U}, 102U).full_image);
 }
 
+TEST_CASE("admitted image copies preserve readers and refuse full capacity without waiting", "[gpu][image]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime source{{.device = 0, .backend = backend}};
+    source.Publish(4U, 4U, [](auto clean, auto, auto) {
+        std::memset(reinterpret_cast<void*>(clean.data), 0x37, clean.descriptor.pitch_bytes * clean.descriptor.height);
+    });
+    SystemImageRuntime receiver{{.device = 0, .backend = backend, .output_buffer_count = 2U}};
+    SystemImageRuntime::CompletedOutput baseline;
+    auto first = receiver.TryAcquireOutput(baseline);
+    REQUIRE(first.valid());
+    CHECK(receiver.CopyFrom(first, source.Borrow())[0U] == ImageCopyPath::SameDevice);
+    auto retained = receiver.CommitOutput(std::move(first));
+    auto reader = retained.Borrow();
+    auto second = receiver.TryAcquireOutput(baseline);
+    REQUIRE(second.valid());
+    static_cast<void>(receiver.CopyFrom(second, source.Borrow()));
+    auto latest = receiver.CommitOutput(std::move(second));
+    auto latest_reader = latest.Borrow();
+    REQUIRE_FALSE(receiver.TryAcquireOutput(baseline).valid());
+    std::stop_source cancelled;
+    cancelled.request_stop();
+    CHECK_FALSE(receiver.AcquireOutput(cancelled.get_token(), receiver.Completed()).valid());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(reader.plane(0U).plane().data) == 0x37U);
+    CHECK_THROWS_AS(receiver.CopyFrom({}), std::invalid_argument);
+    reader = {};
+    retained = {};
+    auto available = receiver.TryAcquireOutput(baseline);
+    REQUIRE(available.valid());
+    available = {};
+    CHECK(receiver.Completed().revision() == latest.revision());
+}
+
+TEST_CASE("adopted image contexts validate complete ownership and retain independent custody") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    std::optional<DeviceContext> context{std::in_place, 0, backend};
+    CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 1, .backend = backend, .adopted_context = context}), std::invalid_argument);
+    CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = std::make_shared<FakeImageBackend>(), .adopted_context = context}), std::invalid_argument);
+    CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = backend, .context_mode = DeviceContextMode::PrimaryInterop, .adopted_context = context}), std::invalid_argument);
+    DeviceExecution unexpected;
+    unexpected.device = 0;
+    unexpected.placement.numa_node = 99;
+    CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = backend, .execution = unexpected, .adopted_context = context}), std::invalid_argument);
+    {
+        SystemImageRuntime runtime({.device = 0, .backend = backend, .adopted_context = context});
+        CHECK(runtime.UsesContext(*context));
+        {
+            DeviceContext different(0, backend);
+            CHECK_FALSE(runtime.UsesContext(different));
+        }
+        context.reset();
+        CHECK(backend->contexts_destroyed == 1U);
+        runtime.Publish(2U, 2U, [](auto, auto, auto) {});
+        CHECK(runtime.Completed().valid());
+    }
+    CHECK(backend->contexts_created == 2U);
+    CHECK(backend->contexts_destroyed == 2U);
+}
+
 }  // namespace
 }  // namespace mmltk::frameworks::gpu

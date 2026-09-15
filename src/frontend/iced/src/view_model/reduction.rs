@@ -752,9 +752,6 @@ pub(super) fn merge_predict_snapshot(
     target: &mut Option<PredictSnapshot>,
     mut incoming: PredictSnapshot,
 ) -> Result<Observation, UiError> {
-    if incoming.operation.terminal.outcome != ComputeOperationOutcome::Succeeded {
-        incoming.frame = invalid_visual_frame();
-    }
     let Some(installed) = target.as_mut() else {
         *target = Some(incoming);
         return Ok(Observation::Installed);
@@ -769,37 +766,18 @@ pub(super) fn merge_predict_snapshot(
             Err(UiError::protocol("inconsistent Predict snapshot revision"))
         };
     }
-    let prior_generation = installed.operation.generationfrontier;
-    let incoming_generation = incoming.operation.generationfrontier;
     let mut operation = installed.operation.clone();
-    let operation_observation = merge_compute_state(&mut operation, incoming.operation.clone())?;
-    if operation_observation == Observation::Stale {
+    if merge_compute_state(&mut operation, incoming.operation.clone())? == Observation::Stale {
         return Ok(Observation::Stale);
     }
-    if incoming_generation > prior_generation {
-        *installed = incoming;
-        return Ok(Observation::Installed);
-    }
-    if operation_observation == Observation::Installed {
-        installed.revision = incoming.revision;
-        installed.operation = operation;
-        installed.frame = incoming.frame;
-        return Ok(Observation::Installed);
-    }
-    if operation_observation == Observation::Current && incoming.frame == installed.frame {
-        installed.revision = incoming.revision;
-        return Ok(Observation::Installed);
-    }
+    incoming.operation = operation;
     if incoming.frame.revision < installed.frame.revision {
         return Ok(Observation::Stale);
     }
-    if incoming.frame.revision == installed.frame.revision {
-        return Err(UiError::protocol(
-            "inconsistent Predict frame for one operation observation",
-        ));
+    if incoming.frame.revision == installed.frame.revision && incoming.frame != installed.frame {
+        return Err(UiError::protocol("inconsistent Predict frame revision"));
     }
-    installed.revision = incoming.revision;
-    installed.frame = incoming.frame;
+    *installed = incoming;
     Ok(Observation::Installed)
 }
 

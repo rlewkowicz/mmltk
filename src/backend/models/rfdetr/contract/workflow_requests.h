@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/data/data_loading_options.h"
 
 #include "src/frameworks/reflection/field_policy.h"
@@ -67,6 +68,7 @@ using ModelExportRequest = std::variant<BuildEngineRequest, ExportOnnxRequest>;
 enum class PredictSourceKind : std::uint8_t {
     CompiledDataset,
     ImageFiles,
+    VideoFile,
 };
 
 struct PredictImageInput {
@@ -77,17 +79,21 @@ struct PredictImageInput {
 
 struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
     PredictSourceKind source_kind = PredictSourceKind::CompiledDataset;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path video_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
     [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::kMaximumCliImageInputs}]] std::vector<PredictImageInput>
         image_inputs;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
     [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
-    [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t max_dets_per_image = 500U;
+    [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]]
+    [[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lanes = 0;
     [[= mmltk::frameworks::reflection::Minimum<float>{
         0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float threshold =
         0.0F;
+    std::size_t limit_images = 0U;
+    bool include_masks = true;
     bool progress_bar = true;
     CompilationMode compilation_mode = CompilationMode::kSelective;
 };

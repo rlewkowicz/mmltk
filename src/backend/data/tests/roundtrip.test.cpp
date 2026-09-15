@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -449,6 +450,67 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     while (same_seed_a.next_batch(batch))
         same_seed_a.release_batch(batch);
     same_seed_a.synchronize();
+    DatasetLoader stopped(direct_cfg);
+    stopped.begin_epoch();
+    Batch retained{};
+    REQUIRE(stopped.next_batch(retained));
+    stopped.wait_batch(retained);
+    stopped.stop_workers();
+    stopped.stop_workers();
+    REQUIRE(retained.device_images != nullptr);
+    float first_channel = -1.0F;
+    REQUIRE(cudaMemcpy(&first_channel, retained.device_images, sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(std::isfinite(first_channel));
+    REQUIRE_FALSE(stopped.next_batch(batch));
+    REQUIRE_THROWS(stopped.begin_epoch());
+    stopped.release_batch(retained, compute_stream);
+    DatasetLoader cancellable(direct_cfg);
+    cancellable.begin_epoch();
+    Batch occupied{};
+    REQUIRE(cancellable.next_batch(occupied));
+    cancellable.wait_batch(occupied);
+    // One prefetch slot remains checked out: readiness cannot complete this wait.
+    std::stop_source cancellation;
+    std::promise<void> entered;
+    auto entered_future = entered.get_future();
+    auto waiting = std::async(std::launch::async, [&] {
+        entered.set_value();
+        Batch unused{};
+        return cancellable.next_batch(unused, cancellation.get_token());
+    });
+    mmltk::testsupport::await_test_future(entered_future, "compiled acquisition entered");
+    CHECK(cancellation.request_stop());
+    CHECK_FALSE(cancellation.request_stop());
+    CHECK_FALSE(mmltk::testsupport::await_test_future(waiting, "cancelled batch acquisition"));
+    // Stop neither releases nor joins on the requester; the owner still owns this lease.
+    cancellable.release_batch(occupied, compute_stream);
+    Batch after_stop{};
+    CHECK_FALSE(cancellable.next_batch(after_stop, cancellation.get_token()));
+    // Cancellation is scoped to one acquisition, not the ordinary training loader.
+    REQUIRE(cancellable.next_batch(after_stop));
+    cancellable.wait_batch(after_stop);
+    cancellable.release_batch(after_stop, compute_stream);
+    cancellable.begin_epoch();
+    std::stop_source checkout_stop;
+    REQUIRE(cancellable.next_batch(after_stop, checkout_stop.get_token()));
+    CHECK(checkout_stop.request_stop());
+    cancellable.wait_batch(after_stop);
+    cancellable.release_batch(after_stop, compute_stream);
+    CHECK_FALSE(cancellable.next_batch(after_stop, checkout_stop.get_token()));
+    cancellable.begin_epoch();
+    std::stop_source readiness_stop;
+    auto stopper = std::async(std::launch::async, [&] { return readiness_stop.request_stop(); });
+    const bool checked_out = cancellable.next_batch(after_stop, readiness_stop.get_token());
+    CHECK(mmltk::testsupport::await_test_future(stopper, "stop racing batch readiness"));
+    if (checked_out) {
+        cancellable.wait_batch(after_stop);
+        cancellable.release_batch(after_stop, compute_stream);
+    }
+    CHECK_FALSE(cancellable.next_batch(after_stop, readiness_stop.get_token()));
+    DatasetLoader never_started(direct_cfg);
+    never_started.stop_workers();
+    REQUIRE_FALSE(never_started.next_batch(batch));
+    REQUIRE_THROWS(never_started.begin_epoch());
 }
 
 void test_roundtrip_end_to_end() {

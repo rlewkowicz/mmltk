@@ -1,6 +1,8 @@
 #pragma once
+#include "src/backend/models/rfdetr/contract/prediction_limits.h"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -36,6 +38,47 @@ struct EncodedMask {
     uint32_t area = 0;
     std::vector<std::pair<uint32_t, uint32_t>> runs;
 };
+
+template <typename ValueAt>
+void encode_mask_values_into(const uint32_t height, const uint32_t width, EncodedMask& mask, ValueAt&& value_at,
+                             std::size_t maximum_runs = kMaximumPredictionMaskRuns) {
+    mask.height = height;
+    mask.width = width;
+    mask.area = 0;
+    mask.runs.clear();
+    if (width == 0U || height == 0U) return;
+    const auto pixel_count = static_cast<uint32_t>(checked_prediction_extent(width, height, kMaximumEncodedMaskPixels));
+    maximum_runs = std::min(maximum_runs, kMaximumPredictionMaskRuns);
+    // Allocate only emitted runs. Geometric spare storage stays below twice
+    // their physical size and is independent of the serialized run allowance.
+    const auto append_run = [&](uint32_t start, uint32_t length) {
+        if (mask.runs.size() == maximum_runs) throw std::invalid_argument("RF-DETR encoded masks exceed aggregate storage capacity");
+        if (mask.runs.size() == mask.runs.capacity())
+            mask.runs.reserve(std::min(maximum_runs, std::max(std::size_t{1U}, mask.runs.capacity() * 2U)));
+        mask.runs.emplace_back(start, length);
+    };
+    bool in_run = false;
+    uint32_t run_start = 0;
+    uint32_t run_length = 0;
+    for (uint32_t index = 0; index < pixel_count; ++index) {
+        const bool value = value_at(index);
+        mask.area += value ? 1U : 0U;
+        if (value) {
+            if (!in_run) {
+                in_run = true;
+                run_start = index;
+                run_length = 1;
+            } else {
+                ++run_length;
+            }
+        } else if (in_run) {
+            append_run(run_start, run_length);
+            in_run = false;
+            run_length = 0;
+        }
+    }
+    if (in_run) { append_run(run_start, run_length); }
+}
 
 struct Prediction {
     int image_id = 0;

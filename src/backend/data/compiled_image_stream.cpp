@@ -399,7 +399,7 @@ CompiledImageStream::~CompiledImageStream() {
         mmltk::common::io::write_all_noexcept(STDERR_FILENO, "fatal: compiled image stream retained unsafe CUDA resources\n");
     }
 }
-void CompiledImageStream::close() {
+void CompiledImageStream::stop_workers() {
     {
         std::lock_guard lock(impl_->mutex);
         impl_->stopping = true;
@@ -420,6 +420,9 @@ void CompiledImageStream::close() {
     }
     impl_->changed.notify_all();
     if (impl_->completion_worker.joinable()) impl_->completion_worker.join();
+}
+void CompiledImageStream::close() {
+    stop_workers();
     if (impl_->context == nullptr) return;
     on_context(impl_->context, [&] {
         if (impl_->completion_failed) std::rethrow_exception(impl_->failure);

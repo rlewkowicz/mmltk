@@ -17,6 +17,7 @@ mmltk_register_public_headers(
         contract.h
         model_config.h
         preset_catalog.h
+        prediction_limits.h
         train_recipe.h
         training_supervision.h
         weight_catalog.h

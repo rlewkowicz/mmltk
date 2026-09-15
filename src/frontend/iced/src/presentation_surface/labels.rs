@@ -1,7 +1,7 @@
 use super::{PlacementGeometry, Program, Surface, WorkspaceViewport, placement_geometry};
 use crate::fluent_theme::{Element, Theme};
 use iced::advanced::Renderer as _;
-use iced::advanced::text::Renderer as _;
+use iced::advanced::text::{Renderer as _, Paragraph as _};
 use iced::advanced::{Layout, Shell, Widget, layout, mouse, renderer, text, widget};
 use iced::{Color, Event, Fill, Point, Rectangle, Size};
 
@@ -19,10 +19,38 @@ fn label_bounds(
     }
 }
 
+pub(crate) struct PredictionContent {
+    metadata: crate::generated::PredictImageMetadata,
+    labels: Vec<CachedLabel>,
+}
+struct CachedLabel {
+    text: String,
+    width: f32,
+    paragraph: iced::advanced::graphics::text::Paragraph,
+}
+impl PredictionContent {
+    pub(crate) fn new(metadata: crate::generated::PredictImageMetadata) -> Self {
+        let labels = metadata.labels.iter().map(|item| {
+            let text = format!("{} {}", item.name, item.confidence);
+            let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
+            let paragraph = iced::advanced::graphics::text::Paragraph::with_text(text::Text {
+                content: &text, bounds: Size::new(width - 6.0, 19.0), size: iced::Pixels(12.0),
+                line_height: text::LineHeight::default(), font: iced::Font::DEFAULT,
+                align_x: text::Alignment::Left, align_y: iced::alignment::Vertical::Center,
+                shaping: text::Shaping::Advanced, wrapping: text::Wrapping::None,
+                ellipsis: text::Ellipsis::default(), hint_factor: None,
+            });
+            CachedLabel { text, width, paragraph }
+        }).collect();
+        Self { metadata, labels }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Source {
     Gallery(std::sync::Arc<crate::generated::ExploreImageMetadata>, bool),
     Detail(super::DetailContent, bool),
+    Prediction(std::sync::Arc<PredictionContent>),
     Hidden,
 }
 
@@ -35,7 +63,8 @@ impl Source {
             &str,
             &crate::generated::AnnotationColor,
             usize,
-            &crate::generated::ExploreOverlay,
+            Option<&crate::generated::ExploreOverlay>,
+            Option<&CachedLabel>,
         ),
     ) {
         match self {
@@ -51,7 +80,8 @@ impl Source {
                             &name.value,
                             color,
                             snapshot.dataset.classnames.len(),
-                            &snapshot.overlay,
+                            Some(&snapshot.overlay),
+                            None,
                         );
                     }
                 }
@@ -78,9 +108,15 @@ impl Source {
                             &name.value,
                             color,
                             scene.categories.len(),
-                            overlay,
+                            Some(overlay),
+                            None,
                         );
                     }
+                }
+            }
+            Self::Prediction(snapshot) => {
+                for (item, cached) in snapshot.metadata.labels.iter().zip(&snapshot.labels) {
+                    label(item.category as u16, &item.box_, &cached.text, &item.color, 0, None, Some(cached));
                 }
             }
             _ => {}
@@ -270,8 +306,9 @@ impl<Message> Labelled<'_, Message> {
         }
         renderer.with_layer(clip, |renderer| {
             self.source
-                .visit(|category, bounds, name, color, catalog_count, overlay| {
-                    let rect = label_bounds(geometry, region, bounds, name);
+                .visit(|category, bounds, name, color, catalog_count, overlay, cached| {
+                    let mut rect = label_bounds(geometry, region, bounds, if cached.is_some() { "" } else { name });
+                    if let Some(cached) = cached { rect.width = cached.width; }
                     if rect.intersection(&clip).is_none() {
                         return;
                     }
@@ -283,6 +320,11 @@ impl<Message> Labelled<'_, Message> {
                         },
                         color,
                     );
+                    let position = Point::new(rect.x + 3.0, rect.y + 9.5);
+                    let foreground = if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.55 { Color::BLACK } else { Color::WHITE };
+                    if let Some(cached) = cached {
+                        renderer.fill_paragraph(&cached.paragraph, position, foreground, clip);
+                    } else {
                     renderer.fill_text(
                         text::Text {
                             content: name.to_owned(),
@@ -297,16 +339,14 @@ impl<Message> Labelled<'_, Message> {
                             ellipsis: text::Ellipsis::default(),
                             hint_factor: None,
                         },
-                        Point::new(rect.x + 3.0, rect.y + 9.5),
-                        if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.55 {
-                            Color::BLACK
-                        } else {
-                            Color::WHITE
-                        },
+                        position,
+                        foreground,
                         clip,
                     );
+                    }
                     if crate::integration_control::reporting_enabled()
                         && let Some(frame) = self.surface.frame
+                        && let Some(overlay) = overlay
                     {
                         crate::integration_control::report_viewer_label(
                             category,
@@ -341,6 +381,40 @@ pub(crate) fn class_color(color: &crate::generated::AnnotationColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prediction_labels_cache_exact_text_and_keep_source_products_distinct() {
+        let model = crate::view_model::test_support::bootstrapped();
+        let mut snapshot = model.predict_snapshot.unwrap();
+        snapshot.labels = (0..4096).map(|index| crate::generated::PredictLabel {
+            box_: crate::generated::AnnotationBox {
+                first: crate::generated::AnnotationPoint { x: index as f32, y: 2.0 },
+                second: crate::generated::AnnotationPoint { x: index as f32 + 10.0, y: 12.0 },
+            },
+            category: if index == 0 { 0 } else { 79 },
+            confidence: 0.75,
+            color: crate::generated::AnnotationColor { hue: 120.0, saturation: 1.0, value: 0.8 },
+            name: if index == 0 { "person".into() } else { "80".into() },
+        }).collect();
+        let retained = std::sync::Arc::new(PredictionContent::new(crate::generated::PredictImageMetadata::from(&snapshot)));
+        assert_eq!(retained.labels.len(), 4096);
+        assert_eq!(retained.labels[0].text, "person 0.75");
+        assert_eq!(retained.labels[4095].text, "80 0.75");
+        let pointer = retained.labels[0].text.as_ptr();
+        let source = Source::Prediction(retained.clone());
+        for _ in 0..3 {
+            source.visit(|_, _, text, _, _, _, cached| {
+                assert!(cached.is_some());
+                if text == "person 0.75" { assert_eq!(text.as_ptr(), pointer); }
+            });
+        }
+        snapshot.frame.source.instance += 1;
+        snapshot.labels[0].name = "changed".into();
+        let replacement = PredictionContent::new(crate::generated::PredictImageMetadata::from(&snapshot));
+        assert_eq!(replacement.labels[0].text, "changed 0.75");
+        assert_eq!(retained.labels[0].text, "person 0.75");
+        assert_ne!(replacement.metadata.frame.source, retained.metadata.frame.source);
+    }
 
     #[test]
     fn labelled_workspace_retains_the_actual_shader_pan_zoom_and_fps_state() {
@@ -596,7 +670,7 @@ mod tests {
         assert!(snapshot.labels.is_empty());
         let collect = |source: Source| {
             let mut labels = Vec::new();
-            source.visit(|category, bounds, name, color, count, _| {
+            source.visit(|category, bounds, name, color, count, _, _| {
                 labels.push((
                     category,
                     bounds.clone(),

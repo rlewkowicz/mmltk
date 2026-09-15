@@ -99,7 +99,7 @@ const CPP_PROFILE = {
   detectorExcludedPrefixes: NON_CPP_PREFIXES,
   duplo: {
     binary: DUPLO_BINARY,
-    minLines: 7,
+    minLines: 9,
     flags: ["-ip"],
     contentFilter:
       "comments, strings, and preprocessor-only lines excluded",
@@ -108,7 +108,7 @@ const CPP_PROFILE = {
   cpd: {
     binary: PMD_BINARY,
     language: "cpp",
-    minTokens: 69,
+    minTokens: 100,
     flags: ["--ignore-identifiers", "--ignore-literal-sequences"],
   },
   inventoryLabels: {

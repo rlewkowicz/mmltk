@@ -332,6 +332,13 @@ std::uintptr_t DeviceContext::CreateEvent() const {
     if (event == 0U) throw std::runtime_error("image completion event creation returned no event");
     return event;
 }
+void DeviceContext::ValidateSelection(int device, const std::shared_ptr<ImageCopyBackend>& backend, DeviceContextMode mode,
+                                      int numa_node, const std::optional<DeviceExecution>& execution) const {
+    if (state_->device != device || state_->mode != mode || (backend && backend != state_->backend) ||
+        (execution && (!state_->execution || *execution != *state_->execution)) ||
+        (numa_node >= 0 && (!state_->execution || state_->execution->placement.numa_node != numa_node)))
+        throw std::invalid_argument("adopted image context does not match selected ownership");
+}
 DeviceContext DeviceContext::OnDevice(int device, std::optional<DeviceExecution> execution) const {
     if (execution && execution->device != device) throw std::invalid_argument("display execution device mismatch");
     if (device == this->device()) return *this;

@@ -41,14 +41,19 @@ namespace torch_cuda = mmltk::backend::ml::cuda;
 
 namespace {
 
+struct AlignmentSample final {
+    float score = 0.0F;
+    std::array<float, 4U> bbox_xyxy{};
+};
+
 [[nodiscard]] ModelArtifactRequest selected_artifact(const ValidateRequest& request, const ResolvedInferenceArtifact& resolved) {
     return select_inference_artifact(request, resolved);
 }
 
 [[nodiscard]] ValidationBackendResult evaluate_backend(const ValidateRequest& request, const ResolvedInferenceArtifact& artifact,
                                                        EvaluationDatasetOwner dataset, PredictionSession& prediction_session,
-                                                       PredictionRunResult* captured_predictions,
-                                                       const runtime::BorrowedCommandStream command_stream) {
+                                                       std::vector<std::optional<AlignmentSample>>* captured_predictions,
+                                                       const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
     PredictRequest predict;
     static_cast<ModelArtifactRequest&>(predict) = selected_artifact(request, artifact);
     static_cast<InferenceExecutionConfig&>(predict) = request;
@@ -60,20 +65,23 @@ namespace {
     predict.output_path =
         request.report_json_path.empty() ? request.compiled_path.parent_path() / "validation_predictions.json" : request.report_json_path;
     predict.progress_bar = request.log_mode == ValidationLogMode::Interactive;
-    auto predictions = prediction_session.RunResolved(predict, artifact, command_stream);
-
-    const auto limit = request.limit_images == 0U ? predictions.records.size() : std::min(request.limit_images, predictions.records.size());
-    for (std::size_t index = 0U; index < limit; ++index) {
-        const auto& record = predictions.records[index];
-        std::vector<float> scores;
-        std::vector<std::int64_t> labels;
-        std::vector<float> boxes;
+    predict.limit_images = request.limit_images;
+    predict.include_masks = false;
+    std::vector<float> scores;
+    std::vector<std::int64_t> labels;
+    std::vector<float> boxes;
+    const auto predictions = prediction_session.RunResolved(predict, artifact, command_stream, {
+      .stop = delivery.stop,
+      .completed = [&](const PredictionRecord& record, PredictionPixels, const runtime::AnalysisAnnotationStorage&) {
+        scores.clear();
+        labels.clear();
+        boxes.clear();
         scores.reserve(record.detections.size());
         labels.reserve(record.detections.size());
         boxes.reserve(record.detections.size() * 4U);
         for (const auto& detection : record.detections) {
             scores.push_back(detection.score);
-            labels.push_back(detection.category_id);
+            labels.push_back(detection.category_id - 1);
             boxes.insert(boxes.end(), detection.bbox_xyxy.begin(), detection.bbox_xyxy.end());
         }
         dataset.merge_bbox_predictions(record.dataset_index,
@@ -83,7 +91,13 @@ namespace {
                                         .boxes_xyxy = boxes.data(),
                                         .count = scores.size()},
                                        predict.max_dets_per_image);
-    }
+        if (captured_predictions != nullptr && captured_predictions->size() < request.alignment_images) {
+            if (record.detections.empty()) captured_predictions->push_back(std::nullopt);
+            else captured_predictions->push_back(AlignmentSample{record.detections.front().score, record.detections.front().bbox_xyxy});
+        }
+      },
+      .progress = delivery.progress,
+    });
 
     ValidationBackendResult result;
     result.model_info.backend = artifact.backend_name;
@@ -92,7 +106,6 @@ namespace {
     result.model_info.num_classes = static_cast<std::int64_t>(dataset.category_count());
     result.summary = dataset.evaluate(predict.max_dets_per_image);
     result.timing = predictions.timing;
-    if (captured_predictions != nullptr) { *captured_predictions = std::move(predictions); }
     return result;
 }
 
@@ -120,7 +133,7 @@ struct ValidationSession::State final {
 
     [[nodiscard]] PredictionSession& For(const InferenceArtifactKind kind) noexcept { return predictions[static_cast<std::size_t>(kind)]; }
 
-    [[nodiscard]] ValidationRunResult Run(ValidateRequest& options, runtime::BorrowedCommandStream command_stream);
+    [[nodiscard]] ValidationRunResult Run(ValidateRequest& options, runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery);
 };
 
 ValidationSession::ValidationSession() : state_(std::make_unique<State>()) {}
@@ -147,7 +160,7 @@ ValidationRunResult run_validation(const ValidateRequest& request) {
     return session.Run(request, {.native_handle = stream, .valid = true});
 }
 
-ValidationRunResult ValidationSession::Run(const ValidateRequest& request, const runtime::BorrowedCommandStream command_stream) {
+ValidationRunResult ValidationSession::Run(const ValidateRequest& request, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
     if (!command_stream) throw std::invalid_argument("RF-DETR validation command stream is invalid");
     auto options = finalize_validate_request(request);
     ValidationRunResult result;
@@ -156,24 +169,26 @@ ValidationRunResult ValidationSession::Run(const ValidateRequest& request, const
         ValidateRequest* options;
         runtime::BorrowedCommandStream command_stream;
         ValidationRunResult* result;
+        const ValidationDelivery* delivery;
     } call{
         .state = state_.get(),
         .options = &options,
         .command_stream = command_stream,
         .result = &result,
+        .delivery = &delivery,
     };
     torch_cuda::run_on_torch_cuda_stream(options.device_id, command_stream.native_handle, &call, [](void* opaque) {
         auto& bound = *static_cast<BoundValidationCall*>(opaque);
-        *bound.result = bound.state->Run(*bound.options, bound.command_stream);
+        *bound.result = bound.state->Run(*bound.options, bound.command_stream, *bound.delivery);
     });
     return result;
 }
 
-std::size_t ValidationSession::RunImageCount(const ValidateRequest& request, const runtime::BorrowedCommandStream command_stream) {
-    return Run(request, command_stream).images;
+std::size_t ValidationSession::RunImageCount(const ValidateRequest& request, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
+    return Run(request, command_stream, delivery).processed_images;
 }
 
-ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, const runtime::BorrowedCommandStream command_stream) {
+ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
     if (options.tensorrt_path.empty() && !options.save_engine_path.empty()) {
         BuildEngineRequest build;
         static_cast<ModelArtifactRequest&>(build) = options;
@@ -198,12 +213,13 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
     result.limits.num_queries_automatic = options.num_queries == 0U;
     result.limits.eval_max_dets_automatic = options.eval_max_dets == 0U;
 
-    PredictionRunResult onnx_predictions;
-    PredictionRunResult tensorrt_predictions;
+    std::vector<std::optional<AlignmentSample>> onnx_predictions;
+    std::vector<std::optional<AlignmentSample>> tensorrt_predictions;
     for (const auto& requested : evaluation_order(options.eval_order)) {
+        if (delivery.stop.stop_requested()) break;
         const auto artifact = resolve_inference_artifact(options, requested);
         result.eval_order.push_back(artifact.backend_name);
-        PredictionRunResult* captured_result = nullptr;
+        std::vector<std::optional<AlignmentSample>>* captured_result = nullptr;
         switch (artifact.kind) {
             case InferenceArtifactKind::Weights:
                 break;
@@ -217,7 +233,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
                 throw std::invalid_argument("invalid RF-DETR inference artifact kind");
         }
         result.backends.emplace(artifact.backend_name,
-                                evaluate_backend(options, artifact, dataset, For(artifact.kind), captured_result, command_stream));
+                                evaluate_backend(options, artifact, dataset, For(artifact.kind), captured_result, command_stream, delivery));
     }
     if (const auto onnx = result.backends.find("onnx"); onnx != result.backends.end()) {
         if (const auto trt = result.backends.find("tensorrt"); trt != result.backends.end()) {
@@ -230,15 +246,15 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
             AlignmentStats alignment;
             double score_sum = 0.0;
             double box_sum = 0.0;
-            const auto count = std::min({options.alignment_images, onnx_predictions.records.size(), tensorrt_predictions.records.size()});
+            const auto count = std::min({options.alignment_images, onnx_predictions.size(), tensorrt_predictions.size()});
             for (std::size_t index = 0U; index < count; ++index) {
-                const auto& lhs = onnx_predictions.records[index].detections;
-                const auto& rhs = tensorrt_predictions.records[index].detections;
-                if (lhs.empty() || rhs.empty()) { continue; }
-                const double score = std::abs(static_cast<double>(lhs.front().score) - rhs.front().score);
+                const auto& lhs = onnx_predictions[index];
+                const auto& rhs = tensorrt_predictions[index];
+                if (!lhs || !rhs) { continue; }
+                const double score = std::abs(static_cast<double>(lhs->score) - rhs->score);
                 double box = 0.0;
                 for (std::size_t axis = 0U; axis < 4U; ++axis) {
-                    box = std::max(box, std::abs(static_cast<double>(lhs.front().bbox_xyxy[axis] - rhs.front().bbox_xyxy[axis])));
+                    box = std::max(box, std::abs(static_cast<double>(lhs->bbox_xyxy[axis] - rhs->bbox_xyxy[axis])));
                 }
                 score_sum += score;
                 box_sum += box;
@@ -254,17 +270,24 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
             }
         }
     }
+    result.cancelled = delivery.stop.stop_requested();
+    result.FinalizeTiming();
+    return result;
+}
+
+void ValidationRunResult::FinalizeTiming() {
+    processed_images = 0U;
     double total_seconds = 0.0;
-    for (const auto& [name, backend] : result.backends) {
+    for (const auto& [name, backend] : backends) {
         static_cast<void>(name);
         total_seconds += backend.timing.seconds;
+        processed_images += backend.timing.images;
     }
-    result.total_timing = PhaseTiming{
+    total_timing = PhaseTiming{
         .seconds = total_seconds,
-        .img_per_s = total_seconds > 0.0 ? static_cast<double>(result.images) / total_seconds : 0.0,
-        .images = result.images,
+        .img_per_s = total_seconds > 0.0 ? static_cast<double>(processed_images) / total_seconds : 0.0,
+        .images = processed_images,
     };
-    return result;
 }
 
 void write_validation_report(const ValidateRequest& request, const ValidationRunResult& result) {

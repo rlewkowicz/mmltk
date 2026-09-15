@@ -142,14 +142,6 @@ impl ApplicationModel {
         if kind == PresentationSourceKind::Upscale && self.current_upscale().is_none() {
             return None;
         }
-        if kind == PresentationSourceKind::Predict
-            && self.predict_snapshot.as_ref().is_none_or(|snapshot| {
-                snapshot.operation.active
-                    || snapshot.operation.terminal.outcome != ComputeOperationOutcome::Succeeded
-            })
-        {
-            return None;
-        }
         self.frame_observation_for(kind)
             .map(|observation| observation.frame)
             .filter(|frame| Self::valid_visual_source(frame).is_some())
@@ -943,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn predict_generation_clears_old_frame_and_ignores_stale_failure() {
+    fn predict_generation_retains_completed_frame_and_ignores_stale_failure() {
         let mut model = bootstrapped();
         let mut succeeded = model.predict_snapshot.clone().unwrap();
         succeeded.revision += 1;
@@ -967,7 +959,7 @@ mod tests {
                 snapshot: running.clone(),
             },
         ));
-        assert!(model.source_for(PresentationSourceKind::Predict).is_none());
+        assert!(model.source_for(PresentationSourceKind::Predict).is_some());
         let mut newer = running.clone();
         newer.revision += 2;
         newer.operation.generationfrontier = 3;

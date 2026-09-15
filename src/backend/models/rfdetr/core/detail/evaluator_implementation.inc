@@ -151,37 +151,6 @@ float bbox_iou(const std::array<float, 4>& lhs, const std::array<float, 4>& rhs)
     return intersect / union_area;
 }
 
-template <typename ValueAt>
-void encode_mask_values_into(const uint32_t height, const uint32_t width, EncodedMask& mask, ValueAt&& value_at) {
-    mask.height = height;
-    mask.width = width;
-    mask.area = 0;
-    mask.runs.clear();
-    const uint32_t pixel_count = width * height;
-    mask.runs.reserve(std::min<uint32_t>(pixel_count, 64U));
-    bool in_run = false;
-    uint32_t run_start = 0;
-    uint32_t run_length = 0;
-    for (uint32_t index = 0; index < pixel_count; ++index) {
-        const bool value = value_at(index);
-        mask.area += value ? 1U : 0U;
-        if (value) {
-            if (!in_run) {
-                in_run = true;
-                run_start = index;
-                run_length = 1;
-            } else {
-                ++run_length;
-            }
-        } else if (in_run) {
-            mask.runs.emplace_back(run_start, run_length);
-            in_run = false;
-            run_length = 0;
-        }
-    }
-    if (in_run) { mask.runs.emplace_back(run_start, run_length); }
-}
-
 template <typename MaskValue>
 EncodedMask encode_mask_from_linear_data(const MaskValue* data, uint32_t height, uint32_t width) {
     mmltk::common::logging::ScopedNvtxRange nvtx_encode_mask_from_linear_data{"encode_mask_from_linear_data",

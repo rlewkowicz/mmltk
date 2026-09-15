@@ -14,8 +14,10 @@ mmltk_register_retained_module_implementation_units(
     mmltk_backend_imaging_raster raster.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_imaging_raster
+    chw_image.cu
     raster_cuda.cu
     mask_pack_cuda.cu)
+mmltk_register_public_headers(mmltk_backend_imaging_raster BASE_DIRS ${CMAKE_SOURCE_DIR} FILES chw_image.h)
 mmltk_register_private_headers(
     mmltk_backend_imaging_raster
     detail/mask_pack_cuda_abi.h

@@ -327,6 +327,7 @@ constexpr auto source_fields = [](auto& state, const auto& visit) {
     visit("kind", state.kind);
     visit("compiled_path", state.compiled_path);
     visit("single_image_path", state.single_image_path);
+    visit("video_file_path", state.video_file_path);
     visit("image_directory", state.image_directory);
     visit("recursive", state.recursive);
     visit("device_index", state.device_index);

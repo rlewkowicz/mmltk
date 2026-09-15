@@ -42,8 +42,13 @@ struct SystemImageRuntime::State final {
     explicit State(std::unique_ptr<SystemImageModel> adopted_model) noexcept : model(std::move(adopted_model)) {}
 
     void Finish(SystemImageRuntimeConfig& config, const std::shared_ptr<ImageProductRetirement>& products) {
-        context.emplace(config.device, config.backend ? std::move(config.backend) : cuda_image_copy_backend(), config.context_mode,
-                        config.numa_node, std::move(config.execution));
+        if (config.adopted_context) {
+            config.adopted_context->ValidateSelection(config.device, config.backend, config.context_mode, config.numa_node, config.execution);
+            context = std::move(config.adopted_context);
+        } else {
+            context.emplace(config.device, config.backend ? std::move(config.backend) : cuda_image_copy_backend(), config.context_mode,
+                            config.numa_node, std::move(config.execution));
+        }
         std::optional<mmltk::common::system::ScopedExecutionPolicy> policy;
         if (const auto* execution = context->execution())
             policy.emplace(mmltk::common::system::ExecutionPolicyRequest{
@@ -165,6 +170,9 @@ SystemImageRuntime::~SystemImageRuntime() noexcept {
     auto retirement = Retire();
     if (retirement.safe_to_destroy) state_.reset();
     retention_.reset();
+}
+bool SystemImageRuntime::UsesContext(const DeviceContext& context) const noexcept {
+    return state_ && !state_->retired && state_->context && *state_->context == context;
 }
 int SystemImageRuntime::device() const noexcept { return state_ && !state_->retired && state_->context ? state_->context->device() : -1; }
 const DeviceExecution* SystemImageRuntime::execution() const noexcept {
@@ -310,6 +318,10 @@ void SystemImageRuntime::PublishInput(const std::uint32_t width, const std::uint
 }
 BorrowedImageProductReadView SystemImageRuntime::Borrow() const { return ActiveState().output->Borrow(); }
 SystemImageModel* SystemImageRuntime::model() noexcept { return state_ && !state_->retired ? state_->model.get() : nullptr; }
+std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyFrom(OutputCandidate& candidate, BorrowedImageProductReadView source) {
+    auto& state = ActiveState();
+    return state.output->CopyFrom(*state.stream, candidate, std::move(source), TakeProductRevision());
+}
 std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyFrom(BorrowedImageProductReadView source) {
     auto& state = ActiveState();
     return state.output->CopyFrom(*state.stream, std::move(source), TakeProductRevision());

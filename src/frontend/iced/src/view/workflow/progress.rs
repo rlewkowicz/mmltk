@@ -305,6 +305,24 @@ mod tests {
     }
 
     #[test]
+    fn prediction_progress_preserves_processed_count_without_a_declared_total() {
+        let mut predict = snapshots().into_iter().find_map(|snapshot| match snapshot {
+            crate::generated::ApplicationSnapshot::Predict(value) => Some(value),
+            _ => None,
+        }).unwrap();
+        predict.operation.active = true;
+        predict.operation.progress.sequence = 1;
+        predict.operation.progress.completed = 7;
+        predict.operation.progress.total = 0;
+        predict.operation.progress.status = "Processed".into();
+        assert!(matches!(compute_presentation(Some(&predict.operation)),
+            Presentation::OpenEnded { completed: 7, .. }));
+        predict.operation.progress.total = 10;
+        assert!(matches!(compute_presentation(Some(&predict.operation)),
+            Presentation::Determinate { completed: 7, total: 10, .. }));
+    }
+
+    #[test]
     fn typed_compute_completion_and_failure_remain_visible() {
         let mut validation = snapshots()
             .into_iter()

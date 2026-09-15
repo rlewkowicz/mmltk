@@ -104,6 +104,7 @@ class ImageProductPool final {
     void PublishRetained(ImageStream&, Candidate&, std::uint32_t, std::uint32_t, std::uint64_t, ImageProductBuffer::ProductSubmit,
                          ImageSubmission = ImageSubmission::Complete);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, std::uint64_t);
+    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, Candidate&, BorrowedImageProductReadView, std::uint64_t);
     Product Commit(Candidate&&);
     [[nodiscard]] bool PrepareDisplay(ImageStream&, std::uint64_t, const std::shared_ptr<ImageWorkspace>&, ImageWorkspaceFinalize);
     [[nodiscard]] bool DetachDisplay(ImageStream&, const std::shared_ptr<ImageWorkspace>&);
@@ -130,6 +131,7 @@ class ImageProductPool final {
    private:
     [[nodiscard]] bool PrepareWorkspace(const Product&, std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
     void ValidateBaseline(const Product&) const;
+    void ValidateCopySource(const BorrowedImageProductReadView&, std::uint64_t) const;
     std::shared_ptr<Admission> admission_;
     std::vector<std::shared_ptr<Slot>> slots_;
 };

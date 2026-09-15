@@ -28,6 +28,7 @@ struct SystemImageRuntimeConfig final {
     int numa_node = -1;
     std::optional<DeviceExecution> execution{};
     std::shared_ptr<ImageProductRevisionSequence> product_revisions{std::make_shared<ImageProductRevisionSequence>()};
+    std::optional<DeviceContext> adopted_context{};
 };
 
 class SystemImageRuntime final {
@@ -71,6 +72,7 @@ class SystemImageRuntime final {
     SystemImageRuntime& operator=(SystemImageRuntime&&) = delete;
     [[nodiscard]] int device() const noexcept;
     [[nodiscard]] const DeviceExecution* execution() const noexcept;
+    [[nodiscard]] bool UsesContext(const DeviceContext&) const noexcept;
     void BindContext();
     void BeginWork();
     [[nodiscard]] Retirement Retire() noexcept;
@@ -106,6 +108,7 @@ class SystemImageRuntime final {
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
     [[nodiscard]] SystemImageModel* model() noexcept;
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(BorrowedImageProductReadView);
+    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(OutputCandidate&, BorrowedImageProductReadView);
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyInputFrom(BorrowedImageProductReadView, ImageProductBuffer::MissingPlaneSubmit = {},
                                                               bool preserve_clean = false);
     void Publish(std::uint32_t width, std::uint32_t height, ImageProductBuffer::ProductSubmit);

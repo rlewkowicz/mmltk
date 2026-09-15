@@ -3,6 +3,7 @@ module;
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -48,6 +49,15 @@ struct ResolvedInferenceArtifact final {
 [[nodiscard]] ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& request,
                                                                  const ResolvedInferenceArtifact& artifact, std::uint32_t resolution);
 
+// Deferred masks pair selected top-k queries with their model-resolution logits.
+// Materialize on the lane stream before its next Run. Custody retains the exact
+// allocation through exceptional retirement; it is not a replay or immutable cache.
+struct RfdetrMaskSelection final {
+    mmltk::backend::ml::runtime::RuntimeTensorBuffer query_indices;
+    std::optional<mmltk::backend::ml::runtime::RuntimeTensorBuffer> mask_logits;
+    std::shared_ptr<void> custody;
+};
+
 class RfdetrRuntimeBackend final {
    public:
     ~RfdetrRuntimeBackend();
@@ -61,12 +71,16 @@ class RfdetrRuntimeBackend final {
     [[nodiscard]] std::uint32_t static_resolution() const noexcept;
     [[nodiscard]] std::int32_t device() const noexcept;
     [[nodiscard]] std::uintptr_t stream() const noexcept;
+    [[nodiscard]] bool has_masks() const noexcept;
+    [[nodiscard]] const mmltk::backend::ml::runtime::RuntimeShape& logits_shape() const noexcept;
     [[nodiscard]] mmltk::backend::ml::runtime::RuntimeElementType input_element_type() const noexcept;
     [[nodiscard]] const mmltk::backend::ml::runtime::RuntimeModelInfo& model_info() const noexcept;
 
+    // Mask capacity does not imply demand. Existing analysis consumers remain bbox-only.
     [[nodiscard]] mmltk::backend::ml::runtime::RuntimeSubmission Run(
         const mmltk::backend::ml::runtime::RuntimeTensorBuffer& input,
-        std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations);
+        std::span<mmltk::backend::ml::runtime::AnalysisAnnotationStorage> annotations,
+        std::span<RfdetrMaskSelection> selections = {}, bool include_masks = false);
     void ReleaseAfterCompletion(mmltk::backend::ml::runtime::RuntimeSubmission&& submission);
     [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
     [[nodiscard]] std::shared_ptr<RfdetrRuntimeBackend> MakeLane() const;

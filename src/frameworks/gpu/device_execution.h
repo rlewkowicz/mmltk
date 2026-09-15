@@ -4,6 +4,7 @@
 
 namespace mmltk::frameworks::gpu {
 struct DeviceExecution final {
+    bool operator==(const DeviceExecution&) const = default;
     int device = -1;
     std::string pci_identity{};
     int reported_numa_node = -1;

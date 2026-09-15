@@ -33,6 +33,7 @@ enum class SourceKind : std::uint8_t {
     SingleImage,
     ImageFolder,
     VideoStream,
+    VideoFile,
 };
 
 struct SourceSelectionState {
@@ -46,6 +47,9 @@ struct SourceSelectionState {
     [[= mmltk::frameworks::reflection::MaxBytes{
         mmltk::frameworks::reflection::kMaximumPathBytes}]][[= reflection::FileDialog<"Select image directory", "Directories", "*">{
         .mode = FileDialogMode::OpenFolder}]] std::string image_directory;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
+        [[= reflection::FileDialog<"Select video file", "Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v">{
+            .mode = FileDialogMode::OpenFile}]] std::string video_file_path;
     bool recursive = false;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_index = 0;
     [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int capture_width = 1920;

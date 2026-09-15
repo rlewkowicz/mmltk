@@ -8,12 +8,14 @@ pub enum Message {
     Loading(crate::view::workflow::loading::Message),
     StartRequested,
     StopRequested,
+    PauseRequested(bool),
     Model(crate::view::workflow::model_card::Message),
     OutputPathChanged(String),
     ThresholdChanged(f32),
     SourceChanged(crate::generated::SourceKind),
     CompiledPathChanged(String),
     ImagePathChanged(String),
+    VideoPathChanged(String),
     DialogRequested(u64),
     Workspace(crate::view::workspace::Message),
 }
@@ -24,6 +26,7 @@ pub enum Outcome {
     StartRequested,
     // CLEANUP-IGNORE: Predict retains its local domain outcome and workflow-bound child component ownership.
     StopRequested,
+    PauseRequested(bool),
     // CLEANUP-IGNORE: Predict's local settings outcome precedes its distinct model-card outcomes.
     SettingsEdited(crate::view::settings::EditSchedule),
     Model(crate::view::workflow::model_card::Outcome),
@@ -87,13 +90,15 @@ impl Component {
                 "predict.card.inputs",
                 crate::view::shared::card(
                     "Prediction",
-                    "Select a compiled dataset or an ordinary image.",
+                    "Select a compiled dataset, image, or local video file.",
                     column![
                         button("Compiled dataset").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::CompiledDataset))),
                         button("Single image").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::SingleImage))),
+                        button("Video file").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::VideoFile))),
                         text(draft.map_or("", |value| match value.source.kind {
                             crate::generated::SourceKind::CompiledDataset => "Source: compiled dataset",
                             crate::generated::SourceKind::SingleImage => "Source: single image",
+                            crate::generated::SourceKind::VideoFile => "Source: local video file",
                             _ => "Select a supported prediction source",
                         })),
                         crate::view::workflow::fields::text_field(
@@ -104,9 +109,14 @@ impl Component {
                             "Image", crate::generated::constraint_workflowspredictsourcesingleimagepath().stable_field_id,
                             draft.map_or("", |value| value.source.singleimagepath.as_str()), settings_edit_available, Message::ImagePathChanged,
                         ),
+                        crate::view::workflow::fields::text_field(
+                            "Video file", crate::generated::constraint_workflowspredictsourcevideofilepath().stable_field_id,
+                            draft.map_or("", |value| value.source.videofilepath.as_str()), settings_edit_available, Message::VideoPathChanged,
+                        ),
                         model.workflow.dialogs(crate::generated::FeatureId::Predict)
                             .filter(|fact| [crate::generated::constraint_workflowspredictsourcecompiledpath().stable_field_id,
-                                crate::generated::constraint_workflowspredictsourcesingleimagepath().stable_field_id].contains(&fact.stable_field_id))
+                                crate::generated::constraint_workflowspredictsourcesingleimagepath().stable_field_id,
+                                crate::generated::constraint_workflowspredictsourcevideofilepath().stable_field_id].contains(&fact.stable_field_id))
                             .fold(column![], |column, fact| column.push(button(fact.title).on_press_maybe(
                                 model.file_dialog_open_available(fact, crate::generated::FeatureId::Predict).then_some(Message::DialogRequested(fact.stable_field_id))))),
                         crate::view::workflow::fields::text_field(
@@ -167,6 +177,9 @@ impl Component {
                     settings_edit_available,
                     Message::ThresholdChanged,
                 ),
+                button(if model.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.paused) { "Resume" } else { "Pause" })
+                    .on_press_maybe(model.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.operation.active && snapshot.video).then(|| Message::PauseRequested(
+                        !model.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.paused)))),
                 button("Stop").on_press_maybe(
                     model
                         .compute_stop_available(crate::generated::FeatureId::Predict)
@@ -208,6 +221,7 @@ impl Component {
             Message::StartRequested => Outcome::StartRequested,
             // CLEANUP-IGNORE: Predict's Stop arm precedes its distinct child-domain reduction.
             Message::StopRequested => Outcome::StopRequested,
+            Message::PauseRequested(paused) => Outcome::PauseRequested(paused),
             // CLEANUP-IGNORE: Predict maps the model-card child outcome into its local domain.
             Message::Model(message) => {
                 let Some(outcome) = self.model_card.update(message, settings)? else {
@@ -233,6 +247,9 @@ impl Component {
             })?),
             Message::ImagePathChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
                 crate::generated::edit_workflowspredictsourcesingleimagepath(draft, value)
+            })?),
+            Message::VideoPathChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                crate::generated::edit_workflowspredictsourcevideofilepath(draft, value)
             })?),
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
             // CLEANUP-IGNORE: Predict alone converts its child workspace result into its local outcome.

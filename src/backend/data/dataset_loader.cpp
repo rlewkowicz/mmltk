@@ -209,7 +209,13 @@ struct DatasetLoader::Impl {
     void release(const Batch& batch, void* consumer_stream, const bool has_consumer) {
         std::lock_guard lock(mutex);
         auto& slot = require(batch, "release_batch");
-        if (has_consumer) {
+        if (has_consumer && stopping) {
+            mmltk::frameworks::gpu::CudaDeviceScope scope(config.device_id);
+            mmltk::frameworks::gpu::ensure_cuda_ok(scope.status(), "stopped dataset device binding");
+            const auto settled = cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(consumer_stream));
+            mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "stopped dataset caller restoration");
+            mmltk::frameworks::gpu::ensure_cuda_ok(settled, "stopped dataset consumer completion");
+        } else if (has_consumer) {
             stream->release(batch.slot_index, consumer_stream, {.context = this, .complete = consumer_complete});
             slot.consumer_pending = true;
         }
@@ -265,6 +271,15 @@ DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl
     }
     mmltk::frameworks::gpu::ensure_cuda_ok(scope.Finalize(), "dataset loader caller restoration");
 }
+void DatasetLoader::stop_workers() {
+    {
+        std::lock_guard lock(impl_->mutex);
+        impl_->stopping = true;
+    }
+    impl_->changed.notify_all();
+    impl_->stream->stop_workers();
+}
+
 DatasetLoader::~DatasetLoader() {
     {
         std::lock_guard lock(impl_->mutex);
@@ -281,6 +296,7 @@ void DatasetLoader::begin_epoch() {
     {
         std::lock_guard lock(impl_->mutex);
         impl_->check_failure();
+        if (impl_->stopping) throw std::runtime_error("begin_epoch cannot restart a stopped dataset loader");
         if (impl_->checked_out()) throw std::runtime_error("begin_epoch requires all checked-out batches to be released");
         impl_->resetting = true;
     }
@@ -302,11 +318,22 @@ void DatasetLoader::begin_epoch() {
     for (size_t index = 0; index < impl_->slots.size(); ++index)
         impl_->refill(index);
 }
-bool DatasetLoader::next_batch(Batch& out) {
+bool DatasetLoader::next_batch(Batch& out) { return next_batch(out, {}); }
+bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
+    if (stop.stop_requested()) return false;
+    const auto wake = [this] {
+        std::lock_guard lock(impl_->mutex);
+        impl_->changed.notify_all();
+    };
+    std::optional<std::stop_callback<decltype(wake)>> cancellation;
+    if (stop.stop_possible()) cancellation.emplace(stop, wake);
+    { std::lock_guard lock(impl_->mutex); if (impl_->stopping) return false; }
     if (!impl_->epoch) begin_epoch();
     std::unique_lock lock(impl_->mutex);
     for (;;) {
+        if (impl_->stopping) return false;
         impl_->check_failure();
+        if (stop.stop_requested()) return false;
         if (impl_->consumed == impl_->batch_starts.size()) return false;
         if (impl_->consumed == impl_->submitted) {
             impl_->changed.wait(lock);

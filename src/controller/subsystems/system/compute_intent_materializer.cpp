@@ -237,6 +237,7 @@ ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::
     if (!selected) return std::unexpected(selected.error());
     request.compiled_path.clear();
     request.image_inputs.clear();
+    request.video_path.clear();
     const auto& source = settings.workflows.predict.source;
     if (source.kind == mmltk::controller::contracts::SourceKind::CompiledDataset) {
         const auto compiled = current_artifact_split(artifact, source.compiled_path, "prediction dataset artifact is unavailable");
@@ -249,8 +250,12 @@ ComputeIntentMaterializer::PredictionMaterialization ComputeIntentMaterializer::
         request.image_inputs.push_back({.image_path = source.single_image_path,
                                        .source_name = std::filesystem::path{source.single_image_path}.filename().string(),
                                        .image_id = 0});
+    } else if (source.kind == mmltk::controller::contracts::SourceKind::VideoFile) {
+        if (source.video_file_path.empty()) return std::unexpected(refused("prediction video is unavailable"));
+        request.source_kind = mmltk::backend::models::rfdetr::PredictSourceKind::VideoFile;
+        request.video_path = source.video_file_path;
     } else {
-        return std::unexpected(refused("select a compiled dataset or ordinary images"));
+        return std::unexpected(refused("select a compiled dataset, image, or local video file"));
     }
     assign_model_artifact(request, model);
     request.backend = "auto";

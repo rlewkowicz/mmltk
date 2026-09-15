@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <optional>
+#include <stop_token>
 #include "src/frameworks/gpu/device_execution.h"
 
 #include "src/backend/data/compiled_dataset.h"
@@ -48,6 +49,8 @@ class DatasetLoader {
 
     void begin_epoch();
     bool next_batch(Batch& out);
+    // Cancellation only wakes acquisition; joining and checked-out custody remain with the owner.
+    bool next_batch(Batch& out, std::stop_token);
     // Optional CPU pixels for this checked-out lease; valid until release_batch.
     // Contiguous images alias the source. Scattered GDR images gather once here.
     [[nodiscard]] std::span<const float> host_images(const Batch& batch);
@@ -56,6 +59,8 @@ class DatasetLoader {
     void release_batch(const Batch& batch);
     void release_batch(const Batch& batch, void* consumer_stream);
     void synchronize();
+    // Stop/join CPU workers without releasing checked-out GPU storage. Idempotent.
+    void stop_workers();
 
     [[nodiscard]] size_t num_images() const;
     [[nodiscard]] size_t num_batches() const;

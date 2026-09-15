@@ -3198,6 +3198,7 @@ run_tests() {
         mmltk_backend_models_rfdetr_core_tests
         mmltk_backend_models_rfdetr_augmentation_tests
         mmltk_backend_models_rfdetr_export_tests
+        mmltk_backend_media_video_tests
         mmltk_backend_models_rfdetr_inference_tests
         mmltk_backend_models_rfdetr_training_tests
         mmltk_common_system_tests
@@ -3233,6 +3234,7 @@ run_tests() {
                 mmltk_controller_visual_systems_tests
                 mmltk_frameworks_gpu_tests
                 mmltk_backend_media_live_tests
+                mmltk_backend_media_video_tests
             )
             executables=("${targets[@]}")
             ;;
@@ -3283,6 +3285,7 @@ run_tests() {
                 mmltk_backend_models_rfdetr_core_tests
                 mmltk_backend_models_rfdetr_augmentation_tests
                 mmltk_backend_models_rfdetr_export_tests
+                mmltk_backend_media_video_tests
                 mmltk_backend_models_rfdetr_inference_tests
                 mmltk_backend_models_rfdetr_training_tests
             )

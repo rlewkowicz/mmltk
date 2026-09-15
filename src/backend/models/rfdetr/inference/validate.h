@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <functional>
+#include <stop_token>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -38,8 +40,15 @@ struct ValidationLimitResolution {
     bool eval_max_dets_automatic = false;
 };
 
+struct ValidationDelivery final {
+    std::stop_token stop{};
+    std::function<void(std::size_t, std::size_t)> progress{};
+};
+
 struct ValidationRunResult {
-    std::size_t images = 0;
+    bool cancelled = false;
+    std::size_t images = 0; // Planned distinct dataset population.
+    std::size_t processed_images = 0; // Accepted image executions, summed across backends.
     std::size_t categories = 0;
     ValidationLimitResolution limits;
     std::vector<std::string> eval_order;
@@ -47,6 +56,7 @@ struct ValidationRunResult {
     std::optional<AlignmentStats> alignment_probe;
     std::optional<ValidationDeltaSummary> delta_tensorrt_minus_onnx;
     std::optional<PhaseTiming> total_timing;
+    void FinalizeTiming();
 };
 
 class ValidationSession final {
@@ -56,9 +66,9 @@ class ValidationSession final {
     ValidationSession(const ValidationSession&) = delete;
     ValidationSession& operator=(const ValidationSession&) = delete;
 
-    ValidationRunResult Run(const ValidateRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream);
+    ValidationRunResult Run(const ValidateRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery = {});
     [[nodiscard]] std::size_t RunImageCount(const ValidateRequest& request,
-                                            mmltk::backend::ml::runtime::BorrowedCommandStream command_stream);
+                                            mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery = {});
     [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
 
    private:

@@ -427,6 +427,11 @@ impl App {
                     });
                 }
             }
+            crate::view::predict::Outcome::PauseRequested(paused) => {
+                self.submit_intent(ApplicationIntentEndpoint::PredictPause, |correlation| {
+                    crate::generated::encode_predict_Pause(correlation, crate::generated::PredictPauseIntent { paused })
+                });
+            }
             crate::view::predict::Outcome::Model(outcome) => {
                 return self.on_model(FeatureId::Predict, outcome);
             }

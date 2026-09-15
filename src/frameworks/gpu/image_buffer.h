@@ -89,6 +89,7 @@ class DeviceContext final {
     [[nodiscard]] bool operator==(const DeviceContext&) const noexcept = default;
     [[nodiscard]] const DeviceExecution* execution() const noexcept;
     void Bind() const;
+    void ValidateSelection(int, const std::shared_ptr<ImageCopyBackend>&, DeviceContextMode, int numa_node, const std::optional<DeviceExecution>&) const;
     [[nodiscard]] DeviceContext OnDevice(int device, std::optional<DeviceExecution> execution = {}) const;
     [[nodiscard]] std::uintptr_t CreateEvent() const;
     void DestroyEvent(std::uintptr_t) const noexcept;

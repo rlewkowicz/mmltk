@@ -1,4 +1,8 @@
 #include "detail/postprocess.h"
+#include "src/backend/models/rfdetr/contract/prediction_limits.h"
+#include <ATen/ops/gather.h>
+#include <ATen/ops/gt.h>
+#include <ATen/ops/upsample_bilinear2d.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -96,37 +100,55 @@ PostprocessCore postprocess_core(const OutputTensors& outputs, const postprocess
 
 }  // namespace
 
+PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outputs, int64_t height, int64_t width, int64_t count, bool require_masks) {
+    if (require_masks && !outputs.pred_masks) throw std::runtime_error("RF-DETR requested masks are absent");
+    auto core = postprocess_core(outputs, nullptr, std::make_pair(height, width), count);
+    if (outputs.pred_masks && (outputs.pred_masks->dim() != 4 || outputs.pred_masks->size(0) != outputs.pred_logits.size(0) ||
+        outputs.pred_masks->size(1) != outputs.pred_logits.size(1) || outputs.pred_masks->size(2) <= 0 || outputs.pred_masks->size(3) <= 0 ||
+        !outputs.pred_masks->is_floating_point() || outputs.pred_masks->device() != outputs.pred_logits.device()))
+        throw std::invalid_argument("RF-DETR mask logits are incompatible with selected queries");
+    if (outputs.pred_masks) static_cast<void>(checked_prediction_extent(outputs.pred_masks->numel(), outputs.pred_masks->element_size(), kMaximumPredictionTensorBytes));
+    return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks};
+}
+
+postprocess_detail::Tensor SelectedMaskWorkspace::Materialize(const postprocess_detail::Tensor& logits,
+    const postprocess_detail::Tensor& query_indices, int64_t height, int64_t width) {
+    const auto batch = logits.size(0);
+    const auto count = query_indices.size(1);
+    if (count == 0) return postprocess_detail::empty({batch, 0, height, width}, logits.options().dtype(postprocess_detail::kBool));
+    auto gather = query_indices.unsqueeze(-1).unsqueeze(-1).expand({batch, count, logits.size(2), logits.size(3)});
+    const auto selected = checked_prediction_extent(static_cast<std::size_t>(batch), static_cast<std::size_t>(count), kMaximumPredictionCandidates);
+    const auto pixels = checked_prediction_extent(height, width, kMaximumEncodedMaskPixels);
+    static_cast<void>(checked_prediction_extent(selected, pixels, kMaximumPredictionTensorBytes / logits.element_size()));
+    static_cast<void>(checked_prediction_extent(selected, static_cast<std::size_t>(logits.size(2) * logits.size(3)), kMaximumPredictionTensorBytes / logits.element_size()));
+    if (!gathered_.defined()) gathered_ = postprocess_detail::empty({0}, logits.options());
+    if (!expanded_.defined()) expanded_ = postprocess_detail::empty({0}, logits.options());
+    if (!masks_.defined()) masks_ = postprocess_detail::empty({0}, logits.options().dtype(postprocess_detail::kBool));
+    if (gathered_.scalar_type() != logits.scalar_type() || gathered_.device() != logits.device()) {
+        gathered_ = postprocess_detail::empty({0}, logits.options());
+        expanded_ = postprocess_detail::empty({0}, logits.options());
+        masks_ = postprocess_detail::empty({0}, logits.options().dtype(postprocess_detail::kBool));
+    }
+    gathered_.resize_(gather.sizes());
+    expanded_.resize_({static_cast<std::int64_t>(selected), 1, height, width});
+    masks_.resize_(expanded_.sizes());
+    at::gather_out(gathered_, logits, 1, gather);
+    at::upsample_bilinear2d_out(expanded_, gathered_.flatten(0, 1).unsqueeze(1), {height, width}, false);
+    at::gt_out(masks_, expanded_, 0.0);
+    return masks_.view({batch, count, height, width});
+}
+
+postprocess_detail::Tensor materialize_selected_masks(const postprocess_detail::Tensor& logits,
+    const postprocess_detail::Tensor& query_indices, int64_t height, int64_t width) {
+    SelectedMaskWorkspace workspace;
+    return workspace.Materialize(logits, query_indices, height, width);
+}
+
 PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width,
                                                        int64_t num_select) {
-    PostprocessCore core = postprocess_core(outputs, nullptr, std::make_pair(target_height, target_width), num_select);
-    PostprocessedBatch result{
-        std::move(core.scores),
-        std::move(core.labels),
-        std::move(core.boxes),
-        std::nullopt,
-    };
-    if (!outputs.pred_masks.has_value()) { return result; }
-
-    mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_masks{"rfdetr.native.postprocess.masks"};
-    const auto& out_masks = *outputs.pred_masks;
-    const int64_t batch_size = out_masks.size(0);
-    const int64_t selected_count = core.query_indices.size(1);
-    if (selected_count == 0) {
-        result.masks =
-            postprocess_detail::empty({batch_size, 0, target_height, target_width},
-                                      postprocess_detail::TensorOptions().dtype(postprocess_detail::kBool).device(out_masks.device()));
-        return result;
-    }
-    const auto gather_index =
-        core.query_indices.unsqueeze(-1).unsqueeze(-1).expand({batch_size, selected_count, out_masks.size(-2), out_masks.size(-1)});
-    auto masks = out_masks.gather(1, gather_index);
-    auto interpolate_options = postprocess_detail::InterpolateFuncOptions();
-    interpolate_options.size(std::vector<int64_t>{target_height, target_width});
-    interpolate_options.mode(postprocess_detail::kBilinear);
-    interpolate_options.align_corners(false);
-    result.masks = postprocess_detail::interpolate(masks.flatten(0, 1).unsqueeze(1), interpolate_options)
-                       .gt(0.0)
-                       .view({batch_size, selected_count, target_height, target_width});
+    auto selected = select_output_batch_fixed_size(outputs, target_height, target_width, num_select);
+    PostprocessedBatch result{selected.scores, selected.labels, selected.boxes, std::nullopt};
+    if (selected.mask_logits) result.masks = materialize_selected_masks(*selected.mask_logits, selected.query_indices, target_height, target_width);
     return result;
 }
 

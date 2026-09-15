@@ -118,7 +118,7 @@ struct ComputeProgress final {
         [[= mmltk::frameworks::reflection::MaxBytes{kComputeStatusCapacity}]] std::string status;
     [[nodiscard]] bool valid() const noexcept {
         return sequence != 0U && valid_compute_text(status, kComputeStatusCapacity) &&
-               ((total == 0U && completed == 0U) || (total != 0U && completed <= total));
+               (total == 0U || completed <= total);
     }
     bool operator==(const ComputeProgress&) const = default;
 };

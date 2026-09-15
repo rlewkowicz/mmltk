@@ -27,9 +27,12 @@ mmltk_register_ordinary_sources(
     ../train/training_system.cpp)
 mmltk_register_retained_module_importers(
     mmltk_controller_data_compute_systems
-    compute_systems.cpp)
+    compute_systems.cpp
+    detail/prediction_preview.cpp)
 mmltk_register_private_headers(
-    mmltk_controller_data_compute_systems detail/predict_revision.h)
+    mmltk_controller_data_compute_systems detail/predict_revision.h
+        detail/prediction_playback.h
+        detail/prediction_preview.h)
 target_include_directories(mmltk_controller_data_compute_systems PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(mmltk_controller_data_compute_systems
     PUBLIC
@@ -44,6 +47,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::frameworks::reflection
     PRIVATE
         mmltk::controller::visual_runtime
+        mmltk::backend::imaging::raster
         mmltk::backend::imaging::explore
         mmltk::backend::ml::runtime
         mmltk::backend::models::rfdetr::export
@@ -59,6 +63,7 @@ function(mmltk_add_controller_subsystems_system_tests)
         mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_compute_systems.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_playback.test.cpp
         ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.cpp)
     mmltk_register_private_headers(mmltk_controller_data_compute_systems_tests
         ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.h)

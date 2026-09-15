@@ -27,6 +27,7 @@ struct NumaTopology final {
     [[nodiscard]] static NumaTopology Capture();
 };
 struct ExecutionPlacement final {
+    bool operator==(const ExecutionPlacement&) const = default;
     int numa_node = -1;
     std::vector<int> cpus;
     std::uint64_t node_bytes = 0;

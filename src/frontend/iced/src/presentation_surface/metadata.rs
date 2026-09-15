@@ -78,6 +78,7 @@ pub(crate) fn install(
     let mut gallery = None;
     let mut detail = None;
     let mut annotation = None;
+    let mut prediction = None;
     match product {
         WorkspaceImageProduct::Explore(snapshot) if snapshot.frame == metadata.frame => {
             let snapshot = Arc::new(snapshot);
@@ -116,7 +117,9 @@ pub(crate) fn install(
                 upscale: Some(Arc::new(snapshot)),
             });
         }
-        WorkspaceImageProduct::Predict(snapshot) if snapshot.frame == metadata.frame => {}
+        WorkspaceImageProduct::Predict(snapshot) if snapshot.frame == metadata.frame => {
+            prediction = Some(Arc::new(super::labels::PredictionContent::new(snapshot)));
+        }
         WorkspaceImageProduct::Live(snapshot) if snapshot.frame == metadata.frame => {}
         _ => return Err("graphics metadata does not describe this visual product".into()),
     }
@@ -142,6 +145,7 @@ pub(crate) fn install(
             gallery,
             detail,
             annotation,
+            prediction,
             placement,
             complete: super::copy_completed(frame),
             view_ready: true,

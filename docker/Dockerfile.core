@@ -55,6 +55,7 @@ RUN apt-get update \
         gzip \
         libasound2-dev \
         libarchive-dev \
+        libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
         libcurl4-openssl-dev \
         libdbus-glib-1-dev \
         libdrm-dev \

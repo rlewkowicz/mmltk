@@ -326,7 +326,6 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
                     Ok(Observation::Installed) => {
                         if self.source_for(PresentationSourceKind::Predict).is_some() {
                             self.set_foreground_visual(Some(PresentationSourceKind::Predict));
-                            self.set_foreground_visual(Some(PresentationSourceKind::Predict));
                         }
                     }
                     Ok(Observation::Current | Observation::Stale) => {}
@@ -345,7 +344,7 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
 
     fn project_predict_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         let snapshot = match reply {
-            ApplicationReply::PredictStart(snapshot) | ApplicationReply::PredictStop(snapshot) => {
+            ApplicationReply::PredictStart(snapshot) | ApplicationReply::PredictStop(snapshot) | ApplicationReply::PredictPause(snapshot) => {
                 snapshot
             }
             _ => unreachable!("generated Predict dispatch supplied another system reply"),

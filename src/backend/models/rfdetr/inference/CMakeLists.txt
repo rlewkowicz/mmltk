@@ -33,6 +33,7 @@ mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_inference
     validate.cpp
     evaluation.cpp)
+mmltk_register_private_headers(mmltk_backend_models_rfdetr_inference inference_preprocessor.h prediction_capacity.h)
 target_include_directories(mmltk_backend_models_rfdetr_inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
@@ -45,6 +46,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_inference
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::core
     PRIVATE
+        mmltk::backend::media::video
         mmltk::backend::data
         mmltk::backend::ml::cuda
         mmltk::common::concurrency
@@ -66,7 +68,8 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk_backend_models_rfdetr_inference_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/eval_sample_writer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_artifact_resolution.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_json.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_json.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_session.test.cpp)
     mmltk_configure_component(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE_DECLARATIONS)
     target_include_directories(
@@ -84,6 +87,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk::backend::models::rfdetr::inference
         mmltk::backend::ml::torch_dependencies
         CUDA::cudart
+        ONNX::onnx "${Protobuf_LIBRARY}"
         nlohmann_json)
     mmltk_target_cuda_architectures(
         mmltk_backend_models_rfdetr_inference_tests)
