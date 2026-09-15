@@ -42,11 +42,12 @@ struct SystemImageRuntime::State final {
     explicit State(std::unique_ptr<SystemImageModel> adopted_model) noexcept : model(std::move(adopted_model)) {}
 
     void Finish(SystemImageRuntimeConfig& config, const std::shared_ptr<ImageProductRetirement>& products) {
+        auto backend = config.backend ? std::move(config.backend) : cuda_image_copy_backend();
         if (config.adopted_context) {
-            config.adopted_context->ValidateSelection(config.device, config.backend, config.context_mode, config.numa_node, config.execution);
+            config.adopted_context->ValidateSelection(config.device, backend, config.context_mode, config.numa_node, config.execution);
             context = std::move(config.adopted_context);
         } else {
-            context.emplace(config.device, config.backend ? std::move(config.backend) : cuda_image_copy_backend(), config.context_mode,
+            context.emplace(config.device, std::move(backend), config.context_mode,
                             config.numa_node, std::move(config.execution));
         }
         std::optional<mmltk::common::system::ScopedExecutionPolicy> policy;

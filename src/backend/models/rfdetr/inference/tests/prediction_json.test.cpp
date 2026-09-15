@@ -1,4 +1,6 @@
 #include <unistd.h>
+#include <catch2/catch_test_macros.hpp>
+#include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
 
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
@@ -90,3 +92,62 @@ void test_prediction_json_writer_emits_expected_payload() {
 }  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][prediction_json]", test_prediction_json_writer_emits_expected_payload);
+
+TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame", "[model][rfdetr][prediction_json]") {
+    using namespace mmltk::backend::models::rfdetr;
+    namespace runtime = mmltk::backend::ml::runtime;
+    const auto path = fs::temp_directory_path() / ("prediction-raw-failure-" + std::to_string(::getpid()) + ".json");
+    PredictRequest request;
+    request.output_path = path;
+    PredictionJsonWriter writer(request);
+    writer.Begin({});
+    PredictionRecord record{.image_id = 9};
+    record.detections.push_back({.category_id = 1, .score = .9F, .has_mask = true});
+    encode_mask_values_into(2U, 2U, record.detections.front().mask, [](auto) { return true; });
+    runtime::AnalysisAnnotationStorage annotation;
+    std::string failure;
+    static std::size_t settlements;
+    settlements = 0U;
+    const auto settle = +[](cudaStream_t) { ++settlements; return cudaSuccess; };
+    for (int stage = 0; stage < 3; ++stage) {
+        annotation.source_region = {.width = 2U, .height = 2U};
+        annotation.value_count = 1U;
+        annotation.boxes_xyxy.address = 11U;
+        annotation.category_ids.address = 12U;
+        annotation.confidences.address = 13U;
+        annotation.masks.address = 14U;
+        failure.clear();
+        PredictionRawPreparation raw(true, annotation, failure, nullptr, settle);
+        raw.Execute([&] {
+            if (stage == 0) throw std::bad_alloc{};
+            if (stage == 1) throw std::runtime_error("compact selected scalars");
+            throw std::runtime_error("copy dense selected masks");
+        });
+        CHECK_FALSE(raw.available());
+        CHECK_FALSE(failure.empty());
+        CHECK(annotation.value_count == 0U);
+        CHECK(annotation.boxes_xyxy.address == 0U);
+        CHECK(annotation.category_ids.address == 0U);
+        CHECK(annotation.confidences.address == 0U);
+        CHECK(annotation.masks.address == 0U);
+        CHECK(annotation.source_region.width == 2U);
+        raw.Execute([] { FAIL("a failed current preview cannot submit more work"); });
+        writer.Append(record);
+    }
+    CHECK(settlements == 3U);
+    failure.clear();
+    PredictionRawPreparation healthy(true, annotation, failure, nullptr, settle);
+    healthy.Execute([&] { annotation.value_count = 1U; annotation.masks.address = 99U; });
+    CHECK(healthy.available());
+    CHECK(failure.empty());
+    CHECK(annotation.masks.address == 99U);
+    CHECK(settlements == 3U);
+    writer.Append(record);
+    writer.Complete();
+    std::ifstream file(path);
+    const auto output = json::parse(file);
+    REQUIRE(output.at("records").size() == 4U);
+    for (const auto& saved : output.at("records"))
+        CHECK(saved.at("detections").at(0).at("mask_rle") == "0:4");
+    fs::remove(path);
+}

@@ -3071,6 +3071,9 @@ TEST_CASE("admitted image copies preserve readers and refuse full capacity witho
 TEST_CASE("adopted image contexts validate complete ownership and retain independent custody") {
     auto backend = std::make_shared<FakeImageBackend>();
     std::optional<DeviceContext> context{std::in_place, 0, backend};
+    // Omitting the backend selects the canonical CUDA owner; it cannot adopt a
+    // fake context merely because no explicit backend pointer was supplied.
+    CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .adopted_context = context}), std::invalid_argument);
     CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 1, .backend = backend, .adopted_context = context}), std::invalid_argument);
     CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = std::make_shared<FakeImageBackend>(), .adopted_context = context}), std::invalid_argument);
     CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{.device = 0, .backend = backend, .context_mode = DeviceContextMode::PrimaryInterop, .adopted_context = context}), std::invalid_argument);
@@ -3092,6 +3095,35 @@ TEST_CASE("adopted image contexts validate complete ownership and retain indepen
     }
     CHECK(backend->contexts_created == 2U);
     CHECK(backend->contexts_destroyed == 2U);
+}
+
+TEST_CASE("canonical adoption validates ownership before changing the caller binding", "[gpu][hardware]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    REQUIRE(cuInit(0U) == CUDA_SUCCESS);
+    DeviceContext caller(0, cuda_image_copy_backend());
+    caller.Bind();
+    CUcontext before{};
+    REQUIRE(cuCtxGetCurrent(&before) == CUDA_SUCCESS);
+    {
+        DeviceContext adopted(0, cuda_image_copy_backend());
+        caller.Bind();
+        REQUIRE(cuCtxGetCurrent(&before) == CUDA_SUCCESS);
+        CHECK_THROWS_AS(SystemImageRuntime(SystemImageRuntimeConfig{
+            .device = 0, .backend = std::make_shared<FakeImageBackend>(), .adopted_context = adopted}), std::invalid_argument);
+        CUcontext current{};
+        REQUIRE(cuCtxGetCurrent(&current) == CUDA_SUCCESS);
+        CHECK(current == before);
+        // Runtime execution deliberately binds its owner. An enclosing caller
+        // context guard restores the caller across successful construction/retirement.
+        REQUIRE(cuCtxPushCurrent(before) == CUDA_SUCCESS);
+        {
+            SystemImageRuntime runtime({.device = 0, .adopted_context = adopted});
+            CHECK(runtime.UsesContext(adopted));
+        }
+        REQUIRE(cuCtxPopCurrent(&current) == CUDA_SUCCESS);
+        REQUIRE(cuCtxGetCurrent(&current) == CUDA_SUCCESS);
+        CHECK(current == before);
+    }
 }
 
 }  // namespace

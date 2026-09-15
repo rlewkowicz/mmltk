@@ -1,5 +1,7 @@
 #pragma once
 #include <algorithm>
+#include "src/backend/models/rfdetr/core/detail/postprocess.h"
+#include "src/common/system/numa_memory.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 namespace mmltk::backend::models::rfdetr {
 struct PredictionCapacity final {
@@ -19,6 +21,27 @@ struct PredictionCapacity final {
         static_cast<void>(checked_prediction_extent(batch, count, kMaximumPredictionTensorBytes / (4U * sizeof(float))));
         const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
         return {count, pixels, masks ? checked_prediction_extent(pixels, sizeof(std::uint8_t), kMaximumPredictionTensorBytes) : 0U};
+    }
+};
+struct PredictionMaskChunk final {
+    std::size_t count = 0U;
+    std::size_t retained_limit = 0U;
+    SelectedMaskCapacity capacity;
+    [[nodiscard]] static PredictionMaskChunk Resolve(std::size_t survivors, std::size_t model_height, std::size_t model_width,
+        std::size_t height, std::size_t width, std::size_t dtype_bytes) {
+        validate_prediction_candidates(survivors);
+        const auto one = SelectedMaskCapacity::Resolve(1U, model_height, model_width, height, width, dtype_bytes);
+        const auto limit = std::max(kPredictionMaskChunkBytes, one.Total());
+        auto count = std::min(survivors, limit / one.Total());
+        for (const auto bytes : one.bytes) count = std::min(count, kMaximumPredictionTensorBytes / bytes);
+        auto capacity = SelectedMaskCapacity::Resolve(count, model_height, model_width, height, width, dtype_bytes);
+        capacity.bytes.back() = mmltk::common::system::page_rounded_bytes(capacity.bytes.back());
+        // The registered host allocation owns whole pages. Its maximum padding
+        // is charged separately from the chunk's useful pixel storage.
+        const auto padding = mmltk::common::system::host_page_size() - 1U;
+        if (limit > std::numeric_limits<std::size_t>::max() - padding)
+            throw std::invalid_argument("RF-DETR mask retained capacity overflows");
+        return {count, limit + padding, capacity};
     }
 };
 }

@@ -111,6 +111,16 @@ PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outpu
     return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks};
 }
 
+SelectedMaskCapacity SelectedMaskWorkspace::RetainedCapacity(std::size_t host_bytes) const {
+    const auto capacity = [](const auto& tensor) -> std::size_t { return tensor.defined() ? tensor.storage().nbytes() : 0U; };
+    return {{capacity(gathered_), capacity(expanded_), capacity(masks_), host_bytes}};
+}
+void SelectedMaskWorkspace::ResetSettled() {
+    gathered_ = {};
+    expanded_ = {};
+    masks_ = {};
+}
+
 postprocess_detail::Tensor SelectedMaskWorkspace::Materialize(const postprocess_detail::Tensor& logits,
     const postprocess_detail::Tensor& query_indices, int64_t height, int64_t width) {
     const auto batch = logits.size(0);
@@ -118,9 +128,7 @@ postprocess_detail::Tensor SelectedMaskWorkspace::Materialize(const postprocess_
     if (count == 0) return postprocess_detail::empty({batch, 0, height, width}, logits.options().dtype(postprocess_detail::kBool));
     auto gather = query_indices.unsqueeze(-1).unsqueeze(-1).expand({batch, count, logits.size(2), logits.size(3)});
     const auto selected = checked_prediction_extent(static_cast<std::size_t>(batch), static_cast<std::size_t>(count), kMaximumPredictionCandidates);
-    const auto pixels = checked_prediction_extent(height, width, kMaximumEncodedMaskPixels);
-    static_cast<void>(checked_prediction_extent(selected, pixels, kMaximumPredictionTensorBytes / logits.element_size()));
-    static_cast<void>(checked_prediction_extent(selected, static_cast<std::size_t>(logits.size(2) * logits.size(3)), kMaximumPredictionTensorBytes / logits.element_size()));
+    static_cast<void>(SelectedMaskCapacity::Resolve(selected, logits.size(2), logits.size(3), height, width, logits.element_size()));
     if (!gathered_.defined()) gathered_ = postprocess_detail::empty({0}, logits.options());
     if (!expanded_.defined()) expanded_ = postprocess_detail::empty({0}, logits.options());
     if (!masks_.defined()) masks_ = postprocess_detail::empty({0}, logits.options().dtype(postprocess_detail::kBool));

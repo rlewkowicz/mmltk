@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include "src/backend/models/rfdetr/inference/inference_preprocessor.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
+#include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
 import mmltk.backend.models.rfdetr.inference.prediction;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace tensor = mmltk::backend::ml::torch_api;
@@ -269,7 +270,9 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
             REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
             CHECK(category + 1 == record.detections.front().category_id);
         }}).processed_images == 2U);
+    CHECK_FALSE(session.HasUnsafeCustody());
     rfdetr::PredictionSession poisoned;
+    CHECK_FALSE(poisoned.HasUnsafeCustody());
     std::ifstream prior_file(request.output_path);
     const auto prior = nlohmann::json::parse(prior_file);
     CHECK_THROWS_AS(poisoned.RunAndWrite(request, command, {.completed = [](const auto&, auto, const auto&) {
@@ -280,6 +283,9 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     bool rebound = false;
     CHECK_THROWS_AS(poisoned.Run(request, command, {.begin = [&](const auto&) { rebound = true; }}), mmltk::backend::ml::runtime::CudaOperationError);
     CHECK_FALSE(rebound);
+    CHECK(poisoned.HasUnsafeCustody());
+    CHECK(poisoned.Close() != mmltk::backend::ml::runtime::kRuntimeSuccess);
+    CHECK(poisoned.HasUnsafeCustody());
 }
 
 TEST_CASE("prediction output commit reports a destination failure and removes temporary data", "[model][rfdetr][prediction_json]") {
@@ -431,4 +437,89 @@ TEST_CASE("encoded mask allowance counts emitted runs across masks", "[model][rf
     remaining -= masks[2].runs.size();
     CHECK(remaining == 0U);
     CHECK_THROWS_AS(rfdetr::encode_mask_values_into(1U, 1U, masks[1], [](auto) { return true; }, remaining), std::invalid_argument);
+}
+
+TEST_CASE("mask chunks account for model gather expansion device bools and registered host capacity", "[model][rfdetr][prediction]") {
+    using rfdetr::PredictionMaskChunk;
+    using rfdetr::SelectedMaskCapacity;
+    const auto source_dominant = PredictionMaskChunk::Resolve(100, 1, 1, 1024, 1024, 4);
+    CHECK(source_dominant.count == 2U);
+    CHECK(source_dominant.capacity.Total() <= source_dominant.retained_limit);
+    const auto half = PredictionMaskChunk::Resolve(100, 1, 1, 1024, 1024, 2);
+    CHECK(half.count == 3U);
+    CHECK(half.capacity.Total() <= half.retained_limit);
+    const auto model_dominant = PredictionMaskChunk::Resolve(5000, 256, 256, 1, 1, 4);
+    CHECK(model_dominant.count == 63U);
+    CHECK(model_dominant.capacity.Total() <= model_dominant.retained_limit);
+    CHECK_THROWS_AS(SelectedMaskCapacity::Resolve(5000, 256, 256, 1, 1, 4), std::invalid_argument);
+    const auto exact = PredictionMaskChunk::Resolve(99, 1024, 1024, 1024, 1024, 4);
+    CHECK(exact.count == 1U);
+    const auto exact_bytes = rfdetr::SelectedMaskCapacity::Resolve(1, 1, 1, 2, 1398101, 4);
+    CHECK(exact_bytes.Total() == rfdetr::kPredictionMaskChunkBytes);
+    CHECK(PredictionMaskChunk::Resolve(2, 1, 1, 2, 1398101, 4).count == 1U);
+    CHECK(PredictionMaskChunk::Resolve(2, 1, 2, 2, 1398101, 4).count == 1U);
+    const auto oversized_one = PredictionMaskChunk::Resolve(2, 16384, 16384, 1, 1, 4);
+    CHECK(oversized_one.count == 1U);
+    CHECK(oversized_one.capacity.bytes[0] == rfdetr::kMaximumPredictionTensorBytes);
+    CHECK(oversized_one.capacity.Total() <= oversized_one.retained_limit);
+    CHECK_THROWS_AS(PredictionMaskChunk::Resolve(2, 16385, 16384, 1, 1, 4), std::invalid_argument);
+    CHECK_THROWS_AS(PredictionMaskChunk::Resolve(2, 1, 1, std::numeric_limits<std::size_t>::max(), 2, 4), std::invalid_argument);
+    CHECK_THROWS_AS(PredictionMaskChunk::Resolve(0, 1, 1, 1, 1, 4), std::invalid_argument);
+    SelectedMaskCapacity overflow{{std::numeric_limits<std::size_t>::max(), 1U, 0U, 0U}};
+    CHECK_THROWS_AS(overflow.Total(), std::invalid_argument);
+}
+
+TEST_CASE("selected mask workspace reuses allocation and resets dtype and shape high water", "[model][rfdetr][prediction]") {
+    rfdetr::SelectedMaskWorkspace workspace;
+    const auto queries = tensor::tensor({0L, 1L}, tensor::TensorOptions().dtype(tensor::kLong)).reshape({1, 2});
+    auto logits = tensor::ones({1, 2, 4, 4});
+    auto masks = workspace.Materialize(logits, queries, 8, 8);
+    const auto address = masks.data_ptr();
+    CHECK(masks.all().item<bool>());
+    masks = {};
+    CHECK(workspace.Materialize(logits, queries, 8, 8).data_ptr() == address);
+    const auto first = workspace.RetainedCapacity(128U);
+    CHECK(first.bytes == rfdetr::SelectedMaskCapacity::Resolve(2, 4, 4, 8, 8, 4).bytes);
+    logits = -tensor::ones({1, 2, 8, 8}, tensor::TensorOptions().dtype(tensor::kHalf));
+    CHECK_FALSE(workspace.Materialize(logits, queries, 4, 4).any().item<bool>());
+    CHECK(workspace.RetainedCapacity(32U).bytes == rfdetr::SelectedMaskCapacity::Resolve(2, 8, 8, 4, 4, 2).bytes);
+    workspace.ResetSettled();
+    CHECK(workspace.RetainedCapacity(0U).Total() == 0U);
+}
+
+TEST_CASE("raw preparation settles submitted tensor copies and reports unobservable work", "[model][rfdetr][prediction][gpu]") {
+    namespace runtime = mmltk::backend::ml::runtime;
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    const auto stream = c10::cuda::getCurrentCUDAStream(0).stream();
+    const auto source = tensor::ones({2, 2}, tensor::TensorOptions().device(tensor::kCUDA));
+    auto destination = tensor::zeros_like(source);
+    runtime::AnalysisAnnotationStorage annotation;
+    std::string failure;
+    rfdetr::PredictionRawPreparation raw(true, annotation, failure, stream);
+    raw.Execute([&] {
+        destination.copy_(source, true);
+        annotation.masks.address = reinterpret_cast<std::uintptr_t>(destination.data_ptr());
+        throw std::runtime_error("dense copy failure after submission");
+    });
+    CHECK_FALSE(raw.available());
+    CHECK(annotation.masks.address == 0U);
+    CHECK(destination.eq(1).all().item<bool>());
+    rfdetr::PredictionRawPreparation unsafe(true, annotation, failure, stream,
+        +[](cudaStream_t) { return cudaErrorUnknown; });
+    // These are the exact allocations the session retains on the typed failure;
+    // no replacement tensor stands in for an in-flight source or destination.
+    const auto source_address = source.data_ptr();
+    const auto destination_address = destination.data_ptr();
+    CHECK_THROWS_AS(unsafe.Execute([&] {
+        destination.copy_(source, true);
+        annotation.masks.address = reinterpret_cast<std::uintptr_t>(destination.data_ptr());
+        throw std::runtime_error("unobservable dense copy");
+    }), runtime::CudaOperationError);
+    CHECK_FALSE(unsafe.available());
+    CHECK(annotation.masks.address == 0U);
+    CHECK(source.data_ptr() == source_address);
+    CHECK(destination.data_ptr() == destination_address);
+    // The fake settlement failure did not poison actual hardware. Finish the
+    // real work before these test-owned allocations leave scope.
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
 }

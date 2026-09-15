@@ -97,11 +97,14 @@ class PredictionSession final {
     [[nodiscard]] PredictionRunResult RunAndWrite(const PredictRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, const PredictionDelivery& delivery = {});
     PredictionRunResult RunResolved(const PredictRequest& request, const ResolvedInferenceArtifact& artifact,
                                     mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, const PredictionDelivery& delivery = {});
+    // Sticky through Close; the run owner captures this before replacing or
+    // destroying the session. Ordinary contained preview failures leave it false.
+    [[nodiscard]] bool HasUnsafeCustody() const noexcept;
     [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
 
    private:
     struct State;
-    std::unique_ptr<State> state_;
+    std::shared_ptr<State> state_;
 };
 
 [[nodiscard]] PredictRequest finalize_predict_request(PredictRequest request);

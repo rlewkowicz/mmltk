@@ -42,6 +42,7 @@ module;
 #include "stb_image.h"
 #include "inference_preprocessor.h"
 #include "prediction_capacity.h"
+#include "prediction_raw_preparation.h"
 #include "src/backend/media/video/video_file_source.h"
 #include <ATen/ops/upsample_bilinear2d.h>
 #include <ATen/ops/index_select.h>
@@ -471,7 +472,9 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
                 annotations.selections[index].mask_logits.value_or(tensor_api::Tensor{})}, annotations.runtime_selections[index].custody, std::move(source)});
         } catch (...) { pixels = {.preview_failure = "Prediction source custody allocation failed"}; }
     }
-    delivery.completed(record, std::move(pixels), annotations.storage[index]);
+    const runtime::AnalysisAnnotationStorage unavailable{.source_region = annotations.storage[index].source_region};
+    const auto& current = pixels.chw || pixels.rgb8 ? annotations.storage[index] : unavailable;
+    delivery.completed(record, std::move(pixels), current);
 }
 
 [[nodiscard]] std::vector<Prediction> copy_predictions(AnnotationBatch& batch, std::size_t index, float threshold,
@@ -521,10 +524,18 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
     selected_indices = selected_indices.narrow(0, 0, active);
     const auto& selection = batch.selections[index];
     const auto cuda = selection.query_indices.options();
-    if (!storage.device_indices.defined()) storage.device_indices = tensor_api::empty({active}, cuda);
-    else storage.device_indices.resize_({active});
-    storage.device_indices.copy_(selected_indices, true);
-    if (batch.raw_preview) {
+    const auto stream = c10::cuda::getCurrentCUDAStream(batch.boxes.get_device()).stream();
+    PredictionRawPreparation preview(batch.raw_preview, annotation, batch.preview_failure, stream);
+    const auto upload_survivors = [&] {
+        if (!storage.device_indices.defined()) storage.device_indices = tensor_api::empty({active}, cuda);
+        else storage.device_indices.resize_({active});
+        storage.device_indices.copy_(selected_indices, true);
+    };
+    // Mask query selection is semantic work. BBox-only survivor upload belongs
+    // entirely to optional preview preparation.
+    if (batch.want_masks) upload_survivors();
+    preview.Execute([&] {
+        if (!batch.want_masks) upload_survivors();
         annotation = scalar_layout;
         annotation.masks = {};
         annotation.value_count = result.size();
@@ -546,38 +557,46 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
             buffer->shape.extents[0] = static_cast<std::uint32_t>(result.size());
             buffer->capacity_bytes = result.size() * (buffer == &annotation.boxes_xyxy ? 4U * sizeof(float) : sizeof(float));
         }
-    }
+
+    });
     if (!batch.want_masks) return result;
     if (!selection.mask_logits) throw std::runtime_error("RF-DETR requested mask output is absent");
     if (!storage.selected_queries.defined()) storage.selected_queries = tensor_api::empty({0}, cuda);
     storage.selected_queries.resize_({1, active});
     at::index_select_out(storage.selected_queries, selection.query_indices, 1, storage.device_indices);
-    const auto width = annotation.source_region.width;
-    const auto height = annotation.source_region.height;
+    const auto width = source_region.width;
+    const auto height = source_region.height;
     const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
-    const auto element_size = selection.mask_logits->element_size();
-    const auto expanded_bytes = checked_prediction_extent(pixels, element_size, kMaximumPredictionTensorBytes);
-    const auto per_chunk = std::max(std::size_t{1}, kPredictionMaskChunkBytes / expanded_bytes);
-    bool retain_masks = batch.raw_preview && result.size() <= kMaximumPredictionTensorBytes / pixels;
-    if (batch.raw_preview && !retain_masks) batch.preview_failure = "Prediction masks exceed bounded preview storage";
-    if (retain_masks) {
-        try {
-            if (!batch.masks.defined()) batch.masks = tensor_api::empty({active, height, width}, batch.boxes.options().dtype(tensor_api::kUInt8));
-            else batch.masks.resize_({active, height, width});
-        } catch (const std::exception& error) {
-            retain_masks = false;
-            batch.preview_failure = error.what();
-        }
+    const auto plan = PredictionMaskChunk::Resolve(result.size(), selection.mask_logits->size(2), selection.mask_logits->size(3),
+                                                  height, width, selection.mask_logits->element_size());
+    const auto per_chunk = plan.count;
+    auto retained_capacity = storage.mask_workspace.RetainedCapacity(storage.masks.capacity_bytes());
+    for (std::size_t plane = 0U; plane < retained_capacity.bytes.size(); ++plane)
+        retained_capacity.bytes[plane] = std::max(retained_capacity.bytes[plane], plan.capacity.bytes[plane]);
+    if (retained_capacity.Total() > plan.retained_limit) {
+        // The previous chunk/frame completed its host visibility wait. Drop its
+        // escaped view before releasing pinned storage; retain ordinary high water
+        // unless combining old and new shapes would exceed this frame's budget.
+        storage.mask_values = {};
+        const auto released = storage.masks.ReleaseSettled();
+        if (released != CUDA_SUCCESS) throw std::runtime_error("prediction mask scratch is still borrowed");
+        storage.mask_workspace.ResetSettled();
     }
+    preview.Execute([&] {
+        static_cast<void>(checked_prediction_extent(result.size(), pixels, kMaximumPredictionTensorBytes));
+        if (!batch.masks.defined()) batch.masks = tensor_api::empty({active, height, width}, batch.boxes.options().dtype(tensor_api::kUInt8));
+        else batch.masks.resize_({active, height, width});
+    });
     std::size_t remaining_runs = kMaximumPredictionMaskRuns;
     for (std::size_t start = 0; start < result.size(); start += per_chunk) {
         const auto chunk_size = std::min(per_chunk, result.size() - start);
         const auto chunk = static_cast<std::int64_t>(chunk_size);
         const auto masks = storage.mask_workspace.Materialize(*selection.mask_logits,
             storage.selected_queries.narrow(1, static_cast<std::int64_t>(start), chunk), height, width)[0];
+        storage.mask_values = {};
         storage.mask_values = storage.masks.view(masks.sizes(), tensor_api::kBool);
         storage.mask_values.copy_(masks, true);
-        if (retain_masks) batch.masks.narrow(0, static_cast<std::int64_t>(start), chunk).copy_(masks);
+        preview.Execute([&] { batch.masks.narrow(0, static_cast<std::int64_t>(start), chunk).copy_(masks); });
         const auto status = cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(batch.boxes.get_device()).stream());
         if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction mask chunk completion"};
         const auto* values = storage.mask_values.data_ptr<bool>();
@@ -589,7 +608,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
             prediction.has_mask = true;
         }
     }
-    if (retain_masks) annotation.masks = {
+    if (preview.available()) annotation.masks = {
         .address = reinterpret_cast<std::uintptr_t>(batch.masks.data_ptr()),
         .capacity_bytes = result.size() * pixels,
         .shape = {.rank = 3U, .extents = {static_cast<std::uint32_t>(result.size()), height, width}},
@@ -710,6 +729,8 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
 }  // namespace
 
 struct PredictionSession::State final {
+    mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{1U};
+    mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
     std::unique_ptr<PredictionBackend> backend;
     std::unique_ptr<PredictionReadback> readback;
     AnnotationBatch annotations;
@@ -752,13 +773,23 @@ struct PredictionSession::State final {
                                                   runtime::BorrowedCommandStream execution_stream, const PredictionDelivery& delivery);
 };
 
-PredictionSession::PredictionSession() : state_(std::make_unique<State>()) {}
-PredictionSession::~PredictionSession() { static_cast<void>(Close()); }
+PredictionSession::PredictionSession() : state_(std::make_shared<State>()) {}
+PredictionSession::~PredictionSession() {
+    static_cast<void>(Close());
+    if (state_->poisoned) {
+        auto state = std::move(state_);
+        auto lease = std::move(state->retirement_lease);
+        std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state)), cudaErrorUnknown);
+    }
+}
+bool PredictionSession::HasUnsafeCustody() const noexcept { return state_->poisoned; }
 
 mmltk::backend::ml::runtime::RuntimeStatus PredictionSession::Close() noexcept {
+    if (state_->poisoned) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
     if (!state_->backend) return mmltk::backend::ml::runtime::kRuntimeSuccess;
     const auto status = state_->backend->Close();
     if (status == cudaSuccess) state_->backend.reset();
+    else state_->poisoned = true;
     return static_cast<mmltk::backend::ml::runtime::RuntimeStatus>(status);
 }
 
