@@ -1,23 +1,15 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include <algorithm>
-#include "src/backend/models/rfdetr/core/artifact_publication.h"
+#include "src/common/io/file_digest.h"
 #include <array>
 #include <stdexcept>
 #include <utility>
 #include <nlohmann/json.hpp>
 #include "src/backend/data/catalog/coco_catalog.h"
 #include "src/frameworks/serialization/serialization.h"
-#include "src/common/io/file_memory.h"
 
 namespace mmltk::backend::models::rfdetr {
 namespace catalog = mmltk::backend::data::catalog;
-ClassArtifactSnapshot ClassArtifactSnapshot::Read(const std::filesystem::path& artifact_path, const std::filesystem::path& descriptor_path) {
-    ClassArtifactSnapshot result{.artifact = mmltk::common::io::FileSnapshot::Read(artifact_path), .descriptor_path = descriptor_path};
-    const auto companion = std::filesystem::path(artifact_path.string() + ".classes.json");
-    if (std::filesystem::exists(companion)) result.companion = mmltk::common::io::FileSnapshot::Read(companion);
-    if (!descriptor_path.empty()) result.descriptor = mmltk::common::io::FileSnapshot::Read(descriptor_path);
-    return result;
-}
 ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std::move(record)) {
     if (record_.version != kClassLayoutVersion || record_.slots.size() > kMaximumClassOutputSlots)
         throw std::invalid_argument("unsupported or oversized RF-DETR class layout");
@@ -190,36 +182,6 @@ ModelClassDescriptor decode_class_descriptor(std::string_view text) {
     descriptor.artifact_sha256 = mmltk::common::io::sha256_hex(mmltk::common::io::parse_sha256_hex(descriptor.artifact_sha256));
     return descriptor;
 }
-ModelClassDescriptor read_class_descriptor(const std::filesystem::path& path) {
-    const auto snapshot = mmltk::common::io::FileSnapshot::Read(path);
-    if (snapshot.bytes > kClassLayoutByteBudget) throw std::invalid_argument("oversized class descriptor");
-    const auto file = mmltk::common::io::FileHandle::open_readonly(path.string());
-    std::string text(snapshot.bytes, '\0');
-    file.pread_all(text.data(), text.size(), 0);
-    auto descriptor = decode_class_descriptor(text);
-    snapshot.RequireUnchanged(path);
-    return descriptor;
-}
-std::vector<ModelClassDescriptor> read_artifact_class_descriptors(const std::filesystem::path& artifact,
-    const mmltk::common::io::FileDigests& admitted_file, const std::filesystem::path& explicit_descriptor) {
-    const auto publication_lock = lock_class_artifact_for_read(artifact);
-    std::vector<ModelClassDescriptor> descriptors;
-    const auto digest = mmltk::common::io::sha256_hex(admitted_file.sha256);
-    const std::filesystem::path companion = artifact.string() + ".classes.json";
-    for (const auto& path : {companion, explicit_descriptor}) {
-        if (path.empty() || (path == explicit_descriptor && !descriptors.empty() &&
-            std::filesystem::absolute(path).lexically_normal() == std::filesystem::absolute(companion).lexically_normal())) continue;
-        if (!std::filesystem::exists(path)) {
-            if (path == explicit_descriptor) throw std::invalid_argument("missing selected class descriptor");
-            continue;
-        }
-        auto descriptor = read_class_descriptor(path);
-        if (descriptor.artifact_sha256 != digest) throw std::invalid_argument("class descriptor does not match artifact digest");
-        descriptors.push_back(std::move(descriptor));
-    }
-    admitted_file.snapshot.RequireUnchanged(artifact);
-    return descriptors;
-}
 std::vector<RfdetrNamedOutputRole> class_descriptor_output_roles(std::span<const ModelClassDescriptor> descriptors) {
     std::vector<RfdetrNamedOutputRole> roles;
     for (const auto& descriptor : descriptors) for (const auto& declared : descriptor.output_roles) {
@@ -229,16 +191,6 @@ std::vector<RfdetrNamedOutputRole> class_descriptor_output_roles(std::span<const
     }
     if (roles.size() > 3) throw std::invalid_argument("too many artifact output roles");
     return roles;
-}
-ModelClassLayout admit_artifact_class_layout(const std::filesystem::path& artifact, std::size_t output_width,
-    const std::optional<ModelClassLayout>& embedded, const mmltk::common::io::FileDigests& admitted_file,
-    const std::filesystem::path& explicit_descriptor, const std::vector<ModelClassDescriptor>* admitted_descriptors) {
-    const auto owned_descriptors = admitted_descriptors ? std::vector<ModelClassDescriptor>{} :
-        read_artifact_class_descriptors(artifact, admitted_file, explicit_descriptor);
-    const auto& descriptors = admitted_descriptors ? *admitted_descriptors : owned_descriptors;
-    auto result = admit_artifact_class_layout(output_width, embedded, descriptors);
-    admitted_file.snapshot.RequireUnchanged(artifact);
-    return result;
 }
 ModelClassLayout admit_artifact_class_layout(std::size_t output_width, const std::optional<ModelClassLayout>& embedded,
     std::span<const ModelClassDescriptor> descriptors) {

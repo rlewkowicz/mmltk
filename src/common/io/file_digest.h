@@ -14,6 +14,7 @@ struct FileSnapshot final {
     std::int64_t modified_seconds{}, modified_nanoseconds{}, changed_seconds{}, changed_nanoseconds{};
     auto operator<=>(const FileSnapshot&) const = default;
     [[nodiscard]] static FileSnapshot Read(const std::filesystem::path& path);
+    [[nodiscard]] static FileSnapshot Read(int file_descriptor);
     void RequireUnchanged(const std::filesystem::path& path) const;
 };
 struct FileDigests final { FileSnapshot snapshot; Sha256Digest sha256; std::string md5; };

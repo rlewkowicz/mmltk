@@ -89,6 +89,8 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk::backend::ml::cuda
         mmltk::backend::ml::runtime
         mmltk::backend::models::rfdetr::inference
+        mmltk::backend::models::rfdetr::export
+        mmltk::common::io
         mmltk::backend::ml::torch_dependencies
         CUDA::cudart
         ONNX::onnx "${Protobuf_LIBRARY}"

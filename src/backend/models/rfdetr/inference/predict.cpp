@@ -1,4 +1,6 @@
 module;
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <cuda_runtime.h>
@@ -175,7 +177,7 @@ struct AnnotationBatch final {
 class PredictionBackend final {
    public:
     PredictionBackend(const PredictRequest& options, ResolvedInferenceArtifact artifact,
-                      const runtime::BorrowedCommandStream command_stream)
+                      const runtime::BorrowedCommandStream command_stream, std::stop_token stop)
         : artifact_(std::move(artifact)),
           maximum_detections_(options.max_dets_per_image),
           device_(options.device_id),
@@ -183,7 +185,8 @@ class PredictionBackend final {
         validate_prediction_candidates(maximum_detections_);
         switch (artifact_.kind) {
             case InferenceArtifactKind::Weights: {
-                auto resolved = resolve_model_state(artifact_.path, options.preset_name, options.resolution, options.class_layout_path, artifact_.admitted_file);
+                auto resolved = resolve_model_state(artifact_.path, options.preset_name, options.resolution, options.class_layout_path, artifact_.admission, stop);
+                artifact_.admission = resolved.model_state.class_artifact;
                 artifacts_ = std::move(resolved.artifacts);
                 static_cast<void>(PredictionCapacity::Resolve(maximum_detections_, 1U, artifacts_.config.num_queries,
                     artifacts_.config.num_classes, artifacts_.config.resolution, artifacts_.config.resolution, false));
@@ -226,8 +229,10 @@ class PredictionBackend final {
             .maximum_detections = options.max_dets_per_image,
             .save_compiled_model_path = {},
             .allow_fp16 = options.allow_fp16,
-            .admitted_file = artifact_.admitted_file,
+            .admission = artifact_.admission,
+            .stop = stop,
         });
+        artifact_.admission = runtime_->class_artifact();
         resolution_ = runtime_->static_resolution();
         artifacts_ = describe_inference_artifact(options, artifact_, resolution_);
         artifacts_.class_layout = runtime_->class_layout()->record();
@@ -243,6 +248,7 @@ class PredictionBackend final {
 
     ~PredictionBackend() { static_cast<void>(Close()); }
 
+    [[nodiscard]] const std::shared_ptr<const ClassArtifactAdmission>& class_artifact() const noexcept { return artifact_.admission; }
     [[nodiscard]] const std::string& name() const noexcept { return artifact_.backend_name; }
     [[nodiscard]] std::uint32_t resolution() const noexcept { return resolution_; }
     [[nodiscard]] tensor_api::ScalarType input_type() const noexcept {
@@ -740,7 +746,6 @@ struct PredictionSession::State final {
     std::unique_ptr<PredictionReadback> readback;
     AnnotationBatch annotations;
     ResolvedInferenceArtifact artifact{};
-    std::optional<ClassArtifactSnapshot> admitted_snapshot;
     std::string preset_name;
     std::uint32_t resolution = 0U;
     std::size_t maximum_detections = 0U;
@@ -751,25 +756,32 @@ struct PredictionSession::State final {
     bool poisoned = false;
 
     [[nodiscard]] PredictionBackend& Bind(const PredictRequest& options, const ResolvedInferenceArtifact& selected,
-                                          const runtime::BorrowedCommandStream stream) {
+                                          const runtime::BorrowedCommandStream stream, std::stop_token stop) {
+        if (selected.admission) {
+            selected.admission->RequireUnchanged(stop);
+            if (!selected.admission->Matches(selected.path, options.class_layout_path))
+                throw std::runtime_error("prediction admission does not match selected artifact");
+        }
         const auto requested_resolution = options.resolution > 0 ? static_cast<std::uint32_t>(options.resolution) : 0U;
-        const auto snapshot = ClassArtifactSnapshot::Read(selected.path, options.class_layout_path);
-        if (!backend || !readback || admitted_snapshot != snapshot || artifact.kind != selected.kind || artifact.backend_name != selected.backend_name ||
+        if (!backend || !readback || !backend->class_artifact()->Matches(selected.path, options.class_layout_path) || artifact.kind != selected.kind || artifact.backend_name != selected.backend_name ||
             artifact.path != selected.path || preset_name != options.preset_name || resolution != requested_resolution ||
             maximum_detections != options.max_dets_per_image || device != options.device_id || command_stream != stream.native_handle ||
             allow_fp16 != options.allow_fp16) {
+            auto next_artifact = selected;
+            auto next_preset_name = options.preset_name;
             if (backend) {
                 const auto status = backend->Close();
                 if (status != cudaSuccess) throw runtime::CudaOperationError{status, "RF-DETR prediction session rebind"};
                 backend.reset();
             }
-            backend = std::make_unique<PredictionBackend>(options, selected, stream);
-            if (snapshot != ClassArtifactSnapshot::Read(selected.path, options.class_layout_path))
-                throw std::runtime_error("model artifact changed during prediction admission");
-            admitted_snapshot = snapshot;
+            // A failed completion stays session-owned and cannot reuse stale identity.
+            readback.reset();
+            device = -1;
+            backend = std::make_unique<PredictionBackend>(options, selected, stream, stop);
+            backend->class_artifact()->RequireUnchanged(stop);
             readback = std::make_unique<PredictionReadback>(options.device_id);
-            artifact = selected;
-            preset_name = options.preset_name;
+            artifact = std::move(next_artifact);
+            preset_name = std::move(next_preset_name);
             resolution = requested_resolution;
             maximum_detections = options.max_dets_per_image;
             device = options.device_id;
@@ -864,6 +876,8 @@ PredictionRunResult PredictionSession::RunResolved(const PredictRequest& request
         auto& bound = *static_cast<BoundPredictionCall*>(opaque);
         *bound.result = bound.state->RunResolved(*bound.options, *bound.artifact, bound.command_stream, *bound.delivery);
     });
+    } catch (const ArtifactPublicationCancelled&) {
+        result.cancelled = true;
     } catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
         if (error.terminal()) {
             state_->poisoned = true;
@@ -911,7 +925,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
         readback = std::make_unique<PredictionReadback>(options.device_id);
         readback_node = placement.numa_node;
     }
-    auto& bound_backend = Bind(options, selected_artifact, execution_stream);
+    auto& bound_backend = Bind(options, selected_artifact, execution_stream, delivery.stop);
     PredictionRunResult result;
     result.backend_name = bound_backend.name();
     result.artifacts = bound_backend.artifacts();

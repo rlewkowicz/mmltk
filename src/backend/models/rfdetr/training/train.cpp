@@ -1282,8 +1282,8 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
                                          const TrainRequest& options, const std::vector<std::string>& parameter_names,
                                          const std::vector<torch_api::Tensor>& parameters, const bool main_process) {
     auto& retained = detail::model_state_owner(admitted).native_archive;
-    if (!retained || !admitted.admitted_file) throw std::invalid_argument("full resume requires an admitted current native archive");
-    admitted.admitted_file->snapshot.RequireUnchanged(checkpoint_path);
+    if (!retained || !admitted.class_artifact) throw std::invalid_argument("full resume requires an admitted current native archive");
+    admitted.class_artifact->RequireUnchanged();
     auto& archive = *retained;
 
     if (const auto lr_scheduler = read_optional_value<std::string>(archive, "lr_scheduler");

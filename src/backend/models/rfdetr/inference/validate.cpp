@@ -3,8 +3,8 @@
 #include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
-#include "src/backend/models/rfdetr/core/class_layout.h"
-#include "src/backend/models/rfdetr/core/artifact_publication.h"
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 
 // CLEANUP-IGNORE: This global module fragment declares the direct validation implementation dependencies.
 
@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <utility>
 
 // CLEANUP-IGNORE: Validation directly imports the implementation owners required by its native pipeline.
 import mmltk.backend.ml.cuda.torch_scope;
@@ -143,6 +144,8 @@ struct AlignmentSample final {
 
 struct ValidationSession::State final {
     std::array<PredictionSession, 3U> predictions;
+    // At most three selected artifacts and one consumed source; no batch-time I/O.
+    std::array<std::shared_ptr<const ClassArtifactAdmission>, 4U> admissions;
 
     [[nodiscard]] PredictionSession& For(const InferenceArtifactKind kind) noexcept { return predictions[static_cast<std::size_t>(kind)]; }
 
@@ -207,30 +210,74 @@ std::size_t ValidationSession::RunImageCount(const ValidateRequest& request, con
 }
 
 ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
-    std::vector<ResolvedInferenceArtifact> artifacts;
-    for (const auto& requested : evaluation_order(options.eval_order)) artifacts.push_back(resolve_inference_artifact(options, requested));
+    struct PreparedArtifact final {
+        ResolvedInferenceArtifact artifact;
+        std::shared_ptr<const mmltk::common::io::FileDigests> file;
+    };
+    std::vector<PreparedArtifact> artifacts;
+    for (const auto& requested : evaluation_order(options.eval_order)) artifacts.push_back({resolve_inference_artifact(options, requested)});
     const bool materialize = options.tensorrt_path.empty() && !options.save_engine_path.empty();
-    std::optional<ResolvedInferenceArtifact> consumed_source;
-    if (materialize) consumed_source = resolve_inference_artifact(options, "onnx");
+    std::optional<PreparedArtifact> consumed_source;
+    if (materialize) consumed_source = PreparedArtifact{resolve_inference_artifact(options, "onnx")};
     std::optional<ModelClassDescriptor> selected_descriptor;
-    const auto admit_file = [&](ResolvedInferenceArtifact& artifact) {
-        const auto existing = std::ranges::find_if(artifacts, [&](const auto& other) { return other.path == artifact.path && other.admitted_file; });
-        if (existing != artifacts.end()) artifact.admitted_file = existing->admitted_file;
-        else {
-            auto digest = mmltk::common::io::try_file_digests(artifact.path, true, [&] { return delivery.stop.stop_requested(); });
-            if (!digest) throw ArtifactPublicationCancelled{};
-            artifact.admitted_file = std::make_shared<const mmltk::common::io::FileDigests>(std::move(*digest));
+    std::optional<mmltk::common::io::FileSnapshot> selected_snapshot;
+    if (!options.class_layout_path.empty()) {
+        selected_snapshot = mmltk::common::io::FileSnapshot::Read(options.class_layout_path);
+        selected_descriptor = detail::read_class_descriptor(options.class_layout_path);
+        selected_snapshot->RequireUnchanged(options.class_layout_path);
+    }
+    auto previous_admissions = std::exchange(admissions, {});
+    // Descriptor routing needs only digest facts. Companion admission stays at
+    // each backend's existing execution boundary, preserving partial progress.
+    const auto file_for = [&](PreparedArtifact& prepared) {
+        if (prepared.file) return prepared.file;
+        const auto path = std::filesystem::absolute(prepared.artifact.path).lexically_normal();
+        for (const auto& other : artifacts)
+            if (other.file && std::filesystem::absolute(other.artifact.path).lexically_normal() == path)
+                return prepared.file = other.file;
+        if (consumed_source && consumed_source->file &&
+            std::filesystem::absolute(consumed_source->artifact.path).lexically_normal() == path)
+            return prepared.file = consumed_source->file;
+        const auto snapshot = mmltk::common::io::FileSnapshot::Read(path);
+        const auto retained = std::ranges::find_if(previous_admissions, [&](const auto& item) {
+            return item && item->artifact_path() == path && item->file()->snapshot == snapshot;
+        });
+        if (retained != previous_admissions.end()) return prepared.file = (*retained)->file();
+        auto digest = mmltk::common::io::try_file_digests(path, true, [&] { return delivery.stop.stop_requested(); });
+        if (!digest) throw ArtifactPublicationCancelled{};
+        return prepared.file = std::make_shared<const mmltk::common::io::FileDigests>(std::move(*digest));
+    };
+    const auto descriptor_matches = [&](PreparedArtifact& prepared) {
+        return selected_descriptor && selected_descriptor->artifact_sha256 == mmltk::common::io::sha256_hex(file_for(prepared)->sha256);
+    };
+    const auto admit = [&](PreparedArtifact& prepared) {
+        const auto proof = file_for(prepared);
+        const auto descriptor_path = descriptor_matches(prepared) ? options.class_layout_path : std::filesystem::path{};
+        auto& artifact = prepared.artifact;
+        for (const auto* candidates : {&admissions, &previous_admissions}) {
+            const auto found = std::ranges::find_if(*candidates, [&](const auto& item) {
+                return item && item->artifact_path() == std::filesystem::absolute(artifact.path).lexically_normal() &&
+                    item->file() == proof && item->Matches(artifact.path, descriptor_path);
+            });
+            if (found != candidates->end()) { artifact.admission = *found; break; }
         }
-        return selected_descriptor->artifact_sha256 == mmltk::common::io::sha256_hex(artifact.admitted_file->sha256);
+        if (!artifact.admission) artifact.admission = std::make_shared<const ClassArtifactAdmission>(artifact.path, descriptor_path, proof, delivery.stop);
+        artifact.admission->RequireUnchanged(delivery.stop);
+        if (std::ranges::find(admissions, artifact.admission) == admissions.end()) {
+            const auto available = std::ranges::find_if(admissions, [](const auto& item) { return !item; });
+            if (available == admissions.end()) throw std::logic_error("validation artifact admission capacity exceeded");
+            *available = artifact.admission;
+        }
+        if (selected_snapshot) selected_snapshot->RequireUnchanged(options.class_layout_path);
     };
     bool source_descriptor_matches = false;
-    if (!options.class_layout_path.empty()) {
-        selected_descriptor = read_class_descriptor(options.class_layout_path);
+    if (selected_descriptor) {
         bool matched = false;
-        for (auto& artifact : artifacts) matched = admit_file(artifact) || matched;
-        if (consumed_source) source_descriptor_matches = admit_file(*consumed_source);
+        for (auto& artifact : artifacts) matched = descriptor_matches(artifact) || matched;
+        if (consumed_source) source_descriptor_matches = descriptor_matches(*consumed_source);
         if (!matched && !source_descriptor_matches)
             throw std::invalid_argument("selected class descriptor does not bind any consumed or selected validation artifact");
+        selected_snapshot->RequireUnchanged(options.class_layout_path);
     }
 
     if (materialize) {
@@ -242,12 +289,13 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
         build.device_id = options.device_id;
         build.allow_fp16 = options.allow_fp16;
         if (selected_descriptor && !source_descriptor_matches) build.class_layout_path.clear();
-        build_tensorrt_engine(build, command_stream, consumed_source->admitted_file, delivery.stop);
+        admit(*consumed_source);
+        build_tensorrt_engine(build, command_stream, consumed_source->artifact.admission, delivery.stop);
         if (delivery.stop.stop_requested()) return {.cancelled = true};
         options.tensorrt_path = std::filesystem::absolute(options.save_engine_path);
-        for (auto& artifact : artifacts) if (artifact.compile_onnx_to_tensorrt) {
-            artifact = resolve_inference_artifact(options, "tensorrt");
-            if (selected_descriptor) static_cast<void>(admit_file(artifact));
+        for (auto& prepared : artifacts) if (prepared.artifact.compile_onnx_to_tensorrt) {
+            prepared = PreparedArtifact{resolve_inference_artifact(options, "tensorrt")};
+            if (selected_descriptor) static_cast<void>(file_for(prepared));
         }
     }
     if (delivery.stop.stop_requested()) return {.cancelled = true};
@@ -266,10 +314,12 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
 
     std::vector<std::optional<AlignmentSample>> onnx_predictions;
     std::vector<std::optional<AlignmentSample>> tensorrt_predictions;
-    for (const auto& artifact : artifacts) {
+    for (auto& prepared : artifacts) {
         if (delivery.stop.stop_requested()) break;
+        admit(prepared);
+        const auto& artifact = prepared.artifact;
         auto backend_request = options;
-        if (selected_descriptor && selected_descriptor->artifact_sha256 != mmltk::common::io::sha256_hex(artifact.admitted_file->sha256))
+        if (artifact.admission->descriptor_path().empty())
             backend_request.class_layout_path.clear();
         result.eval_order.push_back(artifact.backend_name);
         std::vector<std::optional<AlignmentSample>>* captured_result = nullptr;

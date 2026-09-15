@@ -1,5 +1,7 @@
 #include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/common/io/file_digest.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/models/rfdetr/contract/weight_catalog.h"
 
 #include <algorithm>
@@ -148,7 +150,7 @@ bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path) {
     }
 }
 
-DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path) {
+static DecodedNativeModelState load_native_model_state(const std::filesystem::path& checkpoint_path) {
     const auto canonical = canonical_path(checkpoint_path);
     const auto path = canonical.string();
     const auto snapshot = mmltk::common::io::FileSnapshot::Read(canonical);
@@ -200,19 +202,25 @@ DecodedNativeModelState decode_native_model_state(const std::filesystem::path& c
     return result;
 }
 
-DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path, std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file, const std::filesystem::path& class_layout_path) {
+DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path, std::shared_ptr<const ClassArtifactAdmission> admission, const std::filesystem::path& class_layout_path, std::stop_token stop) {
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     const auto canonical = canonical_path(checkpoint_path);
     const auto snapshot = mmltk::common::io::FileSnapshot::Read(canonical);
     const bool native = is_native_checkpoint_file(canonical);
-    auto digests = admitted_file ? std::optional{*admitted_file} : mmltk::common::io::try_file_digests(canonical, !native);
+    if (!admission) admission = std::make_shared<const ClassArtifactAdmission>(canonical, class_layout_path, nullptr, stop, !native);
+    if (!admission->Matches(canonical, class_layout_path)) throw std::runtime_error("checkpoint admission does not match selected artifact");
+    admission->RequireUnchanged(stop);
+    const auto& digests = admission->file();
     if (digests->snapshot != snapshot) throw std::runtime_error("checkpoint changed during archive identification");
     digests->snapshot.RequireUnchanged(canonical);
     DecodedNativeModelState result;
     if (native) {
-        result = decode_native_model_state(canonical);
+        result = load_native_model_state(canonical);
+        if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     } else {
 #if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
     result = decode_upstream_python_model_state(canonical);
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     result.metadata.source_kind = "upstream-python";
     result.metadata.source_path = canonical.string();
     const auto* preset = find_model_preset_by_weight_filename(canonical.filename().string());
@@ -250,18 +258,26 @@ DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoi
     throw std::runtime_error("RF-DETR upstream Python checkpoint loading is disabled at build time: " + canonical.string());
 #endif
     }
-    result.metadata.class_layout = admit_artifact_class_layout(canonical, result.metadata.num_classes,
-        std::optional{result.metadata.class_layout}, *digests, class_layout_path);
+    result.metadata.class_layout = admission->Resolve(result.metadata.num_classes, std::optional{result.metadata.class_layout}, stop);
     validate_decoded_model_state(result);
-    digests->snapshot.RequireUnchanged(canonical);
-    result.admitted_file = std::move(digests);
+    admission->RequireUnchanged(stop);
+    result.class_artifact = std::move(admission);
+    return result;
+}
+
+DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path) {
+    auto admission = std::make_shared<const ClassArtifactAdmission>(checkpoint_path);
+    auto result = load_native_model_state(admission->artifact_path());
+    result.metadata.class_layout = admission->Resolve(result.metadata.num_classes, result.metadata.class_layout);
+    result.class_artifact = std::move(admission);
     return result;
 }
 
 ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, const std::string_view preset_name,
-                                       const int resolution, const std::filesystem::path& class_layout_path, std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file) {
+                                       const int resolution, const std::filesystem::path& class_layout_path, std::shared_ptr<const ClassArtifactAdmission> admission, std::stop_token stop) {
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     const auto canonical = canonical_path(weights_path);
-    auto state = decode_model_state(canonical, std::move(admitted_file), class_layout_path);
+    auto state = decode_model_state(canonical, std::move(admission), class_layout_path, stop);
     const PresetCatalogEntry* preset = nullptr;
     if (!state.metadata.preset_name.empty()) { preset = find_model_preset(state.metadata.preset_name); }
     if (preset == nullptr) { preset = find_model_preset_by_weight_filename(canonical.filename().string()); }
@@ -276,7 +292,7 @@ ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path
     result.preset_name = std::string(preset->preset_name);
     result.model_id = canonical.stem().string();
     result.class_layout = state.metadata.class_layout;
-    if (state.admitted_file) result.artifact_sha256 = mmltk::common::io::sha256_hex(state.admitted_file->sha256);
+    result.artifact_sha256 = mmltk::common::io::sha256_hex(state.class_artifact->file()->sha256);
     result.config = native_config_from_preset(*preset);
     if (state.metadata.num_classes > 0) { result.config.num_classes = static_cast<int>(state.metadata.num_classes); }
     result.source_num_queries = state.metadata.num_queries > 0 ? static_cast<int>(state.metadata.num_queries) : result.config.num_queries;

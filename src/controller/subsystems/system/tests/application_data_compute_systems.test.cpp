@@ -1,3 +1,4 @@
+#include "src/common/io/file_digest.h"
 #include "prediction_test_support.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
 #include "src/controller/browser/application_materializer.h"
@@ -2725,4 +2726,26 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
     CHECK(io::sha256_file(output) == previous);
     CHECK(io::sha256_file(companion) == previous_companion);
     for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
+}
+
+TEST_CASE("artifact model inspection observes cancellation before each opaque input loader", "[controller][systems][model]") {
+    namespace contracts = mmltk::controller::contracts;
+    const mmltk::testsupport::ScopedTempDir root("model-inspection-stop");
+    const auto artifact = root.path() / "selected.model";
+    { std::ofstream output(artifact); output << "loader must not consume these bytes"; }
+    for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx,
+                            contracts::ModelArtifactInputKind::TensorRt}) {
+        contracts::ModelSelectionKey key{.workflow = contracts::FeatureId::Predict,
+            .source = contracts::ModelSelectionSource::Custom, .input = input, .preset = "nano", .resolution = 64};
+        REQUIRE(key.valid());
+        mmltk::controller::ArtifactModelRuntime runtime;
+        std::stop_source source;
+        bool verified = false;
+        CHECK_THROWS_WITH(runtime.Acquire(key, artifact, 0, source.get_token(), [&](const auto& progress) {
+            CHECK(progress.stage == contracts::ModelProgressStage::Verifying);
+            verified = true;
+            source.request_stop();
+        }), "model selection cancelled");
+        CHECK(verified);
+    }
 }

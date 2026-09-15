@@ -13,7 +13,8 @@
 
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
-#include "src/common/io/file_digest.h"
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include <stop_token>
 namespace mmltk::backend::models::rfdetr::model_state_detail {
 template <class T>
 inline constexpr bool is_optional = false;
@@ -74,7 +75,7 @@ class DecodedNativeModelState {
     DecodedNativeModelState& operator=(const DecodedNativeModelState&) = delete;
 
     NativeCheckpointMetadata metadata;
-    std::optional<mmltk::common::io::FileDigests> admitted_file;
+    std::shared_ptr<const ClassArtifactAdmission> class_artifact;
 
     [[nodiscard]] std::size_t tensor_count() const noexcept;
     [[nodiscard]] void* technical_handle() noexcept;
@@ -93,10 +94,10 @@ struct ResolvedModelState {
 void validate_decoded_model_state(const DecodedNativeModelState& state);
 [[nodiscard]] bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path);
 [[nodiscard]] DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path);
-[[nodiscard]] DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path, std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file = {}, const std::filesystem::path& class_layout_path = {});
+[[nodiscard]] DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path, std::shared_ptr<const ClassArtifactAdmission> admission = {}, const std::filesystem::path& class_layout_path = {}, std::stop_token stop = {});
 void write_upstream_model_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& model_state);
 [[nodiscard]] ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path, std::string_view preset_name,
-                                                     int resolution, const std::filesystem::path& class_layout_path = {}, std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file = {});
+                                                     int resolution, const std::filesystem::path& class_layout_path = {}, std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
 [[nodiscard]] NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, int64_t num_classes);
 
 }  // namespace mmltk::backend::models::rfdetr

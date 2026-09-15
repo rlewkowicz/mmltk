@@ -52,6 +52,7 @@ FileSnapshot snapshot(int fd) {
     return snapshot(value);
 }
 }  // namespace
+FileSnapshot FileSnapshot::Read(int file_descriptor) { return snapshot(file_descriptor); }
 FileSnapshot FileSnapshot::Read(const std::filesystem::path& path) {
     const auto file = FileHandle::open_readonly(path.string());
     return snapshot(file.get());

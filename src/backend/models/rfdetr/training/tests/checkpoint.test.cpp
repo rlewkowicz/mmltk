@@ -1,3 +1,5 @@
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include <ATen/CPUGeneratorImpl.h>
 #include <algorithm>
 #include <array>
@@ -143,6 +145,9 @@ void test_native_checkpoint_roundtrip(const ParityFixtureCase& fixture, const fs
     MMLTK_ASSERT(mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path));
 
     const auto native = mmltk::backend::models::rfdetr::decode_model_state(output_path);
+    REQUIRE(native.class_artifact);
+    CHECK(native.class_artifact->Matches(output_path));
+    CHECK(native.class_artifact->Resolve(native.metadata.num_classes, native.metadata.class_layout) == native.metadata.class_layout);
     MMLTK_ASSERT(native.metadata.preset_name == upstream.metadata.preset_name);
     MMLTK_ASSERT(native.metadata.source_kind == "upstream-python");
     MMLTK_ASSERT(state_entries(native).size() == state_entries(upstream).size());
@@ -598,6 +603,6 @@ TEST_CASE("Direct ONNX export replaces an old automatic companion with embedded 
     CHECK_FALSE(std::filesystem::exists(companion));
     const auto info = r::load_onnx_model_info(output);
     CHECK(info.class_layout == source.metadata.class_layout);
-    CHECK(r::admit_artifact_class_layout(output, info.num_classes, info.class_layout, *io::try_file_digests(output, false)) == source.metadata.class_layout);
+    CHECK(r::ClassArtifactAdmission(output).Resolve(info.num_classes, info.class_layout) == source.metadata.class_layout);
     CHECK(r::rfdetr_output_roles(info).size() == info.outputs.size());
 }

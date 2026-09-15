@@ -44,10 +44,13 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         artifact_publication.h
+        class_artifact.h
         class_layout.h
         evaluation.h
         model_info.h
         model_state.h)
+mmltk_register_private_headers(mmltk_backend_models_rfdetr_core detail/class_artifact_files.h)
+mmltk_register_header_isolation(mmltk_backend_models_rfdetr_core)
 mmltk_register_retained_module_implementation_units(
     mmltk_backend_models_rfdetr_core
     artifact_resolution.cpp
@@ -59,6 +62,7 @@ mmltk_register_retained_module_implementation_units(
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
     artifact_publication.cpp
+    class_artifact.cpp
     class_layout.cpp
     native_library_anchor.cpp
     python_checkpoint_bridge.cpp
@@ -133,6 +137,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_core
         mmltk::backend::ml::cuda
         mmltk::backend::models::rfdetr::contract
         mmltk::common::concurrency
+        mmltk::common::io
         mmltk::frameworks::gpu
     PRIVATE
         mmltk::backend::imaging::raster
@@ -140,7 +145,6 @@ target_link_libraries(mmltk_backend_models_rfdetr_core
         mmltk::backend::ml::layers
         mmltk::backend::ml::ops
         mmltk::backend::ml::runtime
-        mmltk::common::io
         mmltk::common::logging
         mmltk::common::math
         mmltk::common::system

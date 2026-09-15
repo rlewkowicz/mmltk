@@ -273,9 +273,7 @@ Use this prompt verbatim, replacing `<MAIN PHASE>`, `<PHASE TITLE>`,
 > observability, tracing, logging, and correlation as effect-only diagnostics
 > unless the audited phase demonstrates a product requirement. Diagnostic
 > identities never become ordering, cache-validity, acknowledgement, or
-> resource-lifetime state. Do not introduce or inspect an external tracing
-> framework merely by analogy; evaluate one only when the commit presents a
-> concrete unmet requirement that the existing diagnostics cannot satisfy.
+> resource-lifetime state.
 >
 > Preserve every observable behavior, failure path, integration outcome,
 > persisted format, resource-lifetime guarantee, concurrency property, test
@@ -323,8 +321,9 @@ validation.
 
 - The main agent runs these ordered stages: full tidy, full build, every
   applicable cleanup profile, full tidy, cleanup review/remediation, final full
-  build, focused tests/acceptance. Cleanup never precedes successful initial
-  tidy/build or follows the final build; tests require that final build to pass.
+  build, focused tests/acceptance, one final tidy and build. Cleanup never
+  precedes successful initial tidy/build or follows the final build; tests
+  require that final build to pass.
 - Both builds use `./mmltk --build`. Both tidy passes use the complete
   configured `./mmltk --tidy` suite regardless of changed files or commits.
   Resolve every genuine finding before the initial build. Do not reuse earlier

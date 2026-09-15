@@ -1,4 +1,6 @@
 module;
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "prediction_capacity.h"
 #include <cuda_runtime.h>
 
@@ -285,6 +287,7 @@ struct RfdetrRuntimeBackend::State final {
     std::shared_ptr<const ResolvedClassLayout> layout;
     std::vector<RfdetrNamedOutputRole> output_roles;
     std::string artifact_sha256;
+    std::shared_ptr<const ClassArtifactAdmission> admission;
     std::unique_ptr<ClassPostprocessLane> classes;
     std::optional<std::size_t> masks;
     std::size_t logits = std::numeric_limits<std::size_t>::max();
@@ -294,7 +297,7 @@ struct RfdetrRuntimeBackend::State final {
 };
 
 RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBackend> lane, std::string backend_name,
-                                           std::uint32_t static_resolution, std::size_t maximum_detections, std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::string artifact_sha256)
+                                           std::uint32_t static_resolution, std::size_t maximum_detections, std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission)
     : lane_(std::move(lane)),
       backend_name_(std::move(backend_name)),
       static_resolution_(static_resolution),
@@ -306,7 +309,8 @@ RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBacke
     }
     state_->layout = std::move(layout);
     state_->output_roles = std::move(output_roles);
-    state_->artifact_sha256 = std::move(artifact_sha256);
+    state_->artifact_sha256 = mmltk::common::io::sha256_hex(admission->file()->sha256);
+    state_->admission = std::move(admission);
     state_->layout->require_execution();
     state_->classes = std::make_unique<ClassPostprocessLane>(state_->layout);
     struct Preparation { ClassPostprocessLane* classes; int device; } preparation{state_->classes.get(), lane_->device()};
@@ -350,6 +354,7 @@ bool RfdetrRuntimeBackend::has_masks() const noexcept { return state_->masks.has
 const runtime::RuntimeShape& RfdetrRuntimeBackend::logits_shape() const noexcept { return model_info().outputs[state_->logits].shape; }
 std::uint32_t RfdetrRuntimeBackend::static_resolution() const noexcept { return static_resolution_; }
 
+const std::shared_ptr<const ClassArtifactAdmission>& RfdetrRuntimeBackend::class_artifact() const noexcept { return state_->admission; }
 const std::string& RfdetrRuntimeBackend::artifact_sha256() const noexcept { return state_->artifact_sha256; }
 const std::shared_ptr<const ResolvedClassLayout>& RfdetrRuntimeBackend::class_layout() const noexcept { return state_->layout; }
 std::int32_t RfdetrRuntimeBackend::device() const noexcept { return lane_->device(); }
@@ -545,7 +550,7 @@ std::span<const RfdetrNamedOutputRole> RfdetrRuntimeBackend::output_roles() cons
 
 std::shared_ptr<RfdetrRuntimeBackend> RfdetrRuntimeBackend::MakeLane() const {
     return std::shared_ptr<RfdetrRuntimeBackend>(
-        new RfdetrRuntimeBackend(lane_->MakeLane(), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->artifact_sha256));
+        new RfdetrRuntimeBackend(lane_->MakeLane(), backend_name_, static_resolution_, maximum_detections_, state_->layout, state_->output_roles, state_->admission));
 }
 
 std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRuntimeBackendOptions& options) {
@@ -565,12 +570,13 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
         default:
             throw_invalid_artifact_kind();
     }
-    const auto digests = options.admitted_file ? std::optional{*options.admitted_file} : mmltk::common::io::try_file_digests(artifact.path, false, [&] { return options.stop.stop_requested(); });
-    if (!digests) throw ArtifactPublicationCancelled{};
-    digests->snapshot.RequireUnchanged(artifact.path);
+    auto admission = options.admission;
+    if (!admission) admission = std::make_shared<const ClassArtifactAdmission>(artifact.path, options.artifacts.class_layout_path, nullptr, options.stop);
+    if (!admission->Matches(artifact.path, options.artifacts.class_layout_path))
+        throw std::runtime_error("runtime admission does not match selected artifact");
+    admission->RequireUnchanged(options.stop);
     std::optional<ModelClassLayout> embedded;
-    const auto descriptors = read_artifact_class_descriptors(artifact.path, *digests, options.artifacts.class_layout_path);
-    auto output_roles = class_descriptor_output_roles(descriptors);
+    auto output_roles = admission->output_roles();
     if (artifact.kind == InferenceArtifactKind::Onnx || artifact.compile_onnx_to_tensorrt) {
         const auto inspected = load_onnx_model_info(artifact.path, output_roles);
         embedded = inspected.class_layout;
@@ -596,10 +602,10 @@ std::shared_ptr<RfdetrRuntimeBackend> make_rfdetr_runtime_backend(const RfdetrRu
     apply_rfdetr_output_roles(info, output_roles);
     static_cast<void>(validate_rfdetr_output_layout(info));
     output_roles = rfdetr_output_roles(info);
-    auto layout = std::make_shared<const ResolvedClassLayout>(admit_artifact_class_layout(artifact.path,
-        info.num_classes, embedded, *digests, options.artifacts.class_layout_path, &descriptors));
+    auto layout = std::make_shared<const ResolvedClassLayout>(admission->Resolve(info.num_classes, embedded, options.stop));
     auto result = std::shared_ptr<RfdetrRuntimeBackend>(
-        new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, mmltk::common::io::sha256_hex(digests->sha256)));
+        new RfdetrRuntimeBackend(std::move(lane), artifact.backend_name, resolution, options.maximum_detections, layout, output_roles, admission));
+    admission->RequireUnchanged(options.stop);
     if (publication) publication->Publish(ModelClassDescriptor{1U, {}, layout->record(), output_roles}, [&] { return options.stop.stop_requested(); });
 
     return result;
@@ -618,7 +624,8 @@ std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_l
     return lanes;
 }
 
-ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, const int device_id) {
+ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, const int device_id, std::stop_token stop) {
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     if (artifacts.selected_input_count() != 1U || artifacts.tensorrt_path.empty() || device_id < 0) {
         throw std::invalid_argument(
             "RF-DETR TensorRT inspection requires one engine and a valid "
@@ -638,6 +645,7 @@ ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, const in
         .maximum_detections = 500U,
         .save_compiled_model_path = {},
         .allow_fp16 = true,
+        .stop = stop,
     });
     ModelInfo info;
     try {
@@ -661,7 +669,7 @@ void build_tensorrt_engine(const BuildEngineRequest& request) {
 }
 
 void build_tensorrt_engine(const BuildEngineRequest& request, const runtime::BorrowedCommandStream command_stream,
-    std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file, const std::stop_token stop) {
+    std::shared_ptr<const ClassArtifactAdmission> admission, const std::stop_token stop) {
     if (stop.stop_requested()) return;
     validate_build_engine_request(request);
     try {
@@ -674,7 +682,7 @@ void build_tensorrt_engine(const BuildEngineRequest& request, const runtime::Bor
             .maximum_detections = 500U,
             .save_compiled_model_path = std::filesystem::absolute(request.output_path),
             .allow_fp16 = request.allow_fp16,
-            .admitted_file = std::move(admitted_file),
+            .admission = std::move(admission),
             .stop = stop,
         });
         close_runtime_backend(*backend, "RF-DETR TensorRT engine close");

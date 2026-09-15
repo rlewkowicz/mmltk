@@ -15,7 +15,7 @@ module;
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
-#include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/class_artifact.h"
 
 export module mmltk.backend.models.rfdetr.inference.runtime_backend;
 
@@ -30,7 +30,7 @@ struct RfdetrRuntimeBackendOptions final {
     std::size_t maximum_detections = 500U;
     std::filesystem::path save_compiled_model_path;
     bool allow_fp16 = true;
-    std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file;
+    std::shared_ptr<const ClassArtifactAdmission> admission;
     std::stop_token stop{};
 };
 
@@ -45,7 +45,7 @@ struct ResolvedInferenceArtifact final {
     std::string backend_name;
     std::filesystem::path path;
     bool compile_onnx_to_tensorrt = false;
-    std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file;
+    std::shared_ptr<const ClassArtifactAdmission> admission;
 };
 
 [[nodiscard]] ResolvedInferenceArtifact resolve_inference_artifact(const ModelArtifactRequest& artifacts, std::string backend);
@@ -74,6 +74,7 @@ class RfdetrRuntimeBackend final {
 
     [[nodiscard]] const std::string& backend_name() const noexcept;
     [[nodiscard]] const std::string& artifact_sha256() const noexcept;
+    [[nodiscard]] const std::shared_ptr<const ClassArtifactAdmission>& class_artifact() const noexcept;
     [[nodiscard]] std::uint32_t static_resolution() const noexcept;
     [[nodiscard]] std::int32_t device() const noexcept;
     [[nodiscard]] std::uintptr_t stream() const noexcept;
@@ -97,7 +98,7 @@ class RfdetrRuntimeBackend final {
     struct State;
 
     explicit RfdetrRuntimeBackend(std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane, std::string backend_name,
-                                  std::uint32_t static_resolution, std::size_t maximum_detections, std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::string artifact_sha256);
+                                  std::uint32_t static_resolution, std::size_t maximum_detections, std::shared_ptr<const ResolvedClassLayout> layout, std::vector<RfdetrNamedOutputRole> output_roles, std::shared_ptr<const ClassArtifactAdmission> admission);
 
     std::shared_ptr<mmltk::backend::ml::runtime::RuntimeBackend> lane_;
     std::string backend_name_;
@@ -113,11 +114,11 @@ class RfdetrRuntimeBackend final {
 [[nodiscard]] std::vector<std::shared_ptr<RfdetrRuntimeBackend>> make_rfdetr_runtime_backend_lanes(
     const RfdetrRuntimeBackendOptions& options, std::size_t lane_count);
 
-[[nodiscard]] ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, int device_id);
+[[nodiscard]] ModelInfo inspect_tensorrt_model(const ModelArtifactRequest& artifacts, int device_id, std::stop_token stop = {});
 
 void build_tensorrt_engine(const BuildEngineRequest& request);
 
 void build_tensorrt_engine(const BuildEngineRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream,
-    std::shared_ptr<const mmltk::common::io::FileDigests> admitted_file = {}, std::stop_token stop = {});
+    std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
 
 }  // namespace mmltk::backend::models::rfdetr

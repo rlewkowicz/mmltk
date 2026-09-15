@@ -1,3 +1,6 @@
+#include "src/common/io/file_digest.h"
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
@@ -722,7 +725,7 @@ TEST_CASE("ONNX output roles accept explicit producer names without shape guessi
     { std::ofstream output(companion); output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout,
         std::vector<rfdetr::RfdetrNamedOutputRole>(roles.begin(), roles.end())}); }
     rfdetr::simplify_onnx_model_file(path);
-    const auto descriptor = rfdetr::read_class_descriptor(companion);
+    const auto descriptor = rfdetr::detail::read_class_descriptor(companion);
     CHECK(descriptor.artifact_sha256 == io::sha256_hex(io::sha256_file(path)));
     CHECK(descriptor.layout == layout);
     CHECK(rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path, descriptor.output_roles)) == descriptor.output_roles);
@@ -741,12 +744,12 @@ TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout 
     const auto roles = rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path));
     { std::ofstream output(companion); output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, roles}); }
     rfdetr::simplify_onnx_model_file(path);
-    const auto descriptor = rfdetr::read_class_descriptor(companion);
+    const auto descriptor = rfdetr::detail::read_class_descriptor(companion);
     CHECK(descriptor.artifact_sha256 == io::sha256_hex(io::sha256_file(path)));
     CHECK(descriptor.layout == layout);
     CHECK(descriptor.output_roles == roles);
     const auto info = rfdetr::load_onnx_model_info(path, descriptor.output_roles);
-    CHECK(rfdetr::admit_artifact_class_layout(path, info.num_classes, info.class_layout, *io::try_file_digests(path, false)) == layout);
+    CHECK(rfdetr::ClassArtifactAdmission(path).Resolve(info.num_classes, info.class_layout) == layout);
     CHECK(rfdetr::rfdetr_output_roles(info) == roles);
     // Malformed graph serialization must preserve both admitted files on failure.
     { std::ofstream output(path, std::ios::trunc); output << "not a protobuf"; }
@@ -805,7 +808,7 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     CHECK(only.eval_order == std::vector<std::string>{"tensorrt"});
     CHECK(only.processed_images == 1U);
     CHECK(only.backends.at("tensorrt").artifacts.class_layout == layout);
-    const auto engine_descriptor = rfdetr::read_class_descriptor(request.save_engine_path.string() + ".classes.json");
+    const auto engine_descriptor = rfdetr::detail::read_class_descriptor(request.save_engine_path.string() + ".classes.json");
     CHECK(engine_descriptor.layout == layout);
     CHECK(engine_descriptor.artifact_sha256 == io::sha256_hex(io::sha256_file(request.save_engine_path)));
     for (const auto order : {"onnx,tensorrt", "tensorrt,onnx"}) {
@@ -862,4 +865,31 @@ TEST_CASE("Stopped synchronous export engine and validation skip production and 
     CHECK(io::sha256_file(output) == original);
     CHECK(io::sha256_file(companion) == original_companion);
     for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
+}
+
+TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[model][rfdetr][layout][onnx]") {
+    namespace io = mmltk::common::io;
+    const mmltk::testsupport::ScopedTempDir root("onnx-retained-descriptor");
+    const auto path = root.path() / "model.onnx";
+    const auto companion = std::filesystem::path(path.string() + ".classes.json");
+    write_prediction_model(path, 2, false);
+    auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
+    layout.slots.pop_back();
+    const auto encoded = rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout});
+    { std::ofstream output(companion); output << encoded; }
+    const rfdetr::ClassArtifactAdmission admission(path);
+    const auto info = rfdetr::load_onnx_model_info(path, admission.output_roles());
+    CHECK(admission.Resolve(info.num_classes, info.class_layout) == layout);
+    SECTION("replacement after loading rejects the original parsed facts") {
+        const auto replacement = root.path() / "replacement.json";
+        { std::ofstream output(replacement); output << encoded; }
+        std::filesystem::rename(replacement, companion);
+        CHECK_THROWS(admission.Resolve(info.num_classes, info.class_layout));
+    }
+    SECTION("stop after loading rejects completion without changing the source") {
+        std::stop_source source;
+        source.request_stop();
+        CHECK_THROWS_AS(admission.Resolve(info.num_classes, info.class_layout, source.get_token()), rfdetr::ArtifactPublicationCancelled);
+        CHECK_NOTHROW(admission.RequireUnchanged());
+    }
 }

@@ -1,4 +1,7 @@
 #pragma once
+#include "src/common/io/file_digest.h"
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 // RF-DETR core test fixture support.
 
 #include <cstdlib>
@@ -89,7 +92,7 @@ bool validate_onnx_model(const fs::path& onnx_path);
 inline bool validate_tensorrt_engine(const fs::path& tensorrt_path) {
     if (!is_nonempty_regular_file(tensorrt_path)) { return false; }
     try {
-        const auto descriptor = read_class_descriptor(tensorrt_path.string() + ".classes.json");
+        const auto descriptor = detail::read_class_descriptor(tensorrt_path.string() + ".classes.json");
         if (descriptor.artifact_sha256 != mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(tensorrt_path)) ||
             !ResolvedClassLayout(descriptor.layout).semantic()) return false;
     } catch (const std::exception&) { return false; }

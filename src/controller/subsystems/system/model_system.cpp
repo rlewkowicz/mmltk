@@ -8,7 +8,7 @@
 
 #include "src/controller/contracts/compute.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
-#include "src/backend/models/rfdetr/core/class_layout.h"
+#include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 
 import mmltk.backend.models.rfdetr.model_export;
@@ -48,18 +48,16 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
     namespace rfdetr = mmltk::backend::models::rfdetr;
     rfdetr::ModelClassLayout layout;
     if (key.input == contracts::ModelArtifactInputKind::Weights) {
-        layout = rfdetr::resolve_model_state(artifact, key.preset, key.resolution, key.class_layout_path).artifacts.class_layout;
+        layout = rfdetr::resolve_model_state(artifact, key.preset, key.resolution, key.class_layout_path, {}, stop).artifacts.class_layout;
     } else if (key.input == contracts::ModelArtifactInputKind::Onnx) {
-        const auto digest = mmltk::common::io::try_file_digests(artifact, false, [&] { return stop.stop_requested(); });
-        if (!digest) throw std::runtime_error("model selection cancelled");
-        const auto descriptors = rfdetr::read_artifact_class_descriptors(artifact, *digest, key.class_layout_path);
-        const auto info = rfdetr::load_onnx_model_info(artifact, rfdetr::class_descriptor_output_roles(descriptors));
-        layout = rfdetr::admit_artifact_class_layout(artifact, info.num_classes, info.class_layout, *digest, key.class_layout_path, &descriptors);
+        const rfdetr::ClassArtifactAdmission admission(artifact, key.class_layout_path, {}, stop);
+        const auto info = rfdetr::load_onnx_model_info(artifact, admission.output_roles());
+        layout = admission.Resolve(info.num_classes, info.class_layout, stop);
     } else {
         rfdetr::ModelArtifactRequest request;
         request.tensorrt_path = artifact;
         request.class_layout_path = key.class_layout_path;
-        const auto info = rfdetr::inspect_tensorrt_model(request, inspection_device);
+        const auto info = rfdetr::inspect_tensorrt_model(request, inspection_device, stop);
         if (!info.class_layout) throw std::runtime_error("TensorRT class inspection is unavailable");
         layout = *info.class_layout;
     }

@@ -1,4 +1,6 @@
 module;
+#include "src/backend/models/rfdetr/core/class_artifact.h"
+#include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
@@ -206,7 +208,7 @@ void export_onnx(const ExportOnnxRequest& request) {
 struct ExportOnnxSession::State final {
     std::unique_ptr<NativeRfDetrModel> model;
     std::filesystem::path weights_path;
-    std::optional<ClassArtifactSnapshot> admitted_snapshot;
+    std::shared_ptr<const ClassArtifactAdmission> admission;
     std::string preset_name;
     int resolution = 0;
     int device = -1;
@@ -258,28 +260,29 @@ void ExportOnnxSession::Run(const ExportOnnxRequest& request, const runtime::Bor
 
 void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runtime::BorrowedCommandStream execution_stream, const std::stop_token stop) {
     if (stop.stop_requested()) return;
-    const auto snapshot = ClassArtifactSnapshot::Read(request.weights_path, request.class_layout_path);
-    if (!model || admitted_snapshot != snapshot || command_stream != execution_stream || weights_path != request.weights_path || preset_name != request.preset_name || resolution != request.resolution ||
+    if (!model || !admission->Matches(request.weights_path, request.class_layout_path) || command_stream != execution_stream || weights_path != request.weights_path || preset_name != request.preset_name || resolution != request.resolution ||
         device != request.device_id) {
+        auto next_weights_path = request.weights_path;
+        auto next_preset_name = request.preset_name;
         if (model) {
             const auto status = Close();
             if (status != cudaSuccess) throw runtime::CudaOperationError{status, "RF-DETR export session rebind"};
         }
-        auto resolved = resolve_model_state(request.weights_path, request.preset_name, request.resolution, request.class_layout_path);
+        auto resolved = resolve_model_state(request.weights_path, request.preset_name, request.resolution, request.class_layout_path, {}, stop);
         if (stop.stop_requested()) return;
         auto next_model = std::make_unique<NativeRfDetrModel>(resolved.artifacts.config, resolved.artifacts.class_layout);
         auto& technical_model = detail::native_model_owner(*next_model);
         static_cast<void>(technical_model.load_normalized_state(detail::model_state_owner(resolved.model_state).entries, false));
         technical_model.module().to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(request.device_id)));
-        if (snapshot != ClassArtifactSnapshot::Read(request.weights_path, request.class_layout_path))
-            throw std::runtime_error("model artifact changed during export admission");
-        admitted_snapshot = snapshot;
+        admission = std::move(resolved.model_state.class_artifact);
         model = std::move(next_model);
-        weights_path = request.weights_path;
-        preset_name = request.preset_name;
+        weights_path = std::move(next_weights_path);
+        preset_name = std::move(next_preset_name);
         resolution = request.resolution;
         device = request.device_id;
         command_stream = execution_stream;
+        // Close can now settle this exact candidate even when completion rejects it.
+        admission->RequireUnchanged(stop);
     }
     export_model_onnx(*model, request.output_path, request.opset_version, 1, request.simplify, request.class_layout_path, stop);
 }
