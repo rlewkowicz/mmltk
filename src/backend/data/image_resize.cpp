@@ -1,4 +1,5 @@
 #include "src/backend/data/image_resize.h"
+#include "src/backend/data/detail/perceptual_downscale.h"
 
 #include <immintrin.h>
 
@@ -29,6 +30,8 @@ void warm_up_avir_rgb_resize_path() {
 
 struct RgbImageResizer::Impl {
     avir::CImageResizer<> resizer{8};
+    bool perceptual_enabled = false;
+    std::unique_ptr<perceptual::CpuDownscaler> perceptual;
 };
 
 RgbLetterbox compute_rgb_letterbox(const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width,
@@ -203,13 +206,14 @@ ResizeWorkerPlan plan_rgb_resize_workers(int total_workers, bool any_resize, boo
     return {std::max(1, total_workers), 1};
 }
 
-RgbImageResizer::RgbImageResizer(int thread_count) {
+RgbImageResizer::RgbImageResizer(int thread_count, bool perceptual_downscale) {
     if (thread_count != 1) {
         throw std::runtime_error("RgbImageResizer internal threading is disabled; use image-level parallelism and pass thread_count=1");
     }
     static std::once_flag avir_warmup_once;
     std::call_once(avir_warmup_once, warm_up_avir_rgb_resize_path);
     impl_ = std::make_unique<Impl>();
+    impl_->perceptual_enabled = perceptual_downscale;
 }
 
 RgbImageResizer::~RgbImageResizer() = default;
@@ -224,11 +228,25 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
         throw std::runtime_error("RgbImageResizer dimensions must be positive");
     }
     if (src_width == dst_width && src_height == dst_height) {
-        std::memcpy(dst, src, static_cast<size_t>(src_width) * static_cast<size_t>(src_height) * 3);
+        if (dst != src) std::memcpy(dst, src, perceptual::checked_product(perceptual::checked_product(src_width,src_height),3));
         return;
     }
 
+    if (impl_->perceptual_enabled && dst_width <= src_width && dst_height <= src_height) {
+        const auto layout = [](int width,int height) {
+            const auto row=perceptual::checked_product(width,3);
+            return RgbImageLayout{static_cast<std::uint32_t>(width),static_cast<std::uint32_t>(height),row,0,
+                                  perceptual::checked_product(row,height),RgbPixelFormat::RGB8};
+        };
+        downscale({src,layout(src_width,src_height)},{dst,layout(dst_width,dst_height)});
+        return;
+    }
     impl_->resizer.resizeImage(src, src_width, src_height, 0, dst, dst_width, dst_height, 3, 0.0, nullptr);
 }
 
+void RgbImageResizer::downscale(RgbConstImageView source, RgbMutableImageView destination) {
+    if (perceptual::validate_pair(source,destination)) { perceptual::copy_identity(source,destination); return; }
+    if (!impl_->perceptual) impl_->perceptual=std::make_unique<perceptual::CpuDownscaler>();
+    impl_->perceptual->run(source,destination);
+}
 }  // namespace mmltk::backend::data

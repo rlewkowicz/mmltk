@@ -58,7 +58,8 @@ mmltk_register_public_headers(
         data_loading_options.h
         compiled_file_utils.h
         benchmark_hash.h
-        image_resize.h)
+        image_resize.h
+        image_resize_cuda.h)
 mmltk_register_ordinary_sources(mmltk_backend_data
     compiled_dataset.cpp
     benchmark_annotations.cpp
@@ -73,6 +74,7 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark_sampling.cpp
     dataset_compiler_progress.cpp
     image_resize.cpp
+    detail/perceptual_downscale.cpp
     mask_rle_utils.cpp
     staging_file_cleanup.cpp)
 mmltk_register_retained_module_importers(mmltk_backend_data
@@ -98,6 +100,9 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_sampling.h
     detail/benchmark_writer.h
     detail/worker_queue.h
+    detail/perceptual_downscale.h
+    detail/perceptual_downscale_math.h
+    detail/perceptual_downscale_completion.h
     detail/dataset_compiler_cuda.h
     detail/dataset_compiler_cuda_bridge.h
     detail/dataset_compiler_internal.h
@@ -109,6 +114,7 @@ if(BUILD_RFDETR_NATIVE)
     mmltk_register_ordinary_sources(
         mmltk_backend_data
         dataset_compiler_cuda.cu
+        image_resize_cuda.cu
     )
     target_compile_definitions(mmltk_backend_data PRIVATE
         MMLTK_DATASET_COMPILER_CUDA=1
@@ -180,6 +186,12 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/roundtrip.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/benchmark_dataset.test.cpp)
+    mmltk_register_private_headers(mmltk_backend_data_tests
+        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/perceptual_downscale_reference.h)
+    if(BUILD_RFDETR_NATIVE)
+        mmltk_register_ordinary_sources(mmltk_backend_data_tests
+            ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize_cuda.test.cpp)
+    endif()
     mmltk_configure_component(
         mmltk_backend_data_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_backend_data_tests PRIVATE
@@ -196,6 +208,7 @@ function(mmltk_add_backend_data_tests)
         mmltk::frameworks::gpu
         mmltk_backend_data_test_support
         CUDA::cudart
+        CUDA::cuda_driver
         nlohmann_json
         stb
     )

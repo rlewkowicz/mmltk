@@ -1,9 +1,29 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 
 namespace mmltk::backend::data {
+
+enum class RgbPixelFormat : std::uint8_t { RGB8, RGBA8, PlanarUnitSrgbF32 };
+
+// All strides and capacity are bytes. Float planes are R, G, B, contain unit
+// sRGB (not model-normalized values), and require float alignment. RGBA is
+// straight alpha. Padding is neither read as pixels nor written.
+struct RgbImageLayout {
+    std::uint32_t width = 0, height = 0;
+    std::size_t row_stride_bytes = 0, plane_stride_bytes = 0, capacity_bytes = 0;
+    RgbPixelFormat format = RgbPixelFormat::RGB8;
+};
+struct RgbConstImageView {
+    const void* data = nullptr;
+    RgbImageLayout layout{};
+};
+struct RgbMutableImageView {
+    void* data = nullptr;
+    RgbImageLayout layout{};
+};
 
 struct RgbLetterbox {
     std::uint32_t resized_width = 0;
@@ -30,7 +50,7 @@ ResizeWorkerPlan plan_rgb_resize_workers(int total_workers, bool any_resize, boo
 
 class RgbImageResizer {
    public:
-    explicit RgbImageResizer(int thread_count = 1);
+    explicit RgbImageResizer(int thread_count = 1, bool perceptual_downscale = false);
     ~RgbImageResizer();
 
     RgbImageResizer(const RgbImageResizer&) = delete;
@@ -39,6 +59,15 @@ class RgbImageResizer {
     RgbImageResizer& operator=(RgbImageResizer&&) noexcept;
 
     void resize(const uint8_t* src, int src_width, int src_height, uint8_t* dst, int dst_width, int dst_height);
+
+    // Explicit checked perceptual operation. Same format on both sides; no
+    // enlargement. Identity copies exactly (an exact alias is a no-op); all
+    // other overlapping spans are rejected. Nonfinite/out-of-unit float input
+    // is deterministically clamped, with NaN mapped to zero.
+    // sRGB is decoded once, linear Y/Cb/Cr receives the clamped 2x2 SSIM
+    // filter, and is encoded once. Alpha is area averaged, with premultiplied
+    // linear filtering, safe unpremultiplication and zero color at zero alpha.
+    void downscale(RgbConstImageView source, RgbMutableImageView destination);
 
    private:
     struct Impl;
