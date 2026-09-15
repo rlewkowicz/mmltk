@@ -69,8 +69,10 @@ function(mmltk_add_controller_subsystems_system_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_compute_systems.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_playback.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.cpp
         ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.cpp)
     mmltk_register_private_headers(mmltk_controller_data_compute_systems_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.h
         ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.h)
     mmltk_configure_component(mmltk_controller_data_compute_systems_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_data_compute_systems_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

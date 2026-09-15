@@ -1,3 +1,4 @@
+#include "prediction_test_support.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_event_publisher.h"
@@ -54,6 +55,8 @@
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 
+using namespace mmltk::controller::test_support;
+
 namespace mmltk::controller {
 namespace {
 
@@ -86,32 +89,6 @@ TEST_CASE("Predict revision capacity preserves cancellation and terminal observa
     REQUIRE(earlier_cancel == maximum - 5U);
     CHECK(Revision::Progress(*earlier_cancel, true) == maximum - 4U);
 }
-
-class StopGate final {
-   public:
-    void Release() {
-        {
-            std::scoped_lock lock(mutex_);
-            released_ = true;
-        }
-        condition_.notify_all();
-    }
-
-    void Reset() {
-        std::scoped_lock lock(mutex_);
-        released_ = false;
-    }
-
-    [[nodiscard]] bool Wait(const std::stop_token stop) {
-        std::unique_lock lock(mutex_);
-        return condition_.wait(lock, stop, [this] { return released_; });
-    }
-
-   private:
-    std::mutex mutex_;
-    std::condition_variable_any condition_;
-    bool released_ = false;
-};
 
 class TrainingTerminals final {
    public:
@@ -628,130 +605,6 @@ class BlockingInspectRuntime final : public DatasetRuntime {
     }
     void Leave() noexcept { --observation_->active_calls; }
     std::shared_ptr<DatasetRuntimeObservation> observation_;
-};
-
-struct PredictionReceiverFault final {
-    mmltk::testsupport::TestGate upload{"prediction receiver upload"};
-    bool terminal = false;
-    bool enabled = false;
-    std::atomic_bool partial_draw = false;
-    PredictRuntime::PreviewRetirement retirement;
-    std::weak_ptr<std::array<std::uint8_t, 48U>> decoded;
-};
-std::atomic<PredictionReceiverFault*> prediction_receiver_fault = nullptr;
-cudaError_t prediction_receiver_upload(void* destination, const void* source, std::size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
-    const auto copied = cudaMemcpyAsync(destination, source, bytes, kind, stream);
-    if (copied != cudaSuccess) return copied;
-    auto* fault = prediction_receiver_fault.load();
-    if (!fault || !fault->enabled) return cudaSuccess;
-    // The actual receiver upload and pinned allocation exist before injection.
-    // Settle test work before reporting an unobservable receiver outcome.
-    const auto settled = cudaStreamSynchronize(stream);
-    fault->upload.receipt().ArriveAndWait();
-    if (fault->terminal) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(
-        std::make_exception_ptr(std::runtime_error("injected receiver completion failure")));
-    return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
-}
-
-int prediction_receiver_convert(const float* source, std::uint32_t width, std::uint32_t height,
-    std::uint8_t* destination, std::size_t pitch, std::uintptr_t stream) noexcept {
-    auto* fault = prediction_receiver_fault.load();
-    if (fault && fault->partial_draw) {
-        const auto command = reinterpret_cast<cudaStream_t>(stream);
-        const auto written = cudaMemset2DAsync(destination, pitch, 123, width * 4U, 1U, command);
-        if (written != cudaSuccess) return written;
-        const auto settled = cudaStreamSynchronize(command);
-        return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
-    }
-    return mmltk::backend::imaging::raster::chw_float_to_rgba(source, width, height, destination, pitch, stream);
-}
-
-class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime, public PredictRuntime {
-   public:
-    FakeComputeRuntime(std::shared_ptr<StopGate> gate, const bool fail, std::shared_ptr<std::atomic_size_t> predictions = {}, bool refuse_preview = false, std::shared_ptr<std::atomic_int64_t> source_index = {},
-                       std::size_t labels = 0U, std::shared_ptr<StopGate> after_product = {}, std::shared_ptr<PredictionReceiverFault> receiver_fault = {})
-        : gate_(std::move(gate)), fail_(fail), predictions_(std::move(predictions)), refuse_preview_(refuse_preview), source_index_(std::move(source_index)), labels_(labels), after_product_(std::move(after_product)), receiver_fault_(std::move(receiver_fault)) {}
-
-    contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ValidateRequest, const std::stop_token stop,
-                                   const ComputeProgressSink& progress) override {
-        return RunImpl(stop, progress);
-    }
-    contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, const std::stop_token stop,
-                                   const ComputeProgressSink& progress) override {
-        return RunImpl(stop, progress);
-    }
-    contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, const std::stop_token stop,
-                                const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate&, VisualExtent, const ContextProvider& current_context, const PreviewRetirement& retirement) override {
-        if (predictions_) ++*predictions_;
-        auto terminal = RunImpl(stop, progress);
-        if (terminal.outcome != contracts::ComputeOperationOutcome::Succeeded) return terminal;
-        if (refuse_preview_) {
-            products(std::unexpected{std::string{"Prediction preview exceeds the visual object capacity"}});
-            return terminal;
-        }
-        const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
-        const auto context = current_context();
-        if (!context) return terminal;
-        if (!preview_) preview_ = std::make_unique<detail::PredictionPreviewPool>(execution, *context,
-            detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &prediction_receiver_upload, {}, &prediction_receiver_convert}, retirement);
-        if (receiver_fault_ && receiver_fault_->enabled) {
-            receiver_fault_->retirement = retirement;
-            auto decoded = std::make_shared<std::array<std::uint8_t, 48U>>();
-            decoded->fill(255U);
-            receiver_fault_->decoded = decoded;
-            auto raw = preview_->Capture(nullptr, {4U, 4U}, 0U, {}, {},
-                std::make_shared<const std::vector<std::string>>(), 1, decoded->data(), decoded);
-            products(Product{.extent = {4U, 4U}, .raw = std::move(raw), .image_id = 41});
-            return terminal;
-        }
-        if (cudaSetDevice(0) != cudaSuccess) throw std::runtime_error("test CUDA device unavailable");
-        float* pixels = nullptr;
-        if (cudaMalloc(reinterpret_cast<void**>(&pixels), (48U + 5U * labels_) * sizeof(float)) != cudaSuccess) throw std::bad_alloc();
-        const std::shared_ptr<void> custody(pixels, [](void* address) { static_cast<void>(cudaFree(address)); });
-        std::vector<float> white(48U + 5U * labels_, 0.0F);
-        std::fill_n(white.begin(), 48U, 1.0F);
-        std::vector<mmltk::backend::models::rfdetr::Prediction> detections(labels_,
-            {.category_id = 1, .score = .75F, .bbox_xyxy = {0.0F, 0.0F, 3.0F, 3.0F}});
-        for (std::size_t i = 0U; i < labels_; ++i) {
-            white[48U + 4U * i + 2U] = 3.0F;
-            white[48U + 4U * i + 3U] = 3.0F;
-        }
-        if (cudaMemcpy(pixels, white.data(), white.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("test upload failed");
-        mmltk::backend::ml::runtime::AnalysisAnnotationStorage annotations{
-            .boxes_xyxy = {.address = reinterpret_cast<std::uintptr_t>(pixels + 48U), .capacity_bytes = labels_ * 4U * sizeof(float)},
-            .category_ids = {.address = reinterpret_cast<std::uintptr_t>(pixels + 48U + 4U * labels_), .capacity_bytes = labels_ * sizeof(std::int32_t)}};
-        auto raw = preview_->Capture(pixels, {4U, 4U}, 0U, detections, annotations,
-            std::make_shared<const std::vector<std::string>>(std::vector<std::string>{std::string(256U, 'p')}), 1, nullptr, custody);
-        products(Product{.extent = {4U, 4U}, .raw = std::move(raw), .image_id = 41,
-            .source_index = source_index_ ? source_index_->load() : 0});
-        if (after_product_ && after_product_->Wait(stop)) progress({2U, 2U, 2U, "Processed"});
-        return terminal;
-    }
-
-   private:
-    contracts::ComputeTerminal RunImpl(const std::stop_token stop, const ComputeProgressSink& progress) {
-        progress(fail_ ? contracts::ComputeProgress{.sequence = 0U,
-                                                    .completed = 2U,
-                                                    .total = 1U,
-                                                    .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
-                       : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 2U, .status = "running"});
-        if (!gate_->Wait(stop)) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-        if (fail_)
-            return {.outcome = static_cast<contracts::ComputeOperationOutcome>(255U),
-                    .output = std::string(contracts::kComputePathCapacity + 1U, 'x'),
-                    .detail = std::string(contracts::kComputeErrorCapacity + 1U, 'x')};
-        return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, 2U, "result");
-    }
-
-    std::shared_ptr<StopGate> gate_;
-    bool fail_ = false;
-    std::shared_ptr<std::atomic_size_t> predictions_;
-    bool refuse_preview_ = false;
-    std::shared_ptr<std::atomic_int64_t> source_index_;
-    std::size_t labels_ = 0U;
-    std::shared_ptr<StopGate> after_product_;
-    std::shared_ptr<PredictionReceiverFault> receiver_fault_;
-    std::unique_ptr<detail::PredictionPreviewPool> preview_;
 };
 
 class UnsafePredictRuntime final : public PredictRuntime {
@@ -1483,7 +1336,7 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     ValidationSystem validation{settings, dataset, model,
                                 [&] {
                                     const bool fail = constructions++ == 0U;
-                                    return std::make_unique<FakeComputeRuntime>(gate, fail);
+                                    return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate, .fail = fail});
                                 },
                                 // CLEANUP-IGNORE: Compute and dataset event sequences prove distinct typed system contracts.
                                 [&](ComputeSystemEvent event) {
@@ -1539,7 +1392,7 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
     std::promise<ComputeSystemEvent> settled;
     ValidationSystem validation{settings, dataset, model, [&] {
         ++constructions;
-        return std::make_unique<FakeComputeRuntime>(gate, false);
+        return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate});
     }, [&](ComputeSystemEvent event) {
         if (std::holds_alternative<ComputeChanged>(event)) settled.set_value(std::move(event));
     }};
@@ -1620,7 +1473,7 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
     PresentationSnapshot displayed;
     std::string routing_failure;
     PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [&] { return std::make_unique<FakeComputeRuntime>(gate, invalid_first && constructions++ == 0U, nullptr, false, index); },
+        [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate, .fail = invalid_first && constructions++ == 0U}, .source_index = index}); },
         [&](PredictSystem::event_type event) {
             if (auto* presentation = route.load()) presentation->SourceChanged({PresentationSourceKind::Predict, 1U});
             std::visit([&](const auto& value) {
@@ -1701,8 +1554,8 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
     Publisher::Sink sink = [](browser::SystemEvent) {};
     Publisher publisher{sink, [] {}, [&](auto source) { if (auto* selected = route.load()) selected->SourceChanged(source); }};
     PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [&] { return std::make_unique<FakeComputeRuntime>(begin, false, nullptr, false, nullptr,
-            contracts::kAnnotationObjectCapacity, after_image); },
+        [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = begin},
+            .labels = contracts::kAnnotationObjectCapacity, .after_product = after_image}); },
         [&](PredictSystem::event_type event) {
             if (const auto* progress = std::get_if<PredictProgress>(&event);
                 progress && progress->snapshot.operation.progress.sequence == 2U) scalar_sent = true;
@@ -1779,15 +1632,15 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
     auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 2U);
     PredictionReceiverFault fault;
     fault.enabled = fault.terminal = true;
-    prediction_receiver_fault = &fault;
-    const mmltk::testsupport::ScopedTestCleanup clear{[&] { fault.upload.Release(); prediction_receiver_fault = nullptr; }};
-    const detail::PredictionPreviewPool::TransferOperations operations{
-        &cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &prediction_receiver_upload};
+    const ScopedPredictionReceiverFault registration{fault};
+    const auto operations = PredictionReceiverFault::Operations();
     auto pool = std::make_unique<detail::PredictionPreviewPool>(execution, context, operations, authority);
-    auto decoded = std::make_shared<std::array<std::uint8_t, 48U>>();
-    decoded->fill(127U);
-    std::weak_ptr<std::array<std::uint8_t, 48U>> retained = decoded;
-    auto raw = pool->Capture(nullptr, {4U, 4U}, 0U, {}, {}, std::make_shared<const std::vector<std::string>>(), 1, decoded->data(), decoded);
+    std::array<std::uint8_t, 48U> pixels;
+    pixels.fill(127U);
+    auto input = PredictionSource::Decoded({4U, 4U}, pixels);
+    auto& decoded = input.custody();
+    std::weak_ptr<void> retained = decoded;
+    auto raw = pool->Capture(nullptr, input.extent(), 0U, {}, {}, input.classes(), 1, input.rgb8(), decoded);
     REQUIRE(raw);
     auto draw = std::async(std::launch::async, [raw, context] {
         try {
@@ -1798,7 +1651,10 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
         } catch (...) { return std::current_exception(); }
         return std::exception_ptr{};
     });
-    const mmltk::testsupport::ScopedTestCleanup release{[&] { fault.upload.Release(); }};
+    const mmltk::testsupport::ScopedTestCleanup release{[&] {
+        fault.upload.Release();
+        if (draw.valid()) draw.wait();
+    }};
     REQUIRE(fault.upload.WaitEntered(std::chrono::seconds{2}));
     CHECK_FALSE(pool->HasUnsafeSourceCustody());
     raw.reset();
@@ -1827,13 +1683,12 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
     gate->Release();
     auto fault = std::make_shared<PredictionReceiverFault>();
     fault->terminal = terminal;
-    prediction_receiver_fault = fault.get();
-    const mmltk::testsupport::ScopedTestCleanup clear{[&] { fault->upload.Release(); prediction_receiver_fault = nullptr; }};
+    const ScopedPredictionReceiverFault registration{*fault};
     std::atomic_size_t constructions = 0U;
     std::promise<void> first_frame, first_done, second_done, visual_failure, recovered;
     {
         PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-            [&] { ++constructions; return std::make_unique<FakeComputeRuntime>(gate, false, nullptr, false, nullptr, 0U, nullptr, fault); },
+            [&] { ++constructions; return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault}); },
             [&](PredictSystem::event_type event) {
                 if (const auto* changed = std::get_if<PredictChanged>(&event)) {
                     const auto& state = changed->snapshot;
@@ -1898,7 +1753,7 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
     std::promise<PredictSnapshot> completed;
     std::promise<PredictFailed> preview_failed;
     PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [gate] { return std::make_unique<FakeComputeRuntime>(gate, false, nullptr, true); },
+        [gate] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
         [&](PredictSystem::event_type event) {
             if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
             if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active)
@@ -1921,7 +1776,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
 
     auto export_gate = std::make_shared<StopGate>();
     std::promise<ComputeSystemEvent> export_terminal;
-    ExportSystem export_system{settings, dataset, model, [export_gate] { return std::make_unique<FakeComputeRuntime>(export_gate, false); },
+    ExportSystem export_system{settings, dataset, model, [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
                                [&](ComputeSystemEvent event) {
                                    if (!std::holds_alternative<ComputeProgressEvent>(event)) export_terminal.set_value(std::move(event));
                                }};
@@ -1947,7 +1802,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
                           {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
                           [&] {
                               const bool fail = constructions++ == 0U;
-                              return std::make_unique<FakeComputeRuntime>(predict_gate, fail, predictions);
+                              return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = predict_gate, .fail = fail}, .predictions = predictions});
                           },
                           [&](PredictSystem::event_type event) {
                               if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.frame.valid() && !frame_seen.exchange(true))
@@ -2427,7 +2282,7 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
     using namespace mmltk::common::system;
     using namespace mmltk::controller;
     for (const auto call : {SYS_setpriority, SYS_set_mempolicy}) {
-        CHECK(test_support::with_denied_syscall(call, [] {
+        CHECK(mmltk::common::system::test_support::with_denied_syscall(call, [] {
                   const auto topology = NumaTopology::Capture();
                   const auto cpu = topology.permitted_cpus.front();
                   const auto node = std::ranges::find(topology.cpus, cpu, &CpuTopology::cpu)->node;
@@ -2466,15 +2321,14 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
     namespace gpu = mmltk::frameworks::gpu;
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    float* source = nullptr;
-    REQUIRE(cudaMalloc(reinterpret_cast<void**>(&source), 12U * sizeof(float)) == cudaSuccess);
-    const std::shared_ptr<void> custody(source, [](void* address) { static_cast<void>(cudaFree(address)); });
+    const auto classes = std::make_shared<const std::vector<std::string>>(std::vector<std::string>{"first", "last"});
     const std::array<float, 12U> pixels{1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1};
-    REQUIRE(cudaMemcpy(source, pixels.data(), sizeof(pixels), cudaMemcpyHostToDevice) == cudaSuccess);
+    auto input = PredictionSource::Device(execution, {2U, 2U}, pixels, {}, classes);
+    const auto* source = input.pixels();
+    auto& custody = input.custody();
     std::optional<detail::PredictionPreviewPool> pool;
     gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
     pool.emplace(execution, context);
-    const auto classes = std::make_shared<const std::vector<std::string>>(std::vector<std::string>{"first", "last"});
     std::array<std::shared_ptr<const detail::PredictionPreviewFrame>, 3U> readers;
     for (auto& reader : readers) { reader = pool->Capture(source, {2U, 2U}, 0U, {}, {}, classes, 2, nullptr, custody); REQUIRE(reader); }
     CHECK_FALSE(pool->Capture(source, {2U, 2U}, 0U, {}, {}, classes, 2, nullptr, custody));
@@ -2532,77 +2386,49 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
 }
 
-namespace {
-struct PredictionTransferFault {
-    int copies = 0;
-    int fail_copy = 0;
-    bool fail_record = false;
-    bool fail_settle = false;
-    int settlements = 0;
-};
-thread_local PredictionTransferFault prediction_transfer_fault;
-CUresult prediction_copy_test(CUdeviceptr destination, CUcontext destination_context, CUdeviceptr source, CUcontext source_context,
-                              std::size_t bytes, CUstream stream) {
-    if (++prediction_transfer_fault.copies == prediction_transfer_fault.fail_copy) return CUDA_ERROR_INVALID_VALUE;
-    return cuMemcpyPeerAsync(destination, destination_context, source, source_context, bytes, stream);
-}
-cudaError_t prediction_record_test(cudaEvent_t event, cudaStream_t stream) {
-    if (prediction_transfer_fault.fail_record) return cudaErrorInvalidResourceHandle;
-    return cudaEventRecord(event, stream);
-}
-cudaError_t prediction_settle_test(cudaStream_t stream) {
-    ++prediction_transfer_fault.settlements;
-    if (prediction_transfer_fault.fail_settle) return cudaErrorUnknown;
-    return cudaStreamSynchronize(stream);
-}
-}
-
 TEST_CASE("prediction transfer faults settle or retain exact source custody", "[controller][gpu]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace controller = mmltk::controller;
     namespace runtime = mmltk::backend::ml::runtime;
-    namespace rfdetr = mmltk::backend::models::rfdetr;
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    float* source = nullptr;
-    REQUIRE(cudaMalloc(reinterpret_cast<void**>(&source), 17U * sizeof(float)) == cudaSuccess);
-    REQUIRE(cudaMemset(source, 0, 17U * sizeof(float)) == cudaSuccess);
-    std::shared_ptr<void> custody(source, [](void* address) { static_cast<void>(cudaFree(address)); });
-    const std::weak_ptr<void> lifetime = custody;
-    const runtime::AnalysisAnnotationStorage annotations{
-        .source_region = {.width = 2, .height = 2}, .value_capacity = 1, .value_count = 1,
-        .boxes_xyxy = {.address = reinterpret_cast<std::uintptr_t>(source + 12), .capacity_bytes = 16},
-        .category_ids = {.address = reinterpret_cast<std::uintptr_t>(source + 16), .capacity_bytes = 4}};
-    const std::array<rfdetr::Prediction, 1> predictions{{{.category_id = 1, .score = .7F}}};
     const auto classes = std::make_shared<const std::vector<std::string>>(std::vector<std::string>{"object"});
+    const std::array<float, 12U> pixels{};
+    auto input = PredictionSource::Device(execution, {2U, 2U}, pixels,
+        {{.category_id = 1, .score = .7F}}, classes);
+    const auto* source = input.pixels();
+    auto& custody = input.custody();
+    const std::weak_ptr<void> lifetime = custody;
+    const auto& annotations = input.annotations();
+    const auto& predictions = input.detections();
     gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
-    const controller::detail::PredictionPreviewPool::TransferOperations operations{
-        &prediction_copy_test, &prediction_record_test, &prediction_settle_test, &cuMemHostRegister};
+    PredictionTransferFault fault;
+    const auto operations = PredictionTransferFault::Operations();
     auto pool = std::make_unique<controller::detail::PredictionPreviewPool>(execution, context, operations);
     for (int stage : {1, 2, 3, 4}) {
-        prediction_transfer_fault = {.fail_copy = stage < 4 ? stage : 0, .fail_record = stage == 4};
+        fault.Reset({.fail_copy = stage < 4 ? stage : 0, .fail_record = stage == 4});
         CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody), std::runtime_error);
-        CHECK(prediction_transfer_fault.settlements == 1);
+        CHECK(fault.settlements == 1);
         CHECK(custody.use_count() == 1);
-        prediction_transfer_fault = {};
+        fault.Reset();
         auto recovered = pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody);
         REQUIRE(recovered);
-        CHECK(prediction_transfer_fault.settlements == 0);
+        CHECK(fault.settlements == 0);
     }
-    prediction_transfer_fault = {.fail_copy = 2, .fail_settle = true};
+    fault.Reset({.fail_copy = 2, .fail_settle = true});
     int stopped = 0;
     CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody,
-        [](void* value) { ++*static_cast<int*>(value); }, &stopped), runtime::CudaOperationError);
+        &CountPredictionSourceStop, &stopped), runtime::CudaOperationError);
     CHECK(stopped == 1);
     CHECK(pool->HasUnsafeSourceCustody());
-    const auto attempted = prediction_transfer_fault.copies;
+    const auto attempted = fault.copies;
     CHECK_THROWS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody));
-    CHECK(prediction_transfer_fault.copies == attempted);
+    CHECK(fault.copies == attempted);
     custody.reset();
     CHECK_FALSE(lifetime.expired());
     pool.reset();
     CHECK_FALSE(lifetime.expired());
-    prediction_transfer_fault = {};
+    fault.Reset();
 }
 
 TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact", "[controller][gpu]") {
@@ -2611,23 +2437,23 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
-    const controller::detail::PredictionPreviewPool::TransferOperations operations{
-        &cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize,
-        +[](void*, std::size_t, unsigned) -> CUresult { return CUDA_ERROR_OUT_OF_MEMORY; }};
+    const auto operations = RefusePinnedRegistration();
     controller::detail::PredictionPreviewPool pool(execution, context, operations);
-    auto source = std::make_shared<std::array<std::uint8_t, 12>>(std::array<std::uint8_t, 12>{255, 0, 0});
-    const auto classes = std::make_shared<const std::vector<std::string>>();
-    auto raw = pool.Capture(nullptr, {2, 2}, 0, {}, {}, classes, 1, source->data(), source);
+    const std::array<std::uint8_t, 12U> pixels{255, 0, 0};
+    auto input = PredictionSource::Decoded({2U, 2U}, pixels);
+    auto& source = input.custody();
+    const auto& classes = input.classes();
+    auto raw = pool.Capture(nullptr, input.extent(), 0, {}, {}, classes, 1, input.rgb8(), source);
     REQUIRE(raw);
     CHECK(source.use_count() == 2);
     gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated,
         .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
     auto candidate = runtime.AcquireOutput();
     CHECK_THROWS(raw->Draw(runtime, candidate));
-    CHECK((*source)[0] == 255U);
+    CHECK(input.rgb8()[0] == 255U);
     candidate = {};
     controller::detail::PredictionPreviewPool healthy(execution, context);
-    auto recovered = healthy.Capture(nullptr, {2, 2}, 0, {}, {}, classes, 1, source->data(), source);
+    auto recovered = healthy.Capture(nullptr, {2, 2}, 0, {}, {}, classes, 1, input.rgb8(), source);
     REQUIRE(recovered);
     auto output = runtime.AcquireOutput();
     recovered->Draw(runtime, output);
@@ -2650,44 +2476,26 @@ TEST_CASE("preview context failure retains initialized state and source before r
     const bool terminal = GENERATE(false, true);
     enum class Stage { Capture, Draw, Destruction };
     const auto stage = GENERATE(Stage::Capture, Stage::Draw, Stage::Destruction);
-    struct Driver final {
-        bool armed = false;
-        bool query = false;
-        bool repeat = false;
-        unsigned failures = 0U;
-        unsigned calls = 0U;
-    } driver{.query = query_failure, .repeat = terminal};
-    gpu::CudaContextApi api{&driver,
-        [](void* owner, CUcontext* context) noexcept {
-            auto& driver = *static_cast<Driver*>(owner);
-            ++driver.calls;
-            if (driver.armed && driver.query) { ++driver.failures; return CUDA_ERROR_INVALID_CONTEXT; }
-            return cuCtxGetCurrent(context);
-        },
-        [](void* owner, CUcontext context) noexcept {
-            auto& driver = *static_cast<Driver*>(owner);
-            ++driver.calls;
-            const auto result = cuCtxSetCurrent(context);
-            if (driver.armed && !driver.query && (driver.repeat || driver.failures == 0U)) {
-                ++driver.failures;
-                return CUDA_ERROR_INVALID_CONTEXT;
-            }
-            return result;
-        }};
+    PredictionContextFault driver{query_failure ? PredictionContextFault::Failure::Query :
+        terminal ? PredictionContextFault::Failure::RestoreAlways : PredictionContextFault::Failure::RestoreOnce};
+    const auto api = driver.Api();
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
     auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity);
     detail::PredictionPreviewPool::TransferOperations operations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister};
     operations.context_api = api;
     auto pool = std::make_unique<detail::PredictionPreviewPool>(execution, context, operations, authority);
-    auto decoded = std::make_shared<std::array<std::uint8_t, 12U>>();
+    const std::array<std::uint8_t, 12U> pixels{};
+    auto input = PredictionSource::Decoded({2U, 2U}, pixels);
+    auto& decoded = input.custody();
     const std::weak_ptr<void> retained = decoded;
-    auto classes = std::make_shared<const std::vector<std::string>>();
+    const auto& classes = input.classes();
     int stopped = 0;
     const auto capture = [&] {
-        return pool->Capture(nullptr, {2U, 2U}, 0U, {}, {}, classes, 1, decoded->data(), decoded,
-            [](void* count) { ++*static_cast<int*>(count); }, &stopped);
+        return pool->Capture(nullptr, {2U, 2U}, 0U, {}, {}, classes, 1, input.rgb8(), decoded,
+            &CountPredictionSourceStop, &stopped);
     };
+    const mmltk::testsupport::ScopedTestCleanup disarm{[&] { driver.armed = false; }};
     if (stage == Stage::Destruction) { auto raw = capture(); REQUIRE(raw); }
     const bool unsafe = query_failure || terminal;
     if (stage == Stage::Draw) {
@@ -2696,6 +2504,7 @@ TEST_CASE("preview context failure retains initialized state and source before r
         gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
             .adopted_context = context});
         auto candidate = runtime.AcquireOutput();
+        const mmltk::testsupport::ScopedTestCleanup disarm_draw{[&] { driver.armed = false; }};
         driver.armed = true;
         if (unsafe) {
             CHECK_THROWS_AS(raw->Draw(runtime, candidate), gpu::ImageStreamExecutionFailure);
@@ -2739,8 +2548,7 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
     auto gate = std::make_shared<StopGate>();
     gate->Release();
     auto fault = std::make_shared<PredictionReceiverFault>();
-    prediction_receiver_fault = fault.get();
-    const mmltk::testsupport::ScopedTestCleanup clear{[&] { prediction_receiver_fault = nullptr; }};
+    const ScopedPredictionReceiverFault registration{*fault};
     auto source_index = std::make_shared<std::atomic_int64_t>(0);
     std::array<std::promise<void>, 6U> done;
     std::array<std::promise<void>, 3U> images;
@@ -2748,7 +2556,7 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
     std::atomic_size_t published = 0U;
     std::atomic_uint64_t last_revision = 0U;
     PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [&] { return std::make_unique<FakeComputeRuntime>(gate, false, nullptr, false, source_index, 1U); },
+        [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .source_index = source_index, .labels = 1U}); },
         [&](PredictSystem::event_type event) {
             if (const auto* changed = std::get_if<PredictChanged>(&event)) {
                 const auto& snapshot = changed->snapshot;
@@ -2831,34 +2639,19 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
 
 TEST_CASE("preview context construction publishes only after exact caller restoration", "[controller][gpu][context]") {
     namespace gpu = mmltk::frameworks::gpu;
-    enum class Failure { None, Query, RestoreOnce, RestoreAlways };
+    using Failure = PredictionContextFault::Failure;
     const auto failure = GENERATE(Failure::None, Failure::Query, Failure::RestoreOnce, Failure::RestoreAlways);
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     int devices = 0;
     REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
     gpu::DeviceContext caller(devices > 1 ? 1 : 0, gpu::cuda_image_copy_backend());
     caller.Bind();
-    struct Driver final {
-        Failure failure;
-        unsigned restores = 0U;
-        CUcontext candidate = nullptr;
-    } driver{failure};
+    PredictionContextFault driver{failure};
+    driver.armed = true;
+    driver.observe_candidate = true;
     CUcontext previous{};
     REQUIRE(cuCtxGetCurrent(&previous) == CUDA_SUCCESS);
-    gpu::CudaContextApi api{&driver,
-        [](void* owner, CUcontext* context) noexcept {
-            if (static_cast<Driver*>(owner)->failure == Failure::Query) return CUDA_ERROR_INVALID_CONTEXT;
-            return cuCtxGetCurrent(context);
-        },
-        [](void* owner, CUcontext context) noexcept {
-            auto& driver = *static_cast<Driver*>(owner);
-            if (driver.restores == 0U) static_cast<void>(cuCtxGetCurrent(&driver.candidate));
-            const auto result = cuCtxSetCurrent(context);
-            ++driver.restores;
-            if (driver.failure == Failure::RestoreAlways || (driver.failure == Failure::RestoreOnce && driver.restores == 1U))
-                return CUDA_ERROR_INVALID_CONTEXT;
-            return result;
-        }};
+    const auto api = driver.Api();
     auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 3U);
     // Existing current, in-flight and pending frames can reserve all five other slots.
     std::array<gpu::TerminalCudaRetirementLease, detail::PredictionPreviewPool::kSlotCapacity + 2U> frames;
