@@ -327,7 +327,7 @@ constexpr void visit_settings_leaves(Visitor& visitor, std::string prefix,
                 static_assert(!metadata.file_dialog || std::same_as<Member, std::string> || std::same_as<Member, std::filesystem::path>,
                               "file dialog requires a path-like settings leaf");
                 constexpr auto dialog = [&] {
-                    if constexpr (const auto workflow_dialog = mmltk::controller::contracts::workflow_path_dialog<path>(); workflow_dialog)
+                    if constexpr (constexpr auto workflow_dialog = mmltk::controller::contracts::workflow_path_dialog<path>(); workflow_dialog)
                         return std::optional<ApplicationFileDialogFact>{{workflow_dialog->title, workflow_dialog->filter,
                             workflow_dialog->pattern, workflow_dialog->mode}};
                     else return metadata.file_dialog;

@@ -1489,6 +1489,9 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
 TEST_CASE("Predict scalar progress excludes full retained labels and keeps native observation", "[browser][predict][reflection]") {
     using namespace mmltk::controller;
     namespace reflection = mmltk::frameworks::reflection;
+    constexpr auto snapshot_budget = browser::application_schema_detail::annotation_value<
+        ^^PredictSystem::snapshot, contracts::reflection::Snapshot>().byte_budget;
+    STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<PredictSnapshot>() <= snapshot_budget);
     PredictSnapshot snapshot;
     CHECK_FALSE(PredictSystem::visual_source::Observe(snapshot).valid());
     snapshot.revision = 19U;
@@ -1501,6 +1504,11 @@ TEST_CASE("Predict scalar progress excludes full retained labels and keeps nativ
     snapshot.video = true;
     snapshot.labels.resize(contracts::kAnnotationObjectCapacity);
     for (auto& label : snapshot.labels) label.name.assign(256U, 'c');
+    const auto full = browser::application_materializer_detail::reflected_value(snapshot);
+    REQUIRE(full);
+    browser::wire::CountingEncoder full_measure{
+        {.max_bytes = snapshot_budget, .max_items = browser::kMaxOutputValueItems, .max_depth = browser::kMaxIntentValueDepth}};
+    REQUIRE(full_measure.measure(*full));
     const auto* retained_labels = snapshot.labels.data();
     const auto progress = reflection::project_record<PredictProgressState>(snapshot);
     const auto encoded = browser::application_materializer_detail::reflected_value(PredictProgress{progress});

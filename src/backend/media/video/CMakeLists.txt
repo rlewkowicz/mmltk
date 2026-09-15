@@ -1,6 +1,6 @@
 include(MmltkComponent)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(MMLTK_FFMPEG REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+pkg_check_modules(MMLTK_FFMPEG REQUIRED IMPORTED_TARGET GLOBAL libavformat libavcodec libavutil libswscale)
 add_library(mmltk_backend_media_video STATIC)
 add_library(mmltk::backend::media::video ALIAS mmltk_backend_media_video)
 mmltk_configure_component(mmltk_backend_media_video PUBLIC_DECLARATIONS)

@@ -216,7 +216,7 @@ class PredictSystem final {
     // CLEANUP-IGNORE: Predict shutdown is ordinary facade forwarding for this sealed system.
     void Shutdown() noexcept;
     // CLEANUP-IGNORE: Predict owns its reflected snapshot and public read surface independently of Live and Annotation.
-    [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] PredictSnapshot snapshot() const;
+    [[= contracts::reflection::Snapshot{2U * 1024U * 1024U}]] [[nodiscard]] PredictSnapshot snapshot() const;
     // CLEANUP-IGNORE: Predict exposes its sealed image and workspace API through the existing private shared runtime.
     [[nodiscard]] std::optional<PredictImageMetadata> ImageSnapshot(const VisualFrame&) const;
     [[nodiscard]] VisualSourceObservation ObserveSource() const;
