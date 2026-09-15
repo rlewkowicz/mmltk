@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "detail/prediction_preview.h"
 #include "src/controller/presentation/workspace_input.h"
@@ -530,6 +531,10 @@ class PredictSystem::Impl final {
                         if (!runtime_) throw std::runtime_error("prediction runtime factory returned no runtime");
                         const auto execution = mmltk::frameworks::gpu::resolve_device_execution(visual_.device, mmltk::common::system::NumaTopology::Capture(), visual_.numa_node);
                         try { if (initial_runtime) static_cast<void>(PreviewContext(execution)); }
+                        catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
+                            if (error.terminal()) throw;
+                            Product(std::unexpected{std::string{error.what()}}, source_key, video);
+                        }
                         catch (const std::exception& error) { Product(std::unexpected{std::string{error.what()}}, source_key, video); }
                         auto terminal = runtime_->Run(std::move(*request), stop,
                             [this](const auto& progress) { Progress(progress); },
@@ -604,19 +609,13 @@ class PredictSystem::Impl final {
         std::scoped_lock lock(preview_context_mutex_);
         if (!preview_retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
         if (!preview_context_) {
-            CUcontext previous{};
-            if (cuInit(0U) != CUDA_SUCCESS || cuCtxGetCurrent(&previous) != CUDA_SUCCESS) throw std::runtime_error("prediction context query failed");
-            try {
-                preview_context_.emplace(execution.device, mmltk::frameworks::gpu::cuda_image_copy_backend(),
-                    mmltk::frameworks::gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
-            } catch (...) { static_cast<void>(cuCtxSetCurrent(previous)); throw; }
-            if (cuCtxSetCurrent(previous) != CUDA_SUCCESS) throw std::runtime_error("prediction context restore failed");
+            preview_context_ = detail::CreatePredictionPreviewContext(execution, preview_retirement_);
         }
         return *preview_context_;
     }
     void RetireRuntime() noexcept {
         if (!runtime_) return;
-        runtime_->Close();
+        if (!runtime_->HasUnsafeCustody() && preview_retirement_->admission_open()) runtime_->Close();
         if (runtime_->HasUnsafeCustody() || !preview_retirement_->admission_open()) {
             std::move(retirement_lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(runtime_)), cudaErrorUnknown);
         } else runtime_.reset();
@@ -647,67 +646,92 @@ class PredictSystem::Impl final {
     }
     detail::VisualRuntimeOwner::Notification Render(mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::stop_token stop) {
         if (stop.stop_requested()) return {};
-        {
-            std::scoped_lock lock(mutex_);
-            if (!pending_product_) return {};
-            if (pending_product_->product && pending_product_->product->raw && !pending_product_->product->raw->CompatibleWith(runtime)) {
-                pending_product_.reset();
-                return [this] { PreviewFailed("Prediction preview belongs to a retired visual context"); };
-            }
-            if (!pending_product_->product) {
-                auto error = std::move(pending_product_->product.error());
-                pending_product_.reset();
-                return [this, error = std::move(error)]() mutable { PreviewFailed(std::move(error)); };
-            }
-        }
-        auto baseline = runtime.Completed();
-        auto candidate = worker_.TryAcquireOutput(runtime, baseline);
-        if (!candidate.valid()) return {};
-        PendingProduct pending;
-        {
-            std::scoped_lock lock(mutex_);
-            pending = std::move(*pending_product_);
-            pending_product_.reset();
-        }
-        if (!pending.product) throw std::runtime_error(pending.product.error());
-        auto& product = *pending.product;
-        if (!product.extent.valid() || !product.raw || product.extent.width > visual_.maximum_width || product.extent.height > visual_.maximum_height)
-            throw std::runtime_error("Prediction preview exceeds the visual product limits");
-        std::vector<PredictLabel> labels;
-        if (preview_class_count_ != product.raw->class_count()) {
-            preview_palette_ = contracts::annotation_class_palette(static_cast<std::size_t>(product.raw->class_count()));
-            preview_class_count_ = product.raw->class_count();
-        }
-        const auto& palette = preview_palette_;
-        const auto& classes = product.raw->classes();
-        labels.reserve(product.raw->predictions().size());
-        for (const auto& detection : product.raw->predictions()) {
-            const auto category = detection.category_id - 1;
-            labels.push_back({{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.score,
-                category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
-                category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category] : std::to_string(detection.category_id)});
-            const auto& label = labels.back();
-            if (!label.box.valid() || !label.color.valid() || !std::isfinite(label.confidence) || label.name.size() > mmltk::frameworks::reflection::kMaximumNameBytes)
-                throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");
-        }
-        product.raw->Draw(runtime, candidate);
-        const auto completed = runtime.CommitOutput(std::move(candidate));
-        const auto frame = visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, completed.revision());
-        return [this, frame, labels = std::move(labels), identity = product.image_id, content_identity = pending.content_identity]() mutable {
-            PredictSnapshot changed;
+        try {
             {
                 std::scoped_lock lock(mutex_);
-                const auto revision = detail::PredictRevision::Frame(state_.revision, state_.operation.active, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
-                if (!revision) return;
-                state_.frame = frame;
-                state_.labels = std::move(labels);
-                state_.image_id = identity;
-                state_.content_identity = content_identity;
-                state_.revision = *revision;
-                changed = state_;
+                if (!pending_product_) return {};
+                if (pending_product_->product && pending_product_->product->raw && !pending_product_->product->raw->CompatibleWith(runtime)) {
+                    pending_product_.reset();
+                    return [this] { PreviewFailed("Prediction preview belongs to a retired visual context"); };
+                }
+                if (!pending_product_->product) {
+                    auto error = std::move(pending_product_->product.error());
+                    pending_product_.reset();
+                    return [this, error = std::move(error)]() mutable { PreviewFailed(std::move(error)); };
+                }
             }
-            Publish(PredictChanged{std::move(changed)});
-        };
+            // A fallible draw may only acquire unselected replacement storage.
+            mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
+            auto candidate = worker_.TryAcquireOutput(runtime, baseline);
+            if (!candidate.valid()) return {};
+            PendingProduct pending;
+            {
+                std::scoped_lock lock(mutex_);
+                pending = std::move(*pending_product_);
+                pending_product_.reset();
+            }
+            if (!pending.product) throw std::runtime_error(pending.product.error());
+            auto& product = *pending.product;
+            if (!product.extent.valid() || !product.raw || product.extent.width > visual_.maximum_width || product.extent.height > visual_.maximum_height)
+                throw std::runtime_error("Prediction preview exceeds the visual product limits");
+            std::vector<PredictLabel> labels;
+            if (preview_class_count_ != product.raw->class_count()) {
+                preview_palette_ = contracts::annotation_class_palette(static_cast<std::size_t>(product.raw->class_count()));
+                preview_class_count_ = product.raw->class_count();
+            }
+            const auto& palette = preview_palette_;
+            const auto& classes = product.raw->classes();
+            labels.reserve(product.raw->predictions().size());
+            for (const auto& detection : product.raw->predictions()) {
+                const auto category = detection.category_id - 1;
+                labels.push_back({{{detection.bbox_xyxy[0], detection.bbox_xyxy[1]}, {detection.bbox_xyxy[2], detection.bbox_xyxy[3]}}, category, detection.score,
+                    category >= 0 && static_cast<std::size_t>(category) < palette.size() ? palette[category] : contracts::AnnotationColor{},
+                    category >= 0 && static_cast<std::size_t>(category) < classes.size() ? classes[category] : std::to_string(detection.category_id)});
+                const auto& label = labels.back();
+                if (!label.box.valid() || !label.color.valid() || !std::isfinite(label.confidence) || label.name.size() > mmltk::frameworks::reflection::kMaximumNameBytes)
+                    throw std::runtime_error("Prediction preview metadata exceeds the visual product limits");
+            }
+            product.raw->Draw(runtime, candidate);
+            const auto frame = visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, candidate.revision());
+            detail::VisualRuntimeOwner::Notification notification = [this, frame, labels = std::move(labels), identity = product.image_id, content_identity = pending.content_identity]() mutable {
+                PredictSnapshot changed;
+                {
+                    std::scoped_lock lock(mutex_);
+                    const auto revision = detail::PredictRevision::Frame(state_.revision, state_.operation.active, state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::CancellationRequested);
+                    if (!revision) return;
+                    state_.frame = frame;
+                    state_.labels = std::move(labels);
+                    state_.image_id = identity;
+                    state_.content_identity = content_identity;
+                    state_.revision = *revision;
+                    changed = state_;
+                }
+                Publish(PredictChanged{std::move(changed)});
+            };
+            static_cast<void>(runtime.CommitOutput(std::move(candidate)));
+            return notification;
+        } catch (...) {
+            const auto failure = std::current_exception();
+            if (!preview_retirement_->admission_open()) {
+                static_cast<void>(runtime.Retire(failure));
+                throw;
+            }
+            if (mmltk::frameworks::gpu::is_image_execution_failure(failure) ||
+                mmltk::frameworks::gpu::find_image_failure<mmltk::backend::ml::runtime::CudaOperationError>(failure)) throw;
+            try { std::rethrow_exception(failure); }
+            catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
+                if (error.terminal()) {
+                    static_cast<void>(runtime.Retire(failure));
+                    throw;
+                }
+            }
+            catch (...) {}
+            // PublishRetained settled ordinary partial writes; candidate rollback
+            // leaves the selected output valid. Keep its owning runtime alive.
+            return [this, message = visual_failure_detail(failure, "prediction rendering failed")]() mutable {
+                PreviewFailed(std::move(message));
+            };
+        }
     }
     void Progress(const contracts::ComputeProgress& progress) noexcept {
         PredictProgressState changed;
@@ -797,9 +821,9 @@ class PredictSystem::Impl final {
     PredictRuntimeFactory factory_;
     mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
     mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
-    // Current pool plus one in-flight Draw and one pending raw product from older pools.
+    // Current pool, in-flight Draw, pending old product, and context construction.
     PredictRuntime::PreviewRetirement preview_retirement_ =
-        std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 2U);
+        std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 3U);
     std::shared_ptr<PredictRuntime> runtime_;
     direct::LocalRun run_;
     detail::VisualRuntimeOwner worker_;

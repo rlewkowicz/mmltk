@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include <catch2/catch_test_macros.hpp>
 #include <onnx/onnx_pb.h>
@@ -275,6 +276,15 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
             CHECK(category + 1 == record.detections.front().category_id);
         }}).processed_images == 2U);
     CHECK_FALSE(session.HasUnsafeCustody());
+    rfdetr::PredictionSession context_poisoned;
+    CHECK_THROWS_AS(context_poisoned.Run(request, command, {.completed = [](const auto&, auto, const auto&) {
+        throw mmltk::frameworks::gpu::CudaContextFailure(true);
+    }}), mmltk::backend::ml::runtime::CudaOperationError);
+    CHECK(context_poisoned.HasUnsafeCustody());
+    bool context_rebound = false;
+    CHECK_THROWS_AS(context_poisoned.Run(request, command, {.begin = [&](const auto&) { context_rebound = true; }}),
+        mmltk::backend::ml::runtime::CudaOperationError);
+    CHECK_FALSE(context_rebound);
     rfdetr::PredictionSession poisoned;
     CHECK_FALSE(poisoned.HasUnsafeCustody());
     std::ifstream prior_file(request.output_path);

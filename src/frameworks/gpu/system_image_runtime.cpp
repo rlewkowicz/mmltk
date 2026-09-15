@@ -185,10 +185,11 @@ void SystemImageRuntime::BindContext() {
     state.context->Bind();
 }
 void SystemImageRuntime::BeginWork() { BindContext(); }
-SystemImageRuntime::Retirement SystemImageRuntime::Retire() noexcept {
+SystemImageRuntime::Retirement SystemImageRuntime::Retire(std::exception_ptr unproved_execution) noexcept {
     if (!state_ && retention_ && retention_->state)
         return {.failure = UnsafeCustody{retention_}.failure(), .custody = UnsafeCustody{retention_}};
     if (!state_ || state_->retired) return {.safe_to_destroy = true};
+    if (unproved_execution) return {.failure = unproved_execution, .custody = Retain(std::move(unproved_execution))};
     if (state_->model) state_->model->StopIngress();
     if (!state_->context) {
         if (!state_->model) {

@@ -29,6 +29,7 @@ mmltk_register_public_headers(mmltk_frameworks_gpu
         unique_resource.h
         cuda_priority.h
         cuda_device_scope.h
+        cuda_context_scope.h
         resource_owner_command_authority.h
         resource_stop_result.h
         terminal_cuda_retirement_authority.h

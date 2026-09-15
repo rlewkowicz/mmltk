@@ -1,9 +1,25 @@
 #include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <stdexcept>
+#include <utility>
 #include "async_test_utils.hpp"
 #include "src/backend/media/video/video_file_source.h"
+#include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+
+namespace mmltk::backend::media::video::test_support {
+struct VideoFileSourceTestAccess final {
+    static std::unique_ptr<VideoFileSource> Create(
+        const std::filesystem::path& path, int device, std::uintptr_t stream, std::stop_token stop,
+        std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
+        mmltk::frameworks::gpu::CudaContextApi context_api) {
+        return std::unique_ptr<VideoFileSource>(
+            new VideoFileSource(path, device, stream, stop, std::move(retirement), &cudaStreamSynchronize, context_api));
+    }
+};
+}  // namespace mmltk::backend::media::video::test_support
+
 TEST_CASE("video file source rejects remote and absent inputs", "[video]") {
     using mmltk::backend::media::video::VideoFileSource;
     REQUIRE_THROWS_AS(VideoFileSource("https://example.invalid/video.mp4", 0, 1U, {}), std::invalid_argument);
@@ -202,4 +218,87 @@ TEST_CASE("video conversion preserves planar and semiplanar channel layouts", "[
         REQUIRE(cudaMemcpy(pixels.data(), output, sizeof(pixels), cudaMemcpyDeviceToHost) == cudaSuccess);
         for (auto value : pixels) CHECK(std::abs(value - 1.0F) < 0.01F);
     }
+}
+
+TEST_CASE("video exact context transitions seal the existing owner before further decoding", "[video][gpu][context]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    using mmltk::backend::media::video::VideoFileSource;
+    enum class Stage { Construction, Next, Destruction };
+    const auto stage = GENERATE(Stage::Construction, Stage::Next, Stage::Destruction);
+    const bool query = GENERATE(false, true);
+    const bool repeated = GENERATE(false, true);
+    const auto path = std::filesystem::temp_directory_path() / ("mmltk-video-context-" + std::to_string(::getpid()) + ".y4m");
+    const mmltk::testsupport::ScopedTestCleanup remove{[&] { std::filesystem::remove(path); }};
+    {
+        std::ofstream file(path, std::ios::binary);
+        file << "YUV4MPEG2 W2 H2 F4:1 Ip A1:1 C444\nFRAME\n";
+        for (auto value : {16, 128, 128}) for (unsigned pixel = 0; pixel < 4U; ++pixel) file.put(static_cast<char>(value));
+    }
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-context", 0, execution.placement.numa_node, -10, false});
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    cudaStream_t stream{};
+    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+    const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    struct Driver final {
+        bool armed;
+        bool query;
+        bool repeated;
+        unsigned failures = 0U;
+        unsigned calls = 0U;
+        unsigned sets = 0U;
+        CUcontext caller = nullptr;
+    } driver{stage == Stage::Construction, query, repeated};
+    gpu::CudaContextApi api{&driver,
+        [](void* opaque, CUcontext* value) noexcept {
+            auto& driver = *static_cast<Driver*>(opaque);
+            ++driver.calls;
+            if (driver.armed && driver.query) return CUDA_ERROR_INVALID_CONTEXT;
+            return cuCtxGetCurrent(value);
+        },
+        [](void* opaque, CUcontext value) noexcept {
+            auto& driver = *static_cast<Driver*>(opaque);
+            ++driver.calls;
+            const auto result = cuCtxSetCurrent(value);
+            if (++driver.sets > 1U && driver.armed && !driver.query && value == driver.caller && (driver.repeated || driver.failures == 0U)) {
+                ++driver.failures;
+                return CUDA_ERROR_INVALID_CONTEXT;
+            }
+            return result;
+        }};
+    auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
+    std::unique_ptr<VideoFileSource> source;
+    const auto create = [&] {
+        source = mmltk::backend::media::video::test_support::VideoFileSourceTestAccess::Create(
+            path, 0, reinterpret_cast<std::uintptr_t>(stream), std::stop_token{}, authority, api);
+    };
+    const bool terminal = query || repeated;
+    if (stage == Stage::Construction) {
+        // Initial construction also restores the already-current source context.
+        REQUIRE(cuCtxGetCurrent(&driver.caller) == CUDA_SUCCESS);
+        CHECK_THROWS(create());
+    } else {
+        create();
+        // An unrelated isolated caller on the same device must be restored exactly.
+        gpu::DeviceContext caller(0, gpu::cuda_image_copy_backend());
+        caller.Bind();
+        REQUIRE(cuCtxGetCurrent(&driver.caller) == CUDA_SUCCESS);
+        driver.armed = true;
+        if (stage == Stage::Next) {
+            CHECK_THROWS_AS(source->Next(), gpu::CudaContextFailure);
+            if (terminal) {
+                const auto calls = driver.calls;
+                CHECK_THROWS_AS(source->Next(), gpu::CudaContextFailure);
+                CHECK(driver.calls == calls);
+            }
+            driver.armed = false;
+        }
+        source.reset();
+        CUcontext restored{};
+        REQUIRE(cuCtxGetCurrent(&restored) == CUDA_SUCCESS);
+        CHECK(restored == driver.caller);
+    }
+    CHECK(authority->admission_open() == !terminal);
+    CHECK(authority->fact().occupancy == (terminal ? 1U : 0U));
+    CHECK(authority->fact().reservations == 0U);
 }

@@ -1,4 +1,5 @@
 module;
+#include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAStream.h>
@@ -819,6 +820,12 @@ PredictionRunResult PredictionSession::RunResolved(const PredictRequest& request
         auto& bound = *static_cast<BoundPredictionCall*>(opaque);
         *bound.result = bound.state->RunResolved(*bound.options, *bound.artifact, bound.command_stream, *bound.delivery);
     });
+    } catch (const mmltk::frameworks::gpu::CudaContextFailure& error) {
+        if (error.terminal()) {
+            state_->poisoned = true;
+            throw runtime::CudaOperationError{cudaErrorUnknown, "prediction video caller context"};
+        }
+        throw;
     } catch (const runtime::CudaOperationError&) {
         state_->poisoned = true;
         throw;

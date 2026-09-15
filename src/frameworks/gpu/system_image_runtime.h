@@ -75,7 +75,9 @@ class SystemImageRuntime final {
     [[nodiscard]] bool UsesContext(const DeviceContext&) const noexcept;
     void BindContext();
     void BeginWork();
-    [[nodiscard]] Retirement Retire() noexcept;
+    // A known unproved execution boundary retains exact state without issuing
+    // further GPU commands. Omission performs ordinary checked settlement.
+    [[nodiscard]] Retirement Retire(std::exception_ptr unproved_execution = {}) noexcept;
     [[nodiscard]] static std::optional<UnsafeCustody> UnsafeConstruction(std::exception_ptr) noexcept;
     using OutputCandidate = ImageProductPool::Candidate;
     using CompletedOutput = ImageProductPool::Product;

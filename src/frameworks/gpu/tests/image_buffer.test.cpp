@@ -1,3 +1,4 @@
+#include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -3127,4 +3128,88 @@ TEST_CASE("canonical adoption validates ownership before changing the caller bin
 }
 
 }  // namespace
+}  // namespace mmltk::frameworks::gpu
+
+namespace mmltk::frameworks::gpu {
+TEST_CASE("exact CUDA context transactions restore or retain their physical owner once", "[gpu][context]") {
+    enum class Failure { None, Query, Bind, RestoreOnce, RestoreAlways, BindAndRestore, LostRestore };
+    const auto failure = GENERATE(Failure::None, Failure::Query, Failure::Bind, Failure::RestoreOnce, Failure::RestoreAlways, Failure::BindAndRestore, Failure::LostRestore);
+    const bool same_context = GENERATE(false, true);
+    struct Driver final {
+        CUcontext caller = reinterpret_cast<CUcontext>(1U);
+        CUcontext current = caller;
+        CUcontext target;
+        Failure failure;
+        unsigned sets = 0U;
+        unsigned restores = 0U;
+        unsigned terminal = 0U;
+        bool work = false;
+    } driver{.target = reinterpret_cast<CUcontext>(same_context ? 1U : 2U), .failure = failure};
+    const CudaContextApi api{&driver,
+        [](void* value, CUcontext* current) noexcept {
+            auto& driver = *static_cast<Driver*>(value);
+            if (driver.failure == Failure::Query) return CUDA_ERROR_INVALID_CONTEXT;
+            *current = driver.current;
+            return CUDA_SUCCESS;
+        },
+        [](void* value, CUcontext current) noexcept {
+            auto& driver = *static_cast<Driver*>(value);
+            if (++driver.sets == 1U && (driver.failure == Failure::Bind || driver.failure == Failure::BindAndRestore)) return CUDA_ERROR_INVALID_CONTEXT;
+            if (driver.sets > 1U && current == driver.caller) {
+                ++driver.restores;
+                if (driver.failure == Failure::LostRestore) return CUDA_ERROR_CONTEXT_IS_DESTROYED;
+                if (driver.failure == Failure::RestoreAlways || driver.failure == Failure::BindAndRestore || (driver.failure == Failure::RestoreOnce && driver.restores == 1U))
+                    return CUDA_ERROR_INVALID_CONTEXT;
+            }
+            driver.current = current;
+            return CUDA_SUCCESS;
+        }};
+    CudaContextScope scope({&driver, [](void* value) noexcept { ++static_cast<Driver*>(value)->terminal; }}, api);
+    const auto run = [&] { scope.Run([&] { scope.Select(driver.target); driver.work = true; }); };
+    if (failure == Failure::None) CHECK_NOTHROW(run());
+    else CHECK_THROWS(run());
+    CHECK(driver.work == (failure != Failure::Query && failure != Failure::Bind && failure != Failure::BindAndRestore));
+    const bool terminal = failure == Failure::Query || failure == Failure::RestoreAlways || failure == Failure::BindAndRestore || failure == Failure::LostRestore;
+    CHECK(scope.terminal() == terminal);
+    if (failure == Failure::LostRestore) CHECK(driver.restores == 1U);
+    CHECK(driver.terminal == (terminal ? 1U : 0U));
+    if (!terminal) CHECK(driver.current == driver.caller);
+    if (terminal) {
+        scope.Abandon();
+        CHECK(driver.terminal == 1U);
+        const auto calls = driver.sets;
+        CHECK_THROWS(scope.Run([&] { scope.Select(driver.target); }));
+        CHECK(driver.sets == calls);
+    }
+}
+
+TEST_CASE("unproved execution retains runtime before any retirement GPU command", "[gpu][context][retirement]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime::UnsafeCustody retained;
+    unsigned ingress_calls = 0U;
+    struct Model final : SystemImageModel {
+        explicit Model(unsigned& count) : count_(count) {}
+        void StopIngress() noexcept override { ++count_; }
+        unsigned& count_;
+    };
+    {
+        SystemImageRuntime runtime({.device = 0, .backend = backend, .model = std::make_unique<Model>(ingress_calls), .output_buffer_count = 2U});
+        runtime.Publish(2U, 2U, [](auto, auto, auto) {});
+        const auto settled = backend->synchronized.load();
+        const auto destroyed = backend->streams_destroyed.load();
+        auto outcome = runtime.Retire(std::make_exception_ptr(CudaContextFailure(true)));
+        CHECK_FALSE(outcome.safe_to_destroy);
+        CHECK(outcome.custody.valid());
+        CHECK_FALSE(outcome.custody.deferred());
+        CHECK_THROWS(runtime.BeginWork());
+        CHECK_FALSE(runtime.Retire().safe_to_destroy);
+        CHECK(backend->synchronized == settled);
+        CHECK(backend->streams_destroyed == destroyed);
+        retained = std::move(outcome.custody);
+    }
+    CHECK(ingress_calls == 0U);
+    CHECK(backend->streams_destroyed == 0U);
+    CHECK(backend->contexts_destroyed == 0U);
+}
+
 }  // namespace mmltk::frameworks::gpu

@@ -1,5 +1,7 @@
 #pragma once
 #include <array>
+#include "src/backend/imaging/raster/chw_image.h"
+#include "src/frameworks/gpu/cuda_context_scope.h"
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
@@ -13,6 +15,10 @@
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller::detail {
+[[nodiscard]] mmltk::frameworks::gpu::DeviceContext CreatePredictionPreviewContext(
+    const mmltk::frameworks::gpu::DeviceExecution&,
+    const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>&,
+    mmltk::frameworks::gpu::CudaContextApi = {});
 // A slot owns raw model-space products. Only the visual worker draws it.
 class PredictionPreviewFrame final {
    public:
@@ -27,8 +33,9 @@ class PredictionPreviewFrame final {
    private:
     friend class PredictionPreviewPool;
     struct State;
-    PredictionPreviewFrame(const mmltk::frameworks::gpu::DeviceExecution&, const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>);
+    PredictionPreviewFrame(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>, std::shared_ptr<void>, mmltk::frameworks::gpu::CudaContextApi);
     void RetainUnsafe(cudaError_t) const noexcept;
+    [[nodiscard]] mmltk::frameworks::gpu::CudaContextScope ContextScope() const noexcept;
     std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_;
     mutable mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_;
     std::shared_ptr<State> state_;
@@ -42,6 +49,8 @@ class PredictionPreviewPool final {
         decltype(&cudaStreamSynchronize) settle;
         decltype(&cuMemHostRegister) register_host;
         decltype(&cudaMemcpyAsync) upload = &cudaMemcpyAsync;
+        mmltk::frameworks::gpu::CudaContextApi context_api{};
+        decltype(&mmltk::backend::imaging::raster::chw_float_to_rgba) convert = &mmltk::backend::imaging::raster::chw_float_to_rgba;
     };
     PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext,
                           TransferOperations operations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister},

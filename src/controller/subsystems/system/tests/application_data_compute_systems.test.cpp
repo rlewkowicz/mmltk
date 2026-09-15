@@ -633,6 +633,7 @@ struct PredictionReceiverFault final {
     mmltk::testsupport::TestGate upload{"prediction receiver upload"};
     bool terminal = false;
     bool enabled = false;
+    std::atomic_bool partial_draw = false;
     PredictRuntime::PreviewRetirement retirement;
     std::weak_ptr<std::array<std::uint8_t, 48U>> decoded;
 };
@@ -649,6 +650,19 @@ cudaError_t prediction_receiver_upload(void* destination, const void* source, st
     if (fault->terminal) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(
         std::make_exception_ptr(std::runtime_error("injected receiver completion failure")));
     return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
+}
+
+int prediction_receiver_convert(const float* source, std::uint32_t width, std::uint32_t height,
+    std::uint8_t* destination, std::size_t pitch, std::uintptr_t stream) noexcept {
+    auto* fault = prediction_receiver_fault.load();
+    if (fault && fault->partial_draw) {
+        const auto command = reinterpret_cast<cudaStream_t>(stream);
+        const auto written = cudaMemset2DAsync(destination, pitch, 123, width * 4U, 1U, command);
+        if (written != cudaSuccess) return written;
+        const auto settled = cudaStreamSynchronize(command);
+        return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
+    }
+    return mmltk::backend::imaging::raster::chw_float_to_rgba(source, width, height, destination, pitch, stream);
 }
 
 class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime, public PredictRuntime {
@@ -678,7 +692,7 @@ class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime,
         const auto context = current_context();
         if (!context) return terminal;
         if (!preview_) preview_ = std::make_unique<detail::PredictionPreviewPool>(execution, *context,
-            detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &prediction_receiver_upload}, retirement);
+            detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &prediction_receiver_upload, {}, &prediction_receiver_convert}, retirement);
         if (receiver_fault_ && receiver_fault_->enabled) {
             receiver_fault_->retirement = retirement;
             auto decoded = std::make_shared<std::array<std::uint8_t, 48U>>();
@@ -741,16 +755,24 @@ class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime,
 
 class UnsafePredictRuntime final : public PredictRuntime {
    public:
-    UnsafePredictRuntime(bool on_close, std::shared_ptr<int> custody) : on_close_(on_close), custody_(std::move(custody)) {}
-    void Close() noexcept override { unsafe_ = true; }
+    UnsafePredictRuntime(bool on_close, std::shared_ptr<int> custody, bool preview_terminal = false)
+        : on_close_(on_close), preview_terminal_(preview_terminal), custody_(std::move(custody)) {}
+    void Close() noexcept override { ++*custody_; unsafe_ = true; }
     [[nodiscard]] bool HasUnsafeCustody() const noexcept override { return unsafe_; }
     contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token,
-        const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent, const ContextProvider&, const PreviewRetirement&) override {
+        const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent, const ContextProvider&, const PreviewRetirement& retirement) override {
+        if (preview_terminal_) {
+            auto lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement);
+            auto retained = custody_;
+            std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(retained)), cudaErrorUnknown);
+            throw mmltk::frameworks::gpu::CudaContextFailure(true);
+        }
         unsafe_ = !on_close_;
         throw std::runtime_error("test prediction failure");
     }
    private:
     bool on_close_;
+    bool preview_terminal_;
     bool unsafe_ = false;
     std::shared_ptr<int> custody_;
 };
@@ -1721,6 +1743,7 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
 
 TEST_CASE("Predict seals unsafe execution and close custody across repeated admission", "[controller][systems][predict][custody]") {
     const bool on_close = GENERATE(false, true);
+    const bool preview_terminal = GENERATE(false, true);
     ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-unsafe-admission")};
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto [settings, dataset, model] = fixture.systems();
@@ -1730,7 +1753,7 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
     std::promise<void> failed;
     {
         PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-            [&] { ++constructions; return std::make_unique<UnsafePredictRuntime>(on_close, custody); },
+            [&] { ++constructions; return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal); },
             [&](PredictSystem::event_type event) {
                 if (const auto* failure = std::get_if<PredictFailed>(&event);
                     failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
@@ -1741,6 +1764,7 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
         for (unsigned attempt = 0U; attempt < 4U; ++attempt)
             CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
         CHECK(constructions == 1U);
+        CHECK(*custody == (on_close && !preview_terminal ? 8 : 7));
         custody.reset();
     }
     CHECK_FALSE(retained.expired());
@@ -1859,7 +1883,7 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
     if (terminal) {
         const auto facts = fault->retirement->fact();
         CHECK(facts.occupancy == 1U);
-        CHECK(facts.occupancy + facts.reservations <= detail::PredictionPreviewPool::kSlotCapacity + 2U);
+        CHECK(facts.occupancy + facts.reservations <= detail::PredictionPreviewPool::kSlotCapacity + 3U);
     }
 }
 
@@ -2616,3 +2640,245 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
     CHECK(rgba[2] == 0U);
     CHECK(rgba[3] == 255U);
 }
+
+namespace mmltk::controller {
+
+TEST_CASE("preview context failure retains initialized state and source before returning", "[controller][gpu][context]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    const bool query_failure = GENERATE(false, true);
+    const bool terminal = GENERATE(false, true);
+    enum class Stage { Capture, Draw, Destruction };
+    const auto stage = GENERATE(Stage::Capture, Stage::Draw, Stage::Destruction);
+    struct Driver final {
+        bool armed = false;
+        bool query = false;
+        bool repeat = false;
+        unsigned failures = 0U;
+        unsigned calls = 0U;
+    } driver{.query = query_failure, .repeat = terminal};
+    gpu::CudaContextApi api{&driver,
+        [](void* owner, CUcontext* context) noexcept {
+            auto& driver = *static_cast<Driver*>(owner);
+            ++driver.calls;
+            if (driver.armed && driver.query) { ++driver.failures; return CUDA_ERROR_INVALID_CONTEXT; }
+            return cuCtxGetCurrent(context);
+        },
+        [](void* owner, CUcontext context) noexcept {
+            auto& driver = *static_cast<Driver*>(owner);
+            ++driver.calls;
+            const auto result = cuCtxSetCurrent(context);
+            if (driver.armed && !driver.query && (driver.repeat || driver.failures == 0U)) {
+                ++driver.failures;
+                return CUDA_ERROR_INVALID_CONTEXT;
+            }
+            return result;
+        }};
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+    auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity);
+    detail::PredictionPreviewPool::TransferOperations operations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister};
+    operations.context_api = api;
+    auto pool = std::make_unique<detail::PredictionPreviewPool>(execution, context, operations, authority);
+    auto decoded = std::make_shared<std::array<std::uint8_t, 12U>>();
+    const std::weak_ptr<void> retained = decoded;
+    auto classes = std::make_shared<const std::vector<std::string>>();
+    int stopped = 0;
+    const auto capture = [&] {
+        return pool->Capture(nullptr, {2U, 2U}, 0U, {}, {}, classes, 1, decoded->data(), decoded,
+            [](void* count) { ++*static_cast<int*>(count); }, &stopped);
+    };
+    if (stage == Stage::Destruction) { auto raw = capture(); REQUIRE(raw); }
+    const bool unsafe = query_failure || terminal;
+    if (stage == Stage::Draw) {
+        auto raw = capture();
+        REQUIRE(raw);
+        gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+            .adopted_context = context});
+        auto candidate = runtime.AcquireOutput();
+        driver.armed = true;
+        if (unsafe) {
+            CHECK_THROWS_AS(raw->Draw(runtime, candidate), gpu::ImageStreamExecutionFailure);
+            CHECK_THROWS(runtime.BeginWork());
+            CHECK_FALSE(runtime.Retire().safe_to_destroy);
+        } else {
+            CHECK_THROWS_AS(raw->Draw(runtime, candidate), gpu::CudaContextFailure);
+            CHECK_NOTHROW(runtime.BeginWork());
+        }
+        driver.armed = false;
+        raw.reset();
+        pool.reset();
+    } else if (stage == Stage::Destruction) {
+        driver.armed = true;
+        pool.reset();
+    }
+    else {
+        driver.armed = true;
+        if (unsafe) CHECK_THROWS_AS(capture(), mmltk::backend::ml::runtime::CudaOperationError);
+        else CHECK_THROWS_AS(capture(), gpu::CudaContextFailure);
+        CHECK(stopped == (unsafe ? 1 : 0));
+        if (unsafe) {
+            const auto calls = driver.calls;
+            CHECK_THROWS(capture());
+            CHECK(driver.calls == calls);
+        }
+        pool.reset();
+    }
+    CHECK(authority->admission_open() == !unsafe);
+    CHECK(authority->fact().occupancy == (unsafe ? 1U : 0U));
+    decoded.reset();
+    // A destructor restore failure occurs after settled source custody releases.
+    if (stage == Stage::Capture || query_failure) CHECK(retained.expired() == !unsafe);
+    driver.armed = false;
+}
+
+TEST_CASE("Predict replacement pressure coalesces without overwriting its selected image", "[controller][systems][predict][gpu]") {
+    ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-replacement-pressure")};
+    fixture.PrepareModel(contracts::FeatureId::Predict);
+    auto [settings, dataset, model] = fixture.systems();
+    auto gate = std::make_shared<StopGate>();
+    gate->Release();
+    auto fault = std::make_shared<PredictionReceiverFault>();
+    prediction_receiver_fault = fault.get();
+    const mmltk::testsupport::ScopedTestCleanup clear{[&] { prediction_receiver_fault = nullptr; }};
+    auto source_index = std::make_shared<std::atomic_int64_t>(0);
+    std::array<std::promise<void>, 6U> done;
+    std::array<std::promise<void>, 3U> images;
+    std::promise<void> failed;
+    std::atomic_size_t published = 0U;
+    std::atomic_uint64_t last_revision = 0U;
+    PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+        [&] { return std::make_unique<FakeComputeRuntime>(gate, false, nullptr, false, source_index, 1U); },
+        [&](PredictSystem::event_type event) {
+            if (const auto* changed = std::get_if<PredictChanged>(&event)) {
+                const auto& snapshot = changed->snapshot;
+                if (!snapshot.operation.active && snapshot.operation.generation_frontier <= done.size())
+                    mmltk::testsupport::release_test_promise(done[snapshot.operation.generation_frontier - 1U]);
+                if (snapshot.frame.valid() && snapshot.frame.revision > last_revision.load()) {
+                    last_revision = snapshot.frame.revision;
+                    const auto index = published.fetch_add(1U);
+                    if (index < images.size()) mmltk::testsupport::release_test_promise(images[index]);
+                }
+            }
+            if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(failed);
+        }};
+    const mmltk::testsupport::ScopedTestCleanup stop{[&] { prediction.Shutdown(); }};
+    const auto run = [&](std::size_t index) {
+        source_index->store(static_cast<std::int64_t>(index));
+        static_cast<void>(prediction.Start({}));
+        mmltk::testsupport::await_test_promise(done[index], "Predict semantic completion under display pressure");
+    };
+    run(0U);
+    mmltk::testsupport::await_test_promise(images[0U], "first Predict slot");
+    auto old_reader = prediction.BorrowFrame();
+    REQUIRE(old_reader.valid());
+    run(1U);
+    mmltk::testsupport::await_test_promise(images[1U], "selected Predict slot");
+    const auto selected = prediction.snapshot();
+    const auto pixels = [&] {
+        auto borrowed = prediction.BorrowFrame();
+        REQUIRE(borrowed.valid());
+        const auto plane = borrowed.plane(0U).plane();
+        borrowed.plane(0U).context().Bind();
+        std::array<std::uint8_t, 64U> result{};
+        REQUIRE(cudaMemcpy2D(result.data(), 16U, reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes,
+            16U, 4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+        return result;
+    };
+    const auto selected_pixels = pixels();
+    const auto check_metadata = [&] {
+        const auto metadata = prediction.ImageSnapshot(selected.frame);
+        REQUIRE(metadata);
+        CHECK(metadata->frame == selected.frame);
+        CHECK(metadata->content_identity == selected.content_identity);
+        CHECK(metadata->image_id == selected.image_id);
+        REQUIRE(metadata->labels.size() == selected.labels.size());
+        for (std::size_t index = 0U; index < selected.labels.size(); ++index) {
+            CHECK(metadata->labels[index].name == selected.labels[index].name);
+            CHECK(metadata->labels[index].box == selected.labels[index].box);
+            CHECK(metadata->labels[index].confidence == selected.labels[index].confidence);
+            CHECK(metadata->labels[index].category == selected.labels[index].category);
+            CHECK(metadata->labels[index].color == selected.labels[index].color);
+        }
+    };
+    fault->partial_draw = true;
+    run(2U);
+    run(3U); // bounded latest-product replacement while the other output is held
+    CHECK(published == 2U);
+    CHECK(prediction.snapshot().frame == selected.frame);
+    check_metadata();
+    CHECK(pixels() == selected_pixels);
+    old_reader = {};
+    mmltk::testsupport::await_test_promise(failed, "partial replacement draw failure after reader release");
+    CHECK(prediction.snapshot().frame == selected.frame);
+    check_metadata();
+    CHECK(pixels() == selected_pixels);
+    fault->partial_draw = false;
+    old_reader = prediction.BorrowFrame();
+    run(4U);
+    mmltk::testsupport::await_test_promise(images[2U], "successful replacement recovery");
+    CHECK(prediction.snapshot().content_identity > selected.content_identity);
+    CHECK(prediction.snapshot().frame.revision > selected.frame.revision);
+    CHECK(prediction.BorrowFrame().valid());
+    gate->Reset();
+    static_cast<void>(prediction.Start({}));
+    auto stopping = std::async(std::launch::async, [&] { return prediction.Stop(); });
+    static_cast<void>(mmltk::testsupport::await_test_future(stopping, "Stop while old output remains borrowed"));
+    mmltk::testsupport::await_test_promise(done[5U], "cancelled Predict execution with both display roles occupied");
+    CHECK_FALSE(prediction.snapshot().operation.active);
+    CHECK(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
+}
+
+TEST_CASE("preview context construction publishes only after exact caller restoration", "[controller][gpu][context]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    enum class Failure { None, Query, RestoreOnce, RestoreAlways };
+    const auto failure = GENERATE(Failure::None, Failure::Query, Failure::RestoreOnce, Failure::RestoreAlways);
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    int devices = 0;
+    REQUIRE(cudaGetDeviceCount(&devices) == cudaSuccess);
+    gpu::DeviceContext caller(devices > 1 ? 1 : 0, gpu::cuda_image_copy_backend());
+    caller.Bind();
+    struct Driver final {
+        Failure failure;
+        unsigned restores = 0U;
+        CUcontext candidate = nullptr;
+    } driver{failure};
+    CUcontext previous{};
+    REQUIRE(cuCtxGetCurrent(&previous) == CUDA_SUCCESS);
+    gpu::CudaContextApi api{&driver,
+        [](void* owner, CUcontext* context) noexcept {
+            if (static_cast<Driver*>(owner)->failure == Failure::Query) return CUDA_ERROR_INVALID_CONTEXT;
+            return cuCtxGetCurrent(context);
+        },
+        [](void* owner, CUcontext context) noexcept {
+            auto& driver = *static_cast<Driver*>(owner);
+            if (driver.restores == 0U) static_cast<void>(cuCtxGetCurrent(&driver.candidate));
+            const auto result = cuCtxSetCurrent(context);
+            ++driver.restores;
+            if (driver.failure == Failure::RestoreAlways || (driver.failure == Failure::RestoreOnce && driver.restores == 1U))
+                return CUDA_ERROR_INVALID_CONTEXT;
+            return result;
+        }};
+    auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 3U);
+    // Existing current, in-flight and pending frames can reserve all five other slots.
+    std::array<gpu::TerminalCudaRetirementLease, detail::PredictionPreviewPool::kSlotCapacity + 2U> frames;
+    for (auto& lease : frames) lease = gpu::ReserveTerminalCudaLease(*authority);
+    std::optional<gpu::DeviceContext> published;
+    const auto create = [&] { published = detail::CreatePredictionPreviewContext(execution, authority, api); };
+    if (failure == Failure::None) CHECK_NOTHROW(create());
+    else CHECK_THROWS_AS(create(), gpu::CudaContextFailure);
+    const bool terminal = failure == Failure::Query || failure == Failure::RestoreAlways;
+    CHECK(published.has_value() == (failure == Failure::None));
+    CHECK(authority->admission_open() == !terminal);
+    CHECK(authority->fact().occupancy == (terminal ? 1U : 0U));
+    CHECK(authority->fact().reservations == frames.size());
+    CUcontext restored{};
+    REQUIRE(cuCtxGetCurrent(&restored) == CUDA_SUCCESS);
+    CHECK(restored == previous);
+    if (failure == Failure::RestoreAlways) {
+        REQUIRE(driver.candidate != previous);
+        unsigned version{};
+        CHECK(cuCtxGetApiVersion(driver.candidate, &version) == CUDA_SUCCESS);
+    }
+}
+
+}  // namespace mmltk::controller

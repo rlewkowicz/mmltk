@@ -6,8 +6,14 @@
 #include <memory>
 #include <optional>
 #include <stop_token>
-namespace mmltk::frameworks::gpu { class TerminalCudaRetirementOwner; }
+namespace mmltk::frameworks::gpu {
+class TerminalCudaRetirementOwner;
+struct CudaContextApi;
+}
 namespace mmltk::backend::media::video {
+namespace test_support {
+struct VideoFileSourceTestAccess;
+}
 struct VideoFrame final {
     const float* chw = nullptr;
     std::uint32_t width = 0U;
@@ -33,8 +39,13 @@ class VideoFileSource final {
     [[nodiscard]] double frames_per_second() const noexcept;
     [[nodiscard]] std::uint64_t frame_count() const noexcept;
    private:
+    VideoFileSource(const std::filesystem::path&, int device, std::uintptr_t stream, std::stop_token,
+                    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
+                    decltype(&cudaStreamSynchronize) settle,
+                    mmltk::frameworks::gpu::CudaContextApi context_api);
     struct State;
     struct Owner;
     std::unique_ptr<Owner> owner_;
+    friend struct test_support::VideoFileSourceTestAccess;
 };
 }
