@@ -1485,3 +1485,43 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
     REQUIRE(browser::encode_server_record(browser::ServerRecord{std::move(bootstrap)}, encoded));
     CHECK(encoded.size() < browser::kMaxRecordWireBytes);
 }
+
+TEST_CASE("Predict scalar progress excludes full retained labels and keeps native observation", "[browser][predict][reflection]") {
+    using namespace mmltk::controller;
+    namespace reflection = mmltk::frameworks::reflection;
+    PredictSnapshot snapshot;
+    CHECK_FALSE(PredictSystem::visual_source::Observe(snapshot).valid());
+    snapshot.revision = 19U;
+    snapshot.content_identity = std::uint64_t{1} << 40U;
+    snapshot.frame = visual_frame({PresentationSourceKind::Predict, 1U}, {64U, 64U}, 7U);
+    snapshot.operation.generation_frontier = 3U;
+    snapshot.operation.active = true;
+    snapshot.operation.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, 3U);
+    snapshot.operation.progress = {9U, 7U, 0U, "Decoded"};
+    snapshot.video = true;
+    snapshot.labels.resize(contracts::kAnnotationObjectCapacity);
+    for (auto& label : snapshot.labels) label.name.assign(256U, 'c');
+    const auto* retained_labels = snapshot.labels.data();
+    const auto progress = reflection::project_record<PredictProgressState>(snapshot);
+    const auto encoded = browser::application_materializer_detail::reflected_value(PredictProgress{progress});
+    REQUIRE(encoded);
+    const auto observed = PredictSystem::visual_source::Observe(snapshot);
+    CHECK(observed.snapshot_revision == snapshot.frame.revision);
+    CHECK(observed.frame == snapshot.frame);
+    CHECK(snapshot.labels.data() == retained_labels);
+    const auto metadata = PredictSystem::visual_source::ImageOf(snapshot);
+    CHECK(metadata.content_identity == snapshot.content_identity);
+    CHECK(metadata.labels.size() == contracts::kAnnotationObjectCapacity);
+    snapshot.labels.clear();
+    CHECK(browser::application_materializer_detail::reflected_value(
+        PredictProgress{reflection::project_record<PredictProgressState>(snapshot)}) == encoded);
+    browser::wire::CountingEncoder measure{{.max_bytes = 4096U, .max_items = 4096U, .max_depth = browser::kMaxIntentValueDepth}};
+    const auto bytes = measure.measure(*encoded);
+    REQUIRE(bytes);
+    CHECK(*bytes < 256U);
+    snapshot.frame = visual_frame({PresentationSourceKind::Predict, 1U}, {}, 8U);
+    const auto invalidated = PredictSystem::visual_source::Observe(snapshot);
+    CHECK_FALSE(invalidated.valid());
+    CHECK(invalidated.snapshot_revision == 8U);
+    CHECK(invalidated.frame != observed.frame);
+}

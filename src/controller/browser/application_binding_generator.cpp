@@ -1153,25 +1153,42 @@ class BindingEmitter final {
     }
     std::set<std::string> compact_types_;
 
+    template <class Source, class Target>
+    void EmitRecordProjection(bool required, bool apply) {
+        EmitType<Target>();
+        bool projectable = true;
+        VisitRustFields<Target>([&]<class Destination, class>(const auto&, const std::string& target) {
+            bool found = false;
+            VisitRustFields<Source>([&]<class Member, class>(const auto&, const std::string& source) {
+                if constexpr (std::same_as<Destination, Member>) found = found || source == target;
+            });
+            projectable = projectable && found;
+        });
+        if (!projectable) {
+            if (required) throw std::logic_error("declared progress projection does not match its snapshot");
+            return;
+        }
+        output_ << "impl From<&" << rust_type<Source>() << "> for " << rust_type<Target>()
+                << " { fn from(source: &" << rust_type<Source>() << ") -> Self { Self {\n";
+        VisitRustFields<Target>([&]<class, class>(const auto&, const std::string& member) {
+            output_ << member << ": source." << member << ".clone(),\n";
+        });
+        output_ << "} } }\n";
+        if (apply) {
+            symbols_.Reserve("impl " + rust_type<Target>(), "apply_to", "canonical progress projection");
+            output_ << "impl " << rust_type<Target>() << " { pub fn apply_to(&self, target: &mut " << rust_type<Source>() << ") {\n";
+            VisitRustFields<Target>([&]<class, class>(const auto&, const std::string& member) {
+                output_ << "target." << member << " = self." << member << ".clone();\n";
+            });
+            output_ << "} }\n";
+        }
+    }
+
     void EmitImageMetadata() {
         Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
-            EmitType<typename Projection::image_type>();
-            bool projectable = true;
-            VisitRustFields<typename Projection::image_type>([&]<class Target, class>(const auto&, const std::string& target) {
-                bool found = false;
-                VisitRustFields<typename Projection::snapshot_type>([&]<class Source, class>(const auto&, const std::string& source) {
-                    if constexpr (std::same_as<Target, Source>) found = found || source == target;
-                });
-                projectable = projectable && found;
-            });
-            if (projectable) {
-                output_ << "impl From<&" << rust_type<typename Projection::snapshot_type>() << "> for "
-                        << rust_type<typename Projection::image_type>() << " { fn from(source: &"
-                        << rust_type<typename Projection::snapshot_type>() << ") -> Self { Self {\n";
-                VisitRustFields<typename Projection::image_type>([&]<class, class>(const auto&, const std::string& member) {
-                    output_ << member << ": source." << member << ".clone(),\n";
-                });
-                output_ << "} } }\n";
+            EmitRecordProjection<typename Projection::snapshot_type, typename Projection::image_type>(false, false);
+            if constexpr (requires { typename Cell::type::progress_type; }) {
+                EmitRecordProjection<typename Projection::snapshot_type, typename Cell::type::progress_type>(true, true);
             }
         });
         symbols_.Reserve("module", "WorkspaceImageProduct", "canonical visual source image projections");

@@ -12484,7 +12484,7 @@ pub(crate) mod tests {
         surface.viewer_identity = model.explore.snapshot.as_ref().and_then(|snapshot| {
             snapshot
                 .selectedimage
-                .map(|image| (snapshot.dataset.identity, image))
+                .map(|image| (snapshot.dataset.identity, u64::from(image)))
         });
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(640.0, 480.0));
         record_probe_draw(EXPLORE_GALLERY, surface, bounds, bounds, bounds);

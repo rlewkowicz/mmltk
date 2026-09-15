@@ -586,7 +586,7 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
         || metadata::product(frame).as_ref() != Some(source)
         || detail.explore.mode != crate::generated::ExploreMode::Detail
         || detail.viewer_identity().is_none()
-        || surface.viewer_identity != detail.viewer_identity()
+        || surface.viewer_identity != detail.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image)))
     {
         return None;
     }
@@ -1020,7 +1020,7 @@ pub struct Surface {
     // Only accept_publication + SampleRead can authorize an external read.
     pub frame: Option<FrameReady>,
     pub crop: Option<[u32; 4]>,
-    pub viewer_identity: Option<(u64, u32)>,
+    pub viewer_identity: Option<(u64, u64)>,
     pub fit_revision: u64,
 }
 
@@ -1057,7 +1057,7 @@ impl Surface {
         (width, height)
     }
 
-    fn transform_identity(self) -> Option<(u64, u32, u64)> {
+    fn transform_identity(self) -> Option<(u64, u64, u64)> {
         self.viewer_identity
             .or_else(|| self.frame.map(|frame| (frame.content_session, 0)))
             .map(|(session, image)| (session, image, self.fit_revision))
@@ -1225,7 +1225,7 @@ pub(crate) struct ViewportOwner {
     pan_origin: Option<Point>,
     pointer_active: bool,
     last_pointer_sample: Option<SurfaceSample>,
-    content_session: Option<(u64, u32, u64)>,
+    content_session: Option<(u64, u64, u64)>,
 }
 
 impl Default for ViewportOwner {
@@ -1813,7 +1813,7 @@ pub(crate) fn drawable_prediction(requested: Surface) -> Option<(Surface, std::s
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
         SurfaceRenderer::submitted_draws(&renderer.pending, &renderer.imported, requested)
-            .find_map(|(_, pending)| Some((requested, pending.prediction.clone()?)))
+            .find_map(|(_, pending)| Some((pending.surface, pending.prediction.clone()?)))
             .or_else(|| {
                 let image = &renderer.imported.as_ref()?.image;
                 Some((image.retained()?, image.prediction.clone()?))
@@ -1887,7 +1887,7 @@ impl DetailContent {
         original: bool,
         fit_revision: u64,
     ) -> Surface {
-        surface.viewer_identity = self.viewer_identity();
+        surface.viewer_identity = self.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image)));
         surface.fit_revision = fit_revision;
         surface.crop = original.then(|| {
             let region = &self.frame().content;
@@ -3968,7 +3968,7 @@ mod tests {
         let surface = Surface {
             viewer_identity: snapshot
                 .selectedimage
-                .map(|image| (snapshot.dataset.identity, image)),
+                .map(|image| (snapshot.dataset.identity, u64::from(image))),
             ..metadata::surface(frame).unwrap()
         };
         record_drawn_detail(surface, surface.content_region());
@@ -4067,7 +4067,7 @@ mod tests {
                             original.crop,
                             Some([region.x, region.y, region.width, region.height])
                         );
-                        assert_eq!(original.viewer_identity, content.viewer_identity());
+                        assert_eq!(original.viewer_identity, content.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image))));
                         assert_eq!(original.fit_revision, 19);
                         assert_eq!(content.configure_surface(shown, false, 20).crop, None);
                     } else {
@@ -4138,7 +4138,7 @@ mod tests {
         assert!(physical.matches_content(detail.frame()));
         let configured = detail.configure_surface(surface, true, 2);
         assert_eq!(configured.crop, Some([8, 4, 32, 24]));
-        assert_eq!(configured.viewer_identity, detail.viewer_identity());
+        assert_eq!(configured.viewer_identity, detail.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image))));
         assert_eq!(
             detail.frame().source.kind,
             crate::generated::PresentationSourceKind::Upscale
@@ -5849,4 +5849,65 @@ mod tests {
         frame.layer = 3;
         assert_eq!(mailbox_binding(frame), None);
     }
+    #[test]
+    fn prediction_metadata_keeps_identity_with_retained_pixels_and_video_revisions() {
+        reset_test_releases();
+        let model = crate::view_model::test_support::bootstrapped();
+        let mut snapshot = model.predict_snapshot.clone().unwrap();
+        snapshot.contentidentity = (1_u64 << 40) + 9;
+        let session = crate::generated::presentation_source_session(crate::generated::PresentationSourceKind::Predict);
+        let install = |snapshot: &crate::generated::PredictSnapshot, sequence| {
+            let frame = frame_ready(session, sequence, sequence, 640, 480);
+            let mut product = crate::generated::PredictImageMetadata::from(snapshot);
+            product.frame = crate::view_model::test_support::visual_frame(crate::generated::PresentationSourceKind::Predict, sequence);
+            product.frame.extent.width = 640;
+            product.frame.extent.height = 480;
+            product.frame.content.width = 640;
+            product.frame.content.height = 480;
+            metadata::install(frame, 640, 480, sequence, &metadata::encode(product.frame.clone(),
+                metadata::encode_product(crate::generated::ApplicationSystem::Predict, product), None)).unwrap();
+            frame
+        };
+        let first = install(&snapshot, 1);
+        assert!(accept_publication(first));
+        let initial = metadata::pending(first).unwrap();
+        let mut image = ImagePublication {
+            surface: initial.surface, completed: Some(first), pending_sample: None,
+            retained_read: SampleRead::acquire(first), gallery: None, detail: None, annotation: None,
+            prediction: initial.prediction, placement: Placement::Contain,
+        };
+        let mut viewport = ViewportOwner::default();
+        viewport.synchronize_source(image.retained().unwrap());
+        viewport.zoom = 2.0;
+        viewport.pan_x = 17.0;
+        let retained_identity = image.retained().unwrap().viewer_identity;
+        for sequence in [2, 3] { // same-image overlay or sequential video frame
+            let frame = install(&snapshot, sequence);
+            let paired = metadata::surface(frame).unwrap();
+            assert_eq!(paired.viewer_identity, retained_identity);
+            assert_eq!(viewport.transform_for(paired).zoom, 2.0);
+            metadata::retire(frame);
+        }
+        snapshot.contentidentity += 1; // different compiled/ordinary image
+        let next = install(&snapshot, 4);
+        assert!(accept_publication(next));
+        let mut pending = metadata::pending(next).unwrap();
+        pending.read = SampleRead::acquire(next);
+        pending.complete = false;
+        let next_surface = pending.surface;
+        image.pending_sample = Some(pending);
+        assert!(!image.promote(next, &model));
+        assert_eq!(image.retained().unwrap().viewer_identity, retained_identity);
+        assert_eq!(viewport.transform_for(image.retained().unwrap()).zoom, 2.0);
+        assert_ne!(next_surface.viewer_identity, retained_identity);
+        assert_eq!(viewport.transform_for(next_surface).zoom, 1.0);
+        image.complete(next);
+        assert!(image.promote(next, &model));
+        assert_eq!(image.retained().unwrap().viewer_identity, next_surface.viewer_identity);
+        viewport.synchronize_source(image.retained().unwrap());
+        assert_eq!(viewport.zoom, 1.0);
+        assert_eq!(viewport.pan_x, 0.0);
+        drop(image);
+    }
+
 }

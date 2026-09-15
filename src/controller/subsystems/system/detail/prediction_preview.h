@@ -28,30 +28,37 @@ class PredictionPreviewFrame final {
     friend class PredictionPreviewPool;
     struct State;
     PredictionPreviewFrame(const mmltk::frameworks::gpu::DeviceExecution&, const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>);
+    void RetainUnsafe(cudaError_t) const noexcept;
     std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_;
-    mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_;
+    mutable mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_;
     std::shared_ptr<State> state_;
 };
 class PredictionPreviewPool final {
    public:
+    static constexpr std::size_t kSlotCapacity = 3U;
     struct TransferOperations final {
         decltype(&cuMemcpyPeerAsync) copy;
         decltype(&cudaEventRecord) record;
         decltype(&cudaStreamSynchronize) settle;
         decltype(&cuMemHostRegister) register_host;
+        decltype(&cudaMemcpyAsync) upload = &cudaMemcpyAsync;
     };
     PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext,
-                          TransferOperations operations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister});
+                          TransferOperations operations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister},
+                          std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {});
     [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(
         const float*, VisualExtent, std::uintptr_t source_stream,
         std::span<const mmltk::backend::models::rfdetr::Prediction>,
         const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&, std::shared_ptr<const std::vector<std::string>>, int classes,
         const std::uint8_t* rgb8 = nullptr, std::shared_ptr<void> source_custody = {}, void (*stop_source)(void*) = nullptr, void* source_control = nullptr);
+    [[nodiscard]] bool HasUnsafeSourceCustody() const noexcept { return unsafe_source_; }
+    [[nodiscard]] bool HasUnsafeCustody() const noexcept { return !retirement_->admission_open(); }
    private:
+    bool unsafe_source_ = false;
     TransferOperations operations_;
     mmltk::frameworks::gpu::DeviceExecution execution_;
     mmltk::frameworks::gpu::DeviceContext context_;
-    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_ = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(3U);
-    std::array<std::shared_ptr<PredictionPreviewFrame>, 3U> slots_{};
+    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_;
+    std::array<std::shared_ptr<PredictionPreviewFrame>, kSlotCapacity> slots_{};
 };
 }

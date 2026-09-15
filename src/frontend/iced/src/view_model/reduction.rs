@@ -27,6 +27,7 @@ impl ApplicationModel {
         self.model_snapshot = None;
         self.live_snapshot = None;
         self.predict_snapshot = None;
+        self.predict_full_progress = None;
         self.upscale_snapshot = None;
         self.workflow = WorkflowModel::default();
         self.explore.reset_transport();
@@ -246,7 +247,7 @@ impl ApplicationModel {
         &mut self,
         snapshot: PredictSnapshot,
     ) -> Result<Observation, UiError> {
-        merge_predict_snapshot(&mut self.predict_snapshot, snapshot)
+        merge_predict_snapshot(&mut self.predict_snapshot, &mut self.predict_full_progress, snapshot)
     }
 
     pub(super) fn install_training_snapshot(
@@ -748,35 +749,68 @@ pub(super) fn merge_live_snapshot(
     merge_observation(target, incoming, |value| value.revision, "Live")
 }
 
-pub(super) fn merge_predict_snapshot(
+pub(super) fn merge_predict_progress(
     target: &mut Option<PredictSnapshot>,
-    mut incoming: PredictSnapshot,
+    mut incoming: crate::generated::PredictProgressState,
 ) -> Result<Observation, UiError> {
     let Some(installed) = target.as_mut() else {
-        *target = Some(incoming);
-        return Ok(Observation::Installed);
+        return Err(UiError::protocol("Predict progress arrived before bootstrap"));
     };
-    if incoming.revision < installed.revision {
-        return Ok(Observation::Stale);
-    }
+    if incoming.revision < installed.revision { return Ok(Observation::Stale); }
     if incoming.revision == installed.revision {
-        return if incoming == *installed {
+        return if incoming == crate::generated::PredictProgressState::from(&*installed) {
             Ok(Observation::Current)
-        } else {
-            Err(UiError::protocol("inconsistent Predict snapshot revision"))
-        };
+        } else { Err(UiError::protocol("inconsistent Predict progress revision")) };
     }
     let mut operation = installed.operation.clone();
     if merge_compute_state(&mut operation, incoming.operation.clone())? == Observation::Stale {
         return Ok(Observation::Stale);
     }
     incoming.operation = operation;
-    if incoming.frame.revision < installed.frame.revision {
-        return Ok(Observation::Stale);
+    incoming.apply_to(installed);
+    Ok(Observation::Installed)
+}
+
+pub(super) fn merge_predict_snapshot(
+    target: &mut Option<PredictSnapshot>,
+    full_progress: &mut Option<crate::generated::PredictProgressState>,
+    mut incoming: PredictSnapshot,
+) -> Result<Observation, UiError> {
+    use crate::generated::PredictProgressState;
+    let full = PredictProgressState::from(&incoming);
+    let Some(installed) = target.as_mut() else {
+        *full_progress = Some(full);
+        *target = Some(incoming);
+        return Ok(Observation::Installed);
+    };
+    let previous_full = full_progress.as_ref().expect("installed Predict full observation");
+    if incoming.revision < previous_full.revision { return Ok(Observation::Stale); }
+    let latest = PredictProgressState::from(&*installed);
+    if incoming.revision == previous_full.revision {
+        if full != *previous_full {
+            return Err(UiError::protocol("inconsistent Predict snapshot revision"));
+        }
+        // Compare the full image without copying retained labels or mistaking
+        // newer scalar observations for a conflicting full snapshot.
+        latest.apply_to(&mut incoming);
+        return if incoming == *installed { Ok(Observation::Current) }
+            else { Err(UiError::protocol("inconsistent Predict snapshot revision")) };
     }
+    if incoming.frame.revision < installed.frame.revision { return Ok(Observation::Stale); }
     if incoming.frame.revision == installed.frame.revision && incoming.frame != installed.frame {
         return Err(UiError::protocol("inconsistent Predict frame revision"));
     }
+    let mut operation = installed.operation.clone();
+    if merge_compute_state(&mut operation, incoming.operation.clone())? == Observation::Stale {
+        return Ok(Observation::Stale);
+    }
+    incoming.operation = operation;
+    if incoming.revision < latest.revision {
+        latest.apply_to(&mut incoming);
+    } else if incoming.revision == latest.revision && full != latest {
+        return Err(UiError::protocol("inconsistent Predict progress revision"));
+    }
+    *full_progress = Some(full);
     *installed = incoming;
     Ok(Observation::Installed)
 }

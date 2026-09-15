@@ -1044,7 +1044,7 @@ mod tests {
                 viewer_identity: app.model.explore.snapshot.as_ref().and_then(|snapshot| {
                     snapshot
                         .selectedimage
-                        .map(|image| (snapshot.dataset.identity, image))
+                        .map(|image| (snapshot.dataset.identity, u64::from(image)))
                 }),
                 crop: (crop != [0, 0, frame.content_width, frame.content_height]).then_some(crop),
                 ..surface

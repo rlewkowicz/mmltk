@@ -61,6 +61,7 @@ struct PredictionPreviewFrame::State final {
     bool source_recorded = false;
     const std::uint8_t* rgb8 = nullptr;
     decltype(&cuMemHostRegister) register_host = &cuMemHostRegister;
+    decltype(&cudaMemcpyAsync) upload = &cudaMemcpyAsync;
     mmltk::common::system::ExecutionPlacement placement;
     std::shared_ptr<void> decoded_source;
     std::unique_ptr<gpu::PinnedHostBuffer> pinned;
@@ -84,6 +85,8 @@ PredictionPreviewFrame::PredictionPreviewFrame(const gpu::DeviceExecution& execu
     state_ = std::make_shared<State>(execution, context);
 }
 PredictionPreviewFrame::~PredictionPreviewFrame() {
+    // Draw may have installed exact custody while the pool still held this frame.
+    if (state_->unsafe != cudaSuccess) return;
     cudaError_t failure = state_->unsafe;
     try {
         ContextScope scope(state_->context);
@@ -95,14 +98,24 @@ PredictionPreviewFrame::~PredictionPreviewFrame() {
         if (failure == cudaSuccess && state_->pinned && state_->pinned->ReleaseSettled() != CUDA_SUCCESS) failure = cudaErrorUnknown;
         if (failure == cudaSuccess) state_.reset();
     } catch (...) { failure = cudaErrorUnknown; }
-    if (failure != cudaSuccess) std::move(lease_).Install(gpu::TerminalCudaCustody::Share(std::move(state_)), failure);
+    if (failure != cudaSuccess) RetainUnsafe(failure);
+}
+void PredictionPreviewFrame::RetainUnsafe(cudaError_t failure) const noexcept {
+    // The frame's transaction lock (or sole-owner destruction) serializes installation.
+    if (state_->unsafe.exchange(failure) == cudaSuccess) {
+        auto retained = state_;
+        std::move(lease_).Install(gpu::TerminalCudaCustody::Share(std::move(retained)), failure);
+    }
 }
 std::span<const rfdetr::Prediction> PredictionPreviewFrame::predictions() const noexcept { return state_->predictions; }
 const std::vector<std::string>& PredictionPreviewFrame::classes() const noexcept { return *state_->catalog; }
 int PredictionPreviewFrame::class_count() const noexcept { return state_->category_count; }
-PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu::DeviceContext context, TransferOperations operations)
-    : operations_(operations), execution_(std::move(execution)), context_(std::move(context)) {
-    if (!operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host)
+PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu::DeviceContext context, TransferOperations operations,
+                                           std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement)
+    : operations_(operations), execution_(std::move(execution)), context_(std::move(context)),
+      retirement_(retirement ? std::move(retirement) : std::make_shared<gpu::TerminalCudaRetirementOwner>(kSlotCapacity)) {
+    if (!retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
+    if (!operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host || !operations_.upload)
         throw std::invalid_argument("prediction transfer operations are incomplete");
     context_.ValidateSelection(execution_.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated,
                                execution_.placement.numa_node, execution_);
@@ -139,6 +152,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
     state.rgb8 = rgb8;
     state.decoded_source = rgb8 ? source_custody : std::shared_ptr<void>{};
     state.register_host = operations_.register_host;
+    state.upload = operations_.upload;
     state.placement = execution_.placement;
     state.extent = extent;
     state.boxes_offset = pixel_bytes;
@@ -187,8 +201,9 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
             } catch (...) { source_status = cudaErrorUnknown; }
         }
         if (source_status != cudaSuccess) {
+            unsafe_source_ = true;
             state.source_custody = std::move(source_custody);
-            state.unsafe = source_status;
+            (*available)->RetainUnsafe(source_status);
             // Joining source CPU workers must not release the borrowed GPU lease.
             if (stop_source) { try { stop_source(source_control); } catch (...) {} }
             state_lock.unlock();
@@ -223,7 +238,7 @@ void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemI
             const auto pixel_bytes = static_cast<std::size_t>(state.extent.width) * state.extent.height * 3U * sizeof(float);
             state.pinned->ensure_bytes(pixel_bytes);
             mmltk::backend::data::rgb_hwc_u8_to_nchw_f32(state.rgb8, static_cast<float*>(state.pinned->data()), state.extent.width, state.extent.height);
-            checked(cudaMemcpyAsync(data, state.pinned->data(), pixel_bytes, cudaMemcpyHostToDevice, cuda_stream));
+            checked(state.upload(data, state.pinned->data(), pixel_bytes, cudaMemcpyHostToDevice, cuda_stream));
         }
         checked(static_cast<cudaError_t>(raster::chw_float_to_rgba(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height,
             reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes, stream)));
@@ -243,7 +258,7 @@ void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemI
     state.rgb8 = nullptr;
     state.decoded_source.reset();
     } catch (...) {
-        if (gpu::is_image_execution_failure(std::current_exception())) state.unsafe = cudaErrorUnknown;
+        if (gpu::is_image_execution_failure(std::current_exception())) RetainUnsafe(cudaErrorUnknown);
         throw;
     }
 }

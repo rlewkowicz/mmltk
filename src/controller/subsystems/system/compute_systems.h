@@ -8,6 +8,7 @@
 #include <functional>
 #include <expected>
 #include "src/frameworks/gpu/image_product_pool.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -65,13 +66,17 @@ class PredictRuntime {
         VisualExtent extent{};
         std::shared_ptr<const detail::PredictionPreviewFrame> raw;
         std::int64_t image_id = 0;
+        std::int64_t source_index = 0;
     };
     using ProductSink = std::function<void(std::expected<Product, std::string>)>;
     using ContextProvider = std::function<std::optional<mmltk::frameworks::gpu::DeviceContext>()>;
+    using PreviewRetirement = std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>;
     using PlaybackGate = std::function<bool(std::optional<double>, double)>;
     virtual ~PredictRuntime() = default;
+    virtual void Close() noexcept {}
+    [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
     [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token,
-                                                         const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&) = 0;
+                                                         const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&, const PreviewRetirement&) = 0;
 };
 
 class CudaValidationRuntime final : public ValidationRuntime {
@@ -100,7 +105,9 @@ class CudaPredictRuntime final : public PredictRuntime {
    public:
     explicit CudaPredictRuntime(DirectComputeConfiguration);
     ~CudaPredictRuntime() override;
-    [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&) override;
+    void Close() noexcept override;
+    [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
+    [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&, const PreviewRetirement&) override;
 
    private:
     class Impl;
@@ -153,11 +160,13 @@ class ExportSystem final {
 };
 struct PredictPauseIntent final { bool paused = false; };
 struct PredictImageMetadata final {
+    std::uint64_t content_identity = 0U;
     VisualFrame frame{};
     [[= mmltk::frameworks::reflection::MaxItems{contracts::kAnnotationObjectCapacity}]] std::vector<PredictLabel> labels{};
     std::int64_t image_id = 0;
 };
 struct PredictSnapshot final {
+    std::uint64_t content_identity = 0U;
     std::uint64_t revision = 0U;
     // CLEANUP-IGNORE: Predict composes compute facts with its private visual frame in one canonical snapshot.
     contracts::ComputeUiState operation{};
@@ -168,10 +177,15 @@ struct PredictSnapshot final {
     std::int64_t image_id = 0;
     // CLEANUP-IGNORE: PredictSnapshot is a distinct reflected boundary type.
 };
+// Scalar observation excludes immutable image labels and metadata.
+struct PredictProgressState final {
+    std::uint64_t revision = 0U;
+    contracts::ComputeUiState operation{};
+    bool paused = false;
+    bool video = false;
+};
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] PredictProgress final {
-    // CLEANUP-IGNORE: Predict progress is an independently identified transient event.
-    PredictSnapshot snapshot{};
-    // CLEANUP-IGNORE: The transient event terminator intentionally mirrors other snapshot events.
+    PredictProgressState snapshot{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] PredictChanged final {
     PredictSnapshot snapshot{};
@@ -189,7 +203,9 @@ class PredictSystem final {
 
     using visual_source = VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict,
                                                  mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
-                                                 mmltk::frameworks::reflection::member_path<&PredictSnapshot::revision>, PredictImageMetadata>;
+                                                 // Logical progress does not invalidate committed pixels or metadata.
+                                                 mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame, &VisualFrame::revision>, PredictImageMetadata>;
+    using progress_type = PredictProgressState;
     using event_type = std::variant<PredictProgress, PredictChanged, PredictFailed>;
     PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory,
                   SystemEventSink<event_type> = {});
@@ -203,6 +219,7 @@ class PredictSystem final {
     [[= contracts::reflection::Snapshot{contracts::kAnnotationUiStateByteBudget}]] [[nodiscard]] PredictSnapshot snapshot() const;
     // CLEANUP-IGNORE: Predict exposes its sealed image and workspace API through the existing private shared runtime.
     [[nodiscard]] std::optional<PredictImageMetadata> ImageSnapshot(const VisualFrame&) const;
+    [[nodiscard]] VisualSourceObservation ObserveSource() const;
     // CLEANUP-IGNORE: Predict retains a sealed raw/display read API backed by the shared private VisualRuntimeOwner.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
@@ -220,6 +237,7 @@ MMLTK_REFLECT_FIELDS(PredictPauseIntent)
 MMLTK_REFLECT_FIELDS(PredictLabel)
 MMLTK_REFLECT_FIELDS(PredictImageMetadata)
 MMLTK_REFLECT_FIELDS(PredictSnapshot)
+MMLTK_REFLECT_FIELDS(PredictProgressState)
 MMLTK_REFLECT_FIELDS(PredictProgress)
 MMLTK_REFLECT_FIELDS(PredictChanged)
 MMLTK_REFLECT_FIELDS(PredictFailed)

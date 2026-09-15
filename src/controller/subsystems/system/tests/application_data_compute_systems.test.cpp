@@ -1,4 +1,6 @@
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
+#include "src/controller/browser/application_materializer.h"
+#include "src/controller/browser/application_event_publisher.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include <cuda_runtime_api.h>
 #include "src/acceptance/tests/async_test_utils.hpp"
@@ -6,6 +8,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <cuda.h>
 #include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/image_failure.h"
 
 #include <atomic>
 #include <algorithm>
@@ -626,10 +629,33 @@ class BlockingInspectRuntime final : public DatasetRuntime {
     std::shared_ptr<DatasetRuntimeObservation> observation_;
 };
 
+struct PredictionReceiverFault final {
+    mmltk::testsupport::TestGate upload{"prediction receiver upload"};
+    bool terminal = false;
+    bool enabled = false;
+    PredictRuntime::PreviewRetirement retirement;
+    std::weak_ptr<std::array<std::uint8_t, 48U>> decoded;
+};
+std::atomic<PredictionReceiverFault*> prediction_receiver_fault = nullptr;
+cudaError_t prediction_receiver_upload(void* destination, const void* source, std::size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
+    const auto copied = cudaMemcpyAsync(destination, source, bytes, kind, stream);
+    if (copied != cudaSuccess) return copied;
+    auto* fault = prediction_receiver_fault.load();
+    if (!fault || !fault->enabled) return cudaSuccess;
+    // The actual receiver upload and pinned allocation exist before injection.
+    // Settle test work before reporting an unobservable receiver outcome.
+    const auto settled = cudaStreamSynchronize(stream);
+    fault->upload.receipt().ArriveAndWait();
+    if (fault->terminal) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(
+        std::make_exception_ptr(std::runtime_error("injected receiver completion failure")));
+    return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
+}
+
 class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime, public PredictRuntime {
    public:
-    FakeComputeRuntime(std::shared_ptr<StopGate> gate, const bool fail, std::shared_ptr<std::atomic_size_t> predictions = {}, bool refuse_preview = false)
-        : gate_(std::move(gate)), fail_(fail), predictions_(std::move(predictions)), refuse_preview_(refuse_preview) {}
+    FakeComputeRuntime(std::shared_ptr<StopGate> gate, const bool fail, std::shared_ptr<std::atomic_size_t> predictions = {}, bool refuse_preview = false, std::shared_ptr<std::atomic_int64_t> source_index = {},
+                       std::size_t labels = 0U, std::shared_ptr<StopGate> after_product = {}, std::shared_ptr<PredictionReceiverFault> receiver_fault = {})
+        : gate_(std::move(gate)), fail_(fail), predictions_(std::move(predictions)), refuse_preview_(refuse_preview), source_index_(std::move(source_index)), labels_(labels), after_product_(std::move(after_product)), receiver_fault_(std::move(receiver_fault)) {}
 
     contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ValidateRequest, const std::stop_token stop,
                                    const ComputeProgressSink& progress) override {
@@ -640,7 +666,7 @@ class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime,
         return RunImpl(stop, progress);
     }
     contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, const std::stop_token stop,
-                                const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate&, VisualExtent, const ContextProvider& current_context) override {
+                                const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate&, VisualExtent, const ContextProvider& current_context, const PreviewRetirement& retirement) override {
         if (predictions_) ++*predictions_;
         auto terminal = RunImpl(stop, progress);
         if (terminal.outcome != contracts::ComputeOperationOutcome::Succeeded) return terminal;
@@ -651,16 +677,39 @@ class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime,
         const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
         const auto context = current_context();
         if (!context) return terminal;
-        if (!preview_) preview_ = std::make_unique<detail::PredictionPreviewPool>(execution, *context);
+        if (!preview_) preview_ = std::make_unique<detail::PredictionPreviewPool>(execution, *context,
+            detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &prediction_receiver_upload}, retirement);
+        if (receiver_fault_ && receiver_fault_->enabled) {
+            receiver_fault_->retirement = retirement;
+            auto decoded = std::make_shared<std::array<std::uint8_t, 48U>>();
+            decoded->fill(255U);
+            receiver_fault_->decoded = decoded;
+            auto raw = preview_->Capture(nullptr, {4U, 4U}, 0U, {}, {},
+                std::make_shared<const std::vector<std::string>>(), 1, decoded->data(), decoded);
+            products(Product{.extent = {4U, 4U}, .raw = std::move(raw), .image_id = 41});
+            return terminal;
+        }
         if (cudaSetDevice(0) != cudaSuccess) throw std::runtime_error("test CUDA device unavailable");
         float* pixels = nullptr;
-        if (cudaMalloc(reinterpret_cast<void**>(&pixels), 4U * 4U * 3U * sizeof(float)) != cudaSuccess) throw std::bad_alloc();
+        if (cudaMalloc(reinterpret_cast<void**>(&pixels), (48U + 5U * labels_) * sizeof(float)) != cudaSuccess) throw std::bad_alloc();
         const std::shared_ptr<void> custody(pixels, [](void* address) { static_cast<void>(cudaFree(address)); });
-        std::array<float, 48U> white;
-        white.fill(1.0F);
-        if (cudaMemcpy(pixels, white.data(), sizeof(white), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("test upload failed");
-        auto raw = preview_->Capture(pixels, {4U, 4U}, 0U, {}, {}, std::make_shared<const std::vector<std::string>>(), 1, nullptr, custody);
-        products(Product{.extent = {4U, 4U}, .raw = std::move(raw)});
+        std::vector<float> white(48U + 5U * labels_, 0.0F);
+        std::fill_n(white.begin(), 48U, 1.0F);
+        std::vector<mmltk::backend::models::rfdetr::Prediction> detections(labels_,
+            {.category_id = 1, .score = .75F, .bbox_xyxy = {0.0F, 0.0F, 3.0F, 3.0F}});
+        for (std::size_t i = 0U; i < labels_; ++i) {
+            white[48U + 4U * i + 2U] = 3.0F;
+            white[48U + 4U * i + 3U] = 3.0F;
+        }
+        if (cudaMemcpy(pixels, white.data(), white.size() * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) throw std::runtime_error("test upload failed");
+        mmltk::backend::ml::runtime::AnalysisAnnotationStorage annotations{
+            .boxes_xyxy = {.address = reinterpret_cast<std::uintptr_t>(pixels + 48U), .capacity_bytes = labels_ * 4U * sizeof(float)},
+            .category_ids = {.address = reinterpret_cast<std::uintptr_t>(pixels + 48U + 4U * labels_), .capacity_bytes = labels_ * sizeof(std::int32_t)}};
+        auto raw = preview_->Capture(pixels, {4U, 4U}, 0U, detections, annotations,
+            std::make_shared<const std::vector<std::string>>(std::vector<std::string>{std::string(256U, 'p')}), 1, nullptr, custody);
+        products(Product{.extent = {4U, 4U}, .raw = std::move(raw), .image_id = 41,
+            .source_index = source_index_ ? source_index_->load() : 0});
+        if (after_product_ && after_product_->Wait(stop)) progress({2U, 2U, 2U, "Processed"});
         return terminal;
     }
 
@@ -683,7 +732,27 @@ class FakeComputeRuntime final : public ValidationRuntime, public ExportRuntime,
     bool fail_ = false;
     std::shared_ptr<std::atomic_size_t> predictions_;
     bool refuse_preview_ = false;
+    std::shared_ptr<std::atomic_int64_t> source_index_;
+    std::size_t labels_ = 0U;
+    std::shared_ptr<StopGate> after_product_;
+    std::shared_ptr<PredictionReceiverFault> receiver_fault_;
     std::unique_ptr<detail::PredictionPreviewPool> preview_;
+};
+
+class UnsafePredictRuntime final : public PredictRuntime {
+   public:
+    UnsafePredictRuntime(bool on_close, std::shared_ptr<int> custody) : on_close_(on_close), custody_(std::move(custody)) {}
+    void Close() noexcept override { unsafe_ = true; }
+    [[nodiscard]] bool HasUnsafeCustody() const noexcept override { return unsafe_; }
+    contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token,
+        const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent, const ContextProvider&, const PreviewRetirement&) override {
+        unsafe_ = !on_close_;
+        throw std::runtime_error("test prediction failure");
+    }
+   private:
+    bool on_close_;
+    bool unsafe_ = false;
+    std::shared_ptr<int> custody_;
 };
 
 class FakeDialogRuntime final : public FileDialogRuntime {
@@ -1463,6 +1532,337 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
     CHECK(observation->compile_calls == 0);
 }
 
+struct PredictReaderComposition final { SettingsSystem* settings; PredictSystem* predict; };
+
+// Exercises real source observation/borrowing/paired metadata and Presentation
+// routing; this writer supplies publication receipts, not Firefox GPU acceptance.
+class PredictReaderWriter final : public PresentationNativeWriter {
+   public:
+    explicit PredictReaderWriter(std::function<void()> pumped = {}) : pumped_(std::move(pumped)) {}
+    void Submit(PresentationSubmittedSource submitted, const VisualSourceReader& reader) override {
+        auto pixels = reader.borrow();
+        if (!visual_product_matches_frame(submitted.observation.frame, pixels) ||
+            !reader.image_metadata(submitted.observation.frame))
+            throw std::runtime_error("Predict materialized reader lost its exact image");
+        pending_ = submitted;
+    }
+    PresentationNativeOutcome Pump(std::uint64_t generation) override {
+        const mmltk::testsupport::ScopedTestCleanup notify{[&] { if (pumped_) pumped_(); }};
+        if (!pending_) return {};
+        const auto submitted = *std::exchange(pending_, std::nullopt);
+        if (submitted.selection_generation != generation)
+            return {.progress = PresentationNativeProgress::Superseded, .submitted = submitted};
+        ++sequence_;
+        return {.progress = PresentationNativeProgress::Published, .submitted = submitted,
+            .publication = {.capability = {.surface_high = 1U, .surface_low = 1U,
+                .extent = submitted.observation.frame.extent, .generation = 1U,
+                .condition = PresentationCapabilityCondition::Ready},
+                .timeline_ready = sequence_, .presentation_revision = sequence_, .transfer_sequence = sequence_}};
+    }
+    int poll_fd() const noexcept override { return -1; }
+    int completion_fd() const noexcept override { return -1; }
+    bool wants_write() const noexcept override { return false; }
+    void SetExpectedBrowserProcessGroup(pid_t) override {}
+    Retirement BrowserPeerLost() noexcept override { return Retirement::Released; }
+   private:
+    std::function<void()> pumped_;
+    std::optional<PresentationSubmittedSource> pending_;
+    std::uint64_t sequence_ = 0U;
+};
+
+TEST_CASE("Predict materialized routing keeps one producer across input changes and ordinary restart", "[controller][systems][predict][presentation]") {
+    const bool invalid_first = GENERATE(false, true);
+    const auto kind = GENERATE(contracts::SourceKind::CompiledDataset, contracts::SourceKind::SingleImage, contracts::SourceKind::VideoFile);
+    const auto root = mmltk::testsupport::make_temp_root("predict-materialized-routing");
+    ApplicationDataFixture fixture{root};
+    fixture.PrepareModel(contracts::FeatureId::Predict);
+    auto [settings, dataset, model] = fixture.systems();
+    const auto field = kind == contracts::SourceKind::CompiledDataset ? "workflows.predict.source.compiled_path" :
+        kind == contracts::SourceKind::SingleImage ? "workflows.predict.source.single_image_path" : "workflows.predict.source.video_file_path";
+    const auto select = [&](std::string path) {
+        contracts::SettingsUpdateRequest update;
+        update.updates = {{.path = "workflows.predict.source.kind", .value = static_cast<std::int64_t>(kind)},
+                          {.path = field, .value = std::move(path)}};
+        static_cast<void>(settings.Update(std::move(update)));
+    };
+    select((root / "first.input").string());
+    auto gate = std::make_shared<StopGate>();
+    gate->Release();
+    auto index = std::make_shared<std::atomic_int64_t>(0);
+    std::atomic_size_t constructions = 0U;
+    std::atomic<PresentationSystem*> route = nullptr;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::uint64_t terminal_generation = 0U;
+    PresentationSnapshot displayed;
+    std::string routing_failure;
+    PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+        [&] { return std::make_unique<FakeComputeRuntime>(gate, invalid_first && constructions++ == 0U, nullptr, false, index); },
+        [&](PredictSystem::event_type event) {
+            if (auto* presentation = route.load()) presentation->SourceChanged({PresentationSourceKind::Predict, 1U});
+            std::visit([&](const auto& value) {
+                if (!value.snapshot.operation.active) {
+                    std::scoped_lock lock(mutex);
+                    terminal_generation = std::max(terminal_generation, value.snapshot.operation.generation_frontier);
+                    changed.notify_all();
+                }
+            }, event);
+        }};
+    const auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
+    REQUIRE(readers.size() == 1U);
+    CHECK((readers[0].source == PresentationSourceIdentity{PresentationSourceKind::Predict, 1U}));
+    CHECK_FALSE(prediction.ObserveSource().valid());
+    CHECK(prediction.ObserveSource() == readers[0].observe());
+    PresentationSystem presentation{{.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+        [] { return std::make_unique<PredictReaderWriter>(); }, readers,
+        [&](PresentationSystem::event_type event) {
+            std::scoped_lock lock(mutex);
+            if (const auto* completed = std::get_if<PresentationCompleted>(&event)) displayed = completed->snapshot;
+            if (const auto* failure = std::get_if<PresentationFailed>(&event)) routing_failure = failure->detail;
+            changed.notify_all();
+        }};
+    route = &presentation;
+    const mmltk::testsupport::ScopedTestCleanup stop{[&] { prediction.Shutdown(); route = nullptr; }};
+    static_cast<void>(presentation.Select(readers[0].source));
+    const auto run = [&](bool expect_image) {
+        const auto previous = prediction.ObserveSource().frame.revision;
+        const auto admitted = prediction.Start({});
+        std::unique_lock lock(mutex);
+        REQUIRE(changed.wait_for(lock, std::chrono::seconds{2}, [&] {
+            return !routing_failure.empty() || (terminal_generation >= admitted.operation.generation_frontier &&
+                (!expect_image || displayed.completed.revision > previous));
+        }));
+        REQUIRE(routing_failure.empty());
+        lock.unlock();
+        return prediction.snapshot();
+    };
+    if (invalid_first) {
+        CHECK(run(false).operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
+        select((root / "valid-after-error.input").string());
+    }
+    const auto first = run(true);
+    CHECK(first.frame.source == readers[0].source);
+    REQUIRE(first.content_identity != 0U);
+    CHECK(readers[0].observe().frame == first.frame);
+    REQUIRE(prediction.ImageSnapshot(first.frame));
+    CHECK(prediction.ImageSnapshot(first.frame)->content_identity == first.content_identity);
+    select((root / "second.input").string());
+    const auto second = run(true);
+    CHECK(second.frame.source == first.frame.source);
+    CHECK(second.content_identity != first.content_identity);
+    const auto same = run(true);
+    CHECK(same.content_identity == second.content_identity);
+    CHECK(same.frame.revision > second.frame.revision);
+    if (kind != contracts::SourceKind::SingleImage) {
+        ++*index;
+        const auto next = run(true);
+        CHECK(next.image_id == same.image_id);
+        CHECK((next.content_identity == same.content_identity) == (kind == contracts::SourceKind::VideoFile));
+    }
+}
+
+TEST_CASE("Predict compact publication and source observation do not reread retained labels", "[controller][systems][predict][presentation]") {
+    ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-compact-progress")};
+    fixture.PrepareModel(contracts::FeatureId::Predict);
+    auto [settings, dataset, model] = fixture.systems();
+    auto begin = std::make_shared<StopGate>();
+    begin->Release();
+    auto after_image = std::make_shared<StopGate>();
+    std::atomic<PresentationSystem*> route = nullptr;
+    std::atomic_bool scalar_sent = false;
+    std::atomic_bool scalar_observed = false;
+    std::atomic_size_t metadata_reads = 0U;
+    std::promise<void> shown;
+    std::promise<void> scalar_pumped;
+    using Publisher = browser::ApplicationEventPublisher<&PredictReaderComposition::predict, PredictReaderComposition>;
+    Publisher::Sink sink = [](browser::SystemEvent) {};
+    Publisher publisher{sink, [] {}, [&](auto source) { if (auto* selected = route.load()) selected->SourceChanged(source); }};
+    PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+        [&] { return std::make_unique<FakeComputeRuntime>(begin, false, nullptr, false, nullptr,
+            contracts::kAnnotationObjectCapacity, after_image); },
+        [&](PredictSystem::event_type event) {
+            if (const auto* progress = std::get_if<PredictProgress>(&event);
+                progress && progress->snapshot.operation.progress.sequence == 2U) scalar_sent = true;
+            publisher(event);
+        }};
+    auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
+    auto observe = std::move(readers[0].observe);
+    readers[0].observe = [&, observe = std::move(observe)] {
+        auto result = observe();
+        if (scalar_sent) scalar_observed = true;
+        return result;
+    };
+    auto metadata = std::move(readers[0].image_metadata);
+    readers[0].image_metadata = [&, metadata = std::move(metadata)](const VisualFrame& frame) {
+        ++metadata_reads;
+        return metadata(frame);
+    };
+    PresentationSystem presentation{{.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+        [&] { return std::make_unique<PredictReaderWriter>([&] {
+            if (scalar_observed) mmltk::testsupport::release_test_promise(scalar_pumped);
+        }); }, readers, [&](PresentationSystem::event_type event) {
+            if (std::holds_alternative<PresentationCompleted>(event)) mmltk::testsupport::release_test_promise(shown);
+        }};
+    route = &presentation;
+    const mmltk::testsupport::ScopedTestCleanup stop{[&] { after_image->Release(); prediction.Shutdown(); route = nullptr; }};
+    static_cast<void>(presentation.Select(readers[0].source));
+    static_cast<void>(prediction.Start({}));
+    mmltk::testsupport::await_test_promise(shown, "full Predict label image");
+    REQUIRE(prediction.snapshot().labels.size() == contracts::kAnnotationObjectCapacity);
+    const auto before = prediction.ObserveSource();
+    const auto reads = metadata_reads.load();
+    REQUIRE(reads == 1U);
+    after_image->Release();
+    mmltk::testsupport::await_test_promise(scalar_pumped, "Predict progress presentation cycle");
+    CHECK(prediction.ObserveSource() == before);
+    CHECK(metadata_reads == reads);
+    CHECK(prediction.snapshot().revision > before.snapshot_revision);
+}
+
+TEST_CASE("Predict seals unsafe execution and close custody across repeated admission", "[controller][systems][predict][custody]") {
+    const bool on_close = GENERATE(false, true);
+    ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-unsafe-admission")};
+    fixture.PrepareModel(contracts::FeatureId::Predict);
+    auto [settings, dataset, model] = fixture.systems();
+    auto custody = std::make_shared<int>(7);
+    std::weak_ptr<int> retained = custody;
+    std::atomic_size_t constructions = 0U;
+    std::promise<void> failed;
+    {
+        PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+            [&] { ++constructions; return std::make_unique<UnsafePredictRuntime>(on_close, custody); },
+            [&](PredictSystem::event_type event) {
+                if (const auto* failure = std::get_if<PredictFailed>(&event);
+                    failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
+            }};
+        static_cast<void>(prediction.Start({}));
+        mmltk::testsupport::await_test_promise(failed, "unsafe Predict settlement");
+        REQUIRE_FALSE(prediction.snapshot().operation.active);
+        for (unsigned attempt = 0U; attempt < 4U; ++attempt)
+            CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
+        CHECK(constructions == 1U);
+        custody.reset();
+    }
+    CHECK_FALSE(retained.expired());
+}
+
+TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[controller][gpu][custody]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+    auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 2U);
+    PredictionReceiverFault fault;
+    fault.enabled = fault.terminal = true;
+    prediction_receiver_fault = &fault;
+    const mmltk::testsupport::ScopedTestCleanup clear{[&] { fault.upload.Release(); prediction_receiver_fault = nullptr; }};
+    const detail::PredictionPreviewPool::TransferOperations operations{
+        &cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &prediction_receiver_upload};
+    auto pool = std::make_unique<detail::PredictionPreviewPool>(execution, context, operations, authority);
+    auto decoded = std::make_shared<std::array<std::uint8_t, 48U>>();
+    decoded->fill(127U);
+    std::weak_ptr<std::array<std::uint8_t, 48U>> retained = decoded;
+    auto raw = pool->Capture(nullptr, {4U, 4U}, 0U, {}, {}, std::make_shared<const std::vector<std::string>>(), 1, decoded->data(), decoded);
+    REQUIRE(raw);
+    auto draw = std::async(std::launch::async, [raw, context] {
+        try {
+            gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated,
+                .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+            auto candidate = runtime.AcquireOutput();
+            raw->Draw(runtime, candidate);
+        } catch (...) { return std::current_exception(); }
+        return std::exception_ptr{};
+    });
+    const mmltk::testsupport::ScopedTestCleanup release{[&] { fault.upload.Release(); }};
+    REQUIRE(fault.upload.WaitEntered(std::chrono::seconds{2}));
+    CHECK_FALSE(pool->HasUnsafeSourceCustody());
+    raw.reset();
+    decoded.reset();
+    pool.reset(); // the receiver transaction, not this replaceable shell, owns the fact
+    CHECK(authority->admission_open());
+    CHECK(authority->fact().reservations == 1U);
+    fault.upload.Release();
+    const auto failure = mmltk::testsupport::await_test_future(draw, "receiver completion after pool destruction");
+    CHECK(gpu::is_image_execution_failure(failure));
+    CHECK_FALSE(authority->admission_open());
+    CHECK(authority->fact().occupancy == 1U);
+    CHECK(authority->fact().reservations == 0U);
+    CHECK_FALSE(retained.expired());
+    for (unsigned attempt = 0U; attempt < 4U; ++attempt)
+        CHECK_THROWS(detail::PredictionPreviewPool(execution, context, operations, authority));
+    CHECK(authority->fact().occupancy == 1U);
+}
+
+TEST_CASE("late receiver custody seals Predict admission while optional visual failure preserves semantic success", "[controller][systems][predict][custody]") {
+    const bool terminal = GENERATE(false, true);
+    ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-late-receiver")};
+    fixture.PrepareModel(contracts::FeatureId::Predict);
+    auto [settings, dataset, model] = fixture.systems();
+    auto gate = std::make_shared<StopGate>();
+    gate->Release();
+    auto fault = std::make_shared<PredictionReceiverFault>();
+    fault->terminal = terminal;
+    prediction_receiver_fault = fault.get();
+    const mmltk::testsupport::ScopedTestCleanup clear{[&] { fault->upload.Release(); prediction_receiver_fault = nullptr; }};
+    std::atomic_size_t constructions = 0U;
+    std::promise<void> first_frame, first_done, second_done, visual_failure, recovered;
+    {
+        PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+            [&] { ++constructions; return std::make_unique<FakeComputeRuntime>(gate, false, nullptr, false, nullptr, 0U, nullptr, fault); },
+            [&](PredictSystem::event_type event) {
+                if (const auto* changed = std::get_if<PredictChanged>(&event)) {
+                    const auto& state = changed->snapshot;
+                    if (state.frame.valid() && state.operation.generation_frontier == 1U)
+                        mmltk::testsupport::release_test_promise(first_frame);
+                    if (!state.operation.active) {
+                        if (state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_done);
+                        if (state.operation.generation_frontier == 2U) mmltk::testsupport::release_test_promise(second_done);
+                    }
+                    if (state.operation.generation_frontier == 3U && state.frame.revision > 1U)
+                        mmltk::testsupport::release_test_promise(recovered);
+                }
+                if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
+            }};
+        const mmltk::testsupport::ScopedTestCleanup stop{[&] { fault->upload.Release(); prediction.Shutdown(); }};
+        static_cast<void>(prediction.Start({}));
+        mmltk::testsupport::await_test_promise(first_frame, "initial retained Predict image");
+        mmltk::testsupport::await_test_promise(first_done, "initial semantic completion");
+        const auto retained = prediction.snapshot().frame;
+        fault->enabled = true;
+        static_cast<void>(prediction.Start({}));
+        REQUIRE(fault->upload.WaitEntered(std::chrono::seconds{2}));
+        mmltk::testsupport::await_test_promise(second_done, "semantic completion before receiver outcome");
+        CHECK(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+        CHECK(prediction.snapshot().frame == retained);
+        REQUIRE(fault->retirement);
+        CHECK(fault->retirement->admission_open());
+        fault->upload.Release();
+        mmltk::testsupport::await_test_promise(visual_failure, "late receiver failure");
+        CHECK(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+        CHECK(prediction.snapshot().frame == retained);
+        CHECK(fault->retirement->admission_open() == !terminal);
+        if (terminal) {
+            CHECK(fault->retirement->fact().occupancy == 1U);
+            for (unsigned attempt = 0U; attempt < 4U; ++attempt)
+                CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
+            CHECK_FALSE(fault->decoded.expired());
+        } else {
+            fault->enabled = false;
+            static_cast<void>(prediction.Start({}));
+            mmltk::testsupport::await_test_promise(recovered, "safely settled visual recovery");
+            CHECK(prediction.snapshot().frame.revision > retained.revision);
+            CHECK(fault->retirement->fact().occupancy == 0U);
+        }
+        CHECK(constructions == 1U);
+    }
+    CHECK(fault->decoded.expired() == !terminal);
+    if (terminal) {
+        const auto facts = fault->retirement->fact();
+        CHECK(facts.occupancy == 1U);
+        CHECK(facts.occupancy + facts.reservations <= detail::PredictionPreviewPool::kSlotCapacity + 2U);
+    }
+}
+
 TEST_CASE("prediction preview refusal preserves successful inference completion", "[controller][systems][compute]") {
     const auto root = mmltk::testsupport::make_temp_root("prediction-preview-refusal");
     ApplicationDataFixture fixture{root};
@@ -1545,7 +1945,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     CHECK_FALSE(predict.BorrowFrame().valid());
     static_cast<void>(predict.Start({}));
     CHECK(std::holds_alternative<PredictChanged>(predict_succeeded.get_future().get()));
-    prediction_frame.get_future().wait();
+    mmltk::testsupport::await_test_promise(prediction_frame, "Predict completed frame publication");
     const auto completed_observation = predict.snapshot().revision;
     CHECK(completed_observation > failed_observation);
     CHECK(predict.snapshot().frame.valid());
@@ -2169,6 +2569,7 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
     CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody,
         [](void* value) { ++*static_cast<int*>(value); }, &stopped), runtime::CudaOperationError);
     CHECK(stopped == 1);
+    CHECK(pool->HasUnsafeSourceCustody());
     const auto attempted = prediction_transfer_fault.copies;
     CHECK_THROWS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody));
     CHECK(prediction_transfer_fault.copies == attempted);

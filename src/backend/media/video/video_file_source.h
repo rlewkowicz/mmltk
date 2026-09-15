@@ -1,10 +1,12 @@
 #pragma once
 #include <cstddef>
+#include <cuda_runtime_api.h>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <stop_token>
+namespace mmltk::frameworks::gpu { class TerminalCudaRetirementOwner; }
 namespace mmltk::backend::media::video {
 struct VideoFrame final {
     const float* chw = nullptr;
@@ -21,7 +23,9 @@ struct VideoFrame final {
 // stream-ordered; destruction settles all consumers before releasing storage.
 class VideoFileSource final {
    public:
-    VideoFileSource(const std::filesystem::path&, int device, std::uintptr_t stream, std::stop_token);
+    VideoFileSource(const std::filesystem::path&, int device, std::uintptr_t stream, std::stop_token,
+                    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {},
+                    decltype(&cudaStreamSynchronize) settle = &cudaStreamSynchronize);
     ~VideoFileSource();
     VideoFileSource(const VideoFileSource&) = delete;
     VideoFileSource& operator=(const VideoFileSource&) = delete;

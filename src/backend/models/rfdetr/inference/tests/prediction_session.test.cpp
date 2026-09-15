@@ -4,6 +4,10 @@
 #include <cuda_runtime_api.h>
 #include <nlohmann/json.hpp>
 #include "async_test_utils.hpp"
+#include "filesystem_test_utils.hpp"
+#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
 #include <array>
 #include <algorithm>
 #include <span>
@@ -522,4 +526,79 @@ TEST_CASE("raw preparation settles submitted tensor copies and reports unobserva
     // The fake settlement failure did not poison actual hardware. Finish the
     // real work before these test-owned allocations leave scope.
     REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+}
+
+TEST_CASE("compiled prediction batch unwind closes shared source custody without losing the primary failure", "[model][rfdetr][prediction][gpu][custody]") {
+    namespace data = mmltk::backend::data;
+    namespace gpu = mmltk::frameworks::gpu;
+    using data::testsupport::FixtureSpec;
+    const mmltk::testsupport::ScopedTempDir root("prediction-batch-custody");
+    const FixtureSpec fixture{root.path().string(), "train", 4, 4, 2};
+    data::testsupport::create_synthetic_dataset(fixture);
+    data::CompilerConfig config;
+    config.source_dir = data::testsupport::dataset_dir(fixture);
+    config.output_dir = data::testsupport::compiled_dir(fixture);
+    config.split = fixture.split;
+    config.target_width = fixture.width;
+    config.target_height = fixture.height;
+    config.num_workers = 1;
+    const auto plan = data::DatasetCompiler::prepare(config, {config.split});
+    data::DatasetCompiler::compile(plan, 0U);
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    cudaStream_t stream{};
+    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
+    const mmltk::testsupport::ScopedTestCleanup destroy{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const data::DatasetLoader::Config loading{.compiled_path = data::testsupport::compiled_bin_path(fixture),
+        .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1,
+        .loading = data::data_loading_options(true)};
+    for (const bool unsafe : {false, true}) for (const bool explicit_release : {false, true}) {
+        auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(rfdetr::DatasetBatchLease::kSourceRetirementCapacity);
+        auto loader = std::make_shared<data::DatasetLoader>(loading, authority,
+            unsafe ? +[](cudaEvent_t event, cudaStream_t value) -> cudaError_t {
+                const auto recorded = cudaEventRecord(event, value);
+                if (recorded != cudaSuccess) return recorded;
+                const auto status = cudaStreamSynchronize(value);
+                return status == cudaSuccess ? cudaErrorUnknown : status;
+            } : &cudaEventRecord);
+        std::weak_ptr<data::DatasetLoader> exact_loader = loader;
+        data::Batch batch{};
+        struct PrimaryFailure final : std::runtime_error { PrimaryFailure() : std::runtime_error("ordinary prediction failure") {} };
+        bool primary_preserved = false;
+        try {
+            rfdetr::DatasetBatchLease transaction(loader, reinterpret_cast<std::uintptr_t>(stream), authority);
+            CHECK_NOTHROW(transaction.Release());
+            CHECK(authority->fact().reservations == 2U);
+            CHECK(authority->admission_open());
+            loader->begin_epoch();
+            REQUIRE(loader->next_batch(batch));
+            transaction.Adopt(batch);
+            loader->wait_batch(batch);
+            if (explicit_release) {
+                if (unsafe) CHECK_THROWS_AS(transaction.Release(), mmltk::backend::ml::runtime::CudaOperationError);
+                else transaction.Release();
+                CHECK_NOTHROW(transaction.Release());
+            }
+            throw PrimaryFailure{};
+        } catch (const PrimaryFailure&) { primary_preserved = true; }
+        REQUIRE(primary_preserved);
+        CHECK(authority->admission_open() == !unsafe);
+        CHECK(authority->fact().occupancy == (unsafe ? 1U : 0U));
+        CHECK(authority->fact().reservations == 1U); // exact compiled stream still belongs to loader
+        if (unsafe) CHECK_FALSE(loader->next_batch(batch)); // failed release stopped/joined the live source
+        loader->stop_workers(); // idempotent after failed cleanup; settles normal asynchronous release
+        CHECK_FALSE(loader->next_batch(batch));
+        loader.reset();
+        CHECK(exact_loader.expired() == !unsafe);
+        if (unsafe) {
+            for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
+                CHECK_FALSE(authority->Reserve());
+                CHECK_THROWS(data::DatasetLoader(loading, authority));
+            }
+            CHECK(authority->fact().occupancy == 1U);
+            CHECK(authority->fact().reservations == 1U);
+        } else {
+            CHECK(authority->fact().reservations == 0U);
+            data::DatasetLoader restarted(loading, authority);
+        }
+    }
 }

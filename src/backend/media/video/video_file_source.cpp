@@ -205,11 +205,16 @@ struct VideoFileSource::State final {
     }
 };
 struct VideoFileSource::Owner final {
-    mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{1U};
+    Owner(std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> authority, decltype(&cudaStreamSynchronize) settlement)
+        : retirement(authority ? std::move(authority) : std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U)), settle(settlement) {
+        if (!settle) throw std::invalid_argument("video settlement operation is unavailable");
+    }
+    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement;
+    decltype(&cudaStreamSynchronize) settle;
     mmltk::frameworks::gpu::TerminalCudaRetirementLease lease = Reserve();
     std::shared_ptr<State> state = std::make_shared<State>();
     mmltk::frameworks::gpu::TerminalCudaRetirementLease Reserve() {
-        auto reserved = retirement.Reserve();
+        auto reserved = retirement->Reserve();
         if (!reserved) throw std::runtime_error("video retirement admission failed");
         return std::move(*reserved);
     }
@@ -217,7 +222,7 @@ struct VideoFileSource::Owner final {
         cudaError_t failure = cudaSuccess;
         try {
             DecoderContext binding(state->context);
-            if (state->stream) failure = cudaStreamSynchronize(state->stream);
+            if (state->stream) failure = settle(state->stream);
             if (failure == cudaSuccess) failure = state->chw.ReleaseAll([](float* address) noexcept { return cudaFree(address); }).failure;
             if (failure == cudaSuccess) failure = state->rgb.ReleaseAll([](std::uint8_t* address) noexcept { return cudaFree(address); }).failure;
             if (failure == cudaSuccess && state->decoder_ready) failure = cudaEventDestroy(state->decoder_ready);
@@ -228,8 +233,9 @@ struct VideoFileSource::Owner final {
         if (failure != cudaSuccess) std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state)), failure);
     }
 };
-VideoFileSource::VideoFileSource(const std::filesystem::path& path, int device, std::uintptr_t stream, std::stop_token stop)
-    : owner_(std::make_unique<Owner>()) {
+VideoFileSource::VideoFileSource(const std::filesystem::path& path, int device, std::uintptr_t stream, std::stop_token stop,
+                                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, decltype(&cudaStreamSynchronize) settle)
+    : owner_(std::make_unique<Owner>(std::move(retirement), settle)) {
     auto& state = *owner_->state;
     configure_video_logging();
     std::error_code path_error;

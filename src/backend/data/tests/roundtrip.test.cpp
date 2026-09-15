@@ -21,6 +21,7 @@
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/compiled_image_stream.h"
 #include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/common/concurrency/event_cancellation.h"
@@ -563,3 +564,27 @@ void test_roundtrip_end_to_end() {
 }
 
 TEST_CASE("compiled dataset round trip", "[backend][data][roundtrip][cuda]") { test_roundtrip_end_to_end(); }
+
+TEST_CASE("compiled source teardown retains one durable authority across replacement", "[data][gpu][custody]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    REQUIRE(cudaFree(nullptr) == cudaSuccess);
+    auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(1U);
+    CompiledImageStream::Config config{.slots = 1U, .workers = 1U, .device = 0, .loading = data_loading_options(true)};
+    config.settle = +[](cudaStream_t stream) -> cudaError_t {
+        const auto status = cudaStreamSynchronize(stream);
+        return status == cudaSuccess ? cudaErrorUnknown : status;
+    };
+    {
+        CompiledImageStream source(config, authority);
+        source.bind_current_context();
+        source.prepare_device(0U, 64U);
+        source.stop_workers();
+        source.stop_workers();
+    }
+    CHECK_FALSE(authority->admission_open());
+    CHECK(authority->fact().occupancy == 1U);
+    CHECK(authority->fact().reservations == 0U);
+    for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS(CompiledImageStream(config, authority));
+    CHECK(authority->fact().occupancy == 1U);
+}

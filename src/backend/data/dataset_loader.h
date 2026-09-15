@@ -2,6 +2,7 @@
 #include "src/backend/data/data_loading_options.h"
 
 #include <cstdint>
+#include <cuda_runtime_api.h>
 #include <memory>
 #include <string>
 #include <optional>
@@ -9,6 +10,7 @@
 #include "src/frameworks/gpu/device_execution.h"
 
 #include "src/backend/data/compiled_dataset.h"
+namespace mmltk::frameworks::gpu { class TerminalCudaRetirementOwner; }
 namespace mmltk::backend::data {
 
 struct Batch {
@@ -41,7 +43,8 @@ class DatasetLoader {
         std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};
     };
 
-    explicit DatasetLoader(const Config& config);
+    explicit DatasetLoader(const Config& config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {},
+                           decltype(&cudaEventRecord) record_consumer = &cudaEventRecord);
     ~DatasetLoader();
 
     DatasetLoader(const DatasetLoader&) = delete;

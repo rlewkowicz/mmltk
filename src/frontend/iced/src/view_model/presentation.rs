@@ -523,7 +523,7 @@ mod tests {
             .frame_observation_for(PresentationSourceKind::Predict)
             .unwrap();
         assert_eq!(observation.frame, &snapshot.frame);
-        assert_eq!(observation.snapshotrevision, 12);
+        assert_eq!(observation.snapshotrevision, snapshot.frame.revision);
         assert_eq!(
             model.install_predict_snapshot(snapshot.clone()).unwrap(),
             super::super::reduction::Observation::Current
@@ -546,7 +546,7 @@ mod tests {
                 .frame_observation_for(PresentationSourceKind::Predict)
                 .unwrap()
                 .snapshotrevision,
-            12
+            4
         );
     }
 
@@ -991,4 +991,74 @@ mod tests {
         );
         assert!(model.error.is_none());
     }
+    #[test]
+    fn compact_predict_progress_preserves_labels_and_delayed_image_reconciliation() {
+        use crate::generated::{PredictProgress, PredictProgressState};
+        let mut model = bootstrapped();
+        let mut baseline = model.predict_snapshot.clone().unwrap();
+        baseline.revision = 10;
+        baseline.operation.generationfrontier = 1;
+        baseline.operation.active = true;
+        baseline.operation.terminal.generation = 1;
+        baseline.operation.terminal.outcome = ComputeOperationOutcome::Running;
+        baseline.operation.progress.sequence = 1;
+        baseline.operation.progress.completed = 1;
+        baseline.operation.progress.total = 0;
+        baseline.video = true;
+        baseline.contentidentity = 1_u64 << 40;
+        baseline.frame = visual_frame(PresentationSourceKind::Predict, 4);
+        let label = crate::generated::PredictLabel {
+            box_: crate::generated::AnnotationBox {
+                first: crate::generated::AnnotationPoint { x: 0.0, y: 0.0 },
+                second: crate::generated::AnnotationPoint { x: 4.0, y: 4.0 },
+            }, category: 0, confidence: 0.75,
+            color: crate::generated::AnnotationColor { hue: 0.0, saturation: 1.0, value: 1.0 },
+            name: "retained".into(),
+        };
+        baseline.labels = vec![label; 4096];
+        model.install_predict_snapshot(baseline.clone()).unwrap();
+        let pointer = model.predict_snapshot.as_ref().unwrap().labels.as_ptr();
+        let mut progress = PredictProgressState::from(&baseline);
+        progress.revision = 13;
+        progress.operation.progress.sequence = 3;
+        progress.operation.progress.completed = 3;
+        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress { snapshot: progress.clone() }));
+        assert!(model.error.is_none());
+        assert_eq!(model.predict_snapshot.as_ref().unwrap().labels.as_ptr(), pointer);
+        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress { snapshot: progress.clone() }));
+        assert!(model.error.is_none());
+        assert_eq!(model.predict_snapshot.as_ref().unwrap().labels.as_ptr(), pointer);
+        let mut image = baseline.clone();
+        image.revision = 12;
+        image.operation.progress.sequence = 2;
+        image.operation.progress.completed = 2;
+        image.frame = visual_frame(PresentationSourceKind::Predict, 5);
+        image.contentidentity += 1;
+        model.install_predict_snapshot(image.clone()).unwrap();
+        let installed = model.predict_snapshot.as_ref().unwrap();
+        assert_eq!(installed.revision, 13);
+        assert_eq!(installed.operation.progress.completed, 3);
+        assert_eq!(installed.frame, image.frame);
+        assert_eq!(installed.contentidentity, image.contentidentity);
+        model.install_predict_snapshot(baseline).unwrap(); // delayed Start reply
+        assert_eq!(model.predict_snapshot.as_ref().unwrap().frame, image.frame);
+        let mut cancellation = image.clone();
+        cancellation.revision = 14;
+        cancellation.operation.terminal.outcome = ComputeOperationOutcome::CancellationRequested;
+        model.install_predict_snapshot(cancellation.clone()).unwrap();
+        assert_eq!(model.predict_snapshot.as_ref().unwrap().operation.progress.completed, 3);
+        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress { snapshot: progress }));
+        assert_eq!(model.predict_snapshot.as_ref().unwrap().operation.terminal.outcome, ComputeOperationOutcome::CancellationRequested);
+        cancellation.revision = 15;
+        cancellation.operation.active = false;
+        cancellation.operation.terminal.outcome = ComputeOperationOutcome::Cancelled;
+        model.install_predict_snapshot(cancellation.clone()).unwrap();
+        assert_eq!(model.predict_snapshot.as_ref().unwrap().frame, image.frame);
+        assert!(model.error.is_none());
+        model.peer_disconnected(UiError::transport("reconnect"));
+        assert!(model.predict_snapshot.is_none());
+        model.install_predict_snapshot(cancellation).unwrap();
+        assert_eq!(model.predict_snapshot.as_ref().unwrap().revision, 15);
+    }
+
 }

@@ -117,7 +117,7 @@ pub(crate) fn install(
                 upscale: Some(Arc::new(snapshot)),
             });
         }
-        WorkspaceImageProduct::Predict(snapshot) if snapshot.frame == metadata.frame => {
+        WorkspaceImageProduct::Predict(snapshot) if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 => {
             prediction = Some(Arc::new(super::labels::PredictionContent::new(snapshot)));
         }
         WorkspaceImageProduct::Live(snapshot) if snapshot.frame == metadata.frame => {}
@@ -130,7 +130,8 @@ pub(crate) fn install(
         height,
         frame: Some(frame),
         crop: None,
-        viewer_identity: None,
+        viewer_identity: prediction.as_ref().map(|content: &Arc<super::labels::PredictionContent>|
+            (frame.content_session, content.metadata.contentidentity)),
         fit_revision: 0,
     };
     let placement = gallery.as_ref().map_or(Placement::Contain, |snapshot| {

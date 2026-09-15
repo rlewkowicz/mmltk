@@ -5,6 +5,7 @@ module;
 #include "src/common/system/execution_policy.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
+#include "dataset_batch_lease.h"
 
 #include <algorithm>
 #include <array>
@@ -338,45 +339,6 @@ class PredictionBackend final {
     bool native_autocast_enabled_ = false;
 };
 
-class DatasetBatchLease final {
-   public:
-    DatasetBatchLease(std::shared_ptr<mmltk::backend::data::DatasetLoader> loader, std::uintptr_t stream)
-        : loader_(std::move(loader)), stream_(reinterpret_cast<void*>(stream)) {
-        auto lease = retirement_.Reserve();
-        if (!lease) throw std::runtime_error("prediction source retirement admission failed");
-        retirement_lease_ = std::move(*lease);
-    }
-    void Adopt(mmltk::backend::data::Batch batch) noexcept {
-        if (active_) std::terminate();
-        batch_ = batch;
-        active_ = true;
-    }
-    void StopWorkers() { loader_->stop_workers(); }
-    ~DatasetBatchLease() noexcept {
-        if (active_) { try { Release(); } catch (...) {} }
-    }
-    DatasetBatchLease(const DatasetBatchLease&) = delete;
-    DatasetBatchLease& operator=(const DatasetBatchLease&) = delete;
-    void Release() {
-        try { loader_->release_batch(batch_, stream_); }
-        catch (...) {
-            // A failed release must never destroy a loader with a checked-out
-            // lease or leave its CPU workers alive with quarantined storage.
-            try { StopWorkers(); } catch (...) {}
-            active_ = false;
-            std::move(retirement_lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(loader_)), cudaErrorUnknown);
-            throw runtime::CudaOperationError{cudaErrorUnknown, "prediction dataset source release"};
-        }
-        active_ = false;
-    }
-   private:
-    mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
-    mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease_;
-    std::shared_ptr<mmltk::backend::data::DatasetLoader> loader_;
-    mmltk::backend::data::Batch batch_{};
-    void* stream_ = nullptr;
-    bool active_ = false;
-};
 
 bool preview_requested(const PredictionDelivery& delivery, std::uint32_t width, std::uint32_t height) noexcept {
     return delivery.completed && delivery.source_pixels && width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
@@ -687,9 +649,10 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
 }
 
 [[nodiscard]] PredictionRunResult run_video_prediction(const PredictRequest& options, PredictionBackend& backend,
-    runtime::BorrowedCommandStream command_stream, PredictionRunResult result, PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery) {
+    runtime::BorrowedCommandStream command_stream, PredictionRunResult result, PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery,
+    const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& source_retirement) {
     const auto started = std::chrono::steady_clock::now();
-    auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, options.device_id, command_stream.native_handle, delivery.stop);
+    auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, options.device_id, command_stream.native_handle, delivery.stop, source_retirement);
     if (delivery.begin) delivery.begin(result);
     const auto cuda = tensor_api::TensorOptions().dtype(tensor_api::kFloat).device(tensor_api::kCUDA, options.device_id);
     const auto mean = tensor_api::tensor({0.485F, 0.456F, 0.406F}, cuda).view({1, 3, 1, 1});
@@ -729,6 +692,8 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
 }  // namespace
 
 struct PredictionSession::State final {
+    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> source_retirement =
+        std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(DatasetBatchLease::kSourceRetirementCapacity);
     mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{1U};
     mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
     std::unique_ptr<PredictionBackend> backend;
@@ -776,16 +741,18 @@ struct PredictionSession::State final {
 PredictionSession::PredictionSession() : state_(std::make_shared<State>()) {}
 PredictionSession::~PredictionSession() {
     static_cast<void>(Close());
-    if (state_->poisoned) {
+    if (HasUnsafeCustody()) {
         auto state = std::move(state_);
         auto lease = std::move(state->retirement_lease);
         std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(state)), cudaErrorUnknown);
     }
 }
-bool PredictionSession::HasUnsafeCustody() const noexcept { return state_->poisoned; }
+bool PredictionSession::HasUnsafeCustody() const noexcept {
+    return state_->poisoned || !state_->source_retirement->admission_open();
+}
 
 mmltk::backend::ml::runtime::RuntimeStatus PredictionSession::Close() noexcept {
-    if (state_->poisoned) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
+    if (HasUnsafeCustody()) return static_cast<runtime::RuntimeStatus>(cudaErrorUnknown);
     if (!state_->backend) return mmltk::backend::ml::runtime::kRuntimeSuccess;
     const auto status = state_->backend->Close();
     if (status == cudaSuccess) state_->backend.reset();
@@ -827,7 +794,7 @@ PredictionRunResult PredictionSession::RunResolved(const PredictRequest& request
                                                    const runtime::BorrowedCommandStream command_stream, const PredictionDelivery& delivery) {
     if (!command_stream) throw std::invalid_argument("RF-DETR prediction command stream is invalid");
     const auto options = finalize_predict_request(request);
-    if (state_->poisoned) throw runtime::CudaOperationError{cudaErrorUnknown, "prediction session has unobservable CUDA custody"};
+    if (HasUnsafeCustody()) throw runtime::CudaOperationError{cudaErrorUnknown, "prediction session has unobservable CUDA custody"};
     PredictionRunResult result;
     if (delivery.stop.stop_requested()) { result.cancelled = true; return result; }
     struct BoundPredictionCall final {
@@ -856,6 +823,7 @@ PredictionRunResult PredictionSession::RunResolved(const PredictRequest& request
         state_->poisoned = true;
         throw;
     }
+    if (HasUnsafeCustody()) throw runtime::CudaOperationError{cudaErrorUnknown, "prediction source teardown"};
     return result;
 }
 
@@ -886,7 +854,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     const auto& placement = execution.placement;
     std::shared_ptr<mmltk::backend::data::DatasetLoader> loader = options.source_kind != PredictSourceKind::CompiledDataset
                       ? std::unique_ptr<mmltk::backend::data::DatasetLoader>{}
-                      : inference_detail::make_loader(options.compiled_path, options.batch_size, options, 2U);
+                      : inference_detail::make_loader(options.compiled_path, options.batch_size, options, 2U, source_retirement);
     mmltk::common::system::ScopedExecutionPolicy policy({placement.cpus, "predict", 0, placement.numa_node, -10, false});
     if (readback_node != placement.numa_node) {
         readback = std::make_unique<PredictionReadback>(options.device_id);
@@ -897,7 +865,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     result.backend_name = bound_backend.name();
     result.artifacts = bound_backend.artifacts();
     if (options.source_kind == PredictSourceKind::VideoFile)
-        return run_video_prediction(options, bound_backend, execution_stream, std::move(result), *readback, annotations, delivery);
+        return run_video_prediction(options, bound_backend, execution_stream, std::move(result), *readback, annotations, delivery, source_retirement);
     if (options.source_kind == PredictSourceKind::ImageFiles) {
         return run_image_prediction(options, bound_backend, execution_stream, std::move(result), *readback, annotations, delivery);
     }
@@ -920,7 +888,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     std::shared_ptr<DatasetBatchLease> batch_lease;
     while (result.processed_images < total && !delivery.stop.stop_requested()) {
         // Allocate custody before checking out a slot; ordinary batches reuse it.
-        if (!batch_lease || batch_lease.use_count() != 1) batch_lease = std::make_shared<DatasetBatchLease>(loader, execution_stream.native_handle);
+        if (!batch_lease || batch_lease.use_count() != 1) batch_lease = std::make_shared<DatasetBatchLease>(loader, execution_stream.native_handle, source_retirement);
         if (!loader->next_batch(batch, delivery.stop)) break;
         batch_lease->Adopt(batch);
         loader->wait_batch(batch);

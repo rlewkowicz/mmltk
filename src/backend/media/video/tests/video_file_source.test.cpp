@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include "async_test_utils.hpp"
 #include "src/backend/media/video/video_file_source.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 TEST_CASE("video file source rejects remote and absent inputs", "[video]") {
     using mmltk::backend::media::video::VideoFileSource;
     REQUIRE_THROWS_AS(VideoFileSource("https://example.invalid/video.mp4", 0, 1U, {}), std::invalid_argument);
@@ -35,8 +36,11 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
     cudaStream_t stream = nullptr;
     REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
     const mmltk::testsupport::ScopedTestCleanup destroy_stream{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    auto retirement = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U);
+    REQUIRE_THROWS_AS(mmltk::backend::media::video::VideoFileSource("/nonexistent/predict-video", 0, 1U, {}, retirement), std::invalid_argument);
+    CHECK(retirement->admission_open());
     {
-        auto source = std::make_unique<mmltk::backend::media::video::VideoFileSource>(path, 0, reinterpret_cast<std::uintptr_t>(stream), std::stop_token{});
+        auto source = std::make_unique<mmltk::backend::media::video::VideoFileSource>(path, 0, reinterpret_cast<std::uintptr_t>(stream), std::stop_token{}, retirement);
         REQUIRE(source->frames_per_second() == 4.0);
         for (std::uint64_t index = 0U; index < 2U; ++index) {
             const auto frame = source->Next();
@@ -61,6 +65,21 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
         REQUIRE(cuCtxGetCurrent(&after) == CUDA_SUCCESS);
         CHECK(after == before);
     }
+    CHECK(retirement->admission_open());
+    CHECK(retirement->fact().reservations == 0U);
+    {
+        mmltk::backend::media::video::VideoFileSource source(path, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement,
+            +[](cudaStream_t value) -> cudaError_t {
+                const auto status = cudaStreamSynchronize(value);
+                return status == cudaSuccess ? cudaErrorUnknown : status;
+            });
+        REQUIRE(source.Next());
+    }
+    CHECK_FALSE(retirement->admission_open());
+    CHECK(retirement->fact().occupancy == 1U);
+    for (unsigned attempt = 0U; attempt < 4U; ++attempt)
+        CHECK_THROWS(mmltk::backend::media::video::VideoFileSource(path, 0, reinterpret_cast<std::uintptr_t>(stream), {}, retirement));
+    CHECK(retirement->fact().occupancy == 1U);
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     std::stop_source stop;
     stop.request_stop();

@@ -81,6 +81,7 @@ class CudaRuntimeResources final {
         });
         return stop.stop_requested() ? contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled, 0U, result.completed) : result;
     }
+    void CloseSession() { WithDevice([this] { if (close_) close_(); }); }
     [[nodiscard]] int device() const noexcept { return device_; }
 
    private:
@@ -330,16 +331,24 @@ class CudaPredictRuntime::Impl final : public CudaSessionRuntimeState<mmltk::bac
    public:
     explicit Impl(DirectComputeConfiguration configuration) : CudaSessionRuntimeState(configuration), config(std::move(configuration)) {}
     DirectComputeConfiguration config;
+    bool close_failed = false;
     std::unique_ptr<detail::PredictionPreviewPool> preview;
     std::optional<mmltk::frameworks::gpu::DeviceContext> preview_context;
 };
 
 CudaPredictRuntime::CudaPredictRuntime(DirectComputeConfiguration configuration) : impl_(std::make_unique<Impl>(configuration)) {}
 CudaPredictRuntime::~CudaPredictRuntime() = default;
+void CudaPredictRuntime::Close() noexcept {
+    try { impl_->resources.CloseSession(); }
+    catch (...) { impl_->close_failed = true; }
+}
+bool CudaPredictRuntime::HasUnsafeCustody() const noexcept { return impl_->close_failed || impl_->session.HasUnsafeCustody() || (impl_->preview && impl_->preview->HasUnsafeCustody()); }
 contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdetr::PredictRequest operation, const std::stop_token stop,
-                                                    const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context) {
+                                                    const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate& gate, VisualExtent maximum, const ContextProvider& current_context, const PreviewRetirement& retirement) {
+    if (!retirement) throw std::invalid_argument("prediction preview retirement authority is unavailable");
+    if (!retirement->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
     return impl_->resources.Run(
-        [this, &progress, &products, &gate, stop, operation, maximum, &current_context](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
+        [this, &progress, &products, &gate, stop, operation, maximum, &current_context, &retirement](const mmltk::backend::ml::runtime::BorrowedCommandStream stream) mutable {
             operation.device_id = impl_->resources.device();
             std::shared_ptr<const std::vector<std::string>> classes;
             int class_count = 0;
@@ -367,17 +376,21 @@ contracts::ComputeTerminal CudaPredictRuntime::Run(mmltk::backend::models::rfdet
                             products(std::unexpected{std::string{"Prediction preview context is recovering"}});
                             return;
                         }
+                        if (!retirement->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
                         if (!pixels.preview_failure.empty()) throw std::runtime_error(std::string{pixels.preview_failure});
                         if (pixels.width > maximum.width || pixels.height > maximum.height)
                             throw std::runtime_error("Prediction preview exceeds the visual dimensions");
+                        if (impl_->preview && impl_->preview->HasUnsafeSourceCustody())
+                            throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction preview source custody"};
                         if (!impl_->preview || impl_->preview_context != context) {
-                            auto candidate = std::make_unique<detail::PredictionPreviewPool>(*impl_->config.execution, *context);
+                            auto candidate = std::make_unique<detail::PredictionPreviewPool>(*impl_->config.execution, *context,
+                                detail::PredictionPreviewPool::TransferOperations{&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister}, retirement);
                             impl_->preview = std::move(candidate);
                             impl_->preview_context = context;
                         }
                         auto raw = impl_->preview->Capture(pixels.chw, {pixels.width, pixels.height}, pixels.stream,
                             record.detections, annotations, classes, class_count, pixels.rgb8, pixels.custody, pixels.stop_source, pixels.source_control);
-                        if (raw) products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(raw), .image_id = record.image_id});
+                        if (raw) products(Product{.extent = {pixels.width, pixels.height}, .raw = std::move(raw), .image_id = record.image_id, .source_index = record.dataset_index});
                     } catch (const mmltk::backend::ml::runtime::CudaOperationError&) {
                         throw;
                     } catch (const std::exception& error) {
@@ -473,6 +486,7 @@ class PredictSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (state_.operation.active) throw contracts::BusyError("prediction is busy");
+            if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction has unobservable CUDA custody");
         }
         // CLEANUP-IGNORE: Predict begins from canonical settings but then owns a distinct visual operation path.
         const auto settings = settings_.materialization_facts();
@@ -483,16 +497,12 @@ class PredictSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (state_.operation.active) throw contracts::BusyError("prediction is busy");
+            if (!retirement_.admission_open() || !preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction has unobservable CUDA custody");
             const auto prior = state_;
             const auto& source = settings.settings.workflows.predict.source;
             const auto key = std::to_string(static_cast<unsigned>(source.kind)) + ":" +
                 (source.kind == contracts::SourceKind::CompiledDataset ? source.compiled_path :
                  source.kind == contracts::SourceKind::SingleImage ? source.single_image_path : source.video_file_path);
-            if (source_key_ != key) {
-                if (source_instance_ == std::numeric_limits<std::uint64_t>::max()) throw contracts::FailedError("prediction source identity exhausted");
-                ++source_instance_;
-                source_key_ = key;
-            }
             const auto generation = contracts::next_compute_generation(state_.operation.generation_frontier);
             if (!generation) throw contracts::FailedError("prediction operation generation exhausted");
             state_.revision = detail::PredictRevision::Admit(state_.revision);
@@ -507,7 +517,8 @@ class PredictSystem::Impl final {
                                                                          0U, {}, "Preparing selected prediction inputs");
             try {
                 run_.Start({
-                    .work = [this, settings = settings.settings, selection, source_instance = source_instance_, generation = *generation](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+                    .work = [this, settings = settings.settings, selection, source_key = key, video = state_.video, generation = *generation](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+                        if (!preview_retirement_->admission_open()) throw contracts::UnavailableError("prediction receiver custody is unobservable");
                         contracts::ArtifactInspection inspection;
                         if (!stop.stop_requested() && settings.workflows.predict.source.kind == contracts::SourceKind::CompiledDataset)
                             inspection = dataset_.Inspect({settings.workflows.predict.source.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
@@ -519,22 +530,25 @@ class PredictSystem::Impl final {
                         if (!runtime_) throw std::runtime_error("prediction runtime factory returned no runtime");
                         const auto execution = mmltk::frameworks::gpu::resolve_device_execution(visual_.device, mmltk::common::system::NumaTopology::Capture(), visual_.numa_node);
                         try { if (initial_runtime) static_cast<void>(PreviewContext(execution)); }
-                        catch (const std::exception& error) { Product(std::unexpected{std::string{error.what()}}, source_instance); }
+                        catch (const std::exception& error) { Product(std::unexpected{std::string{error.what()}}, source_key, video); }
                         auto terminal = runtime_->Run(std::move(*request), stop,
                             [this](const auto& progress) { Progress(progress); },
-                            [this, source_instance](std::expected<PredictRuntime::Product, std::string> product) {
-                                Product(std::move(product), source_instance);
+                            [this, &source_key, video](std::expected<PredictRuntime::Product, std::string> product) {
+                                Product(std::move(product), source_key, video);
                             },
                             [this, stop](std::optional<double> timestamp, double fps) { return playback_.Wait(timestamp, fps, stop); }, {visual_.maximum_width, visual_.maximum_height}, [this] {
                                 std::unique_lock lock(preview_context_mutex_, std::try_to_lock);
                                 return lock.owns_lock() ? preview_context_ : std::nullopt;
-                            });
+                            }, preview_retirement_);
+                        // Native source failures already fail RunAndWrite. Optional receiver
+                        // failure seals custody without changing a completed semantic result.
+                        if (runtime_->HasUnsafeCustody()) RetireRuntime();
                         if (!terminal.valid_worker_terminal()) throw std::runtime_error("prediction runtime returned an invalid terminal");
                         terminal.generation = generation;
                         return [this, terminal = std::move(terminal)]() mutable { Settled(std::move(terminal)); };
                     },
                     .failure = [this](std::exception_ptr failure) -> direct::LocalRun::Notification {
-                        runtime_.reset();
+                        RetireRuntime();
                         return [this, failure] { Failed(failure); };
                     },
                 });
@@ -564,7 +578,7 @@ class PredictSystem::Impl final {
         if (active) static_cast<void>(run_.Stop());
         return snapshot();
     }
-    void Shutdown() noexcept { run_.StopAndJoin(); worker_.StopAndWait(); pending_product_.reset(); runtime_.reset(); worker_.FinishStoppedRetirement(); }
+    void Shutdown() noexcept { run_.StopAndJoin(); worker_.StopAndWait(); pending_product_.reset(); RetireRuntime(); worker_.FinishStoppedRetirement(); }
     [[nodiscard]] std::optional<PredictImageMetadata> ImageSnapshot(const VisualFrame& frame) const {
         std::scoped_lock lock(mutex_);
         if (state_.frame != frame) return std::nullopt;
@@ -588,6 +602,7 @@ class PredictSystem::Impl final {
    private:
     mmltk::frameworks::gpu::DeviceContext PreviewContext(const mmltk::frameworks::gpu::DeviceExecution& execution) {
         std::scoped_lock lock(preview_context_mutex_);
+        if (!preview_retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
         if (!preview_context_) {
             CUcontext previous{};
             if (cuInit(0U) != CUDA_SUCCESS || cuCtxGetCurrent(&previous) != CUDA_SUCCESS) throw std::runtime_error("prediction context query failed");
@@ -599,17 +614,34 @@ class PredictSystem::Impl final {
         }
         return *preview_context_;
     }
+    void RetireRuntime() noexcept {
+        if (!runtime_) return;
+        runtime_->Close();
+        if (runtime_->HasUnsafeCustody() || !preview_retirement_->admission_open()) {
+            std::move(retirement_lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(runtime_)), cudaErrorUnknown);
+        } else runtime_.reset();
+    }
     std::mutex preview_context_mutex_;
     std::optional<mmltk::frameworks::gpu::DeviceContext> preview_context_;
     struct PendingProduct final {
         std::expected<PredictRuntime::Product, std::string> product;
-        std::uint64_t source_instance = 0U;
+        std::uint64_t content_identity = 0U;
     };
-    void Product(std::expected<PredictRuntime::Product, std::string> product, std::uint64_t source_instance) {
+    void Product(std::expected<PredictRuntime::Product, std::string> product, const std::string& source_key, bool video) {
         {
             std::scoped_lock lock(mutex_);
             preview_failure_.clear();
-            pending_product_ = PendingProduct{std::move(product), source_instance};
+            if (product) {
+                const auto image = video ? 0 : product->source_index;
+                if (source_key_ != source_key || source_image_ != image) {
+                    if (content_identity_ == std::numeric_limits<std::uint64_t>::max())
+                        throw contracts::FailedError("prediction content identity exhausted");
+                    ++content_identity_;
+                    source_key_ = source_key;
+                    source_image_ = image;
+                }
+            }
+            pending_product_ = PendingProduct{std::move(product), content_identity_};
         }
         static_cast<void>(worker_.NotifyContinuation());
     }
@@ -660,8 +692,8 @@ class PredictSystem::Impl final {
         }
         product.raw->Draw(runtime, candidate);
         const auto completed = runtime.CommitOutput(std::move(candidate));
-        const auto frame = visual_frame({PresentationSourceKind::Predict, pending.source_instance}, product.extent, completed.revision());
-        return [this, frame, labels = std::move(labels), identity = product.image_id]() mutable {
+        const auto frame = visual_frame({PresentationSourceKind::Predict, 1U}, product.extent, completed.revision());
+        return [this, frame, labels = std::move(labels), identity = product.image_id, content_identity = pending.content_identity]() mutable {
             PredictSnapshot changed;
             {
                 std::scoped_lock lock(mutex_);
@@ -670,6 +702,7 @@ class PredictSystem::Impl final {
                 state_.frame = frame;
                 state_.labels = std::move(labels);
                 state_.image_id = identity;
+                state_.content_identity = content_identity;
                 state_.revision = *revision;
                 changed = state_;
             }
@@ -677,7 +710,7 @@ class PredictSystem::Impl final {
         };
     }
     void Progress(const contracts::ComputeProgress& progress) noexcept {
-        PredictSnapshot changed;
+        PredictProgressState changed;
         {
             std::scoped_lock lock(mutex_);
             if (!state_.operation.active || !contracts::compute_progress_follows(progress, state_.operation.progress.sequence)) return;
@@ -687,7 +720,7 @@ class PredictSystem::Impl final {
             state_.revision = *revision;
             state_.operation.progress = progress;
             if (state_.operation.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.operation.terminal.detail.clear();
-            changed = state_;
+            changed = mmltk::frameworks::reflection::project_record<PredictProgressState>(state_);
         }
         Publish(PredictProgress{std::move(changed)});
     }
@@ -758,10 +791,16 @@ class PredictSystem::Impl final {
     std::vector<contracts::AnnotationColor> preview_palette_;
     std::string source_key_;
     std::string preview_failure_;
-    std::uint64_t source_instance_ = 0U;
+    std::uint64_t content_identity_ = 0U;
+    std::int64_t source_image_ = 0;
     detail::PredictionPlayback playback_;
     PredictRuntimeFactory factory_;
-    std::unique_ptr<PredictRuntime> runtime_;
+    mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement_{1U};
+    mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement_);
+    // Current pool plus one in-flight Draw and one pending raw product from older pools.
+    PredictRuntime::PreviewRetirement preview_retirement_ =
+        std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(detail::PredictionPreviewPool::kSlotCapacity + 2U);
+    std::shared_ptr<PredictRuntime> runtime_;
     direct::LocalRun run_;
     detail::VisualRuntimeOwner worker_;
 };
@@ -789,6 +828,10 @@ PredictSnapshot PredictSystem::Stop(contracts::PredictWorkflowIntent) noexcept {
 // CLEANUP-IGNORE: Predict exposes ordinary sealed lifecycle/read methods; VisualRuntimeOwner already owns shared workspace behavior.
 void PredictSystem::Shutdown() noexcept { impl_->Shutdown(); }
 PredictSnapshot PredictSystem::snapshot() const { return impl_->snapshot(); }
+VisualSourceObservation PredictSystem::ObserveSource() const {
+    std::scoped_lock lock(impl_->mutex_);
+    return visual_source::Observe(impl_->state_);
+}
 // CLEANUP-IGNORE: Predict forwards its sealed source API to its own owner and the existing shared renderer.
 std::optional<PredictImageMetadata> PredictSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView PredictSystem::BorrowFrame() const { return impl_->BorrowFrame(); }

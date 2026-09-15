@@ -229,8 +229,10 @@ struct DatasetLoader::Impl {
     }
 };
 
-DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl>()) {
+DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
+                             decltype(&cudaEventRecord) record_consumer) : impl_(std::make_unique<Impl>()) {
     validate_config(config);
+    if (!record_consumer) throw std::invalid_argument("dataset consumer completion operation is unavailable");
     auto& state = *impl_;
     state.config = config;
     state.source = CompiledDataset::open(
@@ -251,7 +253,8 @@ DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl
                                                                                      .device = config.device_id,
                                                                                      .cpu_affinity = config.cpu_affinity,
                                                                                      .loading = config.loading,
-                                                                                     .execution = execution});
+                                                                                     .execution = execution,
+                                                                                     .record_consumer = record_consumer}, std::move(retirement));
     const auto stride = static_cast<size_t>(state.source.header().image_stride);
     if (config.batch_size > std::numeric_limits<size_t>::max() / stride) throw std::overflow_error("dataset batch storage size overflow");
     mmltk::frameworks::gpu::CudaDeviceScope scope(config.device_id);

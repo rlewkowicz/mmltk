@@ -232,7 +232,8 @@ struct CompiledImageStream::Impl {
         auto& slot = *slots.at(index);
         auto& pending = consumer ? slot.consumer_pending : slot.transfer_pending;
         if (stopping || pending || queued == completions.size()) throw std::logic_error("compiled image completion capacity unavailable");
-        gpu::ensure_cuda_ok(cudaEventRecord(consumer ? slot.consumer : slot.transfer, stream), "compiled image completion event");
+        const auto record = consumer ? config.record_consumer : &cudaEventRecord;
+        gpu::ensure_cuda_ok(record(consumer ? slot.consumer : slot.transfer, stream), "compiled image completion event");
         completions[(head + queued) % completions.size()] = {index, consumer, observer};
         pending = true;
         ++slot.callbacks;
@@ -326,20 +327,22 @@ struct CompiledImageStream::Impl {
 };
 
 struct CompiledImageStream::Retention {
-    Retention() : terminal(1U), lease(gpu::ReserveTerminalCudaLease(terminal)) {}
+    explicit Retention(std::shared_ptr<gpu::TerminalCudaRetirementOwner> authority)
+        : terminal(authority ? std::move(authority) : std::make_shared<gpu::TerminalCudaRetirementOwner>(1U)),
+          lease(gpu::ReserveTerminalCudaLease(*terminal)) {}
     ~Retention() noexcept {
         if (state) std::move(lease).Install(gpu::TerminalCudaCustody::Share(std::move(state)), cudaErrorUnknown);
     }
-    gpu::TerminalCudaRetirementOwner terminal;
+    std::shared_ptr<gpu::TerminalCudaRetirementOwner> terminal;
     gpu::TerminalCudaRetirementLease lease;
     std::shared_ptr<Impl> state;
 };
 
-CompiledImageStream::CompiledImageStream(Config config) {
-    if (config.slots == 0 || config.slots > std::numeric_limits<std::size_t>::max() / 2 || config.workers == 0 ||
+CompiledImageStream::CompiledImageStream(Config config, std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement) {
+    if (!config.settle || !config.record_consumer || config.slots == 0 || config.slots > std::numeric_limits<std::size_t>::max() / 2 || config.workers == 0 ||
         config.workers > config.slots || config.workers > static_cast<std::size_t>(std::numeric_limits<int>::max()))
         throw std::invalid_argument("invalid compiled image stream capacity");
-    retention_ = std::make_unique<Retention>();
+    retention_ = std::make_unique<Retention>(std::move(retirement));
     impl_ = std::make_shared<Impl>(std::move(config));
 }
 const gpu::DeviceExecution& CompiledImageStream::execution() const noexcept { return impl_->execution; }
@@ -427,7 +430,7 @@ void CompiledImageStream::close() {
     on_context(impl_->context, [&] {
         if (impl_->completion_failed) std::rethrow_exception(impl_->failure);
         impl_->settle_unfenced();
-        if (impl_->copy) gpu::ensure_cuda_ok(cudaStreamSynchronize(impl_->copy), "compiled image stream destruction settlement");
+        if (impl_->copy) gpu::ensure_cuda_ok(impl_->config.settle(impl_->copy), "compiled image stream destruction settlement");
         gpu::ensure_cuda_ok(static_cast<cudaError_t>(reset_storage()), "compiled image storage destruction");
         for (auto& slot : impl_->slots) {
             for (auto* event : {&slot->transfer, &slot->consumer}) {

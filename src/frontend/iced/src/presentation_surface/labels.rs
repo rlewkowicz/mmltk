@@ -20,7 +20,7 @@ fn label_bounds(
 }
 
 pub(crate) struct PredictionContent {
-    metadata: crate::generated::PredictImageMetadata,
+    pub(super) metadata: crate::generated::PredictImageMetadata,
     labels: Vec<CachedLabel>,
 }
 struct CachedLabel {
@@ -408,12 +408,13 @@ mod tests {
                 if text == "person 0.75" { assert_eq!(text.as_ptr(), pointer); }
             });
         }
-        snapshot.frame.source.instance += 1;
+        snapshot.contentidentity += 1;
         snapshot.labels[0].name = "changed".into();
         let replacement = PredictionContent::new(crate::generated::PredictImageMetadata::from(&snapshot));
         assert_eq!(replacement.labels[0].text, "changed 0.75");
         assert_eq!(retained.labels[0].text, "person 0.75");
-        assert_ne!(replacement.metadata.frame.source, retained.metadata.frame.source);
+        assert_eq!(replacement.metadata.frame.source, retained.metadata.frame.source);
+        assert_ne!(replacement.metadata.contentidentity, retained.metadata.contentidentity);
     }
 
     #[test]

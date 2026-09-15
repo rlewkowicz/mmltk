@@ -33,7 +33,7 @@ mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_inference
     validate.cpp
     evaluation.cpp)
-mmltk_register_private_headers(mmltk_backend_models_rfdetr_inference inference_preprocessor.h prediction_capacity.h prediction_raw_preparation.h)
+mmltk_register_private_headers(mmltk_backend_models_rfdetr_inference inference_preprocessor.h prediction_capacity.h prediction_raw_preparation.h dataset_batch_lease.h)
 target_include_directories(mmltk_backend_models_rfdetr_inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
@@ -82,6 +82,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
     target_link_libraries(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE
         mmltk_acceptance_support
+        mmltk_backend_data_test_support
         mmltk::backend::ml::cuda
         mmltk::backend::ml::runtime
         mmltk::backend::models::rfdetr::inference

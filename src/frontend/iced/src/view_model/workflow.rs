@@ -316,7 +316,7 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
     fn project_predict_event(&mut self, event: ApplicationEvent) {
         match event {
             ApplicationEvent::PredictPredictProgress(value) => {
-                if let Err(error) = self.install_predict_snapshot(value.snapshot) {
+                if let Err(error) = super::reduction::merge_predict_progress(&mut self.predict_snapshot, value.snapshot) {
                     self.error = Some(error);
                 }
             }

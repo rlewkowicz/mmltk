@@ -2,6 +2,7 @@
 #include "src/backend/data/data_loading_options.h"
 
 #include <cstddef>
+#include <cuda_runtime_api.h>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -13,6 +14,7 @@
 #include "src/backend/data/compiled_dataset.h"
 #include "src/common/concurrency/worker_pool.h"
 
+namespace mmltk::frameworks::gpu { class TerminalCudaRetirementOwner; }
 namespace mmltk::backend::data {
 
 // A system-local physical image loader. Policy owners assign bounded slots and
@@ -49,6 +51,8 @@ class CompiledImageStream final {
         bool prefault = false;
         DataLoadingOptions loading{};
         std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};
+        decltype(&cudaStreamSynchronize) settle = &cudaStreamSynchronize;
+        decltype(&cudaEventRecord) record_consumer = &cudaEventRecord;
     };
     struct ReadObserver {
         void* context = nullptr;
@@ -62,7 +66,7 @@ class CompiledImageStream final {
         void (*complete)(void*, std::size_t, std::exception_ptr) noexcept = nullptr;
     };
 
-    explicit CompiledImageStream(Config config);
+    explicit CompiledImageStream(Config config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {});
     ~CompiledImageStream();
     CompiledImageStream(const CompiledImageStream&) = delete;
     CompiledImageStream& operator=(const CompiledImageStream&) = delete;
