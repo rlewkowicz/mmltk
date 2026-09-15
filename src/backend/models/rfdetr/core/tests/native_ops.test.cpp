@@ -565,6 +565,47 @@ void test_packed_mask_sampling_matches_grid_sample_nearest_boundaries() {
     REQUIRE(torch_api::equal(sampled.cpu(), expected.cpu()));
 }
 
+constexpr std::array<std::pair<int64_t, int64_t>, 5> postprocess_geometries{{
+    {80, 160}, {80, 160}, {96, 40}, {32, 224}, {80, 160},
+}};
+
+using GeometrySelections = std::array<mmltk::backend::models::rfdetr::PostprocessedSelection, postprocess_geometries.size()>;
+
+GeometrySelections select_postprocess_geometries(torch_api::Device device) {
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    const auto options = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(device);
+    rfdetr::OutputTensors outputs;
+    outputs.pred_logits = torch_api::tensor({{{0.F, 2.F}, {4.F, -2.F}}}, options);
+    outputs.pred_boxes = torch_api::tensor({{{0.5F, 0.5F, 0.5F, 0.25F}, {0.75F, 0.25F, 0.25F, 0.5F}}}, options);
+    GeometrySelections selections;
+    for (std::size_t index = 0; index < postprocess_geometries.size(); ++index) {
+        const auto [height, width] = postprocess_geometries[index];
+        selections[index] = rfdetr::select_output_batch_fixed_size(outputs, height, width, 3);
+    }
+    return selections;
+}
+
+void require_postprocess_geometries(const GeometrySelections& selections) {
+    const auto expected_scores = torch_api::tensor({{1.F / (1.F + std::exp(-4.F)), 1.F / (1.F + std::exp(-2.F)), 0.5F}});
+    const auto expected_labels = torch_api::tensor({{0, 1, 0}}, torch_api::TensorOptions().dtype(torch_api::kInt64));
+    const auto expected_queries = torch_api::tensor({{1, 0, 0}}, torch_api::TensorOptions().dtype(torch_api::kInt64));
+    // Check every retained result only after all replacements have been submitted.
+    for (std::size_t index = 0; index < postprocess_geometries.size(); ++index) {
+        const auto [height, width] = postprocess_geometries[index];
+        const auto h = static_cast<float>(height);
+        const auto w = static_cast<float>(width);
+        const auto expected_boxes = torch_api::tensor({{{0.625F * w, 0.F, 0.875F * w, 0.5F * h},
+                                                       {0.25F * w, 0.375F * h, 0.75F * w, 0.625F * h},
+                                                       {0.25F * w, 0.375F * h, 0.75F * w, 0.625F * h}}});
+        const auto& selected = selections[index];
+        CHECK(torch_api::equal(selected.boxes.cpu(), expected_boxes));
+        CHECK(torch_api::allclose(selected.scores.cpu(), expected_scores));
+        CHECK(torch_api::equal(selected.labels.cpu(), expected_labels));
+        CHECK(torch_api::equal(selected.query_indices.cpu(), expected_queries));
+        CHECK_FALSE(selected.mask_logits.has_value());
+    }
+}
+
 void test_postprocess() {
     const auto outputs = make_outputs();
     const auto target_sizes = torch_api::tensor({{100, 100}}, torch_api::TensorOptions().dtype(torch_api::kInt64));
@@ -585,6 +626,29 @@ void test_postprocess() {
     REQUIRE(std::fabs(box_values[0][1] - 40.0f) < 1e-4f);
     REQUIRE(std::fabs(box_values[0][2] - 60.0f) < 1e-4f);
     REQUIRE(std::fabs(box_values[0][3] - 60.0f) < 1e-4f);
+
+    require_postprocess_geometries(select_postprocess_geometries(torch_api::kCPU));
+}
+
+void test_postprocess_cuda_stream_replacement() {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
+
+    const auto first_stream = c10::cuda::getStreamFromPool(false, 0);
+    const auto second_stream = c10::cuda::getStreamFromPool(false, 0);
+    c10::cuda::CUDAStreamGuard first_guard(first_stream);
+    const auto first = select_postprocess_geometries(torch_api::Device(torch_api::kCUDA, 0));
+    GeometrySelections second;
+    {
+        c10::cuda::CUDAStreamGuard second_guard(second_stream);
+        second = select_postprocess_geometries(torch_api::Device(torch_api::kCUDA, 0));
+    }
+    const auto revisited = select_postprocess_geometries(torch_api::Device(torch_api::kCUDA, 0));
+    require_postprocess_geometries(first);
+    require_postprocess_geometries(revisited);
+    {
+        c10::cuda::CUDAStreamGuard second_guard(second_stream);
+        require_postprocess_geometries(second);
+    }
 }
 
 }  // namespace
@@ -600,6 +664,7 @@ MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_sparse_mask_loss_ma
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_matcher_mask_cost_handles_zero_point_sampling_on_cuda);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_packed_mask_sampling_matches_grid_sample_nearest_boundaries);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_postprocess);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops][cuda]", test_postprocess_cuda_stream_replacement);
 
 TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity", "[rfdetr][lsap][numa]") {
     using namespace mmltk::backend::models::rfdetr;

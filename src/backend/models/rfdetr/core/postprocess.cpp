@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 import mmltk.common.logging.mmltk_logging;
@@ -34,21 +35,22 @@ struct FixedBoxScaleCacheEntry {
 postprocess_detail::Tensor fixed_box_scale(const postprocess_detail::Tensor& boxes, const int64_t height, const int64_t width) {
     postprocess_detail::CudaStream stream = nullptr;
     if (boxes.is_cuda()) { stream = postprocess_detail::getCurrentCUDAStream(boxes.get_device()).stream(); }
-    thread_local std::vector<FixedBoxScaleCacheEntry> cache;
-    for (const auto& entry : cache) {
-        if (entry.device == boxes.device() && entry.stream == stream && entry.height == height && entry.width == width) {
-            return entry.scale;
-        }
+    thread_local FixedBoxScaleCacheEntry cache;
+    if (cache.scale.defined() && cache.device == boxes.device() && cache.stream == stream && cache.height == height && cache.width == width) {
+        return cache.scale;
     }
 
-    cache.push_back(FixedBoxScaleCacheEntry{
+    FixedBoxScaleCacheEntry candidate{
         boxes.device(),
         stream,
         height,
         width,
         postprocess_detail::tensor({width, height, width, height}, boxes.options().dtype(postprocess_detail::kFloat32)).view({1, 1, 4}),
-    });
-    return cache.back().scale;
+    };
+    // Never rewrite storage still read by queued work. Torch retires the old
+    // allocation on its own stream; construction failure leaves the cache intact.
+    cache = std::move(candidate);
+    return cache.scale;
 }
 
 PostprocessCore postprocess_core(const OutputTensors& outputs, const postprocess_detail::Tensor* target_sizes,
