@@ -1807,18 +1807,31 @@ pub(crate) fn drawable_annotation(requested: Surface) -> Option<(Surface, Annota
     })
 }
 
-pub(crate) fn drawable_prediction(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::PredictionContent>)> {
-    if requested.frame?.content_session != crate::generated::presentation_source_session(crate::generated::PresentationSourceKind::Predict) { return None; }
+fn drawable_content<T>(
+    requested: Surface,
+    kind: crate::generated::PresentationSourceKind,
+    pending_content: impl Fn(&PendingImage) -> Option<std::sync::Arc<T>>,
+    retained_content: impl Fn(&ImagePublication) -> Option<std::sync::Arc<T>>,
+) -> Option<(Surface, std::sync::Arc<T>)> {
+    if requested.frame?.content_session != crate::generated::presentation_source_session(kind) { return None; }
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
         SurfaceRenderer::submitted_draws(&renderer.pending, &renderer.imported, requested)
-            .find_map(|(_, pending)| Some((pending.surface, pending.prediction.clone()?)))
+            .find_map(|(_, pending)| Some((pending.surface, pending_content(pending)?)))
             .or_else(|| {
                 let image = &renderer.imported.as_ref()?.image;
-                Some((image.retained()?, image.prediction.clone()?))
+                Some((image.retained()?, retained_content(image)?))
             })
     })
+}
+pub(crate) fn drawable_prediction(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::PredictionContent>)> {
+    drawable_content(requested, crate::generated::PresentationSourceKind::Predict,
+        |pending| pending.prediction.clone(), |image| image.prediction.clone())
+}
+pub(crate) fn drawable_validation(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::ValidationContent>)> {
+    drawable_content(requested, crate::generated::PresentationSourceKind::Validation,
+        |pending| pending.validation.clone(), |image| image.validation.clone())
 }
 
 pub(crate) struct Pipeline {
@@ -1866,6 +1879,7 @@ struct ImagePublication {
     detail: Option<DetailContent>,
     annotation: Option<AnnotationContent>,
     prediction: Option<std::sync::Arc<labels::PredictionContent>>,
+    validation: Option<std::sync::Arc<labels::ValidationContent>>,
     placement: Placement,
 }
 
@@ -1935,6 +1949,7 @@ struct PendingImage {
     detail: Option<DetailContent>,
     annotation: Option<AnnotationContent>,
     prediction: Option<std::sync::Arc<labels::PredictionContent>>,
+    validation: Option<std::sync::Arc<labels::ValidationContent>>,
     placement: Placement,
     complete: bool,
     view_ready: bool,
@@ -2401,6 +2416,7 @@ impl SurfaceRenderer {
                 detail: None,
                 annotation: None,
                 prediction: None,
+                    validation: None,
                 placement,
             },
             views,
@@ -2805,6 +2821,7 @@ impl ImagePublication {
         self.detail = None;
         self.annotation = None;
         self.prediction = None;
+        self.validation = None;
         (self.pending_sample.take(), self.retained_read.take())
     }
 
@@ -2895,6 +2912,7 @@ impl ImagePublication {
         self.detail = pending.detail;
         self.annotation = pending.annotation;
         self.prediction = pending.prediction;
+        self.validation = pending.validation;
         self.placement = pending.placement;
         self.completed = Some(frame);
         self.retained_read = pending.read;
@@ -3594,6 +3612,7 @@ mod tests {
                     detail: initial.detail,
                     annotation: None,
                     prediction: None,
+                    validation: None,
                     placement: initial.placement,
                 };
                 let mut empty = model.explore.snapshot.clone().unwrap();
@@ -3674,6 +3693,7 @@ mod tests {
                     detail: initial.detail,
                     annotation: None,
                     prediction: None,
+                    validation: None,
                     placement: initial.placement,
                 };
                 let mut source = crate::generated::ExploreImageMetadata::from(
@@ -4007,6 +4027,7 @@ mod tests {
                         detail: initial.detail,
                         annotation: None,
                         prediction: None,
+                    validation: None,
                         placement: initial.placement,
                     };
                     snapshot.mode = if from_gallery {
@@ -4223,6 +4244,7 @@ mod tests {
                     detail: previous.detail,
                     annotation: previous.annotation,
                     prediction: previous.prediction,
+                    validation: previous.validation,
                     placement: previous.placement,
                 };
                 let mut copy_notified = false;
@@ -4442,6 +4464,7 @@ mod tests {
                     detail: None,
                     annotation: None,
                     prediction: None,
+                    validation: None,
                     placement: Placement::Contain,
                     complete: true,
                     view_ready: true,
@@ -4452,6 +4475,7 @@ mod tests {
                 detail: metadata::pending(frame).and_then(|image| image.detail),
                 annotation: None,
                 prediction: None,
+                    validation: None,
                 placement: Placement::Contain,
             };
             DRAW_AUTHORIZATION.with(|authorization| {
@@ -5874,7 +5898,7 @@ mod tests {
         let mut image = ImagePublication {
             surface: initial.surface, completed: Some(first), pending_sample: None,
             retained_read: SampleRead::acquire(first), gallery: None, detail: None, annotation: None,
-            prediction: initial.prediction, placement: Placement::Contain,
+            prediction: initial.prediction, validation: initial.validation, placement: Placement::Contain,
         };
         let mut viewport = ViewportOwner::default();
         viewport.synchronize_source(image.retained().unwrap());

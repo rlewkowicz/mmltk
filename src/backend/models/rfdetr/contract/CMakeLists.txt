@@ -13,6 +13,7 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         class_layout.h
+        evaluation_metrics.h
         output_roles.h
         artifacts.h
         cli.h

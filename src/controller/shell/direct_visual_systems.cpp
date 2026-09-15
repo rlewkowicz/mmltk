@@ -87,7 +87,7 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
     };
     validation_ = std::make_unique<ValidationSystem>(
         *settings_, *dataset_, *model_, [compute] { return std::make_unique<CudaValidationRuntime>(compute); },
-        browser::ApplicationEventPublisher<&ApplicationSystems::validation>(events_, continuity_), compute.execution);
+        browser::ApplicationEventPublisher<&ApplicationSystems::validation>(events_, continuity_, source_changed), compute.execution, configuration.base_visual);
     export_ = std::make_unique<ExportSystem>(
         *settings_, *dataset_, *model_, [compute] { return std::make_unique<CudaExportRuntime>(compute); },
         browser::ApplicationEventPublisher<&ApplicationSystems::export_system>(events_, continuity_), compute.execution);

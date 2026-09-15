@@ -331,18 +331,18 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        validation.active = false;
-        validation.terminal.outcome = crate::generated::ComputeOperationOutcome::Succeeded;
-        validation.terminal.output = "metrics.json".into();
+        validation.operation.active = false;
+        validation.operation.terminal.outcome = crate::generated::ComputeOperationOutcome::Succeeded;
+        validation.operation.terminal.output = "metrics.json".into();
         assert!(matches!(
-            compute_presentation(Some(&validation)),
+            compute_presentation(Some(&validation.operation)),
             Presentation::Terminal { ref outcome, ref detail }
                 if outcome == "Succeeded" && detail == "metrics.json"
         ));
-        validation.terminal.outcome = crate::generated::ComputeOperationOutcome::Failed;
-        validation.terminal.detail = "device unavailable".into();
+        validation.operation.terminal.outcome = crate::generated::ComputeOperationOutcome::Failed;
+        validation.operation.terminal.detail = "device unavailable".into();
         assert!(matches!(
-            compute_presentation(Some(&validation)),
+            compute_presentation(Some(&validation.operation)),
             Presentation::Terminal { ref outcome, ref detail }
                 if outcome == "Failed" && detail == "device unavailable"
         ));

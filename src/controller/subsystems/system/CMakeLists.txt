@@ -32,16 +32,19 @@ mmltk_register_retained_module_importers(
     compute_systems.cpp
     model_system.cpp
     predict_system.cpp
-    detail/prediction_preview.cpp)
+    detail/prediction_preview.cpp
+    detail/validation_samples.cpp)
 mmltk_register_private_headers(
     mmltk_controller_data_compute_systems detail/cuda_runtime_resources.h
         detail/predict_revision.h
         detail/prediction_playback.h
-        detail/prediction_preview.h)
+        detail/prediction_preview.h
+        detail/validation_samples.h)
 target_include_directories(mmltk_controller_data_compute_systems PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(mmltk_controller_data_compute_systems
     PUBLIC
         mmltk::backend::models::rfdetr::contract
+        mmltk::backend::models::rfdetr::inference
         mmltk::common::types
         mmltk::common::system
         mmltk::controller::application_boundary
@@ -55,8 +58,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::backend::imaging::raster
         mmltk::backend::imaging::explore
         mmltk::backend::ml::runtime
-        mmltk::backend::models::rfdetr::export
-        mmltk::backend::models::rfdetr::inference)
+        mmltk::backend::models::rfdetr::export)
 mmltk_link_declarations(mmltk_controller_data_compute_systems PUBLIC
     mmltk::controller::visual_runtime)
 mmltk_register_header_isolation(mmltk_controller_data_compute_systems)

@@ -155,6 +155,7 @@ struct AnalysisOverlayRgbaPitchedLaunch {
     std::uint8_t mask_alpha = 0;
     int box_thickness = 1;
     cudaStream_t stream = nullptr;
+    bool labels = true;
 };
 
 struct CompositeRgbaOverBgrPitchedLaunch {

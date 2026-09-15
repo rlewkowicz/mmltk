@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "predict_system.h"
 
 #include <cuda_runtime_api.h>

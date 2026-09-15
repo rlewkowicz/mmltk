@@ -27,6 +27,10 @@ class PredictionPreviewFrame final {
     PredictionPreviewFrame& operator=(const PredictionPreviewFrame&) = delete;
     [[nodiscard]] bool CompatibleWith(const mmltk::frameworks::gpu::SystemImageRuntime&) const noexcept;
     void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&) const;
+    void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean,
+                    mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream,
+                    bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks) const;
+    [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> ground_truth() const noexcept;
     [[nodiscard]] std::span<const mmltk::backend::models::rfdetr::Prediction> predictions() const noexcept;
     [[nodiscard]] std::span<const std::string> classes() const noexcept;
     [[nodiscard]] int class_count() const noexcept;
@@ -51,15 +55,17 @@ class PredictionPreviewPool final {
         decltype(&cudaMemcpyAsync) upload = &cudaMemcpyAsync;
         mmltk::frameworks::gpu::CudaContextApi context_api{};
         decltype(&mmltk::backend::imaging::raster::chw_float_to_rgba) convert = &mmltk::backend::imaging::raster::chw_float_to_rgba;
+        decltype(&cudaStreamWaitEvent) wait = &cudaStreamWaitEvent;
     };
     PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext,
                           TransferOperations operations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister},
-                          std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {});
+                          std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {}, std::size_t slots = kSlotCapacity);
     [[nodiscard]] std::shared_ptr<const PredictionPreviewFrame> Capture(
         const float*, VisualExtent, std::uintptr_t source_stream,
         std::span<const mmltk::backend::models::rfdetr::Prediction>,
         const mmltk::backend::ml::runtime::AnalysisAnnotationStorage&, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>, int classes,
-        const std::uint8_t* rgb8 = nullptr, std::shared_ptr<void> source_custody = {}, void (*stop_source)(void*) = nullptr, void* source_control = nullptr);
+        const std::uint8_t* rgb8 = nullptr, std::shared_ptr<void> source_custody = {}, void (*stop_source)(void*) = nullptr, void* source_control = nullptr,
+        std::span<const mmltk::backend::models::rfdetr::Prediction> ground_truth = {}, bool composition = false);
     [[nodiscard]] bool HasUnsafeSourceCustody() const noexcept { return unsafe_source_; }
     [[nodiscard]] bool HasUnsafeCustody() const noexcept { return !retirement_->admission_open(); }
    private:
@@ -68,6 +74,6 @@ class PredictionPreviewPool final {
     mmltk::frameworks::gpu::DeviceExecution execution_;
     mmltk::frameworks::gpu::DeviceContext context_;
     std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_;
-    std::array<std::shared_ptr<PredictionPreviewFrame>, kSlotCapacity> slots_{};
+    std::vector<std::shared_ptr<PredictionPreviewFrame>> slots_;
 };
 }

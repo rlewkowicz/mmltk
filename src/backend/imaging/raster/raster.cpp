@@ -163,14 +163,14 @@ std::int32_t raster_mask_boxes_bgr(const MaskBoxLabelBgrWork& work) noexcept {
 
 std::int32_t raster_instance_overlay_rgba(const InstanceOverlayRgbaWork& work) noexcept {
     if (work.instances.instance_count == 0) return cudaSuccess;
-    if (!work.overlay.valid(4U) || !box_inputs_valid(work.instances) || work.box_thickness <= 0 ||
+    if (!work.overlay.valid(4U) || !box_inputs_valid(work.instances) || work.box_thickness < 0 ||
         !indexed_instances_fit(work.instances.instance_count, work.overlay.width, work.overlay.height) || !work.stream) {
         return cudaErrorInvalidValue;
     }
     const MaskBoxLabelInputs launch_instances{work.masks, work.instances.boxes, work.instances.colors, work.instances.labels,
                                               work.instances.instance_count};
     return detail::launch_draw_analysis_overlay_rgba_pitched(
-        {as_launch_surface(work.overlay), launch_instances, work.mask_alpha, work.box_thickness, as_stream(work.stream)});
+        {as_launch_surface(work.overlay), launch_instances, work.mask_alpha, work.box_thickness, as_stream(work.stream), work.labels});
 }
 
 std::int32_t composite_rgba_over_bgr(const CompositeRgbaOverBgrWork& work) noexcept {

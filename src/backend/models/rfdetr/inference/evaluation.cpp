@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 
@@ -30,18 +31,22 @@ EvaluationRunResult run_evaluation(const EvaluateRequest& request) {
     validation.eval_order = resolve_inference_artifact(options, options.backend).backend_name;
     auto validation_result = run_validation(validation);
     if (validation_result.backends.size() != 1U) { throw std::runtime_error("RF-DETR evaluation expected one selected backend"); }
-    const auto& [backend_name, backend_result] = *validation_result.backends.begin();
+    auto& [backend_name, backend_result] = *validation_result.backends.begin();
     EvaluationRunResult result;
     result.backend_name = backend_name;
     result.image_count = validation_result.images;
     result.category_count = validation_result.categories;
-    result.result = backend_result;
     result.artifacts = backend_result.artifacts;
+    result.result = std::move(backend_result);
     return result;
 }
 
 void print_evaluation_summary(const EvaluateRequest&, const EvaluationRunResult& result) {
-    std::cout << result.backend_name << ": bbox AP=" << result.result.summary.bbox.ap << '\n';
+    std::cout << result.backend_name << ": bbox AP=";
+    if (result.result.summary.bbox.available) std::cout << result.result.summary.bbox.ap;
+    else std::cout << "unavailable";
+    const auto& caps = result.result.summary.bbox.detection_limits;
+    std::cout << " model budget=" << result.result.summary.model_detection_budget << " AR caps=" << caps[0] << '/' << caps[1] << '/' << caps[2] << '\n';
 }
 
 }  // namespace mmltk::backend::models::rfdetr

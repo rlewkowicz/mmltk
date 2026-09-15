@@ -117,7 +117,7 @@ impl ApplicationModel {
                 }) && !self.training_family_pending()
             }
             FeatureId::Validate => self.compute_start_available_for(
-                self.workflow.validation.as_ref(),
+                self.workflow.validation.as_ref().map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::ValidationStart,
                 ApplicationIntentEndpoint::ValidationStop,
             ),
@@ -152,7 +152,7 @@ impl ApplicationModel {
         if self.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == page) { return true; }
         let (snapshot, start, stop) = match page {
             FeatureId::Validate => (
-                self.workflow.validation.as_ref(),
+                self.workflow.validation.as_ref().map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::ValidationStart,
                 ApplicationIntentEndpoint::ValidationStop,
             ),
@@ -413,10 +413,10 @@ mod tests {
             .begin_intent(ApplicationIntentEndpoint::ValidationStart)
             .unwrap();
         let mut validation = model.workflow.validation.clone().unwrap();
-        validation.generationfrontier += 1;
-        validation.active = true;
-        validation.terminal.generation = validation.generationfrontier;
-        validation.terminal.outcome = ComputeOperationOutcome::Running;
+        validation.operation.generationfrontier += 1;
+        validation.operation.active = true;
+        validation.operation.terminal.generation = validation.operation.generationfrontier;
+        validation.operation.terminal.outcome = ComputeOperationOutcome::Running;
         model.reduce_reply(
             start,
             Ok(ApplicationReply::ValidationStart(validation.clone())),
@@ -425,7 +425,7 @@ mod tests {
         let stop = model
             .begin_intent(ApplicationIntentEndpoint::ValidationStop)
             .unwrap();
-        validation.terminal.outcome = ComputeOperationOutcome::CancellationRequested;
+        validation.operation.terminal.outcome = ComputeOperationOutcome::CancellationRequested;
         model.reduce_reply(stop, Ok(ApplicationReply::ValidationStop(validation)));
         assert!(!model.compute_stop_available(FeatureId::Validate));
     }

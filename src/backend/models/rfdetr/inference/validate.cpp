@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 
 #include "src/backend/models/rfdetr/core/evaluation.h"
@@ -18,8 +19,12 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <meta>
+#include <type_traits>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -54,9 +59,9 @@ struct AlignmentSample final {
 }
 
 [[nodiscard]] ValidationBackendResult evaluate_backend(const ValidateRequest& request, const ResolvedInferenceArtifact& artifact,
-                                                       EvaluationDatasetOwner dataset, PredictionSession& prediction_session,
+                                                       mmltk::backend::data::DatasetLoader& loader, std::optional<EvaluationDatasetOwner>& dataset, PredictionSession& prediction_session,
                                                        std::vector<std::optional<AlignmentSample>>* captured_predictions,
-                                                       const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
+                                                       const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery, std::span<const std::uint32_t> samples) {
     PredictRequest predict;
     static_cast<ModelArtifactRequest&>(predict) = selected_artifact(request, artifact);
     static_cast<InferenceExecutionConfig&>(predict) = request;
@@ -64,24 +69,38 @@ struct AlignmentSample final {
     predict.compiled_path = request.compiled_path;
     predict.backend = artifact.backend_name;
     predict.batch_size = request.batch_size;
-    predict.max_dets_per_image = request.eval_max_dets == 0U ? 500U : request.eval_max_dets;
+    predict.max_dets_per_image = request.num_queries == 0U ? 500U : request.num_queries;
+    const auto evaluation_cap = std::min(predict.max_dets_per_image, request.eval_max_dets == 0U ? predict.max_dets_per_image : request.eval_max_dets);
     predict.output_path =
         request.report_json_path.empty() ? request.compiled_path.parent_path() / "validation_predictions.json" : request.report_json_path;
     predict.progress_bar = request.log_mode == ValidationLogMode::Interactive;
     predict.limit_images = request.limit_images;
     predict.include_masks = false;
-    std::vector<std::uint32_t> evaluator_order;
+    std::vector<std::uint32_t> evaluator_order, model_order;
     std::vector<float> scores;
     std::vector<std::int64_t> labels;
     std::vector<float> boxes;
+    std::vector<Prediction> ground_truth;
+    bool masks = false;
+    const auto is_sample = [&](std::int64_t index) { return index >= 0 && std::ranges::binary_search(samples, static_cast<std::uint32_t>(index)); };
     const auto predictions = prediction_session.RunResolved(predict, artifact, command_stream, {
       .stop = delivery.stop,
+      .demand = [&](std::int64_t index) { const bool selected = delivery.sample && is_sample(index); return PredictionDemand{.source_pixels = selected, .encoded_masks = masks, .preview_masks = selected}; },
       .begin = [&](const PredictionRunResult& result) {
         if (result.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || !result.class_catalog)
             throw std::invalid_argument("semantic evaluation requires a fully bound model class layout");
-        evaluator_order = result.class_catalog->permutation_to(*dataset.class_catalog());
+        masks = delivery.mask_metrics && result.masks_available &&
+                std::ranges::all_of(std::span{loader.label_data(), loader.num_label_instances()}, [](const auto& label) { return label.mask_rle_pairs != 0U; });
+        const auto mode = masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox;
+        if (!dataset || dataset->facts().metric_set != mode) dataset.emplace(loader, mode);
+        else dataset->clear_predictions();
+        if (request.limit_images != 0U) dataset->limit_images(request.limit_images);
+        evaluator_order = result.class_catalog->permutation_to(*dataset->class_catalog());
+        model_order.resize(evaluator_order.size());
+        for (std::size_t category = 0; category < evaluator_order.size(); ++category)
+            model_order[evaluator_order[category]] = static_cast<std::uint32_t>(category);
       },
-      .completed = [&](const PredictionRecord& record, PredictionPixels, const runtime::AnalysisAnnotationStorage&) {
+      .completed = [&](const PredictionRecord& record, PredictionPixels pixels, const runtime::AnalysisAnnotationStorage& annotations) {
         scores.clear();
         labels.clear();
         boxes.clear();
@@ -96,13 +115,35 @@ struct AlignmentSample final {
             labels.push_back(evaluator_order[detection.class_reference]);
             boxes.insert(boxes.end(), detection.bbox_xyxy.begin(), detection.bbox_xyxy.end());
         }
-        dataset.merge_bbox_predictions(record.dataset_index,
+        dataset->merge_matches(dataset->match_predictions(record.dataset_index,
                                        {.image_id = static_cast<int>(record.image_id),
                                         .scores = scores.data(),
                                         .labels_zero_based = labels.data(),
                                         .boxes_xyxy = boxes.data(),
                                         .count = scores.size()},
-                                       predict.max_dets_per_image);
+                                       std::nullopt, evaluation_cap, masks ? std::span<const Prediction>{record.detections} : std::span<const Prediction>{}));
+        if (delivery.sample && is_sample(record.dataset_index)) {
+            ground_truth.clear();
+            const auto& entry = loader.label_index()[record.dataset_index];
+            for (std::size_t ordinal = 0; ordinal < entry.num_instances; ++ordinal) {
+                const auto& packed = loader.label_data()[entry.label_begin + ordinal];
+                Prediction gt;
+                gt.image_id = static_cast<int>(record.image_id);
+                // GT is expressed in the producing sample catalog, while metrics
+                // consume the already-admitted model-to-dataset permutation.
+                gt.class_reference = static_cast<int>(model_order[packed.class_id]);
+                gt.bbox_xyxy = {static_cast<float>(packed.bbox_x1), static_cast<float>(packed.bbox_y1),
+                                static_cast<float>(packed.bbox_x2), static_cast<float>(packed.bbox_y2)};
+                gt.has_mask = packed.mask_rle_pairs != 0U;
+                gt.mask.width = loader.image_width(); gt.mask.height = loader.image_height();
+                for (std::size_t run = 0; run < packed.mask_rle_pairs; ++run) {
+                    const auto pair = loader.rle_data()[packed.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair) + run];
+                    gt.mask.runs.emplace_back(pair.start, pair.length); gt.mask.area += pair.length;
+                }
+                ground_truth.push_back(std::move(gt));
+            }
+            delivery.sample({record, std::move(pixels), annotations, ground_truth});
+        }
         if (captured_predictions != nullptr && captured_predictions->size() < request.alignment_images) {
             if (record.detections.empty()) captured_predictions->push_back(std::nullopt);
             else captured_predictions->push_back(AlignmentSample{record.detections.front().score, record.detections.front().bbox_xyxy});
@@ -115,16 +156,42 @@ struct AlignmentSample final {
     result.artifacts = predictions.artifacts;
     result.model_info.backend = artifact.backend_name;
     result.model_info.model_path = artifact.path.string();
-    result.model_info.num_queries = static_cast<std::int64_t>(predict.max_dets_per_image);
+    result.model_info.num_queries = predictions.artifacts.config.num_queries;
     result.model_info.num_classes = predictions.artifacts.config.num_classes;
     result.model_info.class_layout = predictions.artifacts.class_layout;
-    result.summary = dataset.evaluate(predict.max_dets_per_image);
+    if (!dataset) {
+        if (!predictions.cancelled) throw std::logic_error("validation did not admit an evaluator");
+        // Cancellation can win between selected-backend admission and Begin.
+        // No matching has occurred, so this backend has no available metrics.
+        result.summary.model_detection_budget = static_cast<std::uint32_t>(predict.max_dets_per_image);
+        result.timing = predictions.timing;
+        return result;
+    }
+    if (predictions.cancelled) dataset->limit_images(predictions.processed_images);
+    result.summary = dataset->evaluate(evaluation_cap);
+    result.summary.model_detection_budget = static_cast<std::uint32_t>(predict.max_dets_per_image);
+    result.details = dataset->take_details();
     result.timing = predictions.timing;
     return result;
 }
 
-[[nodiscard]] nlohmann::json metric_json(const MetricSummary& metric) {
-    return {{"ap", metric.ap}, {"ap50", metric.ap50}, {"ap75", metric.ap75}};
+// The report is a genuinely distinct external JSON form. Derive its fields
+// from the metric contract so additional summary facts have one declaration.
+template <class T>
+[[nodiscard]] nlohmann::json metric_json(const T& value) {
+    if constexpr (std::is_arithmetic_v<T>) return value;
+    else if constexpr (requires { value.has_value(); *value; }) return value ? metric_json(*value) : nlohmann::json(nullptr);
+    else if constexpr (requires { value.begin(); value.end(); }) {
+        auto result = nlohmann::json::array();
+        for (const auto& item : value) result.push_back(metric_json(item));
+        return result;
+    } else {
+        auto result = nlohmann::json::object();
+        template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()))) {
+            result[std::string(std::meta::identifier_of(member))] = metric_json(value.[:member:]);
+        }
+        return result;
+    }
 }
 
 [[nodiscard]] std::vector<std::string> evaluation_order(const std::string& value) {
@@ -203,10 +270,6 @@ ValidationRunResult ValidationSession::Run(const ValidateRequest& request, const
         result.cancelled = true;
     }
     return result;
-}
-
-std::size_t ValidationSession::RunImageCount(const ValidateRequest& request, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
-    return Run(request, command_stream, delivery).processed_images;
 }
 
 ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, const runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery) {
@@ -300,15 +363,28 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
     }
     if (delivery.stop.stop_requested()) return {.cancelled = true};
     auto loader = inference_detail::make_loader(options.compiled_path, options.batch_size, options, options.prefetch_factor);
-    EvaluationDatasetOwner dataset(*loader, EvaluationMetricSet::BBox);
-    if (options.limit_images != 0U) { dataset.limit_images(options.limit_images); }
+    std::optional<EvaluationDatasetOwner> dataset;
+    const auto population = options.limit_images == 0U ? loader->num_images() : std::min(options.limit_images, loader->num_images());
+    std::vector<std::uint32_t> samples;
+    if (delivery.sample) {
+        // Floyd selection uses at most six entries, independent of population.
+        std::mt19937_64 random(std::random_device{}());
+        const auto count = std::min<std::size_t>(6U, population);
+        for (std::size_t index = population - count; index < population; ++index) {
+            auto selected = static_cast<std::uint32_t>(std::uniform_int_distribution<std::size_t>(0U, index)(random));
+            if (std::ranges::find(samples, selected) != samples.end()) selected = static_cast<std::uint32_t>(index);
+            samples.push_back(selected);
+        }
+        std::ranges::sort(samples);
+        if (delivery.samples_selected) delivery.samples_selected(samples, loader->class_catalog());
+    }
 
     ValidationRunResult result;
-    result.images = dataset.image_count();
-    result.categories = dataset.category_count();
+    result.images = population;
+    result.categories = loader->num_classes();
     result.limits.persisted_max_instances_per_image = loader->max_instances_per_image();
     result.limits.resolved_num_queries = options.num_queries == 0U ? 500U : options.num_queries;
-    result.limits.resolved_eval_max_dets = options.eval_max_dets == 0U ? result.limits.resolved_num_queries : options.eval_max_dets;
+    result.limits.resolved_eval_max_dets = std::min(result.limits.resolved_num_queries, options.eval_max_dets == 0U ? result.limits.resolved_num_queries : options.eval_max_dets);
     result.limits.num_queries_automatic = options.num_queries == 0U;
     result.limits.eval_max_dets_automatic = options.eval_max_dets == 0U;
 
@@ -336,7 +412,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
                 throw std::invalid_argument("invalid RF-DETR inference artifact kind");
         }
         result.backends.emplace(artifact.backend_name,
-                                evaluate_backend(backend_request, artifact, dataset, For(artifact.kind), captured_result, command_stream, delivery));
+                                evaluate_backend(backend_request, artifact, *loader, dataset, For(artifact.kind), captured_result, command_stream, delivery, samples));
     }
     if (const auto onnx = result.backends.find("onnx"); onnx != result.backends.end()) {
         if (const auto trt = result.backends.find("tensorrt"); trt != result.backends.end()) {
@@ -346,6 +422,10 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
                 .mask_ap = std::nullopt,
                 .mask_ap50 = std::nullopt,
             };
+            if (onnx->second.summary.mask && trt->second.summary.mask && onnx->second.summary.mask->available && trt->second.summary.mask->available) {
+                result.delta_tensorrt_minus_onnx->mask_ap = trt->second.summary.mask->ap - onnx->second.summary.mask->ap;
+                result.delta_tensorrt_minus_onnx->mask_ap50 = trt->second.summary.mask->ap50 - onnx->second.summary.mask->ap50;
+            }
             AlignmentStats alignment;
             double score_sum = 0.0;
             double box_sum = 0.0;
@@ -397,11 +477,9 @@ void write_validation_report(const ValidateRequest& request, const ValidationRun
     if (!request.write_report_json || request.report_json_path.empty()) { return; }
     nlohmann::json backends = nlohmann::json::object();
     for (const auto& [name, value] : result.backends) {
-        backends[name] = {
-            {"bbox", metric_json(value.summary.bbox)},
-            {"seconds", value.timing.seconds},
-            {"images_per_second", value.timing.img_per_s},
-        };
+        backends[name] = metric_json(value.summary);
+        backends[name]["seconds"] = value.timing.seconds;
+        backends[name]["images_per_second"] = value.timing.img_per_s;
     }
     nlohmann::json report = {
         {"images", result.images},
@@ -427,7 +505,11 @@ void print_model_metadata(const ModelInfo& info, std::size_t images, std::size_t
 void print_validation_run_summary(const ValidateRequest& request, const ValidationRunResult& result) {
     if (request.log_mode != ValidationLogMode::Interactive) { return; }
     for (const auto& [name, value] : result.backends) {
-        std::cout << name << ": bbox AP=" << value.summary.bbox.ap << ", AP50=" << value.summary.bbox.ap50 << '\n';
+        std::cout << name << ": bbox AP=";
+        if (value.summary.bbox.available) std::cout << value.summary.bbox.ap << ", AP50=" << value.summary.bbox.ap50;
+        else std::cout << "unavailable";
+        const auto& caps = value.summary.bbox.detection_limits;
+        std::cout << " model budget=" << value.summary.model_detection_budget << " AR caps=" << caps[0] << '/' << caps[1] << '/' << caps[2] << '\n';
     }
 }
 

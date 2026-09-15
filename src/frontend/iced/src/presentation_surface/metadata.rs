@@ -79,6 +79,7 @@ pub(crate) fn install(
     let mut detail = None;
     let mut annotation = None;
     let mut prediction = None;
+    let mut validation = None;
     match product {
         WorkspaceImageProduct::Explore(snapshot) if snapshot.frame == metadata.frame => {
             let snapshot = Arc::new(snapshot);
@@ -120,6 +121,16 @@ pub(crate) fn install(
         WorkspaceImageProduct::Predict(snapshot) if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 => {
             prediction = Some(Arc::new(super::labels::PredictionContent::new(snapshot)));
         }
+        WorkspaceImageProduct::Validation(snapshot) if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 => {
+            if snapshot.samples.iter().any(|sample| sample.available &&
+                (sample.identity.generation == 0 || sample.originalextent.width == 0 || sample.originalextent.height == 0 ||
+                 sample.crop.width == 0 || sample.crop.height == 0 ||
+                 sample.crop.x.checked_add(sample.crop.width).is_none_or(|end| end > snapshot.frame.extent.width) ||
+                 sample.crop.y.checked_add(sample.crop.height).is_none_or(|end| end > snapshot.frame.extent.height))) {
+                return Err("invalid validation sample image geometry".into());
+            }
+            validation = Some(Arc::new(super::labels::ValidationContent::new(snapshot)));
+        }
         WorkspaceImageProduct::Live(snapshot) if snapshot.frame == metadata.frame => {}
         _ => return Err("graphics metadata does not describe this visual product".into()),
     }
@@ -131,7 +142,8 @@ pub(crate) fn install(
         frame: Some(frame),
         crop: None,
         viewer_identity: prediction.as_ref().map(|content: &Arc<super::labels::PredictionContent>|
-            (frame.content_session, content.metadata.contentidentity)),
+            (frame.content_session, content.metadata.contentidentity)).or_else(|| validation.as_ref().map(|content: &Arc<super::labels::ValidationContent>|
+            (frame.content_session, content.metadata.contentidentity))),
         fit_revision: 0,
     };
     let placement = gallery.as_ref().map_or(Placement::Contain, |snapshot| {
@@ -147,6 +159,7 @@ pub(crate) fn install(
             detail,
             annotation,
             prediction,
+            validation,
             placement,
             complete: super::copy_completed(frame),
             view_ready: true,

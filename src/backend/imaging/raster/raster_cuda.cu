@@ -176,14 +176,15 @@ __device__ void apply_box_color<cuda_launch::RgbaPixelU8>(cuda_launch::RgbaPixel
 
 template <typename PixelT>
 __device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const uint8_t* colors, const int* labels, int num_instances,
-                                       int box_thickness, PixelT& pixel) {
+                                       int box_thickness, PixelT& pixel, bool labels_enabled = true) {
+    if (box_thickness <= 0 && !labels_enabled) return;
     for (int i = 0; i < num_instances; ++i) {
         const int x1 = static_cast<int>(boxes[i * 4 + 0]);
         const int y1 = static_cast<int>(boxes[i * 4 + 1]);
         const int x2 = static_cast<int>(boxes[i * 4 + 2]);
         const int y2 = static_cast<int>(boxes[i * 4 + 3]);
-        const bool is_edge = pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
-        const bool is_label = pixel_hits_label_digit(x, y, x1, y1, labels[i]);
+        const bool is_edge = box_thickness > 0 && pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
+        const bool is_label = labels_enabled && pixel_hits_label_digit(x, y, x1, y1, labels[i]);
         if (is_edge || is_label) { apply_box_color(pixel, colors, i * 3); }
     }
 }
@@ -283,7 +284,7 @@ __global__ void draw_analysis_overlay_rgba_pitched_kernel(const draw_launch::Ana
         }
     }
 
-    apply_launch_boxes_and_labels(x, y, launch, pixel);
+    apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, instances.instance_count, launch.box_thickness, pixel, launch.labels);
 
     cuda_launch::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, pixel);
 }
@@ -611,11 +612,14 @@ MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_masks_boxes_label
                                                        has_valid_mask_box_label_inputs(launch.instances),
                                                    draw_masks_boxes_labels_bgr_pitched_kernel)
 
-MMLTK_DRAW_CUDA_DEFINE_NORMALIZED_SURFACE_LAUNCHER(launch_draw_analysis_overlay_rgba_pitched, draw_launch::AnalysisOverlayRgbaPitchedLaunch,
-                                                   overlay, box_thickness,
-                                                   draw_launch::is_valid(launch.overlay) &&
-                                                       has_valid_mask_box_label_inputs(launch.instances),
-                                                   draw_analysis_overlay_rgba_pitched_kernel)
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_analysis_overlay_rgba_pitched, draw_launch::AnalysisOverlayRgbaPitchedLaunch) {
+    if (!draw_launch::is_valid(launch.overlay) || !has_valid_mask_box_label_inputs(launch.instances) || launch.box_thickness < 0)
+        return cudaErrorInvalidValue;
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(launch.overlay.width, launch.overlay.height);
+    draw_analysis_overlay_rgba_pitched_kernel<<<grid, block, 0, launch.stream>>>(launch);
+    return cudaGetLastError();
+}
 
 MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_composite_rgba_over_bgr_pitched, draw_launch::CompositeRgbaOverBgrPitchedLaunch) {
     if (!draw_launch::is_valid(launch.base_bgr) || !draw_launch::is_valid(launch.overlay_rgba)) { return cudaErrorInvalidValue; }

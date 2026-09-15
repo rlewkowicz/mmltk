@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 

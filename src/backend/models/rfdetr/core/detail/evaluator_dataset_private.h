@@ -26,10 +26,11 @@ class CocoDataset {
     bool has_image(int image_id) const;
     [[nodiscard]] ImageEvaluationMatches match_staged_predictions(std::int64_t dataset_index, const BBoxPredictionView& bbox,
                                                                   const std::optional<PackedMaskPredictionView>& mask,
-                                                                  size_t max_dets_per_image) const;
+                                                                  size_t max_dets_per_image, std::span<const Prediction> encoded_masks = {}) const;
     void merge_matches(ImageEvaluationMatches&& matches);
     void clear_predictions();
     EvalSummary evaluate(size_t max_dets_per_image, mmltk::common::concurrency::WorkerPool* worker_pool = nullptr) const;
+    std::vector<EvaluationMetricDetail> take_details() { return std::exchange(details_, {}); }
 
    private:
     struct GroundTruthSpan {
@@ -42,7 +43,8 @@ class CocoDataset {
         std::uint32_t area = 0;
     };
     struct CategoryReductionScratch {
-        std::array<double, 10> average_precision{};
+        std::array<EvaluationMetricDetail*, 4> areas{};
+        std::array<ConfidenceMetrics, 101> confidence{};
         std::array<size_t, 101> recall_indices{};
         std::vector<double> precisions;
     };
@@ -51,8 +53,10 @@ class CocoDataset {
 
         inline void reset(size_t category_count) {
             categories.resize(category_count);
-            for (CategoryReductionScratch& category : categories)
-                category.average_precision.fill(0.0);
+            for (CategoryReductionScratch& category : categories) {
+                category.areas = {};
+                category.confidence = {};
+            }
         }
     };
 
@@ -69,6 +73,10 @@ class CocoDataset {
     std::vector<std::array<float, 4>> ground_truth_boxes_;
     std::vector<std::uint16_t> ground_truth_categories_;
     std::vector<std::uint32_t> ground_truth_ordinals_;
+    std::vector<double> image_area_scale_;
+    std::vector<double> ground_truth_areas_;
+    std::vector<std::array<size_t, 4>> area_ground_truth_totals_;
+    std::vector<std::array<size_t, 4>> mask_area_ground_truth_totals_;
     std::optional<std::vector<GroundTruthMask>> ground_truth_masks_;
     std::optional<std::vector<std::pair<std::uint32_t, std::uint32_t>>> ground_truth_mask_runs_;
     std::uint32_t ground_truth_mask_height_ = 0;
@@ -82,6 +90,7 @@ class CocoDataset {
     std::optional<size_t> matched_max_dets_per_image_;
     mutable MetricScratch bbox_metric_scratch_;
     mutable std::optional<MetricScratch> mask_metric_scratch_;
+    mutable std::vector<EvaluationMetricDetail> details_;
 };
 
 }  // namespace mmltk::backend::models::rfdetr

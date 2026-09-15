@@ -27,6 +27,7 @@ mmltk_register_public_headers(
     mmltk_backend_models_rfdetr_inference
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        prediction_delivery.h
         validate.h
         evaluation.h)
 mmltk_register_retained_module_importers(

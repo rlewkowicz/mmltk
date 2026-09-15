@@ -427,6 +427,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         explore: None,
         annotation: None,
         predict: None,
+        validation: None,
         live: None,
         upscale: None,
     };
@@ -435,6 +436,7 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
             ApplicationSnapshot::Explore(value) => visual.explore = Some(value),
             ApplicationSnapshot::Annotation(value) => visual.annotation = Some(value),
             ApplicationSnapshot::Predict(value) => visual.predict = Some(value),
+            ApplicationSnapshot::Validation(value) => visual.validation = Some(value),
             ApplicationSnapshot::Live(value) => visual.live = Some(value),
             ApplicationSnapshot::Upscale(value) => visual.upscale = Some(value),
             _ => {}
@@ -514,6 +516,20 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         "positional output decoder accepted named persistence data",
     )?;
     use mmltk_browser_app::generated;
+    let metric_page = generated::EvaluationDetailPage::from_application_value(model_reference(600)?).map_err(io::Error::other)?;
+    let transported_page = generated::EvaluationDetailPage::from_application_transport_value(model_reference(601)?).map_err(io::Error::other)?;
+    require(metric_page == transported_page && metric_page.rows.len() == 2 && metric_page.rows[0].precisioncurve[9][100] == 0.125,
+        "native validation detail grid did not survive both codecs")?;
+    let sample_image = generated::ValidationImageMetadata::from_application_value(model_reference(602)?).map_err(io::Error::other)?;
+    let transported_image = generated::ValidationImageMetadata::from_application_transport_value(model_reference(603)?).map_err(io::Error::other)?;
+    require(sample_image == transported_image && sample_image.samples[0].identity.datasetindex == 3 && sample_image.samples[0].labels[0].groundtruth
+        && !sample_image.overlays.predictionboxes && sample_image.overlays.predictionmasks
+        && !sample_image.overlays.groundtruthboxes && sample_image.overlays.groundtruthmasks,
+        "native validation sample image metadata did not survive both codecs")?;
+    let validation = visual.validation.ok_or_else(|| io::Error::other("validation bootstrap is missing"))?;
+    require(validation.metrics.as_ref().is_some_and(|summary| summary.bbox.areaap == [Some(0.0), None, Some(1.0)] && summary.mask.is_none())
+        && validation.sampleavailable[0] && validation.sampleidentities[0].generation == 7,
+        "validation summary availability or sample identity was lost")?;
     for (kind, session) in [
         (generated::PresentationSourceKind::None, 0),
         (generated::PresentationSourceKind::Explore, 1),

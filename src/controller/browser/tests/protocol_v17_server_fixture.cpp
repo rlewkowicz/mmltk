@@ -63,6 +63,21 @@ int main(const int argument_count, char* const* const arguments) {
                     std::numeric_limits<std::uint64_t>::max() - session;
             snapshots_valid = snapshots_valid && visual_clean_content_identity(frame).revision == 43U;
         }
+        if constexpr (std::same_as<Snapshot, ValidationSnapshot>) {
+            snapshot.operation.generation_frontier = 7U;
+            snapshot.metrics.emplace();
+            snapshot.metrics->bbox.available = true;
+            snapshot.metrics->bbox.ap = 0.75;
+            snapshot.metrics->bbox.average_recall = {0.25, 0.5, 0.75};
+            snapshot.metrics->bbox.area_ap = {0.0, std::nullopt, 1.0};
+            snapshot.metrics->bbox.confidence = {0.8, 0.6, 0.6857142857142857};
+            snapshot.metrics->bbox.confidence_threshold = 0.58;
+            snapshot.metrics->model_detection_budget = 500U;
+            snapshot.detail_rows = 2U;
+            snapshot.content_identity = 71U;
+            snapshot.sample_identities[0] = {7U, 3U};
+            snapshot.sample_available[0] = true;
+        }
         if constexpr (std::same_as<Snapshot, AnnotationSnapshot>) {
             auto& scene = snapshot.ui.scene;
             scene.document = contracts::WorkspaceResource::From("annotation-codec-fixture", 1U);
@@ -181,6 +196,34 @@ int main(const int argument_count, char* const* const arguments) {
         }
     });
     if (!model_projections_valid) return EXIT_FAILURE;
+    // Full metric grids and paired sample metadata exercise independent named
+    // and positional codecs, in addition to the compact bootstrap summary.
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    rfdetr::EvaluationDetailPage metric_page{7U, 2U, 0U, {rfdetr::EvaluationMetricDetail{}, rfdetr::EvaluationMetricDetail{}}};
+    metric_page.rows[0].available = true;
+    metric_page.rows[0].ground_truth_count = 17U;
+    metric_page.rows[0].precision_curve[9][100] = 0.125;
+    metric_page.rows[0].average_recall[2][9] = 0.375;
+    metric_page.rows[1].category = 5U;
+    metric_page.rows[1].kind = rfdetr::EvaluationMetricKind::Mask;
+    ValidationImageMetadata sample_image;
+    sample_image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, {768U, 512U}, 77U);
+    sample_image.content_identity = 71U;
+    sample_image.overlays = {false, true, false, true};
+    auto& sample = sample_image.samples[0];
+    sample.identity = {7U, 3U}; sample.available = true;
+    sample.crop = {0U, 0U, 256U, 256U}; sample.original_extent = {640U, 640U};
+    sample.labels.push_back({{{1.25F, 2.5F}, {15.0F, 19.0F}}, {}, 5U, true, 0.0F, "last"});
+    std::uint64_t validation_correlation = 600U;
+    const auto append_validation = [&](const auto& value) {
+        auto named = mmltk::frameworks::serialization::reflected_value(value);
+        auto transport = mmltk::frameworks::serialization::reflected_transport_value(value);
+        if (!named || !transport) return false;
+        records.emplace_back(IntentReply{.correlation = validation_correlation++, .result = std::move(*named)});
+        records.emplace_back(IntentReply{.correlation = validation_correlation++, .result = std::move(*transport)});
+        return true;
+    };
+    if (!append_validation(metric_page) || !append_validation(sample_image)) return EXIT_FAILURE;
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
         complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {

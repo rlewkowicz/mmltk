@@ -104,6 +104,7 @@ struct InstanceOverlayRgbaWork final {
     std::uint8_t mask_alpha = 0U;
     int box_thickness = 1;
     NativeStream stream{};
+    bool labels = true;
 };
 
 struct CompositeRgbaOverBgrWork final {

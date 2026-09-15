@@ -116,9 +116,9 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        compute.terminal.outcome = crate::generated::ComputeOperationOutcome::Cancelled;
-        compute.terminal.detail = "cancelled by native owner".into();
-        let compute_label = compute_status(Some(&compute));
+        compute.operation.terminal.outcome = crate::generated::ComputeOperationOutcome::Cancelled;
+        compute.operation.terminal.detail = "cancelled by native owner".into();
+        let compute_label = compute_status(Some(&compute.operation));
         assert!(compute_label.contains("Cancelled"));
         assert!(compute_label.contains("cancelled by native owner"));
 

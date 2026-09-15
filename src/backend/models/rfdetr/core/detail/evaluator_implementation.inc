@@ -133,22 +133,19 @@ void EvaluationCudaTimingPool::release(EvaluationCudaTimingLease& lease) {
 
 namespace {
 
-constexpr std::array<double, 10> kIouThresholds = {0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95};
+constexpr auto kIouThresholds = kEvaluationIouThresholds;
 constexpr double kRecallStep = 0.01;
 
-float bbox_iou(const std::array<float, 4>& lhs, const std::array<float, 4>& rhs) {
-    const float left = std::max(lhs[0], rhs[0]);
-    const float top = std::max(lhs[1], rhs[1]);
-    const float right = std::min(lhs[2], rhs[2]);
-    const float bottom = std::min(lhs[3], rhs[3]);
-    const float intersect_w = std::max(0.0f, right - left);
-    const float intersect_h = std::max(0.0f, bottom - top);
-    const float intersect = intersect_w * intersect_h;
-    const float lhs_area = std::max(0.0f, lhs[2] - lhs[0]) * std::max(0.0f, lhs[3] - lhs[1]);
-    const float rhs_area = std::max(0.0f, rhs[2] - rhs[0]) * std::max(0.0f, rhs[3] - rhs[1]);
-    const float union_area = lhs_area + rhs_area - intersect;
-    if (union_area <= 0.0f) { return 0.0f; }
-    return intersect / union_area;
+double evaluation_box_area(const std::array<float, 4>& box) {
+    return std::max(0.0, static_cast<double>(box[2]) - box[0]) * std::max(0.0, static_cast<double>(box[3]) - box[1]);
+}
+
+double bbox_iou(const std::array<float, 4>& lhs, const std::array<float, 4>& rhs) {
+    const double left = std::max(lhs[0], rhs[0]), top = std::max(lhs[1], rhs[1]);
+    const double right = std::min(lhs[2], rhs[2]), bottom = std::min(lhs[3], rhs[3]);
+    const double intersect = std::max(0.0, right - left) * std::max(0.0, bottom - top);
+    const double union_area = evaluation_box_area(lhs) + evaluation_box_area(rhs) - intersect;
+    return union_area <= 0.0 ? 0.0 : intersect / union_area;
 }
 
 template <typename MaskValue>
@@ -262,7 +259,7 @@ SelectedPredictions select_predictions(int image_id, const torch_api::Tensor& sc
 constexpr std::uint16_t kAllThresholdBits = static_cast<std::uint16_t>((std::uint16_t{1} << std::size(kIouThresholds)) - 1U);
 
 struct MatchCandidate {
-    float iou = 0.0F;
+    double iou = 0.0;
     std::uint32_t ground_truth_index = 0;
     std::uint32_t ground_truth_ordinal = 0;
     std::uint16_t eligible_threshold_bits = 0;
@@ -270,7 +267,7 @@ struct MatchCandidate {
 
 struct ImageMatchingScratch {
     std::vector<std::vector<std::uint32_t>> predictions_by_category;
-    std::vector<std::uint16_t> unmatched_threshold_bits;
+    std::vector<std::array<std::uint16_t, 4>> unmatched_threshold_bits;
     std::vector<MatchCandidate> candidates;
     std::vector<std::array<float, 4>> staged_boxes;
     std::vector<EncodedMask> staged_masks;
@@ -285,10 +282,10 @@ ImageMatchingScratch& image_matching_scratch(const size_t category_count) {
     return scratch;
 }
 
-std::uint16_t eligible_threshold_bits(const float iou) {
+std::uint16_t eligible_threshold_bits(const double iou) {
     std::uint16_t bits = 0;
     for (size_t threshold_index = 0; threshold_index < std::size(kIouThresholds); ++threshold_index) {
-        if (iou >= static_cast<float>(kIouThresholds[threshold_index])) {
+        if (iou >= kIouThresholds[threshold_index]) {
             bits |= static_cast<std::uint16_t>(std::uint16_t{1} << threshold_index);
         }
     }
@@ -304,96 +301,149 @@ size_t group_staged_predictions_by_category(const BBoxPredictionView& prediction
         if (label < 0 || label >= static_cast<std::int64_t>(category_count)) { continue; }
         auto& category_predictions = scratch.predictions_by_category[static_cast<size_t>(label)];
         category_predictions.push_back(static_cast<std::uint32_t>(prediction_index));
-        ++selected_count;
-        if (selected_count >= max_dets_per_image) { break; }
     }
     const auto score_order = [&predictions](const std::uint32_t lhs_index, const std::uint32_t rhs_index) {
         const float lhs_score = predictions.scores[static_cast<std::ptrdiff_t>(lhs_index) * predictions.score_stride];
         const float rhs_score = predictions.scores[static_cast<std::ptrdiff_t>(rhs_index) * predictions.score_stride];
-        return lhs_score > rhs_score || (lhs_score == rhs_score && lhs_index < rhs_index);
+        if (std::isnan(lhs_score) != std::isnan(rhs_score)) return !std::isnan(lhs_score);
+        return lhs_score > rhs_score || ((lhs_score == rhs_score || std::isnan(lhs_score)) && lhs_index < rhs_index);
     };
     for (auto& category_predictions : scratch.predictions_by_category) {
-        if (!std::ranges::is_sorted(category_predictions, score_order)) { std::ranges::sort(category_predictions, score_order); }
+        std::ranges::sort(category_predictions, score_order);
+        if (category_predictions.size() > max_dets_per_image) category_predictions.resize(max_dets_per_image);
+        selected_count += category_predictions.size();
     }
     return selected_count;
 }
 
-template <typename ScoreFn, typename IoUFn>
+// COCO ranges overlap exactly at 32² and 96². Compiled annotations do not
+// contain crowd/ignore flags; only the supported area exclusion is represented.
+bool evaluation_area_contains(const size_t area, const double value) {
+    constexpr std::array<double, 4> minimum{0.0, 0.0, 1024.0, 9216.0};
+    constexpr std::array<double, 4> maximum{1.0e10, 1024.0, 9216.0, 1.0e10};
+    return value >= minimum[area] && value <= maximum[area];
+}
+
+template <typename ScoreFn, typename IoUFn, typename GroundTruthAreaFn, typename PredictionAreaFn>
 void match_category_predictions(const std::vector<std::uint32_t>& prediction_indices,
                                 const std::span<const std::uint32_t> ground_truth_ordinals, const std::uint32_t image_ordinal,
                                 const std::uint16_t category_index, ImageMatchingScratch& scratch,
                                 std::vector<CompactImageMatchRecord>& output, size_t& iou_candidate_count, ScoreFn&& score_fn,
-                                IoUFn&& iou_fn) {
-    scratch.unmatched_threshold_bits.assign(ground_truth_ordinals.size(), kAllThresholdBits);
+                                IoUFn&& iou_fn, GroundTruthAreaFn&& ground_truth_area, PredictionAreaFn&& prediction_area) {
+    scratch.unmatched_threshold_bits.assign(ground_truth_ordinals.size(), {kAllThresholdBits, kAllThresholdBits, kAllThresholdBits, kAllThresholdBits});
     scratch.candidates.reserve(ground_truth_ordinals.size());
+    std::uint32_t rank = 0;
     for (const std::uint32_t prediction_index : prediction_indices) {
         scratch.candidates.clear();
         for (size_t ground_truth_index = 0; ground_truth_index < ground_truth_ordinals.size(); ++ground_truth_index) {
             ++iou_candidate_count;
-            const float iou = iou_fn(prediction_index, ground_truth_index);
-            if (iou < static_cast<float>(kIouThresholds.front())) { continue; }
-            scratch.candidates.push_back(MatchCandidate{
-                iou,
-                static_cast<std::uint32_t>(ground_truth_index),
-                ground_truth_ordinals[ground_truth_index],
-                eligible_threshold_bits(iou),
-            });
+            const double iou = iou_fn(prediction_index, ground_truth_index);
+            if (!(iou >= kIouThresholds.front())) continue;
+            scratch.candidates.push_back({iou, static_cast<std::uint32_t>(ground_truth_index),
+                                          ground_truth_ordinals[ground_truth_index], eligible_threshold_bits(iou)});
         }
+        // evaluateImg replaces a previous match on equal IoU, so the last GT
+        // in stable annotation order wins within each ignore group.
         std::ranges::sort(scratch.candidates, [](const MatchCandidate& lhs, const MatchCandidate& rhs) {
-            return lhs.iou > rhs.iou || (lhs.iou == rhs.iou && lhs.ground_truth_ordinal < rhs.ground_truth_ordinal);
+            return lhs.iou > rhs.iou || (lhs.iou == rhs.iou && lhs.ground_truth_ordinal > rhs.ground_truth_ordinal);
         });
-
-        std::uint16_t matched_bits = 0;
-        for (const MatchCandidate& candidate : scratch.candidates) {
-            std::uint16_t& unmatched = scratch.unmatched_threshold_bits[candidate.ground_truth_index];
-            const auto available =
-                static_cast<std::uint16_t>(unmatched & candidate.eligible_threshold_bits & static_cast<std::uint16_t>(~matched_bits));
-            if (available == 0) { continue; }
-            matched_bits = static_cast<std::uint16_t>(matched_bits | available);
-            unmatched = static_cast<std::uint16_t>(unmatched & static_cast<std::uint16_t>(~available));
-            if (matched_bits == kAllThresholdBits) { break; }
+        CompactImageMatchRecord record;
+        record.score = score_fn(prediction_index);
+        record.image_ordinal = image_ordinal;
+        record.prediction_ordinal = prediction_index;
+        record.category_index = category_index;
+        record.category_rank = rank++;
+        for (size_t area = 0; area < 4U; ++area) {
+            std::uint16_t matched = 0;
+            std::uint16_t ignored = 0;
+            // Nonignored GT always takes precedence over ignored GT, even if
+            // the latter has a larger IoU. Every area owns independent state.
+            for (const bool ignore_group : {false, true}) {
+                for (const auto& candidate : scratch.candidates) {
+                    if ((!evaluation_area_contains(area, ground_truth_area(candidate.ground_truth_index))) != ignore_group) continue;
+                    auto& unmatched = scratch.unmatched_threshold_bits[candidate.ground_truth_index][area];
+                    const auto available = static_cast<std::uint16_t>(unmatched & candidate.eligible_threshold_bits & ~matched);
+                    matched |= available;
+                    unmatched &= static_cast<std::uint16_t>(~available);
+                    if (ignore_group) ignored |= available;
+                }
+            }
+            if (!evaluation_area_contains(area, prediction_area(prediction_index))) ignored |= static_cast<std::uint16_t>(kAllThresholdBits & ~matched);
+            record.area_matched_bits[area] = matched;
+            record.area_ignored_bits[area] = ignored;
         }
-        output.push_back(CompactImageMatchRecord{
-            score_fn(prediction_index),
-            image_ordinal,
-            prediction_index,
-            category_index,
-            matched_bits,
-        });
+        output.push_back(record);
     }
 }
 
+ConfidenceMetrics confidence_metrics(const size_t tp, const size_t count, const size_t gt) {
+    ConfidenceMetrics result;
+    result.precision = count == 0U ? 0.0 : static_cast<double>(tp) / static_cast<double>(count);
+    result.recall = gt == 0U ? 0.0 : static_cast<double>(tp) / static_cast<double>(gt);
+    const double denominator = result.precision + result.recall;
+    result.f1 = denominator == 0.0 ? 0.0 : 2.0 * result.precision * result.recall / denominator;
+    return result;
+}
+
 template <typename CategoryScratch>
-void reduce_category_matches(std::vector<CompactImageMatchRecord>& matches, const size_t ground_truth_count, CategoryScratch& scratch) {
+void reduce_category_matches(std::vector<CompactImageMatchRecord>& matches, const std::array<size_t, 4>& ground_truth_count,
+                             const std::array<std::uint32_t, 3>& caps, CategoryScratch& scratch) {
     std::ranges::sort(matches, [](const CompactImageMatchRecord& lhs, const CompactImageMatchRecord& rhs) {
-        if (lhs.score != rhs.score) { return lhs.score > rhs.score; }
-        if (lhs.image_ordinal != rhs.image_ordinal) { return lhs.image_ordinal < rhs.image_ordinal; }
+        if (std::isnan(lhs.score) != std::isnan(rhs.score)) return !std::isnan(lhs.score);
+        if (!std::isnan(lhs.score) && lhs.score != rhs.score) return lhs.score > rhs.score;
+        if (lhs.image_ordinal != rhs.image_ordinal) return lhs.image_ordinal < rhs.image_ordinal;
         return lhs.prediction_ordinal < rhs.prediction_ordinal;
     });
-
-    scratch.precisions.resize(matches.size());
-    for (size_t threshold_index = 0; threshold_index < std::size(kIouThresholds); ++threshold_index) {
-        scratch.recall_indices.fill(matches.size());
-        size_t next_recall_bucket = 0;
-        size_t true_positives = 0;
-        const std::uint16_t threshold_bit = static_cast<std::uint16_t>(std::uint16_t{1} << threshold_index);
-        for (size_t prediction_index = 0; prediction_index < matches.size(); ++prediction_index) {
-            true_positives += (matches[prediction_index].matched_threshold_bits & threshold_bit) != 0 ? 1U : 0U;
-            scratch.precisions[prediction_index] = static_cast<double>(true_positives) / static_cast<double>(prediction_index + 1U);
-            const double recall = static_cast<double>(true_positives) / static_cast<double>(ground_truth_count);
-            while (next_recall_bucket < scratch.recall_indices.size() && recall >= static_cast<double>(next_recall_bucket) * kRecallStep) {
-                scratch.recall_indices[next_recall_bucket++] = prediction_index;
+    scratch.precisions.reserve(matches.size());
+    for (size_t area = 0; area < 4U; ++area) {
+        auto& detail = *scratch.areas[area];
+        detail.area = static_cast<EvaluationArea>(area);
+        detail.ground_truth_count = ground_truth_count[area];
+        detail.available = ground_truth_count[area] != 0U;
+        detail.detection_limits = caps;
+        if (!detail.available) continue;
+        for (size_t threshold = 0; threshold < kIouThresholds.size(); ++threshold) {
+            const auto bit = static_cast<std::uint16_t>(1U << threshold);
+            scratch.precisions.clear();
+            scratch.recall_indices.fill(matches.size());
+            size_t next_recall = 0U;
+            std::array<size_t, 3> true_positives{};
+            for (const auto& match : matches) {
+                if ((match.area_ignored_bits[area] & bit) != 0U) continue;
+                const bool tp = (match.area_matched_bits[area] & bit) != 0U;
+                for (size_t cap = 0; cap < caps.size(); ++cap)
+                    if (match.category_rank < caps[cap]) true_positives[cap] += tp ? 1U : 0U;
+                if (match.category_rank >= caps.back()) continue;
+                scratch.precisions.push_back(static_cast<double>(true_positives.back()) / static_cast<double>(scratch.precisions.size() + 1U));
+                const double recall = static_cast<double>(true_positives.back()) / static_cast<double>(ground_truth_count[area]);
+                while (next_recall < 101U && recall >= static_cast<double>(next_recall) * kRecallStep)
+                    scratch.recall_indices[next_recall++] = scratch.precisions.size() - 1U;
             }
+            for (size_t index = scratch.precisions.size(); index > 1U; --index)
+                scratch.precisions[index - 2U] = std::max(scratch.precisions[index - 2U], scratch.precisions[index - 1U]);
+            for (size_t recall = 0; recall < 101U; ++recall) {
+                const size_t index = scratch.recall_indices[recall];
+                const double precision = index < scratch.precisions.size() ? scratch.precisions[index] : 0.0;
+                detail.precision_curve[threshold][recall] = precision;
+                detail.average_precision[threshold] += precision / 101.0;
+            }
+            for (size_t cap = 0; cap < caps.size(); ++cap)
+                detail.average_recall[cap][threshold] = static_cast<double>(true_positives[cap]) / static_cast<double>(ground_truth_count[area]);
         }
-        for (size_t prediction_index = scratch.precisions.size(); prediction_index > 1; --prediction_index) {
-            scratch.precisions[prediction_index - 2U] =
-                std::max(scratch.precisions[prediction_index - 2U], scratch.precisions[prediction_index - 1U]);
+    }
+    // One monotonic cursor, with scores widened before the inclusive comparison.
+    // This is the upstream float64 sweep, without 101 detection rescans.
+    size_t cursor = 0, tp = 0, count = 0;
+    for (size_t reverse = 101U; reverse > 0U; --reverse) {
+        const size_t threshold_index = reverse - 1U;
+        const double threshold = static_cast<double>(threshold_index) * 0.01;
+        while (cursor < matches.size() && static_cast<double>(matches[cursor].score) >= threshold) {
+            const auto& match = matches[cursor++];
+            if (match.category_rank >= caps.back() || (match.area_ignored_bits[0] & 1U) != 0U) continue;
+            ++count;
+            tp += (match.area_matched_bits[0] & 1U) != 0U ? 1U : 0U;
         }
-        double average_precision = 0.0;
-        for (const size_t prediction_index : scratch.recall_indices) {
-            if (prediction_index < scratch.precisions.size()) { average_precision += scratch.precisions[prediction_index]; }
-        }
-        scratch.average_precision[threshold_index] = average_precision / 101.0;
+        scratch.confidence[threshold_index] = confidence_metrics(tp, count, ground_truth_count[0]);
     }
 }
 
@@ -839,6 +889,10 @@ CocoDataset::CocoDataset(const CocoDataset& other)
       ground_truth_boxes_(other.ground_truth_boxes_),
       ground_truth_categories_(other.ground_truth_categories_),
       ground_truth_ordinals_(other.ground_truth_ordinals_),
+      image_area_scale_(other.image_area_scale_),
+      ground_truth_areas_(other.ground_truth_areas_),
+      area_ground_truth_totals_(other.area_ground_truth_totals_),
+      mask_area_ground_truth_totals_(other.mask_area_ground_truth_totals_),
       ground_truth_masks_(other.ground_truth_masks_),
       ground_truth_mask_runs_(other.ground_truth_mask_runs_),
       ground_truth_mask_height_(other.ground_truth_mask_height_),
@@ -870,9 +924,9 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     const size_t image_count = loader.num_images();
     const uint32_t num_classes = loader.num_classes();
     const size_t label_count = loader.num_label_instances();
-    if (image_count == 0 || image_count > std::numeric_limits<std::uint32_t>::max() ||
+    if (image_count > std::numeric_limits<std::uint32_t>::max() ||
         image_count > static_cast<size_t>(std::numeric_limits<int>::max()) || num_classes == 0 ||
-        num_classes > std::numeric_limits<std::uint16_t>::max() || label_count == 0 ||
+        num_classes > std::numeric_limits<std::uint16_t>::max() ||
         label_count > std::numeric_limits<std::uint32_t>::max() ||
         image_count > std::numeric_limits<size_t>::max() / static_cast<size_t>(num_classes)) {
         throw std::runtime_error("compiled evaluation dataset exceeds the dense evaluator limits");
@@ -886,7 +940,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
 
     const auto* label_index = loader.label_index();
     const auto* label_data = loader.label_data();
-    if (label_index == nullptr || label_data == nullptr) {
+    if ((image_count != 0U && label_index == nullptr) || (label_count != 0U && label_data == nullptr)) {
         throw std::runtime_error("compiled evaluation dataset does not contain usable bbox ground truth");
     }
     const mmltk::backend::data::RLEPair* rle_data = nullptr;
@@ -894,7 +948,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     if (metric_set == EvaluationMetricSet::BBoxAndMask) {
         rle_data = loader.rle_data();
         rle_pair_count = loader.num_rle_pairs();
-        if (rle_data == nullptr || rle_pair_count == 0 || rle_pair_count > std::numeric_limits<std::uint32_t>::max()) {
+        if ((label_count != 0U && (rle_data == nullptr || rle_pair_count == 0)) || rle_pair_count > std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error("bbox-and-mask evaluation requires a bounded mask RLE payload");
         }
         const uint64_t mask_pixels = static_cast<uint64_t>(loader.image_height()) * loader.image_width();
@@ -957,6 +1011,14 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     }
     if (annotation_offset != label_count) { throw std::runtime_error("compiled evaluation dense-span cardinality mismatch"); }
 
+    out.image_area_scale_.resize(image_count);
+    for (size_t image = 0; image < image_count; ++image) {
+        const auto& entry = loader.image_entry(static_cast<std::uint32_t>(image));
+        const auto geometry = loader.letterbox(static_cast<std::uint32_t>(image));
+        out.image_area_scale_[image] = (static_cast<double>(entry.original_width) / geometry.resized_width) *
+                                       (static_cast<double>(entry.original_height) / geometry.resized_height);
+    }
+    out.ground_truth_areas_.resize(label_count);
     out.ground_truth_boxes_.resize(label_count);
     out.ground_truth_categories_.resize(label_count);
     out.ground_truth_ordinals_.resize(label_count);
@@ -986,6 +1048,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
                 static_cast<float>(packed.bbox_x2),
                 static_cast<float>(packed.bbox_y2),
             };
+            out.ground_truth_areas_[dense_index] = evaluation_box_area(out.ground_truth_boxes_[dense_index]) * out.image_area_scale_[image_index];
             out.ground_truth_categories_[dense_index] = packed.class_id;
             out.ground_truth_ordinals_[dense_index] = annotation_ordinal;
 
@@ -1031,9 +1094,18 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
 
 void CocoDataset::rebuild_ground_truth_totals() {
     ground_truth_totals_.assign(category_names_.size(), 0);
+    area_ground_truth_totals_.assign(category_names_.size(), {});
+    mask_area_ground_truth_totals_.assign(ground_truth_masks_ ? category_names_.size() : 0U, {});
     for (size_t image_index = 0; image_index < image_ids_.size(); ++image_index) {
         for (size_t category_index = 0; category_index < category_names_.size(); ++category_index) {
-            ground_truth_totals_[category_index] += ground_truth_spans_[ground_truth_span_index(image_index, category_index)].count;
+            const auto span = ground_truth_spans_[ground_truth_span_index(image_index, category_index)];
+            ground_truth_totals_[category_index] += span.count;
+            for (size_t gt = span.offset; gt < span.offset + span.count; ++gt)
+                for (size_t area = 0; area < 4U; ++area) {
+                    area_ground_truth_totals_[category_index][area] += evaluation_area_contains(area, ground_truth_areas_[gt]) ? 1U : 0U;
+                    if (ground_truth_masks_) mask_area_ground_truth_totals_[category_index][area] +=
+                        evaluation_area_contains(area, (*ground_truth_masks_)[gt].area * image_area_scale_[image_index]) ? 1U : 0U;
+                }
         }
     }
     ground_truth_nonempty_categories_.clear();
@@ -1068,6 +1140,7 @@ void CocoDataset::reset_match_storage() {
         mask_matches_by_category_.reset();
     }
     prediction_count_ = 0;
+    details_.clear();
     matched_max_dets_per_image_.reset();
 }
 
@@ -1080,6 +1153,8 @@ void CocoDataset::limit_images(const size_t limit) {
         retained_annotation_count = static_cast<size_t>(last_span.offset) + last_span.count;
     }
     ground_truth_spans_.resize(retained_span_count);
+    image_area_scale_.resize(limit);
+    ground_truth_areas_.resize(retained_annotation_count);
     ground_truth_boxes_.resize(retained_annotation_count);
     ground_truth_categories_.resize(retained_annotation_count);
     ground_truth_ordinals_.resize(retained_annotation_count);
@@ -1118,12 +1193,12 @@ bool CocoDataset::has_image(int image_id) const { return image_id_to_index_.cont
 
 ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t dataset_index, const BBoxPredictionView& bbox,
                                                              const std::optional<PackedMaskPredictionView>& mask,
-                                                             const size_t max_dets_per_image) const {
+                                                             const size_t max_dets_per_image, const std::span<const Prediction> encoded_masks) const {
     if (dataset_index < 0 || static_cast<size_t>(dataset_index) >= image_ids_.size()) {
         throw std::out_of_range("staged prediction image index is outside the evaluation dataset");
     }
-    if (max_dets_per_image == 0 || bbox.count > std::numeric_limits<std::uint32_t>::max() || bbox.scores == nullptr ||
-        bbox.labels_zero_based == nullptr || bbox.boxes_xyxy == nullptr || bbox.score_stride <= 0 || bbox.label_stride <= 0 ||
+    if (max_dets_per_image == 0 || bbox.count > std::numeric_limits<std::uint32_t>::max() ||
+        (bbox.count != 0U && (bbox.scores == nullptr || bbox.labels_zero_based == nullptr || bbox.boxes_xyxy == nullptr)) || bbox.score_stride <= 0 || bbox.label_stride <= 0 ||
         bbox.box_stride < 4) {
         throw std::invalid_argument("staged bbox prediction view is invalid");
     }
@@ -1132,15 +1207,15 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
         throw std::invalid_argument("staged prediction image ID does not match the image matcher index");
     }
     const bool mask_mode = metric_set_ == EvaluationMetricSet::BBoxAndMask;
-    if (mask_mode != mask.has_value()) {
+    if ((!mask_mode && (mask || !encoded_masks.empty())) || (mask_mode && bbox.count != 0U && !mask && encoded_masks.size() != bbox.count)) {
         throw std::invalid_argument("staged prediction mask view does not match the dataset metric mode");
     }
-    if (mask_mode && (!mask || !ground_truth_masks_ || !ground_truth_mask_runs_)) {
+    if (mask_mode && (!ground_truth_masks_ || !ground_truth_mask_runs_)) {
         throw std::logic_error("mask evaluation ground truth storage is incomplete");
     }
     const std::uint64_t packed_mask_bytes = mask ? (static_cast<std::uint64_t>(mask->height) * mask->width + 7U) / 8U : 0U;
     if (mask &&
-        (mask->data == nullptr || mask->prediction_stride <= 0 || static_cast<std::uint64_t>(mask->prediction_stride) < packed_mask_bytes ||
+        ((bbox.count != 0U && mask->data == nullptr) || mask->prediction_stride <= 0 || static_cast<std::uint64_t>(mask->prediction_stride) < packed_mask_bytes ||
          mask->height != ground_truth_mask_height_ || mask->width != ground_truth_mask_width_)) {
         throw std::invalid_argument("staged mask prediction view is invalid");
     }
@@ -1179,22 +1254,28 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
             scratch, result.bbox, bbox_iou_candidate_count, bbox_prediction_score,
             [this, span, &scratch](const std::uint32_t prediction_index, const size_t ground_truth_index) {
                 return bbox_iou(scratch.staged_boxes[prediction_index], ground_truth_boxes_[span.offset + ground_truth_index]);
-            });
+            }, [this, span](size_t index) { return ground_truth_areas_[span.offset + index]; },
+            [this, image_index, &scratch](size_t index) { return evaluation_box_area(scratch.staged_boxes[index]) * image_area_scale_[image_index]; });
     }
     result.prediction_count = result.bbox.size();
 
     if (mask_mode) {
         auto& mask_matches = result.mask.emplace();
         mask_matches.reserve(bbox_prediction_count);
-        scratch.staged_masks.resize(bbox.count);
-        const PackedMaskPredictionView& mask_view = *mask;
-        for (const auto& category_predictions : scratch.predictions_by_category) {
-            for (const std::uint32_t prediction_index : category_predictions) {
-                encode_mask_from_packed_data_into(
-                    mask_view.data + static_cast<std::ptrdiff_t>(prediction_index) * mask_view.prediction_stride, mask_view.height,
-                    mask_view.width, scratch.staged_masks[prediction_index]);
-            }
+        if (mask) {
+            scratch.staged_masks.resize(bbox.count);
+            for (const auto& category_predictions : scratch.predictions_by_category)
+                for (const std::uint32_t index : category_predictions)
+                    encode_mask_from_packed_data_into(mask->data + static_cast<std::ptrdiff_t>(index) * mask->prediction_stride,
+                                                     mask->height, mask->width, scratch.staged_masks[index]);
+        } else {
+            for (const auto& prediction : encoded_masks)
+                if (!prediction.has_mask || prediction.mask.height != ground_truth_mask_height_ || prediction.mask.width != ground_truth_mask_width_)
+                    throw std::invalid_argument("encoded evaluation masks do not match compiled geometry");
         }
+        const auto prediction_mask_at = [&](size_t index) -> const EncodedMask& {
+            return mask ? scratch.staged_masks[index] : encoded_masks[index].mask;
+        };
         const auto& masks = *ground_truth_masks_;
         const auto& runs = *ground_truth_mask_runs_;
         for (size_t category_index = 0; category_index < category_count; ++category_index) {
@@ -1202,15 +1283,16 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
             match_category_predictions(
                 scratch.predictions_by_category[category_index], span_ordinals(span), image_ordinal,
                 static_cast<std::uint16_t>(category_index), scratch, mask_matches, mask_iou_candidate_count, bbox_prediction_score,
-                [span, &masks, &runs, &scratch](const std::uint32_t prediction_index, const size_t ground_truth_index) {
-                    const EncodedMask& prediction_mask = scratch.staged_masks[prediction_index];
+                [span, &masks, &runs, &prediction_mask_at](const std::uint32_t prediction_index, const size_t ground_truth_index) {
+                    const EncodedMask& prediction_mask = prediction_mask_at(prediction_index);
                     const GroundTruthMask& ground_truth_mask = masks[span.offset + ground_truth_index];
                     const auto ground_truth_runs = std::span<const std::pair<std::uint32_t, std::uint32_t>>(runs).subspan(
                         ground_truth_mask.run_offset, ground_truth_mask.run_count);
                     const std::uint32_t intersect = intersection_area(prediction_mask, ground_truth_runs);
                     const std::uint64_t union_area = static_cast<std::uint64_t>(prediction_mask.area) + ground_truth_mask.area - intersect;
-                    return union_area == 0 ? 0.0F : static_cast<float>(intersect) / static_cast<float>(union_area);
-                });
+                    return union_area == 0 ? 0.0 : static_cast<double>(intersect) / static_cast<double>(union_area);
+                }, [this, span, image_index](size_t index) { return (*ground_truth_masks_)[span.offset + index].area * image_area_scale_[image_index]; },
+                [this, image_index, &prediction_mask_at](size_t index) { return prediction_mask_at(index).area * image_area_scale_[image_index]; });
         }
     }
     result.bbox_iou_candidate_count = bbox_iou_candidate_count;
@@ -1265,53 +1347,110 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, mmltk::common
     if (max_dets_per_image == 0 || (matched_max_dets_per_image_ && *matched_max_dets_per_image_ != max_dets_per_image)) {
         throw std::invalid_argument("evaluation detection limit does not match the image matcher");
     }
-    const auto reduce_metric = [this, worker_pool](auto& matches_by_category, MetricScratch& scratch) {
+    const std::array<std::uint32_t, 3> caps{1U, static_cast<std::uint32_t>(std::min<size_t>(10U, max_dets_per_image)),
+                                             static_cast<std::uint32_t>(max_dets_per_image)};
+    details_.clear();
+    details_.resize((category_names_.size() + 1U) * 4U * (metric_set_ == EvaluationMetricSet::BBoxAndMask ? 2U : 1U));
+    const auto reduce_metric = [this, worker_pool, &caps](auto& matches_by_category, MetricScratch& scratch,
+                                                         EvaluationMetricKind kind) {
         scratch.reset(category_names_.size());
-        const std::vector<size_t>& nonempty_categories = ground_truth_nonempty_categories_;
+        const auto row_width = category_names_.size() + 1U;
+        const auto base = kind == EvaluationMetricKind::Box ? 0U : row_width * 4U;
+        for (size_t category = 0; category < category_names_.size(); ++category)
+            for (size_t area = 0; area < 4U; ++area)
+                scratch.categories[category].areas[area] = &details_[base + area * row_width + category + 1U];
         const auto reduce_range = [&](const size_t begin, const size_t end) {
-            mmltk::common::logging::ScopedNvtxRange nvtx_reduce_compact_metric_categories{"reduce_compact_metric_categories",
-                                                                                          mmltk::common::logging::nvtx_color_cyan};
-            for (size_t task_index = begin; task_index < end; ++task_index) {
-                const size_t category_index = nonempty_categories[task_index];
-                reduce_category_matches(matches_by_category[category_index], ground_truth_totals_[category_index],
-                                        scratch.categories[category_index]);
+            for (size_t category = begin; category < end; ++category) {
+                reduce_category_matches(matches_by_category[category], (kind == EvaluationMetricKind::Mask ? mask_area_ground_truth_totals_ : area_ground_truth_totals_)[category], caps, scratch.categories[category]);
             }
         };
-        if (worker_pool != nullptr && nonempty_categories.size() > 1U) {
-            const size_t worker_count = std::min(worker_pool->size(), nonempty_categories.size());
-            worker_pool->parallel_for<size_t>(0, nonempty_categories.size(), static_cast<int>(worker_count), reduce_range);
-        } else {
-            reduce_range(0, nonempty_categories.size());
-        }
+        if (worker_pool != nullptr && category_names_.size() > 1U) {
+            const size_t workers = std::min(worker_pool->size(), category_names_.size());
+            worker_pool->parallel_for<size_t>(0, category_names_.size(), static_cast<int>(workers), reduce_range);
+        } else reduce_range(0, category_names_.size());
 
-        std::array<double, std::size(kIouThresholds)> threshold_sums{};
-        for (const size_t category_index : nonempty_categories) {
-            for (size_t threshold_index = 0; threshold_index < std::size(kIouThresholds); ++threshold_index) {
-                threshold_sums[threshold_index] += scratch.categories[category_index].average_precision[threshold_index];
+        std::array<ConfidenceMetrics, 101> macro{};
+        for (const auto category : ground_truth_nonempty_categories_) {
+            const auto& values = scratch.categories[category].confidence;
+            for (size_t threshold = 0; threshold < macro.size(); ++threshold) {
+                macro[threshold].precision += values[threshold].precision;
+                macro[threshold].recall += values[threshold].recall;
+                macro[threshold].f1 += values[threshold].f1;
             }
         }
-        MetricSummary metric;
-        if (nonempty_categories.empty()) { return metric; }
-        double overall_sum = 0.0;
-        for (double& threshold_sum : threshold_sums) {
-            threshold_sum /= static_cast<double>(nonempty_categories.size());
-            overall_sum += threshold_sum;
+        size_t best = 0U;
+        for (size_t threshold = 0; threshold < macro.size(); ++threshold) {
+            if (!ground_truth_nonempty_categories_.empty()) {
+                const double divisor = static_cast<double>(ground_truth_nonempty_categories_.size());
+                macro[threshold].precision /= divisor;
+                macro[threshold].recall /= divisor;
+                macro[threshold].f1 /= divisor;
+            }
+            if (macro[threshold].f1 > macro[best].f1) best = threshold;
         }
-        metric.ap = overall_sum / static_cast<double>(threshold_sums.size());
-        metric.ap50 = threshold_sums[0];
-        metric.ap75 = threshold_sums[5];
-        return metric;
-    };
+        MetricSummary summary;
+        summary.detection_limits = caps;
+        summary.confidence = macro[best];
+        summary.confidence_threshold = static_cast<double>(best) * 0.01;
+        for (size_t area = 0; area < 4U; ++area) {
+            auto& aggregate = details_[base + area * row_width];
+            aggregate.kind = kind;
+            aggregate.area = static_cast<EvaluationArea>(area);
+            aggregate.detection_limits = caps;
+            aggregate.confidence = macro[best];
+            aggregate.confidence_threshold = summary.confidence_threshold;
+            size_t available_categories = 0U;
+            for (size_t category = 0; category < category_names_.size(); ++category) {
+                auto& detail = *scratch.categories[category].areas[area];
+                detail.kind = kind;
+                detail.category = static_cast<std::uint32_t>(category);
+                detail.confidence = scratch.categories[category].confidence[best];
+                detail.confidence_threshold = summary.confidence_threshold;
+                aggregate.ground_truth_count += detail.ground_truth_count;
+                if (!detail.available) continue;
+                ++available_categories;
+                for (size_t iou = 0; iou < kIouThresholds.size(); ++iou) {
+                    aggregate.average_precision[iou] += detail.average_precision[iou];
+                    for (size_t cap = 0; cap < caps.size(); ++cap)
+                        aggregate.average_recall[cap][iou] += detail.average_recall[cap][iou];
+                    for (size_t recall = 0; recall < 101U; ++recall)
+                        aggregate.precision_curve[iou][recall] += detail.precision_curve[iou][recall];
+                }
+            }
+            aggregate.available = available_categories != 0U;
+            double ap = 0.0;
+            std::array<double, 3> ar{};
+            if (aggregate.available) {
+                for (size_t iou = 0; iou < kIouThresholds.size(); ++iou) {
+                    aggregate.average_precision[iou] /= static_cast<double>(available_categories);
+                    ap += aggregate.average_precision[iou] / static_cast<double>(kIouThresholds.size());
+                    for (size_t cap = 0; cap < caps.size(); ++cap) {
+                        aggregate.average_recall[cap][iou] /= static_cast<double>(available_categories);
+                        ar[cap] += aggregate.average_recall[cap][iou] / static_cast<double>(kIouThresholds.size());
+                    }
+                    for (double& precision : aggregate.precision_curve[iou]) precision /= static_cast<double>(available_categories);
+                }
+            }
+            if (area == 0U) {
+                summary.available = aggregate.available;
+                summary.ap = ap;
+                summary.ap50 = aggregate.average_precision[0];
+                summary.ap75 = aggregate.average_precision[5];
+                if (aggregate.available) for (size_t cap = 0; cap < caps.size(); ++cap) summary.average_recall[cap] = ar[cap];
+            } else if (aggregate.available) {
+                summary.area_ap[area - 1U] = ap;
+                summary.area_ar[area - 1U] = ar.back();
+            }
 
-    EvalSummary summary;
-    summary.bbox = reduce_metric(bbox_matches_by_category_, bbox_metric_scratch_);
-    if (metric_set_ == EvaluationMetricSet::BBoxAndMask) {
-        auto* mask_matches = mask_matches_by_category_ ? &*mask_matches_by_category_ : nullptr;
-        auto* mask_scratch = mask_metric_scratch_ ? &*mask_metric_scratch_ : nullptr;
-        if (mask_matches == nullptr || mask_scratch == nullptr) {
-            throw std::logic_error("mask evaluation reduction storage is unavailable");
         }
-        summary.mask = reduce_metric(*mask_matches, *mask_scratch);
+        return summary;
+    };
+    EvalSummary summary;
+    summary.model_detection_budget = static_cast<std::uint32_t>(max_dets_per_image);
+    summary.bbox = reduce_metric(bbox_matches_by_category_, bbox_metric_scratch_, EvaluationMetricKind::Box);
+    if (metric_set_ == EvaluationMetricSet::BBoxAndMask) {
+        if (!mask_matches_by_category_ || !mask_metric_scratch_) throw std::logic_error("mask evaluation reduction storage is unavailable");
+        summary.mask = reduce_metric(*mask_matches_by_category_, *mask_metric_scratch_, EvaluationMetricKind::Mask);
     }
     return summary;
 }

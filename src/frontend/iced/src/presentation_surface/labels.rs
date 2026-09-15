@@ -49,11 +49,37 @@ impl PredictionContent {
     }
 }
 
+pub(crate) struct ValidationContent {
+    pub(crate) metadata: crate::generated::ValidationImageMetadata,
+    labels: Vec<(usize, usize, crate::generated::AnnotationBox)>,
+}
+impl ValidationContent {
+    pub(crate) fn new(metadata: crate::generated::ValidationImageMetadata) -> Self {
+        let mut labels = Vec::new();
+        for (sample_index, sample) in metadata.samples.iter().enumerate().filter(|(_, sample)| sample.available) {
+            for (label_index, label) in sample.labels.iter().enumerate() {
+                let mut bounds = label.box_.clone();
+                for point in [&mut bounds.first, &mut bounds.second] {
+                    point.x = sample.crop.x as f32 + point.x * sample.crop.width as f32 / sample.originalextent.width as f32;
+                    point.y = sample.crop.y as f32 + point.y * sample.crop.height as f32 / sample.originalextent.height as f32;
+                }
+                labels.push((sample_index, label_index, bounds));
+            }
+        }
+        Self { metadata, labels }
+    }
+    pub(crate) fn sample_at(&self, x: f32, y: f32) -> Option<crate::generated::ValidationSampleIdentity> {
+        self.metadata.samples.iter().find(|sample| sample.available && x >= sample.crop.x as f32 && y >= sample.crop.y as f32 &&
+            x < (sample.crop.x + sample.crop.width) as f32 && y < (sample.crop.y + sample.crop.height) as f32).map(|sample| sample.identity.clone())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Source {
     Gallery(std::sync::Arc<crate::generated::ExploreImageMetadata>, bool),
     Detail(super::DetailContent, bool),
     Prediction(std::sync::Arc<PredictionContent>),
+    Validation(std::sync::Arc<ValidationContent>, bool, bool),
     Hidden,
 }
 
@@ -115,6 +141,13 @@ impl Source {
                             None,
                         );
                     }
+                }
+            }
+            Self::Validation(content, ground_truth, predictions) => {
+                for (sample, index, bounds) in &content.labels {
+                    let item = &content.metadata.samples[*sample].labels[*index];
+                    if (item.groundtruth && !ground_truth) || (!item.groundtruth && !predictions) { continue; }
+                    label(item.category as u16, bounds, &item.name, &item.color, 0, None, None);
                 }
             }
             Self::Prediction(snapshot) => {

@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include <exception>
 
 #include "profile_runner_common.h"

@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/common/io/file_digest.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
@@ -238,6 +239,36 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     }});
     CHECK(without_masks.processed_images == 1U);
     CHECK_FALSE(without_masks.cancelled);
+    request.limit_images = 3U;
+    std::size_t selected_count = 0U;
+    const auto selective = session.Run(request, command, {
+        .demand = [](std::int64_t index) { return rfdetr::PredictionDemand{.source_pixels = index == 1, .encoded_masks = index == 1, .preview_masks = index == 1}; },
+        .completed = [&](const auto& record, auto pixels, const auto& annotations) {
+            const bool selected = record.dataset_index == 1;
+            CHECK(record.detections.front().has_mask == selected);
+            CHECK((pixels.rgb8 != nullptr) == selected);
+            CHECK(annotations.masks_available == selected);
+            selected_count += selected ? 1U : 0U;
+        },
+    });
+    CHECK(selective.processed_images == 3U);
+    CHECK(selected_count == 1U);
+    for (const bool encoded : {false, true}) for (const bool gpu_masks : {false, true}) {
+        request.limit_images = 1U;
+        const auto mode = session.Run(request, command, {
+            .demand = [=](auto) { return rfdetr::PredictionDemand{.source_pixels = true, .encoded_masks = encoded, .preview_masks = gpu_masks}; },
+            .completed = [&](const auto& record, auto pixels, const auto& annotations) {
+                REQUIRE(pixels.rgb8);
+                REQUIRE_FALSE(record.detections.empty());
+                CHECK(record.detections.front().has_mask == encoded);
+                CHECK(record.detections.front().mask.runs.empty() == !encoded);
+                CHECK(annotations.masks_available == gpu_masks);
+                CHECK((annotations.masks.address != 0U) == gpu_masks);
+            },
+        });
+        CHECK(mode.processed_images == 1U);
+    }
+    request.limit_images = 1U;
     std::size_t preview_refusals = 0U;
     const auto preview_limited = session.RunAndWrite(request, command, {
         .source_pixels = true, .maximum_pixel_width = 1U, .maximum_pixel_height = 1U,
@@ -764,12 +795,20 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     namespace data = mmltk::backend::data;
     namespace io = mmltk::common::io;
     const mmltk::testsupport::ScopedTempDir root("validation-source-descriptor");
-    const data::testsupport::FixtureSpec fixture{root.path().string(), "train", 8, 8, 2, 1, 0, true};
+    const data::testsupport::FixtureSpec fixture{root.path().string(), "train", 8, 8, 8, 1, 0, true};
     data::testsupport::create_synthetic_dataset(fixture);
     const auto categories = std::filesystem::path(data::testsupport::dataset_dir(fixture)) / "categories.json";
     nlohmann::json catalog;
     { std::ifstream input(categories); input >> catalog; }
     catalog["classes"].erase(catalog["classes"].begin() + 2, catalog["classes"].end());
+    for (int index = 3; index <= fixture.num_images; ++index) {
+        auto filename = std::to_string(index); filename.insert(0U, 6U - filename.size(), '0');
+        const auto path = std::filesystem::path(data::testsupport::dataset_dir(fixture)) / fixture.split / (filename + ".jsonl");
+        nlohmann::json annotation;
+        { std::ifstream input(path); input >> annotation; }
+        annotation["class"] = index % 2 == 0 ? "person" : "ret";
+        { std::ofstream output(path); output << annotation.dump() << '\n'; }
+    }
     { std::ofstream output(categories); output << catalog; }
     data::CompilerConfig config;
     config.source_dir = data::testsupport::dataset_dir(fixture);
@@ -820,6 +859,38 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
         CHECK(mixed.backends.at("onnx").artifacts.class_layout == layout);
         CHECK(mixed.backends.at("tensorrt").artifacts.class_layout == layout);
     }
+    request.eval_order = "onnx";
+    for (const std::size_t population : {3U, 7U}) {
+        request.limit_images = population;
+        std::vector<std::uint32_t> chosen, captured;
+        std::size_t selections = 0U;
+        const auto sampled = session.Run(request, command, {
+            .mask_metrics = false,
+            .samples_selected = [&](auto indices, auto) { ++selections; chosen.assign(indices.begin(), indices.end()); },
+            .sample = [&](rfdetr::ValidationSampleView sample) {
+                REQUIRE(sample.pixels.chw);
+                REQUIRE(sample.pixels.custody);
+                CHECK(sample.annotations.class_catalog);
+                CHECK_FALSE(sample.ground_truth.empty());
+                captured.push_back(static_cast<std::uint32_t>(sample.prediction.dataset_index));
+            },
+        });
+        CHECK(selections == 1U);
+        CHECK(chosen.size() == std::min<std::size_t>(6U, population));
+        CHECK(std::ranges::adjacent_find(chosen) == chosen.end());
+        CHECK(chosen.back() < population);
+        CHECK(captured == chosen);
+        CHECK(sampled.processed_images == population);
+        CHECK_FALSE(sampled.backends.at("onnx").summary.mask);
+        CHECK_FALSE(sampled.backends.at("onnx").details.empty());
+    }
+    std::stop_source cancelled;
+    const auto partial = session.Run(request, command, {.stop = cancelled.get_token(),
+        .progress = [&](auto processed, auto) { if (processed == 1U) cancelled.request_stop(); }});
+    CHECK(partial.cancelled);
+    CHECK(partial.processed_images == 1U);
+    CHECK(partial.backends.at("onnx").timing.images == 1U);
+    request.limit_images = 1U;
     CHECK(io::sha256_file(descriptor) == selected_digest);
     const auto preserved = io::sha256_file(request.save_engine_path);
     auto unrelated = rfdetr::decode_class_descriptor(encoded);

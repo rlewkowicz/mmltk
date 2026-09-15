@@ -25,6 +25,7 @@ enum class PresentationSourceKind : std::uint8_t {
     Predict[[= BrowserContentSession{3U}]],
     Live[[= BrowserContentSession{4U}]],
     Upscale[[= BrowserContentSession{5U}]],
+    Validation[[= BrowserContentSession{6U}]],
 };
 
 struct PresentationSourceMetadata final {

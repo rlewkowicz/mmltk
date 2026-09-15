@@ -383,6 +383,14 @@ void DatasetLoader::synchronize() { impl_->stream->synchronize(); }
 size_t DatasetLoader::num_images() const { return impl_->source.header().num_images; }
 size_t DatasetLoader::num_batches() const { return impl_->batch_starts.size(); }
 uint32_t DatasetLoader::image_width() const { return impl_->source.header().image_width; }
+const ImageEntry& DatasetLoader::image_entry(std::uint32_t index) const {
+    if (index >= num_images()) throw std::out_of_range("dataset image geometry index");
+    return impl_->source.image_entry(index);
+}
+RgbLetterbox DatasetLoader::letterbox(std::uint32_t index) const {
+    if (index >= num_images()) throw std::out_of_range("dataset letterbox index");
+    return impl_->source.letterbox(index);
+}
 uint32_t DatasetLoader::image_height() const { return impl_->source.header().image_height; }
 uint32_t DatasetLoader::num_classes() const { return impl_->source.header().num_classes; }
 uint32_t DatasetLoader::max_instances_per_image() const { return impl_->source.header().max_instances_per_image; }

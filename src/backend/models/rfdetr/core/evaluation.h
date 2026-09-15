@@ -1,5 +1,6 @@
 #pragma once
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
+#include "src/backend/models/rfdetr/contract/evaluation_metrics.h"
 
 #include <array>
 #include "src/backend/data/catalog/class_catalog.h"
@@ -107,17 +108,6 @@ struct PackedMaskPredictionView {
     std::ptrdiff_t prediction_stride = 0;
     std::uint32_t height = 0;
     std::uint32_t width = 0;
-};
-
-struct MetricSummary {
-    double ap = 0.0;
-    double ap50 = 0.0;
-    double ap75 = 0.0;
-};
-
-struct EvalSummary {
-    MetricSummary bbox;
-    std::optional<MetricSummary> mask;
 };
 
 struct AlignmentStats {

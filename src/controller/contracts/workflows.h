@@ -34,13 +34,13 @@ inline constexpr std::size_t kFeatureCount = static_cast<std::size_t>(FeatureId:
 
 [[nodiscard]] inline constexpr bool valid_foreground_workflow(const std::uint32_t workflow) noexcept {
     switch (static_cast<FeatureId>(workflow)) {
+        case FeatureId::Validate:
         case FeatureId::Predict:
         case FeatureId::Annotate:
         case FeatureId::Live:
         case FeatureId::Explore:
             return true;
         case FeatureId::Train:
-        case FeatureId::Validate:
         case FeatureId::Export:
             return false;
     }

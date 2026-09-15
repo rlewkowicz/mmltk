@@ -79,7 +79,7 @@ impl Component {
                     .id(format!("dialog.{}", fact.stable_field_id)),
                 )
             });
-        let progress = crate::view::workflow::progress::compute(model.workflow.validation.as_ref());
+        let progress = crate::view::workflow::progress::compute(model.workflow.validation.as_ref().map(|snapshot| &snapshot.operation));
         let setup = column![
             self.model_card
                 .view(crate::view::workflow::model_card::State::from_settings(
@@ -174,7 +174,7 @@ impl Component {
             "Validation status",
             "Canonical native operation outcome.",
             text(crate::view::shared::compute_status(
-                model.workflow.validation.as_ref(),
+                model.workflow.validation.as_ref().map(|snapshot| &snapshot.operation),
             )),
         );
         crate::view::workflow::Regions::new(

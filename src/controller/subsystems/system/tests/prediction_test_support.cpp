@@ -117,7 +117,15 @@ cudaError_t PredictionReceiverFault::Upload(void* destination, const void* sourc
 int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, std::uint32_t height,
     std::uint8_t* destination, std::size_t pitch, std::uintptr_t stream) noexcept {
     auto* fault = receiver_fault.load();
-    if (fault && fault->partial_draw) {
+    bool fail = false;
+    if (fault) {
+        ++fault->draws;
+        fail = fault->partial_draw;
+        auto remaining = fault->draw_failures_remaining.load();
+        while (remaining != 0U && !fault->draw_failures_remaining.compare_exchange_weak(remaining, remaining - 1U)) {}
+        fail = fail || remaining != 0U;
+    }
+    if (fail) {
         const auto command = reinterpret_cast<cudaStream_t>(stream);
         const auto written = cudaMemset2DAsync(destination, pitch, 123, width * 4U, 1U, command);
         if (written != cudaSuccess) return written;
@@ -132,7 +140,7 @@ detail::PredictionPreviewPool::TransferOperations PredictionReceiverFault::Opera
 PredictionTransferFault::PredictionTransferFault() : previous_(std::exchange(transfer_fault, this)) {}
 PredictionTransferFault::~PredictionTransferFault() { transfer_fault = previous_; }
 void PredictionTransferFault::Reset() { Reset(Selection{}); }
-void PredictionTransferFault::Reset(Selection selection) { selection_ = selection; copies = settlements = 0; }
+void PredictionTransferFault::Reset(Selection selection) { selection_ = selection; copies = settlements = waits = 0; waited_stream = nullptr; }
 CUresult PredictionTransferFault::Copy(CUdeviceptr destination, CUcontext destination_context, CUdeviceptr source,
     CUcontext source_context, std::size_t bytes, CUstream stream) {
     if (transfer_fault && ++transfer_fault->copies == transfer_fault->selection_.fail_copy) return CUDA_ERROR_INVALID_VALUE;
@@ -149,8 +157,18 @@ cudaError_t PredictionTransferFault::Settle(cudaStream_t stream) {
     }
     return cudaStreamSynchronize(stream);
 }
+cudaError_t PredictionTransferFault::Wait(cudaStream_t stream, cudaEvent_t event, unsigned flags) {
+    if (transfer_fault) {
+        ++transfer_fault->waits;
+        transfer_fault->waited_stream = stream;
+        if (transfer_fault->selection_.fail_wait) return cudaErrorInvalidResourceHandle;
+    }
+    return cudaStreamWaitEvent(stream, event, flags);
+}
 detail::PredictionPreviewPool::TransferOperations PredictionTransferFault::Operations() {
-    return {&Copy, &Record, &Settle, &cuMemHostRegister};
+    auto operations = detail::PredictionPreviewPool::TransferOperations{&Copy, &Record, &Settle, &cuMemHostRegister};
+    operations.wait = &Wait;
+    return operations;
 }
 detail::PredictionPreviewPool::TransferOperations RefusePinnedRegistration() {
     return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize,
@@ -186,8 +204,16 @@ contracts::ComputeTerminal ComputeSequence::Run(std::stop_token stop, const Comp
         .output = std::string(contracts::kComputePathCapacity + 1U, 'x'), .detail = std::string(contracts::kComputeErrorCapacity + 1U, 'x')};
     return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, 2U, "result");
 }
-contracts::ComputeTerminal FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest, std::stop_token stop, const ComputeProgressSink& progress) {
-    return sequence_.Run(stop, progress);
+ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest, std::stop_token stop, const ComputeProgressSink& progress, const rfdetr::ValidationDelivery&) {
+    ValidationRuntimeResult result{.terminal = sequence_.Run(stop, progress)};
+    if (result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded) {
+        result.evaluation.emplace();
+        result.evaluation->summary.bbox.available = true;
+        result.evaluation->summary.bbox.ap = 0.75;
+        result.evaluation->details.resize(5U);
+        for (std::uint32_t index = 0U; index < 5U; ++index) result.evaluation->details[index].category = index;
+    }
+    return result;
 }
 contracts::ComputeTerminal FakeNonvisualComputeRuntime::Run(rfdetr::ModelExportRequest, std::stop_token stop, const ComputeProgressSink& progress) {
     return sequence_.Run(stop, progress);

@@ -157,6 +157,7 @@ impl ApplicationModel {
             live: self.live_snapshot.as_ref(),
             upscale: self.upscale_snapshot.as_ref(),
             predict: self.predict_snapshot.as_ref(),
+            validation: self.workflow.validation.as_ref(),
         }
         .observe(kind)
     }
@@ -167,11 +168,12 @@ impl ApplicationModel {
 
     pub(super) fn page_visual_source(page: FeatureId) -> Option<PresentationSourceKind> {
         match page {
+            FeatureId::Validate => Some(PresentationSourceKind::Validation),
             FeatureId::Predict => Some(PresentationSourceKind::Predict),
             FeatureId::Live => Some(PresentationSourceKind::Live),
             FeatureId::Explore => Some(PresentationSourceKind::Explore),
             FeatureId::Annotate => Some(PresentationSourceKind::Annotation),
-            FeatureId::Train | FeatureId::Validate | FeatureId::Export => None,
+            FeatureId::Train | FeatureId::Export => None,
         }
     }
 

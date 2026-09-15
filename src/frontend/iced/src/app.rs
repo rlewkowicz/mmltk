@@ -1284,10 +1284,10 @@ mod tests {
             .begin_intent(ApplicationIntentEndpoint::ValidationStart)
             .unwrap();
         let mut running = app.model.workflow.validation.clone().unwrap();
-        running.generationfrontier += 1;
-        running.active = true;
-        running.terminal.generation = running.generationfrontier;
-        running.terminal.outcome = crate::generated::ComputeOperationOutcome::Running;
+        running.operation.generationfrontier += 1;
+        running.operation.active = true;
+        running.operation.terminal.generation = running.operation.generationfrontier;
+        running.operation.terminal.outcome = crate::generated::ComputeOperationOutcome::Running;
         app.model.reduce_reply(
             correlation,
             Ok(crate::generated::ApplicationReply::ValidationStart(running)),

@@ -335,7 +335,7 @@ impl ApplicationModel {
                 .training
                 .as_mut()
                 .map(|snapshot| &mut snapshot.local),
-            FeatureId::Validate => self.workflow.validation.as_mut(),
+            FeatureId::Validate => self.workflow.validation.as_mut().map(|snapshot| &mut snapshot.operation),
             FeatureId::Export => self.workflow.export.as_mut(),
             FeatureId::Predict | FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => None,
         }
@@ -935,6 +935,7 @@ mod tests {
         else {
             unreachable!()
         };
+        let mut installed = installed.operation;
         installed.generationfrontier = 4;
         installed.active = true;
         installed.terminal.generation = 4;

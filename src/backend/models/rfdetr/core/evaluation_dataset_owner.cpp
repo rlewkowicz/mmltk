@@ -74,13 +74,14 @@ void EvaluationDatasetOwner::merge_bbox_predictions(const std::int64_t dataset_i
 EvaluationDatasetOwner::ImageMatches EvaluationDatasetOwner::match_predictions(const std::int64_t dataset_index,
                                                                                const BBoxPredictionView predictions,
                                                                                const std::optional<PackedMaskPredictionView> masks,
-                                                                               const std::size_t max_dets_per_image) const {
-    return impl_->dataset.match_staged_predictions(dataset_index, predictions, masks, max_dets_per_image);
+                                                                               const std::size_t max_dets_per_image, const std::span<const Prediction> encoded_masks) const {
+    return impl_->dataset.match_staged_predictions(dataset_index, predictions, masks, max_dets_per_image, encoded_masks);
 }
 void EvaluationDatasetOwner::merge_matches(ImageMatches matches) { impl_->dataset.merge_matches(std::move(matches)); }
 EvalSummary EvaluationDatasetOwner::evaluate(const std::size_t max_dets_per_image) const {
     return impl_->dataset.evaluate(max_dets_per_image);
 }
+std::vector<EvaluationMetricDetail> EvaluationDatasetOwner::take_details() { return impl_->dataset.take_details(); }
 EvalSummary EvaluationDatasetOwner::evaluate(const std::size_t max_dets_per_image,
                                              mmltk::common::concurrency::WorkerPool& worker_pool) const {
     return impl_->dataset.evaluate(max_dets_per_image, &worker_pool);

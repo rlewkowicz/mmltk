@@ -81,6 +81,8 @@ class DatasetLoader {
     [[nodiscard]] const LabelIndexEntry* label_index() const;
     [[nodiscard]] const PackedInstance* label_data() const;
     [[nodiscard]] const RLEPair* rle_data() const;
+    [[nodiscard]] const ImageEntry& image_entry(std::uint32_t index) const;
+    [[nodiscard]] RgbLetterbox letterbox(std::uint32_t index) const;
 
    private:
     struct Impl;

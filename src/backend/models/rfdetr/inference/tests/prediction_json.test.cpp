@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include <unistd.h>
 #include <catch2/catch_test_macros.hpp>

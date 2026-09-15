@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include <signal.h>
 #include <spdlog/spdlog.h>
 #include <sys/wait.h>

@@ -1,6 +1,7 @@
 #include "src/common/io/file_digest.h"
 #include "prediction_test_support.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
+#include "src/controller/subsystems/system/detail/validation_samples.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/backend/ml/runtime/backend_factory.h"
@@ -899,6 +900,19 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
     REQUIRE(dialog.snapshot().selection->selected());
     CHECK(std::get<services::FileDialogSelected>(dialog.snapshot().selection->result).path == "/tmp/input");
     CHECK(constructions == 2U);
+    const auto measured = validation.snapshot();
+    REQUIRE(measured.metrics);
+    CHECK(measured.metrics->bbox.ap == 0.75);
+    CHECK(measured.detail_rows == 5U);
+    CHECK_FALSE(measured.metrics->mask);
+    CHECK(validation.Details({measured.operation.generation_frontier, 0U, 4U}).rows.size() == 4U);
+    const auto last = validation.Details({measured.operation.generation_frontier, 4U, 4U});
+    REQUIRE(last.rows.size() == 1U);
+    CHECK(last.rows.front().category == 4U);
+    CHECK(validation.Details({measured.operation.generation_frontier, 5U, 1U}).rows.empty());
+    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 6U, 1U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 0U, 5U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier - 1U, 0U, 1U}), contracts::InvalidIntentError);
 }
 
 TEST_CASE("production direct adapters reject unavailable physical dependencies", "[controller][systems][production-adapters]") {
@@ -1371,9 +1385,9 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
 
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0U;
-    std::promise<ComputeSystemEvent> first_terminal;
-    std::promise<ComputeSystemEvent> second_terminal;
-    std::promise<ComputeSystemEvent> third_terminal;
+    std::promise<ValidationSystem::event_type> first_terminal;
+    std::promise<ValidationSystem::event_type> second_terminal;
+    std::promise<ValidationSystem::event_type> third_terminal;
     std::atomic_size_t terminals = 0U;
     std::atomic_size_t progress = 0U;
     ValidationSystem validation{settings, dataset, model,
@@ -1382,8 +1396,8 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
                                     return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate, .fail = fail});
                                 },
                                 // CLEANUP-IGNORE: Compute and dataset event sequences prove distinct typed system contracts.
-                                [&](ComputeSystemEvent event) {
-                                    if (std::holds_alternative<ComputeProgressEvent>(event))
+                                [&](ValidationSystem::event_type event) {
+                                    if (std::holds_alternative<ValidationProgress>(event))
                                         ++progress;  // CLEANUP-IGNORE: This oracle consumes the distinct typed compute
                                                      // event stream; dataset events are validated independently above.
                                     else {
@@ -1405,21 +1419,21 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     CHECK_THROWS_AS(validation.Start({}), contracts::BusyError);
     gate->Release();
     const auto failed_compute = first_terminal.get_future().get();
-    REQUIRE(std::holds_alternative<ComputeChanged>(failed_compute));
-    CHECK(std::get<ComputeChanged>(failed_compute).snapshot.generation_frontier == 1U);
-    CHECK(std::get<ComputeChanged>(failed_compute).snapshot.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
+    REQUIRE(std::holds_alternative<ValidationChanged>(failed_compute));
+    CHECK(std::get<ValidationChanged>(failed_compute).snapshot.operation.generation_frontier == 1U);
+    CHECK(std::get<ValidationChanged>(failed_compute).snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
     CHECK(progress == 0U);
-    CHECK_FALSE(validation.snapshot().active);
+    CHECK_FALSE(validation.snapshot().operation.active);
 
     gate = std::make_shared<StopGate>();
     static_cast<void>(validation.Start({}));
     static_cast<void>(validation.Stop());
-    CHECK(std::holds_alternative<ComputeChanged>(second_terminal.get_future().get()));
-    CHECK(validation.snapshot().terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
+    CHECK(std::holds_alternative<ValidationChanged>(second_terminal.get_future().get()));
+    CHECK(validation.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
     gate->Release();
     static_cast<void>(validation.Start({}));
-    CHECK(std::holds_alternative<ComputeChanged>(third_terminal.get_future().get()));
-    CHECK(validation.snapshot().terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+    CHECK(std::holds_alternative<ValidationChanged>(third_terminal.get_future().get()));
+    CHECK(validation.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     CHECK(constructions == 2U);
 }
 
@@ -1432,21 +1446,21 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
     DatasetSystem dataset{settings, [observation] { return std::make_unique<BlockingInspectRuntime>(observation); }};
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0;
-    std::promise<ComputeSystemEvent> settled;
+    std::promise<ValidationSystem::event_type> settled;
     ValidationSystem validation{settings, dataset, model, [&] {
         ++constructions;
         return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate});
-    }, [&](ComputeSystemEvent event) {
-        if (std::holds_alternative<ComputeChanged>(event)) settled.set_value(std::move(event));
+    }, [&](ValidationSystem::event_type event) {
+        if (std::holds_alternative<ValidationChanged>(event)) settled.set_value(std::move(event));
     }};
     const auto admitted = validation.Start({});
-    CHECK(admitted.active);
+    CHECK(admitted.operation.active);
     observation->inspect_started.get_future().wait();
     CHECK(constructions == 0U);
     CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
     static_cast<void>(validation.Stop());
     const auto terminal = settled.get_future().get();
-    CHECK(std::get<ComputeChanged>(terminal).snapshot.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
+    CHECK(std::get<ValidationChanged>(terminal).snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
     CHECK(constructions == 0U);
     CHECK(observation->compile_calls == 0);
 }
@@ -2474,6 +2488,50 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
     fault.Reset();
 }
 
+TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault custody", "[controller][gpu]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    namespace runtime = mmltk::backend::ml::runtime;
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    cudaStream_t first_raw = nullptr, second_raw = nullptr;
+    REQUIRE(cudaStreamCreateWithFlags(&first_raw, cudaStreamNonBlocking) == cudaSuccess);
+    std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)> first(first_raw, &cudaStreamDestroy);
+    REQUIRE(cudaStreamCreateWithFlags(&second_raw, cudaStreamNonBlocking) == cudaSuccess);
+    std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)> second(second_raw, &cudaStreamDestroy);
+    const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
+    const std::array<float, 12> pixels{};
+    auto input = PredictionSource::Device(execution, {2U, 2U}, pixels, {}, classes);
+    gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+    PredictionTransferFault fault;
+    for (int stage : {0, 1, 2, 3, 4}) {
+        fault.Reset();
+        detail::PredictionPreviewPool pool(execution, context, PredictionTransferFault::Operations(), {}, 1U);
+        auto capture = [&](cudaStream_t stream) {
+            return pool.Capture(input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), {}, input.annotations(), classes, 1, nullptr, input.custody());
+        };
+        auto previous = capture(first.get());
+        REQUIRE(previous);
+        previous.reset(); // The peer copy need not have completed or been drawn.
+        fault.Reset({.fail_copy = stage == 2 || stage == 4 ? 1 : 0, .fail_record = stage == 3, .fail_settle = stage == 4, .fail_wait = stage == 1});
+        if (stage == 0) {
+            REQUIRE(capture(second.get()));
+            CHECK(fault.settlements == 0);
+        } else if (stage == 4) {
+            CHECK_THROWS_AS(capture(second.get()), runtime::CudaOperationError);
+            CHECK(pool.HasUnsafeSourceCustody());
+        } else {
+            CHECK_THROWS_AS(capture(second.get()), std::runtime_error);
+            CHECK(fault.settlements == 1);
+            CHECK_FALSE(pool.HasUnsafeCustody());
+        }
+        CHECK(fault.waits == 1);
+        CHECK(fault.waited_stream == second.get());
+        fault.Reset();
+        if (stage != 4) REQUIRE(capture(first.get()));
+    }
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+}
+
 TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact", "[controller][gpu]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace controller = mmltk::controller;
@@ -2752,7 +2810,7 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
     validation.save_engine_path = output;
     validation.compiled_path = root.path() / "not-opened.bin";
     validation.eval_order = "tensorrt";
-    CHECK(validator.Run(validation, stop.get_token(), {}).outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
+    CHECK(validator.Run(validation, stop.get_token(), {}, {}).terminal.outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
     CHECK(io::sha256_file(output) == previous);
     CHECK(io::sha256_file(companion) == previous_companion);
     for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
@@ -2778,4 +2836,110 @@ TEST_CASE("artifact model inspection observes cancellation before each opaque in
         }), "model selection cancelled");
         CHECK(verified);
     }
+}
+
+TEST_CASE("validation retains the limited sample atlas and selects detail without a producer", "[controller][gpu][validation]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    std::mutex mutex;
+    std::condition_variable changed;
+    PredictionReceiverFault fault;
+    ScopedPredictionReceiverFault receiver(fault);
+    std::size_t notifications = 0U;
+    detail::ValidationSamples samples({.device = 0, .maximum_width = 768U, .maximum_height = 512U},
+        [&] { std::scoped_lock lock(mutex); ++notifications; changed.notify_all(); }, PredictionReceiverFault::Operations());
+    const std::array<std::uint32_t, 2> indices{1U, 3U};
+    samples.Begin(7U, indices);
+    const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"empty"});
+    const std::array<float, 12> pixels{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+    auto source = PredictionSource::Device(execution, {2U, 2U}, pixels, {}, classes);
+    for (const auto index : indices) {
+        const rfdetr::PredictionRecord record{.dataset_index = index};
+        samples.Capture({record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
+    }
+    const auto await = [&](auto predicate) {
+        std::unique_lock lock(mutex);
+        REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
+    };
+    await([&] { const auto snapshot = samples.snapshot(); return snapshot.sample_available[0] && snapshot.sample_available[1]; });
+    const auto atlas = samples.snapshot();
+    CHECK_FALSE(atlas.detail);
+    CHECK(std::count(atlas.sample_available.begin(), atlas.sample_available.end(), true) == 2);
+    REQUIRE(samples.ImageSnapshot(atlas.frame));
+    CHECK(samples.ImageSnapshot(atlas.frame)->samples[0].labels.empty());
+    CHECK_THROWS_AS(samples.Select({6U, 1U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(samples.Select({7U, 2U}), contracts::InvalidIntentError);
+    samples.Select({7U, 3U});
+    await([&] { return samples.snapshot().detail; });
+    const auto detail = samples.snapshot();
+    CHECK(detail.content_identity != atlas.content_identity);
+    CHECK(detail.frame.extent == VisualExtent{2U, 2U});
+    auto retained = samples.BorrowFrame();
+    REQUIRE(retained.valid());
+    samples.Begin(8U, indices); // Empty newer run cannot replace the retained detail's atlas.
+    samples.CloseDetail();
+    await([&] { return !samples.snapshot().detail; });
+    CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    auto atlas_reader = samples.BorrowFrame();
+    REQUIRE(atlas_reader.valid());
+    const auto before = samples.snapshot();
+    samples.SetOverlays({false, false, false, false});
+    CHECK(samples.snapshot().frame == before.frame); // Both outputs have physical readers.
+    CHECK(samples.snapshot().overlays == before.overlays);
+    retained = {};
+    await([&] { return samples.snapshot().frame.revision > before.frame.revision; });
+    CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    CHECK(samples.snapshot().overlays == ValidationOverlays{false, false, false, false});
+    CHECK(samples.ImageSnapshot(samples.snapshot().frame)->overlays == samples.snapshot().overlays);
+    atlas_reader = {};
+    samples.Select({7U, 1U});
+    await([&] { return samples.snapshot().detail; });
+    samples.Begin(9U, indices);
+    const auto capture = [&](std::uint32_t index) {
+        const rfdetr::PredictionRecord record{.dataset_index = index};
+        samples.Capture({record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
+    };
+    capture(1U); // A partial newer set stays pending while old detail is selected.
+    samples.CloseDetail();
+    await([&] { return !samples.snapshot().detail; });
+    CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    for (const auto overlays : {ValidationOverlays{true, false, false, false}, ValidationOverlays{false, true, false, false},
+                               ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
+        const auto revision = samples.snapshot().frame.revision;
+        samples.SetOverlays(overlays);
+        await([&] { return samples.snapshot().frame.revision > revision; });
+        CHECK(samples.snapshot().content_identity == atlas.content_identity);
+        CHECK(samples.snapshot().overlays == overlays);
+    }
+    const auto preserved = samples.snapshot();
+    std::size_t failure_notifications = 0U;
+    { std::scoped_lock lock(mutex); failure_notifications = notifications + 2U; }
+    fault.partial_draw = true;
+    samples.SetOverlays({true, true, true, true});
+    await([&] { return notifications >= failure_notifications; });
+    CHECK(samples.snapshot().frame == preserved.frame);
+    CHECK(samples.snapshot().overlays == preserved.overlays);
+    CHECK(samples.ImageSnapshot(preserved.frame)->overlays == preserved.overlays);
+    fault.partial_draw = false;
+    samples.SetOverlays({true, true, true, true}); // Repeating a refused request is an explicit retry.
+    await([&] { return samples.snapshot().frame.revision > preserved.frame.revision; });
+    CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    fault.draw_failures_remaining = 1U;
+    capture(3U); // Last capture's ordinary draw failure retries without another producer callback.
+    await([&] { return samples.snapshot().sample_identities[0].generation == 9U; });
+    CHECK(samples.snapshot().sample_available[0]);
+    CHECK(samples.snapshot().sample_available[1]);
+    CHECK_THROWS_AS(samples.Select({7U, 1U}), contracts::InvalidIntentError);
+    auto final_reader = samples.BorrowFrame();
+    REQUIRE(final_reader.valid());
+    samples.Shutdown();
+}
+
+TEST_CASE("validation requires a nonzero three by two atlas envelope", "[controller][validation]") {
+    CHECK_THROWS_AS(detail::ValidationSamples({.device = 0, .maximum_width = 2U, .maximum_height = 2U}, {}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(detail::ValidationSamples({.device = 0, .maximum_width = 3U, .maximum_height = 1U}, {}), contracts::InvalidIntentError);
+    detail::ValidationSamples minimum({.device = 0, .maximum_width = 3U, .maximum_height = 2U}, {});
+    minimum.Shutdown();
 }

@@ -41,6 +41,7 @@ module;
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "stb_image.h"
@@ -170,6 +171,9 @@ struct AnnotationBatch final {
     std::vector<PostprocessedSelection> selections;
     std::vector<RfdetrMaskSelection> runtime_selections;
     bool want_masks = false;
+    bool encoded_masks = false;
+    bool preview_masks = false;
+    std::vector<PredictionDemand> demand;
     bool raw_preview = false;
     std::string preview_failure;
 };
@@ -363,10 +367,6 @@ class PredictionBackend final {
 };
 
 
-bool preview_requested(const PredictionDelivery& delivery, std::uint32_t width, std::uint32_t height) noexcept {
-    return delivery.completed && delivery.source_pixels && width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
-}
-
 void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t capacity, std::uint32_t width, std::uint32_t height,
                          int device, bool masks, bool raw_preview) {
     const auto cuda = tensor_api::TensorOptions().device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(device));
@@ -438,10 +438,21 @@ struct PredictionReadback final {
 
 void execute_prediction_batch(const PredictRequest& options, PredictionBackend& backend, const tensor_api::Tensor& input,
     std::size_t batch_size, std::uint32_t width, std::uint32_t height, const PredictionDelivery& delivery,
-    AnnotationBatch& annotations, PredictionReadback& readback) {
-    const bool masks = options.include_masks && backend.has_masks();
+    AnnotationBatch& annotations, PredictionReadback& readback, std::span<const std::uint32_t> indices = {}, std::int64_t first_index = 0) {
+    annotations.demand.resize(batch_size);
+    bool masks = false, pixels = false;
+    for (std::size_t image = 0; image < batch_size; ++image) {
+        auto demand = delivery.demand ? delivery.demand(indices.empty() ? first_index + static_cast<std::int64_t>(image) : indices[image]) : PredictionDemand{};
+        demand.encoded_masks = (options.include_masks || demand.encoded_masks) && backend.has_masks();
+        demand.source_pixels = (delivery.source_pixels || demand.source_pixels) && static_cast<bool>(delivery.completed);
+        demand.preview_masks = demand.source_pixels && (options.include_masks || demand.preview_masks) && backend.has_masks() &&
+                               width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height;
+        annotations.demand[image] = demand;
+        masks = masks || demand.encoded_masks || demand.preview_masks;
+        pixels = pixels || (demand.source_pixels && width <= delivery.maximum_pixel_width && height <= delivery.maximum_pixel_height);
+    }
     prepare_annotations(annotations, batch_size, backend.capacity(batch_size, width, height, masks), width, height,
-                        options.device_id, masks, preview_requested(delivery, width, height));
+                        options.device_id, masks, pixels);
     backend.Execute(input, annotations);
     if (annotations.storage.front().value_capacity != 0U) readback.Read(annotations);
 }
@@ -454,9 +465,9 @@ struct PredictionSourceStorage final {
 void deliver_prediction(const PredictionDelivery& delivery, const PredictionRecord& record, PredictionPixels pixels,
     const AnnotationBatch& annotations, std::size_t index, const PredictionReadback& readback, std::shared_ptr<void> source) {
     if (!delivery.completed) return;
-    if (!delivery.source_pixels) pixels = {};
+    if (!annotations.demand[index].source_pixels) pixels = {};
     else if (!annotations.preview_failure.empty()) pixels = {.preview_failure = annotations.preview_failure};
-    else if (!preview_requested(delivery, pixels.width, pixels.height))
+    else if (pixels.width > delivery.maximum_pixel_width || pixels.height > delivery.maximum_pixel_height)
         pixels = {.preview_failure = "Prediction preview exceeds the visual dimensions"};
     else if (pixels.chw || pixels.rgb8) {
         try {
@@ -531,9 +542,9 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
     };
     // Mask query selection is semantic work. BBox-only survivor upload belongs
     // entirely to optional preview preparation.
-    if (batch.want_masks) upload_survivors();
+    if (batch.encoded_masks) upload_survivors();
     preview.Execute([&] {
-        if (!batch.want_masks) upload_survivors();
+        if (!batch.encoded_masks) upload_survivors();
         annotation = scalar_layout;
         annotation.masks = {};
         annotation.value_count = result.size();
@@ -557,62 +568,71 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         }
 
     });
-    if (!batch.want_masks) return result;
-    if (!selection.mask_logits) throw std::runtime_error("RF-DETR requested mask output is absent");
-    if (!storage.selected_queries.defined()) storage.selected_queries = tensor_api::empty({0}, cuda);
-    storage.selected_queries.resize_({1, active});
-    at::index_select_out(storage.selected_queries, selection.query_indices, 1, storage.device_indices);
-    const auto width = source_region.width;
-    const auto height = source_region.height;
-    const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
-    const auto plan = PredictionMaskChunk::Resolve(result.size(), selection.mask_logits->size(2), selection.mask_logits->size(3),
-                                                  height, width, selection.mask_logits->element_size());
-    const auto per_chunk = plan.count;
-    auto retained_capacity = storage.mask_workspace.RetainedCapacity(storage.masks.capacity_bytes());
-    for (std::size_t plane = 0U; plane < retained_capacity.bytes.size(); ++plane)
-        retained_capacity.bytes[plane] = std::max(retained_capacity.bytes[plane], plan.capacity.bytes[plane]);
-    if (retained_capacity.Total() > plan.retained_limit) {
-        // The previous chunk/frame completed its host visibility wait. Drop its
-        // escaped view before releasing pinned storage; retain ordinary high water
-        // unless combining old and new shapes would exceed this frame's budget.
-        storage.mask_values = {};
-        const auto released = storage.masks.ReleaseSettled();
-        if (released != CUDA_SUCCESS) throw std::runtime_error("prediction mask scratch is still borrowed");
-        storage.mask_workspace.ResetSettled();
-    }
-    preview.Execute([&] {
-        static_cast<void>(checked_prediction_extent(result.size(), pixels, kMaximumPredictionTensorBytes));
-        if (!batch.masks.defined()) batch.masks = tensor_api::empty({active, height, width}, batch.boxes.options().dtype(tensor_api::kUInt8));
-        else batch.masks.resize_({active, height, width});
-    });
-    std::size_t remaining_runs = kMaximumPredictionMaskRuns;
-    for (std::size_t start = 0; start < result.size(); start += per_chunk) {
-        const auto chunk_size = std::min(per_chunk, result.size() - start);
-        const auto chunk = static_cast<std::int64_t>(chunk_size);
-        const auto masks = storage.mask_workspace.Materialize(*selection.mask_logits,
-            storage.selected_queries.narrow(1, static_cast<std::int64_t>(start), chunk), height, width)[0];
-        storage.mask_values = {};
-        storage.mask_values = storage.masks.view(masks.sizes(), tensor_api::kBool);
-        storage.mask_values.copy_(masks, true);
-        preview.Execute([&] { batch.masks.narrow(0, static_cast<std::int64_t>(start), chunk).copy_(masks); });
-        const auto status = cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(batch.boxes.get_device()).stream());
-        if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction mask chunk completion"};
-        const auto* values = storage.mask_values.data_ptr<bool>();
-        for (std::size_t offset = 0; offset < chunk_size; ++offset) {
-            auto& prediction = result[start + offset];
-            encode_mask_values_into(height, width, prediction.mask,
-                [values, offset, pixels](std::uint32_t pixel) { return values[offset * pixels + pixel]; }, remaining_runs);
-            remaining_runs -= prediction.mask.runs.size();
-            prediction.has_mask = true;
+    if (!batch.encoded_masks && (!batch.preview_masks || !preview.available())) return result;
+    const auto materialize_masks = [&] {
+        const auto raw_mask_work = [&](auto&& work) {
+            if (batch.encoded_masks) preview.Execute(std::forward<decltype(work)>(work));
+            else std::forward<decltype(work)>(work)();
+        };
+        if (!selection.mask_logits) throw std::runtime_error("RF-DETR requested mask output is absent");
+        if (!storage.selected_queries.defined()) storage.selected_queries = tensor_api::empty({0}, cuda);
+        storage.selected_queries.resize_({1, active});
+        at::index_select_out(storage.selected_queries, selection.query_indices, 1, storage.device_indices);
+        const auto width = source_region.width;
+        const auto height = source_region.height;
+        const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
+        const auto plan = PredictionMaskChunk::Resolve(result.size(), selection.mask_logits->size(2), selection.mask_logits->size(3),
+                                                      height, width, selection.mask_logits->element_size());
+        const auto per_chunk = plan.count;
+        auto retained_capacity = storage.mask_workspace.RetainedCapacity(storage.masks.capacity_bytes());
+        for (std::size_t plane = 0U; plane < retained_capacity.bytes.size(); ++plane)
+            retained_capacity.bytes[plane] = std::max(retained_capacity.bytes[plane], plan.capacity.bytes[plane]);
+        if (retained_capacity.Total() > plan.retained_limit) {
+            // Encoded-mask reads completed their host visibility wait; preview-only
+            // work has no pinned view. GPU scratch reuse stays on the inference
+            // stream. Drop retained storage when mixed shapes exceed the budget.
+            storage.mask_values = {};
+            const auto released = storage.masks.ReleaseSettled();
+            if (released != CUDA_SUCCESS) throw std::runtime_error("prediction mask scratch is still borrowed");
+            storage.mask_workspace.ResetSettled();
         }
-    }
-    annotation.masks_available = preview.available();
-    if (preview.available()) annotation.masks = {
-        .address = reinterpret_cast<std::uintptr_t>(batch.masks.data_ptr()),
-        .capacity_bytes = result.size() * pixels,
-        .shape = {.rank = 3U, .extents = {static_cast<std::uint32_t>(result.size()), height, width}},
-        .element_type = runtime::AnalysisElementType::Uint8,
+        if (batch.preview_masks) raw_mask_work([&] {
+            static_cast<void>(checked_prediction_extent(result.size(), pixels, kMaximumPredictionTensorBytes));
+            if (!batch.masks.defined()) batch.masks = tensor_api::empty({active, height, width}, batch.boxes.options().dtype(tensor_api::kUInt8));
+            else batch.masks.resize_({active, height, width});
+        });
+        std::size_t remaining_runs = kMaximumPredictionMaskRuns;
+        for (std::size_t start = 0; start < result.size(); start += per_chunk) {
+            const auto chunk_size = std::min(per_chunk, result.size() - start);
+            const auto chunk = static_cast<std::int64_t>(chunk_size);
+            const auto masks = storage.mask_workspace.Materialize(*selection.mask_logits,
+                storage.selected_queries.narrow(1, static_cast<std::int64_t>(start), chunk), height, width)[0];
+            if (batch.preview_masks) raw_mask_work([&] { batch.masks.narrow(0, static_cast<std::int64_t>(start), chunk).copy_(masks); });
+            if (!batch.encoded_masks) continue;
+            storage.mask_values = {};
+            storage.mask_values = storage.masks.view(masks.sizes(), tensor_api::kBool);
+            storage.mask_values.copy_(masks, true);
+            const auto status = cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(batch.boxes.get_device()).stream());
+            if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction mask chunk completion"};
+            const auto* values = storage.mask_values.data_ptr<bool>();
+            for (std::size_t offset = 0; offset < chunk_size; ++offset) {
+                auto& prediction = result[start + offset];
+                encode_mask_values_into(height, width, prediction.mask,
+                    [values, offset, pixels](std::uint32_t pixel) { return values[offset * pixels + pixel]; }, remaining_runs);
+                remaining_runs -= prediction.mask.runs.size();
+                prediction.has_mask = true;
+            }
+        }
+        annotation.masks_available = batch.preview_masks && preview.available();
+        if (annotation.masks_available) annotation.masks = {
+            .address = reinterpret_cast<std::uintptr_t>(batch.masks.data_ptr()),
+            .capacity_bytes = result.size() * pixels,
+            .shape = {.rank = 3U, .extents = {static_cast<std::uint32_t>(result.size()), height, width}},
+            .element_type = runtime::AnalysisElementType::Uint8,
+        };
     };
+    if (batch.encoded_masks) materialize_masks();
+    else preview.Execute(materialize_masks);
     return result;
 }
 
@@ -622,6 +642,10 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
     const PredictionBackend& backend, AnnotationBatch& annotations, PredictionReadback& readback,
     const PredictionDelivery& delivery, PredictionRunResult& result, std::size_t total,
     PredictionPixels pixels, std::shared_ptr<void> source = {}, DecodedPredictionImage* decoded_source = nullptr) {
+    annotations.encoded_masks = annotations.demand[index].encoded_masks;
+    annotations.preview_masks = annotations.demand[index].preview_masks;
+    annotations.want_masks = annotations.encoded_masks || annotations.preview_masks;
+    annotations.raw_preview = annotations.demand[index].source_pixels && pixels.width <= delivery.maximum_pixel_width && pixels.height <= delivery.maximum_pixel_height;
     record.detections = copy_predictions(annotations, index, options.threshold, readback, static_cast<int>(backend.class_layout()->semantic() ? backend.class_layout()->catalog()->size() : backend.class_layout()->output_width()));
     for (auto& detection : record.detections) {
         detection.image_id = static_cast<int>(record.image_id);
@@ -630,7 +654,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
     if (delivery.completed) {
         // Decoded images keep unique ownership until semantics are complete and
         // pixels are requested. The shared control block is optional preview work.
-        if (decoded_source && delivery.source_pixels) {
+        if (decoded_source && annotations.demand[index].source_pixels) {
             try {
                 std::shared_ptr<stbi_uc> decoded = std::move(*decoded_source);
                 pixels.rgb8 = decoded.get();
@@ -681,7 +705,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
         if (converted.defined()) converted.copy_(device);
         const auto& normalized = converted.defined() ? converted : device;
         execute_prediction_batch(options, backend, normalized, 1U, static_cast<std::uint32_t>(width),
-                                 static_cast<std::uint32_t>(height), delivery, annotations, readback);
+                                 static_cast<std::uint32_t>(height), delivery, annotations, readback, {}, static_cast<std::int64_t>(result.processed_images));
         PredictionRecord record;
         record.dataset_index = static_cast<std::int64_t>(index);
         record.image_id = source.image_id != 0 ? source.image_id : static_cast<std::int64_t>(index + 1U);
@@ -724,7 +748,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
         normalized.sub_(mean).div_(deviation);
         if (converted.defined()) converted.copy_(normalized);
         execute_prediction_batch(options, backend, converted.defined() ? converted : normalized, 1U,
-                                 frame->width, frame->height, delivery, annotations, readback);
+                                 frame->width, frame->height, delivery, annotations, readback, {}, static_cast<std::int64_t>(result.processed_images));
         PredictionRecord record{.dataset_index = static_cast<std::int64_t>(frame->index), .image_id = static_cast<std::int64_t>(frame->index + 1U),
                                 .source_name = options.video_path.string()};
         complete_prediction_record(record, 0U, options, backend, annotations, readback, delivery, result, total,
@@ -930,6 +954,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     result.backend_name = bound_backend.name();
     result.artifacts = bound_backend.artifacts();
     result.artifacts.class_layout = bound_backend.class_layout()->record();
+    result.masks_available = bound_backend.has_masks();
     result.class_catalog = bound_backend.class_layout()->catalog();
     result.class_domain = bound_backend.class_layout()->domain();
     if (options.source_kind == PredictSourceKind::VideoFile)
@@ -965,7 +990,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
         active_batch.num_images = std::min(batch.num_images, total - result.processed_images);
         auto normalized = preprocessor.Run(active_batch);
         execute_prediction_batch(options, bound_backend, normalized, active_batch.num_images, loader->image_width(),
-                                 loader->image_height(), delivery, annotations, *readback);
+                                 loader->image_height(), delivery, annotations, *readback, {batch.image_indices, active_batch.num_images});
         for (std::size_t image = 0U; image < active_batch.num_images && !delivery.stop.stop_requested(); ++image) {
             PredictionRecord record;
             record.dataset_index = static_cast<std::int64_t>(batch.image_indices[image]);

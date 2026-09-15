@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <stop_token>
+#include <span>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -15,6 +16,7 @@
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
+#include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
 namespace mmltk::backend::models::rfdetr {
 
@@ -22,6 +24,7 @@ struct ValidationBackendResult {
     ResolvedModelArtifacts artifacts;
     ModelInfo model_info;
     EvalSummary summary;
+    std::vector<EvaluationMetricDetail> details;
     PhaseTiming timing;
 };
 
@@ -41,9 +44,18 @@ struct ValidationLimitResolution {
     bool eval_max_dets_automatic = false;
 };
 
+struct ValidationSampleView final {
+    const PredictionRecord& prediction;
+    PredictionPixels pixels;
+    const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations;
+    std::span<const Prediction> ground_truth;
+};
 struct ValidationDelivery final {
     std::stop_token stop{};
     std::function<void(std::size_t, std::size_t)> progress{};
+    bool mask_metrics = true;
+    std::function<void(std::span<const std::uint32_t>, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>)> samples_selected{};
+    std::function<void(ValidationSampleView)> sample{};
 };
 
 struct ValidationRunResult {
@@ -68,8 +80,6 @@ class ValidationSession final {
     ValidationSession& operator=(const ValidationSession&) = delete;
 
     ValidationRunResult Run(const ValidateRequest& request, mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery = {});
-    [[nodiscard]] std::size_t RunImageCount(const ValidateRequest& request,
-                                            mmltk::backend::ml::runtime::BorrowedCommandStream command_stream, const ValidationDelivery& delivery = {});
     [[nodiscard]] mmltk::backend::ml::runtime::RuntimeStatus Close() noexcept;
 
    private:

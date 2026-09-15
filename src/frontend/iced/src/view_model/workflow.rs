@@ -6,7 +6,8 @@ use crate::generated::{
 pub struct WorkflowModel {
     pub dataset: Option<ArtifactUiState>,
     pub training: Option<TrainingSnapshot>,
-    pub validation: Option<ComputeUiState>,
+    pub validation: Option<crate::generated::ValidationSnapshot>,
+    pub validation_details: Option<crate::generated::EvaluationDetailPage>,
     pub export: Option<ComputeUiState>,
     settings_revision: Option<u64>,
     pub pending_start: Option<PendingStart>,
@@ -73,6 +74,7 @@ impl Default for WorkflowModel {
             dataset: None,
             training: None,
             validation: None,
+            validation_details: None,
             export: None,
             settings_revision: None,
             pending_start: None,
@@ -251,30 +253,75 @@ impl ApplicationModel {
     }
 }
 
+impl ApplicationModel {
+    fn install_validation_snapshot(&mut self, mut value: crate::generated::ValidationSnapshot) -> Result<(), UiError> {
+        let failed = value.operation.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed;
+        let detail = value.operation.terminal.detail.clone();
+        let mut installed = true;
+        if let Some(current) = self.workflow.validation.as_ref() {
+            // Neutralize only the independent logical facts: equality then covers
+            // every physical field in the canonical generated snapshot, including
+            // future additions, without a second physical member inventory.
+            if value.frame.revision == current.frame.revision {
+                let mut physical = value.clone();
+                physical.operation = current.operation.clone();
+                physical.metrics = current.metrics.clone();
+                physical.detailrows = current.detailrows;
+                if physical != *current {
+                    return Err(UiError::protocol("inconsistent Validation frame revision"));
+                }
+            }
+            let mut operation = current.operation.clone();
+            let outcome = super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
+            installed = outcome == Observation::Installed;
+            if outcome == Observation::Stale {
+                value.metrics = current.metrics.clone();
+                value.detailrows = current.detailrows;
+            }
+            if value.frame.revision < current.frame.revision {
+                let metrics = value.metrics.take();
+                let detail_rows = value.detailrows;
+                value = current.clone();
+                value.metrics = metrics;
+                value.detailrows = detail_rows;
+            }
+            value.operation = operation;
+        }
+        if self.workflow.validation_details.as_ref().is_some_and(|page| page.generation != value.operation.generationfrontier) {
+            self.workflow.validation_details = None;
+        }
+        self.workflow.validation = Some(value);
+        if installed && failed { self.failed(detail); }
+        Ok(())
+    }
+}
 impl crate::generated::ValidationApplicationProjection<UiError> for ApplicationModel {
-    fn project_validation_snapshot(
-        &mut self,
-        value: crate::generated::ComputeUiState,
-    ) -> Result<(), UiError> {
-        merge_compute_snapshot(&mut self.workflow.validation, value).map(|_| ())
+    fn project_validation_snapshot(&mut self, value: crate::generated::ValidationSnapshot) -> Result<(), UiError> {
+        self.install_validation_snapshot(value)
     }
-
     fn project_validation_event(&mut self, event: ApplicationEvent) {
-        let snapshot = match event {
-            ApplicationEvent::ValidationComputeProgressEvent(value) => value.snapshot,
-            ApplicationEvent::ValidationComputeChanged(value) => value.snapshot,
+        match event {
+            ApplicationEvent::ValidationValidationProgress(value) => self.install_compute_snapshot(FeatureId::Validate, value.operation),
+            ApplicationEvent::ValidationValidationChanged(value) => {
+                if let Err(error) = self.install_validation_snapshot(value.snapshot) { self.error = Some(error); }
+            }
             _ => unreachable!("generated Validation dispatch supplied another system event"),
-        };
-        self.install_compute_snapshot(FeatureId::Validate, snapshot);
+        }
     }
-
     fn project_validation_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         let snapshot = match reply {
-            ApplicationReply::ValidationStart(snapshot)
-            | ApplicationReply::ValidationStop(snapshot) => snapshot,
+            ApplicationReply::ValidationStart(snapshot) | ApplicationReply::ValidationStop(snapshot)
+            | ApplicationReply::ValidationSelectSample(snapshot) | ApplicationReply::ValidationCloseDetail(snapshot)
+            | ApplicationReply::ValidationSetOverlays(snapshot) => snapshot,
+            ApplicationReply::ValidationDetails(page) => {
+                if self.workflow.validation.as_ref().is_some_and(|snapshot| snapshot.operation.generationfrontier == page.generation) {
+                    self.workflow.validation_details = Some(page);
+                }
+                return;
+            }
             _ => unreachable!("generated Validation dispatch supplied another system reply"),
         };
-        self.install_compute_snapshot(FeatureId::Validate, snapshot);
+        if let Err(error) = self.install_validation_snapshot(snapshot) { self.error = Some(error); }
     }
 }
 
@@ -453,4 +500,86 @@ mod tests {
         assert_eq!(receipt.workflow, FeatureId::Predict);
         assert_eq!(receipt.settings_revision, settings.revision);
     }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::generated::{ValidationApplicationProjection, ValidationChanged, ValidationProgress};
+    #[test]
+    fn validation_keeps_physical_generation_independent_and_rejects_old_detail_pages() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut current = model.workflow.validation.clone().unwrap();
+        current.operation.generationfrontier = 2;
+        current.operation.progress.sequence = 1;
+        current.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 7);
+        current.contentidentity = 11;
+        current.sampleidentities[0].generation = 2;
+        current.sampleavailable[0] = true;
+        model.project_validation_event(ApplicationEvent::ValidationValidationChanged(ValidationChanged { snapshot: current.clone() }));
+        let mut old = current.clone();
+        old.operation.generationfrontier = 1;
+        old.frame.revision = 8;
+        model.project_validation_event(ApplicationEvent::ValidationValidationChanged(ValidationChanged { snapshot: old }));
+        let installed = model.workflow.validation.as_ref().unwrap();
+        assert_eq!(installed.operation.generationfrontier, 2);
+        assert_eq!(installed.frame.revision, 8);
+        let mut progress = current.operation.clone();
+        progress.progress.sequence = 2;
+        model.project_validation_event(ApplicationEvent::ValidationValidationProgress(ValidationProgress { operation: progress }));
+        assert_eq!(model.workflow.validation.as_ref().unwrap().contentidentity, 11);
+        model.project_validation_reply(1, ApplicationReply::ValidationDetails(crate::generated::EvaluationDetailPage {
+            generation: 1, total: 0, offset: 0, rows: vec![],
+        }));
+        assert!(model.workflow.validation_details.is_none());
+        model.project_validation_reply(2, ApplicationReply::ValidationDetails(crate::generated::EvaluationDetailPage {
+            generation: 2, total: 0, offset: 0, rows: vec![],
+        }));
+        assert!(model.workflow.validation_details.is_some());
+    }
+    #[test]
+    fn validation_equal_physical_revisions_require_identical_product_facts() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut baseline = model.workflow.validation.clone().unwrap();
+        baseline.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 9);
+        baseline.operation.generationfrontier = 3;
+        baseline.contentidentity = 17;
+        model.install_validation_snapshot(baseline.clone()).unwrap();
+        let mut progress = baseline.clone();
+        progress.operation.progress.sequence = 1;
+        model.install_validation_snapshot(progress.clone()).unwrap();
+        assert_eq!(model.workflow.validation.as_ref().unwrap().operation.progress.sequence, 1);
+        for mutation in 0..6 {
+            let mut conflict = progress.clone();
+            match mutation {
+                0 => conflict.frame.extent.width += 1,
+                1 => conflict.contentidentity += 1,
+                2 => conflict.detail = !conflict.detail,
+                3 => conflict.sampleidentities[0].datasetindex += 1,
+                4 => conflict.sampleavailable[0] = !conflict.sampleavailable[0],
+                _ => conflict.overlays.groundtruthmasks = !conflict.overlays.groundtruthmasks,
+            }
+            assert!(model.install_validation_snapshot(conflict).is_err());
+            assert_eq!(model.workflow.validation.as_ref().unwrap(), &progress);
+        }
+        let mut older = progress.clone();
+        older.frame.revision -= 1;
+        older.contentidentity += 1;
+        older.overlays.predictionboxes = !older.overlays.predictionboxes;
+        older.operation.progress.sequence = 2;
+        model.install_validation_snapshot(older).unwrap();
+        let installed = model.workflow.validation.as_ref().unwrap();
+        assert_eq!(installed.frame, baseline.frame);
+        assert_eq!(installed.contentidentity, baseline.contentidentity);
+        assert_eq!(installed.overlays, baseline.overlays);
+        assert_eq!(installed.operation.progress.sequence, 2);
+        let mut newer = baseline.clone();
+        newer.frame.revision += 1;
+        newer.operation.generationfrontier -= 1;
+        newer.overlays.predictionboxes = !newer.overlays.predictionboxes;
+        model.install_validation_snapshot(newer.clone()).unwrap();
+        assert_eq!(model.workflow.validation.as_ref().unwrap().overlays, newer.overlays);
+        assert_eq!(model.workflow.validation.as_ref().unwrap().operation.generationfrontier, 3);
+    }
+
 }

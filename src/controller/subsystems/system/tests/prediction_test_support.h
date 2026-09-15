@@ -63,6 +63,8 @@ class PredictionReceiverFault final {
     bool terminal = false;
     std::atomic_bool enabled = false;
     std::atomic_bool partial_draw = false;
+    std::atomic_uint draw_failures_remaining = 0U;
+    std::atomic_size_t draws = 0U;
     PredictRuntime::PreviewRetirement retirement;
     std::weak_ptr<void> decoded;
     [[nodiscard]] static detail::PredictionPreviewPool::TransferOperations Operations();
@@ -85,7 +87,7 @@ class ScopedPredictionReceiverFault final {
 
 class PredictionTransferFault final {
  public:
-    struct Selection { int fail_copy = 0; bool fail_record = false; bool fail_settle = false; };
+    struct Selection { int fail_copy = 0; bool fail_record = false; bool fail_settle = false; bool fail_wait = false; };
     PredictionTransferFault();
     ~PredictionTransferFault();
     PredictionTransferFault(const PredictionTransferFault&) = delete;
@@ -94,6 +96,8 @@ class PredictionTransferFault final {
     void Reset(Selection);
     int copies = 0;
     int settlements = 0;
+    int waits = 0;
+    cudaStream_t waited_stream = nullptr;
     [[nodiscard]] static detail::PredictionPreviewPool::TransferOperations Operations();
  private:
     Selection selection_;
@@ -101,6 +105,7 @@ class PredictionTransferFault final {
     static CUresult Copy(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, std::size_t, CUstream);
     static cudaError_t Record(cudaEvent_t, cudaStream_t);
     static cudaError_t Settle(cudaStream_t);
+    static cudaError_t Wait(cudaStream_t, cudaEvent_t, unsigned);
 };
 
 [[nodiscard]] detail::PredictionPreviewPool::TransferOperations RefusePinnedRegistration();
@@ -137,7 +142,7 @@ class ComputeSequence final {
 class FakeNonvisualComputeRuntime final : public ValidationRuntime, public ExportRuntime {
  public:
     explicit FakeNonvisualComputeRuntime(ComputeScenario scenario) : sequence_(std::move(scenario)) {}
-    contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&) override;
+    ValidationRuntimeResult Run(mmltk::backend::models::rfdetr::ValidateRequest, std::stop_token, const ComputeProgressSink&, const mmltk::backend::models::rfdetr::ValidationDelivery&) override;
     contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token, const ComputeProgressSink&) override;
  private:
     ComputeSequence sequence_;
