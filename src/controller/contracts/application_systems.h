@@ -7,6 +7,7 @@
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/controller/subsystems/system/compute_systems.h"
+#include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/train/training_system.h"

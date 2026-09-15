@@ -8,7 +8,9 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         compute_intent_materializer.h
+        compute_runtime.h
         compute_systems.h
+        predict_system.h
         dataset_system.h
         local_run.h
         model_system.h
@@ -19,6 +21,7 @@ mmltk_register_public_headers(
 mmltk_register_ordinary_sources(
     mmltk_controller_data_compute_systems
     compute_intent_materializer.cpp
+    detail/cuda_runtime_resources.cpp
     dataset_system.cpp
     local_run.cpp
     model_system.cpp
@@ -28,9 +31,11 @@ mmltk_register_ordinary_sources(
 mmltk_register_retained_module_importers(
     mmltk_controller_data_compute_systems
     compute_systems.cpp
+    predict_system.cpp
     detail/prediction_preview.cpp)
 mmltk_register_private_headers(
-    mmltk_controller_data_compute_systems detail/predict_revision.h
+    mmltk_controller_data_compute_systems detail/cuda_runtime_resources.h
+        detail/predict_revision.h
         detail/prediction_playback.h
         detail/prediction_preview.h)
 target_include_directories(mmltk_controller_data_compute_systems PRIVATE ${CMAKE_SOURCE_DIR}/src)

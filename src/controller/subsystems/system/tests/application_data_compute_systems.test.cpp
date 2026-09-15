@@ -44,6 +44,7 @@
 #include "src/controller/services/persistence_storage.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/compute_systems.h"
+#include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/detail/predict_revision.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/subsystems/system/dataset_system.h"

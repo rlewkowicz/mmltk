@@ -415,6 +415,16 @@ struct PredictionReadback final {
     tensor_api::Tensor box_values, label_values, score_values, mask_values, index_values;
 };
 
+void execute_prediction_batch(const PredictRequest& options, PredictionBackend& backend, const tensor_api::Tensor& input,
+    std::size_t batch_size, std::uint32_t width, std::uint32_t height, const PredictionDelivery& delivery,
+    AnnotationBatch& annotations, PredictionReadback& readback) {
+    const bool masks = options.include_masks && backend.has_masks();
+    prepare_annotations(annotations, batch_size, backend.capacity(batch_size, width, height, masks), width, height,
+                        options.device_id, masks, preview_requested(delivery, width, height));
+    backend.Execute(input, annotations);
+    readback.Read(annotations);
+}
+
 struct PredictionSourceStorage final {
     std::array<tensor_api::Tensor, 11U> products;
     std::shared_ptr<void> backend_masks;
@@ -581,6 +591,30 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
     return result;
 }
 
+using DecodedPredictionImage = std::unique_ptr<stbi_uc, decltype(&stbi_image_free)>;
+
+void complete_prediction_record(PredictionRecord& record, std::size_t index, const PredictRequest& options,
+    const PredictionBackend& backend, AnnotationBatch& annotations, PredictionReadback& readback,
+    const PredictionDelivery& delivery, PredictionRunResult& result, std::size_t total,
+    PredictionPixels pixels, std::shared_ptr<void> source = {}, DecodedPredictionImage* decoded_source = nullptr) {
+    record.detections = copy_predictions(annotations, index, options.threshold, readback, backend.artifacts().config.num_classes);
+    for (auto& detection : record.detections) detection.image_id = static_cast<int>(record.image_id);
+    if (delivery.completed) {
+        // Decoded images keep unique ownership until semantics are complete and
+        // pixels are requested. The shared control block is optional preview work.
+        if (decoded_source && delivery.source_pixels) {
+            try {
+                std::shared_ptr<stbi_uc> decoded = std::move(*decoded_source);
+                pixels.rgb8 = decoded.get();
+                source = std::move(decoded);
+            } catch (...) { pixels = {.preview_failure = "Prediction decoded source custody allocation failed"}; }
+        }
+        deliver_prediction(delivery, record, std::move(pixels), annotations, index, readback, std::move(source));
+    }
+    ++result.processed_images;
+    if (delivery.progress) delivery.progress(result.processed_images, total >= result.processed_images ? total : 0U);
+}
+
 [[nodiscard]] PredictionRunResult run_image_prediction(const PredictRequest& options, PredictionBackend& backend,
                                                        const runtime::BorrowedCommandStream command_stream, PredictionRunResult result,
                                                        PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery) {
@@ -603,7 +637,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         int width = 0;
         int height = 0;
         int channels = 0;
-        std::unique_ptr<stbi_uc, decltype(&stbi_image_free)> owned_pixels(stbi_load(source.image_path.c_str(), &width, &height, &channels, 3), &stbi_image_free);
+        DecodedPredictionImage owned_pixels(stbi_load(source.image_path.c_str(), &width, &height, &channels, 3), &stbi_image_free);
         stbi_uc* pixels = owned_pixels.get();
         if (pixels == nullptr || width <= 0 || height <= 0) {
             throw std::runtime_error("failed to decode RF-DETR prediction image: " + source.image_path.string());
@@ -618,32 +652,15 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         device.sub_(mean).div_(deviation);
         if (converted.defined()) converted.copy_(device);
         const auto& normalized = converted.defined() ? converted : device;
-        prepare_annotations(annotations, 1U, backend.capacity(1U, width, height, options.include_masks && backend.has_masks()), static_cast<std::uint32_t>(width),
-                                            static_cast<std::uint32_t>(height), options.device_id, options.include_masks && backend.has_masks(), preview_requested(delivery, width, height));
-        backend.Execute(normalized, annotations);
-        readback.Read(annotations);
+        execute_prediction_batch(options, backend, normalized, 1U, static_cast<std::uint32_t>(width),
+                                 static_cast<std::uint32_t>(height), delivery, annotations, readback);
         PredictionRecord record;
         record.dataset_index = static_cast<std::int64_t>(index);
         record.image_id = source.image_id != 0 ? source.image_id : static_cast<std::int64_t>(index + 1U);
         record.source_name = source.source_name.empty() ? source.image_path.string() : source.source_name;
-        record.detections = copy_predictions(annotations, 0U, options.threshold, readback, backend.artifacts().config.num_classes);
-        for (auto& detection : record.detections) {
-            detection.image_id = static_cast<int>(record.image_id);
-        }
-        if (delivery.completed) {
-            PredictionPixels current;
-            std::shared_ptr<stbi_uc> source_pixels;
-            if (delivery.source_pixels) {
-                try {
-                    source_pixels = std::move(owned_pixels);
-                    current = {.width = static_cast<std::uint32_t>(width), .height = static_cast<std::uint32_t>(height),
-                        .device = options.device_id, .stream = command_stream.native_handle, .rgb8 = source_pixels.get()};
-                } catch (...) { current.preview_failure = "Prediction decoded source custody allocation failed"; }
-            }
-            deliver_prediction(delivery, record, std::move(current), annotations, 0U, readback, std::move(source_pixels));
-        }
-        ++result.processed_images;
-        if (delivery.progress) delivery.progress(result.processed_images, total);
+        complete_prediction_record(record, 0U, options, backend, annotations, readback, delivery, result, total,
+            {.width = static_cast<std::uint32_t>(width), .height = static_cast<std::uint32_t>(height),
+             .device = options.device_id, .stream = command_stream.native_handle}, {}, &owned_pixels);
     }
     result.cancelled = delivery.stop.stop_requested();
     finish_prediction_run(result, started);
@@ -678,16 +695,12 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         at::upsample_bilinear2d_out(normalized, input, {resolution, resolution}, false);
         normalized.sub_(mean).div_(deviation);
         if (converted.defined()) converted.copy_(normalized);
-        prepare_annotations(annotations, 1U, backend.capacity(1U, frame->width, frame->height, options.include_masks && backend.has_masks()), frame->width, frame->height,
-                                            options.device_id, options.include_masks && backend.has_masks(), preview_requested(delivery, frame->width, frame->height));
-        backend.Execute(converted.defined() ? converted : normalized, annotations);
-        readback.Read(annotations);
+        execute_prediction_batch(options, backend, converted.defined() ? converted : normalized, 1U,
+                                 frame->width, frame->height, delivery, annotations, readback);
         PredictionRecord record{.dataset_index = static_cast<std::int64_t>(frame->index), .image_id = static_cast<std::int64_t>(frame->index + 1U),
-                                .source_name = options.video_path.string(), .detections = copy_predictions(annotations, 0U, options.threshold, readback, backend.artifacts().config.num_classes)};
-        for (auto& detection : record.detections) detection.image_id = static_cast<int>(record.image_id);
-        deliver_prediction(delivery, record, {frame->chw, frame->width, frame->height, options.device_id, command_stream.native_handle}, annotations, 0U, readback, source);
-        ++result.processed_images;
-        if (delivery.progress) delivery.progress(result.processed_images, total >= result.processed_images ? total : 0U);
+                                .source_name = options.video_path.string()};
+        complete_prediction_record(record, 0U, options, backend, annotations, readback, delivery, result, total,
+            {frame->chw, frame->width, frame->height, options.device_id, command_stream.native_handle}, source);
     }
     result.cancelled = delivery.stop.stop_requested();
     finish_prediction_run(result, started);
@@ -910,10 +923,8 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
         auto active_batch = batch;
         active_batch.num_images = std::min(batch.num_images, total - result.processed_images);
         auto normalized = preprocessor.Run(active_batch);
-        prepare_annotations(annotations, active_batch.num_images, bound_backend.capacity(active_batch.num_images, loader->image_width(), loader->image_height(), options.include_masks && bound_backend.has_masks()), loader->image_width(), loader->image_height(),
-                                            options.device_id, options.include_masks && bound_backend.has_masks(), preview_requested(delivery, loader->image_width(), loader->image_height()));
-        bound_backend.Execute(normalized, annotations);
-        readback->Read(annotations);
+        execute_prediction_batch(options, bound_backend, normalized, active_batch.num_images, loader->image_width(),
+                                 loader->image_height(), delivery, annotations, *readback);
         for (std::size_t image = 0U; image < active_batch.num_images && !delivery.stop.stop_requested(); ++image) {
             PredictionRecord record;
             record.dataset_index = static_cast<std::int64_t>(batch.image_indices[image]);
@@ -921,16 +932,10 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
             if (dataset_index >= image_ids.size()) { throw std::runtime_error("RF-DETR dataset image index is out of range"); }
             record.image_id = image_ids[dataset_index];
             record.source_name = std::to_string(record.dataset_index);
-            record.detections = copy_predictions(annotations, image, options.threshold, *readback, bound_backend.artifacts().config.num_classes);
-            for (auto& detection : record.detections) {
-                detection.image_id = static_cast<int>(record.image_id);
-            }
-            deliver_prediction(delivery, record, {.chw = batch.device_images + image * loader->image_stride() / sizeof(float),
-                .width = loader->image_width(), .height = loader->image_height(), .device = options.device_id, .stream = execution_stream.native_handle,
-                .stop_source = [](void* owner) { static_cast<DatasetBatchLease*>(owner)->StopWorkers(); }, .source_control = batch_lease.get()},
-                annotations, image, *readback, batch_lease);
-            ++result.processed_images;
-            if (delivery.progress) delivery.progress(result.processed_images, total);
+            complete_prediction_record(record, image, options, bound_backend, annotations, *readback, delivery, result, total,
+                {.chw = batch.device_images + image * loader->image_stride() / sizeof(float),
+                 .width = loader->image_width(), .height = loader->image_height(), .device = options.device_id, .stream = execution_stream.native_handle,
+                 .stop_source = [](void* owner) { static_cast<DatasetBatchLease*>(owner)->StopWorkers(); }, .source_control = batch_lease.get()}, batch_lease);
         }
         batch_lease->Release();
     }

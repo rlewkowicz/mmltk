@@ -9,6 +9,8 @@
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/controller/presentation/visual_document.h"
 #include "src/controller/presentation/visual_runtime.h"
+#include "src/controller/subsystems/system/compute_systems.h"
+#include "src/controller/subsystems/system/predict_system.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 
 namespace mmltk::controller::shell {
