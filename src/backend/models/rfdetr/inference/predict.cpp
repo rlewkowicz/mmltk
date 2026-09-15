@@ -44,6 +44,7 @@ module;
 #include "stb_image.h"
 #include "inference_preprocessor.h"
 #include "prediction_capacity.h"
+#include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "prediction_raw_preparation.h"
 #include "src/backend/media/video/video_file_source.h"
 #include <ATen/ops/upsample_bilinear2d.h>
@@ -653,7 +654,10 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
     runtime::BorrowedCommandStream command_stream, PredictionRunResult result, PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery,
     const std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>& source_retirement) {
     const auto started = std::chrono::steady_clock::now();
-    auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, options.device_id, command_stream.native_handle, delivery.stop, source_retirement);
+    const auto bytes_per_pixel = checked_prediction_extent(3U, sizeof(float), kMaximumPredictionTensorBytes);
+    const mmltk::backend::media::video::VideoFrameCapacity capacity{
+        kMaximumPredictionTensorBytes / bytes_per_pixel};
+    auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, capacity, options.device_id, command_stream.native_handle, delivery.stop, source_retirement);
     if (delivery.begin) delivery.begin(result);
     const auto cuda = tensor_api::TensorOptions().dtype(tensor_api::kFloat).device(tensor_api::kCUDA, options.device_id);
     const auto mean = tensor_api::tensor({0.485F, 0.456F, 0.406F}, cuda).view({1, 3, 1, 1});
