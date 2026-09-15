@@ -72,6 +72,7 @@ mmltk_register_public_headers(
 
 mmltk_register_ordinary_sources(
     mmltk_controller_contracts
+    model_selection.cpp
     annotation_serialization.cpp
     gui_settings_mutation.cpp
     gui_settings_states.cpp

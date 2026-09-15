@@ -20,6 +20,7 @@ struct ComputeIntentMaterializer final {
     using ValidationMaterialization = std::expected<mmltk::backend::models::rfdetr::ValidateRequest, Refusal>;
     using ExportMaterialization = std::expected<mmltk::backend::models::rfdetr::ModelExportRequest, Refusal>;
     using PredictionMaterialization = std::expected<mmltk::backend::models::rfdetr::PredictRequest, Refusal>;
+    // Validated selection settings plus native acquisition parameters.
     struct ModelInput final {
         mmltk::controller::contracts::ModelSelectionKey key{};
         std::string custom_artifact;

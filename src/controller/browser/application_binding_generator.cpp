@@ -122,10 +122,12 @@ void emit_rust_value(std::ostream& output, const mmltk::controller::browser::wir
     return result;
 }
 
-void emit_rust_field_access(std::ostream& output, std::string_view path) {
+void emit_rust_field_access(std::ostream& output, std::string_view path, bool leading_dot = true) {
     while (!path.empty()) {
         const std::size_t separator = path.find('.');
-        output << '.' << rust_identifier(path.substr(0U, separator), false);
+        if (leading_dot) output << '.';
+        leading_dot = true;
+        output << rust_identifier(path.substr(0U, separator), false);
         if (separator == std::string_view::npos) return;
         path.remove_prefix(separator + 1U);
     }
@@ -345,6 +347,8 @@ class BindingEmitter final {
                 << mmltk::controller::presentation::detail::kWorkspaceMetadataByteCapacity << ";\n";
         EmitType<mmltk::controller::contracts::AnnotationPointerTarget>();
         EmitRecordPreflight();
+        EmitType<mmltk::controller::contracts::ModelSettingsProjection>();
+        EmitType<mmltk::controller::contracts::ModelArtifactDialog>();
         EmitMetadata();
         EmitIdentitiesAndApplicationEnums();
         EmitSnapshotDefaults();
@@ -819,47 +823,122 @@ class BindingEmitter final {
         for (const auto& row : field_facts_)
             output_ << row;
         output_ << "];\n";
+        EmitModelSelection();
+    }
+
+    template <class Root, auto Path>
+    static std::string RustMemberPath() {
+        constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Root, Path>();
+        std::ostringstream output;
+        emit_rust_field_access(output, path.view(), false);
+        return std::move(output).str();
+    }
+
+    template <class Relation>
+    void EmitModelKeyFields(const bool declaration) {
+        Relation::key_relation::VisitMembers([&]<class Entry>() {
+            const auto member = RustMemberPath<mmltk::controller::contracts::ModelSelectionKey, Entry::destination>();
+            if (declaration) {
+                symbols_.Reserve("struct ModelSelectionFields", member, "model selection destination " + member);
+                output_ << "pub " << member << ": u64,\n";
+            } else {
+                constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, Entry::source>();
+                output_ << member << ": " << mmltk::controller::browser::application_settings_field_stable_id(path.view()) << ",\n";
+            }
+        });
+    }
+
+    template <class Relation>
+    void EmitModelPredicate(const auto& row) {
+        if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U) output_ << "true";
+        else output_ << "settings." << RustMemberPath<Settings, std::get<0>(Relation::predicate)>()
+                     << " == " << (*row.required_export_build_tensorrt ? "true" : "false");
+    }
+
+    void EmitModelSelection() {
+        using namespace mmltk::controller::contracts;
+        symbols_.Reserve("module", "ModelSelectionFields", "canonical model key settings identities");
+        output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct ModelSelectionFields {\n";
+        EmitModelKeyFields<TrainWeightsModelSelection>(true);
+        output_ << "}\nimpl ModelSelectionFields { pub fn all(&self) -> [u64; "
+                << TrainWeightsModelSelection::key_relation::member_count << "] { [";
+        TrainWeightsModelSelection::key_relation::VisitMembers([&]<class Entry>() {
+            output_ << "self." << RustMemberPath<ModelSelectionKey, Entry::destination>() << ',';
+        });
+        output_ << "] } }\n";
         ReserveGeneratedStruct("ModelArtifactDialogFact", "canonical model artifact dialogs",
-                               {"target", "stable_field_id", "source_field_id", "input_field_id", "preset_field_id", "resolution_field_id",
-                                "class_layout_field_id", "predicate_field_id", "field_path", "title", "filter", "pattern"});
+                               {"target", "stable_field_id", "key_fields", "predicate_field_id", "field_path", "dialog"});
         symbols_.Reserve("module", "MODEL_ARTIFACT_DIALOGS", "canonical model artifact dialogs");
         output_ << "#[derive(Debug, Clone, PartialEq)]\n"
                    "pub struct ModelArtifactDialogFact { pub target: ModelArtifactTarget, "
-                   "pub stable_field_id: u64, pub source_field_id: u64, pub input_field_id: u64, "
-                   "pub preset_field_id: u64, pub resolution_field_id: u64, pub class_layout_field_id: u64, "
-                   "pub predicate_field_id: Option<u64>, "
-                   "pub field_path: &'static str, pub title: &'static str, "
-                   "pub filter: &'static str, pub pattern: &'static str }\n"
+                   "pub stable_field_id: u64, pub key_fields: ModelSelectionFields, "
+                   "pub predicate_field_id: Option<u64>, pub field_path: &'static str, pub dialog: ModelArtifactDialog }\n"
                    "pub static MODEL_ARTIFACT_DIALOGS: &[ModelArtifactDialogFact] = &[\n";
-        mmltk::controller::contracts::ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
+        ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
             constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::artifact>();
             const auto stable_id = mmltk::controller::browser::application_settings_field_stable_id(path.view());
-            constexpr auto source_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::source>();
-            constexpr auto input_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::input>();
-            constexpr auto preset_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::preset>();
-            constexpr auto resolution_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::resolution>();
-            constexpr auto layout_path = mmltk::frameworks::reflection::reflected_member_path<Settings, Relation::class_layout>();
             output_ << "ModelArtifactDialogFact { target: ModelArtifactTarget { stableid: " << stable_id
                     << ", workflow: FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.workflow), true)
                     << ", input: ModelArtifactInputKind::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
-                    << " }, stable_field_id: " << stable_id
-                    << ", source_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(source_path.view())
-                    << ", input_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(input_path.view())
-                    << ", preset_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(preset_path.view())
-                    << ", resolution_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(resolution_path.view())
-                    << ", class_layout_field_id: " << mmltk::controller::browser::application_settings_field_stable_id(layout_path.view())
-                    << ", predicate_field_id: ";
-            if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U) {
-                output_ << "None";
-            } else {
+                    << " }, stable_field_id: " << stable_id << ", key_fields: ModelSelectionFields {";
+            EmitModelKeyFields<Relation>(false);
+            output_ << "}, predicate_field_id: ";
+            if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U) output_ << "None";
+            else {
                 constexpr auto predicate_path =
                     mmltk::frameworks::reflection::reflected_member_path<Settings, std::get<0>(Relation::predicate)>();
                 output_ << "Some(" << mmltk::controller::browser::application_settings_field_stable_id(predicate_path.view()) << ')';
             }
-            output_ << ", field_path: " << std::quoted(path.view()) << ", title: " << std::quoted(row.dialog_title)
-                    << ", filter: " << std::quoted(row.dialog_filter) << ", pattern: " << std::quoted(row.dialog_pattern) << " },\n";
+            output_ << ", field_path: " << std::quoted(path.view()) << ", dialog: ";
+            emit_catalog_value(output_, ModelArtifactDialog{row.dialog_title, row.dialog_filter, row.dialog_pattern});
+            output_ << " },\n";
         });
         output_ << "];\n";
+        symbols_.Reserve("module", "model_dialog_predicate_matches", "canonical model selection predicate");
+        output_ << "pub fn model_dialog_predicate_matches(settings: &GuiSettingsState, dialog: &ModelArtifactDialogFact) -> bool { "
+                   "match dialog.stable_field_id {\n";
+        ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
+            output_ << mmltk::controller::browser::application_settings_field_stable_id(Relation::artifact_field_path.view()) << " => ";
+            EmitModelPredicate<Relation>(row);
+            output_ << ",\n";
+        });
+        output_ << "_ => false } }\n";
+        symbols_.Reserve("module", "project_model_settings", "canonical model selection projection");
+        output_ << "pub fn project_model_settings(settings: &GuiSettingsState, workflow: FeatureId) -> Option<ModelSettingsProjection> {\n"
+                   "let mut result: Option<ModelSettingsProjection> = None;\n";
+        ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& row) {
+            output_ << "if workflow == FeatureId::" << rust_identifier(mmltk::frameworks::reflection::enum_name(row.workflow), true)
+                    << " && ";
+            EmitModelPredicate<Relation>(row);
+            output_ << " {\nif result.is_none() { result = Some(ModelSettingsProjection { key: ModelSelectionKey {\n";
+            output_ << RustMemberPath<ModelSelectionKey, Relation::workflow_destination>() << ": FeatureId::"
+                    << rust_identifier(mmltk::frameworks::reflection::enum_name(Relation::workflow), true) << ",\n";
+            Relation::key_relation::VisitMembers([&]<class Entry>() {
+                output_ << RustMemberPath<ModelSelectionKey, Entry::destination>() << ": settings."
+                        << RustMemberPath<Settings, Entry::source>();
+                if constexpr (std::same_as<typename Entry::transform, ModelSelectionResolutionTransform>) output_ << " as u32";
+                else {
+                    static_assert(std::same_as<typename Entry::transform, ModelSelectionTextTransform> ||
+                                  std::same_as<typename Entry::transform, mmltk::frameworks::reflection::ExactMemberTransform>);
+                    output_ << ".clone()";
+                }
+                output_ << ",\n";
+            });
+            output_ << "}, artifact: String::new(), compatible: false, exportbuildtensorrt: ";
+            if constexpr (std::tuple_size_v<decltype(Relation::predicate)> == 0U) output_ << "false";
+            else output_ << "settings." << RustMemberPath<Settings, std::get<0>(Relation::predicate)>();
+            output_ << " }); }\nif settings." << RustMemberPath<Settings, Relation::input>() << " == ModelArtifactInputKind::"
+                    << rust_identifier(mmltk::frameworks::reflection::enum_name(row.input), true)
+                    << " { let projection = result.as_mut().unwrap();\n";
+            Relation::artifact_relation::VisitMembers([&]<class Entry>() {
+                output_ << "projection." << RustMemberPath<ModelSettingsProjection, Entry::destination>() << " = settings."
+                        << RustMemberPath<Settings, Entry::source>() << ".clone();\n";
+            });
+            output_ << "projection.compatible = match projection.key.source { ModelSelectionSource::Canonical => "
+                    << (row.canonical_allowed ? "true" : "false") << ", ModelSelectionSource::Custom => "
+                    << (row.custom_allowed ? "true" : "false") << " };\n} }\n";
+        });
+        output_ << "result }\n";
     }
 
     void EmitIdentitiesAndApplicationEnums() {

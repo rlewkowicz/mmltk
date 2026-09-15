@@ -118,18 +118,13 @@ fn validate_generated_surfaces() -> io::Result<()> {
     for dialog in schema::MODEL_ARTIFACT_DIALOGS {
         require(
             dialog.target.stableid == dialog.stable_field_id
-                && !dialog.title.is_empty()
-                && !dialog.filter.is_empty()
-                && !dialog.pattern.is_empty()
+                && !dialog.dialog.title.is_empty()
+                && !dialog.dialog.filter.is_empty()
+                && !dialog.dialog.pattern.is_empty()
                 && schema::SETTINGS_LEAVES.iter().any(|leaf| {
                     leaf.stable_field_id == dialog.stable_field_id && leaf.path == dialog.field_path
                 })
-                && [
-                    dialog.source_field_id,
-                    dialog.input_field_id,
-                    dialog.preset_field_id,
-                    dialog.resolution_field_id,
-                ]
+                && dialog.key_fields.all()
                 .into_iter()
                 .chain(dialog.predicate_field_id)
                 .all(|id| settings_ids.contains(&id))
@@ -453,6 +448,29 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
     use mmltk_browser_app::application_codec::{
         FromApplicationValue as _, IntoApplicationValue as _,
     };
+    let model_reference = |correlation| -> Result<_, io::Error> {
+        let Some(ServerRecord::IntentReply(reply)) = records.iter().find(
+            |record| matches!(record, ServerRecord::IntentReply(reply) if reply.correlation == correlation),
+        ) else { return Err(io::Error::other("native model projection pair is missing")); };
+        reply.result.clone().map_err(|_| io::Error::other("native model projection pair is an error"))
+    };
+    let mut model_correlation = 400;
+    for dialog in generated::MODEL_ARTIFACT_DIALOGS {
+        for mode in 0..4 {
+            let settings = generated::GuiSettingsState::from_application_value(model_reference(model_correlation)?)
+                .map_err(io::Error::other)?;
+            let expected_projection = generated::ModelSettingsProjection::from_application_value(model_reference(model_correlation + 1)?)
+                .map_err(io::Error::other)?;
+            model_correlation += 2;
+            let actual = generated::project_model_settings(&settings, dialog.target.workflow)
+                .ok_or_else(|| io::Error::other("generated model draft projection is missing"))?;
+            require(actual == expected_projection, "native and Rust model projections differ")?;
+            require(actual.key.classlayoutpath == "/tmp/fixture-model.classes.json",
+                    "descriptor disappeared from a workflow projection")?;
+            require(actual.key.input == if mode == 2 { generated::ModelArtifactInputKind::None } else { dialog.target.input },
+                    "draft input meaning changed")?;
+        }
+    }
     let expected = mmltk_browser_app::generated::AnnotationSnapshot::from_application_value(
         reference
             .result

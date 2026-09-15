@@ -267,7 +267,7 @@ impl ApplicationModel {
         }
         self.dialog_context = Some(DialogContext {
             target: target.clone(),
-            title: dialog.title,
+            title: dialog.dialog.title.as_ref(),
         });
         Ok(())
     }

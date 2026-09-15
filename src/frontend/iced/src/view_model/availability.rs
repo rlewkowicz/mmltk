@@ -1,4 +1,4 @@
-use super::model_selection::effective_model_selection;
+use super::model_selection::model_settings_projection;
 use super::*;
 
 impl ApplicationModel {
@@ -54,7 +54,7 @@ impl ApplicationModel {
         {
             return false;
         }
-        effective_model_selection(settings, page).is_some_and(|effective| effective.can_prepare())
+        model_settings_projection(settings, page).is_some_and(|effective| effective.can_prepare())
     }
 
     pub fn model_stop_available(&self) -> bool {
@@ -106,7 +106,7 @@ impl ApplicationModel {
             || self.has_pending(ApplicationIntentEndpoint::SettingsReset)
         { return false; }
         if orchestrated {
-            if !effective_model_selection(settings, page).is_some_and(|selection| selection.can_prepare()) { return false; }
+            if !model_settings_projection(settings, page).is_some_and(|selection| selection.can_prepare()) { return false; }
         } else if self.native_settings_unsettled() || self.model_request_pending() || !self.model_selection_matches(settings, page) {
             return false;
         }

@@ -2,6 +2,8 @@
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/tests/annotation_wire_fixture.h"
+#include "src/controller/contracts/default_state.h"
+#include "src/controller/contracts/model_selection.h"
 
 #include <algorithm>
 #include <array>
@@ -155,6 +157,30 @@ int main(const int argument_count, char* const* const arguments) {
                 .receipt = {.kind = Kind, .sequence = 2U, .read_generation = Policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
         }
     });
+    // Native settings/projection pairs exercise every relation row through the
+    // independent named codec as well as the generated direct Rust projection.
+    std::uint64_t model_correlation = 400U;
+    bool model_projections_valid = true;
+    contracts::ModelSelectionRelation::VisitRows([&]<class Row>(const auto& compatibility) {
+        for (unsigned mode = 0U; mode != 4U; ++mode) {
+            auto settings = contracts::default_gui_settings_state();
+            Row::source(settings) = mode == 1U ? contracts::ModelSelectionSource::Canonical : contracts::ModelSelectionSource::Custom;
+            Row::input(settings) = mode == 2U ? contracts::ModelArtifactInputKind::None : compatibility.input;
+            Row::artifact(settings) = "/tmp/fixture-model";
+            Row::class_layout(settings) = "/tmp/fixture-model.classes.json";
+            if constexpr (std::tuple_size_v<decltype(Row::predicate)> != 0U)
+                std::get<0>(Row::predicate)(settings) = mode == 3U ? !*compatibility.required_export_build_tensorrt
+                                                                 : *compatibility.required_export_build_tensorrt;
+            const auto projection = contracts::model_settings_projection(settings, compatibility.workflow);
+            if (!projection) { model_projections_valid = false; return; }
+            auto encoded_settings = mmltk::frameworks::serialization::reflected_value(settings);
+            auto encoded_projection = mmltk::frameworks::serialization::reflected_value(*projection);
+            if (!encoded_settings || !encoded_projection) { model_projections_valid = false; return; }
+            records.emplace_back(IntentReply{.correlation = model_correlation++, .result = std::move(*encoded_settings)});
+            records.emplace_back(IntentReply{.correlation = model_correlation++, .result = std::move(*encoded_projection)});
+        }
+    });
+    if (!model_projections_valid) return EXIT_FAILURE;
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
         complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {

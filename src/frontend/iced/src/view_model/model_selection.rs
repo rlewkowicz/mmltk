@@ -1,19 +1,16 @@
 use super::*;
-use crate::generated::{ModelArtifactDialogFact, ModelArtifactInputKind, SettingsFieldValue};
+use crate::generated::ModelArtifactDialogFact;
+#[cfg(test)]
+use crate::generated::{ModelArtifactInputKind, SettingsFieldValue};
 
 #[derive(Clone)]
 pub(crate) struct ModelSettingsProjection {
     pub(crate) fields: &'static ModelArtifactDialogFact,
     pub(crate) artifact_field: Option<&'static ModelArtifactDialogFact>,
-    pub(crate) source: ModelSelectionSource,
-    pub(crate) input: ModelArtifactInputKind,
-    pub(crate) export_build_tensorrt: bool,
-    pub(crate) preset: String,
-    pub(crate) resolution: i32,
-    pub(crate) artifact: String,
-    pub(crate) class_layout_path: String,
+    pub(crate) selection: crate::generated::ModelSettingsProjection,
 }
 
+#[cfg(test)]
 fn compatibility_for_dialog(
     dialog: &ModelArtifactDialogFact,
 ) -> Option<&'static crate::generated::ModelSelectionCompatibility> {
@@ -26,145 +23,32 @@ fn compatibility_for_dialog(
         })
 }
 
-fn read_field(
-    settings: &GuiSettingsState,
-    stable_id: u64,
-) -> Option<crate::generated::SettingsFieldValue> {
-    crate::generated::read_settings_field(settings, stable_id).ok()
-}
-
-fn predicate_matches(settings: &GuiSettingsState, dialog: &ModelArtifactDialogFact) -> bool {
-    match (
-        dialog.predicate_field_id,
-        compatibility_for_dialog(dialog).and_then(|row| row.requiredexportbuildtensorrt),
-    ) {
-        (None, None) => true,
-        (Some(stable_id), Some(required)) => {
-            read_field(settings, stable_id) == Some(SettingsFieldValue::Bool(required))
-        }
-        _ => false,
-    }
-}
-
 pub(crate) fn model_settings_projection(
     settings: &GuiSettingsState,
     workflow: FeatureId,
 ) -> Option<ModelSettingsProjection> {
-    let fields = crate::generated::MODEL_ARTIFACT_DIALOGS
-        .iter()
-        .find(|dialog| dialog.target.workflow == workflow && predicate_matches(settings, dialog))?;
-    let SettingsFieldValue::ModelSelectionSource(source) =
-        read_field(settings, fields.source_field_id)?
-    else {
-        return None;
-    };
-    let SettingsFieldValue::ModelArtifactInputKind(input) =
-        read_field(settings, fields.input_field_id)?
-    else {
-        return None;
-    };
-    let SettingsFieldValue::String(preset) = read_field(settings, fields.preset_field_id)? else {
-        return None;
-    };
-    let SettingsFieldValue::I32(resolution) = read_field(settings, fields.resolution_field_id)?
-    else {
-        return None;
-    };
-    let export_build_tensorrt = match fields.predicate_field_id {
-        Some(stable_id) => {
-            let SettingsFieldValue::Bool(value) = read_field(settings, stable_id)? else {
-                return None;
-            };
-            value
-        }
-        None => false,
-    };
-    let artifact_field = crate::generated::MODEL_ARTIFACT_DIALOGS
-        .iter()
-        .find(|dialog| {
-            dialog.target.workflow == workflow
-                && dialog.target.input == input
-                && predicate_matches(settings, dialog)
-        });
-    let artifact = artifact_field
-        .and_then(|dialog| read_field(settings, dialog.stable_field_id))
-        .and_then(|value| match value {
-            SettingsFieldValue::String(path) => Some(path),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let SettingsFieldValue::String(class_layout_path) = read_field(settings, fields.class_layout_field_id)? else { return None; };
-    Some(ModelSettingsProjection {
-        fields,
-        artifact_field,
-        source,
-        input,
-        export_build_tensorrt,
-        preset,
-        resolution,
-        artifact,
-        class_layout_path,
-    })
+    let selection = crate::generated::project_model_settings(settings, workflow)?;
+    let matching = || crate::generated::MODEL_ARTIFACT_DIALOGS.iter().filter(|dialog| {
+        dialog.target.workflow == workflow
+            && crate::generated::model_dialog_predicate_matches(settings, dialog)
+    });
+    let fields = matching().next()?;
+    let artifact_field = matching().find(|dialog| dialog.target.input == selection.key.input);
+    Some(ModelSettingsProjection { fields, artifact_field, selection })
 }
 
-#[derive(Clone)]
-pub(super) struct EffectiveModelSelection {
-    pub(super) workflow: FeatureId,
-    pub(super) source: ModelSelectionSource,
-    pub(super) input: ModelArtifactInputKind,
-    pub(super) export_build_tensorrt: bool,
-    pub(super) preset: String,
-    pub(super) resolution: u32,
-    pub(super) artifact: String,
-    pub(super) class_layout_path: String,
-}
-
-impl EffectiveModelSelection {
-    pub(super) fn can_prepare(self) -> bool {
-        crate::generated::MODEL_SELECTION_COMPATIBILITY_CATALOG
-            .iter()
-            .any(|row| {
-                row.workflow == self.workflow
-                    && row.input == self.input
-                    && row
-                        .requiredexportbuildtensorrt
-                        .is_none_or(|required| required == self.export_build_tensorrt)
-                    && match self.source {
-                        ModelSelectionSource::Canonical => row.canonicalallowed,
-                        ModelSelectionSource::Custom => {
-                            row.customallowed && !self.artifact.is_empty()
-                        }
-                    }
-            })
+impl ModelSettingsProjection {
+    pub(super) fn can_prepare(&self) -> bool {
+        self.selection.compatible
+            && (self.selection.key.source == ModelSelectionSource::Canonical
+                || !self.selection.artifact.is_empty())
     }
 
-    pub(super) fn matches(self, selection: &ModelSelection) -> bool {
-        selection.key.workflow == self.workflow
-            && selection.key.source == self.source
-            && selection.key.input == self.input
-            && selection.key.preset == self.preset
-            && selection.key.resolution == self.resolution
-            && selection.key.classlayoutpath == self.class_layout_path
-            && (self.source == ModelSelectionSource::Canonical
-                || selection.artifact == self.artifact)
+    pub(super) fn matches(&self, selection: &ModelSelection) -> bool {
+        selection.key == self.selection.key
+            && (self.selection.key.source == ModelSelectionSource::Canonical
+                || selection.artifact == self.selection.artifact)
     }
-}
-
-pub(super) fn effective_model_selection(
-    settings: &GuiSettingsState,
-    page: FeatureId,
-) -> Option<EffectiveModelSelection> {
-    let projection = model_settings_projection(settings, page)?;
-    Some(EffectiveModelSelection {
-        workflow: page,
-        source: projection.source,
-        input: projection.input,
-        export_build_tensorrt: projection.export_build_tensorrt,
-        preset: projection.preset,
-        resolution: projection.resolution as u32,
-        artifact: projection.artifact,
-        class_layout_path: projection.class_layout_path,
-    })
 }
 
 impl ApplicationModel {
@@ -179,7 +63,7 @@ impl ApplicationModel {
         else {
             return false;
         };
-        effective_model_selection(settings, page)
+        model_settings_projection(settings, page)
             .is_some_and(|effective| effective.matches(selection))
     }
 }
@@ -301,7 +185,7 @@ mod tests {
             .expect("Settings snapshot")
             .settingsstate;
         assert!(
-            !effective_model_selection(&settings, FeatureId::Train)
+            !model_settings_projection(&settings, FeatureId::Train)
                 .expect("Train selection")
                 .can_prepare()
         );
@@ -314,7 +198,7 @@ mod tests {
             }
             write_field(
                 &mut settings,
-                dialog.input_field_id,
+                dialog.key_fields.input,
                 SettingsFieldValue::ModelArtifactInputKind(row.input),
             );
             write_field(
@@ -328,11 +212,11 @@ mod tests {
             ] {
                 write_field(
                     &mut settings,
-                    dialog.source_field_id,
+                    dialog.key_fields.source,
                     SettingsFieldValue::ModelSelectionSource(source),
                 );
                 assert_eq!(
-                    effective_model_selection(&settings, row.workflow)
+                    model_settings_projection(&settings, row.workflow)
                         .expect("generated model workflow")
                         .can_prepare(),
                     allowed
@@ -341,7 +225,7 @@ mod tests {
             if let Some(predicate) = dialog.predicate_field_id {
                 write_field(&mut settings, predicate, SettingsFieldValue::Bool(!build));
                 assert!(
-                    !effective_model_selection(&settings, FeatureId::Export)
+                    !model_settings_projection(&settings, FeatureId::Export)
                         .expect("Export selection")
                         .can_prepare()
                 );
@@ -350,8 +234,52 @@ mod tests {
     }
 
     #[test]
+    fn descriptors_and_partial_drafts_keep_complete_keys_on_every_workflow() {
+        let mut model = bootstrapped();
+        let mut settings = model.settings_snapshot.as_ref().unwrap().settingsstate.clone();
+        for dialog in crate::generated::MODEL_ARTIFACT_DIALOGS {
+            let row = compatibility_for_dialog(dialog).unwrap();
+            if let Some(predicate) = dialog.predicate_field_id {
+                write_field(&mut settings, predicate, SettingsFieldValue::Bool(row.requiredexportbuildtensorrt.unwrap()));
+            }
+            write_field(&mut settings, dialog.key_fields.input, SettingsFieldValue::ModelArtifactInputKind(row.input));
+            write_field(&mut settings, dialog.key_fields.source, SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Custom));
+            write_field(&mut settings, dialog.stable_field_id, SettingsFieldValue::String("/tmp/custom-model".into()));
+            write_field(&mut settings, dialog.key_fields.classlayoutpath, SettingsFieldValue::String("/tmp/first.classes.json".into()));
+            let accepted = accepted_model_for(&model, &settings, row.workflow);
+            assert_eq!(accepted.selection.key.classlayoutpath, "/tmp/first.classes.json");
+            model.model_snapshot = Some(accepted);
+            assert!(model.model_selection_matches(&settings, row.workflow));
+            write_field(&mut settings, dialog.key_fields.classlayoutpath, SettingsFieldValue::String("/tmp/second.classes.json".into()));
+            assert!(!model.model_selection_matches(&settings, row.workflow));
+            if row.canonicalallowed {
+                write_field(&mut settings, dialog.key_fields.source, SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Canonical));
+                model.model_snapshot = Some(accepted_model_for(&model, &settings, row.workflow));
+                write_field(&mut settings, dialog.stable_field_id, SettingsFieldValue::String("/tmp/unused-custom-model".into()));
+                assert!(model.model_selection_matches(&settings, row.workflow));
+            }
+            write_field(&mut settings, dialog.key_fields.input, SettingsFieldValue::ModelArtifactInputKind(ModelArtifactInputKind::None));
+            let partial = model_settings_projection(&settings, row.workflow).unwrap();
+            assert_eq!(partial.selection.key.input, ModelArtifactInputKind::None);
+            assert_eq!(partial.selection.key.classlayoutpath, "/tmp/second.classes.json");
+            assert!(partial.selection.artifact.is_empty());
+            assert!(partial.artifact_field.is_none());
+            assert!(!partial.can_prepare());
+        }
+        // Preserve a raw incomplete draft, including the existing signed cast.
+        settings.workflows.train.request.resolution = -1;
+        settings.workflows.train.request.presetname.clear();
+        let partial = model_settings_projection(&settings, FeatureId::Train).unwrap();
+        assert_eq!(partial.selection.key.resolution, u32::MAX);
+        assert!(partial.selection.key.preset.is_empty());
+        assert!(!partial.can_prepare());
+    }
+
+    #[test]
     fn model_event_before_reply_and_stale_reply_keep_newest_selection() {
         let mut model = bootstrapped();
+        model.settings_snapshot.as_mut().unwrap().settingsstate.workflows.train.request.classlayoutpath =
+            "/tmp/event.classes.json".into();
         let settings = model
             .settings_snapshot
             .as_ref()
@@ -363,7 +291,7 @@ mod tests {
             .model_selection_receipt(FeatureId::Train)
             .unwrap();
         let correlation = model.begin_model_select_intent(receipt).unwrap();
-        let accepted = accepted_train_model(&model);
+        let accepted = accepted_model_for(&model, &settings, FeatureId::Train);
         let mut newer = accepted.clone();
         newer.generation += 1;
         model.reduce_event(ApplicationEvent::ModelModelChanged(
@@ -419,12 +347,12 @@ mod tests {
             .unwrap();
         write_field(
             &mut settings,
-            train.source_field_id,
+            train.key_fields.source,
             SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Custom),
         );
         write_field(
             &mut settings,
-            train.input_field_id,
+            train.key_fields.input,
             SettingsFieldValue::ModelArtifactInputKind(train.target.input),
         );
         write_field(
@@ -453,12 +381,12 @@ mod tests {
             .unwrap();
         write_field(
             &mut settings,
-            validate.source_field_id,
+            validate.key_fields.source,
             SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Custom),
         );
         write_field(
             &mut settings,
-            validate.input_field_id,
+            validate.key_fields.input,
             SettingsFieldValue::ModelArtifactInputKind(validate.target.input),
         );
         write_field(
@@ -480,16 +408,16 @@ mod tests {
             .unwrap();
         write_field(
             &mut settings,
-            canonical.source_field_id,
+            canonical.key_fields.source,
             SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Canonical),
         );
         write_field(
             &mut settings,
-            canonical.input_field_id,
+            canonical.key_fields.input,
             SettingsFieldValue::ModelArtifactInputKind(canonical.target.input),
         );
         assert!(
-            effective_model_selection(&settings, FeatureId::Validate)
+            model_settings_projection(&settings, FeatureId::Validate)
                 .unwrap()
                 .can_prepare()
         );

@@ -1209,6 +1209,24 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
     std::size_t row_index = 0U;
     contracts::ModelSelectionRelation::VisitRows([&]<class Relation>(const auto& compatibility) {
         const auto typed_path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Relation::artifact>();
+        STATIC_REQUIRE(Relation::valid());
+        std::size_t projected_fields = 0U;
+        Relation::key_relation::VisitMembers([&]<class Entry>() {
+            constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Entry::source>();
+            constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<contracts::ModelSelectionKey, Entry::destination>();
+            std::size_t matches = 0U;
+            ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitSettingsLeaves<contracts::GuiSettingsState>(
+                [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+                    if (field.path == source.view()) {
+                        ++matches;
+                        CHECK(field.stable_id == application_settings_field_stable_id(source.view()));
+                    }
+                });
+            CHECK(matches == 1U);
+            CHECK_FALSE(destination.view().empty());
+            ++projected_fields;
+        });
+        CHECK(projected_fields + 1U == Relation::key_field_count);
         REQUIRE(row_index < contracts::kModelSelectionCompatibility.size());
         CHECK(typed_path.view() == compatibility.artifact_field_path);
         CHECK(std::ranges::count(contracts::kModelSelectionCompatibility, compatibility) == 1);

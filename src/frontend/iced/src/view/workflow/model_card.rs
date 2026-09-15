@@ -82,9 +82,9 @@ impl Component {
                 let projection = projection(draft, self.workflow)?;
                 let input = compatible_input(
                     self.workflow,
-                    projection.export_build_tensorrt,
+                    projection.selection.exportbuildtensorrt,
                     ModelSelectionSource::Canonical,
-                    projection.input,
+                    projection.selection.key.input,
                 )?;
                 let resolution = preset.resolution as i32;
                 let name = preset.presetname.to_string();
@@ -92,21 +92,21 @@ impl Component {
                     EditCadence::Debounced,
                     [
                         (
-                            projection.fields.source_field_id,
+                            projection.fields.key_fields.source,
                             crate::generated::SettingsFieldValue::ModelSelectionSource(
                                 ModelSelectionSource::Canonical,
                             ),
                         ),
                         (
-                            projection.fields.input_field_id,
+                            projection.fields.key_fields.input,
                             crate::generated::SettingsFieldValue::ModelArtifactInputKind(input),
                         ),
                         (
-                            projection.fields.resolution_field_id,
+                            projection.fields.key_fields.resolution,
                             crate::generated::SettingsFieldValue::I32(resolution),
                         ),
                         (
-                            projection.fields.preset_field_id,
+                            projection.fields.key_fields.preset,
                             crate::generated::SettingsFieldValue::String(name),
                         ),
                     ],
@@ -121,20 +121,20 @@ impl Component {
                 let projection = projection(draft, self.workflow)?;
                 let input = compatible_input(
                     self.workflow,
-                    projection.export_build_tensorrt,
+                    projection.selection.exportbuildtensorrt,
                     value,
-                    projection.input,
+                    projection.selection.key.input,
                 )?;
-                let schedule = if input != projection.input {
+                let schedule = if input != projection.selection.key.input {
                     settings.edit_fields(
                         EditCadence::Debounced,
                         [
                             (
-                                projection.fields.input_field_id,
+                                projection.fields.key_fields.input,
                                 crate::generated::SettingsFieldValue::ModelArtifactInputKind(input),
                             ),
                             (
-                                projection.fields.source_field_id,
+                                projection.fields.key_fields.source,
                                 crate::generated::SettingsFieldValue::ModelSelectionSource(value),
                             ),
                         ],
@@ -143,7 +143,7 @@ impl Component {
                     settings.edit_fields(
                         EditCadence::Debounced,
                         [(
-                            projection.fields.source_field_id,
+                            projection.fields.key_fields.source,
                             crate::generated::SettingsFieldValue::ModelSelectionSource(value),
                         )],
                     )?
@@ -156,8 +156,8 @@ impl Component {
                     .as_ref()
                     .ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, self.workflow)?;
-                if !compatibility(self.workflow, projection.export_build_tensorrt)
-                    .any(|row| row.input == value && source_allowed(row, projection.source))
+                if !compatibility(self.workflow, projection.selection.exportbuildtensorrt)
+                    .any(|row| row.input == value && source_allowed(row, projection.selection.key.source))
                 {
                     return Err(
                         "Generated catalog rejects this model input for the selected source."
@@ -167,7 +167,7 @@ impl Component {
                 Outcome::SettingsEdited(settings.edit_fields(
                     EditCadence::Debounced,
                     [(
-                        projection.fields.input_field_id,
+                        projection.fields.key_fields.input,
                         crate::generated::SettingsFieldValue::ModelArtifactInputKind(value),
                     )],
                 )?)
@@ -176,14 +176,14 @@ impl Component {
                 let draft = settings.draft.as_ref().ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, self.workflow)?;
                 Outcome::SettingsEdited(settings.edit_fields(EditCadence::Debounced, [(
-                    projection.fields.class_layout_field_id, crate::generated::SettingsFieldValue::String(value)
+                    projection.fields.key_fields.classlayoutpath, crate::generated::SettingsFieldValue::String(value)
                 )])?)
             }
             Message::BrowseClassLayout => {
                 let draft = settings.draft.as_ref().ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, self.workflow)?;
                 Outcome::BrowseRequested(crate::generated::FileDialogTarget::SettingsFieldTarget(
-                    crate::generated::SettingsFieldTarget { stableid: projection.fields.class_layout_field_id }
+                    crate::generated::SettingsFieldTarget { stableid: projection.fields.key_fields.classlayoutpath }
                 ))
             }
             Message::BrowseRequested => {
@@ -211,13 +211,13 @@ impl Component {
                     EditCadence::Debounced,
                     [
                         (
-                            dialog.source_field_id,
+                            dialog.key_fields.source,
                             crate::generated::SettingsFieldValue::ModelSelectionSource(
                                 ModelSelectionSource::Custom,
                             ),
                         ),
                         (
-                            dialog.input_field_id,
+                            dialog.key_fields.input,
                             crate::generated::SettingsFieldValue::ModelArtifactInputKind(row.input),
                         ),
                         (
@@ -244,23 +244,23 @@ impl Component {
                 let projection = projection(draft, FeatureId::Export)?;
                 let input = compatibility(FeatureId::Export, value)
                     .find(|row| {
-                        row.input == projection.input && source_allowed(row, projection.source)
+                        row.input == projection.selection.key.input && source_allowed(row, projection.selection.key.source)
                     })
                     .or_else(|| {
                         compatibility(FeatureId::Export, value)
-                            .find(|row| source_allowed(row, projection.source))
+                            .find(|row| source_allowed(row, projection.selection.key.source))
                     })
                     .ok_or_else(|| "Generated Export compatibility row is unavailable.".to_owned())?
                     .input;
                 let predicate_field_id = projection.fields.predicate_field_id.ok_or_else(|| {
                     "Generated Export predicate identity is unavailable.".to_owned()
                 })?;
-                let schedule = if input != projection.input {
+                let schedule = if input != projection.selection.key.input {
                     settings.edit_fields(
                         EditCadence::Debounced,
                         [
                             (
-                                projection.fields.input_field_id,
+                                projection.fields.key_fields.input,
                                 crate::generated::SettingsFieldValue::ModelArtifactInputKind(input),
                             ),
                             (
@@ -334,7 +334,7 @@ impl<'a> State<'a> {
             .and_then(|value| custom_compatible_row(value).ok());
         let source = projection
             .as_ref()
-            .map_or(ModelSelectionSource::Canonical, |value| value.source);
+            .map_or(ModelSelectionSource::Canonical, |value| value.selection.key.source);
         let input = projection.as_ref().map_or_else(
             || {
                 if workflow == FeatureId::Export {
@@ -347,21 +347,21 @@ impl<'a> State<'a> {
             },
             |value| {
                 train_custom_row
-                    .filter(|_| value.input == ModelArtifactInputKind::None)
-                    .map_or(value.input, |row| row.input)
+                    .filter(|_| value.selection.key.input == ModelArtifactInputKind::None)
+                    .map_or(value.selection.key.input, |row| row.input)
             },
         );
         let build_tensorrt = projection
             .as_ref()
-            .is_some_and(|value| value.export_build_tensorrt);
-        let preset = projection.as_ref().map(|value| value.preset.clone());
+            .is_some_and(|value| value.selection.exportbuildtensorrt);
+        let preset = projection.as_ref().map(|value| value.selection.key.preset.clone());
         let artifact_field_id = projection
             .as_ref()
             .and_then(|value| value.artifact_field)
             .or_else(|| train_custom_row.and_then(|row| dialog_for_row(row).ok()))
             .map_or(0, |dialog| dialog.stable_field_id);
-        let class_layout_path = projection.as_ref().map_or_else(String::new, |value| value.class_layout_path.clone());
-        let artifact = projection.map_or_else(String::new, |value| value.artifact);
+        let class_layout_path = projection.as_ref().map_or_else(String::new, |value| value.selection.key.classlayoutpath.clone());
+        let artifact = projection.map_or_else(String::new, |value| value.selection.artifact);
         Self {
             workflow,
             preset,
@@ -430,12 +430,12 @@ fn custom_compatible_row(
     projection: &crate::view_model::ModelSettingsProjection,
 ) -> Result<&'static crate::generated::ModelSelectionCompatibility, String> {
     let workflow = projection.fields.target.workflow;
-    compatibility(workflow, projection.export_build_tensorrt)
-        .find(|row| row.input == projection.input && row.customallowed)
+    compatibility(workflow, projection.selection.exportbuildtensorrt)
+        .find(|row| row.input == projection.selection.key.input && row.customallowed)
         .or_else(|| {
             (workflow == FeatureId::Train)
                 .then(|| {
-                    compatibility(workflow, projection.export_build_tensorrt)
+                    compatibility(workflow, projection.selection.exportbuildtensorrt)
                         .find(|row| row.customallowed)
                 })
                 .flatten()
@@ -862,9 +862,9 @@ mod tests {
             )
             .unwrap();
         let selected = projection(settings.draft.as_ref().unwrap(), FeatureId::Train).unwrap();
-        assert_eq!(selected.source, ModelSelectionSource::Custom);
-        assert_eq!(selected.input, ModelArtifactInputKind::Weights);
-        assert_eq!(selected.artifact, "/tmp/custom.pth");
+        assert_eq!(selected.selection.key.source, ModelSelectionSource::Custom);
+        assert_eq!(selected.selection.key.input, ModelArtifactInputKind::Weights);
+        assert_eq!(selected.selection.artifact, "/tmp/custom.pth");
     }
 
     #[test]
@@ -938,7 +938,7 @@ mod tests {
                     .unwrap();
                 let draft = settings.draft.as_ref().unwrap();
                 let actual = projection(draft, row.workflow).unwrap();
-                assert_eq!((actual.source, actual.input), (source, row.input));
+                assert_eq!((actual.selection.key.source, actual.selection.key.input), (source, row.input));
             }
         }
     }
@@ -954,8 +954,8 @@ mod tests {
             .iter()
             .copied()
             .filter(|input| {
-                !compatibility(FeatureId::Train, selected.export_build_tensorrt)
-                    .any(|row| row.input == *input && source_allowed(row, selected.source))
+                !compatibility(FeatureId::Train, selected.selection.exportbuildtensorrt)
+                    .any(|row| row.input == *input && source_allowed(row, selected.selection.key.source))
             })
             .collect::<Vec<_>>();
         assert!(rejected.contains(&ModelArtifactInputKind::None));
@@ -1011,10 +1011,10 @@ mod tests {
                 .unwrap();
             let draft = settings.draft.as_ref().unwrap();
             let selected = projection(draft, FeatureId::Export).unwrap();
-            assert_eq!(selected.export_build_tensorrt, build);
+            assert_eq!(selected.selection.exportbuildtensorrt, build);
             assert!(
                 compatibility(FeatureId::Export, build)
-                    .any(|row| row.input == selected.input && source_allowed(row, selected.source))
+                    .any(|row| row.input == selected.selection.key.input && source_allowed(row, selected.selection.key.source))
             );
         }
     }
@@ -1038,13 +1038,13 @@ mod tests {
             }
             crate::generated::apply_settings_field(
                 draft,
-                fields.input_field_id,
+                fields.key_fields.input,
                 crate::generated::SettingsFieldValue::ModelArtifactInputKind(row.input),
             )
             .unwrap();
             crate::generated::apply_settings_field(
                 draft,
-                fields.source_field_id,
+                fields.key_fields.source,
                 crate::generated::SettingsFieldValue::ModelSelectionSource(source),
             )
             .unwrap();
@@ -1068,9 +1068,9 @@ mod tests {
                 .unwrap();
             let selected =
                 projection(settings.draft.as_ref().unwrap(), canonical.workflow).unwrap();
-            assert_eq!(selected.source, ModelSelectionSource::Custom);
-            assert_eq!(selected.input, canonical.input);
-            assert_eq!(selected.artifact, "/tmp/model");
+            assert_eq!(selected.selection.key.source, ModelSelectionSource::Custom);
+            assert_eq!(selected.selection.key.input, canonical.input);
+            assert_eq!(selected.selection.artifact, "/tmp/model");
         } else {
             let before = settings.draft.clone();
             let queued = settings.queued_len();
@@ -1098,7 +1098,7 @@ mod tests {
         let input_field_id = projection(settings.draft.as_ref().unwrap(), custom.workflow)
             .unwrap()
             .fields
-            .input_field_id;
+            .key_fields.input;
         crate::generated::apply_settings_field(
             settings.draft.as_mut().unwrap(),
             input_field_id,

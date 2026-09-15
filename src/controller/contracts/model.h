@@ -12,6 +12,7 @@
 
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/controller/contracts/model_selection.h"
+#include "src/controller/contracts/model_selection_types.h"
 #include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/controller/contracts/terminal_presentation.h"
 
@@ -20,7 +21,6 @@
 namespace mmltk::controller::contracts {
 
 inline constexpr std::size_t kModelUiStateByteBudget = 16384U;
-inline constexpr std::size_t kModelArtifactCapacity = 4096U;
 inline constexpr std::size_t kModelDetailCapacity = 4096U;
 
 [[nodiscard]] inline std::string bounded_model_detail(const std::string_view value) {
@@ -45,21 +45,6 @@ struct ModelProgress final {
                (total_known || total == 0U);
     }
     bool operator==(const ModelProgress&) const = default;
-};
-
-struct ModelSelectionKey final {
-    FeatureId workflow = FeatureId::Train;
-    ModelSelectionSource source = ModelSelectionSource::Canonical;
-    ModelArtifactInputKind input = ModelArtifactInputKind::None;
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string preset;
-    std::uint32_t resolution = 0U;
-    [[= mmltk::frameworks::reflection::MaxBytes{kModelArtifactCapacity}]] std::string class_layout_path;
-    [[nodiscard]] bool valid() const noexcept {
-        return model_selection_compatible(workflow, source, input) && !preset.empty() &&
-               preset.size() <= mmltk::frameworks::reflection::kMaximumNameBytes && resolution != 0U &&
-               class_layout_path.size() <= kModelArtifactCapacity && class_layout_path.find('\0') == std::string::npos;
-    }
-    bool operator==(const ModelSelectionKey&) const = default;
 };
 
 struct[[= reflection::feature_scope(FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export)]]
@@ -108,7 +93,6 @@ struct ModelUiState final {
 };
 
 MMLTK_REFLECT_FIELDS(ModelSelection)
-MMLTK_REFLECT_FIELDS(ModelSelectionKey)
 MMLTK_REFLECT_FIELDS(ModelSelectionRequest)
 MMLTK_REFLECT_FIELDS(ModelProgress)
 MMLTK_REFLECT_FIELDS(ModelSelectionResult)

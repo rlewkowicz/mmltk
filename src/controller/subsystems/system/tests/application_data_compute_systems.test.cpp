@@ -181,14 +181,11 @@ void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesyst
 
 [[nodiscard]] contracts::ModelSelection export_model_selection(const contracts::GuiSettingsState& settings,
                                                                const contracts::ModelArtifactInputKind input, std::string artifact) {
-    return {
-        .key = {.workflow = contracts::FeatureId::Export,
-                .source = contracts::ModelSelectionSource::Custom,
-                .input = input,
-                .preset = settings.workflows.export_state.preset_name,
-                .resolution = static_cast<std::uint32_t>(settings.workflows.export_state.model_resolution)},
-        .artifact = std::move(artifact),
-    };
+    auto projection = contracts::model_settings_projection(settings, contracts::FeatureId::Export);
+    REQUIRE(projection);
+    projection->key.source = contracts::ModelSelectionSource::Custom;
+    projection->key.input = input;
+    return {.key = std::move(projection->key), .artifact = std::move(artifact)};
 }
 
 [[nodiscard]] contracts::ModelSelection selected_model(const contracts::GuiSettingsState& settings, const contracts::FeatureId workflow) {
@@ -385,6 +382,37 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
                 FAIL("test case requires a ModelSystem workflow");
         }
 
+        settings.workflows.train.request.class_layout_path = "/tmp/train.classes.json";
+        settings.workflows.validate.request.class_layout_path = "/tmp/validate.classes.json";
+        settings.workflows.predict.request.class_layout_path = "/tmp/predict.classes.json";
+        settings.workflows.export_state.class_layout_path = "/tmp/export.classes.json";
+        const auto projection = contracts::model_settings_projection(settings, workflow);
+        REQUIRE(projection);
+        CHECK(projection->key.workflow == workflow);
+        CHECK(projection->key.source == source);
+        CHECK(projection->key.input == selected_input);
+        CHECK(projection->key.preset == contracts::kDefaultModelPresetName);
+        CHECK(projection->key.resolution == contracts::kDefaultModelResolution);
+        const std::string workflow_name = workflow == contracts::FeatureId::Train ? "train" :
+                                          workflow == contracts::FeatureId::Validate ? "validate" :
+                                          workflow == contracts::FeatureId::Predict ? "predict" : "export";
+        CHECK(projection->key.class_layout_path == "/tmp/" + workflow_name + ".classes.json");
+        CHECK(projection->export_build_tensorrt == build_tensorrt);
+        // Distinct raw drafts prove source meaning independently of relation-fed fixtures.
+        auto draft = settings;
+        draft.workflows.train.request.preset_name = "train-draft";
+        draft.workflows.validate.request.preset_name = "validate-draft";
+        draft.workflows.predict.request.preset_name = "predict-draft";
+        draft.workflows.export_state.preset_name = "export-draft";
+        draft.workflows.train.request.resolution = 100;
+        draft.workflows.validate.request.resolution = 101;
+        draft.workflows.predict.request.resolution = 102;
+        draft.workflows.export_state.model_resolution = 104;
+        const auto draft_projection = contracts::model_settings_projection(draft, workflow);
+        REQUIRE(draft_projection);
+        CHECK(draft_projection->key.preset == workflow_name + "-draft");
+        CHECK(draft_projection->key.resolution == 100U + static_cast<std::uint32_t>(workflow));
+
         const auto* compatibility = workflow == contracts::FeatureId::Export
                                         ? contracts::find_model_selection_compatibility(workflow, selected_input, build_tensorrt)
                                         : contracts::find_model_selection_compatibility(workflow, selected_input);
@@ -394,7 +422,9 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
         CAPTURE(workflow, source, selected_input, build_tensorrt);
         const auto result = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, workflow);
         CHECK(result.has_value() == expected);
+        CHECK(projection->compatible == expected);
         if (!result) return;
+        CHECK(result->key == projection->key);
         CHECK(result->key.workflow == workflow);
         CHECK(result->key.source == source);
         CHECK(result->key.input == selected_input);

@@ -1,4 +1,4 @@
-use super::model_selection::effective_model_selection;
+use super::model_selection::model_settings_projection;
 use super::*;
 
 pub(crate) fn physical_surface(
@@ -178,57 +178,27 @@ pub(crate) fn annotation_object(category: u16) -> crate::generated::AnnotationOb
     }
 }
 
-pub(super) fn accepted_train_model(model: &ApplicationModel) -> ModelUiState {
-    let settings = &model
-        .settings_snapshot
-        .as_ref()
-        .expect("Settings snapshot")
-        .settingsstate;
-    let train = &settings.workflows.train;
-    let mut snapshot = model.model_snapshot.clone().expect("Model snapshot");
-    snapshot.generation += 1;
-    snapshot.active = false;
-    snapshot.selection.key.workflow = FeatureId::Train;
-    snapshot.selection.key.source = train.modelsource;
-    snapshot.selection.key.input = train.modelinput;
-    snapshot.selection.key.preset = train.request.presetname.clone();
-    snapshot.selection.key.resolution = train.request.resolution as u32;
-    snapshot.selection.artifact = crate::generated::RFDETR_PRESET_CATALOG
-        .iter()
-        .find(|preset| preset.presetname.as_ref() == train.request.presetname)
-        .expect("generated preset")
-        .canonicalweightfilename
-        .to_string();
-    snapshot.terminal.outcome = ModelSelectionOutcome::Accepted;
-    snapshot.terminal.detail.clear();
-    snapshot
-}
-
 pub(crate) fn accepted_model_for(
     model: &ApplicationModel,
     settings: &GuiSettingsState,
     workflow: FeatureId,
 ) -> ModelUiState {
-    let effective = effective_model_selection(settings, workflow).unwrap();
+    let effective = model_settings_projection(settings, workflow).unwrap();
     let mut snapshot = model.model_snapshot.clone().unwrap();
     snapshot.generation += 1;
     snapshot.active = false;
-    snapshot.selection.key.workflow = effective.workflow;
-    snapshot.selection.key.source = effective.source;
-    snapshot.selection.key.input = effective.input;
-    let artifact = if effective.source == ModelSelectionSource::Canonical {
+    let artifact = if effective.selection.key.source == ModelSelectionSource::Canonical {
         crate::generated::RFDETR_PRESET_CATALOG
             .iter()
-            .find(|preset| preset.presetname.as_ref() == effective.preset)
+            .find(|preset| preset.presetname.as_ref() == effective.selection.key.preset)
             .unwrap()
             .canonicalweightfilename
             .as_ref()
             .to_owned()
     } else {
-        effective.artifact.into()
+        effective.selection.artifact.into()
     };
-    snapshot.selection.key.preset = effective.preset.into();
-    snapshot.selection.key.resolution = effective.resolution;
+    snapshot.selection.key = effective.selection.key;
     snapshot.selection.artifact = artifact;
     snapshot.terminal.outcome = ModelSelectionOutcome::Accepted;
     snapshot.terminal.detail.clear();

@@ -805,14 +805,11 @@ mod tests {
             correlation,
             Ok(crate::generated::ApplicationReply::ModelSelect({
                 let mut snapshot = app.model.model_snapshot.clone().unwrap();
-                let train = &app.settings.draft().unwrap().workflows.train;
                 snapshot.generation = snapshot.generation.checked_add(1).unwrap();
                 snapshot.active = false;
-                snapshot.selection.key.workflow = crate::generated::FeatureId::Train;
-                snapshot.selection.key.source = crate::generated::ModelSelectionSource::Canonical;
-                snapshot.selection.key.input = crate::generated::ModelArtifactInputKind::Weights;
-                snapshot.selection.key.preset = train.request.presetname.clone();
-                snapshot.selection.key.resolution = train.request.resolution as u32;
+                snapshot.selection.key = crate::generated::project_model_settings(
+                    app.settings.draft().unwrap(), crate::generated::FeatureId::Train,
+                ).unwrap().key;
                 snapshot.selection.artifact = crate::generated::RFDETR_PRESET_CATALOG
                     .first()
                     .unwrap()

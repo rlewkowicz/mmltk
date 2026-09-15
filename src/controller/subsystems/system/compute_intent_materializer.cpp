@@ -99,51 +99,26 @@ std::expected<ComputeIntentMaterializer::ModelInput, ComputeIntentMaterializer::
     if (mmltk::controller::contracts::valid_feature(workflow) &&
         !mmltk::controller::contracts::model_selection_workflow_supported(workflow))
         return std::unexpected(refused("workflow does not support model selection"));
-    std::optional<ModelInput> materialized;
-    mmltk::controller::contracts::ModelSelectionRelation::VisitRows(
-        [&]<class Relation>(const mmltk::controller::contracts::ModelSelectionCompatibility& row) {
-            if (materialized || row.workflow != workflow || Relation::input(settings) != row.input) return;
-            if constexpr (std::tuple_size_v<decltype(Relation::predicate)> != 0U) {
-                if (!row.required_export_build_tensorrt ||
-                    std::get<0>(Relation::predicate)(settings) != *row.required_export_build_tensorrt)
-                    return;
-            }
-            const auto source = Relation::source(settings);
-            if (!mmltk::controller::contracts::model_selection_source_allowed(row, source)) return;
-            const auto& artifact_value = Relation::artifact(settings);
-            const std::string artifact = [&] {
-                if constexpr (std::same_as<std::remove_cvref_t<decltype(artifact_value)>, std::filesystem::path>)
-                    return artifact_value.native();
-                else
-                    return artifact_value;
-            }();
-            mmltk::controller::contracts::ModelSelectionKey key{
-                .workflow = workflow,
-                .source = source,
-                .input = row.input,
-                .preset = Relation::preset(settings),
-                .resolution = static_cast<std::uint32_t>(Relation::resolution(settings)),
-                .class_layout_path = std::filesystem::path(Relation::class_layout(settings)).string(),
-            };
-            materialized = ModelInput{
-                .key = std::move(key),
-                .custom_artifact = source == mmltk::controller::contracts::ModelSelectionSource::Custom ? artifact : std::string{},
-            };
-        });
-    if (!materialized) return std::unexpected(refused("model selection is incomplete"));
-    if (materialized->key.source == mmltk::controller::contracts::ModelSelectionSource::Custom) {
-        if (materialized->custom_artifact.empty() ||
-            materialized->custom_artifact.size() > mmltk::controller::contracts::kModelArtifactCapacity)
+    auto projection = mmltk::controller::contracts::model_settings_projection(settings, workflow);
+    if (!projection || !projection->compatible) return std::unexpected(refused("model selection is incomplete"));
+    const bool custom = projection->key.source == mmltk::controller::contracts::ModelSelectionSource::Custom;
+    ModelInput materialized{
+        .key = std::move(projection->key),
+        .custom_artifact = custom ? std::move(projection->artifact) : std::string{},
+    };
+    if (materialized.key.source == mmltk::controller::contracts::ModelSelectionSource::Custom) {
+        if (materialized.custom_artifact.empty() ||
+            materialized.custom_artifact.size() > mmltk::controller::contracts::kModelArtifactCapacity)
             return std::unexpected(refused("custom model artifact is unavailable"));
     }
     if (workflow == mmltk::controller::contracts::FeatureId::Validate)
-        materialized->inspection_device = settings.workflows.validate.request.device_id;
+        materialized.inspection_device = settings.workflows.validate.request.device_id;
     else if (workflow == mmltk::controller::contracts::FeatureId::Predict)
-        materialized->inspection_device = settings.workflows.predict.request.device_id;
+        materialized.inspection_device = settings.workflows.predict.request.device_id;
     else if (workflow == mmltk::controller::contracts::FeatureId::Export)
-        materialized->inspection_device = settings.workflows.export_state.device_id;
-    if (!materialized->key.valid()) return std::unexpected(refused("model selection key is invalid"));
-    return std::move(*materialized);
+        materialized.inspection_device = settings.workflows.export_state.device_id;
+    if (!materialized.key.valid()) return std::unexpected(refused("model selection key is invalid"));
+    return materialized;
 }
 
 std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMaterializer::Refusal> ComputeIntentMaterializer::LocalTrain(
