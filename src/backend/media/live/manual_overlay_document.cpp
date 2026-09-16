@@ -1,4 +1,4 @@
-module;
+#include "src/backend/media/live/manual_overlay_document.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -8,8 +8,6 @@ module;
 #include <span>
 #include <stdexcept>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
-module mmltk.backend.media.live.manual_overlay_document;
 namespace mmltk::backend::media::live {
 bool manual_overlay_mask_region_contained(const ManualOverlayMaskRegion& region, const std::uint32_t target_width, const std::uint32_t target_height) noexcept {
     return region.width > 0U && region.height > 0U && target_width > 0U && target_height > 0U &&

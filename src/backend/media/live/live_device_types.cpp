@@ -1,18 +1,4 @@
-module;
-#include <cuda.h>
-#include <cuda_runtime_api.h>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
-#include "src/frameworks/gpu/cuda_device_scope.h"
-#include "src/frameworks/gpu/resource_owner_command_authority.h"
-module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id;
-import mmltk.backend.media.live.live_types;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
 #include "detail/live_device_types.h"
-#include "detail/live_state_signal.h"
-#include "detail/workspace_frame_signal.h"
 namespace mmltk::backend::media::live {
 thread_local detail::ActiveLiveCudaContext detail::active_live_cuda_context{};
 LivePhysicalCudaContext::LivePhysicalCudaContext(gpu::ResourceOwnerCommandBinding command, gpu::CudaDeviceOwner device) noexcept
@@ -60,41 +46,6 @@ cudaError_t LiveCudaCommandScope::Record(const cudaError_t status) noexcept {
     return status;
 }
 cudaError_t LiveCudaCommandScope::Record(const std::int32_t status) noexcept { return Record(static_cast<cudaError_t>(status)); }
-void LiveStateSignal::set_listener(Listener listener) {
-    listener_.store(listener ? std::make_shared<const Listener>(std::move(listener)) : nullptr, std::memory_order_release);
-}
-void LiveStateSignal::notify() const noexcept {
-    const auto listener = listener_.load(std::memory_order_acquire);
-    if (listener == nullptr || !*listener) return;
-    try {
-        (*listener)();
-    } catch (...) {}
-}
-void LiveCompletedFramePublication::publish(const PhysicalFrameRevision revision) noexcept {
-    if (revision.valid() && revision.revision > revision_.load(std::memory_order_seq_cst)) store(revision);
-}
-PhysicalFrameRevision LiveCompletedFramePublication::snapshot() const noexcept {
-    for (;;) {
-        const std::uint64_t before = sequence_.load(std::memory_order_seq_cst);
-        if ((before & 1U) != 0U) continue;
-        const PhysicalFrameRevision result{revision_.load(std::memory_order_seq_cst),
-                                           {frame_session_.load(std::memory_order_seq_cst), frame_sequence_.load(std::memory_order_seq_cst)},
-                                           slot_.load(std::memory_order_seq_cst),
-                                           ready_.load(std::memory_order_seq_cst)};
-        if (sequence_.load(std::memory_order_seq_cst) == before) return result;
-    }
-}
-void LiveCompletedFramePublication::clear() noexcept { store({}); }
-void LiveCompletedFramePublication::store(const PhysicalFrameRevision revision) noexcept {
-    const std::uint64_t before = sequence_.fetch_add(1U, std::memory_order_seq_cst);
-    if ((before & 1U) != 0U) std::terminate();
-    revision_.store(revision.revision, std::memory_order_seq_cst);
-    frame_session_.store(revision.frame.session, std::memory_order_seq_cst);
-    frame_sequence_.store(revision.frame.sequence, std::memory_order_seq_cst);
-    slot_.store(revision.slot, std::memory_order_seq_cst);
-    ready_.store(revision.ready_event, std::memory_order_seq_cst);
-    sequence_.store(before + 2U, std::memory_order_seq_cst);
-}
 cudaError_t copy_device_frame(LiveCudaCommandScope& scope, const DeviceFrameView& source, const DeviceFrameCopyTarget target) noexcept {
     cudaError_t status = scope.Record(cudaStreamWaitEvent(target.stream, source.ready, 0U));
     if (status == cudaSuccess)

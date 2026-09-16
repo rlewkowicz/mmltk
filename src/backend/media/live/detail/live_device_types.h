@@ -1,4 +1,8 @@
 #pragma once
+#include "src/backend/media/capture/capture_types.h"
+#include "src/backend/media/live/live_frame_id.h"
+#include "src/frameworks/gpu/cuda_device_scope.h"
+#include "src/frameworks/gpu/resource_owner_command_authority.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>
@@ -91,7 +95,7 @@ struct DeviceFrameMetadata {
     capture::CaptureSessionIdentity capture_identity{};
     std::uint32_t capture_slot = 0U;
     std::uint32_t pixel_format = 0U;
-    LiveCaptureRegion region{};
+    capture::CaptureRegion region{};
     std::uint64_t captured_ns = 0U;
     std::uint64_t ready_ns = 0U;
     bool short_frame = false;

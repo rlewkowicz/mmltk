@@ -1,7 +1,6 @@
-module;
+#pragma once
 #include <cstdint>
-export module mmltk.backend.media.live.live_frame_id;
-export namespace mmltk::backend::media::live {
+namespace mmltk::backend::media::live {
 struct LiveFrameId final {
     std::uint64_t session = 0U;
     std::uint64_t sequence = 0U;

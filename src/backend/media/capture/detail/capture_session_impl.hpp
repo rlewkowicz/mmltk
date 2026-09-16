@@ -1,4 +1,19 @@
 #pragma once
+#include "src/backend/media/capture/capture_session.h"
+#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "src/common/system/numa_memory.h"
+#include <cuda_runtime_api.h>
+#include <linux/videodev2.h>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <vector>
 namespace mmltk::backend::media::capture {
 namespace capture_internal {
 using Clock = std::chrono::steady_clock;

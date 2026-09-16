@@ -1,4 +1,9 @@
 #pragma once
+#include "live_device_types.h"
+#include "live_slot_state.h"
+#include "live_state_signal.h"
+#include "src/backend/ml/runtime/analysis_provider.h"
+#include "src/backend/media/live/live_frame_id.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>

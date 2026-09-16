@@ -1,6 +1,4 @@
-// CLEANUP-IGNORE: This independent module implementation declares the exact global-fragment and module dependencies it
-// consumes.
-module;
+#include "detail/live_frame_fanout.h"
 #include <cuda_runtime_api.h>
 #include <atomic>
 #include <cstddef>
@@ -10,15 +8,6 @@ module;
 #include <optional>
 #include <stdexcept>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
-module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.media.capture.live_video_source;
-import mmltk.backend.media.capture.status;
-#include "detail/live_frame_fanout.h"
 namespace mmltk::backend::media::live {
 LiveFrameFanout::LiveFrameFanout(LiveVideoIngress& ingress, const std::uint32_t count, const std::uint32_t width, const std::uint32_t height,
                                  LivePhysicalCudaContext cuda)

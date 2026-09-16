@@ -1,9 +1,8 @@
-module;
+#pragma once
 #include <cstddef>
 #include <cstdint>
 #include "detail/manual_mask_mapping_abi.h"
-export module mmltk.backend.imaging.annotation.manual_mask_mapping;
-export namespace mmltk::backend::imaging::annotation {
+namespace mmltk::backend::imaging::annotation {
 // One integer mapping vocabulary shared by overlay persistence and CUDA launch
 // boundaries. The derived launch record adds only execution-specific fields.
 using ManualMaskMapping = detail::ManualMaskMappingAbi;

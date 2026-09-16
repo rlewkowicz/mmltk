@@ -9,14 +9,7 @@ mmltk_configure_component(
     mmltk_backend_imaging_annotation PUBLIC_DECLARATIONS)
 
 foreach(_mmltk_annotation_partition IN ITEMS
-        semantic_scene_descriptor.cppm
-        semantic_scene.cppm
-        manual_mask_mapping.cppm
-        common.cppm
-        core.cppm
-        renderer.cppm
-        canvas_layers.cppm
-        preview_rect_drag.cppm)
+        semantic_scene.cppm common.cppm core.cppm renderer.cppm)
     mmltk_register_retained_module_providers(
         mmltk_backend_imaging_annotation "${_mmltk_annotation_partition}")
 endforeach()
@@ -26,17 +19,14 @@ mmltk_register_retained_module_implementation_units(
     core_persistence.cpp
     core_preview.cpp
     types.cpp
-    manual_mask_mapping.cpp
     renderer.cpp
-    canvas_layers.cpp
-    preview_rect_drag.cpp
 )
 mmltk_register_ordinary_sources(
-    mmltk_backend_imaging_annotation manual_mask_mapping_cuda.cu)
+    mmltk_backend_imaging_annotation manual_mask_mapping.cpp manual_mask_mapping_cuda.cu)
 mmltk_register_public_headers(
     mmltk_backend_imaging_annotation
-    BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
-    FILES detail/manual_mask_mapping_abi.h)
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES manual_mask_mapping.h detail/manual_mask_mapping_abi.h)
 mmltk_register_private_headers(
     mmltk_backend_imaging_annotation
     detail/manual_mask_mapping_cuda_abi.h)
@@ -60,8 +50,6 @@ function(mmltk_add_backend_imaging_annotation_tests)
     mmltk_register_retained_module_importers(
         mmltk_backend_imaging_annotation_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/annotation_core.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/canvas_layers.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/preview_rect_drag.test.cpp
     )
     mmltk_configure_component(
         mmltk_backend_imaging_annotation_tests PRIVATE_DECLARATIONS)
@@ -76,3 +64,5 @@ function(mmltk_add_backend_imaging_annotation_tests)
         ADD_TAGS_AS_LABELS
     )
 endfunction()
+
+mmltk_register_header_isolation(mmltk_backend_imaging_annotation)

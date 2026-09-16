@@ -1,8 +1,7 @@
-module;
+#pragma once
 #include <cstddef>
 #include <cstdint>
-export module mmltk.backend.media.capture.capture_types;
-export namespace mmltk::backend::media::capture {
+namespace mmltk::backend::media::capture {
 struct CaptureRegion final {
     std::uint32_t x = 0U;
     std::uint32_t y = 0U;

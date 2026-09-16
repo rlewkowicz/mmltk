@@ -1,4 +1,9 @@
 #pragma once
+#include "src/backend/media/live/live_types.h"
+#include "live_device_types.h"
+#include "live_frame_fanout.h"
+#include "live_slot_state.h"
+#include "live_state_signal.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>
@@ -8,11 +13,15 @@
 #include <memory>
 #include <optional>
 #include "live_analyzer_worker.h"
-#include "live_compositor_status.h"
 #include "live_manual_overlay_worker.h"
 #include "workspace_frame_signal.h"
 namespace mmltk::backend::media::live {
-class LiveCompositor;
+struct LiveCompositorTelemetry {
+    bool running = false;
+    std::uint64_t frames_composited = 0;
+    std::uint64_t frames_dropped = 0;
+    std::uint64_t front_revision = 0;
+};
 // CLEANUP-IGNORE: LiveCompositor has distinct physical compositor custody despite a conventional sealed-owner API.
 class LiveCompositor final {
    public:

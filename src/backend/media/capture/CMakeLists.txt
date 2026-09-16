@@ -8,12 +8,10 @@ add_library(
 mmltk_configure_component(
     mmltk_backend_media_capture PUBLIC_DECLARATIONS)
 
-foreach(_mmltk_capture_partition IN ITEMS
-        status.cppm capture_types.cppm live_video_source.cppm capture_session.cppm)
-    mmltk_register_retained_module_providers(
-        mmltk_backend_media_capture "${_mmltk_capture_partition}")
-endforeach()
-mmltk_register_retained_module_implementation_units(
+mmltk_register_public_headers(mmltk_backend_media_capture
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES capture_types.h status.h live_video_source.h capture_session.h)
+mmltk_register_ordinary_sources(
     mmltk_backend_media_capture
     capture_types.cpp
     capture_session_core.cpp
@@ -26,7 +24,9 @@ mmltk_register_private_headers(mmltk_backend_media_capture
 target_include_directories(mmltk_backend_media_capture PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(mmltk_backend_media_capture PRIVATE
+target_link_libraries(mmltk_backend_media_capture
+    PUBLIC mmltk::frameworks::gpu
+    PRIVATE
     CUDA::cudart
     Threads::Threads
     mmltk::backend::ml::cuda
@@ -34,5 +34,6 @@ target_link_libraries(mmltk_backend_media_capture PRIVATE
     mmltk::common::logging
     mmltk::common::system
     mmltk::common::types
-    mmltk::frameworks::gpu
 )
+
+mmltk_register_header_isolation(mmltk_backend_media_capture)

@@ -1,3 +1,7 @@
+#include "src/backend/media/live/live_types.h"
+#include "src/backend/media/live/live_session_controller.h"
+#include "src/backend/media/capture/capture_session.h"
+#include "src/backend/media/capture/status.h"
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -16,10 +20,6 @@
 #include "src/backend/media/live/detail/live_slot_state.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
-import mmltk.backend.media.live.live_types;
-import mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.status;
 namespace mmltk::backend::media::live {
 namespace {
 TEST_CASE("Live rejects placement belonging to a different capture receiver before allocating resources", "[live][numa]") {

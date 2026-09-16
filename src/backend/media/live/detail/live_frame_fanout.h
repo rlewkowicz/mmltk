@@ -1,4 +1,10 @@
 #pragma once
+#include "live_device_types.h"
+#include "live_slot_state.h"
+#include "live_state_signal.h"
+#include "src/backend/media/live/live_frame_id.h"
+#include "src/backend/media/capture/capture_types.h"
+#include "src/frameworks/gpu/pinned_host_buffer.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>
@@ -43,7 +49,7 @@ class LiveRawFrameCache final {
         std::size_t pitch = 0U;
         cudaEvent_t ready = nullptr;
         LiveFrameId frame{};
-        LiveCaptureRegion region{};
+        capture::CaptureRegion region{};
         std::uint32_t index = 0U;
     };
     static void CUDART_CB ReadbackComplete(void* context) noexcept;

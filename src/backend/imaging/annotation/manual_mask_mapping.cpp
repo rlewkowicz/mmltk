@@ -1,8 +1,7 @@
-module;
+#include "src/backend/imaging/annotation/manual_mask_mapping.h"
 #include <cstddef>
 #include <cstdint>
 #include "detail/manual_mask_mapping_cuda_abi.h"
-module mmltk.backend.imaging.annotation.manual_mask_mapping;
 namespace {
 using ManualMaskMapping = mmltk::backend::imaging::annotation::ManualMaskMapping;
 }  // namespace

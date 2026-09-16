@@ -1,4 +1,17 @@
 #pragma once
+#include "src/backend/media/live/live_session_controller.h"
+#include "src/backend/media/live/manual_overlay_document.h"
+#include "src/backend/media/live/live_types.h"
+#include "src/backend/media/capture/capture_session.h"
+#include "src/backend/media/capture/status.h"
+#include "src/frameworks/gpu/resource_owner_command_authority.h"
+#include "live_analyzer_worker.h"
+#include "live_device_types.h"
+#include "live_frame_fanout.h"
+#include "live_manual_overlay_worker.h"
+#include "live_video_ingress.h"
+#include "workspace_frame_signal.h"
+#include <stop_token>
 #include <cuda_runtime_api.h>
 #include <condition_variable>
 #include <cstddef>

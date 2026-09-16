@@ -1,4 +1,5 @@
-module;
+#include "detail/capture_session_impl.hpp"
+#include "src/backend/media/capture/capture_session.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/common/system/numa_memory.h"
@@ -21,8 +22,6 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
-module mmltk.backend.media.capture.capture_session;
-#include "detail/capture_session_impl.hpp"
 namespace mmltk::backend::media::capture {
 using capture_internal::AllocateHostBuffer;
 using capture_internal::CaptureSlotPhase;

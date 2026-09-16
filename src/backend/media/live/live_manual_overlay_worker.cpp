@@ -1,6 +1,6 @@
-// CLEANUP-IGNORE: This independent module implementation declares the exact global-fragment and module dependencies it
-// consumes.
-module;
+#include "detail/live_manual_overlay_worker.h"
+#include "src/backend/imaging/annotation/manual_mask_mapping.h"
+#include "detail/overlay_palette.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <algorithm>
@@ -15,18 +15,7 @@ module;
 #include <memory>
 #include <stdexcept>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
-module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id; // CLEANUP-IGNORE: The overlay worker directly imports its typed Live schema dependencies.
-import mmltk.backend.media.live.live_types;
-import mmltk.backend.media.live.manual_overlay_document;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.imaging.annotation.core;
-import mmltk.backend.imaging.annotation.renderer;
-import mmltk.backend.imaging.annotation.semantic_scene_descriptor;
 import mmltk.backend.imaging.raster;
-#include "detail/live_manual_overlay_worker.h"
 namespace mmltk::backend::media::live {
 namespace annotation = mmltk::backend::imaging::annotation;
 namespace raster = mmltk::backend::imaging::raster;
@@ -168,7 +157,7 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
                 packed.deferred_mask_projection.has_value() ? packed.deferred_mask_projection->run_value_count : instance.mask_runs.size() * 2U;
             if (!add_bounded(values, upload_limits_.run_values, &run_values_total)) return PrepareResult::Refused;
         }
-        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced) {
+        if (snapshot.renderer_mode != SemanticRenderer::Iced) {
             if (instance.polyline_points.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
                 instance.points.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
                 instance.skeleton_edges.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
@@ -208,7 +197,7 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
                 runs[write++] = run.length;
             }
         }
-        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced) {
+        if (snapshot.renderer_mode != SemanticRenderer::Iced) {
             std::size_t write = packed.polyline_value_offset;
             for (const ManualOverlayPoint point : instance.polyline_points) {
                 points[write++] = point.x;
@@ -284,7 +273,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
             }
             has_content = true;
         }
-        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && instance.polyline_points.size() >= 2U && status == cudaSuccess) {
+        if (snapshot.renderer_mode != SemanticRenderer::Iced && instance.polyline_points.size() >= 2U && status == cudaSuccess) {
             status = scope.Record(
                 raster::raster_polyline_rgba({.overlay = target,
                                               .points = {reinterpret_cast<const int*>(slot.points.device + packed.polyline_value_offset * sizeof(int)),
@@ -295,7 +284,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
                                               .stream = slot.stream}));
             has_content = true;
         }
-        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && !instance.skeleton_edges.empty() && !instance.points.empty() &&
+        if (snapshot.renderer_mode != SemanticRenderer::Iced && !instance.skeleton_edges.empty() && !instance.points.empty() &&
             status == cudaSuccess) {
             status = scope.Record(raster::raster_skeleton_rgba(
                 {.overlay = target,
@@ -310,7 +299,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
         }
         // CLEANUP-IGNORE: Skeleton edges and standalone point glyphs are distinct raster primitives with separate
         // buffers.
-        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && !instance.points.empty() && status == cudaSuccess) {
+        if (snapshot.renderer_mode != SemanticRenderer::Iced && !instance.points.empty() && status == cudaSuccess) {
             status = scope.Record(
                 raster::raster_points_rgba({.overlay = target,
                                             .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)),
@@ -320,7 +309,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
                                             .stream = slot.stream}));
             has_content = true;
         }
-        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && box_has_area(instance.box) && status == cudaSuccess) {
+        if (snapshot.renderer_mode != SemanticRenderer::Iced && box_has_area(instance.box) && status == cudaSuccess) {
             status = scope.Record(raster::raster_box_outline_rgba({.overlay = target,
                                                                    .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2},
                                                                    .color = {color[0], color[1], color[2]},
@@ -335,7 +324,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
                                                                              .stream = slot.stream}));
         }
     }
-    if (status == cudaSuccess && snapshot.renderer_mode != annotation::SemanticRenderer::Iced && snapshot.selected_instance.has_value() &&
+    if (status == cudaSuccess && snapshot.renderer_mode != SemanticRenderer::Iced && snapshot.selected_instance.has_value() &&
         *snapshot.selected_instance < snapshot.instances.size()) {
         const ManualOverlayInstance& selected = snapshot.instances[*snapshot.selected_instance];
         if (box_has_area(selected.box)) {
@@ -347,7 +336,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
             has_content = true;
         }
     }
-    if (status == cudaSuccess && snapshot.renderer_mode != annotation::SemanticRenderer::Iced && snapshot.brush_preview.has_value()) {
+    if (status == cudaSuccess && snapshot.renderer_mode != SemanticRenderer::Iced && snapshot.brush_preview.has_value()) {
         const ManualOverlayBrushPreview& brush = *snapshot.brush_preview;
         auto* host = static_cast<int*>(slot.brush.host);
         const double brush_radius = static_cast<double>(std::max(1, brush.radius));

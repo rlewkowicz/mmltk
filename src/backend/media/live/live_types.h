@@ -1,4 +1,4 @@
-module;
+#pragma once
 #include <cstddef>
 #include <cstdint>
 #include <condition_variable>
@@ -6,9 +6,8 @@ module;
 #include <optional>
 #include <span>
 #include <stop_token>
-export module mmltk.backend.media.live.live_types;
-import mmltk.backend.media.live.live_frame_id;
-export namespace mmltk::backend::media::live {
+#include "src/backend/media/live/live_frame_id.h"
+namespace mmltk::backend::media::live {
 inline constexpr std::size_t kManualOverlayBrushSegments = 64U;
 inline constexpr std::size_t kManualOverlayBrushValueCount = kManualOverlayBrushSegments * 2U;
 struct LiveManualOverlayUploadLimits final {

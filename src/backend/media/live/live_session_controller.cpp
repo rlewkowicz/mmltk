@@ -1,6 +1,6 @@
-// CLEANUP-IGNORE: This independent module implementation declares the exact global-fragment and module dependencies it
-// consumes.
-module;
+#include "detail/live_session_owner.h"
+#include "src/common/system/execution_policy.h"
+#include "src/frameworks/gpu/device_execution.h"
 #include <cuda_runtime_api.h>
 #include <cstddef>
 #include <cstdint>
@@ -14,22 +14,10 @@ module;
 #include <string>
 #include <thread>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/frameworks/gpu/cuda_device_scope.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
-module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id;
-import mmltk.backend.media.live.live_types;
-import mmltk.backend.media.live.manual_overlay_document;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.media.capture.live_video_source;
-import mmltk.backend.media.capture.status;
-#include "detail/live_session_owner.h"
 namespace mmltk::backend::media::live {
 namespace capture = mmltk::backend::media::capture;
 namespace gpu = mmltk::frameworks::gpu;
@@ -410,7 +398,7 @@ void LiveMediaDataPlane::Impl::publish_start(capture::CaptureSessionStartResult 
     wake_condition_.notify_all();
 }
 void LiveMediaDataPlane::Impl::publish_terminal(std::shared_ptr<const capture::CaptureStopTerminal> capture_terminal) noexcept {
-    retire_live_physical_aggregate(resources_);
+    resources_.reset();
     LiveAdmittedRunTerminalListener listener;
     const LivePhysicalTerminal* published = nullptr;
     {
@@ -492,7 +480,7 @@ void LiveMediaDataPlane::Impl::run(const std::stop_token stop) noexcept {
         }
         capture::CaptureSessionStartResult admission = resources_->start(provider_factory);
         if (!admission.has_custody()) {
-            retire_live_physical_aggregate(resources_);
+            resources_.reset();
             publish_start(std::move(admission));
             return;
         }
@@ -506,7 +494,7 @@ void LiveMediaDataPlane::Impl::run(const std::stop_token stop) noexcept {
         finish_admitted_run(stop, admission_closing);
         return;
     }
-    retire_live_physical_aggregate(resources_);
+    resources_.reset();
     bool publish = false;
     {
         std::lock_guard lock(lifecycle_);

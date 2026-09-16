@@ -1,4 +1,7 @@
-module;
+#include "detail/capture_session_impl.hpp"
+#include <cerrno>
+#include <cuda.h>
+#include "src/backend/media/capture/capture_session.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/common/system/numa_memory.h"
@@ -22,8 +25,6 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
-module mmltk.backend.media.capture.capture_session;
-#include "detail/capture_session_impl.hpp"
 namespace mmltk::backend::media::capture::capture_internal {
 std::uint64_t NowNs() { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()); }
 }  // namespace mmltk::backend::media::capture::capture_internal

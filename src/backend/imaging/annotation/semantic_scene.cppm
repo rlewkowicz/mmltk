@@ -1,4 +1,5 @@
 module;
+#include "src/backend/imaging/annotation/manual_mask_mapping.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -7,7 +8,6 @@ module;
 #include <variant>
 #include <vector>
 export module mmltk.backend.imaging.annotation.semantic_scene;
-export import mmltk.backend.imaging.annotation.manual_mask_mapping;
 export namespace mmltk::backend::imaging::annotation {
 struct ContentIdentity final {
     std::uint64_t session_nonce = 0U;

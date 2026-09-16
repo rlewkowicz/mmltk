@@ -11,12 +11,11 @@ mmltk_register_public_headers(
     FILES live_system.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_live_system
+    native_live_algorithm.cpp
     live_receiver_copy.cpp
     live_system.cpp)
 mmltk_register_private_headers(
     mmltk_controller_live_system live_receiver_copy.h)
-mmltk_register_retained_module_importers(
-    mmltk_controller_live_system native_live_algorithm.cpp)
 target_link_libraries(mmltk_controller_live_system
     PUBLIC
         mmltk::controller::application_boundary

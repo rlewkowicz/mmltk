@@ -1,4 +1,4 @@
-module;
+#pragma once
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -6,11 +6,10 @@ module;
 #include <optional>
 #include "src/frameworks/gpu/device_execution.h"
 #include <string>
-export module mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.media.capture.live_video_source;
-import mmltk.backend.media.capture.status;
-export namespace mmltk::backend::media::capture {
+#include "src/backend/media/capture/capture_types.h"
+#include "src/backend/media/capture/live_video_source.h"
+#include "src/backend/media/capture/status.h"
+namespace mmltk::backend::media::capture {
 struct CaptureDeviceApi final {
     void* context = nullptr;
     int (*ioctl)(void*, int, unsigned long, void*) noexcept = nullptr;

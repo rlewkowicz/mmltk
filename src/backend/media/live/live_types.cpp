@@ -1,11 +1,6 @@
-module;
+#include "src/backend/media/live/live_types.h"
 #include <limits>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
-module mmltk.backend.media.live.live_types;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id;
-import mmltk.backend.media.capture.capture_types;
 namespace mmltk::backend::media::live {
 bool LiveManualOverlayUploadLimits::valid() const noexcept {
     return mask_bytes != 0U && run_values != 0U && point_values != 0U && edge_values != 0U && brush_values >= kManualOverlayBrushValueCount &&

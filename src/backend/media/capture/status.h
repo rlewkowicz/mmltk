@@ -1,8 +1,7 @@
-module;
+#pragma once
 #include <cstdint>
 #include <string>
-export module mmltk.backend.media.capture.status;
-export namespace mmltk::backend::media::capture {
+namespace mmltk::backend::media::capture {
 enum class StatusCode : std::uint8_t {
     kOk = 0,
     kNotReady,

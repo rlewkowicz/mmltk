@@ -1,9 +1,8 @@
-module;
+#include "src/backend/media/capture/capture_types.h"
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <utility>
-module mmltk.backend.media.capture.capture_types;
 namespace mmltk::backend::media::capture {
 FilledCaptureSlotLease::FilledCaptureSlotLease(const CaptureSessionIdentity identity, const std::uint32_t slot, const std::uint64_t sequence,
                                                const std::uint8_t* const data, const std::size_t bytes, const std::size_t stride_bytes,

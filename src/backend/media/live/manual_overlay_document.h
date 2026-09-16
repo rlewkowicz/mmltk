@@ -1,15 +1,22 @@
-module;
+#pragma once
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include "src/backend/imaging/annotation/manual_mask_mapping.h"
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <vector>
-export module mmltk.backend.media.live.manual_overlay_document;
-import mmltk.backend.imaging.annotation.core;
-import mmltk.backend.imaging.annotation.semantic_scene_descriptor;
-export namespace mmltk::backend::media::live {
+namespace mmltk::backend::media::live {
+enum class SemanticRenderer : std::uint8_t {
+    Iced = 0U,
+    NativeImageView = 1U,
+    NativeTileAtlas = 2U,
+};
+[[nodiscard]] constexpr bool semantic_renderer_valid(const SemanticRenderer renderer) noexcept {
+    return renderer == SemanticRenderer::Iced || renderer == SemanticRenderer::NativeImageView || renderer == SemanticRenderer::NativeTileAtlas;
+}
 struct LiveInteractionAck final {
     std::uint64_t interaction = 0U;
     std::uint64_t sequence = 0U;
@@ -104,7 +111,7 @@ struct ManualOverlayDocumentSnapshot {
     std::vector<ManualOverlayInstance> interaction_instances;
     std::optional<std::size_t> selected_instance;
     std::optional<ManualOverlayBrushPreview> brush_preview;
-    mmltk::backend::imaging::annotation::SemanticRenderer renderer_mode = mmltk::backend::imaging::annotation::SemanticRenderer::NativeImageView;
+    SemanticRenderer renderer_mode = SemanticRenderer::NativeImageView;
     [[nodiscard]] bool same_content(const ManualOverlayDocumentSnapshot& other) const {
         return document_generation == other.document_generation && session_revision == other.session_revision && interaction_ack == other.interaction_ack &&
                capture_width == other.capture_width && capture_height == other.capture_height && instances == other.instances &&

@@ -1,4 +1,8 @@
 #pragma once
+#include "src/backend/media/capture/capture_session.h"
+#include "src/backend/media/capture/capture_types.h"
+#include "src/backend/media/capture/status.h"
+#include "live_slot_state.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>

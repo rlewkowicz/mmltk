@@ -1,6 +1,4 @@
-// CLEANUP-IGNORE: This independent module implementation declares the exact global-fragment and module dependencies it
-// consumes.
-module;
+#include "detail/live_compositor_owner.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>
@@ -13,22 +11,11 @@ module;
 #include <span>
 #include <stdexcept>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/common/system/time_utils.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
-module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id;
-import mmltk.backend.media.live.live_types;
-import mmltk.backend.media.live.manual_overlay_document;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.media.capture.status;
 import mmltk.backend.imaging.raster;
-#include "detail/live_compositor_owner.h"
 namespace mmltk::backend::media::live {
 namespace raster = mmltk::backend::imaging::raster;
 namespace system = mmltk::common::system;

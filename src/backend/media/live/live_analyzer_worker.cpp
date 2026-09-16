@@ -1,5 +1,4 @@
-// CLEANUP-IGNORE: This module implementation owns its concrete global-fragment dependencies.
-module;
+#include "detail/live_analyzer_worker.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>
@@ -11,18 +10,8 @@ module;
 #include <span>
 #include <stdexcept>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/backend/ml/runtime/tensorrt_runtime.h"
-module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.media.capture.live_video_source;
-import mmltk.backend.media.capture.status;
-#include "detail/live_analyzer_worker.h"
 namespace mmltk::backend::media::live {
 namespace runtime = mmltk::backend::ml::runtime;
 LiveAnalyzerWorker::LiveAnalyzerWorker(LiveFrameFanout& fanout, const std::uint32_t count, const std::uint32_t regions, const std::uint32_t width,

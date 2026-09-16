@@ -1,4 +1,4 @@
-module;
+#pragma once
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -6,16 +6,14 @@ module;
 #include <utility>
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
-#include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
-export module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_types;
-import mmltk.backend.media.live.manual_overlay_document;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.media.capture.live_video_source;
-import mmltk.backend.media.capture.status;
-export namespace mmltk::backend::media::live {
+#include "src/backend/media/live/live_types.h"
+#include "src/backend/media/live/manual_overlay_document.h"
+#include "src/backend/media/capture/capture_session.h"
+#include "src/backend/media/capture/capture_types.h"
+#include "src/backend/media/capture/live_video_source.h"
+#include "src/backend/media/capture/status.h"
+namespace mmltk::backend::media::live {
 struct LiveDataPlaneConfig final {
     mmltk::backend::media::capture::CaptureConfig capture{};
     mmltk::frameworks::gpu::ResourceOwnerWorkerCapability resource_worker{};

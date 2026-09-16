@@ -1,4 +1,6 @@
 #pragma once
+#include "src/backend/ml/runtime/analysis_provider.h"
+#include "src/backend/media/live/live_frame_id.h"
 #include <cstddef>
 #include <cstdint>
 #include <span>

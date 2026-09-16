@@ -1,6 +1,4 @@
-// CLEANUP-IGNORE: This independent module implementation declares the exact global-fragment and module dependencies it
-// consumes.
-module;
+#include "detail/live_video_ingress.h"
 #include <cuda_runtime_api.h>
 #include <atomic>
 #include <cstddef>
@@ -10,16 +8,7 @@ module;
 #include <mutex>
 #include <stdexcept>
 #include <utility>
-#include "detail/live_module_dependencies.h"  // IWYU pragma: keep
 #include "src/common/system/time_utils.h"
-module mmltk.backend.media.live.live_session_controller;
-import mmltk.backend.media.live.live_capture_region;
-import mmltk.backend.media.live.live_frame_id;
-import mmltk.backend.media.capture.capture_session;
-import mmltk.backend.media.capture.capture_types;
-import mmltk.backend.media.capture.live_video_source;
-import mmltk.backend.media.capture.status;
-#include "detail/live_video_ingress.h"
 namespace mmltk::backend::media::live {
 namespace system = mmltk::common::system;
 LiveVideoIngress::LiveVideoIngress(capture::CaptureConfig config, const std::uint32_t count, LivePhysicalCudaContext cuda)

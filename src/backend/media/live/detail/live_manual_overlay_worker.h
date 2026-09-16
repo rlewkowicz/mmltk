@@ -1,4 +1,8 @@
 #pragma once
+#include "src/backend/media/live/manual_overlay_document.h"
+#include "src/backend/media/live/live_types.h"
+#include "src/frameworks/gpu/pinned_host_buffer.h"
+#include "live_slot_state.h"
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <atomic>
@@ -9,7 +13,6 @@
 #include <optional>
 #include "live_device_types.h"
 #include "live_state_signal.h"
-#include "overlay_palette.h"
 namespace mmltk::backend::media::live {
 class LiveManualOverlayWorker final {
    public:

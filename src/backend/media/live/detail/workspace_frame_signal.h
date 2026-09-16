@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/media/live/live_types.h"
 #include <atomic>
 #include <cstdint>
 #include <exception>
