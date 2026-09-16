@@ -110,6 +110,9 @@ auto read_scalar(torch_api::InputArchive& archive, const char* key) {
 }
 void validate_values(const TrainingContinuationValues& values, bool requested_ema, bool present_ema) {
     if (values.epoch < 0 || values.epoch >= std::numeric_limits<int>::max()) throw std::runtime_error("invalid checkpoint epoch");
+    if (values.ema_completed_updates < 0 || values.ema_completed_updates == std::numeric_limits<int64_t>::max() ||
+        (!requested_ema && values.ema_completed_updates != 0))
+        throw std::runtime_error("invalid checkpoint EMA completed update count");
     if (std::isnan(values.best_regular_metric) || std::isnan(values.best_ema_metric)) throw std::runtime_error("checkpoint best metric is invalid");
     if (values.training_attempt_id.empty() || values.training_attempt_id.size() > 64) throw std::runtime_error("invalid checkpoint attempt identity");
     if (values.training_original_descriptor.size() > mmltk::frameworks::reflection::kMaximumPathBytes)

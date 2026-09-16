@@ -907,15 +907,22 @@ void save_snapshot_checkpoint(const std::filesystem::path& path, const NativeChe
 }
 void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer,
                             const GradScaler& grad_scaler, const TrainRequest& options, int epoch, double best_regular, double best_ema,
-                            const std::vector<NormalizedModelStateEntry>& model_state, const std::vector<NormalizedModelStateEntry>& ema_state,
-                            std::string_view attempt_id, const std::filesystem::path& original_descriptor, torch_cuda::TensorReadbackBuffers& readback) {
+                            int64_t ema_completed_updates, const std::vector<NormalizedModelStateEntry>& model_state,
+                            const std::vector<NormalizedModelStateEntry>& ema_state, std::string_view attempt_id,
+                            const std::filesystem::path& original_descriptor, torch_cuda::TensorReadbackBuffers& readback) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_total{"rfdetr.train.save.resume.total"};
     std::filesystem::create_directories(checkpoint_path.parent_path());
     torch_api::OutputArchive archive;
     detail::write_native_checkpoint_metadata(archive, metadata);
     detail::write_training_continuation(archive, options,
-                                        {epoch, best_regular, best_ema, static_cast<double>(grad_scaler.current_scale()), grad_scaler.growth_tracker(),
-                                         std::string(attempt_id), original_descriptor.string()});
+                                        {.epoch = epoch,
+                                         .best_regular_metric = best_regular,
+                                         .best_ema_metric = best_ema,
+                                         .grad_scaler_scale = static_cast<double>(grad_scaler.current_scale()),
+                                         .grad_scaler_growth_tracker = grad_scaler.growth_tracker(),
+                                         .ema_completed_updates = ema_completed_updates,
+                                         .training_attempt_id = std::string(attempt_id),
+                                         .training_original_descriptor = original_descriptor.string()});
     optimizer.reserve_checkpoint(readback, model_state.size() + ema_state.size());
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_write_state{"rfdetr.train.save.resume.write_state"};
@@ -961,7 +968,8 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
         const auto cpu_shadow = detail::read_ema_shadow_archive(ema_archive, parameter_names);
         if (main_process) {
             // The factory validates the entire CPU inventory once before copies.
-            state.restored_ema = ModelEma::from_cpu_shadow(parameters, cpu_shadow, options.ema_decay, static_cast<double>(options.ema_tau));
+            state.restored_ema = ModelEma::from_cpu_shadow(parameters, cpu_shadow, options.ema_decay, static_cast<double>(options.ema_tau),
+                                                           continuation.values.ema_completed_updates);
         } else {
             ModelEma::validate_cpu_shadow(parameters, cpu_shadow);
         }
@@ -1947,7 +1955,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             grad_scaler.step(optimizer, gradient_overflow);
             grad_scaler.update(gradient_overflow);
             optimizer.zero_grad(true);
-            if (ema.has_value() && !gradient_overflow) { ema->update(optimizer_steps); }
+            if (ema.has_value() && !gradient_overflow) { ema->update(); }
             if (gradient_overflow) {
                 mmltk::common::logging::warn(
                     [&](auto& logger) { logger.warn("skipped RF-DETR optimizer update after gradient overflow{}", overflow_details); });
@@ -2195,7 +2203,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             {
                 mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume{"rfdetr.train.save.resume"};
                 save_resume_checkpoint(checkpoint_path, metadata, optimizer, grad_scaler, checkpoint_configuration, epoch, best_regular, best_ema,
-                                       ordinary_snapshot, ema_snapshot, progress_writer->attempt_id(), original_descriptor, checkpoint_readback);
+                                       ema ? ema->completed_updates() : 0, ordinary_snapshot, ema_snapshot, progress_writer->attempt_id(), original_descriptor,
+                                       checkpoint_readback);
                 checkpoint_readback.Release();
             }
             if (result.history.size() == result.history.capacity()) result.history.erase(result.history.begin());

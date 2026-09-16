@@ -28,22 +28,25 @@ struct CachedLabel {
     width: f32,
     paragraph: iced::advanced::graphics::text::Paragraph,
 }
+fn label_text<Content>(content: Content, width: f32) -> text::Text<Content> {
+    text::Text {
+        content,
+        bounds: Size::new(width - 6.0, 19.0),
+        size: iced::Pixels(12.0),
+        line_height: text::LineHeight::default(),
+        font: iced::Font::DEFAULT,
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Center,
+        shaping: text::Shaping::Advanced,
+        wrapping: text::Wrapping::None,
+        ellipsis: text::Ellipsis::default(),
+        hint_factor: None,
+    }
+}
 impl CachedLabel {
     fn new(text: String) -> Self {
         let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
-        let paragraph = iced::advanced::graphics::text::Paragraph::with_text(text::Text {
-            content: &text,
-            bounds: Size::new(width - 6.0, 19.0),
-            size: iced::Pixels(12.0),
-            line_height: text::LineHeight::default(),
-            font: iced::Font::DEFAULT,
-            align_x: text::Alignment::Left,
-            align_y: iced::alignment::Vertical::Center,
-            shaping: text::Shaping::Advanced,
-            wrapping: text::Wrapping::None,
-            ellipsis: text::Ellipsis::default(),
-            hint_factor: None,
-        });
+        let paragraph = iced::advanced::graphics::text::Paragraph::with_text(label_text(text.as_str(), width));
         Self {
             text,
             width,
@@ -429,19 +432,7 @@ impl<Message> Labelled<'_, Message> {
                         renderer.fill_paragraph(&cached.paragraph, position, foreground, clip);
                     } else {
                         renderer.fill_text(
-                            text::Text {
-                                content: name.to_owned(),
-                                bounds: Size::new(rect.width - 6.0, 19.0),
-                                size: iced::Pixels(12.0),
-                                line_height: text::LineHeight::default(),
-                                font: iced::Font::DEFAULT,
-                                align_x: text::Alignment::Left,
-                                align_y: iced::alignment::Vertical::Center,
-                                shaping: text::Shaping::Advanced,
-                                wrapping: text::Wrapping::None,
-                                ellipsis: text::Ellipsis::default(),
-                                hint_factor: None,
-                            },
+                            label_text(name.to_owned(), rect.width),
                             position,
                             foreground,
                             clip,

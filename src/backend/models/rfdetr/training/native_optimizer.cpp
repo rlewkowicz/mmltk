@@ -407,6 +407,16 @@ void read_inspection_layout(torch_api::InputArchive& archive, const std::unorder
     if (std::ranges::find(assigned, false) != assigned.end()) throw std::runtime_error("optimizer group inventory is incomplete");
 }
 }  // namespace
+template <typename GroupConfig, typename ParamStateT>
+template <class Optimizer>
+std::vector<std::string> NativeOptimizerStorage<GroupConfig, ParamStateT>::inspect_checkpoint(
+    torch_api::InputArchive& archive, const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
+    Optimizer candidate;
+    read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
+    populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
+    candidate.load(archive);
+    return std::move(candidate.all_param_names_);
+}
 const char* native_optimizer_backend_name(const NativeOptimizerBackend backend) {
     switch (backend) {
         case NativeOptimizerBackend::eager: return "eager";
@@ -592,11 +602,7 @@ void NativeAdamW::load(torch_api::InputArchive& archive) {
     state_.swap(candidate_state);
 }
 std::vector<std::string> NativeAdamW::InspectCheckpoint(torch_api::InputArchive& archive, const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
-    NativeAdamW candidate;
-    read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
-    populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
-    candidate.load(archive);
-    return std::move(candidate.all_param_names_);
+    return inspect_checkpoint<NativeAdamW>(archive, tensors);
 }
 void NativeAdamW::commit(NativeAdamW candidate) noexcept {
     groups_.swap(candidate.groups_);
@@ -757,11 +763,7 @@ void NativeMuonWithAuxAdam::load(torch_api::InputArchive& archive) {
 }
 std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch_api::InputArchive& archive,
                                                                   const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
-    NativeMuonWithAuxAdam candidate;
-    read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
-    populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
-    candidate.load(archive);
-    return std::move(candidate.all_param_names_);
+    return inspect_checkpoint<NativeMuonWithAuxAdam>(archive, tensors);
 }
 void NativeMuonWithAuxAdam::commit(NativeMuonWithAuxAdam candidate) noexcept {
     groups_.swap(candidate.groups_);

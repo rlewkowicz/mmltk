@@ -64,6 +64,8 @@ class NativeOptimizerStorage {
     using ParamState = ParamStateT;
     NativeOptimizerStorage() = default;
     NativeOptimizerStorage(std::vector<Group> groups, std::vector<NamedParameter> params) : groups_(std::move(groups)), params_(std::move(params)) {}
+    template <class Optimizer>
+    [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch_api::InputArchive&, const std::unordered_map<std::string, torch_api::Tensor>&);
     std::vector<Group> groups_;
     std::vector<NamedParameter> params_;
     std::vector<ParamState> state_;

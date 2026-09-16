@@ -23,8 +23,15 @@ r::TrainRequest saved_request() {
 }
 api::InputArchive continuation_fixture(const r::TrainRequest& request) {
     api::OutputArchive output;
-    r::detail::write_training_continuation(
-        output, request, {0, -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(), 1024.0, 17, "attempt", "original.json"});
+    r::detail::write_training_continuation(output, request,
+                                           {.epoch = 0,
+                                            .best_regular_metric = -std::numeric_limits<double>::infinity(),
+                                            .best_ema_metric = -std::numeric_limits<double>::infinity(),
+                                            .grad_scaler_scale = 1024.0,
+                                            .grad_scaler_growth_tracker = 17,
+                                            .ema_completed_updates = request.use_ema ? 37 : 0,
+                                            .training_attempt_id = "attempt",
+                                            .training_original_descriptor = "original.json"});
     api::OutputArchive optimizer;
     r::write_int(optimizer, "fixture", 1);
     output.write("optimizer", optimizer);
@@ -71,13 +78,16 @@ void test_current_continuation_required_fields() {
     REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
 void test_current_continuation_scalar_boundaries() {
-    const std::array<std::pair<std::string, api::IValue>, 19> invalid{
+    const std::array<std::pair<std::string, api::IValue>, 22> invalid{
         {{"epoch", int64_t{-1}},
          {"epoch", int64_t{std::numeric_limits<int>::max()}},
          {"grad_scaler_scale", 0.0},
          {"grad_scaler_scale", std::numeric_limits<double>::infinity()},
          {"grad_scaler_growth_tracker", int64_t{-1}},
          {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
+         {"ema_completed_updates", int64_t{-1}},
+         {"ema_completed_updates", std::numeric_limits<int64_t>::max()},
+         {"ema_completed_updates", int64_t{1}},
          {"best_regular_metric", std::numeric_limits<double>::quiet_NaN()},
          {"best_ema_metric", std::numeric_limits<double>::quiet_NaN()},
          {"training_attempt_id", std::string{}},
@@ -125,6 +135,7 @@ void test_current_continuation_scalar_boundaries() {
             const auto admitted = r::detail::read_training_continuation(source);
             REQUIRE(admitted.has_value());
             REQUIRE(admitted->configuration == request);
+            REQUIRE(admitted->values.ema_completed_updates == (ema ? 37 : 0));
             auto active = request;
             active.output_dir = "another-run";
             active.epochs += 10;
@@ -158,7 +169,12 @@ void test_ordered_cpu_ema_admission() {
             case 4: shadow[0] = api::full({2, 3}, std::numeric_limits<float>::infinity()); break;
             case 5: shadow[0] = shadow[0].to_sparse(); break;
         }
-        REQUIRE_THROWS(r::ModelEma::from_cpu_shadow(parameters, shadow, 0.9, 100));
+        REQUIRE_THROWS(r::ModelEma::from_cpu_shadow(parameters, shadow, 0.9, 100, 37));
+        REQUIRE(parameters.front().data_ptr() == pointer);
+        REQUIRE(api::equal(parameters.front(), api::ones({2, 3})));
+    }
+    for (const auto count : {int64_t{-1}, std::numeric_limits<int64_t>::max()}) {
+        REQUIRE_THROWS(r::ModelEma::from_cpu_shadow(parameters, parameters, 0.9, 100, count));
         REQUIRE(parameters.front().data_ptr() == pointer);
         REQUIRE(api::equal(parameters.front(), api::ones({2, 3})));
     }

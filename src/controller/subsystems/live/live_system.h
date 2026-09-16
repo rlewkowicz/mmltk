@@ -44,6 +44,7 @@ struct LiveSnapshot final {
     bool running = false;
     bool cancellation_requested = false;
     std::uint64_t completed_frames = 0U;
+    // CLEANUP-IGNORE: Live's frame and typed events are independent declarations, not shared execution.
     VisualFrame frame{};
     // CLEANUP-IGNORE: LiveSnapshot is a distinct reflected snapshot even where its closing shape matches peers.
 };

@@ -21,6 +21,7 @@ struct TrainingContinuationValues {
     double best_ema_metric = 0.0;
     double grad_scaler_scale = 1.0;
     int64_t grad_scaler_growth_tracker = 0;
+    int64_t ema_completed_updates = 0;
     std::string training_attempt_id;
     std::string training_original_descriptor;
 };

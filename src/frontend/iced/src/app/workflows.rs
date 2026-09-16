@@ -1158,6 +1158,7 @@ mod tests {
         next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
         app.workspace.select(FeatureId::Predict);
         app.advance_start();
+        // CLEANUP-IGNORE: Route changes independently assert cancellation, as do input edits.
         assert!(
             app.model
                 .workflow

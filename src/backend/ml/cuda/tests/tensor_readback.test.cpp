@@ -10,6 +10,16 @@
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/common/system/execution_policy.h"
+namespace {
+[[nodiscard]] mmltk::common::system::ScopedExecutionPolicy readback_test_policy() {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
+    CUDA_ASSERT_OK(cudaSetDevice(0));
+    const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
+    const auto& placement = execution.placement;
+    return mmltk::common::system::ScopedExecutionPolicy({placement.cpus, {}, 0, placement.numa_node, -10, false});
+}
+}  // namespace
 TEST_CASE("serialization readback preserves CPU views without registered capacity", "[readback][cpu]") {
     using mmltk::backend::ml::cuda::TensorReadbackBuffers;
     TensorReadbackBuffers readback;
@@ -33,12 +43,7 @@ TEST_CASE("serialization readback preserves CPU views without registered capacit
     readback.Release();
 }
 TEST_CASE("serialization slots retain simultaneous exact GPU extents and reuse capacity", "[cuda][readback]") {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
-    CUDA_ASSERT_OK(cudaSetDevice(0));
-    const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
-    const auto& p = execution.placement;
-    mmltk::common::system::ScopedExecutionPolicy policy({p.cpus, {}, 0, p.numa_node, -10, false});
+    const auto policy = readback_test_policy();
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     auto storage = at::arange(128, at::TensorOptions().dtype(at::kFloat).device(at::Device(at::kCUDA, 0)));
     const std::array sources{storage.narrow(0, 7, 32).reshape({4, 8}).transpose(0, 1), storage.narrow(0, 64, 8), storage.narrow(0, 0, 0)};
@@ -92,12 +97,7 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* to, const void* from, std::s
     return __real_cudaMemcpyAsync(to, from, size, kind, stream);
 }
 TEST_CASE("readback archive tensors preserve dtype, view flags and distinct active storage", "[cuda][readback][archive]") {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
-    CUDA_ASSERT_OK(cudaSetDevice(0));
-    const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
-    const auto& p = execution.placement;
-    mmltk::common::system::ScopedExecutionPolicy policy({p.cpus, {}, 0, p.numa_node, -10, false});
+    const auto policy = readback_test_policy();
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     for (const auto dtype : {at::kFloat, at::kHalf, at::kBFloat16, at::kLong, at::kBool, at::kComplexFloat}) {
         auto tensor = at::arange(16, at::kFloat).to(at::Device(at::kCUDA, 0), dtype).reshape({4, 4});
@@ -129,12 +129,7 @@ TEST_CASE("readback archive tensors preserve dtype, view flags and distinct acti
     }
 }
 TEST_CASE("failed readback proof retains the actual source and registered receiver after partial enqueue", "[cuda][readback][failure]") {
-    int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
-    CUDA_ASSERT_OK(cudaSetDevice(0));
-    const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
-    const auto& p = execution.placement;
-    mmltk::common::system::ScopedExecutionPolicy policy({p.cpus, {}, 0, p.numa_node, -10, false});
+    const auto policy = readback_test_policy();
     void* allocation = nullptr;
     CUDA_ASSERT_OK(cudaMalloc(&allocation, 16 * sizeof(float)));
     auto released = std::make_shared<std::atomic_bool>(false);

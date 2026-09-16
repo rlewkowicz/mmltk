@@ -3,7 +3,6 @@
 #include "detail/validation_samples.h"
 #include "src/controller/presentation/workspace_input.h"
 #include <algorithm>
-#include <atomic>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
@@ -56,7 +55,7 @@ class ValidationSystem::Impl final {
           model_(model),
           factory_(std::move(factory)),
           events_(std::move(events)),
-          execution_(std::move(execution)),
+          configuration_{std::move(execution)},
           samples_(visual, [this] { Changed(); }) {
         if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
         if (visual.valid()) {
@@ -77,10 +76,7 @@ class ValidationSystem::Impl final {
         if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
         const auto selection = model_.selection();
         run_.Start({
-            .policy = execution_
-                          ? std::optional<
-                                mmltk::common::system::ExecutionPolicyRequest>{{execution_->placement.cpus, {}, 0, execution_->placement.numa_node, -10, false}}
-                          : std::nullopt,
+            .policy = configuration_.worker_policy(),
             .prepare =
                 [this] {
                     std::scoped_lock lock(mutex_);
@@ -89,41 +85,27 @@ class ValidationSystem::Impl final {
                     contracts::begin_compute(state_, *next, "Inspecting selected inputs");
                 },
             .work = [this, settings = settings.settings, selection](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-                contracts::ComputeTerminal terminal;
-                bool failed = false;
-                std::atomic_bool malformed_progress = false;
-                try {
-                    if (stop.stop_requested()) return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
-                    const auto inspection =
-                        dataset_.Inspect({settings.workflows.validate.request.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
-                    if (stop.stop_requested()) return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
-                    auto prepared = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, selection);
-                    if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
-                    if (stop.stop_requested()) return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
-                    if (!runtime_) runtime_ = factory_();
-                    if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-                    const auto progress = [this, &malformed_progress](const contracts::ComputeProgress& p) {
-                        if (!p.valid()) {
-                            malformed_progress.store(true, std::memory_order_relaxed);
-                            return;
+                auto terminal = run_checked_compute(
+                    [&](const ComputeProgressSink& progress) {
+                        if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+                        const auto inspection =
+                            dataset_.Inspect({settings.workflows.validate.request.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
+                        if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+                        auto prepared = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, selection);
+                        if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
+                        if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+                        if (!runtime_) runtime_ = factory_();
+                        if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
+                        auto result = runtime_->Run(std::move(*prepared), stop, progress, delivery_);
+                        {
+                            std::scoped_lock lock(mutex_);
+                            evaluation_ = std::move(result.evaluation);
+                            evaluation_generation_ = state_.generation_frontier;
                         }
-                        Progress(p);
-                    };
-                    auto result = runtime_->Run(std::move(*prepared), stop, progress, delivery_);
-                    terminal = result.terminal;
-                    {
-                        std::scoped_lock lock(mutex_);
-                        evaluation_ = std::move(result.evaluation);
-                        evaluation_generation_ = state_.generation_frontier;
-                    }
-                    if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal())
-                        throw std::runtime_error("compute runtime returned an invalid terminal");
-                    failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;
-                } catch (...) {
-                    failed = true;
-                    terminal = contracts::compute_failure_terminal(std::current_exception(), "compute runtime failed");
-                }
-                if (failed) runtime_.reset();
+                        return std::move(result.terminal);
+                    },
+                    [this](const contracts::ComputeProgress& progress) { Progress(progress); });
+                if (terminal.outcome == contracts::ComputeOperationOutcome::Failed) runtime_.reset();
                 return Complete(std::move(terminal));
             },
             .failure = [this](const std::exception_ptr failure) -> direct::LocalRun::Notification {
@@ -186,7 +168,7 @@ class ValidationSystem::Impl final {
     mutable std::mutex mutex_;
     contracts::ComputeUiState state_{};
     std::unique_ptr<ValidationRuntime> runtime_;
-    std::optional<mmltk::frameworks::gpu::DeviceExecution> execution_;
+    DirectComputeConfiguration configuration_;
     direct::LocalRun run_;
     std::optional<mmltk::backend::models::rfdetr::ValidationBackendResult> evaluation_;
     std::uint64_t evaluation_generation_ = 0U;

@@ -22,7 +22,7 @@ class CudaRuntimeResources final {
     using Command = std::move_only_function<void()>;
     void WithExecution(Command);
     void WithDevice(Command);
-    std::optional<mmltk::frameworks::gpu::DeviceExecution> execution_;
+    DirectComputeConfiguration configuration_;
     int device_ = -1;
     cudaStream_t stream_ = nullptr;
     Close close_;

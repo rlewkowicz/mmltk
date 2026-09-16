@@ -7,7 +7,7 @@
 #include "src/frameworks/gpu/cuda_device_scope.h"
 namespace mmltk::controller::detail {
 CudaRuntimeResources::CudaRuntimeResources(const DirectComputeConfiguration config, Close close)
-    : execution_(config.execution), device_(config.execution ? config.execution->device : -1), close_(std::move(close)) {
+    : configuration_(config), device_(config.execution ? config.execution->device : -1), close_(std::move(close)) {
     if (!config.valid()) throw contracts::UnavailableError("compute CUDA device is unavailable");
     WithExecution([this] {
         const auto status = cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
@@ -48,7 +48,7 @@ void CudaRuntimeResources::CloseSession() {
     });
 }
 void CudaRuntimeResources::WithExecution(Command work) {
-    mmltk::common::system::ScopedExecutionPolicy policy({execution_->placement.cpus, {}, 0, execution_->placement.numa_node, -10, false});
+    mmltk::common::system::ScopedExecutionPolicy policy(*configuration_.worker_policy());
     WithDevice(std::move(work));
 }
 void CudaRuntimeResources::WithDevice(Command work) {

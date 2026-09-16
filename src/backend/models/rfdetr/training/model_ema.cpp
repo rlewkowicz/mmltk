@@ -5,6 +5,7 @@
 #include <cmath>
 #include <exception>
 #include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include "src/backend/ml/cuda/tensor_readback.h"
@@ -14,17 +15,19 @@ ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, const double de
     shadow_.reserve(parameters.size());
     for (const auto& parameter : parameters) shadow_.push_back(parameter.detach().clone());
 }
-void ModelEma::update(const int64_t step) {
+void ModelEma::update() {
     if (selected_) throw std::logic_error("cannot update selected EMA weights");
     if (shadow_.empty()) return;
-    const double updates = static_cast<double>(std::max<int64_t>(1, step + 1));
+    if (completed_updates_ == std::numeric_limits<int64_t>::max()) throw std::overflow_error("EMA update count is exhausted");
+    const double updates = static_cast<double>(completed_updates_ + 1);
     const double decay = tau_ > 0.0 ? decay_ * (1.0 - std::exp(-updates / tau_)) : decay_;
     torch::NoGradGuard guard;
     at::_foreach_mul_(shadow_, decay);
     at::_foreach_add_(shadow_, source_, 1.0 - decay);
+    ++completed_updates_;
 }
-ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, ShadowCandidate candidate, double decay, double tau)
-    : decay_(decay), tau_(tau), source_(parameters), shadow_(std::move(candidate.tensors)) {}
+ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, ShadowCandidate candidate, double decay, double tau, int64_t completed_updates)
+    : decay_(decay), tau_(tau), completed_updates_(completed_updates), source_(parameters), shadow_(std::move(candidate.tensors)) {}
 void ModelEma::validate_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow) {
     if (parameters.size() != cpu_shadow.size()) throw std::invalid_argument("EMA CPU inventory differs from active parameters");
     // Validate the entire CPU inventory before any device allocation or copy.
@@ -36,13 +39,15 @@ void ModelEma::validate_cpu_shadow(const std::vector<torch::Tensor>& parameters,
             throw std::invalid_argument("EMA CPU tensor differs from its active parameter");
     }
 }
-ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow, double decay, double tau) {
+ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow, double decay, double tau,
+                                   int64_t completed_updates) {
+    if (completed_updates < 0 || completed_updates == std::numeric_limits<int64_t>::max()) throw std::invalid_argument("invalid EMA completed update count");
     validate_cpu_shadow(parameters, cpu_shadow);
     ShadowCandidate candidate;
     candidate.tensors.reserve(parameters.size());
     for (std::size_t index = 0; index < parameters.size(); ++index)
         candidate.tensors.push_back(cpu_shadow[index].to(parameters[index].device(), cpu_shadow[index].scalar_type(), false, true));
-    return ModelEma(parameters, std::move(candidate), decay, tau);
+    return ModelEma(parameters, std::move(candidate), decay, tau, completed_updates);
 }
 ModelEma::Selection::Selection(ModelEma& owner, torch::nn::Module& module) : owner_(&owner), module_(&module), training_(module.is_training()) {
     if (owner.selected_) throw std::logic_error("EMA weights already selected");

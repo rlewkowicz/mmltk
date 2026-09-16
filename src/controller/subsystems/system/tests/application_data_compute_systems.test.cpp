@@ -50,6 +50,7 @@
 #include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/system/detail/predict_revision.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
+#include "src/controller/subsystems/system/compute_runtime.h"
 #include "src/controller/subsystems/system/dataset_system.h"
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/model_system.h"
@@ -89,9 +90,9 @@ TEST_CASE("Predict revision capacity preserves cancellation and terminal observa
     REQUIRE(earlier_cancel == maximum - 5U);
     CHECK(Revision::Progress(*earlier_cancel, true) == maximum - 4U);
 }
-class TrainingTerminals final {
+template <class Event>
+class TerminalSequence final {
    public:
-    using Event = TrainingSystem::event_type;
     void Publish(Event event) {
         switch (next_.fetch_add(1U)) {
             case 0U: first_.set_value(std::move(event)); break;
@@ -109,6 +110,32 @@ class TrainingTerminals final {
     std::promise<Event> third_;
     std::atomic_size_t next_ = 0U;
 };
+TEST_CASE("compute runtime admission preserves valid progress and reports malformed or failed work", "[controller][systems][compute]") {
+    const auto scenario = GENERATE(0, 1, 2, 3);
+    std::vector<std::uint64_t> delivered;
+    const auto terminal = run_checked_compute(
+        [&](const ComputeProgressSink& progress) {
+            std::jthread reporter([&] {
+                progress({1U, 1U, 2U, "first"});
+                if (scenario == 1) progress({2U, 3U, 2U, "invalid"});
+                progress({3U, 2U, 2U, "last"});
+            });
+            reporter.join();
+            if (scenario == 3) throw std::runtime_error("runtime failure detail");
+            return contracts::make_compute_terminal(scenario == 2 ? contracts::ComputeOperationOutcome::Running : contracts::ComputeOperationOutcome::Succeeded,
+                                                    0U, 2U);
+        },
+        [&](const contracts::ComputeProgress& progress) { delivered.push_back(progress.sequence); });
+    CHECK(delivered == std::vector<std::uint64_t>{1U, 3U});
+    CHECK(terminal.valid_worker_terminal());
+    if (scenario == 0) {
+        CHECK(terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
+        CHECK(terminal.completed == 2U);
+    } else {
+        CHECK(terminal.outcome == contracts::ComputeOperationOutcome::Failed);
+        CHECK(terminal.detail == (scenario == 3 ? "runtime failure detail" : "compute runtime returned an invalid terminal"));
+    }
+}
 void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesystem::path& root) {
     const auto settings_path = root / "settings.json";
     REQUIRE(std::filesystem::remove(settings_path));
@@ -941,10 +968,7 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
     REQUIRE(settings.Load(install_settings(root)).applied());
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0U;
-    std::promise<DatasetSystem::event_type> first_terminal;
-    std::promise<DatasetSystem::event_type> second_terminal;
-    std::promise<DatasetSystem::event_type> third_terminal;
-    std::atomic_size_t terminals = 0U;
+    TerminalSequence<DatasetSystem::event_type> terminals;
     std::atomic_size_t progress = 0U;
     DatasetSystem dataset{settings,
                           [&] {
@@ -954,20 +978,15 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
                           [&](DatasetSystem::event_type event) {
                               if (std::holds_alternative<DatasetProgress>(event))
                                   ++progress;
-                              else {
-                                  switch (terminals++) {
-                                      case 0U: first_terminal.set_value(std::move(event)); break;
-                                      case 1U: second_terminal.set_value(std::move(event)); break;
-                                      default: third_terminal.set_value(std::move(event)); break;
-                                  }
-                              }
+                              else
+                                  terminals.Publish(std::move(event));
                           }};
     static_cast<void>(dataset.Compile({}));
     CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
     // CLEANUP-IGNORE: Compile and Inspect are separate dataset admission endpoints sharing one system-owned runtime.
     CHECK_THROWS_AS(dataset.Inspect({}, "rf-detr-base", 560U), contracts::BusyError);
     gate->Release();
-    const auto failed_dataset = first_terminal.get_future().get();
+    const auto failed_dataset = terminals.First().get();
     REQUIRE(std::holds_alternative<DatasetChanged>(failed_dataset));
     CHECK(std::get<DatasetChanged>(failed_dataset).snapshot.generation == 1U);
     CHECK(std::get<DatasetChanged>(failed_dataset).snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
@@ -976,11 +995,11 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
     gate = std::make_shared<StopGate>();
     static_cast<void>(dataset.Compile({}));
     static_cast<void>(dataset.Stop());
-    CHECK(std::holds_alternative<DatasetChanged>(second_terminal.get_future().get()));
+    CHECK(std::holds_alternative<DatasetChanged>(terminals.Second().get()));
     CHECK(dataset.snapshot().terminal.outcome == contracts::ArtifactTerminalOutcome::Cancelled);
     gate->Release();
     static_cast<void>(dataset.Compile({}));
-    CHECK(std::holds_alternative<DatasetChanged>(third_terminal.get_future().get()));
+    CHECK(std::holds_alternative<DatasetChanged>(terminals.Third().get()));
     CHECK(dataset.snapshot().terminal.outcome == contracts::ArtifactTerminalOutcome::Succeeded);
     CHECK(constructions == 2U);
 }
@@ -1060,34 +1079,24 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     auto [settings, dataset, model] = fixture.systems();
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0U;
-    std::promise<ValidationSystem::event_type> first_terminal;
-    std::promise<ValidationSystem::event_type> second_terminal;
-    std::promise<ValidationSystem::event_type> third_terminal;
-    std::atomic_size_t terminals = 0U;
+    TerminalSequence<ValidationSystem::event_type> terminals;
     std::atomic_size_t progress = 0U;
     ValidationSystem validation{settings, dataset, model,
                                 [&] {
                                     const bool fail = constructions++ == 0U;
                                     return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = gate, .fail = fail});
                                 },
-                                // CLEANUP-IGNORE: Compute and dataset event sequences prove distinct typed system contracts.
                                 [&](ValidationSystem::event_type event) {
                                     if (std::holds_alternative<ValidationProgress>(event))
-                                        ++progress;  // CLEANUP-IGNORE: This oracle consumes the distinct typed compute
-                                                     // event stream; dataset events are validated independently above.
-                                    else {
-                                        switch (terminals++) {
-                                            case 0U: first_terminal.set_value(std::move(event)); break;
-                                            case 1U: second_terminal.set_value(std::move(event)); break;
-                                            default: third_terminal.set_value(std::move(event)); break;
-                                        }
-                                    }
+                                        ++progress;
+                                    else
+                                        terminals.Publish(std::move(event));
                                 }};
     static_cast<void>(validation.Start({}));
     // CLEANUP-IGNORE: Validation Busy evidence is independent from file-dialog and dataset admission evidence.
     CHECK_THROWS_AS(validation.Start({}), contracts::BusyError);
     gate->Release();
-    const auto failed_compute = first_terminal.get_future().get();
+    const auto failed_compute = terminals.First().get();
     REQUIRE(std::holds_alternative<ValidationChanged>(failed_compute));
     CHECK(std::get<ValidationChanged>(failed_compute).snapshot.operation.generation_frontier == 1U);
     CHECK(std::get<ValidationChanged>(failed_compute).snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
@@ -1096,11 +1105,11 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     gate = std::make_shared<StopGate>();
     static_cast<void>(validation.Start({}));
     static_cast<void>(validation.Stop());
-    CHECK(std::holds_alternative<ValidationChanged>(second_terminal.get_future().get()));
+    CHECK(std::holds_alternative<ValidationChanged>(terminals.Second().get()));
     CHECK(validation.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
     gate->Release();
     static_cast<void>(validation.Start({}));
-    CHECK(std::holds_alternative<ValidationChanged>(third_terminal.get_future().get()));
+    CHECK(std::holds_alternative<ValidationChanged>(terminals.Third().get()));
     CHECK(validation.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     CHECK(constructions == 2U);
     const auto measured = validation.snapshot();
@@ -1693,7 +1702,7 @@ TEST_CASE("training owns provider offers and remote control with Busy and lazy f
     auto [settings, dataset, model] = fixture.systems();
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0U;
-    TrainingTerminals terminals;
+    TerminalSequence<TrainingSystem::event_type> terminals;
     TrainingSystem training{settings, dataset, model, reconstructing_training_runtime(gate, constructions), [&](TrainingSystem::event_type event) {
                                 if (std::holds_alternative<TrainingProgress>(event)) return;
                                 terminals.Publish(std::move(event));
@@ -1734,7 +1743,7 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     std::atomic_size_t sequence_one_progress = 0U;
     std::promise<void> first_successful_progress;
     auto first_successful_progress_observed = first_successful_progress.get_future();
-    TrainingTerminals terminals;
+    TerminalSequence<TrainingSystem::event_type> terminals;
     TrainingSystem training{settings, dataset, model, reconstructing_training_runtime(gate, constructions), [&](TrainingSystem::event_type event) {
                                 if (const auto* progress = std::get_if<TrainingProgress>(&event)) {
                                     if (progress->local.progress.sequence == 1U) {
@@ -1758,6 +1767,7 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     const auto before_rejected_clear = training.snapshot();
     CHECK_THROWS_AS(training.Clear({}), contracts::BusyError);
     CHECK(training.snapshot() == before_rejected_clear);
+    // CLEANUP-IGNORE: Training cancellation and restart assert its local terminal, independently of validation metrics.
     static_cast<void>(training.Stop({}));
     CHECK(std::holds_alternative<TrainingChanged>(terminals.Second().get()));
     CHECK(training.snapshot().local.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);

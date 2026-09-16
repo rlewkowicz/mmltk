@@ -1740,33 +1740,38 @@ impl ExploreDisplay {
     }
 }
 
+fn has_live_read(frame: FrameReady) -> bool {
+    LIVE_READS.with(|reads| {
+        reads
+            .borrow()
+            .iter()
+            .flatten()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|read| read.0 == frame)
+    })
+}
+
+fn can_display_pending(frame: FrameReady, has_content: impl Fn(&ImagePublication) -> bool) -> bool {
+    let live = has_live_read(frame);
+    let incumbent = RENDERER.with(|renderer| {
+        renderer
+            .borrow()
+            .as_ref()
+            .and_then(|renderer| renderer.imported.as_ref())
+            .is_some_and(|imported| imported.image.retained().is_some() && has_content(&imported.image))
+    });
+    // An accepted initial offer constructs the first shader owner. Replacements
+    // keep the incumbent until their physical read exists.
+    live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame))))
+}
+
 pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDisplay> {
     if let Some(surface) = requested
         && let Some(frame) = surface.frame
     {
-        let live = LIVE_READS.with(|reads| {
-            reads
-                .borrow()
-                .iter()
-                .flatten()
-                .filter_map(std::sync::Weak::upgrade)
-                .any(|read| read.0 == frame)
+        let accepted = can_display_pending(frame, |image| {
+            image.content.gallery().is_some() || image.content.detail().is_some()
         });
-        let incumbent = RENDERER.with(|renderer| {
-            renderer
-                .borrow()
-                .as_ref()
-                .and_then(|renderer| renderer.imported.as_ref())
-                .is_some_and(|imported| {
-                    imported.image.retained().is_some()
-                        && (imported.image.content.gallery().is_some()
-                            || imported.image.content.detail().is_some())
-                })
-        });
-        // The initial accepted offer can construct the first shader owner.
-        // With an incumbent, reconciliation must acquire the replacement first.
-        let accepted =
-            live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame))));
         if accepted
             && let Some(paired) = metadata::pending(frame)
             && paired.view_ready
@@ -1821,26 +1826,7 @@ fn drawable_content<T>(
     if frame.content_session != crate::generated::presentation_source_session(kind) {
         return None;
     }
-    let live = LIVE_READS.with(|reads| {
-        reads
-            .borrow()
-            .iter()
-            .flatten()
-            .filter_map(std::sync::Weak::upgrade)
-            .any(|read| read.0 == frame)
-    });
-    let incumbent = RENDERER.with(|renderer| {
-        renderer
-            .borrow()
-            .as_ref()
-            .and_then(|renderer| renderer.imported.as_ref())
-            .is_some_and(|imported| {
-                imported.image.retained().is_some() && retained_content(&imported.image).is_some()
-            })
-    });
-    // Admit an accepted initial offer so the first shader can acquire its read.
-    // Replacements remain paired with the incumbent until their physical read exists.
-    if (live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame)))))
+    if can_display_pending(frame, |image| retained_content(image).is_some())
         && let Some(pending) = metadata::pending(frame)
         && pending.view_ready
         && same_allocation(requested, pending.surface)
@@ -2741,14 +2727,7 @@ fn preserving_color_attachment(view: &wgpu::TextureView) -> wgpu::RenderPassColo
 
 pub(crate) fn complete_sample(frame: FrameReady) {
     // A disposed publication's late copy receipt cannot resurrect its lease.
-    let live = LIVE_READS.with(|reads| {
-        reads
-            .borrow()
-            .iter()
-            .flatten()
-            .filter_map(std::sync::Weak::upgrade)
-            .any(|read| read.0 == frame)
-    });
+    let live = has_live_read(frame);
     let released = RELEASED_FRAMES.with(|receipts| {
         receipts.get().iter().flatten().any(|prior| {
             same_mailbox_slot(*prior, frame)
@@ -3267,14 +3246,7 @@ fn write_content_geometry(queue: &wgpu::Queue, geometry: &wgpu::Buffer, key: Geo
 }
 
 pub(crate) fn release(frame: FrameReady) {
-    if LIVE_READS.with(|reads| {
-        reads
-            .borrow()
-            .iter()
-            .flatten()
-            .filter_map(std::sync::Weak::upgrade)
-            .any(|read| read.0 == frame)
-    }) {
+    if has_live_read(frame) {
         return;
     }
     take_publication(frame);

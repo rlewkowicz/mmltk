@@ -541,6 +541,7 @@ void PredictSystem::Shutdown() noexcept { impl_->Shutdown(); }
 PredictSnapshot PredictSystem::snapshot() const { return impl_->snapshot(); }
 VisualSourceObservation PredictSystem::ObserveSource() const {
     std::scoped_lock lock(impl_->mutex_);
+    // CLEANUP-IGNORE: Sealed source forwarding retains Predict ownership; VisualRuntimeOwner shares the implementation.
     return visual_source::Observe(impl_->state_);
 }
 // CLEANUP-IGNORE: Predict forwards its sealed source API to its own owner and the existing shared renderer.

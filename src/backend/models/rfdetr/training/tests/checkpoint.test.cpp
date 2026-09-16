@@ -487,11 +487,14 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
         REQUIRE(entry != source.end());
         for (std::int64_t row = 0; row < entry->tensor.size(dimension); ++row) entry->tensor.select(dimension, row).fill_(10. + static_cast<double>(row));
     }
-    const auto random_before = at::detail::getDefaultCPUGenerator().get_state();
-    auto candidate = owner.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
-    owner.commit_normalized_state(std::move(candidate));
-    CHECK(tensor_api::equal(random_before, at::detail::getDefaultCPUGenerator().get_state()));
-    const auto after = owner.module().named_parameters(true);
+    const auto transfer = [&](r::detail::NativeModelTechnicalOwner& destination) {
+        const auto random_before = at::detail::getDefaultCPUGenerator().get_state();
+        auto candidate = destination.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
+        destination.commit_normalized_state(std::move(candidate));
+        CHECK(tensor_api::equal(random_before, at::detail::getDefaultCPUGenerator().get_state()));
+        return destination.module().named_parameters(true);
+    };
+    const auto after = transfer(owner);
     for (const auto& [name, dimension] : axes) {
         const auto* actual = after.find(name);
         REQUIRE(actual);
@@ -522,11 +525,7 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
         auto& destination = r::detail::native_model_owner(smaller);
         destination.initialize_training_supervision(31);
         const auto seed = r::testsupport::clone_normalized_model_state(destination.module());
-        const auto random_state = at::detail::getDefaultCPUGenerator().get_state();
-        auto mapped = destination.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
-        destination.commit_normalized_state(std::move(mapped));
-        CHECK(tensor_api::equal(random_state, at::detail::getDefaultCPUGenerator().get_state()));
-        const auto parameters = destination.module().named_parameters(true);
+        const auto parameters = transfer(destination);
         for (const auto& [name, dimension] : axes) {
             const auto* actual = parameters.find(name);
             const auto original = std::ranges::find(seed, name, &r::NormalizedModelStateEntry::name);

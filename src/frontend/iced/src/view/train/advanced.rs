@@ -292,6 +292,7 @@ mod tests {
     #[test]
     fn augmentation_and_perceptual_edits_are_independent() {
         let mut model = installed_settings_model();
+        // CLEANUP-IGNORE: Repeated typed field access checks distinct augmentation settings.
         assert!(
             model
                 .draft

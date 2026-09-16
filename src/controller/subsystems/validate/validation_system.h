@@ -34,6 +34,7 @@ class ValidationSystem final {
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
     void SetInputPeer(std::uint64_t);
     void Shutdown() noexcept;
+    // CLEANUP-IGNORE: Validation's sealed read API uses shared rendering without sharing another system's state.
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] ValidationSnapshot snapshot() const;
     [[nodiscard]] std::optional<ValidationImageMetadata> ImageSnapshot(const VisualFrame&) const;
     [[nodiscard]] VisualSourceObservation ObserveSource() const;

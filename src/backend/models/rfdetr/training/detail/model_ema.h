@@ -12,10 +12,11 @@ class ModelEma final {
     ModelEma(const std::vector<torch::Tensor>& model_params, double decay, double tau);
     ModelEma(ModelEma&&) noexcept = default;
     ModelEma& operator=(ModelEma&&) noexcept = default;
-    void update(int64_t step);
+    void update();
+    [[nodiscard]] int64_t completed_updates() const noexcept { return completed_updates_; }
     static void validate_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow);
     [[nodiscard]] static ModelEma from_cpu_shadow(const std::vector<torch::Tensor>& model_params, const std::vector<torch::Tensor>& cpu_shadow, double decay,
-                                                  double tau);
+                                                  double tau, int64_t completed_updates);
     class Selection final {
        public:
         Selection(ModelEma&, torch::nn::Module&);
@@ -36,9 +37,10 @@ class ModelEma final {
     void copy_to(std::vector<torch::Tensor>& model_params) const;
 
    private:
-    ModelEma(const std::vector<torch::Tensor>&, ShadowCandidate, double, double);
+    ModelEma(const std::vector<torch::Tensor>&, ShadowCandidate, double, double, int64_t);
     double decay_;
     double tau_;
+    int64_t completed_updates_ = 0;
     std::vector<torch::Tensor> source_;
     std::vector<torch::Tensor> shadow_;
     std::vector<torch::Tensor> backup_;

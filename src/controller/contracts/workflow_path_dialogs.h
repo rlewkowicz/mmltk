@@ -17,10 +17,14 @@ struct WorkflowPathDialog final {
 template <auto Path>
 [[nodiscard]] consteval std::optional<WorkflowPathDialog> workflow_path_dialog() {
     using mmltk::frameworks::reflection::member_path;
+    // CLEANUP-IGNORE: Typed dataset paths and descriptor paths select different controller metadata.
     if constexpr (std::same_as<
                       std::remove_cv_t<decltype(Path)>,
                       std::remove_cv_t<decltype(member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
-                                                            &mmltk::backend::models::rfdetr::ValidateRequest::compiled_path>)>>) {
+                                                            &mmltk::backend::models::rfdetr::ValidateRequest::compiled_path>)>> ||
+                  std::same_as<std::remove_cv_t<decltype(Path)>,
+                               std::remove_cv_t<decltype(member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
+                                                                     &mmltk::backend::models::rfdetr::TrainRequest::val_compiled_path>)>>) {
         return WorkflowPathDialog{"Select validation dataset", "Compiled datasets", "*.mmltk *.bin", FileDialogMode::OpenFile};
     }
     if constexpr (std::same_as<std::remove_cv_t<decltype(Path)>,
@@ -37,11 +41,6 @@ template <auto Path>
                                std::remove_cv_t<decltype(member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
                                                                      &mmltk::backend::models::rfdetr::TrainRequest::train_compiled_path>)>>) {
         return WorkflowPathDialog{"Select training dataset", "Compiled datasets", "*.mmltk *.bin", FileDialogMode::OpenFile};
-    }
-    if constexpr (std::same_as<std::remove_cv_t<decltype(Path)>,
-                               std::remove_cv_t<decltype(member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
-                                                                     &mmltk::backend::models::rfdetr::TrainRequest::val_compiled_path>)>>) {
-        return WorkflowPathDialog{"Select validation dataset", "Compiled datasets", "*.mmltk *.bin", FileDialogMode::OpenFile};
     }
     if constexpr (std::same_as<std::remove_cv_t<decltype(Path)>,
                                std::remove_cv_t<decltype(member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,

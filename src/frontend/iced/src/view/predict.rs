@@ -280,6 +280,7 @@ impl Component {
             Message::StartRequested => Outcome::StartRequested,
             // CLEANUP-IGNORE: Predict's Stop arm precedes its distinct child-domain reduction.
             Message::StopRequested => Outcome::StopRequested,
+            // CLEANUP-IGNORE: Predict has its own typed outcomes; the model-card implementation is already shared.
             Message::PauseRequested(paused) => Outcome::PauseRequested(paused),
             // CLEANUP-IGNORE: Predict maps the model-card child outcome into its local domain.
             Message::Model(message) => {
@@ -318,6 +319,7 @@ impl Component {
                     crate::generated::edit_workflowspredictsourcevideofilepath(draft, value)
                 })?,
             ),
+            // CLEANUP-IGNORE: This local outcome mapping and adjacent test scaffolding have no shared product policy with Export.
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
             // CLEANUP-IGNORE: Predict alone converts its child workspace result into its local outcome.
             Message::Workspace(message) => {

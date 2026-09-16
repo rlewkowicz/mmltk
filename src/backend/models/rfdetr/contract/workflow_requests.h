@@ -87,6 +87,7 @@ enum class ValidationLogMode : std::uint8_t {
 };
 // CLEANUP-IGNORE: Validation and training are distinct canonical requests even where their reflected path fields align.
 struct ValidateRequest : ModelArtifactRequest, InferenceExecutionConfig {
+    // CLEANUP-IGNORE: Distinct canonical path fields share constraints, not duplicated runtime behavior.
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path source_dir;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path save_engine_path;

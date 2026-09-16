@@ -24,6 +24,7 @@ mmltk_register_public_headers(
 mmltk_register_ordinary_sources(
     mmltk_controller_data_compute_systems
     compute_intent_materializer.cpp
+    compute_runtime.cpp
     detail/cuda_runtime_resources.cpp
     dataset_system.cpp
     local_run.cpp

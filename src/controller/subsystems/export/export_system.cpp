@@ -1,6 +1,5 @@
 #include "export_system.h"
 #include <algorithm>
-#include <atomic>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
@@ -46,7 +45,7 @@ class ExportSystem::Impl final {
    public:
     Impl(SettingsSystem& settings, DatasetSystem&, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<ExportSystem::event_type> events,
          std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
-        : settings_(settings), model_(model), factory_(std::move(factory)), events_(std::move(events)), execution_(std::move(execution)) {
+        : settings_(settings), model_(model), factory_(std::move(factory)), events_(std::move(events)), configuration_{std::move(execution)} {
         if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
     }
     ~Impl() { Shutdown(); }
@@ -57,10 +56,7 @@ class ExportSystem::Impl final {
         auto prepared = subsystems::system::ComputeIntentMaterializer::Export(settings.settings, {}, selection);
         if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
         run_.Start({
-            .policy = execution_
-                          ? std::optional<
-                                mmltk::common::system::ExecutionPolicyRequest>{{execution_->placement.cpus, {}, 0, execution_->placement.numa_node, -10, false}}
-                          : std::nullopt,
+            .policy = configuration_.worker_policy(),
             .prepare =
                 [this] {
                     std::scoped_lock lock(mutex_);
@@ -69,29 +65,16 @@ class ExportSystem::Impl final {
                     contracts::begin_compute(state_, *next, {});
                 },
             .work = [this, prepared = std::move(prepared)](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
-                contracts::ComputeTerminal terminal;
-                bool failed = false;
-                std::atomic_bool malformed_progress = false;
-                try {
-                    if (stop.stop_requested()) return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
-                    if (!runtime_) runtime_ = factory_();
-                    if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-                    const auto progress = [this, &malformed_progress](const contracts::ComputeProgress& p) {
-                        if (!p.valid()) {
-                            malformed_progress.store(true, std::memory_order_relaxed);
-                            return;
-                        }
-                        Progress(p);
-                    };
-                    terminal = runtime_->Run(std::move(*prepared), stop, progress);
-                    if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal())
-                        throw std::runtime_error("compute runtime returned an invalid terminal");
-                    failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;
-                } catch (...) {
-                    failed = true;
-                    terminal = contracts::compute_failure_terminal(std::current_exception(), "compute runtime failed");
-                }
-                if (failed) runtime_.reset();
+                auto terminal = run_checked_compute(
+                    [&](const ComputeProgressSink& progress) {
+                        if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+                        if (!runtime_) runtime_ = factory_();
+                        if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
+                        // CLEANUP-IGNORE: Export owns retirement and publication; LocalRun and run_checked_compute already share execution.
+                        return runtime_->Run(std::move(*prepared), stop, progress);
+                    },
+                    [this](const contracts::ComputeProgress& progress) { Progress(progress); });
+                if (terminal.outcome == contracts::ComputeOperationOutcome::Failed) runtime_.reset();
                 return Complete(std::move(terminal));
             },
             .failure = [this](const std::exception_ptr failure) -> direct::LocalRun::Notification {
@@ -145,7 +128,7 @@ class ExportSystem::Impl final {
     mutable std::mutex mutex_;
     contracts::ComputeUiState state_{};
     std::unique_ptr<ExportRuntime> runtime_;
-    std::optional<mmltk::frameworks::gpu::DeviceExecution> execution_;
+    DirectComputeConfiguration configuration_;
     direct::LocalRun run_;
 };
 ExportSystem::ExportSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ExportRuntimeFactory factory,
