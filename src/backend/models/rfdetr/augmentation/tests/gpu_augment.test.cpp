@@ -908,6 +908,8 @@ double sample_reference(const mmltk::backend::data::test_perceptual::Image& imag
 TEST_CASE("perceptual augmentation preserves plans and independently remaps mixed batches above custody capacity",
           "[backend][models][rfdetr][augmentation][perceptual][cuda]") {
     if (!has_cuda_device()) SKIP("CUDA unavailable; perceptual augmentation acceptance is unexecuted");
+    enum class Completion { Retry, Finish, Destroy };
+    const auto completion = GENERATE(Completion::Retry, Completion::Finish, Completion::Destroy);
     constexpr int extent = 9;
     constexpr std::size_t count = 64, plane = extent * extent;
     namespace oracle = mmltk::backend::data::test_perceptual;
@@ -927,13 +929,84 @@ TEST_CASE("perceptual augmentation preserves plans and independently remaps mixe
     auto config = test_support::isolated_augmentation_config();
     config.resize = {.probability = .7F, .min_strength = .8F, .max_strength = .8F};
     test_support::AugmentationExecution execution;
-    GpuAugmentationExecutor executor(config, count, extent, extent, execution.context, execution.retirement);
+    auto executor_owner = std::make_unique<GpuAugmentationExecutor>(config, count, extent, extent, execution.context, execution.retirement);
+    auto& executor = *executor_owner;
+    const auto executor_custody = test_support::GpuAugmentationTestAccess::Custody(executor);
+    REQUIRE(execution.retirement.fact().reservations == 1U);
+    std::vector<mmltk::frameworks::gpu::TerminalCudaRetirementLease> pressure;
+    while (auto lease = execution.retirement.Reserve()) pressure.push_back(std::move(*lease));
+    REQUIRE_FALSE(pressure.empty());
+    const auto pressured_reservations = execution.retirement.fact().reservations;
+    REQUIRE(pressured_reservations == pressure.size() + 1U);
+    const auto baseline_bytes = executor.workspace_capacity_bytes();
+    // The unselected path still runs while the concrete retirement owner is full.
     const auto ordinary = execute_and_copy(executor, input, indices, keys, {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
                                           GpuAugmentationOutputDomain::UnitRgb, extent);
     const auto plans = executor.plan().images;
-    const auto baseline_bytes = executor.device_capacity_bytes();
+    REQUIRE(std::ranges::any_of(plans, [](const auto& plan) {
+        return std::ceil(extent * std::sqrt(plan.area_scale)) < extent;
+    }));
+    CHECK(executor.workspace_capacity_bytes() == baseline_bytes);
     config.perceptual_downscale = true;
+    config.enabled = false;
     executor.Reconfigure(config);
+    CHECK(execute_and_copy(executor, input, indices, keys, {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
+                          GpuAugmentationOutputDomain::UnitRgb, extent) == input);
+    config.enabled = true;
+    executor.Reconfigure(config);
+    const auto enlarged = std::ranges::find_if(plans, [](const auto& plan) { return plan.area_scale > 1.0F; });
+    REQUIRE(enlarged != plans.end());
+    const auto enlarged_index = static_cast<std::size_t>(enlarged - plans.begin());
+    const std::vector<float> single_input(input.begin(), input.begin() + 3U * plane);
+    const auto single_output = execute_and_copy(executor, single_input, std::span{indices}.subspan(enlarged_index, 1U),
+        std::span{keys}.subspan(enlarged_index, 1U), {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
+        GpuAugmentationOutputDomain::UnitRgb, extent);
+    CHECK(std::equal(single_output.begin(), single_output.end(), ordinary.begin() + enlarged_index * 3U * plane));
+    CHECK(executor.workspace_capacity_bytes() == baseline_bytes);
+    CHECK(execution.retirement.fact().reservations == pressured_reservations);
+    {
+        auto pixels = std::make_shared<AugmentationPixels>(input.size());
+        std::weak_ptr<AugmentationPixels> allocations = pixels;
+        const std::vector<float> unchanged(input.size(), -.25F);
+        cuda_require(cudaMemcpy(pixels->input.data(), input.data(), pixels->input.size_bytes(), cudaMemcpyHostToDevice));
+        cuda_require(cudaMemcpy(pixels->output.data(), unchanged.data(), pixels->output.size_bytes(), cudaMemcpyHostToDevice));
+        GpuAugmentationBatchView batch{
+            .input = pixels->input.data(), .output = pixels->output.data(), .image_indices = indices,
+            .height = extent, .width = extent, .output_domain = GpuAugmentationOutputDomain::UnitRgb,
+            .input_custody = pixels, .output_custody = pixels,
+            .input_capacity_bytes = pixels->input.size_bytes(), .output_capacity_bytes = pixels->output.size_bytes()};
+        REQUIRE_THROWS_WITH(executor.Run(batch, keys, {}, {}, pixels->stream),
+                            "terminal CUDA custody reservation refused before resource allocation");
+        CHECK(executor.plan().images == plans);
+        CHECK(executor.workspace_capacity_bytes() == baseline_bytes);
+        CHECK(execution.retirement.admission_open());
+        CHECK(execution.retirement.fact().first_failure == cudaSuccess);
+        CHECK(execution.retirement.fact().occupancy == 0U);
+        CHECK(execution.retirement.fact().reservations == pressured_reservations);
+        std::vector<float> failed_output(input.size());
+        cuda_require(cudaMemcpy(failed_output.data(), pixels->output.data(), pixels->output.size_bytes(), cudaMemcpyDeviceToHost));
+        CHECK(failed_output == unchanged);
+        batch.input_custody.reset();
+        batch.output_custody.reset();
+        pixels.reset();
+        CHECK(allocations.expired());
+    }
+    if (completion != Completion::Retry) {
+        if (completion == Completion::Finish) {
+            REQUIRE_NOTHROW(executor.Finish());
+            CHECK(execution.retirement.fact().reservations == pressured_reservations);
+        }
+        executor_owner.reset();
+        CHECK(executor_custody.expired());
+        CHECK(execution.retirement.admission_open());
+        CHECK(execution.retirement.fact().occupancy == 0U);
+        CHECK(execution.retirement.fact().reservations == pressure.size());
+        pressure.clear();
+        CHECK(execution.retirement.fact().reservations == 0U);
+        return;
+    }
+    pressure.clear();
+    REQUIRE(execution.retirement.fact().reservations == 1U);
     const auto filtered = execute_and_copy(executor, input, indices, keys, {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
                                           GpuAugmentationOutputDomain::UnitRgb, extent);
     REQUIRE(executor.plan().images == plans);
@@ -962,11 +1035,17 @@ TEST_CASE("perceptual augmentation preserves plans and independently remaps mixe
     CHECK(shrink > 16U);
     CHECK(enlarge > 0U);
     CHECK(identity > 0U);
-    CHECK(executor.device_capacity_bytes() > baseline_bytes);
-    const auto retained_bytes = executor.device_capacity_bytes();
+    CHECK(executor.workspace_capacity_bytes() > baseline_bytes);
+    const auto retained_bytes = executor.workspace_capacity_bytes();
     CHECK(execute_and_copy(executor, input, indices, keys, {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
                           GpuAugmentationOutputDomain::UnitRgb, extent) == filtered);
-    CHECK(executor.device_capacity_bytes() == retained_bytes);
+    CHECK(executor.workspace_capacity_bytes() == retained_bytes);
+    CHECK(execution.retirement.fact().reservations == 2U);
+    executor_owner.reset();
+    CHECK(executor_custody.expired());
+    CHECK(execution.retirement.admission_open());
+    CHECK(execution.retirement.fact().occupancy == 0U);
+    CHECK(execution.retirement.fact().reservations == 0U);
 }
 
 TEST_CASE("perceptual donor reductions preserve mask box and class support", "[backend][augmentation][perceptual][cuda]") {

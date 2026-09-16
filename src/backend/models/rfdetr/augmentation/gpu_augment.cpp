@@ -409,14 +409,19 @@ struct GpuAugmentationExecutor::Impl final {
         require(batch.input_capacity_bytes >= input_bytes * (batch.input_slots.empty() ? count : 1U), "augmentation input logical extent is too small");
         require(batch.output_capacity_bytes >= image_bytes * count, "augmentation output logical extent is too small");
         if (!prepared) {
-            prepared = std::make_shared<PreparedStorage>(context, capacity);
-            downscaler = std::make_unique<GpuPerceptualDownscaler>(context, retirement);
-            reductions.reserve(capacity * 2U);
             require(capacity <= std::numeric_limits<std::size_t>::max() / 4U, "augmentation reduction index overflows");
+            auto candidate_storage = std::make_shared<PreparedStorage>(context, capacity);
+            auto candidate_downscaler = std::make_unique<GpuPerceptualDownscaler>(context, retirement);
+            reductions.reserve(capacity * 2U);
             reduction_keys.resize(capacity * 4U);
             reduction_indices.resize(capacity * 4U);
             occupied_reductions.reserve(capacity * 2U);
             view_reductions.resize(capacity * 2U);
+            // No candidate storage has been submitted. A failed allocation may
+            // retain harmless CPU capacity, but readiness stays unpublished.
+            // Both ownership transfers are nonthrowing; publish readiness last.
+            downscaler = std::move(candidate_downscaler);
+            prepared = std::move(candidate_storage);
         }
         reductions.clear();
         for (const auto slot : occupied_reductions) reduction_keys[slot].source = nullptr;
