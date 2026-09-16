@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/nn/functional/vision.h>
 #include "src/backend/models/rfdetr/core/postprocess.h"
+#include "src/backend/models/rfdetr/core/detail/detection_geometry.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include <ATen/ops/gather.h>
 #include <ATen/ops/index_select.h>

@@ -33,11 +33,11 @@ torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& reque
                                             .training_attempt_id = "attempt",
                                             .training_original_descriptor = "original.json"});
     torch::serialize::OutputArchive optimizer;
-    r::write_int(optimizer, "fixture", 1);
+    mmltk::backend::ml::serialization::write_int(optimizer, "fixture", 1);
     output.write("optimizer", optimizer);
     if (request.use_ema) {
         torch::serialize::OutputArchive ema;
-        r::write_int(ema, "entry_count", 0);
+        mmltk::backend::ml::serialization::write_int(ema, "entry_count", 0);
         output.write("ema_state", ema);
     }
     return r::testsupport::checkpoint_input(output);
@@ -73,7 +73,7 @@ void test_current_continuation_required_fields() {
         REQUIRE_THROWS(r::detail::read_training_continuation(input));
     }
     torch::serialize::OutputArchive weights;
-    r::write_string(weights, "source_kind", "weights-only");
+    mmltk::backend::ml::serialization::write_string(weights, "source_kind", "weights-only");
     auto input = r::testsupport::checkpoint_input(weights);
     REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
@@ -180,12 +180,12 @@ void test_ordered_cpu_ema_admission() {
     }
     for (int fault = 0; fault != 5; ++fault) {
         torch::serialize::OutputArchive output;
-        r::write_int(output, "entry_count", fault == 1 ? 1 : 2);
+        mmltk::backend::ml::serialization::write_int(output, "entry_count", fault == 1 ? 1 : 2);
         for (std::size_t i = 0; i != names.size(); ++i) {
             torch::serialize::OutputArchive entry;
-            r::write_string(entry, "name", names[fault == 2 ? 1 - i : fault == 4 ? 0 : i]);
+            mmltk::backend::ml::serialization::write_string(entry, "name", names[fault == 2 ? 1 - i : fault == 4 ? 0 : i]);
             if (fault != 3) entry.write("tensor", parameters[i]);
-            output.write(r::archive_entry_name(i), entry);
+            output.write(mmltk::backend::ml::serialization::archive_entry_name(i), entry);
         }
         auto input = r::testsupport::checkpoint_input(output);
         if (fault == 0) {

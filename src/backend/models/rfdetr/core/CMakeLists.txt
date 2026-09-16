@@ -49,7 +49,6 @@ mmltk_register_public_headers(
         execution_precision.h
         postprocess.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_core detail/class_artifact_files.h)
-mmltk_register_header_isolation(mmltk_backend_models_rfdetr_core)
 mmltk_register_retained_module_importers(mmltk_backend_models_rfdetr_core model.cpp runtime.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
@@ -93,6 +92,7 @@ mmltk_register_private_headers(
     detail/training_mask_ops_cuda_launch.h
     detail/training_supervision.h
 )
+mmltk_register_header_isolation(mmltk_backend_models_rfdetr_core)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # GCC 16 diagnoses a null dereference inside PyTorch's inlined IValue

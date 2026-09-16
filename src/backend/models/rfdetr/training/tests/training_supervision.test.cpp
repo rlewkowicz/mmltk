@@ -25,6 +25,7 @@
 #include <system_error>
 #include <vector>
 #include "src/backend/ml/torch/archive.h"
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -144,7 +145,7 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     REQUIRE_THROWS(rfdetr::detail::require_resume_training_supervision_config(resume_archive, rfdetr::TrainingSupervisionConfig{}));
     torch::serialize::InputArchive state;
     input.read("state", state);
-    REQUIRE((rfdetr::require_int(state, "entry_count") == 1));
+    REQUIRE((mmltk::backend::ml::serialization::require_int(state, "entry_count") == 1));
     torch::serialize::OutputArchive legacy_output;
     rfdetr::detail::write_training_supervision_config(legacy_output, {});
     rfdetr::detail::write_state_archive(legacy_output, "state", {}, readback, 0);
@@ -267,31 +268,31 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     std::filesystem::create_directories(root);
     const auto write_archive = [&](const std::filesystem::path& path, const float first_value, const bool malformed_last) {
         torch::serialize::OutputArchive archive;
-        rfdetr::write_string(archive, "format", "mmltk.rfdetr.native_adamw");
-        rfdetr::write_int(archive, "format_version", 1);
-        rfdetr::write_string(archive, "backend", "eager");
-        rfdetr::write_double(archive, "beta1", 0.9);
-        rfdetr::write_double(archive, "beta2", 0.999);
-        rfdetr::write_double(archive, "eps", 1.0e-8);
-        rfdetr::write_int(archive, "group_count", 1);
-        rfdetr::write_int(archive, "param_count", 2);
+        mmltk::backend::ml::serialization::write_string(archive, "format", "mmltk.rfdetr.native_adamw");
+        mmltk::backend::ml::serialization::write_int(archive, "format_version", 1);
+        mmltk::backend::ml::serialization::write_string(archive, "backend", "eager");
+        mmltk::backend::ml::serialization::write_double(archive, "beta1", 0.9);
+        mmltk::backend::ml::serialization::write_double(archive, "beta2", 0.999);
+        mmltk::backend::ml::serialization::write_double(archive, "eps", 1.0e-8);
+        mmltk::backend::ml::serialization::write_int(archive, "group_count", 1);
+        mmltk::backend::ml::serialization::write_int(archive, "param_count", 2);
         torch::serialize::OutputArchive group;
-        rfdetr::write_double(group, "lr", 0.01);
-        rfdetr::write_double(group, "weight_decay", 0.0);
-        rfdetr::write_int(group, "amsgrad", 0);
-        rfdetr::write_int(group, "param_index_count", 2);
-        rfdetr::write_int(group, "param_index_000000", 0);
-        rfdetr::write_int(group, "param_index_000001", 1);
+        mmltk::backend::ml::serialization::write_double(group, "lr", 0.01);
+        mmltk::backend::ml::serialization::write_double(group, "weight_decay", 0.0);
+        mmltk::backend::ml::serialization::write_int(group, "amsgrad", 0);
+        mmltk::backend::ml::serialization::write_int(group, "param_index_count", 2);
+        mmltk::backend::ml::serialization::write_int(group, "param_index_000000", 0);
+        mmltk::backend::ml::serialization::write_int(group, "param_index_000001", 1);
         archive.write("group_000000", group);
         for (std::size_t index = 0; index < 2; ++index) {
             torch::serialize::OutputArchive parameter;
-            rfdetr::write_string(parameter, "name", index == 0 ? "first.weight" : "second.weight");
+            mmltk::backend::ml::serialization::write_string(parameter, "name", index == 0 ? "first.weight" : "second.weight");
             parameter.write("step", torch::tensor(2.0F));
             const auto shape = malformed_last && index == 1 ? std::vector<int64_t>{3} : std::vector<int64_t>{2};
             parameter.write("exp_avg", torch::full(shape, index == 0 ? first_value : 4.0F));
             parameter.write("exp_avg_sq", torch::ones(shape));
-            rfdetr::write_int(parameter, "has_max_exp_avg_sq", 0);
-            archive.write(rfdetr::archive_entry_name("param", index), parameter);
+            mmltk::backend::ml::serialization::write_int(parameter, "has_max_exp_avg_sq", 0);
+            archive.write(mmltk::backend::ml::serialization::archive_entry_name("param", index), parameter);
         }
         archive.save_to(path.string());
     };
@@ -317,7 +318,7 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     retained_input.load_from(retained_path.string());
     torch::serialize::InputArchive first_parameter;
     retained_input.read("param_000000", first_parameter);
-    const auto retained_average = rfdetr::require_tensor(first_parameter, "exp_avg");
+    const auto retained_average = mmltk::backend::ml::serialization::require_tensor(first_parameter, "exp_avg");
     REQUIRE(torch::equal(retained_average, torch::full({2}, 3.0F)));
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
@@ -1203,7 +1204,7 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
 void test_parallel_wave_drains_failures_and_cancellation() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     const rfdetr::DistributedContext distributed;
-    const auto device = rfdetr::cuda_device(0);
+    const auto device = mmltk::backend::ml::cuda::cuda_device(0);
     std::atomic<int> prepublication_drained = 0;
     {
         rfdetr::ParallelTrainingWave<int> wave(2, true, 0, distributed);
@@ -1459,12 +1460,12 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                 torch::serialize::InputArchive source, shadows;
                 source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
                 source.read("ema_state", shadows);
-                const auto count = rfdetr::require_int(shadows, "entry_count");
+                const auto count = mmltk::backend::ml::serialization::require_int(shadows, "entry_count");
                 REQUIRE(count > 0);
                 for (int64_t index = 0; index < count; ++index) {
                     torch::serialize::InputArchive entry;
-                    shadows.read(rfdetr::archive_entry_name(static_cast<std::size_t>(index)), entry);
-                    expected_best.at(rfdetr::require_string(entry, "name")) = rfdetr::require_tensor(entry, "tensor");
+                    shadows.read(mmltk::backend::ml::serialization::archive_entry_name(static_cast<std::size_t>(index)), entry);
+                    expected_best.at(mmltk::backend::ml::serialization::require_string(entry, "name")) = mmltk::backend::ml::serialization::require_tensor(entry, "tensor");
                 }
             }
             for (const auto& entry : deployment_state.entries()) {
@@ -1518,7 +1519,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                     torch::serialize::OutputArchive wrong_shadow, wrong_first;
                     rfdetr::testsupport::copy_checkpoint_archive(shadow, wrong_shadow, "entry_000000");
                     rfdetr::testsupport::copy_checkpoint_archive(first, wrong_first, "name");
-                    rfdetr::write_string(wrong_first, "name", "wrong-ordered-parameter");
+                    mmltk::backend::ml::serialization::write_string(wrong_first, "name", "wrong-ordered-parameter");
                     wrong_shadow.write("entry_000000", wrong_first);
                     malformed.write("ema_state", wrong_shadow);
                     reject_checkpoint(malformed, "ordered-ema");

@@ -146,5 +146,6 @@ struct OptimizerBuildResult {
     NativeOptimizer optimizer;
     std::vector<double> base_lrs;
 };
+bool is_encoder_param(std::string_view name);
 OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainRequest& options);
 }  // namespace mmltk::backend::models::rfdetr

@@ -1,11 +1,17 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <array>
+#include <cuda_runtime_api.h>
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include "src/backend/models/rfdetr/core/detail/detection_geometry.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include <torch/types.h>
 namespace mmltk::backend::models::rfdetr {

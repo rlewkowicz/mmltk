@@ -1,4 +1,5 @@
 #include <torch/utils.h>
+#include <torch/nn/functional/vision.h>
 #include <ATen/cuda/CUDAContext.h>
 // RF-DETR core operation coverage.
 #include <algorithm>
