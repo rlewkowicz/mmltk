@@ -73,6 +73,9 @@ class CompiledImageStream final {
 
     // Capture the actual owner context on its GPU worker, never during Explore model construction.
     void bind_current_context();
+    // Retains the actual aggregate containing image allocations and transfer streams.
+    // Consumers still release each input lease on their final CUDA stream.
+    [[nodiscard]] std::weak_ptr<const void> storage_custody() const noexcept;
     [[nodiscard]] const mmltk::frameworks::gpu::DeviceExecution& execution() const noexcept;
     void prepare_host(std::size_t slot, std::size_t bytes);
     void prepare_metadata(std::size_t slot, std::size_t bytes);

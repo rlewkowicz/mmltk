@@ -752,6 +752,41 @@ void test_benchmark_cached_image_writer_and_loader() {
     loader.synchronize();
     REQUIRE(loaded_images == 2U);
 
+    const auto source_digest = mmltk::common::io::sha256_file(cached_image_path(image_root, 1U));
+    const auto cache_manifest_digest = mmltk::common::io::sha256_file(completion);
+    auto perceptual_request = benchmark_write_request(split, root.path() / "perceptual.bin", kNanoResolution);
+    perceptual_request.perceptual_downscale = true;
+    write_benchmark_split(perceptual_request);
+    // These sources enlarge; selecting perceptual shrinking changes no pixels or format facts.
+    CHECK(mmltk::common::io::sha256_file(perceptual_request.output_path) == mmltk::common::io::sha256_file(output));
+    CHECK(mmltk::common::io::sha256_file(cached_image_path(image_root, 1U)) == source_digest);
+    CHECK(mmltk::common::io::sha256_file(completion) == cache_manifest_digest);
+    CHECK(validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, {}, &loaded_rejections));
+
+    const auto raw_cache_identity = read_json_file(completion);
+    for (const bool perceptual : {false, true}) {
+        BenchmarkCompilerConfig manifest_config;
+        manifest_config.resolution = kNanoResolution;
+        manifest_config.perceptual_downscale = perceptual;
+        const auto staged = root.path() / (perceptual ? "filtered-stage" : "ordinary-stage");
+        fs::create_directories(staged);
+        // Acquired facts come from the real raw-cache fixture. The production
+        // publication boundary owns the envelope and selected policy/version.
+        const nlohmann::json acquired{{"image_cache", nlohmann::json::array({raw_cache_identity})},
+                                     {"train", {{"bytes", fs::file_size(output)}}},
+                                     {"val", {{"bytes", fs::file_size(perceptual_request.output_path)}}}};
+        publish_benchmark_manifest(manifest_config, staged, image_root, acquired, {});
+        const auto manifest = read_json_file(staged / "benchmark_manifest.json");
+        CHECK(manifest.at("resampling").at("perceptual_downscale").get<bool>() == perceptual);
+        CHECK(manifest.at("resampling").at("version").get<unsigned>() == 1U);
+        CHECK(manifest.at("compiled_format_version").get<unsigned>() == 7U);
+        CHECK(manifest.at("schema_version").get<unsigned>() == 3U);
+        CHECK(manifest.at("image_cache").at(0) == raw_cache_identity);
+        CHECK(manifest.at("resolution").get<unsigned>() == kNanoResolution);
+        CHECK(mmltk::common::io::sha256_file(completion) == cache_manifest_digest);
+        CHECK(mmltk::common::io::sha256_file(cached_image_path(image_root, 1U)) == source_digest);
+    }
+
     const std::string original_digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(output));
     bool refused = false;
     try {

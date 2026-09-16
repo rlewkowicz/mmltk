@@ -153,6 +153,7 @@ struct AugmentationGroupConfig {
 struct GpuAugmentationConfig {
     bool operator==(const GpuAugmentationConfig&) const = default;
     bool enabled = false;
+    bool perceptual_downscale = false;
     AugmentationGroupConfig geometry{0.50F, 0.05F, 0.50F};
     AugmentationGroupConfig resize{0.50F, 0.05F, 0.50F};
     AugmentationGroupConfig color{0.50F, 0.05F, 0.50F};

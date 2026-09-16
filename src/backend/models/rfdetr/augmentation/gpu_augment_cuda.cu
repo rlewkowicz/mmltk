@@ -271,7 +271,7 @@ __global__ void pointwise_images_kernel(const float* input, float* output, const
 }
 
 __device__ __forceinline__ float remap_channel(const float* input, const std::int64_t plane_offset, const int height, const int width,
-                                               const float source_x, const float source_y, const float blur_strength, const int channel) {
+                                               const float source_x, const float source_y, const float blur_strength, const int channel, const std::int64_t row_stride) {
     if (source_x < 0.0F || source_x > 1.0F || source_y < 0.0F || source_y > 1.0F) { return channel_mean(channel); }
     const float pixel_x = fminf(fmaxf(source_x * static_cast<float>(width) - 0.5F, 0.0F), static_cast<float>(width - 1));
     const float pixel_y = fminf(fmaxf(source_y * static_cast<float>(height) - 0.5F, 0.0F), static_cast<float>(height - 1));
@@ -281,10 +281,10 @@ __device__ __forceinline__ float remap_channel(const float* input, const std::in
     const int y1 = min(height - 1, y0 + 1);
     const float fraction_x = pixel_x - static_cast<float>(x0);
     const float fraction_y = pixel_y - static_cast<float>(y0);
-    const float value00 = input[plane_offset + static_cast<std::int64_t>(y0) * width + x0];
-    const float value01 = input[plane_offset + static_cast<std::int64_t>(y0) * width + x1];
-    const float value10 = input[plane_offset + static_cast<std::int64_t>(y1) * width + x0];
-    const float value11 = input[plane_offset + static_cast<std::int64_t>(y1) * width + x1];
+    const float value00 = input[plane_offset + static_cast<std::int64_t>(y0) * row_stride + x0];
+    const float value01 = input[plane_offset + static_cast<std::int64_t>(y0) * row_stride + x1];
+    const float value10 = input[plane_offset + static_cast<std::int64_t>(y1) * row_stride + x0];
+    const float value11 = input[plane_offset + static_cast<std::int64_t>(y1) * row_stride + x1];
     const float top = fmaf(fraction_x, value01 - value00, value00);
     const float bottom = fmaf(fraction_x, value11 - value10, value10);
     const float bilinear = fmaf(fraction_y, bottom - top, top);
@@ -308,7 +308,7 @@ __global__ void remap_images_kernel(const float* input, float* output, const flo
                                     const std::int64_t donor_mask_words, const std::uint64_t* image_keys, const std::int64_t batch_size,
                                     const int height, const int width, const std::uint64_t seed, const int epoch, const int rank,
                                     const std::uint64_t sequence, const GpuAugmentationOutputDomain output_domain,
-                                    const float* const* input_slots, const float* const* donor_slots) {
+                                    const float* const* input_slots, const float* const* donor_slots, const GpuAugmentationPreparedView* prepared) {
     const std::int64_t index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t pixels_per_image = static_cast<std::int64_t>(height) * width;
     const std::int64_t total = batch_size * pixels_per_image;
@@ -329,7 +329,8 @@ __global__ void remap_images_kernel(const float* input, float* output, const flo
 #pragma unroll
     for (int channel = 0; channel < 3; ++channel) {
         const std::int64_t plane_offset = (source_image * 3 + channel) * pixels_per_image;
-        channels[channel] = remap_channel(input, plane_offset, height, width, source_x, source_y, blur_strength, channel);
+        const auto view = prepared ? prepared[image * 2] : GpuAugmentationPreparedView{input, width, height, width, pixels_per_image};
+        channels[channel] = remap_channel(view.pixels, prepared ? channel * view.plane_stride : plane_offset, view.height, view.width, source_x, source_y, blur_strength, channel, view.row_stride);
     }
     if (copy_paste_parameters != nullptr && (donor_images != nullptr || donor_slots != nullptr)) {
         const float* paste = copy_paste_parameters + image * kGpuCopyPasteParameterCount;
@@ -350,8 +351,9 @@ __global__ void remap_images_kernel(const float* input, float* output, const flo
                 for (int channel = 0; channel < 3; ++channel) {
                     const std::int64_t donor_plane =
                         ((donor_slots ? 0 : static_cast<std::int64_t>(donor_slot)) * 3 + channel) * pixels_per_image;
-                    channels[channel] = remap_channel(donor_slots ? donor_slots[donor_slot] : donor_images, donor_plane, height, width,
-                                                      donor_x, donor_y, blur_strength, channel);
+                    const auto view = prepared ? prepared[image * 2 + 1] : GpuAugmentationPreparedView{donor_slots ? donor_slots[donor_slot] : donor_images, width, height, width, pixels_per_image};
+                    channels[channel] = remap_channel(view.pixels, prepared ? channel * view.plane_stride : donor_plane, view.height, view.width,
+                                                      donor_x, donor_y, blur_strength, channel, view.row_stride);
                 }
             }
         }
@@ -433,13 +435,13 @@ void launch_gpu_augmentation_images(const float* input, float* output, const flo
                                     const std::int64_t donor_mask_words, const std::int64_t batch_size, const int height, const int width,
                                     const GpuAugmentationLaunchConfig&, const std::uint64_t seed, const int epoch, const int rank,
                                     const std::uint64_t sequence, const bool remap, const GpuAugmentationOutputDomain output_domain,
-                                    cudaStream_t stream, const float* const* input_slots, const float* const* donor_slots) {
+                                    cudaStream_t stream, const float* const* input_slots, const float* const* donor_slots, const GpuAugmentationPreparedView* prepared) {
     if (batch_size == 0) { return; }
     if (remap) {
         const std::int64_t total = batch_size * static_cast<std::int64_t>(height) * width;
         remap_images_kernel<false><<<static_cast<unsigned int>(ceil_div(total, kThreads)), kThreads, 0, stream>>>(
             input, output, parameters, copy_paste_parameters, donor_images, donor_masks, donor_boxes, donor_mask_words, nullptr, batch_size,
-            height, width, seed, epoch, rank, sequence, output_domain, input_slots, donor_slots);
+            height, width, seed, epoch, rank, sequence, output_domain, input_slots, donor_slots, prepared);
     } else {
         const std::int64_t total = batch_size * static_cast<std::int64_t>(height) * ceil_div(width, 4);
         pointwise_images_kernel<false><<<static_cast<unsigned int>(ceil_div(total, kThreads)), kThreads, 0, stream>>>(
@@ -454,13 +456,13 @@ void launch_gpu_augmentation_images_explicit(const float* input, float* output, 
                                              const std::int64_t batch_size, const int height, const int width,
                                              const GpuAugmentationLaunchConfig&, const bool remap,
                                              const GpuAugmentationOutputDomain output_domain, cudaStream_t stream,
-                                             const float* const* input_slots, const float* const* donor_slots) {
+                                             const float* const* input_slots, const float* const* donor_slots, const GpuAugmentationPreparedView* prepared) {
     if (batch_size == 0) { return; }
     if (remap) {
         const std::int64_t total = batch_size * static_cast<std::int64_t>(height) * width;
         remap_images_kernel<true><<<static_cast<unsigned int>(ceil_div(total, kThreads)), kThreads, 0, stream>>>(
             input, output, parameters, copy_paste_parameters, donor_images, donor_masks, donor_boxes, donor_mask_words, image_keys,
-            batch_size, height, width, 0U, 0, 0, 0U, output_domain, input_slots, donor_slots);
+            batch_size, height, width, 0U, 0, 0, 0U, output_domain, input_slots, donor_slots, prepared);
     } else {
         const std::int64_t total = batch_size * static_cast<std::int64_t>(height) * ceil_div(width, 4);
         pointwise_images_kernel<true><<<static_cast<unsigned int>(ceil_div(total, kThreads)), kThreads, 0, stream>>>(

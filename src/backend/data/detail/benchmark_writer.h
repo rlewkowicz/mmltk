@@ -71,6 +71,7 @@ struct BenchmarkWriteRequest {
     bool overwrite = false;
     mmltk::common::concurrency::CancellationObservation cancel_requested = {};
     BenchmarkWriteProgressEvent progress;
+    bool perceptual_downscale = false;
 };
 
 void write_benchmark_split(const BenchmarkWriteRequest& request);

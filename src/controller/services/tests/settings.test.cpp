@@ -669,6 +669,8 @@ void test_ui_settings_round_trip() {
     train.request.resolution = 512;
     train.overwrite_compiled_dataset = true;
     train.compile_dimensions = true;
+    train.compile_perceptual_downscale = true;
+    train.request.gpu_augmentation.perceptual_downscale = true;
     train.request.cpu_affinity = "0-3";
     train.request.progress_bar = true;
     train.request.device_ids = {0, 2};
@@ -800,6 +802,8 @@ void test_ui_settings_round_trip() {
     MMLTK_ASSERT(loaded_train.compiled_dataset_dir == "/tmp/compiled");
     MMLTK_ASSERT(loaded_train.overwrite_compiled_dataset);
     MMLTK_ASSERT(loaded_train.compile_dimensions);
+    CHECK(loaded_train.compile_perceptual_downscale);
+    CHECK(loaded_train.request.gpu_augmentation.perceptual_downscale);
     MMLTK_ASSERT(loaded_train.request.resolution == 512);
     MMLTK_ASSERT(loaded_train.request.weights_path == "/tmp/weights.pt");
     CHECK(loaded_train.request.class_layout_path == "/tmp/train.classes.json");
@@ -886,6 +890,8 @@ void test_fresh_defaults_use_capture_only_annotate() {
     MMLTK_ASSERT(train.request.val_compiled_path == "./compiled/val.bin");
     MMLTK_ASSERT(!train.overwrite_compiled_dataset);
     MMLTK_ASSERT(!train.compile_dimensions);
+    CHECK_FALSE(train.compile_perceptual_downscale);
+    CHECK_FALSE(train.request.gpu_augmentation.perceptual_downscale);
     MMLTK_ASSERT(train.request.num_queries == 0);
     MMLTK_ASSERT(train.request.eval_max_dets == 0);
     MMLTK_ASSERT(validate.model_input == ModelArtifactInputKind::Weights);

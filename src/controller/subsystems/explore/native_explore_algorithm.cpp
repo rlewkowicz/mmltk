@@ -591,6 +591,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         return configuration_.loading == options;
     }
     ~NativeExploreAlgorithm() override = default;
+    void BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext& context, std::shared_ptr<mmltk::frameworks::gpu::ImageStream> stream) override { gallery_.BindExecutionContext(context, std::move(stream)); }
     void StopIngress() noexcept override { gallery_.StopIngress(); }
     [[nodiscard]] mmltk::frameworks::gpu::SystemImageModel::Release ReleaseResources() noexcept override {
         return gallery_.ReleaseAfterRuntimeSettlement();

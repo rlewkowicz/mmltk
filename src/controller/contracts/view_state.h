@@ -192,6 +192,7 @@ struct TrainViewState : TrainExecutionPaneState {
     bool use_compiled_directory_defaults = true;
     bool overwrite_compiled_dataset = false;
     bool compile_dimensions = false;
+    bool compile_perceptual_downscale = false;
     bool compile_benchmark_dataset_override = false;
     bool visualize_augmentation_in_explore = false;
 };

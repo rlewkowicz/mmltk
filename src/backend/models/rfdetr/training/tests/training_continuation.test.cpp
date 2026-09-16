@@ -21,6 +21,7 @@ r::TrainRequest saved_request() {
     request.val_compiled_path = "val.bin";
     request.weights_path = "seed.pt";
     request.output_dir = "run";
+    request.gpu_augmentation.perceptual_downscale = true;
     return request;
 }
 
@@ -41,7 +42,10 @@ api::InputArchive continuation_fixture(const r::TrainRequest& request) {
 
 void test_current_continuation_required_fields() {
     auto source = continuation_fixture(saved_request());
-    REQUIRE(r::detail::read_training_continuation(source).has_value());
+    const auto loaded = r::detail::read_training_continuation(source);
+    REQUIRE(loaded.has_value());
+    CHECK(loaded->configuration.gpu_augmentation.perceptual_downscale);
+    CHECK_FALSE(loaded->configuration.gpu_augmentation.enabled);
     // Every written continuation fact is mandatory except the default supervision
     // blob, whose current format deliberately omits the default value.
     for (const auto& key : source.keys()) {
@@ -73,7 +77,7 @@ void test_current_continuation_required_fields() {
 }
 
 void test_current_continuation_scalar_boundaries() {
-    const std::array<std::pair<std::string, api::IValue>, 18> invalid{{
+    const std::array<std::pair<std::string, api::IValue>, 19> invalid{{
         {"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}},
         {"grad_scaler_scale", 0.0}, {"grad_scaler_scale", std::numeric_limits<double>::infinity()},
         {"grad_scaler_growth_tracker", int64_t{-1}},
@@ -84,6 +88,7 @@ void test_current_continuation_scalar_boundaries() {
         {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')},
         {"warmup_epochs", 0.25}, {"warmup_momentum", 0.25}, {"lr_min_factor", 0.25},
         {"lr_drop", int64_t{7}}, {"lr_scheduler", std::string("cosine")},
+        {"gpu_augment_perceptual_downscale", false},
         {"optimizer_kind", std::string("invalid")}, {"gpu_augment_geometry_probability", 0.125}
     }};
     for (const auto& [key, value] : invalid) {

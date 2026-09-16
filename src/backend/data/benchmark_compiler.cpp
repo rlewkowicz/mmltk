@@ -1964,6 +1964,21 @@ bool archive_selection_allows_quarantine(const BenchmarkDatasetSource source, co
     return source != BenchmarkDatasetSource::kCoco2017 || split == "train2017";
 }
 
+void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std::filesystem::path& staging_dir,
+                                const std::filesystem::path& cache_root, nlohmann::json facts,
+                                const common_concurrency::CancellationObservation cancelled) {
+    facts["schema_version"] = 3U;
+    facts["compiled_format_version"] = FORMAT_VERSION;
+    facts["resampling"] = {{"perceptual_downscale", config.perceptual_downscale}, {"version", 1U}};
+    facts["catalog_revision"] = kBenchmarkCatalogRevision;
+    facts["mapping_revision"] = kBenchmarkMappingRevision;
+    facts["resolution"] = config.resolution;
+    facts["cache_root"] = cache_root.string();
+    facts["source_catalog"] = source_catalog_manifest();
+    facts["mappings"] = mapping_manifest();
+    write_json_atomically(staging_dir / "benchmark_manifest.json", facts, cancelled);
+}
+
 void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     if (config.resolution == 0U || config.resolution > MAX_IMAGE_EXTENT) {
         throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format");
@@ -2723,10 +2738,10 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
         }
     };
     compile_split(
-        BenchmarkWriteRequest{train, staging_dir / "train.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}},
+        BenchmarkWriteRequest{train, staging_dir / "train.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale},
         0U);
     compile_split(
-        BenchmarkWriteRequest{validation, staging_dir / "val.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}},
+        BenchmarkWriteRequest{validation, staging_dir / "val.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale},
         train.images.size());
 
     progress.activity("Finalizing rejected and quarantined records");
@@ -2773,10 +2788,6 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
 
     progress.activity("Building benchmark manifest");
     nlohmann::json manifest{
-        {"schema_version", 3U},
-        {"compiled_format_version", FORMAT_VERSION},
-        {"catalog_revision", kBenchmarkCatalogRevision},
-        {"mapping_revision", kBenchmarkMappingRevision},
         {"supplemental_sampling",
          {{"revision", kSupplementalSamplingRevision},
           {"target_images", combined_sampling.target_images},
@@ -2784,10 +2795,7 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
           {"open_images_ceiling", combined_sampling.open_images_ceiling},
           {"objects365_shards", combined_sampling.objects365_shards},
           {"objects365_archive_bytes", combined_sampling.objects365_archive_bytes}}},
-        {"resolution", config.resolution},
-        {"cache_root", cache.root.string()},
         {"projected_output_bytes", total_output_estimate},
-        {"source_catalog", source_catalog_manifest()},
         {"train",
          {{"images", train.images.size()},
           {"boxes", train.labels.size()},
@@ -2799,7 +2807,6 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
           {"boxes", validation.labels.size()},
           {"mask_rle_pairs", validation.rle_pairs.size()},
           {"bytes", std::filesystem::file_size(staging_dir / "val.bin")}}},
-        {"mappings", mapping_manifest()},
         {"sources", nlohmann::json::array()},
         {"image_cache", nlohmann::json::array()},
         {"quarantined_images", nlohmann::json::array()},
@@ -2878,7 +2885,7 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
             {{"source", benchmark_source_name(image.source)}, {"image_id", image.image_id}, {"reason", image.reason}});
     }
     progress.activity("Writing benchmark manifest");
-    write_json_atomically(staging_dir / "benchmark_manifest.json", manifest, cancel_requested);
+    publish_benchmark_manifest(config, staging_dir, cache.root, std::move(manifest), cancel_requested);
     progress.phase(DatasetCompilePhase::Syncing, 3U, kSyncStepCount);
     progress.activity("Syncing staged benchmark dataset");
     sync_directory(staging_dir);

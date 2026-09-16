@@ -15,6 +15,7 @@
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 
 namespace mmltk::controller::explore_detail {
+struct GalleryStreamTestAccess;
 
 struct GalleryProductState final {
     std::shared_ptr<const mmltk::backend::data::CompiledDataset> store;
@@ -53,7 +54,8 @@ class GalleryStream final {
     GalleryStream(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution&, const ExploreNativeConfiguration&,
                   std::uint32_t maximum_height);
     ~GalleryStream();
-    [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
+    void BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::ImageStream>);
+    [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers();
     void SetReadySink(ExploreAlgorithm::GalleryReadySink);
     // Construction-only binding; retained unchanged through native retirement.
     void SetCurrentDemand(ExploreDemandCheck);
@@ -93,7 +95,10 @@ class GalleryStream final {
 
    private:
     class Impl;
-    mmltk::frameworks::gpu::TerminalCudaRetirementOwner terminal_{1U};
+    [[nodiscard]] Impl& Active() const;
+    void SetStreamSettlement(decltype(&cudaStreamSynchronize));
+    friend struct GalleryStreamTestAccess;
+    mmltk::frameworks::gpu::TerminalCudaRetirementOwner terminal_{3U};
     mmltk::frameworks::gpu::TerminalCudaRetirementLease lease_{mmltk::frameworks::gpu::ReserveTerminalCudaLease(terminal_)};
     std::shared_ptr<Impl> impl_;
 };

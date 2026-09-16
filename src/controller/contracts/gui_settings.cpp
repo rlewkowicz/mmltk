@@ -350,6 +350,7 @@ constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
     visit("test_compiled_path", state.request.test_compiled_path);
     visit("overwrite", state.overwrite_compiled_dataset);
     visit("compile_dimensions", state.compile_dimensions);
+    visit("perceptual_downscale", state.compile_perceptual_downscale);
     visit("compile_benchmark_dataset_override", state.compile_benchmark_dataset_override);
 };
 
@@ -451,6 +452,7 @@ constexpr auto augmentation_group_fields = [](auto& group, const auto& visit) {
 
 constexpr auto gpu_augmentation_fields = [](auto& config, const auto& visit) {
     visit("enabled", config.enabled);
+    visit("perceptual_downscale", config.perceptual_downscale);
     visit.nested("geometry", config.geometry, augmentation_group_fields);
     visit.nested("resize", config.resize, augmentation_group_fields);
     visit.nested("color", config.color, augmentation_group_fields);

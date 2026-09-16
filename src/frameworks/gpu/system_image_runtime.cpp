@@ -56,7 +56,8 @@ struct SystemImageRuntime::State final {
                 execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
         input = std::make_unique<ImageProductBuffer>(*context, config.input_layout);
         output = std::make_unique<ImageProductPool>(*context, config.output_layout, config.output_buffer_count, products);
-        stream = std::make_unique<ImageStream>(*context);
+        stream = std::make_shared<ImageStream>(*context);
+        if (model) model->BindExecutionContext(*context, stream);
         workspace_finalize = std::move(config.workspace_finalize);
     }
 
@@ -64,7 +65,7 @@ struct SystemImageRuntime::State final {
     std::unique_ptr<SystemImageModel> model;
     std::unique_ptr<ImageProductBuffer> input;
     std::unique_ptr<ImageProductPool> output;
-    std::unique_ptr<ImageStream> stream;
+    std::shared_ptr<ImageStream> stream;
     ImageWorkspaceFinalize workspace_finalize;
     bool retired = false;
 };

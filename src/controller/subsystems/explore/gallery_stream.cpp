@@ -1,4 +1,5 @@
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
+#include "src/frameworks/gpu/cuda_error.h"
 #include "src/controller/subsystems/explore/detail/gallery_atlas.h"
 #include "src/backend/data/compiled_image_stream.h"
 #include "src/backend/data/compiled_dataset.h"
@@ -226,11 +227,22 @@ void pack_rle_mask(const std::span<const data::RLEPair> runs, const std::span<st
 
 }  // namespace
 
-class GalleryStream::Impl final {
+class GalleryStream::Impl final : public std::enable_shared_from_this<GalleryStream::Impl> {
    public:
     Impl(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution&, const ExploreNativeConfiguration&,
-         std::uint32_t maximum_height);
+         std::uint32_t maximum_height, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement,
+         mmltk::frameworks::gpu::TerminalCudaRetirementLease lease);
     ~Impl();
+    void Retire(cudaError_t) noexcept;
+    void CheckSettlement(cudaError_t, const char*);
+    [[nodiscard]] mmltk::frameworks::gpu::SystemImageModel::Release TerminalRelease() const noexcept {
+        return {.all_released = false, .failure = terminal_failure_};
+    }
+    void SetStreamSettlement(decltype(&cudaStreamSynchronize) operation) { stream_wait_ = operation; }
+    void BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext& context, std::shared_ptr<mmltk::frameworks::gpu::ImageStream> stream) {
+        retained_context_ = context; retained_stream_ = std::move(stream);
+        stream_ = reinterpret_cast<cudaStream_t>(retained_stream_->native_handle());
+    }
     [[nodiscard]] mmltk::common::concurrency::WorkerPool& workers() noexcept;
     void SetReadySink(ExploreAlgorithm::GalleryReadySink);
     void SetCurrentDemand(ExploreDemandCheck check) {
@@ -477,6 +489,12 @@ class GalleryStream::Impl final {
     static void Clear(mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t);
     [[nodiscard]] static explore::ExploreRenderTargetView Target(mmltk::frameworks::gpu::ImagePlaneView);
 
+    std::optional<mmltk::frameworks::gpu::DeviceContext> retained_context_;
+    std::shared_ptr<mmltk::frameworks::gpu::ImageStream> retained_stream_;
+    mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement_;
+    mmltk::frameworks::gpu::TerminalCudaRetirementLease terminal_lease_;
+    std::exception_ptr terminal_failure_;
+    decltype(&cudaStreamSynchronize) stream_wait_ = &cudaStreamSynchronize;
     std::shared_ptr<ExploreAcceptanceGate> acceptance_;
     data::CompiledImageStream image_stream_;
     mutable std::mutex lanes_mutex_;
@@ -597,8 +615,10 @@ class GalleryStream::Impl final {
 };
 
 GalleryStream::Impl::Impl(const std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution,
-                          const ExploreNativeConfiguration& configuration, const std::uint32_t maximum_height)
-    : acceptance_(configuration.acceptance),
+                          const ExploreNativeConfiguration& configuration, const std::uint32_t maximum_height,
+                          mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement,
+                          mmltk::frameworks::gpu::TerminalCudaRetirementLease lease)
+    : retirement_(retirement), terminal_lease_(std::move(lease)), acceptance_(configuration.acceptance),
       image_stream_(
           {.slots = nproc + 1U, .workers = nproc, .device = execution.device, .loading = configuration.loading, .execution = execution}),
       maximum_height_(maximum_height),
@@ -612,6 +632,21 @@ GalleryStream::Impl::Impl(const std::size_t nproc, const mmltk::frameworks::gpu:
     }
     detail_lane_ = std::make_unique<Lane>(nproc, image_stream_.metadata_storage(nproc));
     storage_.Bind(host_allocations_.api());
+}
+
+void GalleryStream::Impl::Retire(const cudaError_t status) noexcept {
+    if (!terminal_lease_) return;
+    StopIngress();
+    try { mmltk::frameworks::gpu::ensure_cuda_ok(status, "Explore gallery settlement failed"); }
+    catch (...) { terminal_failure_ = std::current_exception(); }
+    std::move(terminal_lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(shared_from_this()), status);
+    // Join CPU ingress/completion workers without attempting GPU storage release.
+    try { image_stream_.stop_workers(); } catch (...) {}
+}
+void GalleryStream::Impl::CheckSettlement(const cudaError_t status, const char* detail) {
+    if (status == cudaSuccess) return;
+    Retire(status);
+    mmltk::frameworks::gpu::ensure_cuda_ok(status, detail);
 }
 
 GalleryStream::Impl::~Impl() = default;
@@ -933,6 +968,7 @@ void GalleryStream::Impl::PrepareOutputPublication(const ExploreOutputChange cha
         }
         publication_active_ = true;
     } catch (...) {
+        if (!retirement_.admission_open()) throw;
         if (mode_switched_) {
             std::swap(committed_, retained_);
             selected_mode_ = committed_.plan.mode;
@@ -996,6 +1032,7 @@ void GalleryStream::Impl::CommitOutputPublication() noexcept {
 }
 
 bool GalleryStream::Impl::RollbackOutputPublication() noexcept {
+    if (!retirement_.admission_open()) return false;
     if (rollback_failed_) return false;
     if (!publication_active_) return true;
     atlas_.Rollback();
@@ -2081,7 +2118,7 @@ const rfdetr::AugmentationBatchPlan* GalleryStream::Impl::PrepareImages(const st
                            augmentation_height_ != State().store->header().image_height)) {
         augmenter_ = std::make_unique<rfdetr::GpuAugmentationExecutor>(augmentation_config, lanes_.size(),
                                                                        static_cast<int>(State().store->header().image_height),
-                                                                       static_cast<int>(State().store->header().image_width), device_);
+                                                                       static_cast<int>(State().store->header().image_width), retained_context_.value(), retirement_);
         augmentation_width_ = State().store->header().image_width;
         augmentation_height_ = State().store->header().image_height;
     } else if (preview_active) {
@@ -2135,7 +2172,9 @@ const rfdetr::AugmentationBatchPlan* GalleryStream::Impl::PrepareImages(const st
                       .masks = static_cast<const std::int64_t*>(storage_.buffers_.donor_masks_device_.data()),
                       .boxes = static_cast<const float*>(storage_.buffers_.donor_boxes_device_.data()),
                       .mask_words = static_cast<std::int64_t>(mask_words),
-                      .image_slots = batch_donor_slots_};
+                      .image_slots = batch_donor_slots_,
+                      .image_custody = image_stream_.storage_custody().lock(),
+                      .image_capacity_bytes = pixel_bytes};
     }
     const rfdetr::AugmentationBatchPlan* augmentation_plan = nullptr;
     if (!current_demand_(State().plan.generation)) return nullptr;
@@ -2146,7 +2185,11 @@ const rfdetr::AugmentationBatchPlan* GalleryStream::Impl::PrepareImages(const st
                                               .height = static_cast<int>(State().store->header().image_height),
                                               .width = static_cast<int>(State().store->header().image_width),
                                               .output_domain = rfdetr::GpuAugmentationOutputDomain::UnitRgb,
-                                              .input_slots = batch_input_slots_},
+                                              .input_slots = batch_input_slots_,
+                                              .input_custody = image_stream_.storage_custody().lock(),
+                                              .output_custody = shared_from_this(),
+                                              .input_capacity_bytes = pixel_bytes,
+                                              .output_capacity_bytes = ready_lanes.size() * pixel_bytes},
                                              batch_keys_, batch_donors_, donor_view, cuda_stream, State().plan.augmentation.seed % 2U);
     if (augmentation_plan != nullptr && diagnostics_.valid())
         for (std::size_t slot = 0U; slot != ready_lanes.size(); ++slot)
@@ -2488,7 +2531,7 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
         descriptors_pending_ = true;
         if (!current_demand_(plan.generation)) return;
         RenderDetailPlane(State().detail_view, plan.overlay, semantic, stream, true);
-        EnsureCuda(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream)), "Explore semantic update failed");
+        CheckSettlement(stream_wait_(reinterpret_cast<cudaStream_t>(stream)), "Explore semantic update failed");
         descriptors_pending_ = false;
         return;
     }
@@ -2594,7 +2637,7 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
     State().document = std::move(document);
     DiagnoseRendered(clean, semantic, stream, plan.generation, *plan.selected_image, *plan.selected_image);
     FlushProbes(stream);
-    EnsureCuda(cudaStreamSynchronize(cuda_stream), "Explore detail completion failed");
+    CheckSettlement(stream_wait_(cuda_stream), "Explore detail completion failed");
     image_stream_.synchronize(lane.index);
     descriptors_pending_ = false;
     lane.state = reusable_lane ? LaneState::InputReady : LaneState::Idle;
@@ -3190,7 +3233,7 @@ void GalleryStream::Impl::UploadDescriptor(explore::ExploreHighWaterBuffer& dest
 
 void GalleryStream::Impl::SettleDescriptors() {
     if (!descriptors_pending_) return;
-    EnsureCuda(cudaStreamSynchronize(stream_), "Explore descriptor staging settlement failed");
+    CheckSettlement(stream_wait_(stream_), "Explore descriptor staging settlement failed");
     descriptors_pending_ = false;
 }
 
@@ -3226,14 +3269,19 @@ explore::ExploreRenderTargetView GalleryStream::Impl::Target(const mmltk::framew
             .height = target.descriptor.height};
 }
 
-void GalleryStream::Impl::Suspend() {
+void GalleryStream::Impl::Suspend() try {
     desired_generation_.store(0U, std::memory_order_release);
     if (acceptance_) acceptance_->AdvanceGeneration(0U);
-    if (stream_ != nullptr && cudaStreamSynchronize(stream_) != cudaSuccess) throw std::runtime_error("Explore gallery quiescence failed");
+    if (!retirement_.admission_open()) throw std::runtime_error("Explore gallery has terminal custody");
+    if (stream_ != nullptr) CheckSettlement(stream_wait_(stream_), "Explore gallery quiescence failed");
+    try { if (augmenter_) augmenter_->Finish(); }
+    catch (...) {
+        Retire(retirement_.fact().first_failure != cudaSuccess ? retirement_.fact().first_failure : cudaErrorUnknown);
+        throw;
+    }
     image_stream_.wait_consumers();
     image_stream_.synchronize(detail_lane_->index);
-    if (diagnostic_stream_ != nullptr && cudaStreamSynchronize(diagnostic_stream_) != cudaSuccess)
-        throw std::runtime_error("Explore diagnostic quiescence failed");
+    if (diagnostic_stream_ != nullptr) CheckSettlement(stream_wait_(diagnostic_stream_), "Explore diagnostic quiescence failed");
     descriptors_pending_ = false;
     probe_count_ = 0U;
     probes_pending_.store(false, std::memory_order_release);
@@ -3249,9 +3297,12 @@ void GalleryStream::Impl::Suspend() {
     detail_lane_->state = LaneState::Idle;
     detail_lane_->store.reset();
     detail_lane_->pending_meaning.reset();
+} catch (...) {
+    Retire(retirement_.fact().first_failure != cudaSuccess ? retirement_.fact().first_failure : cudaErrorUnknown);
+    throw;
 }
 
-void GalleryStream::Impl::Quiesce() {
+void GalleryStream::Impl::Quiesce() try {
     Suspend();
     image_stream_.cancel_reads();
     image_stream_.synchronize();
@@ -3263,6 +3314,9 @@ void GalleryStream::Impl::Quiesce() {
         lane->failure = {};
     }
     next_priority_ = State().priority_slots.size();
+} catch (...) {
+    Retire(retirement_.fact().first_failure != cudaSuccess ? retirement_.fact().first_failure : cudaErrorUnknown);
+    throw;
 }
 
 void GalleryStream::Impl::ClearLogicalState() {
@@ -3315,14 +3369,16 @@ void GalleryStream::Impl::ClearReadinessState() {
 }
 
 auto GalleryStream::Impl::ReleaseAfterRuntimeSettlement() noexcept -> mmltk::frameworks::gpu::SystemImageModel::Release {
+    if (!retirement_.admission_open()) { Retire(retirement_.fact().first_failure); return TerminalRelease(); }
     if (resources_released_) return {};
     try {
         Quiesce();
         ClearLogicalState();
     } catch (...) {
         const auto failure = std::current_exception();
-        // Failed completion still stops and joins the physical workers. The
-        // runtime retains CUDA custody when settlement cannot be proved.
+        // Failed completion retains the complete physical owner. Do not retry
+        // resource release after its settlement authority has become terminal.
+        if (!retirement_.admission_open()) { Retire(retirement_.fact().first_failure); return TerminalRelease(); }
         try {
             image_stream_.close();
         } catch (...) {}
@@ -3340,9 +3396,9 @@ auto GalleryStream::Impl::ReleaseProbesChecked() noexcept -> mmltk::frameworks::
         } catch (...) { failure = mmltk::frameworks::gpu::combine_image_failures(failure, std::current_exception()); }
     };
     if (diagnostic_stream_) {
-        const auto settled = cudaStreamSynchronize(diagnostic_stream_);
+        const auto settled = stream_wait_(diagnostic_stream_);
         record(settled, "Explore diagnostic retirement settlement failed");
-        if (settled != cudaSuccess) return {.all_released = false, .failure = failure};
+        if (settled != cudaSuccess) { Retire(settled); return {.all_released = false, .failure = failure}; }
     }
     const bool owned = probes_ready_ || diagnostic_stream_;
     if (probes_ready_) {
@@ -3366,6 +3422,7 @@ auto GalleryStream::Impl::ReleaseProbesChecked() noexcept -> mmltk::frameworks::
 }
 
 auto GalleryStream::Impl::ResetBuffersChecked() noexcept -> mmltk::frameworks::gpu::SystemImageModel::Release {
+    if (!retirement_.admission_open()) { Retire(retirement_.fact().first_failure); return TerminalRelease(); }
     if (resources_released_) return {};
     const auto probes = ReleaseProbesChecked();
     if (!probes.all_released) return probes;
@@ -3397,23 +3454,35 @@ auto GalleryStream::Impl::ResetBuffersChecked() noexcept -> mmltk::frameworks::g
 
 GalleryStream::GalleryStream(const std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution,
                              const ExploreNativeConfiguration& configuration, const std::uint32_t maximum_height)
-    : impl_(std::make_shared<Impl>(nproc, execution, configuration, maximum_height)) {}
+    : impl_(std::make_shared<Impl>(nproc, execution, configuration, maximum_height, terminal_, std::move(lease_))) {}
+auto GalleryStream::Active() const -> Impl& {
+    if (!impl_) throw std::runtime_error("Explore gallery has no physical owner");
+    if (!terminal_.admission_open()) {
+        impl_->Retire(terminal_.fact().first_failure);
+        throw std::runtime_error("Explore gallery has terminal custody");
+    }
+    return *impl_;
+}
+void GalleryStream::SetStreamSettlement(decltype(&cudaStreamSynchronize) operation) { Active().SetStreamSettlement(operation); }
+void GalleryStream::BindExecutionContext(const mmltk::frameworks::gpu::DeviceContext& context, std::shared_ptr<mmltk::frameworks::gpu::ImageStream> stream) {
+    Active().BindExecutionContext(context, std::move(stream));
+}
 GalleryStream::~GalleryStream() {
     if (!impl_) return;
+    if (!terminal_.admission_open()) { impl_->Retire(terminal_.fact().first_failure); return; }
     impl_->StopIngress();
     const auto released = impl_->ReleaseAfterRuntimeSettlement();
-    if (!released.all_released)
-        std::move(lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), cudaErrorUnknown);
+    if (!released.all_released) impl_->Retire(terminal_.fact().first_failure != cudaSuccess ? terminal_.fact().first_failure : cudaErrorUnknown);
 }
-mmltk::common::concurrency::WorkerPool& GalleryStream::workers() noexcept { return impl_->workers(); }
-void GalleryStream::SetReadySink(ExploreAlgorithm::GalleryReadySink sink) { impl_->SetReadySink(std::move(sink)); }
-void GalleryStream::SetCurrentDemand(ExploreDemandCheck check) { impl_->SetCurrentDemand(std::move(check)); }
+mmltk::common::concurrency::WorkerPool& GalleryStream::workers() { return Active().workers(); }
+void GalleryStream::SetReadySink(ExploreAlgorithm::GalleryReadySink sink) { Active().SetReadySink(std::move(sink)); }
+void GalleryStream::SetCurrentDemand(ExploreDemandCheck check) { Active().SetCurrentDemand(std::move(check)); }
 
 ExploreOutputChange GalleryStream::OutputChange(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                 const data::CompiledDataset* store, std::span<const std::uint32_t> window) const {
-    return impl_->OutputChange(plan, visible, store, window);
+    return Active().OutputChange(plan, visible, store, window);
 }
-void GalleryStream::StopIngress() noexcept { impl_->StopIngress(); }
+void GalleryStream::StopIngress() noexcept { if (impl_) impl_->StopIngress(); }
 ExploreGalleryPublication GalleryStream::Begin(const ExploreRenderPlan& plan, std::span<const std::uint32_t> visible,
                                                std::span<const std::uint32_t> window, const std::size_t window_first,
                                                std::shared_ptr<const data::CompiledDataset> store,
@@ -3421,44 +3490,46 @@ ExploreGalleryPublication GalleryStream::Begin(const ExploreRenderPlan& plan, st
                                                const std::span<const explore::detail::ExploreRenderClassDescriptorAbi> classes,
                                                const mmltk::frameworks::gpu::ImagePlaneView clean,
                                                const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) {
-    return impl_->Begin(plan, visible, window, window_first, std::move(store), annotated, classes, clean, semantic, stream);
+    return Active().Begin(plan, visible, window, window_first, std::move(store), annotated, classes, clean, semantic, stream);
 }
-ExploreGalleryPublication GalleryStream::Advance() { return impl_->Advance(); }
-bool GalleryStream::HasReadyTiles() const { return impl_->HasReadyTiles(); }
+ExploreGalleryPublication GalleryStream::Advance() { return Active().Advance(); }
+bool GalleryStream::HasReadyTiles() const { return Active().HasReadyTiles(); }
 void GalleryStream::PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation allocation) noexcept {
-    impl_->PrepareDetailOutput(allocation);
+    if (terminal_.admission_open()) Active().PrepareDetailOutput(allocation);
 }
 void GalleryStream::PrepareOutputPublication(ExploreOutputChange change, ExploreMode mode) {
-    impl_->PrepareOutputPublication(change, mode);
+    Active().PrepareOutputPublication(change, mode);
 }
-void GalleryStream::CommitOutputPublication() noexcept { impl_->CommitOutputPublication(); }
+void GalleryStream::CommitOutputPublication() noexcept { if (terminal_.admission_open()) Active().CommitOutputPublication(); }
 mmltk::frameworks::gpu::ImageWorkspaceCoverage GalleryStream::WorkspaceCoverage(
     const mmltk::frameworks::gpu::ImageWorkspaceObservation& output) {
-    return impl_->WorkspaceCoverage(output);
+    return Active().WorkspaceCoverage(output);
 }
-bool GalleryStream::RollbackOutputPublication() noexcept { return impl_->RollbackOutputPublication(); }
+bool GalleryStream::RollbackOutputPublication() noexcept { return terminal_.admission_open() && Active().RollbackOutputPublication(); }
 ExploreGalleryPublication GalleryStream::PublishTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,
                                                       const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) {
-    return impl_->PublishTiles(clean, semantic, stream);
+    return Active().PublishTiles(clean, semantic, stream);
 }
 void GalleryStream::RenderDetail(const ExploreRenderPlan& plan, std::shared_ptr<const data::CompiledDataset> store,
                                  const std::span<const std::uint32_t> annotated,
                                  const std::span<const explore::detail::ExploreRenderClassDescriptorAbi> classes,
                                  const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
                                  const std::uintptr_t stream) {
-    impl_->RenderDetail(plan, std::move(store), annotated, classes, clean, semantic, stream);
+    Active().RenderDetail(plan, std::move(store), annotated, classes, clean, semantic, stream);
 }
-void GalleryStream::Quiesce() { impl_->Quiesce(); }
-void GalleryStream::Suspend() { impl_->Suspend(); }
-std::shared_ptr<const VisualDocument> GalleryStream::Document() const { return impl_->Document(); }
-std::vector<ExploreLabel> GalleryStream::Labels() const { return impl_->Labels(); }
-ExploreStorageFootprint GalleryStream::StorageFootprint() const { return impl_->StorageFootprint(); }
-void GalleryStream::ClearLogicalState() { impl_->ClearLogicalState(); }
+void GalleryStream::Quiesce() { Active().Quiesce(); }
+void GalleryStream::Suspend() { Active().Suspend(); }
+std::shared_ptr<const VisualDocument> GalleryStream::Document() const { return Active().Document(); }
+std::vector<ExploreLabel> GalleryStream::Labels() const { return Active().Labels(); }
+ExploreStorageFootprint GalleryStream::StorageFootprint() const { return Active().StorageFootprint(); }
+void GalleryStream::ClearLogicalState() { Active().ClearLogicalState(); }
 auto GalleryStream::ReleaseAfterRuntimeSettlement() noexcept -> mmltk::frameworks::gpu::SystemImageModel::Release {
-    return impl_->ReleaseAfterRuntimeSettlement();
+    if (!terminal_.admission_open()) { impl_->Retire(terminal_.fact().first_failure); return impl_->TerminalRelease(); }
+    return Active().ReleaseAfterRuntimeSettlement();
 }
 auto GalleryStream::ResetBuffersChecked() noexcept -> mmltk::frameworks::gpu::SystemImageModel::Release {
-    return impl_->ResetBuffersChecked();
+    if (!terminal_.admission_open()) { impl_->Retire(terminal_.fact().first_failure); return impl_->TerminalRelease(); }
+    return Active().ResetBuffersChecked();
 }
 
 }  // namespace mmltk::controller::explore_detail

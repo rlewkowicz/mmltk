@@ -1,11 +1,27 @@
 #pragma once
 
-#include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include <algorithm>
 #include <array>
+#include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 
 namespace mmltk::backend::models::rfdetr::test_support {
+
+struct GpuAugmentationTestAccess final {
+    static void FailEventWait(GpuAugmentationExecutor& executor) {
+        executor.event_wait_ = +[](cudaEvent_t) { return cudaErrorLaunchFailure; };
+    }
+    static std::weak_ptr<const void> Custody(const GpuAugmentationExecutor& executor) { return executor.impl_; }
+};
+
+struct AugmentationExecution final {
+    explicit AugmentationExecution(int device = 0)
+        : context(device, mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop) {}
+    mmltk::frameworks::gpu::DeviceContext context;
+    mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{8U};
+};
 
 [[nodiscard]] inline GpuAugmentationConfig isolated_augmentation_config(const float copy_paste_probability = 0.0F) {
     return {

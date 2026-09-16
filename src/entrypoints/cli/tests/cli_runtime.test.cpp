@@ -909,3 +909,16 @@ TEST_CASE("negative reflected flags preserve canonical defaults and round trip p
 }
 
 MMLTK_REGISTER_TEST_CASE("[core][cli][logging][rfdetr]", test_rfdetr_info_forwards_explicit_logging_options);
+
+TEST_CASE("RF-DETR help exposes independent augmentation and compiler resampling controls", "[core][cli][rfdetr][perceptual]") {
+    for (const auto command : {"train", "compile"}) {
+        const auto result = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", command, "--help"});
+        REQUIRE(result.exit_code == 0);
+        if (std::string_view(command) == "train") {
+            CHECK(result.stdout_text.find("--gpu-augment") != std::string::npos);
+            CHECK(result.stdout_text.find("--aug-perceptual-downscale") != std::string::npos);
+        } else {
+            CHECK(result.stdout_text.find("--perceptual-downscale") != std::string::npos);
+        }
+    }
+}

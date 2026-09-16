@@ -44,6 +44,7 @@ struct ArtifactCompileRequest final {
     std::string preset;
     std::uint32_t resolution = 0U;
     bool overwrite = false;
+    bool perceptual_downscale = false;
     [[nodiscard]] bool valid() const noexcept;
 };
 
@@ -84,9 +85,9 @@ class ArtifactCompilerOperations {
 
    private:
     friend class ArtifactStore;
-    virtual void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, std::uint32_t resolution,
+    virtual void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, std::uint32_t resolution, bool perceptual_downscale,
                                    mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver) const = 0;
-    virtual void compile_benchmark(const std::filesystem::path& output, std::uint32_t resolution,
+    virtual void compile_benchmark(const std::filesystem::path& output, std::uint32_t resolution, bool perceptual_downscale,
                                    mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver,
                                    ArtifactBenchmarkTraceObserver) const = 0;
 };

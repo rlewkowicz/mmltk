@@ -91,6 +91,7 @@ struct PixelBlobWriteRequest {
     int num_workers = 0;
     bool any_resize = false;
     bool any_downscale = false;
+    bool perceptual_downscale = false;
     ProgressCounter* completed_images = nullptr;
     std::span<const int> worker_cpus;
     int initial_active_workers = 0;

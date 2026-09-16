@@ -3950,6 +3950,7 @@ struct BrowserAudit final {
     Bounds error_copy;
     Bounds error_dismiss;
     Bounds benchmark_override;
+    bool perceptual_controls_round_trip = false;
     std::array<Bounds, 8> advanced_fixed;
     Bounds advanced_assignment;
     std::array<Bounds, 3> advanced_match_free;
@@ -4488,6 +4489,8 @@ struct BrowserAudit final {
             workspace_fps_pixels |= record.value("control", "") == kExploreGalleryControl &&
                                     record.value("detail", "") == "visible-counter" && numeric(record, "a") > 0.0 &&
                                     numeric(record, "b") >= 0.5 && numeric(record, "c") >= 12.0 && numeric(record, "d") > 0.0;
+        } else if (event == "integration.perceptual_controls") {
+            perceptual_controls_round_trip = true;
         } else if (event == "integration.benchmark_override") {
             benchmark_round_trip = record.value("control", "") == BENCHMARK_OVERRIDE && record.value("detail", "") == "round-trip" &&
                                    numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 &&
@@ -5191,6 +5194,7 @@ struct BrowserAudit final {
             "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence", compile_progress_placement,
             "Dataset progress placement", model_progress_placement, "Model progress containment", model_composition && model_copy,
             "Model card composition", benchmark_override.valid() && benchmark_round_trip, "benchmark override interaction",
+            perceptual_controls_round_trip, "independent perceptual controls round trip",
             explore_composition, "Explore composition", annotation_composition, "annotation composition",
             workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
             settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released &&

@@ -14,6 +14,7 @@ pub enum Message {
     TestSplitChanged(String),
     OverwriteChanged(bool),
     CompileDimensionsChanged(bool),
+    PerceptualDownscaleChanged(bool),
     ResolutionChanged(i32),
     Browse(u64),
     Compile,
@@ -57,6 +58,9 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<Outcome, St
         })?,
         Message::OverwriteChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainoverwritecompileddataset(draft, value)
+        })?,
+        Message::PerceptualDownscaleChanged(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstraincompileperceptualdownscale(draft, value)
         })?,
         Message::CompileDimensionsChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompiledimensions(draft, value)
@@ -182,6 +186,9 @@ pub fn view<'a>(
             ))
             .id(super::COMPILE_DIMENSIONS_ID),
         );
+    let fields = fields.push(container(crate::view::workflow::fields::toggle(
+        "Perceptual downscaling", train.compileperceptualdownscale, enabled, Message::PerceptualDownscaleChanged,
+    )).id(crate::generated::constraint_workflowstraincompileperceptualdownscale().stable_field_id.to_string()));
     let fields = if train.compiledimensions {
         fields.push(
             container(crate::view::workflow::fields::number_i32(

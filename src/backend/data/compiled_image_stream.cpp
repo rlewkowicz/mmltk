@@ -694,7 +694,9 @@ void CompiledImageStream::synchronize() {
     impl_->changed.wait(lock, [&] { return impl_->queued == 0 && impl_->active == 0; });
     if (impl_->failure) std::rethrow_exception(impl_->failure);
 }
+std::weak_ptr<const void> CompiledImageStream::storage_custody() const noexcept { return impl_; }
 int CompiledImageStream::reset_storage() noexcept {
+    if (impl_.use_count() != 1) return cudaErrorNotReady;
     {
         std::lock_guard lock(impl_->mutex);
         if (impl_->completion_failed) return cudaErrorUnknown;

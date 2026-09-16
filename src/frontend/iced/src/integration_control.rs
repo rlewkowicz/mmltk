@@ -65,6 +65,18 @@ const COMPILE_DATASET: &str = train::COMPILE_DATASET_ID;
 const DATASET_STATUS: &str = train::DATASET_STATUS_ID;
 const DATASET_SOURCE: &str = train::DATASET_SOURCE_ID;
 const COMPILED_DIRECTORY: &str = train::COMPILED_DIRECTORY_ID;
+fn perceptual_control_slot(index: usize) -> usize { [0, 1, 1, 0, 2, 2][index] }
+fn perceptual_control_id(index: usize) -> String {
+    match perceptual_control_slot(index) {
+        0 => crate::generated::constraint_workflowstrainrequestgpuaugmentationenabled().stable_field_id,
+        1 => crate::generated::constraint_workflowstrainrequestgpuaugmentationperceptualdownscale().stable_field_id,
+        _ => crate::generated::constraint_workflowstraincompileperceptualdownscale().stable_field_id,
+    }.to_string()
+}
+fn perceptual_control_values(train: &crate::generated::TrainViewState) -> [bool; 3] {
+    [train.request.gpuaugmentation.enabled, train.request.gpuaugmentation.perceptualdownscale, train.compileperceptualdownscale]
+}
+
 const COMPILE_DIMENSIONS: &str = train::COMPILE_DIMENSIONS_ID;
 const COMPILE_RESOLUTION: &str = train::COMPILE_RESOLUTION_ID;
 const COMPILE_PROGRESS: &str = train::COMPILE_PROGRESS_ID;
@@ -2531,6 +2543,8 @@ enum Phase {
     AwaitDatasetSource,
     CompiledDirectory,
     AwaitCompiledDirectory,
+    PerceptualControl(usize),
+    AwaitPerceptualControl(usize),
     CompileDimensions,
     AwaitCompileDimensions,
     CompileResolution,
@@ -3252,6 +3266,7 @@ pub struct Controller {
     workspace_fps_result: Option<FpsPixelOutcome>,
     workspace_fps_failure: Option<&'static str>,
     benchmark_baseline: bool,
+    perceptual_baseline: [bool; 3],
     settings_revision: u64,
     explore_paste_read: bool,
     explore_integer_baseline: u64,
@@ -3458,6 +3473,7 @@ impl Controller {
             workspace_fps_result: None,
             workspace_fps_failure: None,
             benchmark_baseline: false,
+            perceptual_baseline: [false; 3],
             settings_revision: 0,
             explore_paste_read: false,
             explore_integer_baseline: 0,
@@ -4062,6 +4078,13 @@ impl Controller {
             iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, offset)
                 .chain(locate(control, self.generation))
         }
+    }
+
+    fn arm_perceptual_control(&mut self, index: usize) -> Task<RootMessage> {
+        self.arm_scrolled(
+            perceptual_control_id(index),
+            if perceptual_control_slot(index) == 2 { RelativeOffset::START } else { RelativeOffset::END },
+        )
     }
 
     fn arm_revealed(
@@ -4761,6 +4784,7 @@ impl Controller {
             Phase::BenchmarkRestore => BENCHMARK_OVERRIDE.to_owned(),
             Phase::DatasetSource => DATASET_SOURCE.to_owned(),
             Phase::CompiledDirectory => COMPILED_DIRECTORY.to_owned(),
+            Phase::PerceptualControl(index) => perceptual_control_id(index),
             Phase::CompileDimensions => COMPILE_DIMENSIONS.to_owned(),
             Phase::CompileResolution => COMPILE_RESOLUTION.to_owned(),
             Phase::Compile | Phase::CompileActionWithProgress => COMPILE_DATASET.to_owned(),
@@ -5196,6 +5220,11 @@ impl Controller {
                         self.compiled_directory.clone(),
                     ),
                 ))
+            }
+            Phase::PerceptualControl(index) => {
+                self.phase = Phase::AwaitPerceptualControl(index);
+                if !click(input_bounds) { self.fail("Firefox perceptual control click dispatch failed"); }
+                None
             }
             Phase::CompileDimensions => {
                 self.phase = Phase::AwaitCompileDimensions;
@@ -6870,8 +6899,26 @@ impl Controller {
                         ],
                     )
                 });
-                self.phase = Phase::DatasetSource;
-                self.arm(DATASET_SOURCE)
+                let train = &settings.draft.as_ref().unwrap().workflows.train;
+                self.perceptual_baseline = perceptual_control_values(train);
+                self.phase = Phase::PerceptualControl(0);
+                self.arm_perceptual_control(0)
+            }
+            Phase::PerceptualControl(index) => self.arm_perceptual_control(index),
+            Phase::AwaitPerceptualControl(index) => {
+                let mut expected = self.perceptual_baseline;
+                for step in 0..=index { expected[perceptual_control_slot(step)] ^= true; }
+                let Some(snapshot) = settled_settings_snapshot(model, settings, self.settings_revision) else { return Task::none(); };
+                if perceptual_control_values(&snapshot.settingsstate.workflows.train) != expected { return Task::none(); }
+                self.settings_revision = snapshot.revision;
+                if index == 5 {
+                    reporting::emit(|sink| sink.record("integration.perceptual_controls", "train.perceptual", "independent-round-trip", [1.0, 1.0, 1.0, snapshot.revision as f64]));
+                    self.phase = Phase::DatasetSource;
+                    self.arm_scrolled(DATASET_SOURCE, RelativeOffset::START)
+                } else {
+                    self.phase = Phase::PerceptualControl(index + 1);
+                    self.arm_perceptual_control(index + 1)
+                }
             }
             Phase::DatasetSource => self.arm(DATASET_SOURCE),
             Phase::AwaitDatasetSource

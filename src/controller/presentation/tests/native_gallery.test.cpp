@@ -8,6 +8,8 @@
 #include <array>
 #include <bit>
 #include "src/controller/subsystems/explore/detail/gallery_atlas.h"
+#include "src/controller/subsystems/explore/detail/gallery_stream.h"
+#include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -43,6 +45,16 @@
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/common/io/scoped_fd.h"
+
+namespace mmltk::controller::explore_detail {
+struct GalleryStreamTestAccess final {
+    static void FailStreamWait(GalleryStream& owner) {
+        owner.SetStreamSettlement(+[](cudaStream_t) { return cudaErrorLaunchFailure; });
+    }
+    static std::weak_ptr<const void> Custody(const GalleryStream& owner) { return owner.impl_; }
+    static auto Fact(const GalleryStream& owner) { return owner.terminal_.fact(); }
+};
+}
 
 namespace native_gallery_allocations {
 thread_local bool enabled = false;
@@ -1594,6 +1606,64 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) == detail_descriptors);
     CHECK(gallery.Pixels(0U) == detail_clean);
     CHECK(gallery.Pixels(1U) == detail_semantic);
+}
+
+TEST_CASE("Gallery suspension failure closes admission and retains its real runtime stream", "[explore][native][shutdown][custody]") {
+    namespace gpu=mmltk::frameworks::gpu;
+    using Access=explore_detail::GalleryStreamTestAccess;
+    int count=0;
+    if (cudaGetDeviceCount(&count)!=cudaSuccess || count==0) SKIP("CUDA unavailable; gallery failure custody unexecuted");
+    const auto execution=gpu::test_support::selected_test_device(0,mmltk::common::system::NumaTopology::Capture());
+    gpu::DeviceContext context(0,gpu::cuda_image_copy_backend(),gpu::DeviceContextMode::PrimaryInterop,-1,execution);
+    context.Bind();
+    NativeGalleryArtifact artifact("gallery-settlement-custody");
+    std::weak_ptr<const mmltk::backend::data::CompiledDataset> source_custody;
+    std::weak_ptr<const void> owner_custody;
+    std::weak_ptr<gpu::ImageStream> stream_custody;
+    {
+        auto stream=std::make_shared<gpu::ImageStream>(context);
+        stream_custody=stream;
+        explore_detail::GalleryStream gallery(1,execution,{},16U);
+        gallery.BindExecutionContext(context,stream);
+        owner_custody=Access::Custody(gallery);
+        REQUIRE_NOTHROW(gallery.Suspend());
+        CHECK_FALSE(Access::Fact(gallery).terminal);
+        auto store=std::make_shared<mmltk::backend::data::CompiledDataset>(mmltk::backend::data::CompiledDataset::open(artifact.path));
+        source_custody=store;
+        auto demand=std::make_shared<std::atomic<std::uint64_t>>(1U);
+        gallery.SetCurrentDemand(ExploreDemandCheck{demand});
+        ExploreRenderPlan plan;
+        plan.mode=ExploreMode::Detail; plan.selected_image=0U; plan.dataset_identity=1U; plan.generation=1U;
+        plan.viewport={.extent={16U,16U},.row_count=1U,.columns=1U};
+        plan.augmentation.enabled=true;
+        plan.augmentation_config.enabled=true;
+        plan.augmentation_config.perceptual_downscale=true;
+        plan.augmentation_config.geometry={}; plan.augmentation_config.color={}; plan.augmentation_config.noise={};
+        plan.augmentation_config.blur={}; plan.augmentation_config.occlusion={}; plan.augmentation_config.copy_paste_probability=0;
+        plan.augmentation_config.resize={.probability=1.F,.min_strength=1.F,.max_strength=1.F};
+        gpu::ImageProductBuffer output(context,gpu::ImageProductLayout::CleanAndSemantic);
+        gallery.PrepareOutputPublication(ExploreOutputChange::Initialize,ExploreMode::Detail);
+        output.Publish(*stream,16U,16U,[&](auto clean,auto semantic,auto native) {
+            gallery.RenderDetail(plan,store,{},{},clean,semantic,native);
+        });
+        gallery.CommitOutputPublication();
+        CHECK(gallery.StorageFootprint().augmentation_device_bytes>0U);
+        store.reset();
+        Access::FailStreamWait(gallery);
+        REQUIRE_THROWS(gallery.Suspend());
+        CHECK(Access::Fact(gallery).terminal);
+        CHECK(Access::Fact(gallery).first_failure==cudaErrorLaunchFailure);
+        CHECK(Access::Fact(gallery).occupancy==1U);
+        REQUIRE_THROWS(gallery.Suspend());
+        REQUIRE_THROWS(gallery.PrepareOutputPublication(ExploreOutputChange::Initialize));
+        REQUIRE_THROWS(gallery.Advance());
+        CHECK_FALSE(gallery.RollbackOutputPublication());
+        CHECK_FALSE(gallery.ReleaseAfterRuntimeSettlement().all_released);
+        CHECK_FALSE(gallery.ResetBuffersChecked().all_released);
+        stream.reset();
+        CHECK_FALSE(owner_custody.expired()); CHECK_FALSE(stream_custody.expired()); CHECK_FALSE(source_custody.expired());
+    }
+    CHECK_FALSE(owner_custody.expired()); CHECK_FALSE(stream_custody.expired()); CHECK_FALSE(source_custody.expired());
 }
 
 TEST_CASE("Native retirement settles held GPU and probe callbacks before checked release", "[explore][native][shutdown]") {

@@ -52,6 +52,19 @@ import mmltk.backend.models.rfdetr.training.checkpoint;
 
 #include "detail/gpu_augment_private.h"
 
+namespace mmltk::backend::models::rfdetr::test_support {
+struct GpuBatchAugmenterTestAccess final {
+    static void FailCacheWait(GpuBatchAugmenter& owner) {
+        owner.stream_wait_ = +[](cudaStream_t) { return cudaErrorLaunchFailure; };
+    }
+    static void FailUploadWait(GpuBatchAugmenter& owner) {
+        owner.event_wait_ = +[](cudaEvent_t) { return cudaErrorLaunchFailure; };
+    }
+    static std::weak_ptr<const void> Custody(const GpuBatchAugmenter& owner) { return owner.resources_; }
+    static auto Fact(const GpuBatchAugmenter& owner) { return owner.retirement_.fact(); }
+};
+}
+
 namespace {
 
 namespace rfdetr = mmltk::backend::models::rfdetr;
@@ -552,7 +565,8 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
     const auto config = rfdetr::test_support::isolated_augmentation_config(1);
-    rfdetr::GpuBatchAugmenter augmenter(config, 1, 8, 8, 0);
+    rfdetr::test_support::AugmentationExecution execution_augmenter(0);
+    rfdetr::GpuBatchAugmenter augmenter(config, 1, 8, 8, execution_augmenter.context);
     const auto options = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA);
     const auto donor_pixels = torch_api::full({1, 3, 8, 8}, .9F, options);
     const auto source_pixels = torch_api::full({1, 3, 8, 8}, .1F, options);
@@ -631,6 +645,15 @@ void test_training_adapter_matches_raw_augmentation_executor() {
     const auto int64_device = torch_api::TensorOptions().dtype(torch_api::kInt64).device(torch_api::kCUDA);
     auto source_pixels = torch_api::full({1, 3, height, width}, 0.1F, float_device);
     auto donor_pixels = torch_api::full({1, 3, height, width}, 0.9F, float_device);
+    rfdetr::test_support::AugmentationExecution source_execution(device_id);
+    struct PixelCustody final {
+        mmltk::frameworks::gpu::DeviceContext context;
+        c10::cuda::CUDAStream stream;
+        std::vector<torch_api::Tensor> tensors;
+    };
+    auto source_custody = std::make_shared<PixelCustody>(PixelCustody{
+        source_execution.context, test_stream, {source_pixels, donor_pixels}});
+    constexpr std::size_t image_bytes = 3U * height * width * sizeof(float);
 
     std::array<mmltk::backend::data::LabelIndexEntry, donor_index + 1U> label_index{};
     label_index[donor_index] = {0U, 1U, 0U};
@@ -647,6 +670,8 @@ void test_training_adapter_matches_raw_augmentation_executor() {
         .image_indices = donor_indices.data(),
         .slot_index = 0U,
         .lease_id = 0U,
+        .image_custody = source_custody,
+        .image_capacity_bytes = image_bytes,
     };
     const mmltk::backend::data::Batch source_batch{
         .num_images = source_indices.size(),
@@ -657,11 +682,15 @@ void test_training_adapter_matches_raw_augmentation_executor() {
         .image_indices = source_indices.data(),
         .slot_index = 0U,
         .lease_id = 0U,
+        .image_custody = source_custody,
+        .image_capacity_bytes = image_bytes,
     };
     auto config = rfdetr::test_support::isolated_augmentation_config(1.0F);
 
-    for (const bool include_masks : {false, true}) {
-        rfdetr::GpuBatchAugmenter adapter(config, 1, height, width, device_id);
+    for (const bool perceptual : {false, true}) for (const bool include_masks : {false, true}) {
+        config.perceptual_downscale = perceptual;
+        rfdetr::test_support::AugmentationExecution execution_adapter(device_id);
+        rfdetr::GpuBatchAugmenter adapter(config, 1, height, width, execution_adapter.context);
         (void)adapter.run(donor_batch, seed, epoch, rank, sequence - 1U);
         rfdetr::TargetScratch scratch(1);
         auto supervision = rfdetr::TrainingSupervisionConfig{};
@@ -691,8 +720,12 @@ void test_training_adapter_matches_raw_augmentation_executor() {
         const rfdetr::AugmentationBatchPlan adapted_plan = adapter.batch_plan();
         REQUIRE(adapted_plan.images.front().paste_donor_slot == 0);
 
-        rfdetr::GpuAugmentationExecutor raw(config, 1U, height, width, device_id);
+        rfdetr::test_support::AugmentationExecution execution_raw(device_id);
+
+        rfdetr::GpuAugmentationExecutor raw(config, 1U, height, width, execution_raw.context, execution_raw.retirement);
         auto raw_output = torch_api::empty_like(source_pixels);
+        auto raw_custody = std::make_shared<PixelCustody>(PixelCustody{
+            execution_raw.context, test_stream, {raw_output}});
         std::array<std::uint64_t, source_indices.size()> keys{};
         for (std::size_t image = 0U; image < keys.size(); ++image) {
             keys[image] = rfdetr::training_augmentation_image_key(seed, epoch, rank, sequence, image);
@@ -704,6 +737,10 @@ void test_training_adapter_matches_raw_augmentation_executor() {
             .image_indices = source_indices,
             .height = height,
             .width = width,
+            .input_custody = source_custody,
+            .output_custody = raw_custody,
+            .input_capacity_bytes = image_bytes,
+            .output_capacity_bytes = image_bytes,
         };
         const std::array raw_donors{
             rfdetr::GpuAugmentationDonor{
@@ -716,12 +753,15 @@ void test_training_adapter_matches_raw_augmentation_executor() {
         };
         auto donor_mask = torch_api::full({1, 1}, -1, int64_device);
         auto donor_box = torch_api::tensor({0.125F, 0.125F, 0.875F, 0.875F}, float_device).view({1, 4});
+        raw_custody->tensors.insert(raw_custody->tensors.end(), {donor_pixels, donor_mask, donor_box});
         const rfdetr::GpuAugmentationDonorBatchView raw_donor_batch{
             .images = donor_pixels.data_ptr<float>(),
             .masks = donor_mask.data_ptr<std::int64_t>(),
             .boxes = donor_box.data_ptr<float>(),
             .mask_words = 1,
             .selection = rfdetr::GpuAugmentationDonorSelection::Cached,
+            .image_custody = raw_custody,
+            .image_capacity_bytes = image_bytes,
         };
         (void)raw.Run(raw_batch, keys, raw_donors, raw_donor_batch, stream);
         REQUIRE(torch_api::equal(adapted, raw_output));
@@ -865,7 +905,8 @@ void test_copy_paste_ring_support_and_cache_cycles() {
         CAPTURE(include_masks);
         auto config = isolated_augmentation_config(1);
         config.geometry = {1.F, .4F, .4F};
-        rfdetr::GpuBatchAugmenter augmenter(config, 1, 8, 8, 0);
+        rfdetr::test_support::AugmentationExecution execution_augmenter(0);
+        rfdetr::GpuBatchAugmenter augmenter(config, 1, 8, 8, execution_augmenter.context);
         rfdetr::TargetScratch scratch(1);
         const auto consume_cached_batch = [&] {
             auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16,
@@ -1167,7 +1208,8 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
                                             .image_indices = indices.data(),
                                             .slot_index = 0U,
                                             .lease_id = 0U};
-    rfdetr::GpuBatchAugmenter augmenter(rfdetr::test_support::spatial_occlusion_config(), count, extent, extent, 0);
+    rfdetr::test_support::AugmentationExecution execution_augmenter(0);
+    rfdetr::GpuBatchAugmenter augmenter(rfdetr::test_support::spatial_occlusion_config(), count, extent, extent, execution_augmenter.context);
     const auto image = augmenter.run(batch, 53U, 0, 0, 0U);
     rfdetr::TargetScratch scratch(count);
     auto supervision = rfdetr::TrainingSupervisionConfig{};
@@ -1640,3 +1682,91 @@ MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][co
                          test_copy_paste_cache_publication_recovers_without_targets);
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][ema]", test_ema_selection_restores_identity_and_mode);
+
+TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads", "[model][rfdetr][training][augmentation][perceptual][cuda]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Torch resampling custody unexecuted");
+    const auto stream = training_test_stream();
+    c10::cuda::CUDAStreamGuard stream_guard(stream);
+    rfdetr::test_support::AugmentationExecution execution;
+    struct TensorImages final {
+        mmltk::frameworks::gpu::DeviceContext context;
+        c10::cuda::CUDAStream stream;
+        torch_api::Tensor input, output;
+    };
+    auto images = std::make_shared<TensorImages>(TensorImages{execution.context, stream,
+        torch_api::full({20,3,9,9}, .25F, torch_api::TensorOptions().device(torch_api::kCUDA)),
+        torch_api::full({20,3,9,9}, -.75F, torch_api::TensorOptions().device(torch_api::kCUDA))});
+    auto config = rfdetr::test_support::isolated_augmentation_config();
+    config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
+    config.perceptual_downscale = true;
+    rfdetr::GpuAugmentationExecutor executor(config, 20, 9, 9, execution.context, execution.retirement);
+    std::array<std::uint32_t,20> indices{};
+    std::array<std::uint64_t,20> keys{};
+    for (std::size_t i = 0; i != keys.size(); ++i) keys[i] = i + 1;
+    rfdetr::GpuAugmentationBatchView batch{.input=images->input.data_ptr<float>(), .output=images->output.data_ptr<float>(),
+        .image_indices=indices, .height=9, .width=9, .output_domain=rfdetr::GpuAugmentationOutputDomain::UnitRgb,
+        .input_custody=images, .output_custody=images,
+        .input_capacity_bytes=static_cast<std::size_t>(images->input.numel())*sizeof(float)-1,
+        .output_capacity_bytes=static_cast<std::size_t>(images->output.numel())*sizeof(float)};
+    REQUIRE_THROWS(executor.Run(batch, keys, {}, {}, stream.stream()));
+    CHECK(images->output.eq(-.75F).all().item<bool>());
+    ++batch.input_capacity_bytes;
+    (void)executor.Run(batch, keys, {}, {}, stream.stream());
+    std::weak_ptr<TensorImages> weak = images;
+    batch.input_custody.reset(); batch.output_custody.reset(); images.reset();
+    REQUIRE_FALSE(weak.expired());
+    executor.Finish();
+    CHECK(weak.expired());
+}
+
+TEST_CASE("training cache failed settlement retains tensors stream and source and refuses another batch", "[model][rfdetr][augmentation][cuda][custody]") {
+    if (mmltk::testsupport::checked_cuda_device_count()==0) SKIP("CUDA unavailable; cache settlement case unexecuted");
+    c10::cuda::CUDAStreamGuard guard(training_test_stream());
+    rfdetr::test_support::AugmentationExecution execution;
+    const auto config=rfdetr::test_support::isolated_augmentation_config(1.F);
+    using Access=rfdetr::test_support::GpuBatchAugmenterTestAccess;
+    for (int failure_path=0;failure_path<3;++failure_path) {
+        std::weak_ptr<const void> retained, retained_source;
+        {
+            rfdetr::GpuBatchAugmenter owner(config,1,4,4,execution.context);
+            retained=Access::Custody(owner);
+            auto pixels=std::make_shared<torch_api::Tensor>(torch_api::full({1,3,4,4},.25F,
+                torch_api::TensorOptions().device(torch_api::kCUDA)));
+            retained_source=pixels;
+            std::array<std::uint32_t,1> indices{0};
+            mmltk::backend::data::Batch batch{.num_images=1,.device_images=pixels->data_ptr<float>(),
+                .image_indices=indices.data(),.image_custody=pixels,.image_capacity_bytes=48U*sizeof(float)};
+            if (failure_path==0) {
+                Access::FailCacheWait(owner);
+                REQUIRE_THROWS(owner.reconfigure(config));
+            } else {
+                (void)owner.run(batch,1,0,0,0);
+                (void)owner.prepare_batch_consumer();
+                if (failure_path==1) {
+                    owner.batch_plan().images[0].cache_source_ordinal=0;
+                    Access::FailCacheWait(owner);
+                    REQUIRE_THROWS_WITH(owner.finish_batch(batch), "donor cache replacement requires source labels and identities");
+                } else {
+                    (void)owner.finish_batch(batch);
+                    (void)owner.run(batch,1,0,0,1);
+                    (void)owner.prepare_batch_consumer();
+                    Access::FailUploadWait(owner);
+                    REQUIRE_THROWS(owner.finish_batch(batch));
+                }
+            }
+            CHECK(Access::Fact(owner).terminal);
+            CHECK(Access::Fact(owner).first_failure==cudaErrorLaunchFailure);
+            REQUIRE_THROWS(owner.run({},1,0,0,0));
+            REQUIRE_THROWS(owner.reconfigure(config));
+            REQUIRE_THROWS(owner.finish_batch({}));
+            REQUIRE_THROWS(owner.prepare_batch_consumer());
+            REQUIRE_THROWS(owner.batch_plan());
+            REQUIRE_THROWS(owner.enabled());
+            pixels.reset();
+            CHECK_FALSE(retained.expired());
+            if (failure_path!=0) CHECK_FALSE(retained_source.expired());
+        }
+        CHECK_FALSE(retained.expired());
+        if (failure_path!=0) CHECK_FALSE(retained_source.expired());
+    }
+}

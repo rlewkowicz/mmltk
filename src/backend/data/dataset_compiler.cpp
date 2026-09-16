@@ -277,6 +277,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
                                                         pixel_workers,
                                                         true,
                                                         true,
+                                                        effective_config.perceptual_downscale,
                                                         telemetry != nullptr ? &pixel_progress : nullptr,
                                                         worker_cpus,
                                                         initial_pixel_workers,

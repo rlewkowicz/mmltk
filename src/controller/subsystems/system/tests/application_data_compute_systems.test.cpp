@@ -591,9 +591,9 @@ class UnusedWeightOperations final : public services::ArtifactWeightOperations {
 
 class DiagnosticCompiler final : public services::ArtifactCompilerOperations {
    private:
-    void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t,
+    void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool,
                            mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
-    void compile_benchmark(const std::filesystem::path&, std::uint32_t, mmltk::common::concurrency::CancellationObservation,
+    void compile_benchmark(const std::filesystem::path&, std::uint32_t, bool, mmltk::common::concurrency::CancellationObservation,
                            services::ArtifactProgressObserver, services::ArtifactBenchmarkTraceObserver trace) const override {
         trace("benchmark.direct", R"({"records":1})");
     }
@@ -2627,4 +2627,20 @@ TEST_CASE("artifact model inspection observes cancellation before each opaque in
         }), "model selection cancelled");
         CHECK(verified);
     }
+}
+
+TEST_CASE("compilation captures its perceptual selection independently of augmentation", "[controller][systems][dataset][perceptual]") {
+    contracts::GuiSettingsState settings;
+    settings.workflows.train.compile_perceptual_downscale = true;
+    settings.workflows.train.request.gpu_augmentation.enabled = false;
+    settings.workflows.train.request.gpu_augmentation.perceptual_downscale = false;
+    const auto captured = services::materialize_artifact_compile(settings);
+    REQUIRE(captured);
+    CHECK(captured->perceptual_downscale);
+    settings.workflows.train.compile_perceptual_downscale = false;
+    settings.workflows.train.request.gpu_augmentation.perceptual_downscale = true;
+    const auto next = services::materialize_artifact_compile(settings);
+    REQUIRE(next);
+    CHECK_FALSE(next->perceptual_downscale);
+    CHECK(captured->perceptual_downscale);
 }

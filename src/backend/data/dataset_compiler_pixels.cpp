@@ -110,10 +110,10 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void decode_pixel_worker(const std::filesystem::path& split_dir, const WritablePixelRange& pixel_blob, std::atomic<uint32_t>& next_image,
                          uint32_t num_images, uint32_t target_width, uint32_t target_height, size_t image_stride,
-                         int resize_threads_per_image, ProgressCounter* completed_images,
+                         int resize_threads_per_image, bool perceptual_downscale, ProgressCounter* completed_images,
                          mmltk::common::concurrency::CancellationObservation cancel_requested, std::atomic<bool>* failure_requested) {
     mmltk::common::logging::ScopedProfile profile{"compiler.pixels.decode_worker"};
-    RgbImageResizer image_resizer(resize_threads_per_image);
+    RgbImageResizer image_resizer(resize_threads_per_image, perceptual_downscale);
     std::vector<uint8_t> resize_scratch;
     ProgressBatch progress(completed_images);
     while (true) {
@@ -160,7 +160,7 @@ void write_pixel_blob(const FileHandle& fd, const PixelBlobWriteRequest& request
                                         }
                                         decode_pixel_worker(request.split_dir, pixel_blob, next_image, request.num_images, request.width,
                                                             request.height, request.image_stride, resize_plan.resize_threads_per_image,
-                                                            request.completed_images, request.cancel_requested, request.failure_requested);
+                                                            request.perceptual_downscale, request.completed_images, request.cancel_requested, request.failure_requested);
                                     });
 }
 

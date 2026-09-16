@@ -1,4 +1,5 @@
 #include "copy_paste_fixture.h"
+#include "src/backend/data/tests/perceptual_downscale_reference.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -58,6 +59,21 @@ class TestDeviceBuffer final {
     std::size_t count_ = 0U;
 };
 
+// The same aggregate owns every source/output allocation and the issuing stream.
+struct AugmentationPixels final {
+    explicit AugmentationPixels(std::size_t count) : input(count), output(count) {
+        cuda_require(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    }
+    ~AugmentationPixels() {
+        (void)cudaStreamSynchronize(stream);
+        (void)cudaStreamDestroy(stream);
+    }
+    TestDeviceBuffer<float> input, output;
+    std::unique_ptr<TestDeviceBuffer<float>> donor, boxes;
+    std::unique_ptr<TestDeviceBuffer<std::int64_t>> masks;
+    cudaStream_t stream = nullptr;
+};
+
 void check_model_normalized_rgb(const std::span<const float> model, const std::span<const float> rgb,
                                 const std::size_t pixels_per_channel) {
     constexpr std::array means{0.485F, 0.456F, 0.406F};
@@ -90,12 +106,13 @@ std::vector<float> execute_and_copy(GpuAugmentationExecutor& executor, const std
                                     const GpuAugmentationDonorSelection donor_selection = GpuAugmentationDonorSelection::Aligned,
                                     const GpuAugmentationOutputDomain output_domain = GpuAugmentationOutputDomain::ModelNormalized,
                                     const int extent = 4) {
-    TestDeviceBuffer<float> input_device(input.size());
-    TestDeviceBuffer<float> output_device(input.size());
+    auto pixels = std::make_shared<AugmentationPixels>(input.size());
+    auto& input_device = pixels->input;
+    auto& output_device = pixels->output;
     cuda_require(cudaMemcpy(input_device.data(), input.data(), input_device.size_bytes(), cudaMemcpyHostToDevice));
-    std::unique_ptr<TestDeviceBuffer<float>> donor_device;
-    std::unique_ptr<TestDeviceBuffer<std::int64_t>> masks_device;
-    std::unique_ptr<TestDeviceBuffer<float>> boxes_device;
+    auto& donor_device = pixels->donor;
+    auto& masks_device = pixels->masks;
+    auto& boxes_device = pixels->boxes;
     if (!donor_pixels.empty()) {
         donor_device = std::make_unique<TestDeviceBuffer<float>>(donor_pixels.size());
         cuda_require(cudaMemcpy(donor_device->data(), donor_pixels.data(), donor_device->size_bytes(), cudaMemcpyHostToDevice));
@@ -108,8 +125,7 @@ std::vector<float> execute_and_copy(GpuAugmentationExecutor& executor, const std
         boxes_device = std::make_unique<TestDeviceBuffer<float>>(donor_boxes.size());
         cuda_require(cudaMemcpy(boxes_device->data(), donor_boxes.data(), boxes_device->size_bytes(), cudaMemcpyHostToDevice));
     }
-    cudaStream_t stream = nullptr;
-    cuda_require(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const cudaStream_t stream = pixels->stream;
     const bool indirect = GENERATE(false, true);
     std::vector<const float*> input_slots, donor_slots;
     if (indirect && !indices.empty()) {
@@ -138,6 +154,10 @@ std::vector<float> execute_and_copy(GpuAugmentationExecutor& executor, const std
         .width = extent,
         .output_domain = output_domain,
         .input_slots = input_slots,
+        .input_custody = pixels,
+        .output_custody = pixels,
+        .input_capacity_bytes = indirect ? std::size_t(extent * extent * 3) * sizeof(float) : input_device.size_bytes(),
+        .output_capacity_bytes = output_device.size_bytes(),
     };
     const GpuAugmentationDonorBatchView donor_batch{
         .images = donor_device != nullptr ? donor_device->data() : nullptr,
@@ -146,12 +166,14 @@ std::vector<float> execute_and_copy(GpuAugmentationExecutor& executor, const std
         .mask_words = masks_device != nullptr ? 1 : 0,
         .selection = donor_selection,
         .image_slots = donor_slots,
+        .image_custody = pixels,
+        .image_capacity_bytes = donor_device ? (indirect ? std::size_t(extent * extent * 3) * sizeof(float) : donor_device->size_bytes()) : 0U,
     };
     (void)executor.Run(batch, keys, donors, donor_batch, stream);
     cuda_require(cudaStreamSynchronize(stream));
     std::vector<float> output(input.size());
     cuda_require(cudaMemcpy(output.data(), output_device.data(), output_device.size_bytes(), cudaMemcpyDeviceToHost));
-    cuda_require(cudaStreamDestroy(stream));
+    executor.Finish();
     return output;
 }
 
@@ -237,7 +259,8 @@ TEST_CASE("augmentation executor selects display RGB for both input formats and 
     cuda_require(cudaMemcpy(rgba_input.data(), rgba.data(), rgba_input.size_bytes(), cudaMemcpyHostToDevice));
     for (const auto& config :
          {disabled_config(), test_support::isolated_augmentation_config(), test_support::isolated_augmentation_config(1.0F)}) {
-        GpuAugmentationExecutor executor(config, 1U, 4, 4, 0);
+        test_support::AugmentationExecution execution_executor(0);
+        GpuAugmentationExecutor executor(config, 1U, 4, 4, execution_executor.context, execution_executor.retirement);
         for (const auto format : {GpuAugmentationInputFormat::PlanarFloat32, GpuAugmentationInputFormat::Rgba8}) {
             const GpuAugmentationBatchView batch{.input = format == GpuAugmentationInputFormat::Rgba8
                                                               ? static_cast<const void*>(rgba_input.data())
@@ -412,7 +435,10 @@ TEST_CASE("augmentation preview donor selection is deterministic and excludes it
 TEST_CASE("raw augmentation rejects invalid configuration before allocating", "[backend][models][rfdetr][augmentation]") {
     GpuAugmentationConfig invalid;
     invalid.color.probability = std::numeric_limits<float>::quiet_NaN();
-    CHECK_THROWS(GpuAugmentationExecutor(invalid, 1U, 4, 4, 0));
+    CHECK_FALSE(gpu_augmentation_config_valid(invalid));
+    if (!has_cuda_device()) SKIP("CUDA context unavailable for executor construction");
+    test_support::AugmentationExecution execution;
+    CHECK_THROWS(GpuAugmentationExecutor(invalid, 1U, 4, 4, execution.context, execution.retirement));
 }
 
 TEST_CASE("raw augmentation rejects overflowing two-slot parameter staging before CUDA access", "[backend][models][rfdetr][augmentation]") {
@@ -423,8 +449,9 @@ TEST_CASE("raw augmentation rejects overflowing two-slot parameter staging befor
     STATIC_REQUIRE(capacity <= maximum / parameters);
     STATIC_REQUIRE(capacity <= maximum / 3U);
     STATIC_REQUIRE(capacity <= maximum / (staging_slots * static_cast<std::size_t>(kGpuCopyPasteParameterCount)));
-    // The exact shape-validation error must win even without a CUDA device or with an invalid device id.
-    CHECK_THROWS_WITH(GpuAugmentationExecutor(disabled_config(), capacity, 1, 1, -1), "GPU augmentation workspace size overflows");
+    if (!has_cuda_device()) SKIP("CUDA context unavailable for executor construction");
+    test_support::AugmentationExecution execution;
+    CHECK_THROWS_WITH(GpuAugmentationExecutor(disabled_config(), capacity, 1, 1, execution.context, execution.retirement), "GPU augmentation workspace size overflows");
 }
 
 TEST_CASE("raw augmentation is deterministic, seed-sensitive, bounded, and reuses high-water workspace",
@@ -439,7 +466,9 @@ TEST_CASE("raw augmentation is deterministic, seed-sensitive, bounded, and reuse
         input[index] = static_cast<float>(index) / static_cast<float>(input.size());
     }
 
-    GpuAugmentationExecutor identity(disabled_config(), 2U, 4, 4, 0);
+    test_support::AugmentationExecution execution_identity(0);
+
+    GpuAugmentationExecutor identity(disabled_config(), 2U, 4, 4, execution_identity.context, execution_identity.retirement);
     const auto identity_output = execute_and_copy(identity, input, indices, key_a);
     CHECK(identity.plan().active_size == 1U);
     CHECK_FALSE(identity.plan().transforms_geometry);
@@ -511,7 +540,8 @@ TEST_CASE("raw augmentation is deterministic, seed-sensitive, bounded, and reuse
 
     GpuAugmentationConfig color = test_support::isolated_augmentation_config();
     color.color = {1.0F, 1.0F, 1.0F};
-    GpuAugmentationExecutor executor(color, 2U, 4, 4, 0);
+    test_support::AugmentationExecution execution_executor(0);
+    GpuAugmentationExecutor executor(color, 2U, 4, 4, execution_executor.context, execution_executor.retirement);
     const std::size_t capacity_bytes = executor.workspace_capacity_bytes();
     const auto first = execute_and_copy(executor, input, indices, key_a);
     executor.Reconfigure(color);
@@ -591,7 +621,8 @@ TEST_CASE("raw augmentation handles missing and valid copy-paste donors with mas
     cuda_require(cudaSetDevice(0));
     GpuAugmentationConfig config = test_support::isolated_augmentation_config();
     config.copy_paste_probability = 1.0F;
-    GpuAugmentationExecutor executor(config, 1U, 4, 4, 0);
+    test_support::AugmentationExecution execution_executor(0);
+    GpuAugmentationExecutor executor(config, 1U, 4, 4, execution_executor.context, execution_executor.retirement);
     constexpr std::array<std::uint32_t, 1U> indices{4U};
     constexpr std::array<std::uint64_t, 1U> keys{83U};
     std::vector<float> source(3U * 4U * 4U, 0.1F);
@@ -604,7 +635,8 @@ TEST_CASE("raw augmentation handles missing and valid copy-paste donors with mas
     }};
     const auto without_donor = execute_and_copy(executor, source, indices, keys, missing);
     CHECK(executor.plan().images.front().paste_donor_slot < 0);
-    GpuAugmentationExecutor no_copy_paste(test_support::isolated_augmentation_config(), 1U, 4, 4, 0);
+    test_support::AugmentationExecution execution_no_copy_paste(0);
+    GpuAugmentationExecutor no_copy_paste(test_support::isolated_augmentation_config(), 1U, 4, 4, execution_no_copy_paste.context, execution_no_copy_paste.retirement);
     const auto copy_paste_disabled = execute_and_copy(no_copy_paste, source, indices, keys);
     REQUIRE(without_donor.size() == copy_paste_disabled.size());
     for (std::size_t value = 0U; value < without_donor.size(); ++value) {
@@ -639,7 +671,8 @@ TEST_CASE("copy-paste physical ring support is independent of loss selection", "
         for (const bool present : {false, true})
             for (const float probability : {0.F, 1.F}) {
                 CAPTURE(masked, present, probability);
-                GpuAugmentationExecutor executor(test_support::isolated_augmentation_config(probability), 1, 8, 8, 0);
+                test_support::AugmentationExecution execution_executor(0);
+                GpuAugmentationExecutor executor(test_support::isolated_augmentation_config(probability), 1, 8, 8, execution_executor.context, execution_executor.retirement);
                 const std::array donors{GpuAugmentationDonor{.label = present ? 7 : -1,
                                                              .dataset_index = 1,
                                                              .area = masked ? 20.F : 36.F,
@@ -670,13 +703,15 @@ TEST_CASE("raw augmentation executor settles submitted work during shutdown", "[
     constexpr std::array<std::uint32_t, 1U> indices{7U};
     constexpr std::array<std::uint64_t, 1U> keys{31U};
     std::vector<float> input(3U * 4U * 4U, 0.25F);
-    TestDeviceBuffer<float> input_device(input.size());
-    TestDeviceBuffer<float> output_device(input.size());
+    auto pixels = std::make_shared<AugmentationPixels>(input.size());
+    auto& input_device = pixels->input;
+    auto& output_device = pixels->output;
     cuda_require(cudaMemcpy(input_device.data(), input.data(), input_device.size_bytes(), cudaMemcpyHostToDevice));
     cudaStream_t stream = nullptr;
     cuda_require(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     {
-        GpuAugmentationExecutor executor(disabled_config(), 1U, 4, 4, 0);
+        test_support::AugmentationExecution execution_executor(0);
+        GpuAugmentationExecutor executor(disabled_config(), 1U, 4, 4, execution_executor.context, execution_executor.retirement);
         const GpuAugmentationBatchView batch{
             .input = input_device.data(),
             .output = output_device.data(),
@@ -719,7 +754,8 @@ TEST_CASE("planned spatial erasure agrees with final image pixels through geomet
     for (const bool geometry : {false, true}) {
         auto config = test_support::spatial_occlusion_config(geometry);
         config.copy_paste_probability = geometry ? 1.0F : 0.0F;
-        GpuAugmentationExecutor executor(config, count, 4, 4, 0);
+        test_support::AugmentationExecution execution_executor(0);
+        GpuAugmentationExecutor executor(config, count, 4, 4, execution_executor.context, execution_executor.retirement);
         const std::vector<float> input(count * 48U, 0.9F);
         const auto output = execute_and_copy(executor, input, indices, keys, donors, std::vector<float>(input.size(), 0.7F),
                                              std::vector<std::int64_t>(count, 0xFFFF));
@@ -808,6 +844,197 @@ TEST_CASE("paste admission handles disabled zero and certain probabilities", "[b
         config.enabled = false;
         CHECK_FALSE(augmentation_paste_admitted(config, key));
         config.enabled = true;
+    }
+}
+
+TEST_CASE("augmentation failed staging finish and reconfigure settlement closes exact owner admission",
+          "[backend][augmentation][perceptual][cuda][custody]") {
+    if (!has_cuda_device()) SKIP("CUDA unavailable; settlement custody case unexecuted");
+    const auto failure_path = GENERATE(0, 1, 2);
+    test_support::AugmentationExecution execution;
+    std::weak_ptr<const void> owner;
+    std::weak_ptr<AugmentationPixels> allocations;
+    {
+        auto config = test_support::isolated_augmentation_config();
+        config.perceptual_downscale = true;
+        config.resize = {.probability=1.F,.min_strength=1.F,.max_strength=1.F};
+        GpuAugmentationExecutor executor(config, 20, 9, 9, execution.context, execution.retirement);
+        auto pixels = std::make_shared<AugmentationPixels>(20U*3U*81U);
+        cuda_require(cudaMemsetAsync(pixels->input.data(), 0, pixels->input.size_bytes(), pixels->stream));
+        std::array<std::uint32_t,20> indices{};
+        std::array<std::uint64_t,20> keys{};
+        for (std::size_t i=0;i<keys.size();++i) keys[i]=i+1;
+        GpuAugmentationBatchView batch{.input=pixels->input.data(),.output=pixels->output.data(),.image_indices=indices,
+            .height=9,.width=9,.input_custody=pixels,.output_custody=pixels,
+            .input_capacity_bytes=pixels->input.size_bytes(),.output_capacity_bytes=pixels->output.size_bytes()};
+        auto invalid=batch; invalid.height=8;
+        REQUIRE_THROWS(executor.Run(invalid,keys,{},{},pixels->stream));
+        CHECK(execution.retirement.admission_open());
+        (void)executor.Run(batch,keys,{},{},pixels->stream);
+        owner=test_support::GpuAugmentationTestAccess::Custody(executor);
+        allocations=pixels;
+        test_support::GpuAugmentationTestAccess::FailEventWait(executor);
+        if (failure_path==0) REQUIRE_THROWS(executor.Run(batch,keys,{},{},pixels->stream));
+        if (failure_path==1) REQUIRE_THROWS(executor.Finish());
+        if (failure_path==2) { config.enabled=false; REQUIRE_THROWS(executor.Reconfigure(config)); }
+        CHECK_FALSE(execution.retirement.admission_open());
+        CHECK(execution.retirement.fact().first_failure==cudaErrorLaunchFailure);
+        CHECK(execution.retirement.fact().occupancy==1U);
+        REQUIRE_THROWS(executor.Run(batch,keys,{},{},pixels->stream));
+        REQUIRE_THROWS(executor.RunTraining(batch,1,0,0,0,{},{},pixels->stream));
+        REQUIRE_THROWS(executor.Finish());
+        REQUIRE_THROWS(executor.Reconfigure(config));
+        REQUIRE_THROWS(executor.plan());
+        REQUIRE_THROWS(executor.enabled());
+        REQUIRE_THROWS(executor.workspace_capacity_bytes());
+        batch.input_custody.reset(); batch.output_custody.reset(); invalid.input_custody.reset(); invalid.output_custody.reset();
+        pixels.reset();
+        CHECK_FALSE(owner.expired()); CHECK_FALSE(allocations.expired());
+    }
+    CHECK_FALSE(owner.expired()); CHECK_FALSE(allocations.expired());
+}
+
+double sample_reference(const mmltk::backend::data::test_perceptual::Image& image, double x, double y, unsigned channel) {
+    constexpr double mean[]{.485, .456, .406};
+    if (x<0 || x>1 || y<0 || y>1) return mean[channel];
+    const auto width=image.layout.width, height=image.layout.height;
+    const double px=std::clamp(x*width-.5,0.0,double(width-1)), py=std::clamp(y*height-.5,0.0,double(height-1));
+    const unsigned x0=static_cast<unsigned>(px), y0=static_cast<unsigned>(py);
+    const unsigned x1=std::min(x0+1,width-1), y1=std::min(y0+1,height-1);
+    return std::lerp(std::lerp(image.at(x0,y0,channel),image.at(x1,y0,channel),px-x0),
+                     std::lerp(image.at(x0,y1,channel),image.at(x1,y1,channel),px-x0),py-y0);
+}
+
+TEST_CASE("perceptual augmentation preserves plans and independently remaps mixed batches above custody capacity",
+          "[backend][models][rfdetr][augmentation][perceptual][cuda]") {
+    if (!has_cuda_device()) SKIP("CUDA unavailable; perceptual augmentation acceptance is unexecuted");
+    constexpr int extent = 9;
+    constexpr std::size_t count = 64, plane = extent * extent;
+    namespace oracle = mmltk::backend::data::test_perceptual;
+    oracle::Image original(extent, extent, mmltk::backend::data::RgbPixelFormat::PlanarUnitSrgbF32);
+    original.fill(3);
+    std::vector<float> input(count * 3U * plane);
+    std::array<std::uint32_t, count> indices{};
+    std::array<std::uint64_t, count> keys{};
+    for (std::size_t image = 0; image != count; ++image) {
+        indices[image] = static_cast<std::uint32_t>(image);
+        keys[image] = image + 1;
+        for (unsigned channel = 0; channel != 3; ++channel)
+            for (unsigned y = 0; y != extent; ++y)
+                for (unsigned x = 0; x != extent; ++x)
+                    input[(image * 3U + channel) * plane + y * extent + x] = static_cast<float>(original.at(x, y, channel));
+    }
+    auto config = test_support::isolated_augmentation_config();
+    config.resize = {.probability = .7F, .min_strength = .8F, .max_strength = .8F};
+    test_support::AugmentationExecution execution;
+    GpuAugmentationExecutor executor(config, count, extent, extent, execution.context, execution.retirement);
+    const auto ordinary = execute_and_copy(executor, input, indices, keys, {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
+                                          GpuAugmentationOutputDomain::UnitRgb, extent);
+    const auto plans = executor.plan().images;
+    const auto baseline_bytes = executor.device_capacity_bytes();
+    config.perceptual_downscale = true;
+    executor.Reconfigure(config);
+    const auto filtered = execute_and_copy(executor, input, indices, keys, {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
+                                          GpuAugmentationOutputDomain::UnitRgb, extent);
+    REQUIRE(executor.plan().images == plans);
+    std::size_t shrink = 0, enlarge = 0, identity = 0;
+    for (std::size_t image = 0; image != count; ++image) {
+        const auto& plan = plans[image];
+        if (plan.area_scale >= 1.0F) {
+            if (plan.area_scale == 1.0F) ++identity; else ++enlarge;
+            CHECK(std::equal(filtered.begin() + image * 3U * plane, filtered.begin() + (image + 1U) * 3U * plane,
+                             ordinary.begin() + image * 3U * plane));
+            continue;
+        }
+        ++shrink;
+        const auto reduced_extent = static_cast<unsigned>(std::ceil(extent * std::sqrt(plan.area_scale)));
+        const auto reduced = oracle::reference(original, reduced_extent, reduced_extent);
+        for (unsigned y = 0; y != extent; ++y) for (unsigned x = 0; x != extent; ++x) {
+            const double nx = (x + .5) / extent, ny = (y + .5) / extent;
+            const double sx = plan.inverse[0] * nx + plan.inverse[1] * ny + plan.inverse[2];
+            const double sy = plan.inverse[3] * nx + plan.inverse[4] * ny + plan.inverse[5];
+            for (unsigned channel = 0; channel != 3; ++channel) {
+                const double expected = sample_reference(reduced, sx, sy, channel);
+                CHECK(std::abs(filtered[(image * 3U + channel) * plane + y * extent + x] - expected) < 2e-4);
+            }
+        }
+    }
+    CHECK(shrink > 16U);
+    CHECK(enlarge > 0U);
+    CHECK(identity > 0U);
+    CHECK(executor.device_capacity_bytes() > baseline_bytes);
+    const auto retained_bytes = executor.device_capacity_bytes();
+    CHECK(execute_and_copy(executor, input, indices, keys, {}, {}, {}, {}, GpuAugmentationDonorSelection::Aligned,
+                          GpuAugmentationOutputDomain::UnitRgb, extent) == filtered);
+    CHECK(executor.device_capacity_bytes() == retained_bytes);
+}
+
+TEST_CASE("perceptual donor reductions preserve mask box and class support", "[backend][augmentation][perceptual][cuda]") {
+    if (!has_cuda_device()) SKIP("CUDA unavailable; donor acceptance unexecuted");
+    namespace oracle = mmltk::backend::data::test_perceptual;
+    constexpr std::size_t count = 32;
+    constexpr unsigned extent = 4, plane = extent * extent;
+    oracle::Image original(extent, extent, mmltk::backend::data::RgbPixelFormat::PlanarUnitSrgbF32);
+    original.fill(3);
+    std::array<std::uint32_t, count> indices{};
+    std::array<std::uint64_t, count> keys{};
+    std::vector<GpuAugmentationDonor> donors(count);
+    std::vector<float> boxes(count * 4U), donor(count * 3U * plane);
+    std::vector<std::int64_t> masks(count, 0x0660);
+    for (std::size_t image = 0; image != count; ++image) {
+        indices[image] = static_cast<std::uint32_t>(image);
+        keys[image] = image + 17U;
+        donors[image] = {.label = 255, .dataset_index = static_cast<std::uint32_t>(image + count), .area = 4.F,
+                        .box = {.25F,.25F,.75F,.75F}, .has_mask = image % 2U == 0U};
+        std::copy(donors[image].box.begin(), donors[image].box.end(), boxes.begin() + image * 4U);
+        for (unsigned c=0; c<3; ++c) for (unsigned y=0; y<extent; ++y) for (unsigned x=0; x<extent; ++x)
+            donor[(image*3U+c)*plane+y*extent+x] = static_cast<float>(original.at(x,y,c));
+    }
+    auto config = test_support::isolated_augmentation_config(1.F);
+    test_support::AugmentationExecution execution;
+    GpuAugmentationExecutor executor(config, count, extent, extent, execution.context, execution.retirement);
+    const std::vector<float> source(count * 3U * plane, .125F);
+    const auto ordinary = execute_and_copy(executor, source, indices, keys, donors, donor, masks, boxes,
+        GpuAugmentationDonorSelection::Aligned, GpuAugmentationOutputDomain::UnitRgb, extent);
+    const auto plans = executor.plan().images;
+    config.perceptual_downscale = true;
+    executor.Reconfigure(config);
+    const auto selected = execute_and_copy(executor, source, indices, keys, donors, donor, masks, boxes,
+        GpuAugmentationDonorSelection::Aligned, GpuAugmentationOutputDomain::UnitRgb, extent);
+    REQUIRE(executor.plan().images == plans);
+    std::array<std::size_t,2> observed_reduced{}, changed_pixels{}, outside_pixels{};
+    for (std::size_t image=0; image<count; ++image) {
+        const auto& plan = plans[image];
+        REQUIRE(plan.paste_donor_slot >= 0);
+        CHECK(plan.paste_label == 255);
+        const auto side = std::min(extent, static_cast<unsigned>(std::ceil(extent / plan.paste_inverse[0])));
+        const auto reduced = side < extent ? oracle::reference(original,side,side) : original;
+        const auto mode = donors[image].has_mask ? 0U : 1U;
+        for (unsigned y=0; y<extent; ++y) for (unsigned x=0; x<extent; ++x) {
+            const double nx=(x+.5)/extent, ny=(y+.5)/extent;
+            const double sx=plan.paste_inverse[0]*nx+plan.paste_inverse[1]*ny+plan.paste_inverse[2];
+            const double sy=plan.paste_inverse[3]*nx+plan.paste_inverse[4]*ny+plan.paste_inverse[5];
+            bool supported=false;
+            if (sx>=0 && sx<1 && sy>=0 && sy<1) {
+                const auto px=static_cast<unsigned>(sx*extent), py=static_cast<unsigned>(sy*extent);
+                supported = mode==0 ? ((std::uint64_t(masks[image]) >> (py*extent+px)) & 1U)!=0 :
+                    sx>=.25 && sx<=.75 && sy>=.25 && sy<=.75;
+            }
+            if (!supported) ++outside_pixels[mode];
+            if (supported && side<extent) ++observed_reduced[mode];
+            for (unsigned c=0; c<3; ++c) {
+                const auto offset=(image*3U+c)*plane+y*extent+x;
+                const double expected=supported ? sample_reference(reduced,sx,sy,c) : .125;
+                CHECK(std::abs(selected[offset]-expected)<2e-4);
+                if (!supported) CHECK(selected[offset]==ordinary[offset]);
+                if (supported && side<extent && std::abs(selected[offset]-ordinary[offset])>1e-3) ++changed_pixels[mode];
+            }
+        }
+    }
+    for (unsigned mode=0; mode<2; ++mode) {
+        CHECK(observed_reduced[mode]>0);
+        CHECK(changed_pixels[mode]>0); // Omitting donor preparation cannot satisfy this case.
+        CHECK(outside_pixels[mode]>0);
     }
 }
 

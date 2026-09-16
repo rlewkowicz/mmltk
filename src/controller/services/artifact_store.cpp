@@ -53,7 +53,8 @@ std::expected<ArtifactCompileRequest, ArtifactCompileMaterializationError> mater
                                    .output = train.compiled_dataset_dir,
                                    .preset = train.request.preset_name,
                                    .resolution = static_cast<std::uint32_t>(train.request.resolution),
-                                   .overwrite = train.overwrite_compiled_dataset};
+                                   .overwrite = train.overwrite_compiled_dataset,
+                                   .perceptual_downscale = train.compile_perceptual_downscale};
     request.kind = train.compile_benchmark_dataset_override ? ArtifactCompileKind::Benchmark : ArtifactCompileKind::Directory;
     if (!request.valid()) return refusal("invalid dataset compile settings");
     return request;
@@ -118,12 +119,13 @@ contracts::ArtifactProgress project_artifact_progress(const mmltk::backend::data
 namespace {
 class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperations {
    private:
-    void compile_benchmark(const std::filesystem::path& output, const std::uint32_t resolution,
+    void compile_benchmark(const std::filesystem::path& output, const std::uint32_t resolution, const bool perceptual_downscale,
                            const mmltk::common::concurrency::CancellationObservation cancellation, const ArtifactProgressObserver progress,
                            const ArtifactBenchmarkTraceObserver trace) const override {
         mmltk::backend::data::BenchmarkCompilerConfig configuration;
         configuration.output_dir = output;
         configuration.resolution = resolution;
+        configuration.perceptual_downscale = perceptual_downscale;
         configuration.overwrite = true;
         configuration.cancel_requested = cancellation;
         if (progress.report != nullptr) {
@@ -139,7 +141,7 @@ class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperation
         mmltk::backend::data::BenchmarkDatasetCompiler::compile(std::move(configuration));
     }
 
-    void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, const std::uint32_t resolution,
+    void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, const std::uint32_t resolution, const bool perceptual_downscale,
                            const mmltk::common::concurrency::CancellationObservation cancellation,
                            const ArtifactProgressObserver progress) const override {
         std::array<std::string, contracts::kArtifactSplitCapacity> split_names{};
@@ -164,6 +166,7 @@ class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperation
         mmltk::backend::data::CompilerConfig configuration;
         configuration.source_dir = source.string();
         configuration.output_dir = output.string();
+        configuration.perceptual_downscale = perceptual_downscale;
         configuration.target_width = resolution;
         configuration.target_height = resolution;
         configuration.worker_cpus = mmltk::common::system::allowed_cpu_set();
@@ -403,12 +406,12 @@ ArtifactCompileResult ArtifactStore::compile(const ArtifactCompileRequest& reque
         mmltk::common::io::StagingDirectory staging{request.output, "", ".tmp.XXXXXX", "failed to stage compiled artifact"};
         switch (request.kind) {
             case ArtifactCompileKind::Directory:
-                compiler_operations_->compile_directory(request.source, staging.path(), request.resolution, cancellation_observation,
+                compiler_operations_->compile_directory(request.source, staging.path(), request.resolution, request.perceptual_downscale, cancellation_observation,
                                                         progress);
                 break;
             case ArtifactCompileKind::Benchmark: {
                 const ArtifactBenchmarkTraceObserver trace = diagnostics.benchmark;
-                compiler_operations_->compile_benchmark(staging.path(), request.resolution, cancellation_observation, progress, trace);
+                compiler_operations_->compile_benchmark(staging.path(), request.resolution, request.perceptual_downscale, cancellation_observation, progress, trace);
                 break;
             }
         }

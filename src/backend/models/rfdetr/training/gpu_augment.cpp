@@ -112,71 +112,90 @@ void GpuBatchPreprocessor::record_consumer(cudaStream_t stream) {
 }
 
 GpuBatchAugmenter::GpuBatchAugmenter(const GpuAugmentationConfig& config, const std::int64_t batch_capacity, const int height,
-                                     const int width, const int device_id)
-    : config_(config), batch_capacity_(batch_capacity), height_(height), width_(width), device_id_(device_id) {
+                                     const int width, mmltk::frameworks::gpu::DeviceContext context)
+    : config_(config), resources_(std::make_shared<Resources>(std::move(context))), batch_capacity_(batch_capacity), height_(height), width_(width), device_id_(resources_->context.device()) {
     require(gpu_augmentation_config_valid(config_), "invalid GPU augmentation configuration");
     require(batch_capacity_ > 0 && height_ > 0 && width_ > 0, "invalid GPU augmentation tensor shape");
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
     const auto float_options = torch_types::TensorOptions().dtype(torch_types::kFloat32).device(cuda_device(device_id_));
-    output_ = torch_types::empty({batch_capacity_, 3, height_, width_}, float_options);
+    resources_->output_ = torch_types::empty({batch_capacity_, 3, height_, width_}, float_options);
     batch_plan_.images.resize(static_cast<std::size_t>(batch_capacity_));
     donor_support_.resize(static_cast<std::size_t>(batch_capacity_));
     donor_metadata_.resize(static_cast<std::size_t>(batch_capacity_));
-    executor_ = std::make_unique<GpuAugmentationExecutor>(config_, static_cast<std::size_t>(batch_capacity_), height_, width_, device_id_);
+    executor_ = std::make_unique<GpuAugmentationExecutor>(config_, static_cast<std::size_t>(batch_capacity_), height_, width_, resources_->context, retirement_);
 
     if (executor_->copy_paste_enabled()) { ensure_copy_paste_resources(); }
 }
 
+void GpuBatchAugmenter::RequireActive() const {
+    require(resources_ && executor_ && retirement_.admission_open(), "GPU augmentation has terminal custody");
+}
+void GpuBatchAugmenter::Retire(const cudaError_t status) noexcept {
+    if (resources_) std::move(resources_retirement_).Install(
+        mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(resources_)), status);
+    // Shared admission is now closed. The executor retains its pending source,
+    // output and prepared allocations through its own reserved terminal lease.
+    executor_.reset();
+}
+void GpuBatchAugmenter::CheckSettlement(const cudaError_t status, const char* detail) {
+    if (status == cudaSuccess) return;
+    Retire(status);
+    ensure_cuda_ok(status, detail);
+}
+
 void GpuBatchAugmenter::ensure_copy_paste_resources() {
-    if (donor_images_.defined()) { return; }
+    if (resources_->donor_images_.defined()) { return; }
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
     const auto float_options = torch_types::TensorOptions().dtype(torch_types::kFloat32).device(cuda_device(device_id_));
     const auto int64_options = torch_types::TensorOptions().dtype(torch_types::kInt64).device(cuda_device(device_id_));
 
     try {
-        donor_boxes_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, 4}, torch_types::kFloat32, device_id_);
-        donor_boxes_gpu_ = torch_types::empty({batch_capacity_, 4}, float_options);
-        replacement_indices_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_}, torch_types::kInt64, device_id_);
-        replacement_indices_gpu_ = torch_types::empty({batch_capacity_}, int64_options);
+        resources_->donor_boxes_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, 4}, torch_types::kFloat32, device_id_);
+        resources_->donor_boxes_gpu_ = torch_types::empty({batch_capacity_, 4}, float_options);
+        resources_->replacement_indices_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_}, torch_types::kInt64, device_id_);
+        resources_->replacement_indices_gpu_ = torch_types::empty({batch_capacity_}, int64_options);
         mask_words_ = packed_mask_words_for_shape(height_, width_);
-        donor_masks_ = torch_types::empty({batch_capacity_, mask_words_}, int64_options);
-        donor_masks_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, mask_words_}, torch_types::kInt64, device_id_);
+        resources_->donor_masks_ = torch_types::empty({batch_capacity_, mask_words_}, int64_options);
+        resources_->donor_masks_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, mask_words_}, torch_types::kInt64, device_id_);
         int least_priority = 0;
         int greatest_priority = 0;
         ensure_cuda_ok(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority),
                        "cudaDeviceGetStreamPriorityRange for donor cache");
         (void)greatest_priority;
-        ensure_cuda_ok(cudaStreamCreateWithPriority(&cache_stream_, cudaStreamNonBlocking, least_priority),
+        ensure_cuda_ok(cudaStreamCreateWithPriority(&resources_->cache_stream_, cudaStreamNonBlocking, least_priority),
                        "cudaStreamCreateWithPriority for donor cache");
-        ensure_cuda_ok(cudaEventCreateWithFlags(&image_read_complete_, cudaEventDisableTiming),
+        ensure_cuda_ok(cudaEventCreateWithFlags(&resources_->image_read_complete_, cudaEventDisableTiming),
                        "cudaEventCreateWithFlags for augmentation image read");
-        ensure_cuda_ok(cudaEventCreateWithFlags(&cache_ready_, cudaEventDisableTiming),
+        ensure_cuda_ok(cudaEventCreateWithFlags(&resources_->cache_ready_, cudaEventDisableTiming),
                        "cudaEventCreateWithFlags for donor cache readiness");
-        ensure_cuda_ok(cudaEventCreateWithFlags(&cache_upload_complete_, cudaEventDisableTiming),
+        ensure_cuda_ok(cudaEventCreateWithFlags(&resources_->cache_upload_complete_, cudaEventDisableTiming),
                        "cudaEventCreateWithFlags for donor upload staging");
-        donor_images_ = torch_types::empty({batch_capacity_, 3, height_, width_}, float_options);
+        resources_->donor_images_ = torch_types::empty({batch_capacity_, 3, height_, width_}, float_options);
         mmltk::common::logging::trace([&](auto& logger) {
             const std::size_t pinned_host_bytes =
-                tensor_bytes(donor_boxes_cpu_) + tensor_bytes(replacement_indices_cpu_) + tensor_bytes(donor_masks_cpu_);
-            const std::size_t device_bytes = tensor_bytes(donor_images_) + tensor_bytes(donor_masks_) + tensor_bytes(donor_boxes_gpu_) +
-                                             tensor_bytes(replacement_indices_gpu_);
+                tensor_bytes(resources_->donor_boxes_cpu_) + tensor_bytes(resources_->replacement_indices_cpu_) + tensor_bytes(resources_->donor_masks_cpu_);
+            const std::size_t device_bytes = tensor_bytes(resources_->donor_images_) + tensor_bytes(resources_->donor_masks_) + tensor_bytes(resources_->donor_boxes_gpu_) +
+                                             tensor_bytes(resources_->replacement_indices_gpu_);
             logger.trace(
                 "event=augment.copy_paste_resources_allocated device={} batch_capacity={} height={} width={} "
                 "mask_words={} pinned_host_bytes={} device_bytes={}",
                 device_id_, batch_capacity_, height_, width_, mask_words_, pinned_host_bytes, device_bytes);
         });
     } catch (...) {
-        release_copy_paste_resources();
-        donor_images_ = torch_types::Tensor{};
+        const auto released = release_copy_paste_resources();
+        if (released != cudaSuccess)
+            Retire(released);
+        else resources_->donor_images_ = torch_types::Tensor{};
         throw;
     }
 }
 
 void GpuBatchAugmenter::reconfigure(const GpuAugmentationConfig& config) {
+    RequireActive();
     require(!batch_run_pending_, "GPU augmentation cannot be reconfigured before the current batch is finished");
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
-    if (cache_stream_ != nullptr) {
-        ensure_cuda_ok(cudaStreamSynchronize(cache_stream_), "cudaStreamSynchronize before augmentation reconfigure");
+    if (resources_->cache_stream_ != nullptr) {
+        CheckSettlement(stream_wait_(resources_->cache_stream_), "cudaStreamSynchronize before augmentation reconfigure");
     }
     cache_ready_pending_ = false;
     cache_upload_pending_ = false;
@@ -186,35 +205,40 @@ void GpuBatchAugmenter::reconfigure(const GpuAugmentationConfig& config) {
 }
 
 GpuBatchAugmenter::~GpuBatchAugmenter() {
+    executor_.reset();
+    // Failed execution retains this exact tensor/stream aggregate in terminal custody.
+    if (resources_.use_count() != 1) return;
     int previous_device = -1;
     const bool restore_device =
         cudaGetDevice(&previous_device) == cudaSuccess && previous_device != device_id_ && cudaSetDevice(device_id_) == cudaSuccess;
-    release_copy_paste_resources();
+    const auto released = release_copy_paste_resources();
+    if (released != cudaSuccess)
+        Retire(released);
     if (restore_device) { (void)cudaSetDevice(previous_device); }
 }
 
-void GpuBatchAugmenter::release_copy_paste_resources() noexcept {
-    if (cache_stream_ != nullptr) { (void)cudaStreamSynchronize(cache_stream_); }
-    if (cache_upload_complete_ != nullptr) {
-        cudaEventDestroy(cache_upload_complete_);
-        cache_upload_complete_ = nullptr;
+cudaError_t GpuBatchAugmenter::release_copy_paste_resources() noexcept {
+    if (resources_->cache_stream_ != nullptr) {
+        const auto settled = stream_wait_(resources_->cache_stream_);
+        if (settled != cudaSuccess) return settled;
     }
-    if (image_read_complete_ != nullptr) {
-        cudaEventDestroy(image_read_complete_);
-        image_read_complete_ = nullptr;
+    for (auto* event : {&resources_->cache_upload_complete_, &resources_->image_read_complete_, &resources_->cache_ready_}) {
+        if (*event == nullptr) continue;
+        const auto released = cudaEventDestroy(*event);
+        if (released != cudaSuccess) return released;
+        *event = nullptr;
     }
-    if (cache_ready_ != nullptr) {
-        cudaEventDestroy(cache_ready_);
-        cache_ready_ = nullptr;
+    if (resources_->cache_stream_ != nullptr) {
+        const auto released = cudaStreamDestroy(resources_->cache_stream_);
+        if (released != cudaSuccess) return released;
+        resources_->cache_stream_ = nullptr;
     }
-    if (cache_stream_ != nullptr) {
-        cudaStreamDestroy(cache_stream_);
-        cache_stream_ = nullptr;
-    }
+    return cudaSuccess;
 }
 
 torch_types::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch,
                                            const int rank, const std::uint64_t sequence) {
+    RequireActive();
     require(static_cast<std::int64_t>(batch.num_images) <= batch_capacity_, "GPU augmentation batch exceeds preallocated capacity");
     require(batch.num_images == 0U || (batch.device_images != nullptr && batch.image_indices != nullptr),
             "GPU augmentation requires loader device images and identities");
@@ -229,23 +253,29 @@ torch_types::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& ba
     TorchCudaDeviceGuard device_guard(device_index);
     const cudaStream_t stream = current_torch_cuda_stream_object(device_index).stream();
     if (cache_ready_pending_) {
-        ensure_cuda_ok(cudaStreamWaitEvent(stream, cache_ready_, 0), "cudaStreamWaitEvent for donor cache readiness");
+        CheckSettlement(cudaStreamWaitEvent(stream, resources_->cache_ready_, 0), "cudaStreamWaitEvent for donor cache readiness");
         cache_ready_pending_ = false;
     }
     const GpuAugmentationBatchView raw_batch{
         .input = batch.device_images,
-        .output = output_.data_ptr<float>(),
+        .output = resources_->output_.data_ptr<float>(),
         .image_indices = {batch.image_indices, batch.num_images},
         .height = height_,
         .width = width_,
         .output_domain = GpuAugmentationOutputDomain::ModelNormalized,
+        .input_custody = batch.image_custody.lock(),
+        .output_custody = resources_,
+        .input_capacity_bytes = batch.image_capacity_bytes,
+        .output_capacity_bytes = tensor_bytes(resources_->output_),
     };
     const GpuAugmentationDonorBatchView donors{
-        .images = executor_->copy_paste_enabled() ? donor_images_.data_ptr<float>() : nullptr,
-        .masks = executor_->copy_paste_enabled() && donor_masks_.defined() ? donor_masks_.data_ptr<std::int64_t>() : nullptr,
-        .boxes = executor_->copy_paste_enabled() ? donor_boxes_gpu_.data_ptr<float>() : nullptr,
+        .images = executor_->copy_paste_enabled() ? resources_->donor_images_.data_ptr<float>() : nullptr,
+        .masks = executor_->copy_paste_enabled() && resources_->donor_masks_.defined() ? resources_->donor_masks_.data_ptr<std::int64_t>() : nullptr,
+        .boxes = executor_->copy_paste_enabled() ? resources_->donor_boxes_gpu_.data_ptr<float>() : nullptr,
         .mask_words = mask_words_,
         .selection = GpuAugmentationDonorSelection::Cached,
+        .image_custody = resources_,
+        .image_capacity_bytes = tensor_bytes(resources_->donor_images_),
     };
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_augment_plan{"rfdetr.augment.plan"};
@@ -268,24 +298,26 @@ torch_types::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& ba
     mmltk::common::logging::profile_add_value("rfdetr.augment.copy_paste_selected", paste_count);
 #endif
     if (executor_->copy_paste_enabled()) {
-        ensure_cuda_ok(cudaEventRecord(image_read_complete_, stream), "cudaEventRecord for augmentation image read");
+        CheckSettlement(cudaEventRecord(resources_->image_read_complete_, stream), "cudaEventRecord for augmentation image read");
     }
     batch_run_pending_ = true;
-    return current_batch_size_ == batch_capacity_ ? output_ : output_.narrow(0, 0, current_batch_size_);
+    return current_batch_size_ == batch_capacity_ ? resources_->output_ : resources_->output_.narrow(0, 0, current_batch_size_);
 }
 
 cudaStream_t GpuBatchAugmenter::prepare_batch_consumer() {
+    RequireActive();
     const auto device_index = checked_device_index(device_id_);
     require(batch_run_pending_, "GPU augmentation cache consumer preparation requires a completed run submission");
     if (!executor_->copy_paste_enabled() || current_batch_size_ == 0) { return current_torch_cuda_stream_object(device_index).stream(); }
-    require(cache_stream_ != nullptr && image_read_complete_ != nullptr, "copy-paste cache consumer resources are not initialized");
+    require(resources_->cache_stream_ != nullptr && resources_->image_read_complete_ != nullptr, "copy-paste cache consumer resources are not initialized");
     TorchCudaDeviceGuard device_guard(device_index);
-    ensure_cuda_ok(cudaStreamWaitEvent(cache_stream_, image_read_complete_, 0), "cudaStreamWaitEvent for donor image consumption");
+    CheckSettlement(cudaStreamWaitEvent(resources_->cache_stream_, resources_->image_read_complete_, 0), "cudaStreamWaitEvent for donor image consumption");
     cache_consumer_prepared_ = true;
-    return cache_stream_;
+    return resources_->cache_stream_;
 }
 
 cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& batch) {
+    RequireActive();
     mmltk::common::logging::ScopedProfile profile_rfdetr_augment_cache_submit{"rfdetr.augment.cache_submit"};
     require(batch_run_pending_, "GPU augmentation cache publication requires an active batch");
     const auto device_index = checked_device_index(device_id_);
@@ -319,14 +351,14 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
         trace_batch_plan();
         return current_stream;
     }
-    require(cache_stream_ != nullptr, "copy-paste cache resources are not initialized");
+    require(resources_->cache_stream_ != nullptr, "copy-paste cache resources are not initialized");
     require(cache_consumer_prepared_, "copy-paste cache consumer was not prepared");
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
     try {
         // Reuse pinned upload storage only after its preceding DMA reads complete.
         // Image/cache consumers remain ordered on the owning streams below.
         if (cache_upload_pending_) {
-            ensure_cuda_ok(cudaEventSynchronize(cache_upload_complete_), "cudaEventSynchronize for donor upload staging reuse");
+            CheckSettlement(event_wait_(resources_->cache_upload_complete_), "cudaEventSynchronize for donor upload staging reuse");
             cache_upload_pending_ = false;
         }
         require(batch.num_images == static_cast<std::size_t>(current_batch_size_) && batch.device_images != nullptr,
@@ -343,8 +375,8 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
             require(instance.mask_rle_pairs == 0 || batch.rle_pairs != nullptr, "donor cache source mask storage is missing");
             donor_support_[static_cast<std::size_t>(image)].reserve(instance.mask_rle_pairs);
         }
-        auto* replacements = replacement_indices_cpu_.data_ptr<std::int64_t>();
-        auto* packed_support = donor_masks_cpu_.data_ptr<std::int64_t>();
+        auto* replacements = resources_->replacement_indices_cpu_.data_ptr<std::int64_t>();
+        auto* packed_support = resources_->donor_masks_cpu_.data_ptr<std::int64_t>();
 #if MMLTK_ENABLE_PROFILING
         std::int64_t replacement_count = 0;
 #endif
@@ -375,15 +407,15 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
                 metadata.has_mask = instance.mask_rle_pairs != 0;
             }
         }
-        float* donor_boxes = donor_boxes_cpu_.data_ptr<float>();
+        float* donor_boxes = resources_->donor_boxes_cpu_.data_ptr<float>();
         for (std::int64_t slot = 0; slot < batch_capacity_; ++slot) {
             std::copy(donor_metadata_[static_cast<std::size_t>(slot)].box.begin(),
                       donor_metadata_[static_cast<std::size_t>(slot)].box.end(), donor_boxes + slot * 4);
         }
 
         const std::size_t map_bytes = static_cast<std::size_t>(current_batch_size_) * sizeof(std::int64_t);
-        ensure_cuda_ok(cudaMemcpyAsync(replacement_indices_gpu_.data_ptr<std::int64_t>(), replacements, map_bytes, cudaMemcpyHostToDevice,
-                                       cache_stream_),
+        ensure_cuda_ok(cudaMemcpyAsync(resources_->replacement_indices_gpu_.data_ptr<std::int64_t>(), replacements, map_bytes, cudaMemcpyHostToDevice,
+                                       resources_->cache_stream_),
                        "cudaMemcpyAsync for donor replacements");
         for (std::int64_t first = 0; first < current_batch_size_;) {
             if (replacements[first] < 0) {
@@ -395,21 +427,21 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
                 ++end;
             const auto words = static_cast<std::size_t>((end - first) * mask_words_);
             ensure_cuda_ok(
-                cudaMemcpyAsync(donor_masks_.data_ptr<std::int64_t>() + first * mask_words_, packed_support + first * mask_words_,
-                                words * sizeof(std::int64_t), cudaMemcpyHostToDevice, cache_stream_),
+                cudaMemcpyAsync(resources_->donor_masks_.data_ptr<std::int64_t>() + first * mask_words_, packed_support + first * mask_words_,
+                                words * sizeof(std::int64_t), cudaMemcpyHostToDevice, resources_->cache_stream_),
                 "cudaMemcpyAsync for original donor support");
             first = end;
         }
         ensure_cuda_ok(
-            cudaMemcpyAsync(donor_boxes_gpu_.data_ptr<float>(), donor_boxes, static_cast<std::size_t>(batch_capacity_) * 4 * sizeof(float),
-                            cudaMemcpyHostToDevice, cache_stream_),
+            cudaMemcpyAsync(resources_->donor_boxes_gpu_.data_ptr<float>(), donor_boxes, static_cast<std::size_t>(batch_capacity_) * 4 * sizeof(float),
+                            cudaMemcpyHostToDevice, resources_->cache_stream_),
             "cudaMemcpyAsync for donor boxes");
-        ensure_cuda_ok(cudaEventRecord(cache_upload_complete_, cache_stream_), "cudaEventRecord for donor upload staging");
+        ensure_cuda_ok(cudaEventRecord(resources_->cache_upload_complete_, resources_->cache_stream_), "cudaEventRecord for donor upload staging");
         cache_upload_pending_ = true;
-        update_gpu_augmentation_donor_cache(batch.device_images, donor_images_.data_ptr<float>(),
-                                            replacement_indices_gpu_.data_ptr<std::int64_t>(), current_batch_size_,
-                                            static_cast<std::int64_t>(height_) * width_, cache_stream_);
-        ensure_cuda_ok(cudaEventRecord(cache_ready_, cache_stream_), "cudaEventRecord for donor cache readiness");
+        update_gpu_augmentation_donor_cache(batch.device_images, resources_->donor_images_.data_ptr<float>(),
+                                            resources_->replacement_indices_gpu_.data_ptr<std::int64_t>(), current_batch_size_,
+                                            static_cast<std::int64_t>(height_) * width_, resources_->cache_stream_);
+        ensure_cuda_ok(cudaEventRecord(resources_->cache_ready_, resources_->cache_stream_), "cudaEventRecord for donor cache readiness");
         cache_ready_pending_ = true;
 #if MMLTK_ENABLE_PROFILING
         mmltk::common::logging::profile_add_value("rfdetr.augment.cache_replacements", replacement_count);
@@ -421,7 +453,9 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
     } catch (...) {
         // A failed publication cannot leave host metadata selecting partially
         // uploaded image/support pairs. Drain submitted reads before returning.
-        (void)cudaStreamSynchronize(cache_stream_);
+        if (!resources_) throw;
+        const auto settled = stream_wait_(resources_->cache_stream_);
+        if (settled != cudaSuccess) { Retire(settled); throw; }
         for (auto& metadata : donor_metadata_)
             metadata.label = -1;
         cache_ready_pending_ = false;
@@ -433,7 +467,7 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
     batch_run_pending_ = false;
     cache_consumer_prepared_ = false;
     trace_batch_plan();
-    return cache_stream_;
+    return resources_->cache_stream_;
 }
 
 }  // namespace mmltk::backend::models::rfdetr

@@ -168,6 +168,7 @@ std::vector<std::string> build_train_command_arguments(const mmltk::backend::mod
     append_number(arguments, "--dn-center-noise-scale", supervision.denoising.center_noise_scale);
     append_number(arguments, "--dn-size-noise-scale", supervision.denoising.size_noise_scale);
     append_flag(arguments, "--gpu-augment", "--no-gpu-augment", effective.gpu_augmentation.enabled);
+    append_flag(arguments, "--aug-perceptual-downscale", "--no-aug-perceptual-downscale", effective.gpu_augmentation.perceptual_downscale);
     append_augmentation_group(arguments, "geometry", effective.gpu_augmentation.geometry);
     append_augmentation_group(arguments, "resize", effective.gpu_augmentation.resize);
     append_augmentation_group(arguments, "color", effective.gpu_augmentation.color);

@@ -193,8 +193,13 @@ function(mmltk_add_backend_data_tests)
     mmltk_register_private_headers(mmltk_backend_data_tests
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/perceptual_downscale_reference.h)
     if(BUILD_RFDETR_NATIVE)
+        find_package(Vulkan REQUIRED)
         mmltk_register_ordinary_sources(mmltk_backend_data_tests
-            ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize_cuda.test.cpp)
+            ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize_cuda.test.cpp
+            ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.cpp)
+        mmltk_register_private_headers(mmltk_backend_data_tests
+            ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.h)
+        target_link_libraries(mmltk_backend_data_tests PRIVATE Vulkan::Vulkan)
     endif()
     mmltk_configure_component(
         mmltk_backend_data_tests PRIVATE_DECLARATIONS)

@@ -4,6 +4,8 @@
 #include "src/backend/data/detail/perceptual_downscale_completion.h"
 #include "src/backend/data/tests/perceptual_downscale_reference.h"
 #include "src/frameworks/gpu/image_buffer.h"
+#include "src/frameworks/gpu/imported_image_buffer.h"
+#include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
@@ -460,5 +462,37 @@ TEST_CASE("perceptual unproved completion retains its aggregate under terminal a
     REQUIRE(authority.fact().occupancy==1);
     REQUIRE_FALSE(authority.admission_open());
     REQUIRE_FALSE(authority.Reserve().has_value());
+}
+TEST_CASE("CUDA perceptual resampling retains actual imported Vulkan mapped subviews", "[backend][data][image_resize][perceptual][cuda][hardware]") {
+    if (!has_cuda()) SKIP("CUDA unavailable; imported mapped view acceptance unexecuted");
+    CudaFixture fixture;
+    auto exporter = std::make_unique<gpu::test_support::VulkanWorkspaceFixture>(0, 21U, 17U);
+    const auto layout = exporter->layout();
+    auto imported = std::make_shared<gpu::ImportedImageBuffer>();
+    std::string error;
+    REQUIRE(imported->Import(*fixture.context_owner, exporter->Export(), layout, 1U, &error));
+    fixture.context_owner->Bind();
+    Image source(21,17,RgbPixelFormat::RGBA8), cropped(19,15,RgbPixelFormat::RGBA8), shape(9,7,RgbPixelFormat::RGBA8);
+    source.fill(3);
+    std::memcpy(fixture.staging->data(), source.storage.data(), source.layout.capacity_bytes);
+    cuda_check(cudaMemcpy2DAsync(reinterpret_cast<void*>(imported->data()), imported->pitch_bytes(), fixture.staging->data(),
+        source.layout.row_stride_bytes, 21U * 4U, 17U, cudaMemcpyHostToDevice, fixture.stream));
+    exporter.reset();
+    const auto offset = imported->pitch_bytes() + 4U;
+    RgbConstImageView subview{reinterpret_cast<const void*>(imported->data() + offset),
+        {19,15,imported->pitch_bytes(),0,imported->pitch_bytes() * 16U - 4U,RgbPixelFormat::RGBA8}};
+    auto destination = std::make_shared<DeviceImage>(shape.layout);
+    GpuPerceptualDownscaler resizer(*fixture.context_owner, fixture.retirement);
+    auto invalid = subview; invalid.layout.capacity_bytes = 1;
+    REQUIRE_THROWS(resizer.downscale(invalid, destination->write(), fixture.stream, imported, destination));
+    resizer.downscale(subview, destination->write(), fixture.stream, imported, destination);
+    std::weak_ptr<gpu::ImportedImageBuffer> retained = imported;
+    imported.reset();
+    REQUIRE_FALSE(retained.expired());
+    resizer.finish();
+    CHECK(retained.expired());
+    for (unsigned y=0; y<15; ++y) for (unsigned x=0; x<19; ++x) for (unsigned channel=0; channel<4; ++channel)
+        cropped.set(x,y,channel,source.at(x+1,y+1,channel));
+    CHECK(maximum_error(fixture.download(destination, fixture.stream), reference(cropped,9,7)) <= 1.0/255+1e-12);
 }
 }

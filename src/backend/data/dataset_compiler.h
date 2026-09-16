@@ -127,6 +127,7 @@ struct CompileDiagnostic {
 };
 
 struct CompilerConfig {
+    bool perceptual_downscale = false;
     // CLEANUP-IGNORE: Compiler input/output paths remain backend execution facts with canonical reflected limits.
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string source_dir;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string output_dir;

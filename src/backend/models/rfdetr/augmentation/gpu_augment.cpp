@@ -2,6 +2,9 @@
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 
 #include <algorithm>
+#include <cuda.h>
+#include <functional>
+#include "src/backend/data/image_resize_cuda.h"
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -165,34 +168,6 @@ class PinnedAllocation final {
     std::size_t count_ = 0U;
 };
 
-class StreamSubmissionGuard final {
-   public:
-    StreamSubmissionGuard(cudaStream_t stream, const int device_id) noexcept : stream_(stream), device_id_(device_id) {}
-    ~StreamSubmissionGuard() {
-        if (!armed_) { return; }
-        int previous_device = -1;
-        bool restore = false;
-        if (cudaGetDevice(&previous_device) == cudaSuccess) {
-            if (previous_device != device_id_) {
-                if (cudaSetDevice(device_id_) != cudaSuccess) { return; }
-                restore = true;
-            }
-        } else if (cudaSetDevice(device_id_) != cudaSuccess) {
-            return;
-        }
-        (void)cudaStreamSynchronize(stream_);
-        if (restore) { (void)cudaSetDevice(previous_device); }
-    }
-    StreamSubmissionGuard(const StreamSubmissionGuard&) = delete;
-    StreamSubmissionGuard& operator=(const StreamSubmissionGuard&) = delete;
-    void dismiss() noexcept { armed_ = false; }
-
-   private:
-    cudaStream_t stream_;
-    int device_id_;
-    bool armed_ = true;
-};
-
 constexpr std::size_t kStagingSlots = 2U;
 
 }  // namespace
@@ -242,13 +217,39 @@ std::int64_t detail::CachedAugmentationDonorIndex::select(const std::size_t star
 }
 
 struct GpuAugmentationExecutor::Impl final {
+    struct PreparedStorage final {
+        explicit PreparedStorage(mmltk::frameworks::gpu::DeviceContext owner, std::size_t capacity)
+            : context(std::move(owner)), views(capacity * 2U), staged(kStagingSlots * capacity * 2U) {}
+        mmltk::frameworks::gpu::DeviceContext context;
+        DeviceAllocation<float> pixels;
+        DeviceAllocation<GpuAugmentationPreparedView> views;
+        PinnedAllocation<GpuAugmentationPreparedView> staged;
+    };
+    struct Reduction final {
+        const float* source = nullptr;
+        int width = 0, height = 0;
+        std::size_t offset = 0;
+        std::shared_ptr<const void> custody;
+    };
+    struct ReductionKey final {
+        const float* source;
+        int width, height;
+        bool operator==(const ReductionKey&) const = default;
+    };
+    struct ReductionHash final {
+        std::size_t operator()(ReductionKey value) const noexcept {
+            return static_cast<std::size_t>(augmentation_mix64(reinterpret_cast<std::uintptr_t>(value.source) ^
+                (std::uint64_t(value.width) << 32U) ^ std::uint64_t(value.height)));
+        }
+    };
+
     Impl(const GpuAugmentationConfig& input_config, const std::size_t input_capacity, const int input_height, const int input_width,
-         const int input_device)
-        : config(input_config),
+         mmltk::frameworks::gpu::DeviceContext input_context, mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& authority)
+        : context(std::move(input_context)), retirement(authority), config(input_config),
           capacity(input_capacity),
           height(input_height),
           width(input_width),
-          device_id(input_device),
+          device_id(context.device()),
           converted_input(),
           parameters(capacity * static_cast<std::size_t>(kGpuAugmentationParameterCount)),
           keys(capacity),
@@ -259,6 +260,7 @@ struct GpuAugmentationExecutor::Impl final {
           staged_keys(kStagingSlots * capacity),
           staged_parameters(kStagingSlots * capacity * static_cast<std::size_t>(kGpuAugmentationParameterCount)),
           staged_paste(kStagingSlots * capacity * static_cast<std::size_t>(kGpuCopyPasteParameterCount)) {
+        ensure_cuda_ok(static_cast<cudaError_t>(cuCtxGetCurrent(&native_context)), "augmentation current context");
         plan.images.resize(capacity);
         training_keys.resize(capacity);
         std::size_t created = 0U;
@@ -365,6 +367,125 @@ struct GpuAugmentationExecutor::Impl final {
         }
     }
 
+    // Retained context outlives every physical allocation. Each staging slot
+    // retains the exact source/donor/output aggregate through the final remap.
+    mmltk::frameworks::gpu::DeviceContext context;
+    mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement;
+    CUcontext native_context = nullptr;
+    std::shared_ptr<PreparedStorage> prepared;
+    std::unique_ptr<mmltk::backend::data::GpuPerceptualDownscaler> downscaler;
+    std::vector<Reduction> reductions;
+    std::vector<ReductionKey> reduction_keys;
+    std::vector<std::size_t> reduction_indices;
+    std::vector<std::size_t> occupied_reductions;
+    std::vector<std::size_t> view_reductions;
+    std::array<std::array<std::shared_ptr<const void>, 3>, kStagingSlots> custody;
+
+    bool prepare_reductions(const GpuAugmentationBatchView& batch, const GpuAugmentationDonorBatchView& donors,
+                            const float* input, std::shared_ptr<const void> input_owner, cudaStream_t stream, std::size_t slot, GpuAugmentationExecutor& owner) {
+        using namespace mmltk::backend::data;
+        if (!config.perceptual_downscale || !remap) return false;
+        const auto minifies = [&](float scale) {
+            return scale < 1.0F && (std::ceil(width * scale) < width || std::ceil(height * scale) < height);
+        };
+        bool selected = false;
+        for (std::size_t image = 0; image != plan.active_size; ++image) {
+            const auto& planned = plan.images[image];
+            selected |= minifies(std::sqrt(planned.area_scale));
+            if (planned.paste_donor_slot >= 0) {
+                const auto& inverse = planned.paste_inverse;
+                selected |= minifies(1.0F / std::sqrt(std::abs(inverse[0] * inverse[4] - inverse[1] * inverse[3])));
+            }
+        }
+        if (!selected) return false;
+        const auto count = batch.image_indices.size();
+        const auto image_values = std::size_t(width) * std::size_t(height) * 3U;
+        require(image_values <= std::numeric_limits<std::size_t>::max() / (2U * sizeof(float)) &&
+                count <= std::numeric_limits<std::size_t>::max() / (2U * image_values * sizeof(float)),
+                "perceptual augmentation batch storage overflows");
+        const auto image_bytes = image_values * sizeof(float);
+        require(batch.input_custody && batch.output_custody, "perceptual augmentation requires exact batch custody");
+        const auto input_bytes = batch.input_format == GpuAugmentationInputFormat::Rgba8 ? std::size_t(width) * std::size_t(height) * 4U : image_bytes;
+        require(batch.input_capacity_bytes >= input_bytes * (batch.input_slots.empty() ? count : 1U), "augmentation input logical extent is too small");
+        require(batch.output_capacity_bytes >= image_bytes * count, "augmentation output logical extent is too small");
+        if (!prepared) {
+            prepared = std::make_shared<PreparedStorage>(context, capacity);
+            downscaler = std::make_unique<GpuPerceptualDownscaler>(context, retirement);
+            reductions.reserve(capacity * 2U);
+            require(capacity <= std::numeric_limits<std::size_t>::max() / 4U, "augmentation reduction index overflows");
+            reduction_keys.resize(capacity * 4U);
+            reduction_indices.resize(capacity * 4U);
+            occupied_reductions.reserve(capacity * 2U);
+            view_reductions.resize(capacity * 2U);
+        }
+        reductions.clear();
+        for (const auto slot : occupied_reductions) reduction_keys[slot].source = nullptr;
+        occupied_reductions.clear();
+        auto* views = prepared->staged.data() + slot * capacity * 2U;
+        std::size_t total = 0U;
+        const auto add = [&](std::size_t index, const float* pixels, float scale, const std::shared_ptr<const void>& owner) {
+            auto& view = views[index];
+            view = {pixels, width, height, width, std::int64_t(width) * height};
+            view_reductions[index] = std::numeric_limits<std::size_t>::max();
+            if (!(scale < 1.0F)) return;
+            const int reduced_width = std::clamp(static_cast<int>(std::ceil(width * scale)), 1, width);
+            const int reduced_height = std::clamp(static_cast<int>(std::ceil(height * scale)), 1, height);
+            if (reduced_width == width && reduced_height == height) return;
+            const ReductionKey key{pixels, reduced_width, reduced_height};
+            auto bucket = ReductionHash{}(key) % reduction_keys.size();
+            while (reduction_keys[bucket].source && !(reduction_keys[bucket] == key))
+                bucket = (bucket + 1U) % reduction_keys.size();
+            if (!reduction_keys[bucket].source) {
+                reduction_keys[bucket] = key;
+                reduction_indices[bucket] = reductions.size();
+                occupied_reductions.push_back(bucket);
+                reductions.push_back({pixels, reduced_width, reduced_height, total, owner});
+                total += std::size_t(reduced_width) * std::size_t(reduced_height) * 3U;
+            }
+            view_reductions[index] = reduction_indices[bucket];
+        };
+        for (std::size_t image = 0; image != count; ++image) {
+            const auto& image_plan = plan.images[image];
+            add(image * 2U, batch.input_slots.empty() ? input + image * image_values : batch.input_slots[image],
+                std::sqrt(image_plan.area_scale), input_owner);
+            views[image * 2U + 1U] = {};
+            view_reductions[image * 2U + 1U] = std::numeric_limits<std::size_t>::max();
+            if (image_plan.paste_donor_slot < 0) continue;
+            require(donors.image_custody != nullptr, "perceptual augmentation requires exact donor custody");
+            const auto donor = std::size_t(image_plan.paste_donor_slot);
+            require(donors.image_capacity_bytes >= image_bytes * (donors.image_slots.empty() ? donor + 1U : 1U), "augmentation donor logical extent is too small");
+            const auto& inverse = image_plan.paste_inverse;
+            const float determinant = std::abs(inverse[0] * inverse[4] - inverse[1] * inverse[3]);
+            add(image * 2U + 1U, donors.image_slots.empty() ? donors.images + donor * image_values : donors.image_slots[donor],
+                1.0F / std::sqrt(determinant), donors.image_custody);
+        }
+        // Growth is rare and bounded by two active-batch image families. Settle
+        // once before replacing their common allocation, never once per image.
+        if (total > prepared->pixels.capacity()) {
+            if (execution_pending) owner.CheckSettlement(owner.event_wait_(execution_complete), "augmentation prepared storage growth");
+            downscaler->finish();
+            prepared->pixels.ensure(total);
+        }
+        const RgbImageLayout source_layout{std::uint32_t(width), std::uint32_t(height), std::size_t(width) * sizeof(float),
+            std::size_t(width) * std::size_t(height) * sizeof(float), image_bytes, RgbPixelFormat::PlanarUnitSrgbF32};
+        for (const auto& reduction : reductions) {
+            const auto values = std::size_t(reduction.width) * std::size_t(reduction.height);
+            const RgbImageLayout destination_layout{std::uint32_t(reduction.width), std::uint32_t(reduction.height), std::size_t(reduction.width) * sizeof(float),
+                values * sizeof(float), values * 3U * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32};
+            downscaler->downscale({reduction.source, source_layout}, {prepared->pixels.data() + reduction.offset, destination_layout}, stream,
+                reduction.custody, prepared);
+        }
+        for (std::size_t image = 0; image != count * 2U; ++image) {
+            if (view_reductions[image] == std::numeric_limits<std::size_t>::max()) continue;
+            const auto& reduction = reductions[view_reductions[image]];
+            views[image] = {prepared->pixels.data() + reduction.offset, reduction.width, reduction.height, reduction.width,
+                           std::int64_t(reduction.width) * reduction.height};
+        }
+        ensure_cuda_ok(cudaMemcpyAsync(prepared->views.data(), views, count * 2U * sizeof(*views), cudaMemcpyHostToDevice, stream),
+                       "augmentation prepared view upload");
+        return true;
+    }
+
     GpuAugmentationConfig config;
     std::size_t capacity;
     int height;
@@ -392,7 +513,8 @@ struct GpuAugmentationExecutor::Impl final {
 };
 
 GpuAugmentationExecutor::GpuAugmentationExecutor(const GpuAugmentationConfig& config, const std::size_t batch_capacity, const int height,
-                                                 const int width, const int device_id)
+                                                 const int width, mmltk::frameworks::gpu::DeviceContext context,
+                                                 mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement)
     : impl_(nullptr) {
     require(gpu_augmentation_config_valid(config), "invalid GPU augmentation configuration");
     require(batch_capacity > 0U && height > 0 && width > 0, "invalid GPU augmentation batch shape");
@@ -410,27 +532,64 @@ GpuAugmentationExecutor::GpuAugmentationExecutor(const GpuAugmentationConfig& co
             "GPU augmentation workspace size overflows");
     int active_device = -1;
     ensure_cuda_ok(cudaGetDevice(&active_device), "cudaGetDevice for augmentation executor");
-    require(active_device == device_id, "augmentation executor requires its owning CUDA device to be current");
-    impl_ = std::make_unique<Impl>(config, batch_capacity, height, width, device_id);
+    require(active_device == context.device(), "augmentation executor requires its owning CUDA device to be current");
+    CUcontext original = nullptr, retained = nullptr;
+    ensure_cuda_ok(static_cast<cudaError_t>(cuCtxGetCurrent(&original)), "augmentation caller context");
+    context.Bind();
+    const auto captured = cuCtxGetCurrent(&retained);
+    const auto restored = cuCtxSetCurrent(original);
+    ensure_cuda_ok(static_cast<cudaError_t>(restored), "augmentation caller context restoration");
+    ensure_cuda_ok(static_cast<cudaError_t>(captured), "augmentation retained context");
+    require(original == retained, "augmentation executor requires its exact retained context to be current");
+    retirement_ = mmltk::frameworks::gpu::ReserveTerminalCudaLease(retirement);
+    impl_ = std::make_shared<Impl>(config, batch_capacity, height, width, std::move(context), retirement);
 }
 
-GpuAugmentationExecutor::~GpuAugmentationExecutor() = default;
-GpuAugmentationExecutor::GpuAugmentationExecutor(GpuAugmentationExecutor&&) noexcept = default;
-GpuAugmentationExecutor& GpuAugmentationExecutor::operator=(GpuAugmentationExecutor&&) noexcept = default;
+void GpuAugmentationExecutor::RequireActive() const {
+    require(impl_ && impl_->retirement.admission_open(), "augmentation executor has terminal custody");
+}
+void GpuAugmentationExecutor::Retire(const cudaError_t status) noexcept {
+    if (impl_) std::move(retirement_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(impl_)), status);
+}
+void GpuAugmentationExecutor::CheckSettlement(const cudaError_t status, const char* detail) {
+    if (status == cudaSuccess) return;
+    Retire(status);
+    ensure_cuda_ok(status, detail);
+}
+GpuAugmentationExecutor::~GpuAugmentationExecutor() {
+    if (!impl_) return;
+    const auto retained_context = impl_->native_context;
+    if (cuCtxPushCurrent(retained_context) != CUDA_SUCCESS) {
+        Retire(cudaErrorContextIsDestroyed);
+        return;
+    }
+    try { Finish(); impl_.reset(); }
+    catch (...) {
+        if (impl_) Retire(impl_->retirement.fact().first_failure != cudaSuccess ? impl_->retirement.fact().first_failure : cudaErrorUnknown);
+    }
+    CUcontext popped = nullptr;
+    (void)cuCtxPopCurrent(&popped);
+}
+void GpuAugmentationExecutor::Finish() {
+    RequireActive();
+    if (impl_->execution_pending) CheckSettlement(event_wait_(impl_->execution_complete), "augmentation final settlement");
+    try {
+        if (impl_->downscaler) impl_->downscaler->finish();
+    } catch (...) {
+        Retire(impl_->retirement.fact().first_failure != cudaSuccess ? impl_->retirement.fact().first_failure : cudaErrorUnknown);
+        throw;
+    }
+    impl_->execution_pending = false;
+    impl_->staging_pending.fill(false); // Final execution follows every staging read on the ordered streams.
+    for (auto& slot : impl_->custody) slot = {};
+    impl_->reductions.clear();
+}
 
 void GpuAugmentationExecutor::Reconfigure(const GpuAugmentationConfig& config) {
+    RequireActive();
     if (impl_->config == config) return;
     require(gpu_augmentation_config_valid(config), "invalid GPU augmentation configuration");
-    if (impl_->execution_pending) {
-        ensure_cuda_ok(cudaEventSynchronize(impl_->execution_complete), "cudaEventSynchronize before augmentation reconfigure");
-        impl_->execution_pending = false;
-    }
-    for (std::size_t slot = 0U; slot < kStagingSlots; ++slot) {
-        if (impl_->staging_pending[slot]) {
-            ensure_cuda_ok(cudaEventSynchronize(impl_->staging_complete[slot]), "cudaEventSynchronize before augmentation reconfigure");
-            impl_->staging_pending[slot] = false;
-        }
-    }
+    Finish();
     impl_->config = config;
     impl_->update_flags();
 }
@@ -448,6 +607,7 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunTraining(const GpuAugme
                                                                   const std::span<const GpuAugmentationDonor> donors,
                                                                   const GpuAugmentationDonorBatchView& donor_batch, cudaStream_t stream,
                                                                   const std::size_t staging_slot) {
+    RequireActive();
     require(batch.image_indices.size() <= impl_->capacity, "GPU augmentation batch exceeds preallocated capacity");
     for (std::size_t image = 0U; image < batch.image_indices.size(); ++image) {
         impl_->training_keys[image] = training_augmentation_image_key(seed, epoch, rank, sequence, image);
@@ -463,6 +623,7 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
                                                               const std::size_t staging_slot, const bool explicit_keys,
                                                               const std::uint64_t seed, const int epoch, const int rank,
                                                               const std::uint64_t sequence) {
+    RequireActive();
     require(batch.height == impl_->height && batch.width == impl_->width, "GPU augmentation batch dimensions do not match the executor");
     require(batch.image_indices.size() <= impl_->capacity, "GPU augmentation batch exceeds preallocated capacity");
     require(image_keys.size() == batch.image_indices.size(), "GPU augmentation key count does not match the batch");
@@ -498,8 +659,9 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
         require(donors.size() == expected_donors, "GPU augmentation donor metadata does not match its selection policy");
     }
     if (impl_->staging_pending[staging_slot]) {
-        ensure_cuda_ok(cudaEventSynchronize(impl_->staging_complete[staging_slot]), "cudaEventSynchronize for augmentation staging reuse");
+        CheckSettlement(event_wait_(impl_->staging_complete[staging_slot]), "cudaEventSynchronize for augmentation staging reuse");
         impl_->staging_pending[staging_slot] = false;
+        impl_->custody[staging_slot] = {};
     }
     std::uint64_t* staged_keys = impl_->staged_keys.data() + staging_slot * impl_->capacity;
     if (explicit_keys) { std::memcpy(staged_keys, image_keys.data(), image_keys.size_bytes()); }
@@ -532,8 +694,8 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
         batch.image_indices.size() * 3U * static_cast<std::size_t>(impl_->height) * static_cast<std::size_t>(impl_->width);
     if (batch.input_format == GpuAugmentationInputFormat::Rgba8 && converted_count > impl_->converted_input.capacity()) {
         if (impl_->execution_pending) {
-            ensure_cuda_ok(cudaEventSynchronize(impl_->execution_complete),
-                           "cudaEventSynchronize before growing augmentation conversion workspace");
+            CheckSettlement(event_wait_(impl_->execution_complete),
+                            "cudaEventSynchronize before growing augmentation conversion workspace");
             impl_->execution_pending = false;
         }
         impl_->converted_input.ensure(converted_count);
@@ -542,7 +704,8 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
     // From the first stream operation onward, every failure path must settle the stream before
     // executor-owned staging or device storage can be reused or destroyed. The final execution
     // event becomes the normal lifetime fence only after cudaEventRecord succeeds.
-    StreamSubmissionGuard submission(stream, impl_->device_id);
+    impl_->custody[staging_slot] = {batch.input_custody, batch.output_custody, donor_batch.image_custody};
+    try {
     if (impl_->execution_pending) {
         ensure_cuda_ok(cudaStreamWaitEvent(stream, impl_->execution_complete, 0), "cudaStreamWaitEvent for augmentation workspace reuse");
     }
@@ -578,6 +741,9 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
                                          static_cast<std::int64_t>(batch.image_indices.size()), impl_->height, impl_->width, stream);
         augmentation_input = impl_->converted_input.data();
     }
+    const bool has_prepared = impl_->prepare_reductions(batch, donor_batch, augmentation_input,
+        batch.input_format == GpuAugmentationInputFormat::Rgba8 ? std::shared_ptr<const void>(impl_) : batch.input_custody, stream, staging_slot, *this);
+    const auto* prepared = has_prepared ? impl_->prepared->views.data() : nullptr;
     const auto batch_size = static_cast<std::int64_t>(batch.image_indices.size());
     auto* const paste_parameters = impl_->copy_paste ? impl_->paste_parameters.data() : nullptr;
     const auto* const donor_images = has_paste ? donor_batch.images : nullptr;
@@ -587,23 +753,39 @@ const AugmentationBatchPlan& GpuAugmentationExecutor::RunImpl(const GpuAugmentat
     if (explicit_keys) {
         launch_gpu_augmentation_images_explicit(augmentation_input, batch.output, impl_->parameters.data(), paste_parameters, donor_images,
                                                 donor_masks, donor_boxes, donor_mask_words, impl_->keys.data(), batch_size, impl_->height,
-                                                impl_->width, launch, impl_->remap, batch.output_domain, stream, input_slots, donor_slots);
+                                                impl_->width, launch, impl_->remap, batch.output_domain, stream, input_slots, donor_slots, prepared);
     } else {
         launch_gpu_augmentation_images(augmentation_input, batch.output, impl_->parameters.data(), paste_parameters, donor_images,
                                        donor_masks, donor_boxes, donor_mask_words, batch_size, impl_->height, impl_->width, launch, seed,
-                                       epoch, rank, sequence, impl_->remap, batch.output_domain, stream, input_slots, donor_slots);
+                                       epoch, rank, sequence, impl_->remap, batch.output_domain, stream, input_slots, donor_slots, prepared);
     }
     ensure_cuda_ok(cudaEventRecord(impl_->staging_complete[staging_slot], stream), "cudaEventRecord for augmentation staging consumption");
     impl_->staging_pending[staging_slot] = true;
     ensure_cuda_ok(cudaEventRecord(impl_->execution_complete, stream), "cudaEventRecord for augmentation execution");
     impl_->execution_pending = true;
-    submission.dismiss();
+    } catch (...) {
+        const auto failure = std::current_exception();
+        if (!impl_) std::rethrow_exception(failure);
+        if (!impl_->retirement.admission_open()) {
+            Retire(impl_->retirement.fact().first_failure);
+            std::rethrow_exception(failure);
+        }
+        const auto settled = stream_wait_(stream);
+        if (settled != cudaSuccess) {
+            Retire(settled);
+        } else {
+            impl_->custody[staging_slot] = {};
+            impl_->reductions.clear();
+        }
+        std::rethrow_exception(failure);
+    }
     return impl_->plan;
 }
 
-const AugmentationBatchPlan& GpuAugmentationExecutor::plan() const noexcept { return impl_->plan; }
+const AugmentationBatchPlan& GpuAugmentationExecutor::plan() const { RequireActive(); return impl_->plan; }
 std::string GpuAugmentationExecutor::prepared_image_diagnostic(const std::size_t image, const std::size_t staging_slot) const {
-    require(impl_ && image < impl_->plan.active_size && staging_slot < kStagingSlots,
+    RequireActive();
+    require(image < impl_->plan.active_size && staging_slot < kStagingSlots,
             "augmentation prepared diagnostic image or staging slot is unavailable");
     const auto offset = staging_slot * impl_->capacity + image;
     constexpr auto parameter_count = static_cast<std::size_t>(kGpuAugmentationParameterCount);
@@ -633,18 +815,19 @@ std::string GpuAugmentationExecutor::prepared_image_diagnostic(const std::size_t
     output << '}';
     return std::move(output).str();
 }
-bool GpuAugmentationExecutor::enabled() const noexcept { return impl_->config.enabled; }
-bool GpuAugmentationExecutor::transforms_geometry() const noexcept { return impl_->transforms_geometry; }
-bool GpuAugmentationExecutor::copy_paste_enabled() const noexcept { return impl_->copy_paste; }
-bool GpuAugmentationExecutor::remaps_pixels() const noexcept { return impl_->remap; }
-std::size_t GpuAugmentationExecutor::batch_capacity() const noexcept { return impl_->capacity; }
-std::size_t GpuAugmentationExecutor::workspace_capacity_bytes() const noexcept { return device_capacity_bytes() + pinned_capacity_bytes(); }
-std::size_t GpuAugmentationExecutor::device_capacity_bytes() const noexcept {
+bool GpuAugmentationExecutor::enabled() const { RequireActive(); return impl_->config.enabled; }
+bool GpuAugmentationExecutor::transforms_geometry() const { RequireActive(); return impl_->transforms_geometry; }
+bool GpuAugmentationExecutor::copy_paste_enabled() const { RequireActive(); return impl_->copy_paste; }
+bool GpuAugmentationExecutor::remaps_pixels() const { RequireActive(); return impl_->remap; }
+std::size_t GpuAugmentationExecutor::batch_capacity() const { RequireActive(); return impl_->capacity; }
+std::size_t GpuAugmentationExecutor::workspace_capacity_bytes() const { RequireActive(); return device_capacity_bytes() + pinned_capacity_bytes(); }
+std::size_t GpuAugmentationExecutor::device_capacity_bytes() const { RequireActive();
     return impl_->converted_input.bytes() + impl_->parameters.bytes() + impl_->keys.bytes() + impl_->input_slots.bytes() +
-           impl_->donor_slots.bytes() + impl_->paste_parameters.bytes();
+           impl_->donor_slots.bytes() + impl_->paste_parameters.bytes() +
+           (impl_->prepared ? impl_->prepared->pixels.bytes() + impl_->prepared->views.bytes() : 0U);
 }
-std::size_t GpuAugmentationExecutor::pinned_capacity_bytes() const noexcept {
-    return impl_->staged_slots.bytes() + impl_->staged_keys.bytes() + impl_->staged_paste.bytes() + impl_->staged_parameters.bytes();
+std::size_t GpuAugmentationExecutor::pinned_capacity_bytes() const { RequireActive();
+    return impl_->staged_slots.bytes() + impl_->staged_keys.bytes() + impl_->staged_paste.bytes() + impl_->staged_parameters.bytes() + (impl_->prepared ? impl_->prepared->staged.bytes() : 0U);
 }
 
 std::uint64_t training_augmentation_image_key(const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence,

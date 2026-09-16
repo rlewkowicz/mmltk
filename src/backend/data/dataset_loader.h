@@ -23,6 +23,8 @@ struct Batch {
     size_t slot_index;
     uint64_t lease_id;
     const void* owner = nullptr;
+    std::weak_ptr<const void> image_custody;
+    std::size_t image_capacity_bytes = 0;
 };
 
 class DatasetLoader {

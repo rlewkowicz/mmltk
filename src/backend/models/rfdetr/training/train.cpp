@@ -2058,12 +2058,14 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     TrainingMetricHandoff metric_handoff(options.device_id);
     std::unique_ptr<mmltk::common::concurrency::WorkerPool> train_lane_pool;
     std::deque<TrainLaneContext> train_lanes;
+    const mmltk::frameworks::gpu::DeviceContext augmentation_context(options.device_id,
+        mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
     std::unique_ptr<GpuBatchAugmenter> single_lane_augmenter;
     TargetScratch target_scratch(static_cast<std::size_t>(std::max(1, options.grad_accum_steps)));
     if (train_lane_count <= 1) {
         single_lane_augmenter = std::make_unique<GpuBatchAugmenter>(options.gpu_augmentation, static_cast<std::int64_t>(options.batch_size),
                                                                     static_cast<int>(train_loader.image_height()),
-                                                                    static_cast<int>(train_loader.image_width()), options.device_id);
+                                                                    static_cast<int>(train_loader.image_width()), augmentation_context);
     }
     if (train_lane_count > 1) {
         train_lane_pool =
@@ -2077,7 +2079,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         for (auto& lane : train_lanes) {
             lane.augmenter = std::make_unique<GpuBatchAugmenter>(options.gpu_augmentation, static_cast<std::int64_t>(options.batch_size),
                                                                  static_cast<int>(train_loader.image_height()),
-                                                                 static_cast<int>(train_loader.image_width()), options.device_id);
+                                                                 static_cast<int>(train_loader.image_width()), augmentation_context);
             lane.model = make_train_lane_model(model, options.device_id);
             detail::native_model_owner(*lane.model)
                 .configure_supervision_timing(SupervisionTimingSetup{cuda_device(options.device_id),

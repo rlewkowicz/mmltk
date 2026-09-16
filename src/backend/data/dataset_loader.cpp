@@ -355,7 +355,9 @@ bool DatasetLoader::next_batch(Batch& out, std::stop_token stop) {
                    .image_indices = impl_->order.data() + slot.start,
                    .slot_index = index,
                    .lease_id = slot.lease,
-                   .owner = impl_.get()};
+                   .owner = impl_.get(),
+                   .image_custody = impl_->stream->storage_custody(),
+                   .image_capacity_bytes = slot.count * impl_->source.header().image_stride};
             return true;
         }
         impl_->changed.wait(lock);

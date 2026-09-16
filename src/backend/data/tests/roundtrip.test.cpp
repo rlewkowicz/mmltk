@@ -28,6 +28,7 @@
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "test_fixture.h"
+#include "perceptual_downscale_reference.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "src/common/system/cpu_affinity.h"
@@ -587,4 +588,48 @@ TEST_CASE("compiled source teardown retains one durable authority across replace
     CHECK(authority->fact().reservations == 0U);
     for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS(CompiledImageStream(config, authority));
     CHECK(authority->fact().occupancy == 1U);
+}
+
+TEST_CASE("perceptual compiler changes shrinking RGB while preserving format catalog and categorical geometry", "[backend][data][compiler][perceptual]") {
+    namespace oracle = mmltk::backend::data::test_perceptual;
+    mmltk::testsupport::ScopedTempDir root("perceptual-compiled");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 65, .height = 49, .num_images = 2, .background_images = 0};
+    create_synthetic_dataset(fixture);
+    CompilerConfig config;
+    config.source_dir = dataset_dir(fixture);
+    config.output_dir = (root.path() / "ordinary").string();
+    config.target_width = 31;
+    config.target_height = 31;
+    config.num_workers = 1;
+    const auto ordinary_plan = DatasetCompiler::prepare(config, {"train"});
+    DatasetCompiler::compile(ordinary_plan, 0U);
+    const auto ordinary = CompiledDataset::open(fs::path(config.output_dir) / "train.bin");
+    config.output_dir = (root.path() / "perceptual").string();
+    config.perceptual_downscale = true;
+    const auto selected_plan = DatasetCompiler::prepare(config, {"train"});
+    DatasetCompiler::compile(selected_plan, 0U);
+    const auto selected = CompiledDataset::open(fs::path(config.output_dir) / "train.bin");
+    REQUIRE(ordinary.header().version == selected.header().version);
+    REQUIRE(std::ranges::equal(ordinary.class_names(), selected.class_names()));
+    REQUIRE(ordinary.labels().size() == selected.labels().size());
+    CHECK(std::memcmp(ordinary.labels().data(), selected.labels().data(), ordinary.labels().size_bytes()) == 0);
+    REQUIRE(ordinary.rle_pairs().size() == selected.rle_pairs().size());
+    CHECK(std::memcmp(ordinary.rle_pairs().data(), selected.rle_pairs().data(), ordinary.rle_pairs().size_bytes()) == 0);
+    const auto geometry = compute_rgb_letterbox(65, 49, 31, 31);
+    for (std::uint32_t image = 0; image != 2; ++image) {
+        const auto name = image == 0 ? "000001.png" : "000002.png";
+        const auto source = expected_nchw_stub((fs::path(config.source_dir) / "train" / name).string(), 65, 49);
+        oracle::Image pixels(65, 49, RgbPixelFormat::RGB8);
+        for (unsigned y = 0; y != 49; ++y) for (unsigned x = 0; x != 65; ++x) for (unsigned channel = 0; channel != 3; ++channel)
+            pixels.set(x, y, channel, source[channel * 65U * 49U + y * 65U + x]);
+        const auto expected = oracle::reference(pixels, geometry.resized_width, geometry.resized_height);
+        const auto* actual = selected.image_pixels(image);
+        for (unsigned channel = 0; channel != 3; ++channel) for (unsigned y = 0; y != 31; ++y) for (unsigned x = 0; x != 31; ++x) {
+            double answer = 0;
+            if (x >= geometry.offset_x && x < geometry.offset_x + geometry.resized_width &&
+                y >= geometry.offset_y && y < geometry.offset_y + geometry.resized_height)
+                answer = expected.at(x - geometry.offset_x, y - geometry.offset_y, channel);
+            CHECK(std::abs(actual[channel * 31U * 31U + y * 31U + x] - answer) <= 1.0 / 255 + 1e-6);
+        }
+    }
 }

@@ -96,6 +96,17 @@ void test_zero_device_rejected() {
     mmltk::testsupport::expect_runtime_error_contains([&request]() { (void)build_train_command_arguments(request); });
 }
 
+void test_perceptual_selection_is_independent_in_child_arguments() {
+    auto request = make_train_request({0});
+    for (const bool enabled : {false, true}) for (const bool perceptual : {false, true}) {
+        request.gpu_augmentation.enabled = enabled;
+        request.gpu_augmentation.perceptual_downscale = perceptual;
+        const auto arguments = build_train_command_arguments(request);
+        CHECK(std::ranges::find(arguments, enabled ? "--gpu-augment" : "--no-gpu-augment") != arguments.end());
+        CHECK(std::ranges::find(arguments, perceptual ? "--aug-perceptual-downscale" : "--no-aug-perceptual-downscale") != arguments.end());
+    }
+}
+
 void test_optimizer_arguments_are_forwarded() {
     mmltk::backend::models::rfdetr::TrainRequest request = make_train_request({1});
     request.optimizer = mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon;
@@ -266,3 +277,5 @@ MMLTK_REGISTER_TEST_CASE("[gui][train_command][training_supervision]",
                          test_supervision_float_arguments_round_trip_at_representable_boundaries);
 MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_muon_recipe_defaults_are_resolved);
 MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_recipe_application_respects_overrides);
+
+MMLTK_REGISTER_TEST_CASE("[gui][train_command][perceptual]", test_perceptual_selection_is_independent_in_child_arguments);

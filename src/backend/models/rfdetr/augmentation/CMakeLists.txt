@@ -44,8 +44,9 @@ target_link_libraries(
         mmltk::backend::data
         mmltk::backend::models::rfdetr::contract
         CUDA::cudart
+        mmltk::frameworks::gpu
     PRIVATE
-        mmltk::frameworks::gpu)
+        CUDA::cuda_driver)
 set_target_properties(mmltk_backend_models_rfdetr_augmentation PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON

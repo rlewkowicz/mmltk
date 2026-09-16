@@ -177,7 +177,7 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
     std::atomic<bool> worker_failed{false};
     const auto decode_worker = [&](int, const int, const int) {
         BenchmarkJpegDecoder jpeg;
-        RgbImageResizer resizer(1);
+        RgbImageResizer resizer(1, request.perceptual_downscale);
         std::vector<std::uint8_t> encoded;
         std::vector<std::uint8_t> decoded;
         std::vector<std::uint8_t> cmyk;

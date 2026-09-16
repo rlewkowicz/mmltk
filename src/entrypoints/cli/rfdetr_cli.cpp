@@ -71,6 +71,7 @@ struct CompileCliRequest final {
     [[= reflection::Minimum<int>{0}]] int cuda_mask_batch_size = 0;
     [[= reflection::Minimum<int>{0}]] int cuda_device_id = 0;
     bool overwrite = false;
+    bool perceptual_downscale = false;
 };
 
 struct InfoCliRequest final {
@@ -101,6 +102,7 @@ MMLTK_REFLECT_FIELDS(PredictCliRequest)
 MMLTK_REFLECT_FIELDS(TrainCliRequest)
 
 inline constexpr std::array kCompileOptions{
+    reflection::option<CompileCliRequest, &CompileCliRequest::perceptual_downscale>("--perceptual-downscale", "Perceptual shrinking", "Dataset"),
     reflection::option<CompileCliRequest, &CompileCliRequest::source_dir>("--source-dir", "Source dataset root", "Dataset"),
     reflection::option<CompileCliRequest, &CompileCliRequest::output_dir>("--output-dir", "Compiled output directory", "Dataset"),
     reflection::option<CompileCliRequest, &CompileCliRequest::cache_dir>("--cache-dir", "Benchmark cache root", "Dataset"),
@@ -439,6 +441,9 @@ inline constexpr std::array kTrainOptions{
     reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::gpu_augmentation,
                                                                 &rfdetr::GpuAugmentationConfig::enabled>>(
         "--gpu-augment", "Apply GPU augmentation", "GPU augmentation", {}, "--no-gpu-augment"),
+    reflection::option<TrainCliRequest, reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::gpu_augmentation,
+                       &rfdetr::GpuAugmentationConfig::perceptual_downscale>>(
+        "--aug-perceptual-downscale", "Perceptual shrinking", "GPU augmentation", {}, "--no-aug-perceptual-downscale"),
     reflection::option<TrainCliRequest,
                        reflection::member_path<&TrainCliRequest::request, &rfdetr::TrainRequest::gpu_augmentation,
                                                &rfdetr::GpuAugmentationConfig::geometry, &rfdetr::AugmentationGroupConfig::probability>>(
@@ -758,6 +763,7 @@ void run_compile(const CompileCliRequest& request) {
         config.resolution = static_cast<std::uint32_t>(request.benchmark_resolution);
         config.num_workers = request.num_workers;
         config.overwrite = request.overwrite;
+        config.perceptual_downscale = request.perceptual_downscale;
         config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(benchmark_cancel_requested);
         config.progress = [](const data::BenchmarkCompileProgress& progress) {
             if (!progress.activity.empty()) spdmon::ProgressBar::log(progress.activity);
@@ -773,6 +779,7 @@ void run_compile(const CompileCliRequest& request) {
     }
 
     data::CompilerConfig config;
+    config.perceptual_downscale = request.perceptual_downscale;
     config.source_dir = request.source_dir.string();
     config.output_dir = request.output_dir.string();
     config.target_width = static_cast<std::uint32_t>(request.resolution);

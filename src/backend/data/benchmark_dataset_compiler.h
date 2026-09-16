@@ -58,6 +58,7 @@ struct BenchmarkCompilerConfig {
     std::uint32_t resolution = 432;
     int num_workers = -1;
     bool overwrite = false;
+    bool perceptual_downscale = false;
     mmltk::common::concurrency::CancellationObservation cancel_requested;
     BenchmarkProgressCallback progress;
     BenchmarkTraceCallback trace;
