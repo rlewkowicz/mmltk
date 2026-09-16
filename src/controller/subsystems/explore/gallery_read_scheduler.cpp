@@ -469,7 +469,7 @@ void GalleryReadScheduler::RebindInput(const GalleryProductState& product, const
     scheduled_slots_[product.cache.Slot(lane.position)] = generation;
     const explore::ExploreRenderTileDescriptor tile{.card_index = lane.destination_slot,
                                                     .destination_x = lane.prefetch ? 0U : lane.destination_slot % lane.columns * lane.card_extent,
-                                                    .destination_y = lane.prefetch ? static_cast<std::uint32_t>(((lane.cache_bank * product.cache.size() + product.cache.Slot(lane.position)) * product.cache.identity().extent))
+                                                    .destination_y = lane.prefetch ? static_cast<std::uint32_t>(product.cache.PhysicalRow(product.cache.Slot(lane.position), lane.cache_bank))
                                                                                    : lane.destination_slot / lane.columns * lane.card_extent,
                                                     .destination_width = lane.card_extent,
                                                     .destination_height = lane.card_extent,
@@ -532,7 +532,7 @@ void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, co
             if (prefetch) {
                 auto tile = load_payload<explore::ExploreRenderTileDescriptor>(lane.pinned.data(), lane.layout.tile);
                 tile.destination_x = 0U;
-                tile.destination_y = static_cast<std::uint32_t>(((lane.cache_bank * product.cache.size() + product.cache.Slot(position)) * product.cache.identity().extent));
+                tile.destination_y = static_cast<std::uint32_t>(product.cache.PhysicalRow(product.cache.Slot(position), lane.cache_bank));
                 store_payload(lane.pinned.data(), lane.layout.tile, tile);
             }
             {

@@ -101,6 +101,10 @@ class GalleryThumbnailCache final {
     [[nodiscard]] std::size_t capacity() const noexcept { return entries_.capacity(); }
     [[nodiscard]] const Identity& identity() const noexcept { return identity_; }
     [[nodiscard]] std::size_t Slot(std::size_t position) const noexcept { return demand_slots_[position - demand_first_]; }
+    // Requires a valid physical slot and bank 0 or 1; returns rows, not bytes.
+    [[nodiscard]] std::size_t PhysicalRow(std::size_t slot, std::uint8_t bank) const noexcept {
+        return (static_cast<std::size_t>(bank) * entries_.size() + slot) * identity_.extent;
+    }
     [[nodiscard]] const Entry* Find(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] const Entry* Retained(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] const Entry& Physical(std::size_t slot) const { return entries_.at(slot); }

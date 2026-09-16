@@ -107,7 +107,7 @@ void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, co
         const auto position = static_cast<std::size_t>(product.viewport.first_row) * product.viewport.columns + slot;
         const auto* retained = product.cache.Retained(compiled_index);
         const auto bank = retained ? retained->bank : product.cache.WritableBank(position, incumbent);
-        reference.data += (bank * product.cache.size() + product.cache.Slot(position)) * product.cache.identity().extent * reference.pitch_bytes;
+        reference.data += product.cache.PhysicalRow(product.cache.Slot(position), bank) * reference.pitch_bytes;
         reference.height = reference.width;
     }
     const explore::ExploreRenderedCardProbe probe{

@@ -205,9 +205,6 @@ class GalleryStream::Impl final : public std::enable_shared_from_this<GalleryStr
     [[nodiscard]] mmltk::frameworks::gpu::ImagePlaneView CachePlane(bool) const;
     void PrepareCacheWrite(std::uintptr_t);
     [[nodiscard]] std::uint8_t WritableCacheBank(std::size_t, bool semantic = false) const;
-    [[nodiscard]] std::size_t CacheOffset(std::size_t position, std::uint8_t bank) const noexcept {
-        return (bank * State().cache.size() + State().cache.Slot(position)) * State().cache.identity().extent;
-    }
     void PlaceTile(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uint32_t, std::uintptr_t, bool semantic_only = false);
     [[nodiscard]] std::uint32_t AtlasY(const std::size_t logical) const noexcept {
         return static_cast<std::uint32_t>((State().atlas.row_origin + logical / State().atlas.columns) % State().atlas.row_capacity) *
@@ -913,8 +910,8 @@ void GalleryStream::Impl::PrepareCacheWrite(const std::uintptr_t stream) {
         for (const bool semantic : {false, true}) {
             const auto bank = semantic ? entry.semantic_bank : entry.bank;
             auto& family = semantic ? storage_.storage_.buffers_.cached_semantic_ : storage_.storage_.buffers_.cached_clean_;
-            const auto source = (bank * committed_.cache.size() + slot) * static_cast<std::size_t>(side) * side * 4U;
-            const auto destination = (bank * State().cache.size() + slot) * static_cast<std::size_t>(side) * side * 4U;
+            const auto source = committed_.cache.PhysicalRow(slot, bank) * pitch;
+            const auto destination = State().cache.PhysicalRow(slot, bank) * pitch;
             ensure_gallery_cuda(cudaMemcpyAsync(static_cast<std::byte*>(family[State().cache_active].data()) + destination,
                                        static_cast<const std::byte*>(family[committed_.cache_active].data()) + source,
                                        static_cast<std::size_t>(side) * side * 4U, cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(stream)),
@@ -949,7 +946,7 @@ void GalleryStream::Impl::PlaceTile(const mmltk::frameworks::gpu::ImagePlaneView
         const auto cache = CachePlane(semantic_plane);
         const auto bank = semantic_plane ? entry->semantic_bank : entry->bank;
         ensure_gallery_cuda(cudaMemcpy2DAsync(reinterpret_cast<void*>(plane.data + y * plane.descriptor.pitch_bytes + x * 4U), plane.descriptor.pitch_bytes,
-                                     reinterpret_cast<const void*>(cache.data + CacheOffset(position, bank) * cache.descriptor.pitch_bytes),
+                                     reinterpret_cast<const void*>(cache.data + State().cache.PhysicalRow(State().cache.Slot(position), bank) * cache.descriptor.pitch_bytes),
                                      cache.descriptor.pitch_bytes, side * 4U, side, cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(stream)),
                    "Explore cache tile placement failed");
     };
@@ -1031,12 +1028,12 @@ void GalleryStream::Impl::RenderCachedSemantics(const mmltk::frameworks::gpu::Im
             }
             store_payload(descriptors_.storage_.buffers_.descriptors_.data(), descriptors_.descriptor_layout_.rle.offset + run_offset * sizeof(data::RLEPair), std::span{meaning.runs});
             run_offset += meaning.runs.size();
+            const auto position = static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot;
             const explore::ExploreRenderTileDescriptor tile{
                 .card_index = static_cast<std::uint32_t>(index),
                 .destination_x = 0U,
                 .destination_y = static_cast<std::uint32_t>(
-                    CacheOffset(static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot,
-                                WritableCacheBank(static_cast<std::size_t>(State().viewport.first_row) * State().viewport.columns + slot, true))),
+                    State().cache.PhysicalRow(State().cache.Slot(position), WritableCacheBank(position, true))),
                 .destination_width = side,
                 .destination_height = side,
                 .generation = {.viewport = State().plan.generation, .tile = ++scheduler_.next_tile_generation_}};
@@ -1386,9 +1383,9 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::fra
         tile.generation.viewport = generation;
         {
             tile.destination_x = 0U;
-            tile.destination_y = static_cast<std::uint32_t>(CacheOffset(lane->position, lane->cache_bank));
+            tile.destination_y = static_cast<std::uint32_t>(State().cache.PhysicalRow(lane->cache_slot, lane->cache_bank));
             tile.semantic_y_offset =
-                static_cast<std::int32_t>(CacheOffset(lane->position, lane->semantic_bank)) - static_cast<std::int32_t>(tile.destination_y);
+                static_cast<std::int32_t>(State().cache.PhysicalRow(lane->cache_slot, lane->semantic_bank)) - static_cast<std::int32_t>(tile.destination_y);
         }
         lane->pending_meaning = CaptureMeaning(card, card_annotation_offset, annotation_count, card_rle_offset, rle_count);
         tile.card_index = static_cast<std::uint32_t>(tile_count);
