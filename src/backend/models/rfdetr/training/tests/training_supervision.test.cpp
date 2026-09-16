@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unordered_map>
 #include <system_error>
 #include <vector>
 
@@ -1383,6 +1384,34 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             return value;
         }(),
     };
+    const auto require_selected_evaluation = [](const rfdetr::TrainRequest& request, const rfdetr::TrainRunResult& result) {
+        REQUIRE(result.history.size() == 1);
+        const auto& epoch = result.history.front();
+        REQUIRE(epoch.evaluated_ema == request.use_ema);
+        REQUIRE(epoch.val_loss.has_value() == request.validation_loss);
+        if (epoch.val_loss) REQUIRE(std::isfinite(*epoch.val_loss));
+        REQUIRE(epoch.val_summary.bbox.available);
+        REQUIRE(result.best_is_ema == request.use_ema);
+        REQUIRE(result.test_summary.has_value() == !request.test_compiled_path.empty());
+        const auto samples = request.output_dir / "eval_samples";
+        const auto sample = samples / ("epoch_" + std::to_string(epoch.epoch + 1) + ".png");
+        // A completed run has flushed a real PNG with the compiled image geometry.
+        // The final test must not publish an additional sample.
+        const std::array<unsigned char, 24> expected_header{
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
+            0, 0, 0, 64, 0, 0, 0, 64};
+        std::array<unsigned char, 24> header{};
+        std::ifstream image(sample, std::ios::binary);
+        REQUIRE(image.read(reinterpret_cast<char*>(header.data()), header.size()).good());
+        REQUIRE(header == expected_header);
+        REQUIRE(std::filesystem::file_size(sample) > header.size());
+        std::size_t sample_count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(samples)) {
+            REQUIRE(entry.path() == sample);
+            ++sample_count;
+        }
+        REQUIRE(sample_count == 1);
+    };
     for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
         for (const int lanes : {1, 2}) {
             rfdetr::TrainRequest request;
@@ -1404,6 +1433,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             request.validation_loss = true;
             request.optimizer = route_index == 0 && lanes == 1 ? rfdetr::TrainOptimizerKind::Muon : rfdetr::TrainOptimizerKind::AdamW;
             request.use_ema = route_index == routes.size() - 1 && lanes == 2;
+            if ((route_index == 0 && lanes == 1) || request.use_ema) request.test_compiled_path = request.val_compiled_path;
             if (route_index == routes.size() - 1 && lanes == 2) {
                 request.gpu_augmentation.enabled = true;
                 request.gpu_augmentation.copy_paste_probability = 1.0F;
@@ -1413,6 +1443,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             }
             request.training_supervision = routes[route_index];
             const auto result = rfdetr::run_training(request);
+            require_selected_evaluation(request, result);
+            if (result.test_summary) REQUIRE(*result.test_summary == result.history.front().val_summary);
             const auto inspection = rfdetr::inspect_training_checkpoint(result.checkpoint_path);
             REQUIRE(inspection.resumable);
             REQUIRE(inspection.configuration.has_value());
@@ -1431,8 +1463,24 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             REQUIRE(deployment_summary.unexpected_names.empty());
             REQUIRE(deployment_summary.incompatible_names.empty());
             const auto deployment_state = rfdetr::decode_model_state(*result.best_checkpoint_path);
+            const auto full_state = rfdetr::decode_model_state(result.checkpoint_path);
+            std::unordered_map<std::string, torch_api::Tensor> expected_best;
+            for (const auto& entry : rfdetr::detail::model_state_owner(full_state).entries) expected_best.emplace(entry.name, entry.tensor);
+            if (request.use_ema) {
+                torch_api::InputArchive source, shadows;
+                source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
+                source.read("ema_state", shadows);
+                const auto count = rfdetr::require_int(shadows, "entry_count");
+                REQUIRE(count > 0);
+                for (int64_t index = 0; index < count; ++index) {
+                    torch_api::InputArchive entry;
+                    shadows.read(rfdetr::archive_entry_name(static_cast<std::size_t>(index)), entry);
+                    expected_best.at(rfdetr::require_string(entry, "name")) = rfdetr::require_tensor(entry, "tensor");
+                }
+            }
             for (const auto& entry : rfdetr::detail::model_state_owner(deployment_state).entries) {
                 REQUIRE_FALSE(entry.name.starts_with("training_supervision."));
+                REQUIRE(torch_api::equal(entry.tensor, expected_best.at(entry.name)));
             }
             if ((route_index == 0 && lanes == 1) || request.use_ema) {
                 // These use a genuinely saved checkpoint, not a scalar-only
@@ -1492,7 +1540,10 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                 resume_request.resume_path = result.checkpoint_path;
                 resume_request.output_dir = root / (request.use_ema ? "active-ema-resume" : "active-ordinary-resume");
                 resume_request.epochs = 2;
+                resume_request.progress_bar = true;
+                resume_request.validation_loss = false;
                 const auto resumed = rfdetr::run_training(resume_request);
+                require_selected_evaluation(resume_request, resumed);
                 REQUIRE(resumed.history.size() == 1);
                 REQUIRE(resumed.last_epoch == 1);
                 REQUIRE(std::isfinite(resumed.history.front().train_loss));

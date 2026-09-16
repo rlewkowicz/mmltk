@@ -1355,9 +1355,14 @@ std::future<TrainLaneResult> enqueue_train_lane(
     });
 }
 
+enum class EvaluationPurpose : std::uint8_t { ScheduledValidation, FinalTest };
+
 EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model,
                               TrainingEventOwner& event_owner, const DetectionConfig& detection_config, bool calculate_loss,
-                              std::optional<int> current_epoch, std::string progress_label, TrainingMetricHandoff* metrics = nullptr) {
+                              EvaluationPurpose purpose, EvaluatedWeights evaluated_weights, std::optional<int> current_epoch,
+                              TrainingMetricHandoff* metrics = nullptr) {
+    const bool capture_eval_sample = purpose == EvaluationPurpose::ScheduledValidation;
+    if (capture_eval_sample && !current_epoch) throw std::logic_error("scheduled validation requires its epoch");
     mmltk::common::logging::ScopedProfile profile_rfdetr_train_eval_total{"rfdetr.train.eval.total"};
     RuntimeContext& runtime = validation.runtime();
     mmltk::backend::data::DatasetLoader& loader = validation.loader();
@@ -1386,7 +1391,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
         evaluation_run.configure_profile(EvaluationProfileSetup{
             options.output_dir / "validation_profile.jsonl",
             "training_validation",
-            progress_label.starts_with("ema") ? "ema" : (progress_label.starts_with("test") ? "test" : "model"),
+            purpose == EvaluationPurpose::FinalTest ? "test" : (evaluated_weights == EvaluatedWeights::Ema ? "ema" : "model"),
             evaluation_precision_name(autocast_dtype),
             current_epoch.has_value() ? std::optional<int>(*current_epoch + 1) : std::nullopt,
             evaluation_run.dataset().facts().metric_set,
@@ -1408,9 +1413,13 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     if (calculate_loss && !metrics) throw std::logic_error("validation loss requires the retained scalar handoff");
     if (calculate_loss) metrics->begin_validation();
     std::optional<CapturedEvalSample> captured_sample;
-    const bool capture_eval_sample = current_epoch.has_value() && progress_label.starts_with("val ");
     std::unique_ptr<spdmon::ProgressBar> progress;
-    if (options.progress_bar) { progress = std::make_unique<spdmon::ProgressBar>(std::move(progress_label), loader.num_images(), "img"); }
+    if (options.progress_bar) {
+        auto label = purpose == EvaluationPurpose::FinalTest
+                         ? std::string("test")
+                         : phase_progress_label(evaluated_weights == EvaluatedWeights::Ema ? "ema" : "val", *current_epoch, options.epochs);
+        progress = std::make_unique<spdmon::ProgressBar>(std::move(label), loader.num_images(), "img");
+    }
     std::mt19937_64 sample_rng(
         static_cast<uint64_t>(options.seed) ^
         (current_epoch.has_value() ? (0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(*current_epoch + 1)) : 0xd1b54a32d192ed03ULL));
@@ -2483,8 +2492,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 std::optional<ModelEma::Selection> selected;
                 if (ema) selected.emplace(*ema, detail::native_model_owner(model).module());
                 val_result = evaluate_model(options, *validation_runtime, model, training_events, detection_config,
-                                             options.validation_loss, epoch,
-                                             phase_progress_label(ema ? "ema" : "val", epoch, options.epochs), &metric_handoff);
+                                             options.validation_loss, EvaluationPurpose::ScheduledValidation,
+                                             ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary, epoch, &metric_handoff);
                 if (selected) selected->restore();
                 detail::native_model_owner(model).module().train();
             }
@@ -2570,7 +2579,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         load_model_weights(best_model, *result.best_checkpoint_path, false);
         best_model.optimize_for_inference(checked_inference_batch_size(val_batch_size), false, options.compilation_mode);
         result.test_summary =
-            evaluate_model(options, test_runtime, best_model, training_events, detection_config, false, std::nullopt, "test").summary;
+            evaluate_model(options, test_runtime, best_model, training_events, detection_config, false, EvaluationPurpose::FinalTest,
+                           result.best_is_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary, std::nullopt).summary;
     }
 
     if (main_process) {
