@@ -1,48 +1,32 @@
 #pragma once
-
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
 #include <cstddef>
 #include <cstdint>
-
 #include "detail/image_upscaler_nis.h"
 #include "detail/image_upscaler_nis_coefficients.h"
-
 namespace mmltk::backend::imaging::upscale::image_upscaler_nis::device {
-
 inline constexpr std::uint32_t kPhaseCount = static_cast<std::uint32_t>(coefficients::kPhaseCount);
 inline constexpr std::uint32_t kFilterTaps = static_cast<std::uint32_t>(coefficients::kFilterTaps);
-
 using DeviceCoefficientTable = coefficients::CoefficientTable;
-
 extern __device__ __constant__ const DeviceCoefficientTable kScaleCoefficients;
 extern __device__ __constant__ const DeviceCoefficientTable kUsmCoefficients;
-
 struct alignas(8) HalfRgba final {
     __half red;
     __half green;
     __half blue;
     __half alpha;
 };
-
-__device__ __forceinline__ float channel_mean(const std::uint32_t channel) {
-    return channel == 0U ? 0.485F : (channel == 1U ? 0.456F : 0.406F);
-}
-
-__device__ __forceinline__ float channel_std(const std::uint32_t channel) {
-    return channel == 0U ? 0.229F : (channel == 1U ? 0.224F : 0.225F);
-}
-
+__device__ __forceinline__ float channel_mean(const std::uint32_t channel) { return channel == 0U ? 0.485F : (channel == 1U ? 0.456F : 0.406F); }
+__device__ __forceinline__ float channel_std(const std::uint32_t channel) { return channel == 0U ? 0.229F : (channel == 1U ? 0.224F : 0.225F); }
 __device__ __forceinline__ std::uint32_t phase(const float source_coordinate) {
     const float fraction = source_coordinate - floorf(source_coordinate);
     return min(kPhaseCount - 1U, static_cast<std::uint32_t>(fraction * static_cast<float>(kPhaseCount)));
 }
-
 // Workflow-neutral direct sampler used by atlas-style consumers that cannot
 // materialize a single rectangular separable intermediate.
-__device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, const std::uint32_t width, const std::uint32_t height,
-                                                         const float source_x, const float source_y) {
+__device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, const std::uint32_t width, const std::uint32_t height, const float source_x,
+                                                         const float source_y) {
     const int base_x = static_cast<int>(floorf(source_x)) - 2;
     const int base_y = static_cast<int>(floorf(source_y)) - 2;
     const std::uint32_t phase_x = phase(source_x);
@@ -77,8 +61,7 @@ __device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, co
             vertical_detail.z = fmaf(vertical_coefficient, blue, vertical_detail.z);
         }
     }
-    const float horizontal_luma =
-        fabsf(fmaf(0.2126F, horizontal_detail.x, fmaf(0.7152F, horizontal_detail.y, 0.0722F * horizontal_detail.z)));
+    const float horizontal_luma = fabsf(fmaf(0.2126F, horizontal_detail.x, fmaf(0.7152F, horizontal_detail.y, 0.0722F * horizontal_detail.z)));
     const float vertical_luma = fabsf(fmaf(0.2126F, vertical_detail.x, fmaf(0.7152F, vertical_detail.y, 0.0722F * vertical_detail.z)));
     const float3 detail = horizontal_luma <= vertical_luma ? horizontal_detail : vertical_detail;
     constexpr float kSharpness = 0.18F;
@@ -87,5 +70,4 @@ __device__ __forceinline__ float3 sample_normalized_nchw(const float* pixels, co
     color.z = fmaf(kSharpness, detail.z, color.z);
     return color;
 }
-
 }  // namespace mmltk::backend::imaging::upscale::image_upscaler_nis::device

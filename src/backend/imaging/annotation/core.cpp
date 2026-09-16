@@ -1,7 +1,6 @@
 module;
 #include <stb_image.h>
 #include <stb_image_write.h>
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -19,38 +18,22 @@ module;
 #include <system_error>
 #include <utility>
 #include <vector>
-
 module mmltk.backend.imaging.annotation.core;
-
 namespace mmltk::backend::imaging::annotation {
-
 bool annotation_box_has_area(const AnnotationBox& box);
-
 namespace {
-
-std::string fallback_source_name(const std::filesystem::path& path) {
-    return path.filename().empty() ? path.string() : path.filename().string();
-}
-
+std::string fallback_source_name(const std::filesystem::path& path) { return path.filename().empty() ? path.string() : path.filename().string(); }
 std::vector<std::uint8_t> bgr_to_rgb_copy(const std::vector<std::uint8_t>& pixels_bgr) {
     std::vector<std::uint8_t> pixels_rgb = pixels_bgr;
-    for (std::size_t offset = 0; offset + 2U < pixels_rgb.size(); offset += 3U) {
-        std::swap(pixels_rgb[offset + 0], pixels_rgb[offset + 2]);
-    }
+    for (std::size_t offset = 0; offset + 2U < pixels_rgb.size(); offset += 3U) { std::swap(pixels_rgb[offset + 0], pixels_rgb[offset + 2]); }
     return pixels_rgb;
 }
-
 }  // namespace
-
 std::string next_annotation_object_id(const std::size_t object_count) { return "manual-" + std::to_string(object_count + 1U); }
-
 void write_annotation_png(const std::filesystem::path& path, const int width, const int height, const int channels, const void* pixels,
                           const int stride_bytes) {
-    if (stbi_write_png(path.c_str(), width, height, channels, pixels, stride_bytes) == 0) {
-        throw std::runtime_error("failed to write PNG: " + path.string());
-    }
+    if (stbi_write_png(path.c_str(), width, height, channels, pixels, stride_bytes) == 0) { throw std::runtime_error("failed to write PNG: " + path.string()); }
 }
-
 AnnotationFrame load_annotation_frame(const AnnotationImageInput& input) {
     int raw_width = 0;
     int raw_height = 0;
@@ -61,7 +44,6 @@ AnnotationFrame load_annotation_frame(const AnnotationImageInput& input) {
         stbi_image_free(raw_pixels);
         throw std::runtime_error("annotation image has invalid dimensions: " + input.image_path.string());
     }
-
     AnnotationFrame frame;
     frame.source_name = input.source_name.empty() ? fallback_source_name(input.image_path) : input.source_name;
     frame.source_path = input.image_path;
@@ -75,19 +57,14 @@ AnnotationFrame load_annotation_frame(const AnnotationImageInput& input) {
     const std::size_t byte_count = static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height) * 3U;
     std::vector<std::uint8_t> pixels_bgr(raw_pixels, raw_pixels + byte_count);
     stbi_image_free(raw_pixels);
-    for (std::size_t offset = 0; offset + 2U < pixels_bgr.size(); offset += 3U) {
-        std::swap(pixels_bgr[offset + 0], pixels_bgr[offset + 2]);
-    }
+    for (std::size_t offset = 0; offset + 2U < pixels_bgr.size(); offset += 3U) { std::swap(pixels_bgr[offset + 0], pixels_bgr[offset + 2]); }
     set_annotation_frame_pixels(frame, std::move(pixels_bgr));
     return frame;
 }
-
 void write_annotation_frame_png(const std::filesystem::path& path, const AnnotationFrame& frame) {
     const std::vector<std::uint8_t> pixels_rgb = bgr_to_rgb_copy(annotation_frame_pixels(frame));
-    write_annotation_png(path, static_cast<int>(frame.width), static_cast<int>(frame.height), 3, pixels_rgb.data(),
-                         static_cast<int>(frame.width * 3U));
+    write_annotation_png(path, static_cast<int>(frame.width), static_cast<int>(frame.height), 3, pixels_rgb.data(), static_cast<int>(frame.width * 3U));
 }
-
 AnnotationHsv sample_annotation_hsv(const AnnotationFrame& frame, const int x, const int y) {
     if (x < 0 || y < 0 || x >= static_cast<int>(frame.width) || y >= static_cast<int>(frame.height)) {
         throw std::runtime_error("annotation eyedropper sample is outside the current frame");
@@ -100,7 +77,6 @@ AnnotationHsv sample_annotation_hsv(const AnnotationFrame& frame, const int x, c
     const std::size_t byte_offset = pixel_index * 3U;
     return annotation_bgr_to_hsv(pixels_bgr[byte_offset + 0], pixels_bgr[byte_offset + 1], pixels_bgr[byte_offset + 2]);
 }
-
 void recenter_annotation_range(AnnotationColorRange& range, const AnnotationHsv& center) {
     range.center.hue_degrees = annotation_wrap_hue(center.hue_degrees);
     range.center.saturation = annotation_clamp_unit(center.saturation);
@@ -108,14 +84,11 @@ void recenter_annotation_range(AnnotationColorRange& range, const AnnotationHsv&
     range.tolerance = {};
     range.sampling = false;
 }
-
 bool annotation_range_active(const AnnotationColorRange& range) {
     return range.tolerance.hue_minus_pct > 0.0f || range.tolerance.hue_plus_pct > 0.0f || range.tolerance.saturation_minus_pct > 0.0f ||
            range.tolerance.saturation_plus_pct > 0.0f || range.tolerance.value_minus_pct > 0.0f || range.tolerance.value_plus_pct > 0.0f;
 }
-
 bool annotation_box_has_area(const AnnotationBox& box) { return box.x2 > box.x1 && box.y2 > box.y1; }
-
 AnnotationBox normalize_annotation_box(AnnotationBox box, const std::uint32_t width, const std::uint32_t height) {
     const int max_width = static_cast<int>(width);
     const int max_height = static_cast<int>(height);
@@ -127,15 +100,8 @@ AnnotationBox normalize_annotation_box(AnnotationBox box, const std::uint32_t wi
     if (box.y2 < box.y1) { std::swap(box.y1, box.y2); }
     return box;
 }
-
-std::uint32_t annotation_frame_capture_width(const AnnotationFrame& frame) {
-    return frame.capture_width > 0 ? frame.capture_width : frame.width;
-}
-
-std::uint32_t annotation_frame_capture_height(const AnnotationFrame& frame) {
-    return frame.capture_height > 0 ? frame.capture_height : frame.height;
-}
-
+std::uint32_t annotation_frame_capture_width(const AnnotationFrame& frame) { return frame.capture_width > 0 ? frame.capture_width : frame.width; }
+std::uint32_t annotation_frame_capture_height(const AnnotationFrame& frame) { return frame.capture_height > 0 ? frame.capture_height : frame.height; }
 AnnotationBox annotation_frame_view_box(const AnnotationFrame& frame) {
     const std::uint32_t capture_width = annotation_frame_capture_width(frame);
     const std::uint32_t capture_height = annotation_frame_capture_height(frame);
@@ -148,11 +114,9 @@ AnnotationBox annotation_frame_view_box(const AnnotationFrame& frame) {
         },
         capture_width, capture_height);
 }
-
 AnnotationBox annotation_box_to_frame(const AnnotationFrame& frame, const AnnotationBox& capture_box) {
     const AnnotationBox view_box = annotation_frame_view_box(frame);
-    const AnnotationBox normalized =
-        normalize_annotation_box(capture_box, annotation_frame_capture_width(frame), annotation_frame_capture_height(frame));
+    const AnnotationBox normalized = normalize_annotation_box(capture_box, annotation_frame_capture_width(frame), annotation_frame_capture_height(frame));
     const AnnotationBox overlap = annotation_intersect_boxes(normalized, view_box);
     if (!annotation_box_has_area(overlap)) { return {}; }
     return AnnotationBox{
@@ -162,7 +126,6 @@ AnnotationBox annotation_box_to_frame(const AnnotationFrame& frame, const Annota
         overlap.y2 - view_box.y1,
     };
 }
-
 AnnotationBox annotation_box_from_frame(const AnnotationFrame& frame, const AnnotationBox& frame_box) {
     const AnnotationBox view_box = annotation_frame_view_box(frame);
     const AnnotationBox normalized = normalize_annotation_box(frame_box, frame.width, frame.height);
@@ -175,7 +138,6 @@ AnnotationBox annotation_box_from_frame(const AnnotationFrame& frame, const Anno
         },
         annotation_frame_capture_width(frame), annotation_frame_capture_height(frame));
 }
-
 AnnotationMaskRegion annotation_mask_region_from_frame(const AnnotationFrame& frame) {
     const AnnotationBox view_box = annotation_frame_view_box(frame);
     return AnnotationMaskRegion{
@@ -185,17 +147,14 @@ AnnotationMaskRegion annotation_mask_region_from_frame(const AnnotationFrame& fr
         frame.height,
     };
 }
-
 AnnotationFrame extract_annotation_frame_region(const AnnotationFrame& frame, const AnnotationBox& capture_box) {
-    const AnnotationBox requested =
-        normalize_annotation_box(capture_box, annotation_frame_capture_width(frame), annotation_frame_capture_height(frame));
+    const AnnotationBox requested = normalize_annotation_box(capture_box, annotation_frame_capture_width(frame), annotation_frame_capture_height(frame));
     const AnnotationBox view_box = annotation_frame_view_box(frame);
     const AnnotationBox overlap = annotation_intersect_boxes(requested, view_box);
     if (!annotation_box_has_area(requested) || overlap.x1 != requested.x1 || overlap.y1 != requested.y1 || overlap.x2 != requested.x2 ||
         overlap.y2 != requested.y2) {
         throw std::runtime_error("requested annotation crop is outside the current frame view");
     }
-
     AnnotationFrame extracted = frame;
     extracted.view_x = static_cast<std::uint32_t>(requested.x1);
     extracted.view_y = static_cast<std::uint32_t>(requested.y1);
@@ -203,15 +162,12 @@ AnnotationFrame extract_annotation_frame_region(const AnnotationFrame& frame, co
     extracted.height = static_cast<std::uint32_t>(requested.y2 - requested.y1);
     extracted.capture_width = annotation_frame_capture_width(frame);
     extracted.capture_height = annotation_frame_capture_height(frame);
-    std::vector<std::uint8_t> extracted_pixels(static_cast<std::size_t>(extracted.width) * static_cast<std::size_t>(extracted.height) * 3U,
-                                               0U);
-
+    std::vector<std::uint8_t> extracted_pixels(static_cast<std::size_t>(extracted.width) * static_cast<std::size_t>(extracted.height) * 3U, 0U);
     const std::vector<std::uint8_t>& source_pixels = annotation_frame_pixels(frame);
     const AnnotationBox local = annotation_box_to_frame(frame, requested);
     for (std::uint32_t row = 0; row < extracted.height; ++row) {
-        const std::size_t src_offset =
-            (static_cast<std::size_t>(local.y1) + static_cast<std::size_t>(row)) * static_cast<std::size_t>(frame.width) * 3U +
-            static_cast<std::size_t>(local.x1) * 3U;
+        const std::size_t src_offset = (static_cast<std::size_t>(local.y1) + static_cast<std::size_t>(row)) * static_cast<std::size_t>(frame.width) * 3U +
+                                       static_cast<std::size_t>(local.x1) * 3U;
         const std::size_t dst_offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(extracted.width) * 3U;
         std::copy_n(source_pixels.begin() + static_cast<std::ptrdiff_t>(src_offset), static_cast<std::size_t>(extracted.width) * 3U,
                     extracted_pixels.begin() + static_cast<std::ptrdiff_t>(dst_offset));
@@ -219,13 +175,8 @@ AnnotationFrame extract_annotation_frame_region(const AnnotationFrame& frame, co
     set_annotation_frame_pixels(extracted, std::move(extracted_pixels));
     return extracted;
 }
-
-std::optional<AnnotationBox> annotation_bbox_from_mask(const std::vector<std::uint8_t>& mask, const std::uint32_t width,
-                                                       const std::uint32_t height) {
-    if (mask.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) || width == 0U || height == 0U) {
-        return std::nullopt;
-    }
-
+std::optional<AnnotationBox> annotation_bbox_from_mask(const std::vector<std::uint8_t>& mask, const std::uint32_t width, const std::uint32_t height) {
+    if (mask.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) || width == 0U || height == 0U) { return std::nullopt; }
     int min_x = static_cast<int>(width);
     int min_y = static_cast<int>(height);
     int max_x = -1;
@@ -248,9 +199,7 @@ std::optional<AnnotationBox> annotation_bbox_from_mask(const std::vector<std::ui
         max_y + 1,
     };
 }
-
-std::vector<std::uint8_t> decode_annotation_prediction_mask(const AnnotationEncodedMask& mask, const std::uint32_t width,
-                                                            const std::uint32_t height) {
+std::vector<std::uint8_t> decode_annotation_prediction_mask(const AnnotationEncodedMask& mask, const std::uint32_t width, const std::uint32_t height) {
     std::vector<std::uint8_t> dense(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0U);
     if (mask.width != width || mask.height != height) { return dense; }
     const std::size_t pixel_count = dense.size();
@@ -261,12 +210,9 @@ std::vector<std::uint8_t> decode_annotation_prediction_mask(const AnnotationEnco
     }
     return dense;
 }
-
-std::vector<std::uint8_t> decode_annotation_mask_rle(const std::string_view encoded_mask, const std::uint32_t width,
-                                                     const std::uint32_t height) {
+std::vector<std::uint8_t> decode_annotation_mask_rle(const std::string_view encoded_mask, const std::uint32_t width, const std::uint32_t height) {
     std::vector<std::uint8_t> dense(static_cast<std::size_t>(width) * static_cast<std::size_t>(height), 0U);
     if (dense.empty() || encoded_mask.empty()) { return dense; }
-
     const auto parse_size = [](const std::string_view token, std::size_t* value) {
         if (value == nullptr || token.empty()) { return false; }
         const char* begin = token.data();
@@ -274,17 +220,12 @@ std::vector<std::uint8_t> decode_annotation_mask_rle(const std::string_view enco
         const auto [ptr, error] = std::from_chars(begin, end, *value);
         return error == std::errc{} && ptr == end;
     };
-
     std::size_t cursor = 0U;
     while (cursor < encoded_mask.size()) {
-        while (cursor < encoded_mask.size() && std::isspace(static_cast<unsigned char>(encoded_mask[cursor])) != 0) {
-            ++cursor;
-        }
+        while (cursor < encoded_mask.size() && std::isspace(static_cast<unsigned char>(encoded_mask[cursor])) != 0) { ++cursor; }
         if (cursor >= encoded_mask.size()) { break; }
         const std::size_t token_start = cursor;
-        while (cursor < encoded_mask.size() && std::isspace(static_cast<unsigned char>(encoded_mask[cursor])) == 0) {
-            ++cursor;
-        }
+        while (cursor < encoded_mask.size() && std::isspace(static_cast<unsigned char>(encoded_mask[cursor])) == 0) { ++cursor; }
         const std::string_view token = encoded_mask.substr(token_start, cursor - token_start);
         const std::size_t separator = token.find(':');
         if (separator == std::string_view::npos) { continue; }
@@ -295,22 +236,16 @@ std::vector<std::uint8_t> decode_annotation_mask_rle(const std::string_view enco
         const std::size_t bounded_end = std::min(bounded_start + run_length, dense.size());
         std::fill(dense.begin() + static_cast<std::ptrdiff_t>(bounded_start), dense.begin() + static_cast<std::ptrdiff_t>(bounded_end), 1U);
     }
-
     return dense;
 }
-
 std::string encode_annotation_mask_rle(const std::vector<std::uint8_t>& mask) {
     std::string encoded;
     std::size_t cursor = 0;
     while (cursor < mask.size()) {
-        while (cursor < mask.size() && mask[cursor] == 0U) {
-            ++cursor;
-        }
+        while (cursor < mask.size() && mask[cursor] == 0U) { ++cursor; }
         if (cursor >= mask.size()) { break; }
         const std::size_t start = cursor;
-        while (cursor < mask.size() && mask[cursor] != 0U) {
-            ++cursor;
-        }
+        while (cursor < mask.size() && mask[cursor] != 0U) { ++cursor; }
         if (!encoded.empty()) { encoded.push_back(' '); }
         encoded += std::to_string(start);
         encoded.push_back(':');
@@ -318,5 +253,4 @@ std::string encode_annotation_mask_rle(const std::vector<std::uint8_t>& mask) {
     }
     return encoded;
 }
-
 }  // namespace mmltk::backend::imaging::annotation

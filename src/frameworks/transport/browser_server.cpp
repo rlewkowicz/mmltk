@@ -1,8 +1,6 @@
 #include "src/frameworks/transport/browser_server.h"
-
 #include <App.h>
 #include <libusockets.h>
-
 #include <atomic>
 #include <cstddef>
 #include <exception>
@@ -18,27 +16,21 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
 #include "src/common/types/string_utils.h"
 #include "src/frameworks/transport/browser_server_lifecycle.h"
-
 namespace mmltk::frameworks::transport {
 namespace {
-
 inline constexpr std::size_t kMaximumMessageBytes = 8U * 1024U * 1024U;
-
 struct Peer final {
     detail::BrowserPeerLifecycle lifecycle;
 };
 using Socket = uWS::WebSocket<false, true, Peer>;
-
 struct Asset final {
     std::string path;
     std::string mime;
     std::string bytes;
     bool immutable = false;
 };
-
 [[nodiscard]] std::string mime_for(const std::filesystem::path& path) {
     const auto extension = path.extension().string();
     if (extension == ".html") return "text/html; charset=utf-8";
@@ -51,7 +43,6 @@ struct Asset final {
     if (extension == ".woff2") return "font/woff2";
     return "application/octet-stream";
 }
-
 [[nodiscard]] std::optional<std::vector<Asset>> load_assets(const std::filesystem::path& root) {
     if (!std::filesystem::is_directory(root) || !std::filesystem::is_regular_file(root / "index.html")) return std::nullopt;
     std::vector<Asset> assets;
@@ -74,19 +65,16 @@ struct Asset final {
     }
     return assets;
 }
-
 [[nodiscard]] const Asset* find_asset(const std::vector<Asset>& assets, const std::string_view path) noexcept {
     const std::string_view requested = path == "/" ? "/index.html" : path;
     for (const Asset& asset : assets)
         if (asset.path == requested) return &asset;
     return nullptr;
 }
-
 [[nodiscard]] bool query_unreserved(const unsigned char character) noexcept {
-    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
-           character == '-' || character == '.' || character == '_' || character == '~';
+    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' ||
+           character == '.' || character == '_' || character == '~';
 }
-
 [[nodiscard]] std::string percent_encode_query_value(const std::string_view value) {
     static constexpr std::string_view kHex{"0123456789ABCDEF"};
     std::string encoded;
@@ -102,15 +90,12 @@ struct Asset final {
     }
     return encoded;
 }
-
 }  // namespace
-
 struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
     struct UrlState final {
         std::string page;
         std::string websocket;
     };
-
     std::unique_ptr<uWS::App> app;
     Socket* socket = nullptr;
     us_listen_socket_t* listener = nullptr;
@@ -146,17 +131,12 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
     std::string page_query;
     std::string expected_origin;
     std::vector<Asset> assets;
-
     explicit Impl(const std::thread::id owner) noexcept : owner_thread(owner) {}
-
     [[nodiscard]] bool on_owner_thread() const noexcept { return owner_thread == std::this_thread::get_id(); }
-
     void trace(const BrowserServerEvent event, const std::size_t value = 0U) const noexcept {
         if (callbacks.diagnostic != nullptr) callbacks.diagnostic(callbacks.context.get(), event, value);
     }
-
     using DeferredWake = void (Impl::*)(std::uint64_t);
-
     [[nodiscard]] bool request_deferred_wake_locked(bool& pending, const DeferredWake handler) noexcept {
         if (!accepting_wakes || wake_loop == nullptr) return false;
         if (pending) return true;
@@ -173,16 +153,12 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
             return false;
         }
     }
-
     [[nodiscard]] bool request_wake_locked() noexcept { return request_deferred_wake_locked(wake_pending, &Impl::deferred_wake); }
-
     [[nodiscard]] bool request_wake() noexcept {
         std::scoped_lock lock(lifecycle_mutex);
         return request_wake_locked();
     }
-
     [[nodiscard]] bool request_stop_wake_locked() noexcept { return request_deferred_wake_locked(stop_wake_pending, &Impl::deferred_stop); }
-
     void withdraw_wakes() noexcept {
         std::scoped_lock lock(lifecycle_mutex);
         accepting_wakes = false;
@@ -192,30 +168,25 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         ++wake_generation;
         urls.reset();
     }
-
     void begin_output_epoch(const std::uint64_t generation) noexcept {
         std::scoped_lock lock(lifecycle_mutex);
         output_epoch.begin_open(generation);
         output.clear();
     }
-
     void finish_output_epoch(const std::uint64_t generation) noexcept {
         std::scoped_lock lock(lifecycle_mutex);
         output_epoch.finish_open(generation);
     }
-
     void close_output_epoch() noexcept {
         std::scoped_lock lock(lifecycle_mutex);
         output_epoch.close();
         output.clear();
     }
-
     [[nodiscard]] bool active_peer(Socket* const peer) const noexcept {
         if (peer == nullptr || peer != socket) return false;
         const Peer* const state = peer->getUserData();
         return !state->lifecycle.closure_notified && state->lifecycle.generation == active_peer_generation;
     }
-
     void notify_peer_closed(Socket* const peer) noexcept {
         if (peer == nullptr) return;
         Peer* const state = peer->getUserData();
@@ -230,7 +201,6 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         trace(BrowserServerEvent::PeerClosed, state->lifecycle.generation);
         callbacks.closed(callbacks.context.get());
     }
-
     void close_peer_on_owner() noexcept {
         close_requested.store(false, std::memory_order_release);
         Socket* const peer = socket;
@@ -241,19 +211,15 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         notify_peer_closed(peer);
         peer->close();
     }
-
     void flush_worker_diagnostics() noexcept {
         if (callbacks.diagnostic == nullptr) return;
-        if (const auto count = pending_invalid.exchange(0U, std::memory_order_acq_rel); count != 0U)
-            trace(BrowserServerEvent::InvalidMessage, count);
+        if (const auto count = pending_invalid.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::InvalidMessage, count);
         if (const auto count = pending_transient_dropped.exchange(0U, std::memory_order_acq_rel); count != 0U)
             trace(BrowserServerEvent::TransientDropped, count);
         if (const auto count = pending_critical_closed.exchange(0U, std::memory_order_acq_rel); count != 0U)
             trace(BrowserServerEvent::CriticalCapacityClosed, count);
-        if (const auto count = pending_enqueued.exchange(0U, std::memory_order_acq_rel); count != 0U)
-            trace(BrowserServerEvent::RecordEnqueued, count);
+        if (const auto count = pending_enqueued.exchange(0U, std::memory_order_acq_rel); count != 0U) trace(BrowserServerEvent::RecordEnqueued, count);
     }
-
     void drain() noexcept {
         if (close_requested.exchange(false, std::memory_order_acq_rel)) {
             close_peer_on_owner();
@@ -279,7 +245,6 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
             trace(BrowserServerEvent::WriteAccepted, accepted_size);
         }
     }
-
     void stop_on_owner() noexcept {
         if (detached) return;
         detached = true;
@@ -293,7 +258,6 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         else
             close_output_epoch();
     }
-
     void finalize_on_owner() noexcept {
         stop_on_owner();
         app.reset();
@@ -305,7 +269,6 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         port = 0U;
         finalization_required.store(false, std::memory_order_release);
     }
-
     void deferred_wake(const std::uint64_t generation) noexcept {
         {
             std::scoped_lock lock(lifecycle_mutex);
@@ -319,7 +282,6 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         }
         drain();
     }
-
     void deferred_stop(const std::uint64_t generation) noexcept {
         {
             std::scoped_lock lock(lifecycle_mutex);
@@ -329,7 +291,6 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         flush_worker_diagnostics();
         stop_on_owner();
     }
-
     [[nodiscard]] BrowserRecordPush publish(BrowserOutputRecord record) noexcept {
         const bool critical = record.priority != BrowserRecordPriority::Transient;
         const bool owner = on_owner_thread();
@@ -368,43 +329,36 @@ struct BrowserServer::Impl final : std::enable_shared_from_this<Impl> {
         }
         return result;
     }
-
     void request_stop() noexcept {
         stop_requested.store(true, std::memory_order_release);
         std::scoped_lock lock(lifecycle_mutex);
         static_cast<void>(request_stop_wake_locked());
     }
-
     void request_peer_close() noexcept {
         close_requested.store(true, std::memory_order_release);
         static_cast<void>(request_wake());
     }
-
     [[nodiscard]] std::optional<std::string> page_url() const {
         std::scoped_lock lock(lifecycle_mutex);
         if (!urls) return std::nullopt;
         return urls->page;
     }
-
     [[nodiscard]] std::optional<std::string> websocket_url() const {
         std::scoped_lock lock(lifecycle_mutex);
         if (!urls) return std::nullopt;
         return urls->websocket;
     }
 };
-
 BrowserServer::BrowserServer() : impl_(std::make_shared<Impl>(std::this_thread::get_id())) {}
-
 BrowserServer::~BrowserServer() {
     if (impl_->finalization_required.load(std::memory_order_acquire) && !impl_->on_owner_thread()) std::terminate();
     if (!close()) std::terminate();
 }
-
 bool BrowserServer::start(Config config, Callbacks callbacks) noexcept {
     const auto& state = impl_;
     try {
-        if (!state->on_owner_thread() || state->initialized_once || state->running.load(std::memory_order_acquire) ||
-            state->app != nullptr || !callbacks.valid() || config.session_token.empty() || config.maximum_output_bytes == 0U ||
+        if (!state->on_owner_thread() || state->initialized_once || state->running.load(std::memory_order_acquire) || state->app != nullptr ||
+            !callbacks.valid() || config.session_token.empty() || config.maximum_output_bytes == 0U ||
             config.maximum_output_bytes > std::numeric_limits<unsigned int>::max())
             return false;
         auto assets = load_assets(config.asset_root);
@@ -420,96 +374,93 @@ bool BrowserServer::start(Config config, Callbacks callbacks) noexcept {
         state->detached = false;
         const std::weak_ptr<Impl> weak = state;
         state->app->ws<Peer>(
-            "/mmltk",
-            {.compression = uWS::DISABLED,
-             .maxPayloadLength = static_cast<unsigned int>(kMaximumMessageBytes),
-             .idleTimeout = 64,
-             .maxBackpressure = static_cast<unsigned int>(state->maximum_output_bytes),
-             .closeOnBackpressureLimit = false,
-             .upgrade =
-                 [weak](uWS::HttpResponse<false>* response, uWS::HttpRequest* request, us_socket_context_t* context) noexcept {
-                     const auto owner = weak.lock();
-                     if (!owner) {
-                         response->writeStatus("503 Service Unavailable")->end("unavailable");
-                         return;
-                     }
-                     const bool valid_session =
-                         mmltk::common::types::constant_time_equal(request->getQuery("session"), owner->session_token);
-                     const bool valid_origin = request->getHeader("origin") == owner->expected_origin;
-                     if (!valid_session || !valid_origin) {
-                         response->writeStatus("403 Forbidden")->end("forbidden");
-                         return;
-                     }
-                     response->upgrade<Peer>({}, request->getHeader("sec-websocket-key"), request->getHeader("sec-websocket-protocol"),
-                                             request->getHeader("sec-websocket-extensions"), context);
-                 },
-             .open =
-                 [weak](Socket* peer) noexcept {
-                     const auto owner = weak.lock();
-                     if (!owner) {
-                         peer->close();
-                         return;
-                     }
-                     if (owner->socket != nullptr) {
-                         owner->trace(BrowserServerEvent::PeerReplaced);
-                         owner->close_peer_on_owner();
-                     }
-                     if (owner->next_peer_generation == std::numeric_limits<std::uint64_t>::max()) {
-                         peer->close();
-                         return;
-                     }
-                     const std::uint64_t generation = ++owner->next_peer_generation;
-                     owner->begin_output_epoch(generation);
-                     peer->getUserData()->lifecycle.opened(generation);
-                     owner->socket = peer;
-                     owner->active_peer_generation = generation;
-                     owner->backpressured = false;
-                     owner->connected.store(true, std::memory_order_release);
-                     owner->callbacks.opened(owner->callbacks.context.get());
-                     owner->finish_output_epoch(generation);
-                     owner->trace(BrowserServerEvent::PeerOpened, generation);
-                     owner->drain();
-                     if (owner->active_peer(peer) && owner->callbacks.activated) {
-                         owner->callbacks.activated(owner->callbacks.context.get());
-                         owner->drain();
-                     }
-                 },
-             .message =
-                 [weak](Socket* peer, const std::string_view message, const uWS::OpCode opcode) noexcept {
-                     const auto owner = weak.lock();
-                     if (!owner) {
-                         peer->close();
-                         return;
-                     }
-                     if (!owner->active_peer(peer) || opcode != uWS::OpCode::BINARY || message.empty() ||
-                         message.size() > kMaximumMessageBytes) {
-                         owner->trace(BrowserServerEvent::InvalidMessage, message.size());
-                         if (owner->active_peer(peer))
-                             owner->close_peer_on_owner();
-                         else
-                             peer->close();
-                         return;
-                     }
-                     const auto bytes = std::span<const std::byte>{reinterpret_cast<const std::byte*>(message.data()), message.size()};
-                     owner->trace(BrowserServerEvent::BinaryReceived, message.size());
-                     if (!owner->callbacks.record(owner->callbacks.context.get(), bytes)) {
-                         owner->notify_peer_closed(peer);
-                         peer->end(1002, "invalid application protocol record");
-                     }
-                 },
-             .drain =
-                 [weak](Socket* peer) noexcept {
-                     const auto owner = weak.lock();
-                     if (owner && owner->active_peer(peer)) {
-                         owner->backpressured = false;
-                         owner->trace(BrowserServerEvent::WriteDrained);
-                         owner->drain();
-                     }
-                 },
-             .close =
-                 [weak](Socket* peer, int, std::string_view) noexcept {
-                     if (const auto owner = weak.lock()) owner->notify_peer_closed(peer);
-                 }});
+            "/mmltk", {.compression = uWS::DISABLED,
+                       .maxPayloadLength = static_cast<unsigned int>(kMaximumMessageBytes),
+                       .idleTimeout = 64,
+                       .maxBackpressure = static_cast<unsigned int>(state->maximum_output_bytes),
+                       .closeOnBackpressureLimit = false,
+                       .upgrade =
+                           [weak](uWS::HttpResponse<false>* response, uWS::HttpRequest* request, us_socket_context_t* context) noexcept {
+                               const auto owner = weak.lock();
+                               if (!owner) {
+                                   response->writeStatus("503 Service Unavailable")->end("unavailable");
+                                   return;
+                               }
+                               const bool valid_session = mmltk::common::types::constant_time_equal(request->getQuery("session"), owner->session_token);
+                               const bool valid_origin = request->getHeader("origin") == owner->expected_origin;
+                               if (!valid_session || !valid_origin) {
+                                   response->writeStatus("403 Forbidden")->end("forbidden");
+                                   return;
+                               }
+                               response->upgrade<Peer>({}, request->getHeader("sec-websocket-key"), request->getHeader("sec-websocket-protocol"),
+                                                       request->getHeader("sec-websocket-extensions"), context);
+                           },
+                       .open =
+                           [weak](Socket* peer) noexcept {
+                               const auto owner = weak.lock();
+                               if (!owner) {
+                                   peer->close();
+                                   return;
+                               }
+                               if (owner->socket != nullptr) {
+                                   owner->trace(BrowserServerEvent::PeerReplaced);
+                                   owner->close_peer_on_owner();
+                               }
+                               if (owner->next_peer_generation == std::numeric_limits<std::uint64_t>::max()) {
+                                   peer->close();
+                                   return;
+                               }
+                               const std::uint64_t generation = ++owner->next_peer_generation;
+                               owner->begin_output_epoch(generation);
+                               peer->getUserData()->lifecycle.opened(generation);
+                               owner->socket = peer;
+                               owner->active_peer_generation = generation;
+                               owner->backpressured = false;
+                               owner->connected.store(true, std::memory_order_release);
+                               owner->callbacks.opened(owner->callbacks.context.get());
+                               owner->finish_output_epoch(generation);
+                               owner->trace(BrowserServerEvent::PeerOpened, generation);
+                               owner->drain();
+                               if (owner->active_peer(peer) && owner->callbacks.activated) {
+                                   owner->callbacks.activated(owner->callbacks.context.get());
+                                   owner->drain();
+                               }
+                           },
+                       .message =
+                           [weak](Socket* peer, const std::string_view message, const uWS::OpCode opcode) noexcept {
+                               const auto owner = weak.lock();
+                               if (!owner) {
+                                   peer->close();
+                                   return;
+                               }
+                               if (!owner->active_peer(peer) || opcode != uWS::OpCode::BINARY || message.empty() || message.size() > kMaximumMessageBytes) {
+                                   owner->trace(BrowserServerEvent::InvalidMessage, message.size());
+                                   if (owner->active_peer(peer))
+                                       owner->close_peer_on_owner();
+                                   else
+                                       peer->close();
+                                   return;
+                               }
+                               const auto bytes = std::span<const std::byte>{reinterpret_cast<const std::byte*>(message.data()), message.size()};
+                               owner->trace(BrowserServerEvent::BinaryReceived, message.size());
+                               if (!owner->callbacks.record(owner->callbacks.context.get(), bytes)) {
+                                   owner->notify_peer_closed(peer);
+                                   peer->end(1002, "invalid application protocol record");
+                               }
+                           },
+                       .drain =
+                           [weak](Socket* peer) noexcept {
+                               const auto owner = weak.lock();
+                               if (owner && owner->active_peer(peer)) {
+                                   owner->backpressured = false;
+                                   owner->trace(BrowserServerEvent::WriteDrained);
+                                   owner->drain();
+                               }
+                           },
+                       .close =
+                           [weak](Socket* peer, int, std::string_view) noexcept {
+                               if (const auto owner = weak.lock()) owner->notify_peer_closed(peer);
+                           }});
         state->app->get("/health", [](auto* response, auto*) { response->writeHeader("Content-Type", "text/plain")->end("ok"); });
         state->app->get("/*", [weak](uWS::HttpResponse<false>* response, uWS::HttpRequest* request) {
             const auto owner = weak.lock();
@@ -539,8 +490,7 @@ bool BrowserServer::start(Config config, Callbacks callbacks) noexcept {
         }
         state->expected_origin = "http://127.0.0.1:" + std::to_string(state->port);
         const std::string websocket = "ws://127.0.0.1:" + std::to_string(state->port) + "/mmltk?session=" + state->session_token;
-        std::string page =
-            state->expected_origin + "/?session=" + state->session_token + "&mmltk_ws_url=" + percent_encode_query_value(websocket);
+        std::string page = state->expected_origin + "/?session=" + state->session_token + "&mmltk_ws_url=" + percent_encode_query_value(websocket);
         if (!state->page_query.empty()) page += "&" + state->page_query;
         state->stop_requested.store(false, std::memory_order_release);
         state->close_requested.store(false, std::memory_order_release);
@@ -561,7 +511,6 @@ bool BrowserServer::start(Config config, Callbacks callbacks) noexcept {
         return false;
     }
 }
-
 void BrowserServer::run() {
     const auto& state = impl_;
     if (!state->on_owner_thread() || !state->app) return;
@@ -577,9 +526,7 @@ void BrowserServer::run() {
     state->owner_run_active = false;
     state->finalize_on_owner();
 }
-
 void BrowserServer::stop() noexcept { impl_->request_stop(); }
-
 bool BrowserServer::close() noexcept {
     const auto& state = impl_;
     if (!state->on_owner_thread()) {
@@ -594,19 +541,11 @@ bool BrowserServer::close() noexcept {
     state->finalize_on_owner();
     return true;
 }
-
 void BrowserServer::close_peer() noexcept { impl_->request_peer_close(); }
-
 BrowserRecordPush BrowserServer::publish(BrowserOutputRecord record) noexcept { return impl_->publish(std::move(record)); }
-
 bool BrowserServer::running() const noexcept { return impl_->running.load(std::memory_order_acquire); }
-
 bool BrowserServer::connected() const noexcept { return impl_->connected.load(std::memory_order_acquire); }
-
 std::size_t BrowserServer::queued_records() const noexcept { return impl_->output.size(); }
-
 std::optional<std::string> BrowserServer::page_url() const { return impl_->page_url(); }
-
 std::optional<std::string> BrowserServer::websocket_url() const { return impl_->websocket_url(); }
-
 }  // namespace mmltk::frameworks::transport

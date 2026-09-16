@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <cstddef>
 #include <concepts>
@@ -12,26 +11,21 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/presentation/presentation_system.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/frameworks/serialization/serialization.h"
-
 namespace mmltk::controller::browser {
 namespace application_materializer_detail {
-
 template <class Value>
 [[nodiscard]] std::expected<wire::Value, wire::ErrorCode> reflected_value(const Value& value) {
     auto result = mmltk::frameworks::serialization::reflected_transport_value(value);
     if (!result) return std::unexpected(result.error().code);
     return std::move(*result);
 }
-
 template <class Schema, class Endpoint>
-[[nodiscard]] std::expected<typename Endpoint::request_type, ApplicationErrorRecord> materialize_request(
-    const std::vector<IntentField>& fields) {
+[[nodiscard]] std::expected<typename Endpoint::request_type, ApplicationErrorRecord> materialize_request(const std::vector<IntentField>& fields) {
     using Request = typename Endpoint::request_type;
     wire::Value::Object object;
     object.reserve(fields.size());
@@ -40,8 +34,7 @@ template <class Schema, class Endpoint>
     Schema::template VisitRequestFields<Endpoint>([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& fact) {
         const auto first = std::ranges::find(fields, fact.stable_id, &IntentField::field_id);
         if (first == fields.end()) return;
-        if (std::ranges::find(std::ranges::subrange(std::next(first), fields.end()), fact.stable_id, &IntentField::field_id) !=
-            fields.end()) {
+        if (std::ranges::find(std::ranges::subrange(std::next(first), fields.end()), fact.stable_id, &IntentField::field_id) != fields.end()) {
             duplicate = true;
             return;
         }
@@ -59,18 +52,14 @@ template <class Schema, class Endpoint>
     }
     return request;
 }
-
 template <class Result>
 [[nodiscard]] wire::Value encode_result(Result&& result) {
     auto encoded = reflected_value(result);
     if (!encoded) throw std::runtime_error("intent result cannot be encoded");
     return std::move(*encoded);
 }
-
 [[nodiscard]] inline wire::Value void_result() { return wire::Value(wire::Value::Object{}); }
-
 }  // namespace application_materializer_detail
-
 template <class Composition>
 [[nodiscard]] IntentReply dispatch_intent(Composition& systems, Intent intent) noexcept {
     IntentReply reply{.correlation = intent.correlation, .result = {}, .error = {}};
@@ -83,19 +72,16 @@ template <class Composition>
                 auto* system = systems.*Endpoint::system_cell::pointer;
                 if (system == nullptr) throw mmltk::controller::contracts::UnavailableError("application system is unavailable");
                 if constexpr (Endpoint::signature::has_request) {
-                    auto request =
-                        application_materializer_detail::materialize_request<ApplicationSchema<Composition>, Endpoint>(intent.fields);
+                    auto request = application_materializer_detail::materialize_request<ApplicationSchema<Composition>, Endpoint>(intent.fields);
                     if (!request) throw mmltk::controller::contracts::InvalidIntentError(request.error().detail);
                     if constexpr (std::is_void_v<typename Endpoint::result_type>) {
                         std::invoke(Endpoint::method, *system, std::move(*request));
                         reply.result = application_materializer_detail::void_result();
                     } else {
-                        reply.result =
-                            application_materializer_detail::encode_result(std::invoke(Endpoint::method, *system, std::move(*request)));
+                        reply.result = application_materializer_detail::encode_result(std::invoke(Endpoint::method, *system, std::move(*request)));
                     }
                 } else {
-                    if (!intent.fields.empty())
-                        throw mmltk::controller::contracts::InvalidIntentError("parameterless intent contains fields");
+                    if (!intent.fields.empty()) throw mmltk::controller::contracts::InvalidIntentError("parameterless intent contains fields");
                     if constexpr (std::is_void_v<typename Endpoint::result_type>) {
                         std::invoke(Endpoint::method, *system);
                         reply.result = application_materializer_detail::void_result();
@@ -112,13 +98,11 @@ template <class Composition>
     }
     return reply;
 }
-
 enum class InteractionDispatchDisposition : std::uint8_t {
     Accepted,
     ProtocolInvalid,
     ApplicationRejected,
 };
-
 struct InteractionDispatchResult final {
     InteractionDispatchDisposition disposition = InteractionDispatchDisposition::ProtocolInvalid;
     std::uint64_t endpoint_id = 0U;
@@ -127,7 +111,6 @@ struct InteractionDispatchResult final {
     bool essential_input = false;
     std::optional<ApplicationErrorRecord> error{};
 };
-
 template <class Composition>
 [[nodiscard]] InteractionDispatchResult dispatch_interaction(Composition& systems, const InteractionView interaction) noexcept {
     InteractionDispatchResult result{.endpoint_id = interaction.Get<&Interaction::endpoint_id>()};
@@ -149,8 +132,7 @@ template <class Composition>
                     auto* system = systems.*Endpoint::system_cell::pointer;
                     if (system == nullptr) throw mmltk::controller::contracts::UnavailableError("application system is unavailable");
                     std::invoke(Endpoint::method, *system, std::move(request));
-                    if constexpr (requires { system->LastInteractionGeneration(); })
-                        result.generation = system->LastInteractionGeneration();
+                    if constexpr (requires { system->LastInteractionGeneration(); }) result.generation = system->LastInteractionGeneration();
                     result.disposition = InteractionDispatchDisposition::Accepted;
                 } catch (...) {
                     result.disposition = InteractionDispatchDisposition::ApplicationRejected;
@@ -162,12 +144,10 @@ template <class Composition>
     } catch (...) { return result; }
     return result;
 }
-
 template <class Composition>
 [[nodiscard]] InteractionDispatchResult dispatch_interaction(Composition& systems, const Interaction& interaction) noexcept {
     return dispatch_interaction(systems, InteractionView{interaction});
 }
-
 template <class Composition>
 [[nodiscard]] std::vector<SystemSnapshot> encode_application_snapshots(const Composition& systems) {
     std::vector<SystemSnapshot> snapshots;
@@ -181,7 +161,6 @@ template <class Composition>
     });
     return snapshots;
 }
-
 template <auto Member, class Event, class Composition = mmltk::controller::ApplicationSystems>
 [[nodiscard]] SystemEvent encode_system_event(const Event& event) {
     using Descriptor = ApplicationEventDescriptor<Composition, Member, Event>;
@@ -193,7 +172,6 @@ template <auto Member, class Event, class Composition = mmltk::controller::Appli
             .state_revision = Descriptor::StateRevision(event),
             .value = std::move(*value)};
 }
-
 template <class Composition>
 [[nodiscard]] auto materialize_visual_source_readers(const Composition& systems) {
     using Schema = ApplicationSchema<Composition>;
@@ -258,10 +236,8 @@ template <class Composition>
     });
     return readers;
 }
-
 template <class Composition>
 [[nodiscard]] Bootstrap materialize_bootstrap(const Composition& systems) {
     return {.schema_fingerprint = application_schema_fingerprint<Composition>().words, .snapshots = encode_application_snapshots(systems)};
 }
-
 }  // namespace mmltk::controller::browser

@@ -29,7 +29,6 @@ extern "C" {
 #include <string>
 #include <vector>
 import mmltk.common.logging.mmltk_logging;
-
 namespace mmltk::backend::media::video {
 namespace {
 void video_log(void*, int level, const char* format, va_list arguments) {
@@ -37,8 +36,12 @@ void video_log(void*, int level, const char* format, va_list arguments) {
     const auto message_level = level >= 0 ? level & 0xff : level;
     // av_vlog dispatches custom callbacks regardless of av_log_level.
     if (message_level > av_log_get_level()) return;
-    const auto severity = message_level <= AV_LOG_FATAL ? spdlog::level::critical : message_level <= AV_LOG_ERROR ? spdlog::level::err : message_level <= AV_LOG_WARNING ? spdlog::level::warn :
-        message_level <= AV_LOG_INFO ? spdlog::level::info : message_level <= AV_LOG_DEBUG ? spdlog::level::debug : spdlog::level::trace;
+    const auto severity = message_level <= AV_LOG_FATAL     ? spdlog::level::critical
+                          : message_level <= AV_LOG_ERROR   ? spdlog::level::err
+                          : message_level <= AV_LOG_WARNING ? spdlog::level::warn
+                          : message_level <= AV_LOG_INFO    ? spdlog::level::info
+                          : message_level <= AV_LOG_DEBUG   ? spdlog::level::debug
+                                                            : spdlog::level::trace;
     try {
         mmltk::common::logging::log_if_enabled("video", severity, [&](auto& logger) {
             char text[2048]{};
@@ -60,7 +63,7 @@ void check(int result, const char* operation) {
 void cuda_check(cudaError_t result) {
     if (result != cudaSuccess) throw std::runtime_error(cudaGetErrorString(result));
 }
-}
+}  // namespace
 void VideoFileSource::ConfigureLogging(LogCallback callback) {
     const auto selected = mmltk::common::logging::level();
     int admission = AV_LOG_QUIET;
@@ -76,8 +79,7 @@ void VideoFileSource::ConfigureLogging(LogCallback callback) {
     av_log_set_level(admission);
     av_log_set_callback(admission == AV_LOG_QUIET ? nullptr : callback ? callback : &video_log);
 }
-VideoFileSource::StorageLimits::StorageLimits(VideoFrameCapacity requested)
-    : maximum_pixels(requested.maximum_pixels) {
+VideoFileSource::StorageLimits::StorageLimits(VideoFrameCapacity requested) : maximum_pixels(requested.maximum_pixels) {
     constexpr auto maximum = std::numeric_limits<std::size_t>::max();
     if (maximum_pixels == 0U || maximum_pixels > maximum / (3U * sizeof(float)) ||
         maximum_pixels > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
@@ -85,8 +87,7 @@ VideoFileSource::StorageLimits::StorageLimits(VideoFrameCapacity requested)
     chw_bytes = maximum_pixels * 3U * sizeof(float);
     rgb_bytes = maximum_pixels * 3U;
     const auto page = mmltk::common::system::host_page_size();
-    if (rgb_bytes > maximum - (page - 1U))
-        throw std::invalid_argument("video frame capacity exceeds page-rounded storage");
+    if (rgb_bytes > maximum - (page - 1U)) throw std::invalid_argument("video frame capacity exceeds page-rounded storage");
     pinned_bytes = mmltk::common::system::page_rounded_bytes(rgb_bytes);
     // Each high-water owner permits at most an incumbent and one replacement.
     // Device RGB uses the page-rounded extent of its pinned transfer allocation.
@@ -105,7 +106,7 @@ void VideoFileSource::StorageLimits::Declared(int width, int height) const {
     static_cast<void>(Pixels(width == 0 ? 1 : width, height == 0 ? 1 : height));
 }
 struct VideoFileSource::State final {
-    explicit State(VideoFrameCapacity capacity) : limits(capacity) {}
+    explicit State(VideoFrameCapacity requested_capacity) : limits(requested_capacity) {}
     const StorageLimits limits;
     AVFormatContext* format = nullptr;
     AVCodecContext* codec = nullptr;
@@ -134,9 +135,14 @@ struct VideoFileSource::State final {
     int device_id = 0;
     void Open(bool hardware);
     unsigned Rotation() const {
-        std::size_t size = 0U;
-        const auto* matrix = av_stream_get_side_data(format->streams[video_stream], AV_PKT_DATA_DISPLAYMATRIX, &size);
-        if (const auto* side = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX)) { matrix = side->data; size = side->size; }
+        const auto* parameters = format->streams[video_stream]->codecpar;
+        const auto* stream_side = av_packet_side_data_get(parameters->coded_side_data, parameters->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+        std::size_t size = stream_side ? stream_side->size : 0U;
+        const auto* matrix = stream_side ? stream_side->data : nullptr;
+        if (const auto* side = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX)) {
+            matrix = side->data;
+            size = side->size;
+        }
         if (!matrix) return 0U;
         if (size < 9U * sizeof(std::int32_t)) throw std::runtime_error("invalid video display matrix");
         const auto* transform = reinterpret_cast<const std::int32_t*>(matrix);
@@ -162,23 +168,23 @@ struct VideoFileSource::State final {
         cuda_check(cudaStreamSynchronize(stream));
         const auto release = [](float* address) noexcept { return cudaFree(address); };
         cuda_check(chw.RetryPending(release).failure);
-        cuda_check(chw.AllocateCandidate([pixels](float*& address) noexcept { return cudaMalloc(reinterpret_cast<void**>(&address), pixels * 3U * sizeof(float)); }).failure);
+        cuda_check(
+            chw.AllocateCandidate([pixels](float*& address) noexcept { return cudaMalloc(reinterpret_cast<void**>(&address), pixels * 3U * sizeof(float)); })
+                .failure);
         cuda_check(chw.PromoteCandidate(release).failure);
         capacity = pixels;
     }
     void ValidateFrameLayout() const {
         auto pixel_format = static_cast<AVPixelFormat>(frame->format);
         if (pixel_format == AV_PIX_FMT_CUDA) {
-            if (!frame->hw_frames_ctx || !frame->hw_frames_ctx->data)
-                throw std::runtime_error("CUDA video frame lacks device custody");
+            if (!frame->hw_frames_ctx || !frame->hw_frames_ctx->data) throw std::runtime_error("CUDA video frame lacks device custody");
             pixel_format = reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data)->sw_format;
         }
         int rows[4]{};
         check(av_image_fill_linesizes(rows, pixel_format, frame->width), "validate video row extents");
         for (unsigned plane = 0U; plane < 4U; ++plane) {
             const auto stride = static_cast<std::int64_t>(frame->linesize[plane]);
-            if (rows[plane] > 0 && (!frame->data[plane] || std::abs(stride) < rows[plane] ||
-                                   (frame->format == AV_PIX_FMT_CUDA && stride < 0)))
+            if (rows[plane] > 0 && (!frame->data[plane] || std::abs(stride) < rows[plane] || (frame->format == AV_PIX_FMT_CUDA && stride < 0)))
                 throw std::invalid_argument("video frame row stride is too small");
         }
     }
@@ -187,9 +193,8 @@ struct VideoFileSource::State final {
         const auto quarters = Rotation();
         if (quarters % 2 != 0) static_cast<void>(limits.Pixels(frame->height, frame->width));
         ValidateFrameLayout();
-        if (frame->colorspace == AVCOL_SPC_BT2020_CL || frame->colorspace == AVCOL_SPC_YCGCO ||
-            frame->colorspace == AVCOL_SPC_SMPTE2085 || frame->colorspace == AVCOL_SPC_CHROMA_DERIVED_CL ||
-            frame->colorspace == AVCOL_SPC_ICTCP)
+        if (frame->colorspace == AVCOL_SPC_BT2020_CL || frame->colorspace == AVCOL_SPC_YCGCO || frame->colorspace == AVCOL_SPC_SMPTE2085 ||
+            frame->colorspace == AVCOL_SPC_CHROMA_DERIVED_CL || frame->colorspace == AVCOL_SPC_ICTCP)
             throw std::runtime_error("unsupported video color matrix");
         const auto width = static_cast<std::uint32_t>(frame->width);
         const auto height = static_cast<std::uint32_t>(frame->height);
@@ -208,18 +213,34 @@ struct VideoFileSource::State final {
                 const auto& component = description->comp[channel];
                 if (component.depth < 8 || component.depth > 16 || frame->linesize[component.plane] <= 0)
                     throw std::runtime_error("unsupported CUDA video component layout");
-                conversion.planes[channel] = {frame->data[component.plane], static_cast<std::size_t>(frame->linesize[component.plane]),
-                    component.step, component.offset, component.shift, component.depth};
+                conversion.planes[channel] = {frame->data[component.plane],
+                                              static_cast<std::size_t>(frame->linesize[component.plane]),
+                                              component.step,
+                                              component.offset,
+                                              component.shift,
+                                              component.depth};
             }
             conversion.rgb = (description->flags & AV_PIX_FMT_FLAG_RGB) != 0;
             conversion.chroma_x = conversion.rgb ? 0 : description->log2_chroma_w;
             conversion.chroma_y = conversion.rgb ? 0 : description->log2_chroma_h;
             conversion.full_range = frame->color_range == AVCOL_RANGE_JPEG;
             switch (frame->colorspace) {
-                case AVCOL_SPC_BT709: conversion.kr = 0.2126F; conversion.kb = 0.0722F; break;
-                case AVCOL_SPC_BT2020_NCL: conversion.kr = 0.2627F; conversion.kb = 0.0593F; break;
-                case AVCOL_SPC_FCC: conversion.kr = 0.30F; conversion.kb = 0.11F; break;
-                case AVCOL_SPC_SMPTE240M: conversion.kr = 0.212F; conversion.kb = 0.087F; break;
+                case AVCOL_SPC_BT709:
+                    conversion.kr = 0.2126F;
+                    conversion.kb = 0.0722F;
+                    break;
+                case AVCOL_SPC_BT2020_NCL:
+                    conversion.kr = 0.2627F;
+                    conversion.kb = 0.0593F;
+                    break;
+                case AVCOL_SPC_FCC:
+                    conversion.kr = 0.30F;
+                    conversion.kb = 0.11F;
+                    break;
+                case AVCOL_SPC_SMPTE240M:
+                    conversion.kr = 0.212F;
+                    conversion.kb = 0.087F;
+                    break;
                 default: break;
             }
         } else {
@@ -229,17 +250,19 @@ struct VideoFileSource::State final {
             if (rgb_capacity < bytes) {
                 const auto release = [](std::uint8_t* address) noexcept { return cudaFree(address); };
                 cuda_check(rgb.RetryPending(release).failure);
-                cuda_check(rgb.AllocateCandidate([this](std::uint8_t*& address) noexcept { return cudaMalloc(reinterpret_cast<void**>(&address), pinned->capacity_bytes()); }).failure);
+                cuda_check(rgb.AllocateCandidate(
+                                  [this](std::uint8_t*& address) noexcept { return cudaMalloc(reinterpret_cast<void**>(&address), pinned->capacity_bytes()); })
+                               .failure);
                 cuda_check(rgb.PromoteCandidate(release).failure);
                 rgb_capacity = pinned->capacity_bytes();
             }
-            scaler = sws_getCachedContext(scaler, frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
-                frame->width, frame->height, AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
+            scaler = sws_getCachedContext(scaler, frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), frame->width, frame->height,
+                                          AV_PIX_FMT_RGB24, SWS_BILINEAR, nullptr, nullptr, nullptr);
             if (!scaler) throw std::runtime_error("video color converter unavailable");
             const auto color_space = frame->colorspace == AVCOL_SPC_UNSPECIFIED ? SWS_CS_DEFAULT : frame->colorspace;
             const auto* coefficients = sws_getCoefficients(color_space);
-            check(sws_setColorspaceDetails(scaler, coefficients, frame->color_range == AVCOL_RANGE_JPEG,
-                                          coefficients, 1, 0, 1 << 16, 1 << 16), "video color conversion");
+            check(sws_setColorspaceDetails(scaler, coefficients, frame->color_range == AVCOL_RANGE_JPEG, coefficients, 1, 0, 1 << 16, 1 << 16),
+                  "video color conversion");
             std::uint8_t* destination[]{static_cast<std::uint8_t*>(pinned->data()), nullptr, nullptr, nullptr};
             int strides[]{frame->width * 3, 0, 0, 0};
             if (sws_scale(scaler, frame->data, frame->linesize, 0, frame->height, destination, strides) != frame->height)
@@ -250,24 +273,27 @@ struct VideoFileSource::State final {
             conversion.chroma_y = 0;
             for (int channel = 0; channel < 3; ++channel) conversion.planes[channel] = {rgb.active(), width * 3U, 3, channel, 0, 8};
         }
-        cuda_check(static_cast<cudaError_t>(convert_video_chw(conversion, width, height, chw.active(), reinterpret_cast<std::uintptr_t>(stream))));
+        cuda_check(static_cast<cudaError_t>(convert_video_chw(conversion, width, height, chw.active(), stream)));
         cuda_check(cudaEventRecord(source_read, stream));
         source_read_pending = true;
         const auto* track = format->streams[video_stream];
-        if ((track->avg_frame_rate.num <= 0 || track->avg_frame_rate.den <= 0) &&
-            codec->framerate.num > 0 && codec->framerate.den > 0)
+        if ((track->avg_frame_rate.num <= 0 || track->avg_frame_rate.den <= 0) && codec->framerate.num > 0 && codec->framerate.den > 0)
             fps = av_q2d(codec->framerate);
         VideoFrame result{chw.active(), conversion.clockwise_quarters % 2U ? height : width, conversion.clockwise_quarters % 2U ? width : height, index++, {}};
         if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-            const auto seconds = frame->best_effort_timestamp * av_q2d(format->streams[video_stream]->time_base);
+            const auto seconds = static_cast<double>(frame->best_effort_timestamp) * av_q2d(format->streams[video_stream]->time_base);
             if (std::isfinite(seconds)) result.presentation_seconds = seconds;
         }
         return result;
     }
 };
 struct VideoFileSource::Owner final {
-    Owner(VideoFrameCapacity capacity, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> authority, decltype(&cudaStreamSynchronize) settlement, mmltk::frameworks::gpu::CudaContextApi api)
-        : retirement(authority ? std::move(authority) : std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U)), settle(settlement), context_api(api), state(std::make_shared<State>(capacity)) {
+    Owner(VideoFrameCapacity capacity, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> authority,
+          decltype(&cudaStreamSynchronize) settlement, mmltk::frameworks::gpu::CudaContextApi api)
+        : retirement(authority ? std::move(authority) : std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U)),
+          settle(settlement),
+          context_api(api),
+          state(std::make_shared<State>(capacity)) {
         if (!settle || !context_api.get || !context_api.set) throw std::invalid_argument("video settlement operation is unavailable");
     }
     std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement;
@@ -279,7 +305,8 @@ struct VideoFileSource::Owner final {
         auto retained = state;
         std::move(lease).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(retained)), cudaErrorUnknown);
     }
-    template<class Operation> decltype(auto) Run(Operation&& operation) {
+    template <class Operation>
+    decltype(auto) Run(Operation&& operation) {
         if (terminal) throw mmltk::frameworks::gpu::CudaContextFailure(true);
         mmltk::frameworks::gpu::CudaContextScope scope({this, [](void* owner) noexcept { static_cast<Owner*>(owner)->Retain(); }}, context_api);
         return scope.Run([&]() -> decltype(auto) {
@@ -303,8 +330,14 @@ struct VideoFileSource::Owner final {
                 if (state->stream) cuda_check(settle(state->stream));
                 cuda_check(state->chw.ReleaseAll([](float* address) noexcept { return cudaFree(address); }).failure);
                 cuda_check(state->rgb.ReleaseAll([](std::uint8_t* address) noexcept { return cudaFree(address); }).failure);
-                if (state->decoder_ready) { cuda_check(cudaEventDestroy(state->decoder_ready)); state->decoder_ready = nullptr; }
-                if (state->source_read) { cuda_check(cudaEventDestroy(state->source_read)); state->source_read = nullptr; }
+                if (state->decoder_ready) {
+                    cuda_check(cudaEventDestroy(state->decoder_ready));
+                    state->decoder_ready = nullptr;
+                }
+                if (state->source_read) {
+                    cuda_check(cudaEventDestroy(state->source_read));
+                    state->source_read = nullptr;
+                }
                 if (state->pinned && state->pinned->ReleaseSettled() != CUDA_SUCCESS) throw std::runtime_error("video pinned release failed");
                 state->pinned.reset();
                 state->ReleaseDecoder();
@@ -315,11 +348,11 @@ struct VideoFileSource::Owner final {
     }
 };
 VideoFileSource::VideoFileSource(const std::filesystem::path& path, VideoFrameCapacity capacity, int device, std::uintptr_t stream, std::stop_token stop,
-                                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
-                                 decltype(&cudaStreamSynchronize) settle)
+                                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, decltype(&cudaStreamSynchronize) settle)
     : VideoFileSource(path, capacity, device, stream, stop, std::move(retirement), settle, mmltk::frameworks::gpu::CudaContextApi{}) {}
 VideoFileSource::VideoFileSource(const std::filesystem::path& path, VideoFrameCapacity capacity, int device, std::uintptr_t stream, std::stop_token stop,
-                                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, decltype(&cudaStreamSynchronize) settle, mmltk::frameworks::gpu::CudaContextApi context_api)
+                                 std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, decltype(&cudaStreamSynchronize) settle,
+                                 mmltk::frameworks::gpu::CudaContextApi context_api)
     : owner_(std::make_unique<Owner>(capacity, std::move(retirement), settle, context_api)) {
     auto& state = *owner_->state;
     std::error_code path_error;
@@ -339,9 +372,12 @@ VideoFileSource::VideoFileSource(const std::filesystem::path& path, VideoFrameCa
     std::call_once(logging_configured, [] { ConfigureLogging(); });
     state.path = path;
     state.device_id = device;
-    try { owner_->Run([&] { state.Open(true); }); }
-    catch (const mmltk::frameworks::gpu::CudaContextFailure&) { throw; }
-    catch (...) { if (stop.stop_requested()) return; owner_->Run([&] { state.Open(false); }); }
+    try {
+        owner_->Run([&] { state.Open(true); });
+    } catch (const mmltk::frameworks::gpu::CudaContextFailure&) { throw; } catch (...) {
+        if (stop.stop_requested()) return;
+        owner_->Run([&] { state.Open(false); });
+    }
     owner_->Run([&] {
         cuda_check(cudaEventCreateWithFlags(&state.decoder_ready, cudaEventDisableTiming));
         cuda_check(cudaEventCreateWithFlags(&state.source_read, cudaEventDisableTiming));
@@ -366,12 +402,14 @@ void VideoFileSource::State::Open(bool hardware) {
     check(opened, "open prediction video");
     struct ProbeOptions final {
         std::vector<AVDictionary*> streams;
-        ~ProbeOptions() { for (auto*& options : streams) av_dict_free(&options); }
+        ~ProbeOptions() {
+            for (auto*& options : streams) av_dict_free(&options);
+        }
     } probe{std::vector<AVDictionary*>(format->nb_streams, nullptr)};
-    for (unsigned index = 0; index < format->nb_streams; ++index) {
-        const auto* parameters = format->streams[index]->codecpar;
+    for (unsigned stream_index = 0; stream_index < format->nb_streams; ++stream_index) {
+        const auto* parameters = format->streams[stream_index]->codecpar;
         if (parameters->codec_type == AVMEDIA_TYPE_VIDEO) limits.Declared(parameters->width, parameters->height);
-        check(av_dict_set_int(&probe.streams[index], "max_pixels", static_cast<std::int64_t>(limits.maximum_pixels), 0),
+        check(av_dict_set_int(&probe.streams[stream_index], "max_pixels", static_cast<std::int64_t>(limits.maximum_pixels), 0),
               "bound prediction probe decoder");
     }
     // New tracks discovered during find_stream_info have no per-stream option
@@ -382,8 +420,7 @@ void VideoFileSource::State::Open(bool hardware) {
     const auto inspected = avformat_find_stream_info(format, probe.streams.data());
     if (stop.stop_requested()) return;
     check(inspected, "inspect prediction video");
-    if (format->pb && format->pb->error < 0 && format->pb->error != AVERROR_EOF)
-        check(format->pb->error, "read prediction video metadata");
+    if (format->pb && format->pb->error < 0 && format->pb->error != AVERROR_EOF) check(format->pb->error, "read prediction video metadata");
     const AVCodec* decoder = nullptr;
     video_stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     check(video_stream, "select prediction video stream");
@@ -394,21 +431,24 @@ void VideoFileSource::State::Open(bool hardware) {
     check(avcodec_parameters_to_context(codec, track->codecpar), "configure prediction decoder");
     codec->max_pixels = static_cast<std::int64_t>(limits.maximum_pixels);
     hardware_attempt = false;
-    if (hardware) for (int index = 0; const auto* config = avcodec_get_hw_config(decoder, index); ++index) {
-        if (config->device_type != AV_HWDEVICE_TYPE_CUDA || !(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) continue;
-        const auto name = std::to_string(device_id);
-        if (av_hwdevice_ctx_create(&codec->hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, name.c_str(), nullptr, AV_CUDA_USE_CURRENT_CONTEXT) >= 0) {
-            hardware_attempt = true;
-        } else { av_buffer_unref(&codec->hw_device_ctx); }
-        break;
-    }
-    codec->get_format = [](AVCodecContext* context, const AVPixelFormat* formats) {
-        if (context->hw_device_ctx)
-            for (auto* format = formats; *format != AV_PIX_FMT_NONE; ++format)
-                if (*format == AV_PIX_FMT_CUDA) return *format;
-        for (auto* format = formats; *format != AV_PIX_FMT_NONE; ++format) {
-            const auto* descriptor = av_pix_fmt_desc_get(*format);
-            if (descriptor && !(descriptor->flags & AV_PIX_FMT_FLAG_HWACCEL) && sws_isSupportedInput(*format)) return *format;
+    if (hardware)
+        for (int config_index = 0; const auto* config = avcodec_get_hw_config(decoder, config_index); ++config_index) {
+            if (config->device_type != AV_HWDEVICE_TYPE_CUDA || !(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)) continue;
+            const auto name = std::to_string(device_id);
+            if (av_hwdevice_ctx_create(&codec->hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, name.c_str(), nullptr, AV_CUDA_USE_CURRENT_CONTEXT) >= 0) {
+                hardware_attempt = true;
+            } else {
+                av_buffer_unref(&codec->hw_device_ctx);
+            }
+            break;
+        }
+    codec->get_format = [](AVCodecContext* decoder_context, const AVPixelFormat* formats) {
+        if (decoder_context->hw_device_ctx)
+            for (auto* candidate = formats; *candidate != AV_PIX_FMT_NONE; ++candidate)
+                if (*candidate == AV_PIX_FMT_CUDA) return *candidate;
+        for (auto* candidate = formats; *candidate != AV_PIX_FMT_NONE; ++candidate) {
+            const auto* descriptor = av_pix_fmt_desc_get(*candidate);
+            if (descriptor && !(descriptor->flags & AV_PIX_FMT_FLAG_HWACCEL) && sws_isSupportedInput(*candidate)) return *candidate;
         }
         return AV_PIX_FMT_NONE;
     };
@@ -434,9 +474,9 @@ std::optional<VideoFrame> VideoFileSource::Next() {
             while (!state.stop.stop_requested()) {
                 const auto received = owner_->Run([&] { return avcodec_receive_frame(state.codec, state.frame); });
                 if (received == 0) {
-                    try { return owner_->Run([&] { return state.Convert(); }); }
-                    catch (const mmltk::frameworks::gpu::CudaContextFailure&) { throw; }
-                    catch (...) {
+                    try {
+                        return owner_->Run([&] { return state.Convert(); });
+                    } catch (const mmltk::frameworks::gpu::CudaContextFailure&) { throw; } catch (...) {
                         if (!state.hardware_attempt || state.index != 0U || state.stop.stop_requested()) throw;
                         cuda_check(cudaStreamSynchronize(state.stream));
                         owner_->Run([&] { state.Open(false); });
@@ -462,7 +502,10 @@ std::optional<VideoFrame> VideoFileSource::Next() {
                 } else {
                     check(read, "read prediction video");
                     const auto submitted = owner_->Run([&] { return avcodec_send_packet(state.codec, state.packet); });
-                    if (submitted < 0 && state.hardware_attempt && state.index == 0U) { owner_->Run([&] { state.Open(false); }); continue; }
+                    if (submitted < 0 && state.hardware_attempt && state.index == 0U) {
+                        owner_->Run([&] { state.Open(false); });
+                        continue;
+                    }
                     check(submitted, "submit prediction video packet");
                 }
             }
@@ -478,4 +521,4 @@ std::optional<VideoFrame> VideoFileSource::Next() {
 }
 double VideoFileSource::frames_per_second() const noexcept { return owner_->state->fps; }
 std::uint64_t VideoFileSource::frame_count() const noexcept { return owner_->state->total; }
-}
+}  // namespace mmltk::backend::media::video

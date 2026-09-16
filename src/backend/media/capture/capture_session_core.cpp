@@ -7,7 +7,6 @@ module;
 #include <linux/videodev2.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -25,13 +24,9 @@ module;
 #include <thread>
 #include <utility>
 #include <vector>
-
 module mmltk.backend.media.capture.capture_session;
-
 #include "detail/capture_session_impl.hpp"
-
 namespace {
-
 void drain_event_fd(const int fd) noexcept {
     if (fd < 0) { return; }
     std::uint64_t value = 0;
@@ -42,15 +37,12 @@ void drain_event_fd(const int fd) noexcept {
         return;
     }
 }
-
 using AtomicListener = std::atomic<std::shared_ptr<const std::function<void()>>>;
-
 void store_listener(AtomicListener& destination, std::function<void()> listener) {
     std::shared_ptr<const std::function<void()>> stored;
     if (listener) { stored = std::make_shared<const std::function<void()>>(std::move(listener)); }
     destination.store(std::move(stored), std::memory_order_release);
 }
-
 [[nodiscard]] bool signal_event_fd(const int fd) noexcept {
     if (fd < 0) { return false; }
     const std::uint64_t value = 1;
@@ -61,35 +53,26 @@ void store_listener(AtomicListener& destination, std::function<void()> listener)
         return write_rc < 0 && errno == EAGAIN;
     }
 }
-
 void retain_first_failure(mmltk::backend::media::capture::Status* target, mmltk::backend::media::capture::Status candidate) {
     if (target != nullptr && target->ok() && !candidate.ok()) { *target = std::move(candidate); }
 }
-
 std::uint64_t allocate_capture_session_id() noexcept {
     static std::atomic<std::uint64_t> source{0};
     std::uint64_t current = source.load(std::memory_order_relaxed);
     while (current != std::numeric_limits<std::uint64_t>::max()) {
-        if (source.compare_exchange_weak(current, current + 1U, std::memory_order_relaxed, std::memory_order_relaxed)) {
-            return current + 1U;
-        }
+        if (source.compare_exchange_weak(current, current + 1U, std::memory_order_relaxed, std::memory_order_relaxed)) { return current + 1U; }
     }
     return 0U;
 }
-
 }  // namespace
-
 namespace mmltk::backend::media::capture {
-
 using capture_internal::kPackedRegionFieldLimit;
 using capture_internal::MakeErrnoStatus;
 using capture_internal::MakeStatus;
 using capture_internal::PackRegion;
 using capture_internal::UnpackRegion;
-
 struct CaptureSession::OwnerHandle {
     explicit OwnerHandle(CaptureConfig config) : state(std::make_shared<Impl>(std::move(config))) {}
-
     ~OwnerHandle() {
         if (!thread.joinable()) { return; }
         // Releasing the public owner is safe only after the device-owning
@@ -99,13 +82,10 @@ struct CaptureSession::OwnerHandle {
         if (!state->owner_release_permitted()) { std::terminate(); }
         thread.detach();
     }
-
     std::shared_ptr<Impl> state;
     std::thread thread;
 };
-
 CaptureSession::Impl::Impl(CaptureConfig config_in) : config(std::move(config_in)), session_id_(allocate_capture_session_id()) {}
-
 CaptureSession::Impl::~Impl() {
     if (stop_event_fd_ >= 0) {
         ::close(stop_event_fd_);
@@ -120,24 +100,19 @@ CaptureSession::Impl::~Impl() {
         completion_event_fd_ = -1;
     }
 }
-
 CaptureSessionStartResult CaptureSession::Impl::prepare_start() {
     if (!finalized_.load(std::memory_order_acquire)) {
         return {.status = MakeStatus(StatusCode::kAlreadyRunning, "capture session owner has not been finalized")};
     }
-
     Status status = ValidateConfig();
     if (!status.ok()) { return {.status = std::move(status)}; }
     if (session_id_ == 0U) { return {.status = MakeStatus(StatusCode::kUnsupported, "capture session identity space exhausted")}; }
-
     status = EnsureEventFds();
     if (!status.ok()) { return {.status = std::move(status)}; }
-
     const std::uint64_t previous_generation = active_generation_.load(std::memory_order_acquire);
     if (previous_generation == std::numeric_limits<std::uint64_t>::max()) {
         return {.status = MakeStatus(StatusCode::kUnsupported, "capture session generation space exhausted")};
     }
-
     drain_event_fd(stop_event_fd_);
     drain_event_fd(terminal_event_fd_);
     ResetStats();
@@ -157,18 +132,15 @@ CaptureSessionStartResult CaptureSession::Impl::prepare_start() {
     active_generation_.store(previous_generation + 1U, std::memory_order_release);
     return {.phase = CaptureSessionStartPhase::Running, .status = Status::Ok(), .identity = active_identity()};
 }
-
 void CaptureSession::Impl::cancel_prepared_start() noexcept {
     shutdown_.store(true, std::memory_order_release);
     finalized_.store(true, std::memory_order_release);
     terminal_storage_.reset();
 }
-
 void CaptureSession::Impl::capture_owner_main() {
     std::optional<mmltk::common::system::ScopedExecutionPolicy> placement_policy;
     CaptureLoopResult result{};
     bool setup_complete = false;
-
     try {
         Status status = Status::Ok();
         const auto advance_startup = [this, &status](const auto operation) {
@@ -176,14 +148,13 @@ void CaptureSession::Impl::capture_owner_main() {
         };
         advance_startup(&Impl::InitializeCuda);
         if (status.ok()) {
-            const auto execution = config.execution
-                                       ? *config.execution
-                                       : mmltk::frameworks::gpu::resolve_device_execution(
-                                             config.cuda_device_index, mmltk::common::system::NumaTopology::Capture(),
-                                             mmltk::common::system::bound_memory_node(mmltk::common::system::capture_memory_policy()));
+            const auto execution = config.execution ? *config.execution
+                                                    : mmltk::frameworks::gpu::resolve_device_execution(
+                                                          config.cuda_device_index, mmltk::common::system::NumaTopology::Capture(),
+                                                          mmltk::common::system::bound_memory_node(mmltk::common::system::capture_memory_policy()));
             if (execution.device != config.cuda_device_index) throw std::invalid_argument("capture placement device mismatch");
-            placement_policy.emplace(mmltk::common::system::ExecutionPolicyRequest{execution.placement.cpus, "capture", 0,
-                                                                                   execution.placement.numa_node, -10, false});
+            placement_policy.emplace(
+                mmltk::common::system::ExecutionPolicyRequest{execution.placement.cpus, "capture", 0, execution.placement.numa_node, -10, false});
         }
         advance_startup(&Impl::OpenDevice);
         advance_startup(&Impl::ConfigureDevice);
@@ -193,7 +164,6 @@ void CaptureSession::Impl::capture_owner_main() {
         advance_startup(&Impl::AllocateHostSlots);
         advance_startup(&Impl::QueueAllV4l2Buffers);
         advance_startup(&Impl::StartStreaming);
-
         if (!status.ok()) {
             result.kind = CaptureStopKind::kStartupFailed;
             result.status = std::move(status);
@@ -211,19 +181,16 @@ void CaptureSession::Impl::capture_owner_main() {
     } catch (const std::exception& error) {
         result.kind = CaptureStopKind::kOwnerFailure;
         result.status = MakeStatus(StatusCode::kInternalError, error.what());
-        result.teardown = setup_complete && !camera_fault_.load(std::memory_order_acquire)
-                              ? CaptureTeardownDisposition::kRequeueThenStreamOff
-                              : CaptureTeardownDisposition::kNoStreamOrDeviceLost;
+        result.teardown = setup_complete && !camera_fault_.load(std::memory_order_acquire) ? CaptureTeardownDisposition::kRequeueThenStreamOff
+                                                                                           : CaptureTeardownDisposition::kNoStreamOrDeviceLost;
         SetLastError(result.status.message);
     } catch (...) {
         result.kind = CaptureStopKind::kOwnerFailure;
         result.status = MakeStatus(StatusCode::kInternalError, "unknown capture owner failure");
-        result.teardown = setup_complete && !camera_fault_.load(std::memory_order_acquire)
-                              ? CaptureTeardownDisposition::kRequeueThenStreamOff
-                              : CaptureTeardownDisposition::kNoStreamOrDeviceLost;
+        result.teardown = setup_complete && !camera_fault_.load(std::memory_order_acquire) ? CaptureTeardownDisposition::kRequeueThenStreamOff
+                                                                                           : CaptureTeardownDisposition::kNoStreamOrDeviceLost;
         SetLastError(result.status.message);
     }
-
     running_.store(false, std::memory_order_release);
     CloseFilledAdmission();
     RetainFirstFailure(active_identity(), result.status);
@@ -239,7 +206,6 @@ void CaptureSession::Impl::capture_owner_main() {
     }
     PublishStopTerminal(std::move(result));
 }
-
 Status CaptureSession::Impl::request_stop(const CaptureSessionIdentity identity) {
     if (finalized_.load(std::memory_order_acquire) || active_generation_.load(std::memory_order_acquire) == 0U) {
         return MakeStatus(StatusCode::kNotRunning, "capture session has no active owner");
@@ -259,16 +225,13 @@ Status CaptureSession::Impl::request_stop(const CaptureSessionIdentity identity)
     }
     return Status::Ok();
 }
-
 CaptureSessionIdentity CaptureSession::Impl::active_identity() const noexcept {
     return CaptureSessionIdentity{
         .session = session_id_,
         .generation = active_generation_.load(std::memory_order_acquire),
     };
 }
-
 int CaptureSession::Impl::stop_terminal_event_fd() const noexcept { return terminal_event_fd_; }
-
 std::shared_ptr<const CaptureStopTerminal> CaptureSession::Impl::try_take_stop_terminal() noexcept {
     if (!terminal_published_.load(std::memory_order_acquire)) { return {}; }
     bool expected = false;
@@ -276,7 +239,6 @@ std::shared_ptr<const CaptureStopTerminal> CaptureSession::Impl::try_take_stop_t
     drain_event_fd(terminal_event_fd_);
     return terminal_.load(std::memory_order_acquire);
 }
-
 Status CaptureSession::Impl::validate_finalize(const std::shared_ptr<const CaptureStopTerminal>& terminal) const {
     if (terminal == nullptr) { return MakeStatus(StatusCode::kInvalidArgument, "capture finalization requires a terminal"); }
     const std::shared_ptr<const CaptureStopTerminal> authoritative = terminal_.load(std::memory_order_acquire);
@@ -289,21 +251,16 @@ Status CaptureSession::Impl::validate_finalize(const std::shared_ptr<const Captu
     if (finalized_.load(std::memory_order_acquire)) { return MakeStatus(StatusCode::kNotRunning, "capture owner was already finalized"); }
     return Status::Ok();
 }
-
 void CaptureSession::Impl::mark_finalized() noexcept {
     finalized_.store(true, std::memory_order_release);
     terminal_storage_.reset();
 }
-
 bool CaptureSession::Impl::owner_release_permitted() const noexcept { return terminal_published_.load(std::memory_order_acquire); }
-
 Status CaptureSession::Impl::set_capture_region(CaptureRegion region) {
     packed_region_.store(PackRegion(NormalizeRegion(region)), std::memory_order_release);
     return Status::Ok();
 }
-
 CaptureRegion CaptureSession::Impl::snapshot_capture_region() const { return UnpackRegion(packed_region_.load(std::memory_order_acquire)); }
-
 CaptureFormatInfo CaptureSession::Impl::snapshot_format() const {
     return CaptureFormatInfo{
         .width = published_width_.load(std::memory_order_acquire),
@@ -311,7 +268,6 @@ CaptureFormatInfo CaptureSession::Impl::snapshot_format() const {
         .bytes_per_line = published_bytes_per_line_.load(std::memory_order_acquire),
     };
 }
-
 CaptureStats CaptureSession::Impl::snapshot_stats() const {
     const auto load = [](const auto& counter) { return counter.load(std::memory_order_acquire); };
     CaptureStats stats{};
@@ -331,12 +287,10 @@ CaptureStats CaptureSession::Impl::snapshot_stats() const {
     stats.running = load(running_);
     return stats;
 }
-
 std::string CaptureSession::Impl::last_error() const {
     std::lock_guard<std::mutex> lock(error_mutex_);
     return last_error_;
 }
-
 Status CaptureSession::Impl::ValidateConfig() const {
     if (config.width == 0U || config.height == 0U) { return MakeStatus(StatusCode::kInvalidArgument, "width and height must be non-zero"); }
     if (config.width > kPackedRegionFieldLimit || config.height > kPackedRegionFieldLimit) {
@@ -346,7 +300,6 @@ Status CaptureSession::Impl::ValidateConfig() const {
     if (config.v4l2_buffer_count == 0U) { return MakeStatus(StatusCode::kInvalidArgument, "v4l2_buffer_count must be non-zero"); }
     return Status::Ok();
 }
-
 void CaptureSession::Impl::ResetRuntimeState() {
     streaming_.store(false, std::memory_order_release);
     actual_v4l2_buffer_count_ = 0;
@@ -363,22 +316,18 @@ void CaptureSession::Impl::ResetRuntimeState() {
     next_frame_id_ = 1;
     ClearLastError();
 }
-
 CaptureRegion CaptureSession::Impl::NormalizeRegion(CaptureRegion region) const {
     const std::uint32_t width = published_width_.load(std::memory_order_acquire);
     const std::uint32_t height = published_height_.load(std::memory_order_acquire);
     if (width == 0U || height == 0U) { return CaptureRegion{}; }
-
     region.x = std::min(region.x, width - 1U);
     region.y = std::min(region.y, height - 1U);
-
     const std::uint32_t max_width = width - region.x;
     const std::uint32_t max_height = height - region.y;
     region.width = region.width == 0U ? max_width : std::min(region.width, max_width);
     region.height = region.height == 0U ? max_height : std::min(region.height, max_height);
     return region;
 }
-
 Status CaptureSession::Impl::EnsureEventFds() {
     if (stop_event_fd_ < 0) {
         stop_event_fd_ = ::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -394,7 +343,6 @@ Status CaptureSession::Impl::EnsureEventFds() {
     }
     return Status::Ok();
 }
-
 Status CaptureSession::Impl::TeardownSession(const CaptureTeardownDisposition teardown) {
     Status status = Status::Ok();
     switch (teardown) {
@@ -414,7 +362,6 @@ Status CaptureSession::Impl::TeardownSession(const CaptureTeardownDisposition te
     }
     return status;
 }
-
 void CaptureSession::Impl::PublishStopTerminal(CaptureLoopResult result) {
     if (terminal_published_.load(std::memory_order_acquire)) { return; }
     terminal_storage_->identity = active_identity();
@@ -429,15 +376,12 @@ void CaptureSession::Impl::PublishStopTerminal(CaptureLoopResult result) {
     terminal_published_.store(true, std::memory_order_release);
     static_cast<void>(signal_event_fd(terminal_event_fd_));
 }
-
 void CaptureSession::Impl::CloseFilledAdmission() noexcept { shutdown_.store(true, std::memory_order_release); }
-
 void CaptureSession::Impl::ReportCameraFault(const std::string& message) {
     camera_fault_.store(true, std::memory_order_release);
     SetLastError(message);
     static_cast<void>(signal_event_fd(stop_event_fd_));
 }
-
 void CaptureSession::Impl::ResetStats() {
     queued_v4l2_buffers_.store(0, std::memory_order_release);
     dequeued_v4l2_buffers_.store(0, std::memory_order_release);
@@ -453,7 +397,6 @@ void CaptureSession::Impl::ResetStats() {
     sequence_gaps_.store(0, std::memory_order_release);
     requeue_failures_.store(0, std::memory_order_release);
 }
-
 void CaptureSession::Impl::ClearLastError() {
     bool changed = false;
     {
@@ -463,7 +406,6 @@ void CaptureSession::Impl::ClearLastError() {
     }
     if (changed) { NotifyState(); }
 }
-
 void CaptureSession::Impl::SetLastError(const std::string& message) {
     bool changed = false;
     {
@@ -473,13 +415,8 @@ void CaptureSession::Impl::SetLastError(const std::string& message) {
     }
     if (changed) { NotifyState(); }
 }
-
 void CaptureSession::Impl::set_state_listener(std::function<void()> listener) { store_listener(state_listener_, std::move(listener)); }
-
-void CaptureSession::Impl::set_filled_frame_listener(std::function<void()> listener) {
-    store_listener(filled_frame_listener_, std::move(listener));
-}
-
+void CaptureSession::Impl::set_filled_frame_listener(std::function<void()> listener) { store_listener(filled_frame_listener_, std::move(listener)); }
 void CaptureSession::Impl::NotifyState() const noexcept {
     const std::shared_ptr<const std::function<void()>> listener = state_listener_.load(std::memory_order_acquire);
     if (listener == nullptr || !*listener) { return; }
@@ -487,17 +424,12 @@ void CaptureSession::Impl::NotifyState() const noexcept {
         (*listener)();
     } catch (...) { return; }
 }
-
 CaptureSession::CaptureSession(CaptureConfig config) : owner_(std::make_unique<OwnerHandle>(std::move(config))) {}
-
 CaptureSession::~CaptureSession() = default;
 CaptureSession::CaptureSession(CaptureSession&&) noexcept = default;
 CaptureSession& CaptureSession::operator=(CaptureSession&&) noexcept = default;
-
 CaptureSessionStartResult CaptureSession::start() {
-    if (owner_->thread.joinable()) {
-        return {.status = MakeStatus(StatusCode::kAlreadyRunning, "capture owner thread has not been finalized")};
-    }
+    if (owner_->thread.joinable()) { return {.status = MakeStatus(StatusCode::kAlreadyRunning, "capture owner thread has not been finalized")}; }
     CaptureSessionStartResult admission{};
     try {
         admission = owner_->state->prepare_start();
@@ -517,22 +449,16 @@ CaptureSessionStartResult CaptureSession::start() {
     }
     return admission;
 }
-
 Status CaptureSession::request_stop(const CaptureSessionIdentity identity) { return owner_->state->request_stop(identity); }
-
 int CaptureSession::stop_terminal_event_fd() const noexcept { return owner_ != nullptr ? owner_->state->stop_terminal_event_fd() : -1; }
-
 std::shared_ptr<const CaptureStopTerminal> CaptureSession::try_take_stop_terminal() noexcept {
     return owner_ != nullptr ? owner_->state->try_take_stop_terminal() : nullptr;
 }
-
 Status CaptureSession::finalize_stop(const std::shared_ptr<const CaptureStopTerminal>& terminal) {
     Status status = owner_->state->validate_finalize(terminal);
     if (!status.ok()) { return status; }
     if (!owner_->thread.joinable()) { return MakeStatus(StatusCode::kNotRunning, "capture owner thread is not joinable"); }
-    if (owner_->thread.get_id() == std::this_thread::get_id()) {
-        return MakeStatus(StatusCode::kNotReady, "capture owner cannot finalize itself");
-    }
+    if (owner_->thread.get_id() == std::this_thread::get_id()) { return MakeStatus(StatusCode::kNotReady, "capture owner cannot finalize itself"); }
     try {
         owner_->thread.join();
     } catch (const std::exception& error) {
@@ -541,46 +467,24 @@ Status CaptureSession::finalize_stop(const std::shared_ptr<const CaptureStopTerm
     owner_->state->mark_finalized();
     return Status::Ok();
 }
-
 Status CaptureSession::set_capture_region(CaptureRegion region) { return owner_->state->set_capture_region(region); }
-
 CaptureRegion CaptureSession::snapshot_capture_region() const { return owner_->state->snapshot_capture_region(); }
-
 CaptureFormatInfo CaptureSession::snapshot_format() const { return owner_->state->snapshot_format(); }
-
-FilledCaptureSlotLease CaptureSession::MakeFilledSlotLease(const CaptureSessionIdentity identity, const std::uint32_t slot,
-                                                           const std::uint64_t sequence, const std::uint8_t* const data,
-                                                           const std::size_t bytes, const std::size_t stride_bytes,
-                                                           const std::uint32_t pixel_format, const CaptureRegion region,
-                                                           const std::uint64_t capture_ns, const bool short_frame) noexcept {
-    return FilledCaptureSlotLeaseAuthority::Create(identity, slot, sequence, data, bytes, stride_bytes, pixel_format, region, capture_ns,
-                                                   short_frame);
+FilledCaptureSlotLease CaptureSession::MakeFilledSlotLease(const CaptureSessionIdentity identity, const std::uint32_t slot, const std::uint64_t sequence,
+                                                           const std::uint8_t* const data, const std::size_t bytes, const std::size_t stride_bytes,
+                                                           const std::uint32_t pixel_format, const CaptureRegion region, const std::uint64_t capture_ns,
+                                                           const bool short_frame) noexcept {
+    return FilledCaptureSlotLeaseAuthority::Create(identity, slot, sequence, data, bytes, stride_bytes, pixel_format, region, capture_ns, short_frame);
 }
-
 void CaptureSession::ConsumeFilledSlotLease(FilledCaptureSlotLease& lease) noexcept { FilledCaptureSlotLeaseAuthority::Consume(lease); }
-
 Status CaptureSession::try_take_filled(FilledCaptureSlotLease* out_lease) { return owner_->state->try_take_filled(out_lease); }
-
-Status CaptureSession::mark_h2d_completion_pending(const FilledCaptureSlotLease& lease) {
-    return owner_->state->mark_h2d_completion_pending(lease);
-}
-
-Status CaptureSession::return_after_h2d(FilledCaptureSlotLease&& lease) noexcept {
-    return owner_->state->return_after_h2d(std::move(lease));
-}
-
+Status CaptureSession::mark_h2d_completion_pending(const FilledCaptureSlotLease& lease) { return owner_->state->mark_h2d_completion_pending(lease); }
+Status CaptureSession::return_after_h2d(FilledCaptureSlotLease&& lease) noexcept { return owner_->state->return_after_h2d(std::move(lease)); }
 Status CaptureSession::report_failure(const CaptureSessionIdentity identity, Status failure) noexcept {
     return owner_->state->report_failure(identity, std::move(failure));
 }
-
 CaptureStats CaptureSession::snapshot_stats() const { return owner_->state->snapshot_stats(); }
-
 std::string CaptureSession::last_error() const { return owner_->state->last_error(); }
-
 void CaptureSession::set_state_listener(std::function<void()> listener) { owner_->state->set_state_listener(std::move(listener)); }
-
-void CaptureSession::set_filled_frame_listener(std::function<void()> listener) {
-    owner_->state->set_filled_frame_listener(std::move(listener));
-}
-
+void CaptureSession::set_filled_frame_listener(std::function<void()> listener) { owner_->state->set_filled_frame_listener(std::move(listener)); }
 }  // namespace mmltk::backend::media::capture

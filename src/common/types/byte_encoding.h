@@ -1,13 +1,10 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
-
 namespace mmltk::common::types {
-
 [[nodiscard]] inline std::string hex_encode(const std::span<const std::uint8_t> bytes) {
     constexpr std::string_view kDigits = "0123456789abcdef";
     std::string encoded(bytes.size() * 2U, '\0');
@@ -17,5 +14,4 @@ namespace mmltk::common::types {
     }
     return encoded;
 }
-
 }  // namespace mmltk::common::types

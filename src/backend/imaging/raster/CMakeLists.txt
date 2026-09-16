@@ -28,8 +28,9 @@ target_include_directories(mmltk_backend_imaging_raster PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 target_link_libraries(mmltk_backend_imaging_raster
-    PRIVATE
+    PUBLIC
         CUDA::cudart
+    PRIVATE
         mmltk::backend::ml::cuda
 )
 set_target_properties(mmltk_backend_imaging_raster PROPERTIES

@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <cstdint>
 #include <filesystem>
@@ -10,16 +9,13 @@
 #include <stop_token>
 #include <string>
 #include <variant>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/artifact.h"
 #include "src/controller/services/artifact_store.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/system_events.h"
-
 namespace mmltk::controller {
-
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] DatasetProgress final {
     std::uint64_t generation = 0U;
     bool active = false;
@@ -29,14 +25,13 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Tra
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] DatasetChanged final {
     contracts::ArtifactUiState snapshot{};
 };
-
 class DatasetRuntime {
    public:
     virtual ~DatasetRuntime() = default;
     [[nodiscard]] virtual services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&, std::stop_token,
                                                                   const std::function<void(const contracts::ArtifactProgress&)>&) = 0;
-    [[nodiscard]] virtual contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&,
-                                                                std::string_view, std::uint32_t, std::stop_token) = 0;
+    [[nodiscard]] virtual contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&, std::string_view,
+                                                                std::uint32_t, std::stop_token) = 0;
 };
 class ArtifactDatasetRuntime final : public DatasetRuntime {
    public:
@@ -44,14 +39,13 @@ class ArtifactDatasetRuntime final : public DatasetRuntime {
     explicit ArtifactDatasetRuntime(services::ArtifactStore, services::ArtifactDiagnosticObserver = {});
     [[nodiscard]] services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&, std::stop_token,
                                                           const std::function<void(const contracts::ArtifactProgress&)>&) override;
-    [[nodiscard]] contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&,
-                                                        std::string_view, std::uint32_t, std::stop_token) override;
+    [[nodiscard]] contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&, std::string_view,
+                                                        std::uint32_t, std::stop_token) override;
 
    private:
     services::ArtifactStore store_;
     services::ArtifactDiagnosticObserver diagnostics_{};
 };
-
 class DatasetSystem final {
    public:
     using event_type = std::variant<DatasetProgress, DatasetChanged>;
@@ -62,8 +56,8 @@ class DatasetSystem final {
         contracts::WorkflowIntent<contracts::FeatureId::Train>);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::ArtifactUiState Stop() noexcept;
     void Shutdown() noexcept;
-    [[nodiscard]] contracts::ArtifactInspection Inspect(std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>, std::string,
-                                                        std::uint32_t, std::stop_token = {});
+    [[nodiscard]] contracts::ArtifactInspection Inspect(std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>, std::string, std::uint32_t,
+                                                        std::stop_token = {});
     [[= contracts::reflection::Snapshot{contracts::kArtifactUiStateByteBudget}]] [[nodiscard]] contracts::ArtifactUiState snapshot() const;
 
    private:
@@ -83,8 +77,6 @@ class DatasetSystem final {
     std::unique_ptr<DatasetRuntime> runtime_;
     direct::LocalRun run_;
 };
-
 MMLTK_REFLECT_FIELDS(DatasetProgress)
 MMLTK_REFLECT_FIELDS(DatasetChanged)
-
 }  // namespace mmltk::controller

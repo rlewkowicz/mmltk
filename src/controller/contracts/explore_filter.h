@@ -1,36 +1,28 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <span>
 #include <vector>
-
 #include "src/backend/data/compiled_format_limits.h"
 #include "src/controller/contracts/application_boundary.h"
 #include "src/backend/data/catalog/class_catalog.h"
-
 namespace mmltk::controller {
-
 inline constexpr std::size_t kExploreClassCapacity = mmltk::backend::data::MAX_CLASSES;
-
 enum class ExploreOrder : std::uint8_t {
     Sequential = 0,
     Shuffled = 1,
 };
-
 enum class ExploreClassSelectionMode : std::uint8_t {
     All = 0,
     None = 1,
     Subset = 2,
 };
-
 struct ExploreClassSelection final {
     ExploreClassSelectionMode mode = ExploreClassSelectionMode::All;
     [[= mmltk::frameworks::reflection::MaxItems{kExploreClassCapacity}]] std::vector<std::uint32_t> classes{};
     bool operator==(const ExploreClassSelection&) const = default;
 };
-
 struct ExploreOverlay final {
     ExploreClassSelection class_selection{};
     bool show_boxes = true;
@@ -54,9 +46,7 @@ struct ExploreFilterUpdate final {
     ExploreFilter filter{};
     ExploreOverlay overlay{};
 };
-
 using ExploreClassCatalogIdentity = std::uint64_t;
-
 [[nodiscard]] inline ExploreClassCatalogIdentity explore_class_catalog_identity(
     const std::span<const mmltk::backend::data::catalog::ClassName> class_names) noexcept {
     constexpr ExploreClassCatalogIdentity offset_basis = 14'695'981'039'346'656'037ULL;
@@ -75,22 +65,18 @@ using ExploreClassCatalogIdentity = std::uint64_t;
     mix_size(static_cast<std::uint64_t>(class_names.size()));
     for (const auto& class_name : class_names) {
         mix_size(static_cast<std::uint64_t>(class_name.value.size()));
-        for (const unsigned char value : class_name.value)
-            mix(value);
+        for (const unsigned char value : class_name.value) mix(value);
     }
     return identity == 0U ? 1U : identity;
 }
-
 struct ExploreFilterPreferences final {
     ExploreClassCatalogIdentity class_catalog_identity = 0U;
     ExploreFilterUpdate policy{};
 };
-
 MMLTK_REFLECT_FIELDS(ExploreClassSelection)
 MMLTK_REFLECT_FIELDS(ExploreOverlay)
 MMLTK_REFLECT_FIELDS(ExploreFilter)
 MMLTK_REFLECT_FIELDS(ExploreFilterUpdate)
 MMLTK_REFLECT_ENUM(ExploreOrder)
 MMLTK_REFLECT_ENUM(ExploreClassSelectionMode)
-
 }  // namespace mmltk::controller

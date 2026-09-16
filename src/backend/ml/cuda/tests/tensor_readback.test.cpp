@@ -1,8 +1,8 @@
-#include <catch2/catch_test_macros.hpp>
 #include <ATen/ATen.h>
 #include <cuda.h>
 #include <ATen/ops/_neg_view.h>
 #include <torch/serialize.h>
+#include "catch2_compat.hpp"
 #include <array>
 #include <atomic>
 #include <sstream>
@@ -10,7 +10,6 @@
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/common/system/execution_policy.h"
-
 TEST_CASE("serialization readback preserves CPU views without registered capacity", "[readback][cpu]") {
     using mmltk::backend::ml::cuda::TensorReadbackBuffers;
     TensorReadbackBuffers readback;
@@ -33,7 +32,6 @@ TEST_CASE("serialization readback preserves CPU views without registered capacit
     REQUIRE_THROWS(readback.Reserve(std::array{at::Tensor{}}));
     readback.Release();
 }
-
 TEST_CASE("serialization slots retain simultaneous exact GPU extents and reuse capacity", "[cuda][readback]") {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
@@ -60,9 +58,11 @@ TEST_CASE("serialization slots retain simultaneous exact GPU extents and reuse c
     auto* address = first.data_ptr();
     const auto capacity = readback.capacity_bytes();
     auto detached_reader = first.detach();
-    first = {}; second = {}; empty = {};
+    first = at::Tensor{};
+    second = at::Tensor{};
+    empty = at::Tensor{};
     REQUIRE_THROWS(readback.Release());
-    detached_reader = {};
+    detached_reader = at::Tensor{};
     readback.Release();
     readback.Begin();
     readback.Reserve(std::array{storage.narrow(0, 3, 2)});
@@ -72,15 +72,14 @@ TEST_CASE("serialization slots retain simultaneous exact GPU extents and reuse c
     REQUIRE(small.storage().nbytes() == small.nbytes());
     REQUIRE(readback.capacity_bytes() == capacity);
     REQUIRE(at::equal(small, at::tensor({3.0F, 4.0F})));
-    small = {};
+    small = at::Tensor{};
     readback.ReleaseSettled();
     REQUIRE(readback.capacity_bytes() == 0);
 }
-
 namespace {
 thread_local bool reject_completion = false;
 thread_local int remaining_copies = -1;
-}
+}  // namespace
 extern "C" cudaError_t __real_cudaStreamSynchronize(cudaStream_t);
 extern "C" cudaError_t __real_cudaMemcpyAsync(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t);
 extern "C" cudaError_t __wrap_cudaStreamSynchronize(cudaStream_t stream) {
@@ -92,7 +91,6 @@ extern "C" cudaError_t __wrap_cudaMemcpyAsync(void* to, const void* from, std::s
     if (remaining_copies > 0) --remaining_copies;
     return __real_cudaMemcpyAsync(to, from, size, kind, stream);
 }
-
 TEST_CASE("readback archive tensors preserve dtype, view flags and distinct active storage", "[cuda][readback][archive]") {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
@@ -103,16 +101,17 @@ TEST_CASE("readback archive tensors preserve dtype, view flags and distinct acti
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     for (const auto dtype : {at::kFloat, at::kHalf, at::kBFloat16, at::kLong, at::kBool, at::kComplexFloat}) {
         auto tensor = at::arange(16, at::kFloat).to(at::Device(at::kCUDA, 0), dtype).reshape({4, 4});
-        if (dtype == at::kComplexFloat) tensor = tensor.conj();
-        else if (dtype != at::kBool) tensor = at::_neg_view(tensor);
+        if (dtype == at::kComplexFloat)
+            tensor = tensor.conj();
+        else if (dtype != at::kBool)
+            tensor = at::_neg_view(tensor);
         const std::array sources{tensor.transpose(0, 1), tensor + 1, at::scalar_tensor(3, at::kLong)};
         readback.Begin();
         readback.Reserve(sources);
         std::stringstream serialized;
         {
             torch::serialize::OutputArchive archive;
-            for (std::size_t index = 0; index < sources.size(); ++index)
-                archive.write(std::to_string(index), readback.Stage(index));
+            for (std::size_t index = 0; index < sources.size(); ++index) archive.write(std::to_string(index), readback.Stage(index));
             readback.Complete();
             REQUIRE_THROWS(readback.Release());
             archive.save_to(serialized);
@@ -129,7 +128,6 @@ TEST_CASE("readback archive tensors preserve dtype, view flags and distinct acti
         }
     }
 }
-
 TEST_CASE("failed readback proof retains the actual source and registered receiver after partial enqueue", "[cuda][readback][failure]") {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
@@ -140,10 +138,13 @@ TEST_CASE("failed readback proof retains the actual source and registered receiv
     void* allocation = nullptr;
     CUDA_ASSERT_OK(cudaMalloc(&allocation, 16 * sizeof(float)));
     auto released = std::make_shared<std::atomic_bool>(false);
-    auto source = at::from_blob(allocation, {16}, [released](void* pointer) {
-        *released = true;
-        static_cast<void>(cudaFree(pointer));
-    }, at::TensorOptions().device(at::Device(at::kCUDA, 0)).dtype(at::kFloat));
+    auto source = at::from_blob(
+        allocation, {16},
+        [released](void* pointer) {
+            *released = true;
+            static_cast<void>(cudaFree(pointer));
+        },
+        at::TensorOptions().device(at::Device(at::kCUDA, 0)).dtype(at::kFloat));
     source.fill_(2.0);
     void* receiver = nullptr;
     {
@@ -155,13 +156,15 @@ TEST_CASE("failed readback proof retains the actual source and registered receiv
         remaining_copies = 0;
         reject_completion = true;
         bool failed = false;
-        try { (void)readback.Stage(1); } catch (const std::exception&) { failed = true; }
+        try {
+            (void)readback.Stage(1);
+        } catch (const std::exception&) { failed = true; }
         remaining_copies = -1;
         reject_completion = false;
         REQUIRE(failed);
         REQUIRE_FALSE(readback.admission_open());
         REQUIRE_THROWS(readback.Begin());
-        source = {};
+        source = at::Tensor{};
     }
     REQUIRE_FALSE(released->load());
     unsigned flags = 0;

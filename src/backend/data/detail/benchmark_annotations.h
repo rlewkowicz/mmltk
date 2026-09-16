@@ -1,5 +1,4 @@
 #pragma once  // backend.data private implementation boundary
-
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
@@ -8,14 +7,11 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 #include "benchmark_cache.h"
 #include "benchmark_catalog.h"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled_format.h"
-
 namespace mmltk::backend::data::benchmark_internal {
-
 struct __attribute__((packed)) NormalizedBox {
     float x1 = 0.0F;
     float y1 = 0.0F;
@@ -27,7 +23,6 @@ struct __attribute__((packed)) NormalizedBox {
     std::uint8_t reserved[3]{};
 };
 static_assert(sizeof(NormalizedBox) == 32U);
-
 struct __attribute__((packed)) NormalizedImage {
     std::uint64_t source_image_id = 0U;
     std::uint64_t first_box = 0U;
@@ -38,7 +33,6 @@ struct __attribute__((packed)) NormalizedImage {
     std::uint16_t reserved = 0U;
 };
 static_assert(sizeof(NormalizedImage) == 32U);
-
 struct AnnotationRejectCounts {
     std::uint64_t raw_records = 0U;
     std::uint64_t unmapped_categories = 0U;
@@ -47,7 +41,6 @@ struct AnnotationRejectCounts {
     std::uint64_t degenerate_boxes = 0U;
     std::uint64_t duplicate_boxes = 0U;
 };
-
 struct NormalizedAnnotationIndex {
     BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
     std::string split;
@@ -57,7 +50,6 @@ struct NormalizedAnnotationIndex {
     std::vector<RLEPair> mask_rle_pairs;
     AnnotationRejectCounts rejected;
 };
-
 struct AnnotationParseOptions {
     BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
     std::string split;
@@ -67,24 +59,16 @@ struct AnnotationParseOptions {
     mmltk::common::concurrency::CancellationObservation cancel_requested = {};
     BenchmarkTraceSink trace;
 };
-
 [[nodiscard]] NormalizedAnnotationIndex parse_coco_style_annotations(const std::filesystem::path& json_path, std::string annotation_sha256,
-                                                                     std::span<const NumericCategoryMapping> mappings,
-                                                                     const AnnotationParseOptions& options);
-
+                                                                     std::span<const NumericCategoryMapping> mappings, const AnnotationParseOptions& options);
 [[nodiscard]] NormalizedAnnotationIndex parse_open_images_annotations(const std::filesystem::path& boxes_csv_path,
-                                                                      const std::filesystem::path& classes_csv_path,
-                                                                      std::string annotation_sha256,
-                                                                      std::span<const StringCategoryMapping> mappings,
-                                                                      const AnnotationParseOptions& options);
-
-[[nodiscard]] std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(
-    const std::filesystem::path& path, BenchmarkDatasetSource expected_source, std::string_view expected_split,
-    std::string_view expected_annotation_sha256, mmltk::common::concurrency::CancellationObservation cancel_requested,
-    const BenchmarkTraceSink& trace = {});
-
+                                                                      const std::filesystem::path& classes_csv_path, std::string annotation_sha256,
+                                                                      std::span<const StringCategoryMapping> mappings, const AnnotationParseOptions& options);
+[[nodiscard]] std::optional<NormalizedAnnotationIndex> load_normalized_annotation_index(const std::filesystem::path& path,
+                                                                                        BenchmarkDatasetSource expected_source, std::string_view expected_split,
+                                                                                        std::string_view expected_annotation_sha256,
+                                                                                        mmltk::common::concurrency::CancellationObservation cancel_requested,
+                                                                                        const BenchmarkTraceSink& trace = {});
 void store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
-                                       mmltk::common::concurrency::CancellationObservation cancel_requested,
-                                       const BenchmarkTraceSink& trace = {});
-
+                                       mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {});
 }  // namespace mmltk::backend::data::benchmark_internal

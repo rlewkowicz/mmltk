@@ -1,18 +1,14 @@
 #pragma once
-
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
 #include <utility>
-
 #include "src/controller/contracts/diagnostic_context.h"
 #include "src/controller/services/diagnostics_client.h"
 #include "src/frameworks/serialization/cbor_wire.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
-
 namespace mmltk::controller::services {
-
 struct RuntimeDiagnosticFact final {
     contracts::DiagnosticOwner owner = contracts::DiagnosticOwner::BrowserRuntime;
     std::string_view event;
@@ -25,18 +21,14 @@ struct RuntimeDiagnosticFact final {
     std::string_view message{};
 };
 MMLTK_REFLECT_FIELDS(RuntimeDiagnosticFact)
-
 enum class RuntimeDiagnosticDelivery : std::uint8_t { BestEffort, Complete };
-
 class RuntimeDiagnostics;
-
 // An optional, effect-only trace capability. Its shared private state owns the
 // producer lifetime used by every system and worker copy; callers cannot install
 // borrowed contexts or alternate callback vocabularies.
 class RuntimeDiagnosticTarget final {
    public:
     RuntimeDiagnosticTarget() noexcept = default;
-
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] bool pixel_probes_enabled() const noexcept;
     void operator()(RuntimeDiagnosticFact fact) const noexcept { write(fact); }
@@ -62,7 +54,6 @@ class RuntimeDiagnosticTarget final {
     std::shared_ptr<State> state_;
     friend class RuntimeDiagnostics;
 };
-
 // Formats the shared runtime JSONL vocabulary into the application-owned,
 // bounded DiagnosticsClient. A disabled client yields an empty target, so
 // transport and process paths perform no trace collection or formatting.
@@ -70,7 +61,6 @@ class RuntimeDiagnostics final {
    public:
     explicit RuntimeDiagnostics(DiagnosticsProducer producer, bool pixel_probes = false,
                                 RuntimeDiagnosticDelivery delivery = RuntimeDiagnosticDelivery::BestEffort);
-
     [[nodiscard]] RuntimeDiagnosticTarget target() noexcept;
     void write(RuntimeDiagnosticFact fact) noexcept;
     void write_browser_event(std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) noexcept;
@@ -78,11 +68,8 @@ class RuntimeDiagnostics final {
 
    private:
     static void Submit(void* context, RuntimeDiagnosticFact fact) noexcept;
-    static void SubmitBrowserEvent(void* context, std::string_view event,
-                                   const mmltk::frameworks::serialization::wire::Value& fields) noexcept;
+    static void SubmitBrowserEvent(void* context, std::string_view event, const mmltk::frameworks::serialization::wire::Value& fields) noexcept;
     static void SubmitBenchmarkTrace(void* context, std::string_view event, std::string_view json_fields) noexcept;
-
     std::shared_ptr<RuntimeDiagnosticTarget::State> state_;
 };
-
 }  // namespace mmltk::controller::services

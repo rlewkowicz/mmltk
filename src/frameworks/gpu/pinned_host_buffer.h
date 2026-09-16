@@ -3,7 +3,6 @@
 #include <cstddef>
 #include <memory>
 #include "src/common/system/numa_topology.h"
-
 namespace mmltk::frameworks::gpu {
 // Owner calls ReleaseSettled only after every asynchronous borrower completes.
 // Growth and destruction settle the owning context; failed resources enter the
@@ -11,8 +10,7 @@ namespace mmltk::frameworks::gpu {
 class PinnedHostBuffer final {
    public:
     using Register = CUresult (*)(void*, std::size_t, unsigned);
-    PinnedHostBuffer(CUcontext, const mmltk::common::system::ExecutionPlacement&, bool portable = false,
-                     Register registration = &cuMemHostRegister);
+    PinnedHostBuffer(CUcontext, const mmltk::common::system::ExecutionPlacement&, bool portable = false, Register registration = &cuMemHostRegister);
     [[nodiscard]] static std::unique_ptr<PinnedHostBuffer> ForCurrentDevice(bool portable = true);
     ~PinnedHostBuffer() noexcept;
     PinnedHostBuffer(const PinnedHostBuffer&) = delete;

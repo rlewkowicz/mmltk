@@ -1,34 +1,29 @@
 #pragma once
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
-
 #include "live_analyzer_worker.h"
 #include "live_compositor_status.h"
 #include "live_manual_overlay_worker.h"
 #include "workspace_frame_signal.h"
-
 namespace mmltk::backend::media::live {
 class LiveCompositor;
-
 // CLEANUP-IGNORE: LiveCompositor has distinct physical compositor custody despite a conventional sealed-owner API.
 class LiveCompositor final {
    public:
     // CLEANUP-IGNORE: Its constructor and lifecycle are independent from manual-overlay worker ownership.
-    LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* analyzer, LiveManualOverlayWorker* manual_overlay,
-                   LiveCompletedFramePublication& publication, std::uint32_t slot_count, std::uint32_t width,
+    LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* analyzer, LiveManualOverlayWorker* manual_overlay, LiveCompletedFramePublication& publication,
+                   std::uint32_t slot_count, std::uint32_t width,
                    // CLEANUP-IGNORE: Physical compositor dimensions and CUDA context are explicit construction facts.
                    std::uint32_t height, LivePhysicalCudaContext cuda);
     ~LiveCompositor();
     LiveCompositor(const LiveCompositor&) = delete;
     LiveCompositor& operator=(const LiveCompositor&) = delete;
-
     void start() noexcept;
     void close_admission() noexcept;
     void stop() noexcept;
@@ -62,7 +57,6 @@ class LiveCompositor final {
         std::atomic<bool> producer_complete{false};
         LiveCompositor* owner = nullptr;
     };
-
     static void CUDART_CB ProducerComplete(void* context) noexcept;
     static void ScrubLogicalProduct(CompositeSlot& slot) noexcept;
     void publish_slot(CompositeSlot& slot, SlotState published) noexcept;
@@ -70,7 +64,6 @@ class LiveCompositor final {
     [[nodiscard]] CompositeSlot* reserve() noexcept;
     void complete(CompositeSlot& slot) noexcept;
     void destroy() noexcept;
-
     LiveFrameFanout& fanout_;
     LiveAnalyzerWorker* analyzer_ = nullptr;
     LiveManualOverlayWorker* manual_overlay_ = nullptr;

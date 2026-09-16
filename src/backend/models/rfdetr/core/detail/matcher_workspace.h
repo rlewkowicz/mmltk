@@ -7,7 +7,6 @@
 #include <vector>
 #include "src/common/system/numa_memory.h"
 #include "src/backend/models/rfdetr/core/detail/lsap_scratch.h"
-
 namespace mmltk::backend::models::rfdetr {
 struct TracedLossOpCache;
 struct MatcherStatistics final {

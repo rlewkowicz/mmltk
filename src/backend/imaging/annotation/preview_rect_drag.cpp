@@ -1,19 +1,15 @@
 module;
 #include <algorithm>
 #include <cstdint>
-
 module mmltk.backend.imaging.annotation.preview_rect_drag;
-
 namespace mmltk::backend::imaging::annotation {
-
 bool preview_rect_box_meets_min_extent(const AnnotationBox& box, const int min_extent) {
     if (!annotation_box_has_area(box)) { return false; }
     const int required = std::max(1, min_extent);
     return (box.x2 - box.x1) >= required && (box.y2 - box.y1) >= required;
 }
-
-void start_preview_rect_drag(PreviewRectDragSession& session, const RectDragKind kind, const float mouse_x, const float mouse_y,
-                             const AnnotationBox& start_box, const int commit_min_extent) {
+void start_preview_rect_drag(PreviewRectDragSession& session, const RectDragKind kind, const float mouse_x, const float mouse_y, const AnnotationBox& start_box,
+                             const int commit_min_extent) {
     session.active = kind != RectDragKind::None;
     session.drag.kind = kind;
     session.drag.start_mouse_x = mouse_x;
@@ -23,21 +19,18 @@ void start_preview_rect_drag(PreviewRectDragSession& session, const RectDragKind
     session.draft_box = start_box;
     session.commit_min_extent = std::max(1, commit_min_extent);
 }
-
-PreviewRectDragResult update_preview_rect_drag(PreviewRectDragSession& session, const bool left_down, const float mouse_x,
-                                               const float mouse_y, const CanvasViewport& viewport, const int max_width,
-                                               const int max_height, const int min_size) {
+PreviewRectDragResult update_preview_rect_drag(PreviewRectDragSession& session, const bool left_down, const float mouse_x, const float mouse_y,
+                                               const CanvasViewport& viewport, const int max_width, const int max_height, const int min_size) {
     PreviewRectDragResult result;
     if (!session.active) { return result; }
-
     if (left_down) {
         result.active = true;
         const CanvasPointerState pointer{
             mouse_x, mouse_y, true, false, true,
         };
         result.box = apply_rect_drag(session.drag, pointer, viewport, max_width, max_height, min_size);
-        result.changed = !(result.box.x1 == session.original_box.x1 && result.box.y1 == session.original_box.y1 &&
-                           result.box.x2 == session.original_box.x2 && result.box.y2 == session.original_box.y2);
+        result.changed = !(result.box.x1 == session.original_box.x1 && result.box.y1 == session.original_box.y1 && result.box.x2 == session.original_box.x2 &&
+                           result.box.y2 == session.original_box.y2);
         session.draft_box = result.box;
         if (session.drag.kind == RectDragKind::Create) { return result; }
         const float scale_x = viewport.image_width == 0U ? 0.0F : viewport.screen_width / static_cast<float>(viewport.image_width);
@@ -65,21 +58,17 @@ PreviewRectDragResult update_preview_rect_drag(PreviewRectDragSession& session, 
         session.drag.start_box = result.box;
         return result;
     }
-
-    result = resolve_preview_rect_release(session.drag.kind, session.original_box, session.draft_box, max_width, max_height,
-                                          session.commit_min_extent);
+    result = resolve_preview_rect_release(session.drag.kind, session.original_box, session.draft_box, max_width, max_height, session.commit_min_extent);
     session = {};
     return result;
 }
-
-PreviewRectDragResult resolve_preview_rect_release(const RectDragKind kind, const AnnotationBox& original_box,
-                                                   const AnnotationBox& draft_box, const int max_width, const int max_height,
-                                                   const int commit_min_extent) {
+PreviewRectDragResult resolve_preview_rect_release(const RectDragKind kind, const AnnotationBox& original_box, const AnnotationBox& draft_box,
+                                                   const int max_width, const int max_height, const int commit_min_extent) {
     PreviewRectDragResult result;
     result.active = false;
     result.box = draft_box;
-    result.changed = !(draft_box.x1 == original_box.x1 && draft_box.y1 == original_box.y1 && draft_box.x2 == original_box.x2 &&
-                       draft_box.y2 == original_box.y2);
+    result.changed =
+        !(draft_box.x1 == original_box.x1 && draft_box.y1 == original_box.y1 && draft_box.x2 == original_box.x2 && draft_box.y2 == original_box.y2);
     if (kind == RectDragKind::Create) {
         result.commit = preview_rect_box_meets_min_extent(draft_box, commit_min_extent);
         result.cancel = !result.commit;
@@ -95,8 +84,7 @@ PreviewRectDragResult resolve_preview_rect_release(const RectDragKind kind, cons
                 std::clamp(draft_box.x2, 0, max_width),
                 std::clamp(draft_box.y2, 0, max_height),
             };
-            result.clipped_on_commit =
-                clipped.x1 != draft_box.x1 || clipped.y1 != draft_box.y1 || clipped.x2 != draft_box.x2 || clipped.y2 != draft_box.y2;
+            result.clipped_on_commit = clipped.x1 != draft_box.x1 || clipped.y1 != draft_box.y1 || clipped.x2 != draft_box.x2 || clipped.y2 != draft_box.y2;
             result.box = clipped;
         }
         result.commit = result.changed && !result.delete_on_commit && preview_rect_box_meets_min_extent(result.box, commit_min_extent);
@@ -105,28 +93,25 @@ PreviewRectDragResult resolve_preview_rect_release(const RectDragKind kind, cons
     }
     return result;
 }
-
-PreviewRectDragResult apply_preview_rect_draft(PreviewRectDragSession& session, const bool left_down, AnnotationBox draft,
-                                               const int max_width, const int max_height) {
+PreviewRectDragResult apply_preview_rect_draft(PreviewRectDragSession& session, const bool left_down, AnnotationBox draft, const int max_width,
+                                               const int max_height) {
     PreviewRectDragResult result;
     if (!session.active) { return result; }
     if (draft.x1 > draft.x2) { std::swap(draft.x1, draft.x2); }
     if (draft.y1 > draft.y2) { std::swap(draft.y1, draft.y2); }
     if (session.drag.kind != RectDragKind::Move) {
-        draft = normalize_annotation_box(draft, static_cast<std::uint32_t>(std::max(0, max_width)),
-                                         static_cast<std::uint32_t>(std::max(0, max_height)));
+        draft = normalize_annotation_box(draft, static_cast<std::uint32_t>(std::max(0, max_width)), static_cast<std::uint32_t>(std::max(0, max_height)));
     }
     session.draft_box = draft;
     if (left_down) {
         result.active = true;
         result.box = draft;
-        result.changed = !(draft.x1 == session.original_box.x1 && draft.y1 == session.original_box.y1 &&
-                           draft.x2 == session.original_box.x2 && draft.y2 == session.original_box.y2);
+        result.changed = !(draft.x1 == session.original_box.x1 && draft.y1 == session.original_box.y1 && draft.x2 == session.original_box.x2 &&
+                           draft.y2 == session.original_box.y2);
         return result;
     }
     result = resolve_preview_rect_release(session.drag.kind, session.original_box, draft, max_width, max_height, session.commit_min_extent);
     session = {};
     return result;
 }
-
 }  // namespace mmltk::backend::imaging::annotation

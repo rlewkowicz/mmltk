@@ -1,18 +1,13 @@
 #pragma once
-
 #include <cuda_runtime_api.h>
-
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
-
 namespace Ort {
 struct SessionOptions;
 }
-
 namespace mmltk::backend::imaging::upscale::shiftlut {
-
 // The runtime owns physical storage across ORT graph fallback and releases it
 // explicitly after provider settlement, before destroying the session.
 class Operators final {

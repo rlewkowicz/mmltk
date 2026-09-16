@@ -1,6 +1,5 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -14,25 +13,19 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-
 #include "detail/command_arguments.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/controller/services/vast_client.h"
 #include "src/controller/services/vast_provider_owner.h"
 #include "src/frameworks/process/subprocess_utils.h"
-
 namespace mmltk::controller::services {
-
 namespace {
-
 using json = nlohmann::json;
-
 constexpr std::string_view kDefaultPythonExecutable = "python3";
 constexpr std::string_view kDefaultBridgeScript = "src/controller/services/vast_bridge.py";
 constexpr std::chrono::milliseconds kVastBridgeExecutionTimeout{60'000};
 constexpr std::size_t kVastBridgeOutputCapacity = std::size_t{2U} * 1024U * 1024U;
-
 std::string normalize_gpu_name(std::string_view value) {
     std::string normalized;
     normalized.reserve(value.size());
@@ -45,24 +38,17 @@ std::string normalize_gpu_name(std::string_view value) {
     }
     return normalized;
 }
-
 bool matches_family(const mmltk::controller::contracts::ProviderGpuFamily family, std::string_view normalized_gpu_name) {
     switch (family) {
-        case mmltk::controller::contracts::ProviderGpuFamily::A100:
-            return normalized_gpu_name.find("A100") != std::string_view::npos;
-        case mmltk::controller::contracts::ProviderGpuFamily::B200:
-            return normalized_gpu_name.find("B200") != std::string_view::npos;
-        case mmltk::controller::contracts::ProviderGpuFamily::H100:
-            return normalized_gpu_name.find("H100") != std::string_view::npos;
-        case mmltk::controller::contracts::ProviderGpuFamily::H200:
-            return normalized_gpu_name.find("H200") != std::string_view::npos;
+        case mmltk::controller::contracts::ProviderGpuFamily::A100: return normalized_gpu_name.find("A100") != std::string_view::npos;
+        case mmltk::controller::contracts::ProviderGpuFamily::B200: return normalized_gpu_name.find("B200") != std::string_view::npos;
+        case mmltk::controller::contracts::ProviderGpuFamily::H100: return normalized_gpu_name.find("H100") != std::string_view::npos;
+        case mmltk::controller::contracts::ProviderGpuFamily::H200: return normalized_gpu_name.find("H200") != std::string_view::npos;
         case mmltk::controller::contracts::ProviderGpuFamily::LSeries:
-            return normalized_gpu_name.starts_with("L4") || normalized_gpu_name.starts_with("L20") ||
-                   normalized_gpu_name.starts_with("L40");
+            return normalized_gpu_name.starts_with("L4") || normalized_gpu_name.starts_with("L20") || normalized_gpu_name.starts_with("L40");
     }
     return false;
 }
-
 std::optional<mmltk::controller::contracts::ProviderGpuFamily> classify_family(std::string_view gpu_name) {
     const std::string normalized = normalize_gpu_name(gpu_name);
     for (const mmltk::controller::contracts::ProviderGpuFamily family :
@@ -73,13 +59,11 @@ std::optional<mmltk::controller::contracts::ProviderGpuFamily> classify_family(s
     }
     return std::nullopt;
 }
-
 double json_number_or_default(const json& value, const char* key) {
     const auto found = value.find(key);
     if (found == value.end() || !found->is_number()) { return 0.0; }
     return found->get<double>();
 }
-
 int json_int_or_default(const json& value, const char* key) {
     const auto found = value.find(key);
     if (found == value.end() || !found->is_number_integer()) {
@@ -88,35 +72,29 @@ int json_int_or_default(const json& value, const char* key) {
     }
     return found->get<int>();
 }
-
 std::string json_string_or_default(const json& value, const char* key) {
     const auto found = value.find(key);
     if (found == value.end() || !found->is_string()) { return {}; }
     return found->get<std::string>();
 }
-
 bool json_bool_or_default(const json& value, const char* key) {
     const auto found = value.find(key);
     if (found == value.end() || !found->is_boolean()) { return false; }
     return found->get<bool>();
 }
-
 std::string trim_copy(std::string_view value) {
     const std::size_t start = value.find_first_not_of(" \t\r\n");
     if (start == std::string_view::npos) { return {}; }
     const std::size_t end = value.find_last_not_of(" \t\r\n");
     return std::string(value.substr(start, end - start + 1U));
 }
-
 json parse_json_payload(std::string_view payload, const std::string_view context) {
     const std::string trimmed = trim_copy(payload);
     if (trimmed.empty()) { throw std::runtime_error(std::string(context) + " is empty"); }
-
     json parsed = json::parse(trimmed, nullptr, false);
     if (parsed.is_discarded()) { throw std::runtime_error(std::string(context) + " is not valid JSON"); }
     return parsed;
 }
-
 std::vector<json> extract_offer_objects(const json& payload) {
     if (payload.is_array()) { return payload.get<std::vector<json>>(); }
     if (payload.is_object()) {
@@ -127,22 +105,17 @@ std::vector<json> extract_offer_objects(const json& payload) {
     }
     throw std::runtime_error("Vast bridge returned an unexpected search-offers payload shape");
 }
-
 std::string build_vast_search_query(const int min_gpus) {
     return "rentable=True rented=False verified=True external=False num_gpus>=" + std::to_string(std::max(1, min_gpus));
 }
-
 std::vector<json> extract_instance_objects(const json& payload) {
     if (payload.is_array()) { return payload.get<std::vector<json>>(); }
     if (payload.is_object()) {
-        if (const auto found = payload.find("instances"); found != payload.end() && found->is_array()) {
-            return found->get<std::vector<json>>();
-        }
+        if (const auto found = payload.find("instances"); found != payload.end() && found->is_array()) { return found->get<std::vector<json>>(); }
         return {payload};
     }
     throw std::runtime_error("Vast bridge returned an unexpected instance payload shape");
 }
-
 std::filesystem::path default_vast_python_executable() {
 #ifdef MMLTK_GUI_PYTHON_EXECUTABLE
     return MMLTK_GUI_PYTHON_EXECUTABLE;
@@ -150,7 +123,6 @@ std::filesystem::path default_vast_python_executable() {
     return std::filesystem::path{kDefaultPythonExecutable};
 #endif
 }
-
 std::filesystem::path default_vast_bridge_script_path() {
 #ifdef MMLTK_GUI_VAST_BRIDGE_SOURCE
     std::filesystem::path source_path = MMLTK_GUI_VAST_BRIDGE_SOURCE;
@@ -158,7 +130,6 @@ std::filesystem::path default_vast_bridge_script_path() {
 #endif
     return mmltk::common::system::runtime_paths::python_asset_path("vast_bridge.py");
 }
-
 VastInstanceInfo vast_instance_from_json(const json& payload) {
     VastInstanceInfo instance;
     instance.instance_id = json_int_or_default(payload, "id");
@@ -180,31 +151,17 @@ VastInstanceInfo vast_instance_from_json(const json& payload) {
     instance.duration_seconds = json_number_or_default(payload, "duration");
     return instance;
 }
-
-void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const std::string& value) {
-    append_command_option(args, name, value);
-}
-
+void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const std::string& value) { append_command_option(args, name, value); }
 void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const std::optional<double>& value) {
     append_command_option(args, name, value);
 }
-
-void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const bool enabled) {
-    append_command_flag(args, name, enabled);
-}
-
+void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const bool enabled) { append_command_flag(args, name, enabled); }
 void require_vast_api_key(const VastBridgeConfig& config, const std::string_view context) {
     if (config.api_key.empty()) { throw std::runtime_error(std::string(context) + " requires --vast-api-key or VAST_API_KEY"); }
 }
-
-std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::vector<std::string>& bridge_args,
-                                    const VastBridgeInvocation& invocation) {
-    if (!invocation.valid()) {
-        throw VastBridgeError(VastBridgeFailureKind::Process, "Vast bridge requires a nonzero deadline and cancellation fd");
-    }
-    if (config.http_timeout.count() <= 0) {
-        throw VastBridgeError(VastBridgeFailureKind::Process, "Vast bridge HTTP timeout must be nonzero");
-    }
+std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::vector<std::string>& bridge_args, const VastBridgeInvocation& invocation) {
+    if (!invocation.valid()) { throw VastBridgeError(VastBridgeFailureKind::Process, "Vast bridge requires a nonzero deadline and cancellation fd"); }
+    if (config.http_timeout.count() <= 0) { throw VastBridgeError(VastBridgeFailureKind::Process, "Vast bridge HTTP timeout must be nonzero"); }
     std::vector<std::string> argv_strings;
     argv_strings.reserve(bridge_args.size() + 2U);
     argv_strings.push_back(config.python_executable.empty() ? std::string{kDefaultPythonExecutable} : config.python_executable.string());
@@ -212,7 +169,6 @@ std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::v
     argv_strings.insert(argv_strings.end(), bridge_args.begin(), bridge_args.end());
     const mmltk::frameworks::process::ArgvBuffer argv(std::move(argv_strings));
     const std::string http_timeout_seconds = std::to_string(std::chrono::duration<double>(config.http_timeout).count());
-
     mmltk::frameworks::process::CapturedChildProcessResult captured;
     try {
         captured = mmltk::frameworks::process::run_captured_child_process(
@@ -220,21 +176,18 @@ std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::v
             [&](const int stdout_fd, const int setup_error_fd) {
                 mmltk::frameworks::process::prepare_captured_output_child(stdout_fd, setup_error_fd);
                 if (!config.api_key.empty()) {
-                    mmltk::frameworks::process::require_child_setup_step(::setenv("VAST_API_KEY", config.api_key.c_str(), 1) == 0,
-                                                                         setup_error_fd,
+                    mmltk::frameworks::process::require_child_setup_step(::setenv("VAST_API_KEY", config.api_key.c_str(), 1) == 0, setup_error_fd,
                                                                          mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
                 }
-                mmltk::frameworks::process::require_child_setup_step(
-                    ::setenv("MMLTK_VAST_HTTP_TIMEOUT_SECONDS", http_timeout_seconds.c_str(), 1) == 0, setup_error_fd,
-                    mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
+                mmltk::frameworks::process::require_child_setup_step(::setenv("MMLTK_VAST_HTTP_TIMEOUT_SECONDS", http_timeout_seconds.c_str(), 1) == 0,
+                                                                     setup_error_fd, mmltk::frameworks::process::ChildSetupStage::SetEnvironment);
                 ::execvp(argv.program(), argv.data());
                 mmltk::frameworks::process::fail_child_setup(setup_error_fd, mmltk::frameworks::process::ChildSetupStage::Exec);
             },
             {}, invocation.deadline, invocation.cancellation_fd, true, kVastBridgeOutputCapacity);
     } catch (const mmltk::frameworks::process::CapturedChildAborted& error) {
-        throw VastBridgeError(error.reason() == mmltk::frameworks::process::CapturedChildAbortReason::TimedOut
-                                  ? VastBridgeFailureKind::TimedOut
-                                  : VastBridgeFailureKind::Cancelled,
+        throw VastBridgeError(error.reason() == mmltk::frameworks::process::CapturedChildAbortReason::TimedOut ? VastBridgeFailureKind::TimedOut
+                                                                                                               : VastBridgeFailureKind::Cancelled,
                               error.what());
     } catch (const VastBridgeError&) { throw; } catch (const std::exception& error) {
         throw VastBridgeError(VastBridgeFailureKind::Process, error.what());
@@ -250,7 +203,6 @@ std::string run_vast_bridge_command(const VastBridgeConfig& config, const std::v
     }
     return trim_copy(captured.output);
 }
-
 template <typename Result, typename Function>
 Result with_local_vast_invocation(Function&& function) {
     const int descriptor = ::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -261,7 +213,6 @@ Result with_local_vast_invocation(Function&& function) {
         .cancellation_fd = cancellation_fd.get(),
     });
 }
-
 template <typename Function>
 void with_local_vast_invocation(Function&& function) {
     with_local_vast_invocation<int>([&](const VastBridgeInvocation& invocation) {
@@ -269,7 +220,6 @@ void with_local_vast_invocation(Function&& function) {
         return 0;
     });
 }
-
 template <typename Function>
 decltype(auto) classify_parse_failure(Function&& function) {
     try {
@@ -278,7 +228,6 @@ decltype(auto) classify_parse_failure(Function&& function) {
         throw VastBridgeError(VastBridgeFailureKind::Parse, error.what());
     }
 }
-
 std::string normalize_log_output(std::string_view payload) {
     std::istringstream input{std::string(payload)};
     std::string output;
@@ -290,7 +239,6 @@ std::string normalize_log_output(std::string_view payload) {
     }
     return trim_copy(output);
 }
-
 void expect_vast_action_success(std::string_view payload, const std::string_view context) {
     const json parsed = parse_json_payload(payload, context);
     if (!parsed.is_object()) { throw std::runtime_error(std::string(context) + " must be a JSON object"); }
@@ -299,33 +247,22 @@ void expect_vast_action_success(std::string_view payload, const std::string_view
         throw VastBridgeError(VastBridgeFailureKind::Api, std::string(context) + (message.empty() ? " failed" : ": " + message));
     }
 }
-
 }  // namespace
-
 VastBridgeError::VastBridgeError(const VastBridgeFailureKind kind, const std::string& message) : std::runtime_error(message), kind_(kind) {}
-
 VastBridgeFailureKind VastBridgeError::kind() const noexcept { return kind_; }
-
 const char* remote_gpu_family_label(const mmltk::controller::contracts::ProviderGpuFamily family) {
     switch (family) {
-        case mmltk::controller::contracts::ProviderGpuFamily::A100:
-            return "A100";
-        case mmltk::controller::contracts::ProviderGpuFamily::B200:
-            return "B200";
-        case mmltk::controller::contracts::ProviderGpuFamily::H100:
-            return "H100";
-        case mmltk::controller::contracts::ProviderGpuFamily::H200:
-            return "H200";
-        case mmltk::controller::contracts::ProviderGpuFamily::LSeries:
-            return "L Series";
+        case mmltk::controller::contracts::ProviderGpuFamily::A100: return "A100";
+        case mmltk::controller::contracts::ProviderGpuFamily::B200: return "B200";
+        case mmltk::controller::contracts::ProviderGpuFamily::H100: return "H100";
+        case mmltk::controller::contracts::ProviderGpuFamily::H200: return "H200";
+        case mmltk::controller::contracts::ProviderGpuFamily::LSeries: return "L Series";
     }
     return "Unknown";
 }
-
 std::string summarize_selected_remote_gpu_families(const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& families) {
     return std::to_string(families.size()) + " families selected";
 }
-
 std::vector<VastRawOffer> parse_vast_offer_payload(std::string_view payload) {
     const json parsed = parse_json_payload(payload, "Vast offer payload");
     const std::vector<json> offer_objects = extract_offer_objects(parsed);
@@ -348,7 +285,6 @@ std::vector<VastRawOffer> parse_vast_offer_payload(std::string_view payload) {
     }
     return offers;
 }
-
 VastLaunchTemplateOptions parse_vast_launch_template(std::string_view template_text) {
     VastLaunchTemplateOptions options;
     const std::string trimmed = trim_copy(template_text);
@@ -357,10 +293,8 @@ VastLaunchTemplateOptions parse_vast_launch_template(std::string_view template_t
         options.template_hash = trimmed;
         return options;
     }
-
     const json parsed = parse_json_payload(trimmed, "Vast launch template");
     if (!parsed.is_object()) { throw std::runtime_error("Vast launch template must be a JSON object"); }
-
     for (auto it = parsed.begin(); it != parsed.end(); ++it) {
         const std::string& key = it.key();
         const json& value = *it;
@@ -472,16 +406,13 @@ VastLaunchTemplateOptions parse_vast_launch_template(std::string_view template_t
             options.template_hash = value.get<std::string>();
             continue;
         }
-
         throw std::runtime_error("unsupported Vast launch template field: " + key);
     }
     return options;
 }
-
 VastCreateInstanceResult parse_vast_create_instance_payload(std::string_view payload) {
     const json parsed = parse_json_payload(payload, "Vast create-instance payload");
     if (!parsed.is_object()) { throw std::runtime_error("Vast create-instance payload must be a JSON object"); }
-
     VastCreateInstanceResult result;
     result.success = json_bool_or_default(parsed, "success");
     result.offer_id = json_int_or_default(parsed, "ask_id");
@@ -494,7 +425,6 @@ VastCreateInstanceResult parse_vast_create_instance_payload(std::string_view pay
     if (result.instance_id <= 0) { throw std::runtime_error("Vast create-instance payload is missing `new_contract`"); }
     return result;
 }
-
 VastInstanceInfo parse_vast_instance_payload(std::string_view payload) {
     const json parsed = parse_json_payload(payload, "Vast instance payload");
     if (!parsed.is_object()) { throw std::runtime_error("Vast instance payload must be a JSON object"); }
@@ -502,7 +432,6 @@ VastInstanceInfo parse_vast_instance_payload(std::string_view payload) {
     if (instance.instance_id <= 0) { throw std::runtime_error("Vast instance payload is missing `id`"); }
     return instance;
 }
-
 std::vector<VastInstanceInfo> parse_vast_instances_payload(std::string_view payload) {
     const json parsed = parse_json_payload(payload, "Vast instances payload");
     const std::vector<json> instance_objects = extract_instance_objects(parsed);
@@ -514,7 +443,6 @@ std::vector<VastInstanceInfo> parse_vast_instances_payload(std::string_view payl
     }
     return instances;
 }
-
 std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& offers,
                                                const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families,
                                                const std::size_t result_limit, const int min_gpus) {
@@ -530,7 +458,6 @@ std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& 
         summary.family = *family;
         filtered.push_back(std::move(summary));
     }
-
     std::ranges::sort(filtered, [](const VastOfferSummary& lhs, const VastOfferSummary& rhs) {
         if (lhs.dlperf_usd != rhs.dlperf_usd) { return lhs.dlperf_usd > rhs.dlperf_usd; }
         if (lhs.dlperf != rhs.dlperf) { return lhs.dlperf > rhs.dlperf; }
@@ -538,11 +465,9 @@ std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& 
         if (lhs.reliability != rhs.reliability) { return lhs.reliability > rhs.reliability; }
         return lhs.offer_id < rhs.offer_id;
     });
-
     if (filtered.size() > result_limit) { filtered.resize(result_limit); }
     return filtered;
 }
-
 VastBridgeConfig make_vast_bridge_config(const std::string_view api_key) {
     VastBridgeConfig config;
     config.python_executable = default_vast_python_executable();
@@ -550,19 +475,16 @@ VastBridgeConfig make_vast_bridge_config(const std::string_view api_key) {
     config.api_key = std::string(api_key);
     return config;
 }
-
 VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, const int offer_id, const std::string_view image,
                                               const VastLaunchTemplateOptions& options) {
     return with_local_vast_invocation<VastCreateInstanceResult>(
         [&](const VastBridgeInvocation& invocation) { return create_vast_instance(config, offer_id, image, options, invocation); });
 }
-
 VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, const int offer_id, const std::string_view image,
                                               const VastLaunchTemplateOptions& options, const VastBridgeInvocation& invocation) {
     require_vast_api_key(config, "remote Vast instance creation");
     if (offer_id <= 0) { throw std::runtime_error("remote Vast instance creation requires a positive offer id"); }
     if (image.empty()) { throw std::runtime_error("remote Vast instance creation requires a container image"); }
-
     std::vector<std::string> bridge_args{
         "create-instance",
         std::to_string(offer_id),
@@ -593,44 +515,36 @@ VastCreateInstanceResult create_vast_instance(const VastBridgeConfig& config, co
         bridge_args.emplace_back("--args");
         bridge_args.insert(bridge_args.end(), options.args.begin(), options.args.end());
     }
-
     const std::string output = run_vast_bridge_command(config, bridge_args, invocation);
     return classify_parse_failure([&] { return parse_vast_create_instance_payload(output); });
 }
-
 VastInstanceInfo show_vast_instance(const VastBridgeConfig& config, const int instance_id) {
     return with_local_vast_invocation<VastInstanceInfo>(
         [&](const VastBridgeInvocation& invocation) { return show_vast_instance(config, instance_id, invocation); });
 }
-
 VastInstanceInfo show_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) {
     require_vast_api_key(config, "remote Vast instance lookup");
     if (instance_id <= 0) { throw std::runtime_error("remote Vast instance lookup requires a positive instance id"); }
     const std::string output = run_vast_bridge_command(config, {"show-instance", std::to_string(instance_id)}, invocation);
     return classify_parse_failure([&] { return parse_vast_instance_payload(output); });
 }
-
 std::vector<VastInstanceInfo> show_vast_instances(const VastBridgeConfig& config) {
     return with_local_vast_invocation<std::vector<VastInstanceInfo>>(
         [&](const VastBridgeInvocation& invocation) { return show_vast_instances(config, invocation); });
 }
-
 std::vector<VastInstanceInfo> show_vast_instances(const VastBridgeConfig& config, const VastBridgeInvocation& invocation) {
     require_vast_api_key(config, "remote Vast instance listing");
     const std::string output = run_vast_bridge_command(config, {"show-instances"}, invocation);
     return classify_parse_failure([&] { return parse_vast_instances_payload(output); });
 }
-
 std::string fetch_vast_instance_logs(const VastBridgeConfig& config, const int instance_id, const std::optional<std::size_t> tail_lines) {
     return with_local_vast_invocation<std::string>(
         [&](const VastBridgeInvocation& invocation) { return fetch_vast_instance_logs(config, instance_id, tail_lines, invocation); });
 }
-
 std::string fetch_vast_instance_logs(const VastBridgeConfig& config, const int instance_id, const std::optional<std::size_t> tail_lines,
                                      const VastBridgeInvocation& invocation) {
     require_vast_api_key(config, "remote Vast log retrieval");
     if (instance_id <= 0) { throw std::runtime_error("remote Vast log retrieval requires a positive instance id"); }
-
     std::vector<std::string> bridge_args{
         "logs",
         std::to_string(instance_id),
@@ -639,7 +553,6 @@ std::string fetch_vast_instance_logs(const VastBridgeConfig& config, const int i
         bridge_args.emplace_back("--tail");
         bridge_args.push_back(std::to_string(*tail_lines));
     }
-
     const std::string output = run_vast_bridge_command(config, bridge_args, invocation);
     return classify_parse_failure([&] {
         const json parsed = parse_json_payload(output, "Vast logs payload");
@@ -647,44 +560,35 @@ std::string fetch_vast_instance_logs(const VastBridgeConfig& config, const int i
         return normalize_log_output(json_string_or_default(parsed, "logs"));
     });
 }
-
 struct VastInstanceActionSpec {
     std::string_view context;
     std::string_view command;
     std::string_view payload;
 };
-
 inline constexpr VastInstanceActionSpec kVastStartInstance{"remote Vast instance start", "start-instance", "Vast start-instance payload"};
 inline constexpr VastInstanceActionSpec kVastStopInstance{"remote Vast instance stop", "stop-instance", "Vast stop-instance payload"};
-
-void mutate_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation,
-                          const VastInstanceActionSpec& action) {
+void mutate_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation, const VastInstanceActionSpec& action) {
     require_vast_api_key(config, action.context);
     if (instance_id <= 0) { throw std::runtime_error(std::string(action.context) + " requires a positive instance id"); }
     const std::string output = run_vast_bridge_command(config, {std::string(action.command), std::to_string(instance_id)}, invocation);
     classify_parse_failure([&] { expect_vast_action_success(output, action.payload); });
 }
-
 void start_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) {
     mutate_vast_instance(config, instance_id, invocation, kVastStartInstance);
 }
-
 void stop_vast_instance(const VastBridgeConfig& config, const int instance_id, const VastBridgeInvocation& invocation) {
     mutate_vast_instance(config, instance_id, invocation, kVastStopInstance);
 }
-
 std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
                                                 const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families) {
     return with_local_vast_invocation<std::vector<VastOfferSummary>>(
         [&](const VastBridgeInvocation& invocation) { return query_vast_offers(config, selected_families, invocation); });
 }
-
 std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
                                                 const std::vector<mmltk::controller::contracts::ProviderGpuFamily>& selected_families,
                                                 const VastBridgeInvocation& invocation) {
     require_vast_api_key(config, "remote Vast query");
     if (selected_families.empty()) { throw std::runtime_error("remote Vast query requires at least one selected GPU family"); }
-
     const std::string output = run_vast_bridge_command(config,
                                                        {
                                                            "search-offers",
@@ -696,8 +600,6 @@ std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
                                                            "dlperf_usd-",
                                                        },
                                                        invocation);
-    return classify_parse_failure(
-        [&] { return rank_vast_offers(parse_vast_offer_payload(output), selected_families, config.result_limit, config.min_gpus); });
+    return classify_parse_failure([&] { return rank_vast_offers(parse_vast_offer_payload(output), selected_families, config.result_limit, config.min_gpus); });
 }
-
 }  // namespace mmltk::controller::services

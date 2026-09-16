@@ -12,15 +12,13 @@
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/system_events.h"
 #include "src/common/system/execution_policy.h"
-
 import mmltk.backend.models.rfdetr.model_export;
-
+import mmltk.backend.models.rfdetr.inference.runtime_backend;
 namespace mmltk::controller {
 class CudaExportRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::ExportOnnxSession> {
    public:
     using CudaSessionRuntimeState::CudaSessionRuntimeState;
 };
-
 CudaExportRuntime::CudaExportRuntime(DirectComputeConfiguration configuration) : impl_(std::make_unique<Impl>(configuration)) {}
 CudaExportRuntime::~CudaExportRuntime() = default;
 contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr::ModelExportRequest operation, std::stop_token stop,
@@ -37,21 +35,18 @@ contracts::ComputeTerminal CudaExportRuntime::Run(mmltk::backend::models::rfdetr
             auto& request = std::get<ExportOnnxRequest>(operation);
             request.device_id = impl_->resources.device();
             impl_->session.Run(request, stream, stop);
-            return contracts::make_compute_terminal(
-                contracts::ComputeOperationOutcome::Succeeded, 0, 0,
-                // CLEANUP-IGNORE: ONNX export publishes its domain output path from the validated request.
-                request.output_path.string());
+            return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0, 0,
+                                                    // CLEANUP-IGNORE: ONNX export publishes its domain output path from the validated request.
+                                                    request.output_path.string());
         },
         // CLEANUP-IGNORE: Export closes its own CUDA session run independently of prediction result ownership.
         stop);
 }
-
 class ExportSystem::Impl final {
    public:
-    Impl(SettingsSystem& settings, DatasetSystem&, ModelSystem& model, ExportRuntimeFactory factory,
-         SystemEventSink<ExportSystem::event_type> events, std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
-        : settings_(settings), model_(model), factory_(std::move(factory)), events_(std::move(events)),
-          execution_(std::move(execution)) {
+    Impl(SettingsSystem& settings, DatasetSystem&, ModelSystem& model, ExportRuntimeFactory factory, SystemEventSink<ExportSystem::event_type> events,
+         std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
+        : settings_(settings), model_(model), factory_(std::move(factory)), events_(std::move(events)), execution_(std::move(execution)) {
         if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
     }
     ~Impl() { Shutdown(); }
@@ -62,13 +57,10 @@ class ExportSystem::Impl final {
         auto prepared = subsystems::system::ComputeIntentMaterializer::Export(settings.settings, {}, selection);
         if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);
         run_.Start({
-            .policy = execution_ ? std::optional<mmltk::common::system::ExecutionPolicyRequest>{{execution_->placement.cpus,
-                                                                                                 {},
-                                                                                                 0,
-                                                                                                 execution_->placement.numa_node,
-                                                                                                 -10,
-                                                                                                 false}}
-                                 : std::nullopt,
+            .policy = execution_
+                          ? std::optional<
+                                mmltk::common::system::ExecutionPolicyRequest>{{execution_->placement.cpus, {}, 0, execution_->placement.numa_node, -10, false}}
+                          : std::nullopt,
             .prepare =
                 [this] {
                     std::scoped_lock lock(mutex_);
@@ -76,18 +68,19 @@ class ExportSystem::Impl final {
                     if (!next) throw contracts::FailedError("compute operation generation exhausted");
                     contracts::begin_compute(state_, *next, {});
                 },
-            .work = [this, prepared = std::move(prepared)](
-                        const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+            .work = [this, prepared = std::move(prepared)](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
                 contracts::ComputeTerminal terminal;
                 bool failed = false;
                 std::atomic_bool malformed_progress = false;
                 try {
-                    if (stop.stop_requested())
-                        return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
+                    if (stop.stop_requested()) return Complete(contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled));
                     if (!runtime_) runtime_ = factory_();
                     if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
                     const auto progress = [this, &malformed_progress](const contracts::ComputeProgress& p) {
-                        if (!p.valid()) { malformed_progress.store(true, std::memory_order_relaxed); return; }
+                        if (!p.valid()) {
+                            malformed_progress.store(true, std::memory_order_relaxed);
+                            return;
+                        }
                         Progress(p);
                     };
                     terminal = runtime_->Run(std::move(*prepared), stop, progress);
@@ -163,7 +156,4 @@ contracts::ComputeUiState ExportSystem::Start(contracts::ExportWorkflowIntent) {
 contracts::ComputeUiState ExportSystem::Stop() noexcept { return impl_->Stop(); }
 void ExportSystem::Shutdown() noexcept { impl_->Shutdown(); }
 contracts::ComputeUiState ExportSystem::snapshot() const { return impl_->snapshot(); }
-
-
-
 }  // namespace mmltk::controller

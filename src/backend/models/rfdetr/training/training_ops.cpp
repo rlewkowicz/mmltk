@@ -1,23 +1,17 @@
 #include <torch/torch.h>
-
 #include <algorithm>
 #include <cmath>
 #include <numbers>
 #include <stdexcept>
 #include <vector>
-
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/frameworks/gpu/cuda_device_scope.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "torch_api.h"
 #include "torch_cuda_utils.h"
-
 #include "detail/training_ops_private.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 namespace torch_cuda = mmltk::backend::ml::cuda;
-
 void distributed_all_reduce_tensor(const DistributedContext& distributed, torch::Tensor& tensor) {
     if (!distributed.enabled) { return; }
 #if defined(USE_C10D_NCCL)
@@ -29,16 +23,13 @@ void distributed_all_reduce_tensor(const DistributedContext& distributed, torch:
     throw std::runtime_error("distributed RF-DETR training requires a LibTorch build with NCCL/c10d enabled");
 #endif
 }
-
 WaveTargetNormalizer::WaveTargetNormalizer(const std::size_t lanes, const int device_id, const DistributedContext& distributed)
     : host_counts_(lanes, 0), published_(lanes, false), device_id_(device_id), distributed_(&distributed) {
     if (lanes == 0) { throw std::invalid_argument("RF-DETR target normalizer wave requires at least one lane"); }
     mmltk::frameworks::gpu::CudaDeviceScope scope(device_id_);
-    mmltk::frameworks::gpu::ensure_cuda_ok(
-        scope ? scope.FinalizeStatus(cudaEventCreateWithFlags(&ready_, cudaEventDisableTiming)) : scope.Finalize(),
-        "create RF-DETR target normalizer event");
+    mmltk::frameworks::gpu::ensure_cuda_ok(scope ? scope.FinalizeStatus(cudaEventCreateWithFlags(&ready_, cudaEventDisableTiming)) : scope.Finalize(),
+                                           "create RF-DETR target normalizer event");
 }
-
 WaveTargetNormalizer::~WaveTargetNormalizer() noexcept {
     if (ready_ != nullptr) {
         mmltk::frameworks::gpu::CudaDeviceScope scope(device_id_);
@@ -46,19 +37,15 @@ WaveTargetNormalizer::~WaveTargetNormalizer() noexcept {
         static_cast<void>(scope.FinalizeStatus(status));
     }
 }
-
 void WaveTargetNormalizer::publish(const std::size_t lane, const std::int64_t target_count) {
     std::lock_guard lock(mutex_);
     rethrow_failure_locked();
-    if (lane >= host_counts_.size() || published_[lane] || target_count < 0) {
-        throw std::runtime_error("invalid RF-DETR target normalizer lane publication");
-    }
+    if (lane >= host_counts_.size() || published_[lane] || target_count < 0) { throw std::runtime_error("invalid RF-DETR target normalizer lane publication"); }
     host_counts_[lane] = target_count;
     published_[lane] = true;
     ++published_count_;
     condition_.notify_all();
 }
-
 void WaveTargetNormalizer::resolve(const DistributedContext& distributed, const torch::Device& device) {
     try {
         {
@@ -87,7 +74,6 @@ void WaveTargetNormalizer::resolve(const DistributedContext& distributed, const 
         throw;
     }
 }
-
 DeviceLossNormalizer WaveTargetNormalizer::consume(const std::size_t lane, const cudaStream_t stream) {
     {
         std::unique_lock lock(mutex_);
@@ -99,7 +85,6 @@ DeviceLossNormalizer WaveTargetNormalizer::consume(const std::size_t lane, const
     device_counts_.record_stream(torch_cuda::getStreamFromExternal(stream, torch_cuda::checked_device_index(device_id_)));
     return {device_counts_.select(0, static_cast<std::int64_t>(lane))};
 }
-
 void WaveTargetNormalizer::fail(std::exception_ptr failure) noexcept {
     bool abort_distributed = false;
     {
@@ -119,18 +104,11 @@ void WaveTargetNormalizer::fail(std::exception_ptr failure) noexcept {
 #endif
     }
 }
-
 void WaveTargetNormalizer::rethrow_failure_locked() const {
     if (failure_) { std::rethrow_exception(failure_); }
 }
-
-GradScaler::GradScaler(const bool enabled, const float init_scale, const float growth_factor, const float backoff_factor,
-                       const int growth_interval)
-    : enabled_(enabled),
-      scale_(init_scale),
-      growth_factor_(growth_factor),
-      backoff_factor_(backoff_factor),
-      growth_interval_(growth_interval) {}
+GradScaler::GradScaler(const bool enabled, const float init_scale, const float growth_factor, const float backoff_factor, const int growth_interval)
+    : enabled_(enabled), scale_(init_scale), growth_factor_(growth_factor), backoff_factor_(backoff_factor), growth_interval_(growth_interval) {}
 torch::Tensor GradScaler::scale(const torch::Tensor& loss) { return enabled_ ? loss * scale_ : loss; }
 void GradScaler::update(const bool found_inf) {
     if (!enabled_) return;

@@ -1,15 +1,12 @@
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/frameworks/gpu/image_workspace.h"
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
 #include <string_view>
-
 namespace mmltk::controller {
-
 void observe_workspace_storage(contracts::DiagnosticContext& context, const mmltk::frameworks::gpu::ImageWorkspace& workspace) noexcept {
     context.workspace.workspace_allocation = workspace.identity();
     context.workspace.workspace_width = workspace.layout().width;
@@ -20,7 +17,6 @@ void observe_workspace_storage(contracts::DiagnosticContext& context, const mmlt
     context.workspace_progress.workspace_admitted = workspace.admitted();
     context.workspace_progress.workspace_write_available = workspace.WriteAvailable();
 }
-
 contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservation& observation) noexcept {
     const auto& frame = observation.frame;
     return {
@@ -37,7 +33,6 @@ contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservati
         .content_height = frame.content.height,
     };
 }
-
 services::RuntimeDiagnosticFact visual_runtime_diagnostic(const VisualDiagnosticFact fact) noexcept {
     return {
         .owner = fact.system,
@@ -50,7 +45,6 @@ services::RuntimeDiagnosticFact visual_runtime_diagnostic(const VisualDiagnostic
         .message = fact.failure_detail,
     };
 }
-
 std::string visual_failure_detail(const std::exception_ptr failure, const std::string_view fallback) {
     std::string_view detail = fallback;
     try {
@@ -101,7 +95,6 @@ std::string visual_failure_detail(const std::exception_ptr failure, const std::s
     }
     return {bounded.data(), size};
 }
-
 void report_visual_worker_failure(const VisualDiagnosticSink diagnostics, const contracts::DiagnosticOwner system, const int device,
                                   const std::string_view detail, const std::uint64_t generation) noexcept {
     diagnostics.Emit([&] {
@@ -114,5 +107,4 @@ void report_visual_worker_failure(const VisualDiagnosticSink diagnostics, const 
         };
     });
 }
-
 }  // namespace mmltk::controller

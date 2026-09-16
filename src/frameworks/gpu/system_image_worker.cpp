@@ -1,8 +1,6 @@
 #include "src/frameworks/gpu/system_image_worker.h"
-
 #include <stdexcept>
 #include <utility>
-
 namespace mmltk::frameworks::gpu {
 SystemImageWorker::SystemImageWorker(Cycle cycle, FailureSink failures, Cleanup cleanup)
     : cycle_(cycle ? std::move(cycle) : throw std::invalid_argument("system image worker cycle is unavailable")),
@@ -10,7 +8,6 @@ SystemImageWorker::SystemImageWorker(Cycle cycle, FailureSink failures, Cleanup 
       cleanup_(std::move(cleanup)),
       worker_([this](const std::stop_token stop) { Run(stop); }) {}
 SystemImageWorker::~SystemImageWorker() { RequestStop(); }
-
 void SystemImageWorker::Wake() noexcept {
     {
         std::scoped_lock lock(wait_mutex_);
@@ -18,7 +15,6 @@ void SystemImageWorker::Wake() noexcept {
     }
     wait_ready_.notify_one();
 }
-
 void SystemImageWorker::WakeAt(const std::chrono::steady_clock::time_point deadline) noexcept {
     {
         std::scoped_lock lock(wait_mutex_);
@@ -26,7 +22,6 @@ void SystemImageWorker::WakeAt(const std::chrono::steady_clock::time_point deadl
     }
     wait_ready_.notify_one();
 }
-
 void SystemImageWorker::RequestStop() noexcept {
     {
         std::scoped_lock lock(wait_mutex_);
@@ -35,11 +30,8 @@ void SystemImageWorker::RequestStop() noexcept {
     worker_.request_stop();
     wait_ready_.notify_all();
 }
-
 void SystemImageWorker::WaitStopped() noexcept { stopped_.wait(false, std::memory_order_acquire); }
-
 bool SystemImageWorker::stopped() const noexcept { return stopped_.load(std::memory_order_acquire); }
-
 void SystemImageWorker::Run(const std::stop_token stop) {
     while (!stop.stop_requested()) {
         {
@@ -83,5 +75,4 @@ void SystemImageWorker::Run(const std::stop_token stop) {
     stopped_.store(true, std::memory_order_release);
     stopped_.notify_all();
 }
-
 }  // namespace mmltk::frameworks::gpu

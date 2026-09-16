@@ -1,6 +1,5 @@
 #include "detail/benchmark_catalog.h"
 #include "src/backend/data/catalog/coco_catalog.h"
-
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -8,13 +7,9 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 #include "src/backend/data/benchmark_dataset_compiler.h"
-
 namespace mmltk::backend::data::benchmark_internal {
-
 namespace {
-
 constexpr auto kCocoMappings = [] {
     std::array<NumericCategoryMapping, catalog::kCocoCategories.size()> mappings{};
     for (std::size_t index = 0; index < mappings.size(); ++index) {
@@ -23,7 +18,6 @@ constexpr auto kCocoMappings = [] {
     }
     return mappings;
 }();
-
 constexpr std::array<NumericCategoryMapping, 102> kObjects365Mappings{{
     {1, 0, "Person"},
     {3, 56, "Chair"},
@@ -128,7 +122,6 @@ constexpr std::array<NumericCategoryMapping, 102> kObjects365Mappings{{
     {320, 14, "Parrot"},
     {329, 78, "Hair Dryer"},
 }};
-
 constexpr std::array<StringCategoryMapping, 132> kOpenImagesMappings{{
     {"/m/01g317", 0, "Person"},
     {"/m/01bl7v", 0, "Boy"},
@@ -263,7 +256,6 @@ constexpr std::array<StringCategoryMapping, 132> kOpenImagesMappings{{
     {"/m/03wvsk", 78, "Hair dryer"},
     {"/m/012xff", 79, "Toothbrush"},
 }};
-
 constexpr std::array<std::uint64_t, 51> kObjects365TrainShardSizes{
     3850237397ULL, 3835218513ULL, 3851635927ULL, 3698690868ULL, 3706974043ULL, 3668334883ULL, 3683660250ULL, 3668268422ULL, 3686130235ULL,
     3726836684ULL, 3665281260ULL, 3781111049ULL, 4193078792ULL, 4139575052ULL, 4166963795ULL, 3471483977ULL, 8305870133ULL, 8196642348ULL,
@@ -272,16 +264,11 @@ constexpr std::array<std::uint64_t, 51> kObjects365TrainShardSizes{
     8304567926ULL, 8140732124ULL, 8318395028ULL, 8342761395ULL, 8209327654ULL, 8253861700ULL, 8287788214ULL, 8497016986ULL, 8460489730ULL,
     4656815126ULL, 9579677223ULL, 8857804362ULL, 9075419050ULL, 9239286405ULL, 8766215730ULL,
 };
-
 // These immutable descriptors contain string literals only and are required by
 // the noexcept catalog accessors for the lifetime of the process.
 // NOLINTBEGIN(bugprone-throwing-static-initialization)
 const CatalogArtifact kCocoAnnotations{
-    "coco-2017-annotations",
-    "http://images.cocodataset.org/annotations/annotations_trainval2017.zip",
-    "annotations_trainval2017.zip",
-    252907541U,
-    "",
+    "coco-2017-annotations", "http://images.cocodataset.org/annotations/annotations_trainval2017.zip", "annotations_trainval2017.zip", 252907541U, "",
 };
 const CatalogArtifact kCocoTrain{
     "coco-2017-train-images", "http://images.cocodataset.org/zips/train2017.zip", "train2017.zip", 19336861798ULL, "",
@@ -313,28 +300,17 @@ const CatalogArtifact kOpenImagesClasses{
 };
 // NOLINTEND(bugprone-throwing-static-initialization)
 constexpr std::string_view kOpenImagesTrainImageUrlTemplate = "https://open-images-dataset.s3.amazonaws.com/train/{image_id_hex}.jpg";
-
 }  // namespace
-
 const std::array<std::string_view, 80>& coco80_class_names() noexcept { return catalog::kCocoNames; }
-
 std::span<const NumericCategoryMapping> coco_category_mappings() noexcept { return kCocoMappings; }
-
 std::span<const NumericCategoryMapping> objects365_category_mappings() noexcept { return kObjects365Mappings; }
-
 std::span<const StringCategoryMapping> open_images_category_mappings() noexcept { return kOpenImagesMappings; }
-
 const CatalogArtifact& coco_annotations_artifact() noexcept { return kCocoAnnotations; }
-
 const CatalogArtifact& coco_train_images_artifact() noexcept { return kCocoTrain; }
-
 const CatalogArtifact& coco_val_images_artifact() noexcept { return kCocoVal; }
-
 const CatalogArtifact& objects365_annotations_artifact() noexcept { return kObjectsAnnotations; }
-
 std::vector<CatalogArtifact> objects365_train_image_artifacts() {
-    constexpr std::string_view kTrainBase =
-        "https://dorc.ks3-cn-beijing.ksyun.com/data-set/2020Objects365%E6%95%B0%E6%8D%AE%E9%9B%86/train/";
+    constexpr std::string_view kTrainBase = "https://dorc.ks3-cn-beijing.ksyun.com/data-set/2020Objects365%E6%95%B0%E6%8D%AE%E9%9B%86/train/";
     std::vector<CatalogArtifact> artifacts;
     artifacts.reserve(51U);
     for (std::uint32_t shard = 0U; shard < 51U; ++shard) {
@@ -349,43 +325,33 @@ std::vector<CatalogArtifact> objects365_train_image_artifacts() {
     }
     return artifacts;
 }
-
 const CatalogArtifact& open_images_boxes_artifact() noexcept { return kOpenImagesBoxes; }
-
 const CatalogArtifact& open_images_classes_artifact() noexcept { return kOpenImagesClasses; }
-
 std::string_view open_images_train_image_url_template() noexcept { return kOpenImagesTrainImageUrlTemplate; }
-
 std::string open_images_train_image_url(const std::uint64_t image_id) {
     std::array<char, 17> encoded{};
     (void)std::snprintf(encoded.data(), encoded.size(), "%016llx", static_cast<unsigned long long>(image_id));
     return "https://open-images-dataset.s3.amazonaws.com/train/" + std::string(encoded.data()) + ".jpg";
 }
-
 struct BenchmarkSourceDescriptor {
     std::string_view name;
     std::string_view version;
 };
-
 inline constexpr std::array kBenchmarkSourceDescriptors{
     BenchmarkSourceDescriptor{"coco", "2017"},
     BenchmarkSourceDescriptor{"objects365", "v2-2020"},
     BenchmarkSourceDescriptor{"open-images", "v7-bboxes-v6"},
 };
-
 [[nodiscard]] const BenchmarkSourceDescriptor* benchmark_source_descriptor(const BenchmarkDatasetSource source) noexcept {
     const std::size_t index = static_cast<std::size_t>(source);
     return index < kBenchmarkSourceDescriptors.size() ? &kBenchmarkSourceDescriptors[index] : nullptr;
 }
-
 std::string_view benchmark_source_name(const BenchmarkDatasetSource source) noexcept {
     const BenchmarkSourceDescriptor* descriptor = benchmark_source_descriptor(source);
     return descriptor != nullptr ? descriptor->name : "unknown";
 }
-
 std::string_view benchmark_source_version(const BenchmarkDatasetSource source) noexcept {
     const BenchmarkSourceDescriptor* descriptor = benchmark_source_descriptor(source);
     return descriptor != nullptr ? descriptor->version : "unknown";
 }
-
 }  // namespace mmltk::backend::data::benchmark_internal

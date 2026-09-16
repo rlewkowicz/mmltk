@@ -51,8 +51,7 @@ fn y_axis_label<'a, M: 'a>(label: &'a str, size: f32, color: Color) -> Element<'
     container(text(label).size(size).color(color).wrapping(Wrapping::Word))
         .align_x(Horizontal::Left)
         .align_y(Vertical::Center)
-        .width(Length::Shrink)
-        .max_width(100.0)
+        .width(Length::Shrink.max(100.0))
         .height(Length::Fill)
         .into()
 }

@@ -1,45 +1,33 @@
 #pragma once
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
-
 #include "src/frameworks/reflection/reflected_field_policy.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 enum class TrainOptimizerKind : std::uint8_t {
     AdamW,
     Muon,
 };
-
 enum class TrainLrSchedulerKind : std::uint8_t {
     Step,
     Cosine,
 };
-
 [[nodiscard]] constexpr std::string_view cli_enum_spelling(const TrainOptimizerKind optimizer) noexcept {
     switch (optimizer) {
-        case TrainOptimizerKind::AdamW:
-            return "adamw";
-        case TrainOptimizerKind::Muon:
-            return "muon";
+        case TrainOptimizerKind::AdamW: return "adamw";
+        case TrainOptimizerKind::Muon: return "muon";
     }
     return {};
 }
-
 [[nodiscard]] constexpr std::string_view cli_enum_spelling(const TrainLrSchedulerKind scheduler) noexcept {
     switch (scheduler) {
-        case TrainLrSchedulerKind::Step:
-            return "step";
-        case TrainLrSchedulerKind::Cosine:
-            return "cosine";
+        case TrainLrSchedulerKind::Step: return "step";
+        case TrainLrSchedulerKind::Cosine: return "cosine";
     }
     return {};
 }
-
 [[nodiscard]] constexpr std::optional<TrainLrSchedulerKind> train_lr_scheduler_from_spelling(const std::string_view spelling) noexcept {
     constexpr std::array candidates{TrainLrSchedulerKind::Step, TrainLrSchedulerKind::Cosine};
     for (const TrainLrSchedulerKind candidate : candidates) {
@@ -47,7 +35,6 @@ enum class TrainLrSchedulerKind : std::uint8_t {
     }
     return std::nullopt;
 }
-
 struct TrainRecipeCatalogEntry final {
     TrainOptimizerKind optimizer = TrainOptimizerKind::AdamW;
     double lr = 1.0e-4;
@@ -63,11 +50,9 @@ struct TrainRecipeCatalogEntry final {
     TrainLrSchedulerKind lr_scheduler = TrainLrSchedulerKind::Step;
     constexpr bool operator==(const TrainRecipeCatalogEntry&) const noexcept = default;
 };
-
 MMLTK_REFLECT_ENUM(TrainOptimizerKind)
 MMLTK_REFLECT_ENUM(TrainLrSchedulerKind)
 MMLTK_REFLECT_FIELDS(TrainRecipeCatalogEntry)
-
 inline constexpr std::array<TrainRecipeCatalogEntry, 2U> kTrainRecipeCatalog{{
     {.optimizer = TrainOptimizerKind::AdamW,
      .lr = 1.0e-4,
@@ -94,12 +79,11 @@ inline constexpr std::array<TrainRecipeCatalogEntry, 2U> kTrainRecipeCatalog{{
      .lr_drop = 100,
      .lr_scheduler = TrainLrSchedulerKind::Cosine},
 }};
-
 [[nodiscard]] consteval bool train_recipe_catalog_is_valid() {
     for (std::size_t index = 0U; index < kTrainRecipeCatalog.size(); ++index) {
         const auto& recipe = kTrainRecipeCatalog[index];
-        if (cli_enum_spelling(recipe.optimizer).empty() || cli_enum_spelling(recipe.lr_scheduler).empty() || recipe.lr < 0.0 ||
-            recipe.lr_encoder < 0.0 || recipe.momentum < 0.0 || recipe.momentum > 1.0 || recipe.weight_decay < 0.0)
+        if (cli_enum_spelling(recipe.optimizer).empty() || cli_enum_spelling(recipe.lr_scheduler).empty() || recipe.lr < 0.0 || recipe.lr_encoder < 0.0 ||
+            recipe.momentum < 0.0 || recipe.momentum > 1.0 || recipe.weight_decay < 0.0)
             return false;
         for (std::size_t sibling = index + 1U; sibling < kTrainRecipeCatalog.size(); ++sibling) {
             if (recipe.optimizer == kTrainRecipeCatalog[sibling].optimizer) return false;
@@ -107,30 +91,22 @@ inline constexpr std::array<TrainRecipeCatalogEntry, 2U> kTrainRecipeCatalog{{
     }
     return true;
 }
-
 static_assert(train_recipe_catalog_is_valid());
-
 [[nodiscard]] constexpr const TrainRecipeCatalogEntry& train_recipe(const TrainOptimizerKind optimizer) noexcept {
     for (const auto& recipe : kTrainRecipeCatalog) {
         if (recipe.optimizer == optimizer) return recipe;
     }
     return kTrainRecipeCatalog.front();
 }
-
 struct TrainRecipeCatalog final {
     using row_type = TrainRecipeCatalogEntry;
     // CLEANUP-IGNORE: Distinct domain catalogs intentionally implement the same reflection catalog protocol.
     static constexpr std::string_view identity = "rfdetr.train-recipes";
-
     template <class Visitor>
     static constexpr void VisitRows(Visitor&& visitor) {
-        for (std::size_t index = 0U; index < kTrainRecipeCatalog.size(); ++index)
-            visitor(kTrainRecipeCatalog[index], index);
+        for (std::size_t index = 0U; index < kTrainRecipeCatalog.size(); ++index) visitor(kTrainRecipeCatalog[index], index);
     }
-
     [[nodiscard]] static constexpr std::string_view row_key(const row_type& row) noexcept { return cli_enum_spelling(row.optimizer); }
-
     [[nodiscard]] static consteval bool valid() noexcept { return train_recipe_catalog_is_valid(); }
 };
-
 }  // namespace mmltk::backend::models::rfdetr

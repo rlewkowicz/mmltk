@@ -13,23 +13,37 @@ pub(super) struct Content {
 }
 #[derive(Clone, Default)]
 enum Prepared {
-    #[default] None,
+    #[default]
+    None,
     Prediction(Arc<super::labels::PredictionContent>),
     Validation(Arc<super::labels::ValidationContent>),
 }
 impl Content {
     pub(super) fn gallery(&self) -> Option<&Arc<generated::ExploreImageMetadata>> {
         match self.product.as_ref()? {
-            WorkspaceImageProduct::Explore(value) if value.mode == generated::ExploreMode::Gallery => Some(value),
+            WorkspaceImageProduct::Explore(value)
+                if value.mode == generated::ExploreMode::Gallery =>
+            {
+                Some(value)
+            }
             _ => None,
         }
     }
     pub(super) fn detail(&self) -> Option<DetailContent> {
         match self.product.as_ref()? {
-            WorkspaceImageProduct::Explore(value) if value.mode == generated::ExploreMode::Detail =>
-                Some(DetailContent { explore: value.clone(), upscale: None }),
+            WorkspaceImageProduct::Explore(value)
+                if value.mode == generated::ExploreMode::Detail =>
+            {
+                Some(DetailContent {
+                    explore: value.clone(),
+                    upscale: None,
+                })
+            }
             WorkspaceImageProduct::Upscale(value) => match self.source.as_ref()? {
-                WorkspaceImageProduct::Explore(source) => Some(DetailContent { explore: source.clone(), upscale: Some(value.clone()) }),
+                WorkspaceImageProduct::Explore(source) => Some(DetailContent {
+                    explore: source.clone(),
+                    upscale: Some(value.clone()),
+                }),
                 _ => None,
             },
             _ => None,
@@ -37,25 +51,45 @@ impl Content {
     }
     pub(super) fn annotation(&self) -> Option<AnnotationContent> {
         match self.product.as_ref()? {
-            WorkspaceImageProduct::Annotation(value) => Some(AnnotationContent { metadata: value.clone() }),
+            WorkspaceImageProduct::Annotation(value) => Some(AnnotationContent {
+                metadata: value.clone(),
+            }),
             _ => None,
         }
     }
     pub(super) fn prediction(&self) -> Option<Arc<super::labels::PredictionContent>> {
-        match &self.prepared { Prepared::Prediction(value) => Some(value.clone()), _ => None }
+        match &self.prepared {
+            Prepared::Prediction(value) => Some(value.clone()),
+            _ => None,
+        }
     }
     pub(super) fn validation(&self) -> Option<Arc<super::labels::ValidationContent>> {
-        match &self.prepared { Prepared::Validation(value) => Some(value.clone()), _ => None }
+        match &self.prepared {
+            Prepared::Validation(value) => Some(value.clone()),
+            _ => None,
+        }
     }
     pub(super) fn from_gallery(value: Option<Arc<generated::ExploreImageMetadata>>) -> Self {
-        Self { product: value.map(WorkspaceImageProduct::Explore), ..Default::default() }
+        Self {
+            product: value.map(WorkspaceImageProduct::Explore),
+            ..Default::default()
+        }
     }
     #[cfg(test)]
     pub(super) fn from_detail(value: Option<DetailContent>) -> Self {
-        let Some(value) = value else { return Self::default(); };
+        let Some(value) = value else {
+            return Self::default();
+        };
         match value.upscale {
-            Some(upscale) => Self { product: Some(WorkspaceImageProduct::Upscale(upscale)), source: Some(WorkspaceImageProduct::Explore(value.explore)), prepared: Prepared::None },
-            None => Self { product: Some(WorkspaceImageProduct::Explore(value.explore)), ..Default::default() },
+            Some(upscale) => Self {
+                product: Some(WorkspaceImageProduct::Upscale(upscale)),
+                source: Some(WorkspaceImageProduct::Explore(value.explore)),
+                prepared: Prepared::None,
+            },
+            None => Self {
+                product: Some(WorkspaceImageProduct::Explore(value.explore)),
+                ..Default::default()
+            },
         }
     }
 }
@@ -135,34 +169,71 @@ pub(crate) fn install(
     let prepared = match &product {
         WorkspaceImageProduct::Explore(snapshot) if snapshot.frame == metadata.frame => {
             if snapshot.mode == generated::ExploreMode::Gallery {
-                if !super::gallery::valid_layout(snapshot) { return Err("invalid graphics atlas metadata".into()); }
-            } else if !valid_detail(snapshot) { return Err("invalid graphics detail metadata".into()); }
+                if !super::gallery::valid_layout(snapshot) {
+                    return Err("invalid graphics atlas metadata".into());
+                }
+            } else if !valid_detail(snapshot) {
+                return Err("invalid graphics detail metadata".into());
+            }
             Prepared::None
         }
-        WorkspaceImageProduct::Annotation(snapshot) if snapshot.frame == metadata.frame => Prepared::None,
+        WorkspaceImageProduct::Annotation(snapshot) if snapshot.frame == metadata.frame => {
+            Prepared::None
+        }
         WorkspaceImageProduct::Upscale(snapshot) if snapshot.frame == metadata.frame => {
-            let Some(WorkspaceImageProduct::Explore(source)) = &source else { return Err("missing graphics detail source metadata".into()); };
-            if source.frame != snapshot.input || !valid_detail(source) || !valid_content(&snapshot.frame) {
+            let Some(WorkspaceImageProduct::Explore(source)) = &source else {
+                return Err("missing graphics detail source metadata".into());
+            };
+            if source.frame != snapshot.input
+                || !valid_detail(source)
+                || !valid_content(&snapshot.frame)
+            {
                 return Err("graphics detail source identity mismatch".into());
             }
             Prepared::None
         }
-        WorkspaceImageProduct::Predict(snapshot) if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 =>
-            Prepared::Prediction(Arc::new(super::labels::PredictionContent::new(snapshot.clone()))),
-        WorkspaceImageProduct::Validation(snapshot) if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 => {
-            if snapshot.samples.iter().any(|sample| sample.available &&
-                (sample.identity.generation == 0 || sample.originalextent.width == 0 || sample.originalextent.height == 0 ||
-                 sample.crop.width == 0 || sample.crop.height == 0 ||
-                 sample.crop.x.checked_add(sample.crop.width).is_none_or(|end| end > snapshot.frame.extent.width) ||
-                 sample.crop.y.checked_add(sample.crop.height).is_none_or(|end| end > snapshot.frame.extent.height))) {
+        WorkspaceImageProduct::Predict(snapshot)
+            if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 =>
+        {
+            Prepared::Prediction(Arc::new(super::labels::PredictionContent::new(
+                snapshot.clone(),
+            )))
+        }
+        WorkspaceImageProduct::Validation(snapshot)
+            if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 =>
+        {
+            if snapshot.samples.iter().any(|sample| {
+                sample.available
+                    && (sample.identity.generation == 0
+                        || sample.originalextent.width == 0
+                        || sample.originalextent.height == 0
+                        || sample.crop.width == 0
+                        || sample.crop.height == 0
+                        || sample
+                            .crop
+                            .x
+                            .checked_add(sample.crop.width)
+                            .is_none_or(|end| end > snapshot.frame.extent.width)
+                        || sample
+                            .crop
+                            .y
+                            .checked_add(sample.crop.height)
+                            .is_none_or(|end| end > snapshot.frame.extent.height))
+            }) {
                 return Err("invalid validation sample image geometry".into());
             }
-            Prepared::Validation(Arc::new(super::labels::ValidationContent::new(snapshot.clone())))
+            Prepared::Validation(Arc::new(super::labels::ValidationContent::new(
+                snapshot.clone(),
+            )))
         }
         WorkspaceImageProduct::Live(snapshot) if snapshot.frame == metadata.frame => Prepared::None,
         _ => return Err("graphics metadata does not describe this visual product".into()),
     };
-    let content = Content { product: Some(product), source, prepared };
+    let content = Content {
+        product: Some(product),
+        source,
+        prepared,
+    };
     let surface = Surface {
         high: frame.high,
         low: frame.low,
@@ -170,9 +241,16 @@ pub(crate) fn install(
         height,
         frame: Some(frame),
         crop: None,
-        viewer_identity: content.prediction().as_ref().map(|content|
-            (frame.content_session, content.metadata.contentidentity)).or_else(|| content.validation().as_ref().map(|content|
-            (frame.content_session, content.metadata.contentidentity))),
+        viewer_identity: content
+            .prediction()
+            .as_ref()
+            .map(|content| (frame.content_session, content.metadata.contentidentity))
+            .or_else(|| {
+                content
+                    .validation()
+                    .as_ref()
+                    .map(|content| (frame.content_session, content.metadata.contentidentity))
+            }),
         fit_revision: 0,
     };
     let placement = content.gallery().map_or(Placement::Contain, |snapshot| {
@@ -325,17 +403,29 @@ mod tests {
         let product = crate::view_model::test_support::validation_image_metadata();
         let frame = crate::view_model::test_support::physical_frame(
             generated::presentation_source_session(generated::PresentationSourceKind::Validation),
-            product.frame.revision, 1, product.frame.extent.width, product.frame.extent.height);
-        let bytes = encode(product.frame.clone(), encode_product(generated::ApplicationSystem::Validation, product), None);
+            product.frame.revision,
+            1,
+            product.frame.extent.width,
+            product.frame.extent.height,
+        );
+        let bytes = encode(
+            product.frame.clone(),
+            encode_product(generated::ApplicationSystem::Validation, product),
+            None,
+        );
         install(frame, frame.content_width, frame.content_height, 1, &bytes).unwrap();
         let surface = surface(frame).unwrap();
         assert!(super::super::drawable_validation(surface).is_none());
         assert!(super::super::accept_publication(frame));
-        let (_, first) = super::super::drawable_validation(surface).expect("initial shader admission");
+        let (_, first) =
+            super::super::drawable_validation(surface).expect("initial shader admission");
         let (_, next) = super::super::drawable_validation(surface).unwrap();
         assert!(Arc::ptr_eq(&first, &next));
         let pending = pending(frame).unwrap();
-        let WorkspaceImageProduct::Validation(native) = pending.content.product.as_ref().unwrap() else { panic!("wrong native product") };
+        let WorkspaceImageProduct::Validation(native) = pending.content.product.as_ref().unwrap()
+        else {
+            panic!("wrong native product")
+        };
         assert!(Arc::ptr_eq(native, &first.metadata));
         assert_eq!(first.metadata.samples[0].identity.generation, 7);
         assert!(super::super::drawable_prediction(surface).is_none());

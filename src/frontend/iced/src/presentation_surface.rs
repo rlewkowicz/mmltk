@@ -586,7 +586,10 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
         || metadata::product(frame).as_ref() != Some(source)
         || detail.explore.mode != crate::generated::ExploreMode::Detail
         || detail.viewer_identity().is_none()
-        || surface.viewer_identity != detail.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image)))
+        || surface.viewer_identity
+            != detail
+                .viewer_identity()
+                .map(|(dataset, image)| (dataset, u64::from(image)))
     {
         return None;
     }
@@ -1756,7 +1759,8 @@ pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDispl
                 .and_then(|renderer| renderer.imported.as_ref())
                 .is_some_and(|imported| {
                     imported.image.retained().is_some()
-                        && (imported.image.content.gallery().is_some() || imported.image.content.detail().is_some())
+                        && (imported.image.content.gallery().is_some()
+                            || imported.image.content.detail().is_some())
                 })
         });
         // The initial accepted offer can construct the first shader owner.
@@ -1814,19 +1818,36 @@ fn drawable_content<T>(
     retained_content: impl Fn(&ImagePublication) -> Option<std::sync::Arc<T>>,
 ) -> Option<(Surface, std::sync::Arc<T>)> {
     let frame = requested.frame?;
-    if frame.content_session != crate::generated::presentation_source_session(kind) { return None; }
-    let live = LIVE_READS.with(|reads| reads.borrow().iter().flatten()
-        .filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame));
-    let incumbent = RENDERER.with(|renderer| renderer.borrow().as_ref()
-        .and_then(|renderer| renderer.imported.as_ref())
-        .is_some_and(|imported| imported.image.retained().is_some() && retained_content(&imported.image).is_some()));
+    if frame.content_session != crate::generated::presentation_source_session(kind) {
+        return None;
+    }
+    let live = LIVE_READS.with(|reads| {
+        reads
+            .borrow()
+            .iter()
+            .flatten()
+            .filter_map(std::sync::Weak::upgrade)
+            .any(|read| read.0 == frame)
+    });
+    let incumbent = RENDERER.with(|renderer| {
+        renderer
+            .borrow()
+            .as_ref()
+            .and_then(|renderer| renderer.imported.as_ref())
+            .is_some_and(|imported| {
+                imported.image.retained().is_some() && retained_content(&imported.image).is_some()
+            })
+    });
     // Admit an accepted initial offer so the first shader can acquire its read.
     // Replacements remain paired with the incumbent until their physical read exists.
     if (live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame)))))
         && let Some(pending) = metadata::pending(frame)
-        && pending.view_ready && same_allocation(requested, pending.surface)
+        && pending.view_ready
+        && same_allocation(requested, pending.surface)
         && let Some(content) = pending_content(&pending)
-    { return Some((requested, content)); }
+    {
+        return Some((requested, content));
+    }
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
@@ -1838,13 +1859,25 @@ fn drawable_content<T>(
             })
     })
 }
-pub(crate) fn drawable_prediction(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::PredictionContent>)> {
-    drawable_content(requested, crate::generated::PresentationSourceKind::Predict,
-        |pending| pending.content.prediction(), |image| image.content.prediction())
+pub(crate) fn drawable_prediction(
+    requested: Surface,
+) -> Option<(Surface, std::sync::Arc<labels::PredictionContent>)> {
+    drawable_content(
+        requested,
+        crate::generated::PresentationSourceKind::Predict,
+        |pending| pending.content.prediction(),
+        |image| image.content.prediction(),
+    )
 }
-pub(crate) fn drawable_validation(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::ValidationContent>)> {
-    drawable_content(requested, crate::generated::PresentationSourceKind::Validation,
-        |pending| pending.content.validation(), |image| image.content.validation())
+pub(crate) fn drawable_validation(
+    requested: Surface,
+) -> Option<(Surface, std::sync::Arc<labels::ValidationContent>)> {
+    drawable_content(
+        requested,
+        crate::generated::PresentationSourceKind::Validation,
+        |pending| pending.content.validation(),
+        |image| image.content.validation(),
+    )
 }
 
 pub(crate) struct Pipeline {
@@ -1910,7 +1943,9 @@ impl DetailContent {
         original: bool,
         fit_revision: u64,
     ) -> Surface {
-        surface.viewer_identity = self.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image)));
+        surface.viewer_identity = self
+            .viewer_identity()
+            .map(|(dataset, image)| (dataset, u64::from(image)));
         surface.fit_revision = fit_revision;
         surface.crop = original.then(|| {
             let region = &self.frame().content;
@@ -2861,7 +2896,11 @@ impl ImagePublication {
         } else {
             retained
         };
-        ExploreDisplay::paired(surface, self.content.gallery(), self.content.detail().as_ref())
+        ExploreDisplay::paired(
+            surface,
+            self.content.gallery(),
+            self.content.detail().as_ref(),
+        )
     }
 
     fn retained(&self) -> Option<Surface> {
@@ -2985,7 +3024,10 @@ impl Imported {
         let retained_content = self.image.content.clone();
         let retained_placement = self.image.placement;
         self.image.surface = surface;
-        self.image.content = surface.frame.and_then(metadata::pending).map_or_else(metadata::Content::default, |pending| pending.content);
+        self.image.content = surface
+            .frame
+            .and_then(metadata::pending)
+            .map_or_else(metadata::Content::default, |pending| pending.content);
         self.image.placement = placement;
         self.sample();
         self.image.surface = retained_surface;
@@ -2997,8 +3039,17 @@ impl Imported {
         let retained = self.image.surface;
         let retained_content = self.image.content.clone();
         let retained_placement = self.image.placement;
-        self.image.content = surface.frame.and_then(metadata::pending).map(|pending| pending.content)
-            .unwrap_or_else(|| if self.image.completed == surface.frame { retained_content.clone() } else { metadata::Content::default() });
+        self.image.content = surface
+            .frame
+            .and_then(metadata::pending)
+            .map(|pending| pending.content)
+            .unwrap_or_else(|| {
+                if self.image.completed == surface.frame {
+                    retained_content.clone()
+                } else {
+                    metadata::Content::default()
+                }
+            });
         self.image.placement = placement;
         self.image.surface = surface;
         self.sample();
@@ -4066,7 +4117,12 @@ mod tests {
                             original.crop,
                             Some([region.x, region.y, region.width, region.height])
                         );
-                        assert_eq!(original.viewer_identity, content.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image))));
+                        assert_eq!(
+                            original.viewer_identity,
+                            content
+                                .viewer_identity()
+                                .map(|(dataset, image)| (dataset, u64::from(image)))
+                        );
                         assert_eq!(original.fit_revision, 19);
                         assert_eq!(content.configure_surface(shown, false, 20).crop, None);
                     } else {
@@ -4137,7 +4193,12 @@ mod tests {
         assert!(physical.matches_content(detail.frame()));
         let configured = detail.configure_surface(surface, true, 2);
         assert_eq!(configured.crop, Some([8, 4, 32, 24]));
-        assert_eq!(configured.viewer_identity, detail.viewer_identity().map(|(dataset, image)| (dataset, u64::from(image))));
+        assert_eq!(
+            configured.viewer_identity,
+            detail
+                .viewer_identity()
+                .map(|(dataset, image)| (dataset, u64::from(image)))
+        );
         assert_eq!(
             detail.frame().source.kind,
             crate::generated::PresentationSourceKind::Upscale
@@ -4265,7 +4326,15 @@ mod tests {
                     .overlay
                     .showlabels = false;
                 image.reconcile_pending(next, &model);
-                assert!(image.content.detail().as_ref().unwrap().overlay().showlabels);
+                assert!(
+                    image
+                        .content
+                        .detail()
+                        .as_ref()
+                        .unwrap()
+                        .overlay()
+                        .showlabels
+                );
                 image.complete(next);
                 assert!(!image.promote(next, &model));
                 let obsolete = FrameReady {
@@ -4441,7 +4510,9 @@ mod tests {
                 }),
                 completed: Some(frame),
                 retained_read: Some(read),
-                content: metadata::Content::from_detail(metadata::pending(frame).and_then(|image| image.content.detail())),
+                content: metadata::Content::from_detail(
+                    metadata::pending(frame).and_then(|image| image.content.detail()),
+                ),
                 placement: Placement::Contain,
             };
             DRAW_AUTHORIZATION.with(|authorization| {
@@ -5845,32 +5916,52 @@ mod tests {
         let model = crate::view_model::test_support::bootstrapped();
         let mut snapshot = model.predict_snapshot.clone().unwrap();
         snapshot.contentidentity = (1_u64 << 40) + 9;
-        let session = crate::generated::presentation_source_session(crate::generated::PresentationSourceKind::Predict);
+        let session = crate::generated::presentation_source_session(
+            crate::generated::PresentationSourceKind::Predict,
+        );
         let install = |snapshot: &crate::generated::PredictSnapshot, sequence| {
             let frame = frame_ready(session, sequence, sequence, 640, 480);
             let mut product = crate::generated::PredictImageMetadata::from(snapshot);
-            product.frame = crate::view_model::test_support::visual_frame(crate::generated::PresentationSourceKind::Predict, sequence);
+            product.frame = crate::view_model::test_support::visual_frame(
+                crate::generated::PresentationSourceKind::Predict,
+                sequence,
+            );
             product.frame.extent.width = 640;
             product.frame.extent.height = 480;
             product.frame.content.width = 640;
             product.frame.content.height = 480;
-            metadata::install(frame, 640, 480, sequence, &metadata::encode(product.frame.clone(),
-                metadata::encode_product(crate::generated::ApplicationSystem::Predict, product), None)).unwrap();
+            metadata::install(
+                frame,
+                640,
+                480,
+                sequence,
+                &metadata::encode(
+                    product.frame.clone(),
+                    metadata::encode_product(crate::generated::ApplicationSystem::Predict, product),
+                    None,
+                ),
+            )
+            .unwrap();
             frame
         };
         let first = install(&snapshot, 1);
         assert!(accept_publication(first));
         let initial = metadata::pending(first).unwrap();
         let mut image = ImagePublication {
-            surface: initial.surface, completed: Some(first), pending_sample: None,
-            retained_read: SampleRead::acquire(first), content: initial.content, placement: Placement::Contain,
+            surface: initial.surface,
+            completed: Some(first),
+            pending_sample: None,
+            retained_read: SampleRead::acquire(first),
+            content: initial.content,
+            placement: Placement::Contain,
         };
         let mut viewport = ViewportOwner::default();
         viewport.synchronize_source(image.retained().unwrap());
         viewport.zoom = 2.0;
         viewport.pan_x = 17.0;
         let retained_identity = image.retained().unwrap().viewer_identity;
-        for sequence in [2, 3] { // same-image overlay or sequential video frame
+        for sequence in [2, 3] {
+            // same-image overlay or sequential video frame
             let frame = install(&snapshot, sequence);
             let paired = metadata::surface(frame).unwrap();
             assert_eq!(paired.viewer_identity, retained_identity);
@@ -5892,11 +5983,13 @@ mod tests {
         assert_eq!(viewport.transform_for(next_surface).zoom, 1.0);
         image.complete(next);
         assert!(image.promote(next, &model));
-        assert_eq!(image.retained().unwrap().viewer_identity, next_surface.viewer_identity);
+        assert_eq!(
+            image.retained().unwrap().viewer_identity,
+            next_surface.viewer_identity
+        );
         viewport.synchronize_source(image.retained().unwrap());
         assert_eq!(viewport.zoom, 1.0);
         assert_eq!(viewport.pan_x, 0.0);
         drop(image);
     }
-
 }

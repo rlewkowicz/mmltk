@@ -1,7 +1,6 @@
 #include <poll.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 #include <cerrno>
@@ -15,7 +14,6 @@
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
-
 #include "filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled_format.h"
@@ -26,7 +24,6 @@
 #include "src/controller/services/vast_client.h"
 #include "src/controller/services/vast_provider_owner.h"
 #include "test_fixture.h"
-
 namespace mmltk::controller::subsystems::system {
 namespace {
 namespace data = mmltk::backend::data;
@@ -39,11 +36,9 @@ static_assert(!std::is_constructible_v<VastProviderClient, std::uint16_t, std::u
 static_assert(!std::is_default_constructible_v<VastClient>);
 static_assert(std::is_constructible_v<VastClient, VastProviderClient>);
 static_assert(!std::is_constructible_v<VastClient, VastBridgeConfig>);
-
 class VastTestOperations final : public VastOperations {
    public:
-    std::vector<VastOfferSummary> query(const VastQueryConfig&, const std::vector<ProviderGpuFamily>&,
-                                        const VastBridgeInvocation&) const override {
+    std::vector<VastOfferSummary> query(const VastQueryConfig&, const std::vector<ProviderGpuFamily>&, const VastBridgeInvocation&) const override {
         ++queries;
         if (query_observer != nullptr) ++*query_observer;
         return offers;
@@ -88,7 +83,6 @@ class VastTestOperations final : public VastOperations {
     VastCreateInstanceResult create_result;
     bool throw_create = false, throw_start = false, throw_stop = false;
 };
-
 struct ArtifactCancellationFixture final {
     ArtifactCancellationFixture() : ArtifactCancellationFixture(ArtifactCancellationSource::Mint()) {}
     void cancel() noexcept { static_cast<void>(source.RequestCancel()); }
@@ -99,7 +93,6 @@ struct ArtifactCancellationFixture final {
     explicit ArtifactCancellationFixture(std::pair<ArtifactCancellationSource, ArtifactCancellationToken>&& pair) noexcept
         : source(std::move(pair.first)), token(std::move(pair.second)) {}
 };
-
 class ArtifactTestOperations final : public ArtifactWeightOperations {
    public:
     std::optional<ArtifactWeightAsset> find(std::string_view preset) const override {
@@ -115,9 +108,7 @@ class ArtifactTestOperations final : public ArtifactWeightOperations {
                   .total = payload.size(),
                   .total_known = true});
         if (cancel_on_download && cancellation_trigger != nullptr) {
-            if (&cancellation_trigger->token != &cancellation) {
-                throw std::runtime_error("artifact fixture cancellation identity mismatch");
-            }
+            if (&cancellation_trigger->token != &cancellation) { throw std::runtime_error("artifact fixture cancellation identity mismatch"); }
             cancellation_trigger->cancel();
             return;
         }
@@ -133,7 +124,6 @@ class ArtifactTestOperations final : public ArtifactWeightOperations {
     std::string payload = "abc";
     std::string md5 = "900150983cd24fb0d6963f7d28e17f72";
 };
-
 [[nodiscard]] rfdetr::TrainRequest train_request(const std::filesystem::path& output) {
     rfdetr::TrainRequest request;
     request.train_compiled_path = output / "train.bin";
@@ -144,30 +134,25 @@ class ArtifactTestOperations final : public ArtifactWeightOperations {
     request.device_id = 0;
     return request;
 }
-
 [[nodiscard]] std::filesystem::path script(mmltk::testsupport::ScopedTempDir& temp, std::string_view body) {
     const auto path = temp.path() / "fixture.sh";
     mmltk::testsupport::write_text_file(path, std::string("#!/bin/sh\n") + std::string(body));
     if (::chmod(path.c_str(), 0700) != 0) throw std::runtime_error("cannot make train fixture executable");
     return path;
 }
-
 [[nodiscard]] bool ready(const int fd) {
     pollfd descriptor{.fd = fd, .events = POLLIN, .revents = 0};
     return ::poll(&descriptor, 1U, 2'000) > 0;
 }
-
 [[nodiscard]] TrainProcessClient launch_train_ignoring_term(mmltk::testsupport::ScopedTempDir& temp) {
     const auto executable = script(temp, "trap '' TERM\nprintf ready\nexec sleep 30\n");
-    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {},
-                                             {.escalation_delay = std::chrono::milliseconds{10}});
+    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {}, {.escalation_delay = std::chrono::milliseconds{10}});
     REQUIRE(ready(client.stdout_fd()));
     std::string readiness;
     client.consume_output(readiness, 5U);
     REQUIRE(readiness == "ready");
     return client;
 }
-
 [[nodiscard]] VastBridgeConfig valid_vast_config() {
     VastBridgeConfig config;
     config.api_key = "test-api-key";
@@ -176,7 +161,6 @@ class ArtifactTestOperations final : public ArtifactWeightOperations {
     config.http_timeout = std::chrono::milliseconds{1};
     return config;
 }
-
 class VastClientFixture final {
    public:
     VastClientFixture()
@@ -185,7 +169,6 @@ class VastClientFixture final {
           provider_{valid_vast_config(), std::move(operations_storage_)},
           client_{provider_.client()},
           cancellation_{VastCancellationSource::Mint()} {}
-
     [[nodiscard]] VastTestOperations& operations() const noexcept { return *operations_; }
     [[nodiscard]] VastClient& client() noexcept { return client_; }
     [[nodiscard]] VastCancellationSource& source() noexcept { return cancellation_.first; }
@@ -198,7 +181,6 @@ class VastClientFixture final {
     VastClient client_;
     decltype(VastCancellationSource::Mint()) cancellation_;
 };
-
 [[nodiscard]] domain::ProviderPreferences valid_provider_preferences() {
     domain::ProviderPreferences preferences;
     preferences.minimum_gpus = 1;
@@ -208,7 +190,6 @@ class VastClientFixture final {
     return preferences;
 }
 }  // namespace
-
 TEST_CASE("artifact service refuses invalid and cancelled work without shared lifecycle state", "[gui][services]") {
     ArtifactStore store;
     ArtifactCancellationFixture cancellation;
@@ -217,12 +198,10 @@ TEST_CASE("artifact service refuses invalid and cancelled work without shared li
     const domain::ArtifactInspection inspection = store.inspect(paths, "rf-detr-nano", 384U, cancellation.token);
     CHECK_FALSE(inspection.compatible);
     CHECK_FALSE(inspection.detail.empty());
-
     const ArtifactCompileResult invalid = store.compile({}, cancellation.token);
     CHECK_FALSE(invalid.cancelled);
     CHECK_FALSE(invalid.inspection.detail.empty());
 }
-
 TEST_CASE("artifact service derives bounded inspection contracts from reflected state", "[gui][services]") {
     ArtifactStore store;
     ArtifactCancellationFixture cancellation;
@@ -230,14 +209,12 @@ TEST_CASE("artifact service derives bounded inspection contracts from reflected 
     const domain::ArtifactInspection accepted = store.inspect(no_paths, "rf-detr-nano", 384U, cancellation.token);
     CHECK(accepted.detail == "compiled artifact inspection requires at least one path");
     CHECK(accepted.detail.size() <= domain::kArtifactErrorCapacity);
-
     std::array<std::filesystem::path, domain::kArtifactSplitCapacity> oversized{};
     oversized.front() = std::string(domain::kArtifactPathCapacity + 1U, 'p');
     const domain::ArtifactInspection rejected = store.inspect(oversized, "rf-detr-nano", 384U, cancellation.token);
     CHECK_FALSE(rejected.compatible);
     CHECK_FALSE(rejected.detail.empty());
     CHECK(rejected.detail.size() <= domain::kArtifactErrorCapacity);
-
     ArtifactCompileRequest exact{.source = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 's')),
                                  .output = std::filesystem::path(std::string(domain::kArtifactPathCapacity, 'o')),
                                  .preset = std::string(domain::kArtifactPresetCapacity, 'p'),
@@ -251,31 +228,27 @@ TEST_CASE("artifact service derives bounded inspection contracts from reflected 
     exact.output = "/output";
     exact.preset.assign(domain::kArtifactPresetCapacity + 1U, 'p');
     CHECK_FALSE(exact.valid());
-
     ArtifactTestOperations operations;
     ArtifactStore bounded_store("/tmp/mmltk-artifact-input-contract", operations);
     CHECK_THROWS(bounded_store.canonical_weight_path(std::string(domain::kArtifactPresetCapacity + 1U, 'p')));
     CHECK(operations.finds == 0U);
 }
-
 TEST_CASE("artifact service preserves canonical RF-DETR validation", "[gui][services]") {
     ArtifactStore store;
     CHECK_THROWS(store.canonical_weight_path("not-a-rf-detr-preset"));
 }
-
 TEST_CASE("artifact compile progress is borrowed for invalid and cancelled calls", "[gui][services]") {
     ArtifactStore store;
     ArtifactCancellationFixture cancellation;
     std::size_t reports = 0U;
-    const ArtifactProgressObserver observer{
-        .context = &reports, .report = [](void* context, const domain::ArtifactProgress&) { ++*static_cast<std::size_t*>(context); }};
+    const ArtifactProgressObserver observer{.context = &reports,
+                                            .report = [](void* context, const domain::ArtifactProgress&) { ++*static_cast<std::size_t*>(context); }};
     CHECK_FALSE(store.compile({}, cancellation.token, observer).inspection.detail.empty());
     cancellation.cancel();
     ArtifactCompileRequest request{.source = "/unavailable", .output = "/unavailable-output", .preset = "fixture", .resolution = 384U};
     CHECK(store.compile(request, cancellation.token, observer).cancelled);
     CHECK(reports == 0U);
 }
-
 TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark estimates", "[gui][services]") {
     const data::CompileProgress ordinary{
         .done = 30U,
@@ -295,7 +268,6 @@ TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark e
     CHECK(projected_ordinary.remaining_seconds == 12U);
     CHECK(projected_ordinary.throughput_per_second == 5U);
     CHECK(projected_ordinary.dropped_instances == 7U);
-
     data::BenchmarkCompileProgress benchmark{
         .phase = data::DatasetCompilePhase::Pixels,
         .activity = "Downloading",
@@ -323,7 +295,6 @@ TEST_CASE("artifact compile adapters preserve canonical ordinary and benchmark e
     CHECK(projected_benchmark.dropped_instances == 11U);
     CHECK(projected_benchmark.quarantined_images == 13U);
 }
-
 TEST_CASE("artifact service owns verified cache publication and cancellation cleanup", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temporary("mmltk-artifact-service-contract");
     const auto root = temporary.path() / "weights";
@@ -337,8 +308,7 @@ TEST_CASE("artifact service owns verified cache publication and cancellation cle
     CHECK_FALSE(std::filesystem::exists(root / "fixture.bin"));
     ArtifactCancellationFixture first;
     std::vector<domain::ModelProgress> weight_progress;
-    const ArtifactWeightProgressObserver observer{.context = &weight_progress,
-                                                  .report = [](void* context, const domain::ModelProgress& value) noexcept {
+    const ArtifactWeightProgressObserver observer{.context = &weight_progress, .report = [](void* context, const domain::ModelProgress& value) noexcept {
                                                       static_cast<std::vector<domain::ModelProgress>*>(context)->push_back(value);
                                                   }};
     CHECK(store.canonical_weight_path("fixture", first.token, observer) == root / "fixture.bin");
@@ -369,25 +339,15 @@ TEST_CASE("artifact service owns verified cache publication and cancellation cle
     ArtifactCancellationFixture cancelled;
     operations.cancellation_trigger = &cancelled;
     CHECK_THROWS(store.canonical_weight_path("fixture", cancelled.token));
-    for (const auto& entry : std::filesystem::directory_iterator(root)) {
-        CHECK(entry.path().filename().string().find(".weights.") == std::string::npos);
-    }
+    for (const auto& entry : std::filesystem::directory_iterator(root)) { CHECK(entry.path().filename().string().find(".weights.") == std::string::npos); }
 }
-
 TEST_CASE("artifact service refuses hostile weight metadata before transfer or cache mutation", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temporary("mmltk-artifact-metadata-contract");
     const auto root = temporary.path() / "weights";
     ArtifactTestOperations operations;
     ArtifactStore store(root, operations);
     const std::array<std::string, 8U> hostile_filenames{
-        "",
-        ".",
-        "..",
-        "../outside.bin",
-        "/outside.bin",
-        "nested/weight.bin",
-        "nested\\weight.bin",
-        std::string(domain::kArtifactPathCapacity + 1U, 'f'),
+        "", ".", "..", "../outside.bin", "/outside.bin", "nested/weight.bin", "nested\\weight.bin", std::string(domain::kArtifactPathCapacity + 1U, 'f'),
     };
     for (const std::string& filename : hostile_filenames) {
         operations.filename = filename;
@@ -413,7 +373,6 @@ TEST_CASE("artifact service refuses hostile weight metadata before transfer or c
     CHECK(operations.downloads == 0U);
     CHECK_FALSE(std::filesystem::exists(root));
 }
-
 TEST_CASE("compute service domain values retain ordered terminal-safe progress", "[gui][services]") {
     const domain::ComputeProgress initial{.sequence = 1U, .completed = 0U, .total = 8U, .status = "training"};
     const domain::ComputeProgress terminal{.sequence = 2U, .completed = 8U, .total = 8U, .status = "complete"};
@@ -422,19 +381,15 @@ TEST_CASE("compute service domain values retain ordered terminal-safe progress",
     CHECK_FALSE(domain::ComputeProgress{.sequence = 0U, .completed = 0U, .total = 0U, .status = {}}.valid());
     CHECK_FALSE(domain::ComputeProgress{.sequence = 1U, .completed = 9U, .total = 8U, .status = {}}.valid());
     CHECK_FALSE(domain::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 0U, .status = {}}.valid());
-    CHECK_FALSE(domain::ComputeProgress{
-        .sequence = 1U, .completed = 0U, .total = 1U, .status = std::string(domain::kComputeStatusCapacity + 1U, 's')}
-                    .valid());
+    CHECK_FALSE(domain::ComputeProgress{.sequence = 1U, .completed = 0U, .total = 1U, .status = std::string(domain::kComputeStatusCapacity + 1U, 's')}.valid());
     CHECK(domain::bounded_compute_error(std::string(domain::kComputeErrorCapacity + 1U, 'e')).size() == domain::kComputeErrorCapacity);
 }
-
 TEST_CASE("Vast client owns bounded public service limits", "[gui][services]") {
     CHECK(kVastOfferCapacity == 32U);
     CHECK(kVastInventoryCapacity == 64U);
     CHECK(kVastLogCapacity == 64U * 1024U);
     CHECK(kVastLogTailLineLimit == 10'000U);
 }
-
 TEST_CASE("Vast provider cancellation transfers one system source to one worker token", "[gui][services]") {
     auto [source, token] = VastCancellationSource::Mint();
     CHECK_FALSE(token.cancelled());
@@ -442,7 +397,6 @@ TEST_CASE("Vast provider cancellation transfers one system source to one worker 
     CHECK(token.cancelled());
     CHECK_FALSE(source.RequestCancel());
 }
-
 TEST_CASE("Vast provider client retains its immutable ordinary dependency", "[gui][services]") {
     auto operations_storage = std::make_unique<VastTestOperations>();
     auto* const operations = operations_storage.get();
@@ -465,18 +419,15 @@ TEST_CASE("Vast provider client retains its immutable ordinary dependency", "[gu
     static_cast<void>(source);
     CHECK(VastClient{stale}.query(valid_provider_preferences(), cancellation).size() == 1U);
     CHECK(query_count == 2U);
-
     auto successor_operations = std::make_unique<VastTestOperations>();
     VastProviderOwner successor{valid_vast_config(), std::move(successor_operations)};
     const auto live = successor.client();
     CHECK(live.valid());
     CHECK_FALSE(live == stale);
 }
-
 TEST_CASE("Vast provider owner validates configuration before dependency publication", "[gui][services]") {
     VastProviderOwner absent;
     CHECK_FALSE(absent.client().valid());
-
     auto missing_key = valid_vast_config();
     missing_key.api_key.clear();
     CHECK_THROWS(VastProviderOwner(std::move(missing_key), std::make_unique<VastTestOperations>()));
@@ -488,7 +439,6 @@ TEST_CASE("Vast provider owner validates configuration before dependency publica
     CHECK_THROWS(VastProviderOwner(std::move(invalid_timeout), std::make_unique<VastTestOperations>()));
     CHECK_THROWS(VastProviderOwner(valid_vast_config(), std::unique_ptr<const VastOperations>{}));
 }
-
 TEST_CASE("duplicated Vast cancellation signal reaches a running invocation fd", "[gui][services]") {
     class BlockingOperations final : public VastOperations {
        public:
@@ -497,9 +447,7 @@ TEST_CASE("duplicated Vast cancellation signal reaches a running invocation fd",
             started.count_down();
             pollfd event{.fd = invocation.cancellation_fd, .events = POLLIN, .revents = 0};
             int ready = -1;
-            do {
-                ready = ::poll(&event, 1U, -1);
-            } while (ready < 0 && errno == EINTR);
+            do { ready = ::poll(&event, 1U, -1); } while (ready < 0 && errno == EINTR);
             observed = ready > 0 && (event.revents & POLLIN) != 0;
             return {};
         }
@@ -511,13 +459,10 @@ TEST_CASE("duplicated Vast cancellation signal reaches a running invocation fd",
         void stop(const VastBridgeConfig&, int, const VastBridgeInvocation&) const override {}
         VastInstanceInfo show(const VastBridgeConfig&, int, const VastBridgeInvocation&) const override { return {}; }
         std::vector<VastInstanceInfo> inventory(const VastBridgeConfig&, const VastBridgeInvocation&) const override { return {}; }
-        std::string logs(const VastBridgeConfig&, int, std::optional<std::size_t>, const VastBridgeInvocation&) const override {
-            return {};
-        }
+        std::string logs(const VastBridgeConfig&, int, std::optional<std::size_t>, const VastBridgeInvocation&) const override { return {}; }
         mutable std::latch started{1};
         mutable bool observed = false;
     };
-
     auto operations_storage = std::make_unique<BlockingOperations>();
     auto* const operations = operations_storage.get();
     VastProviderOwner provider{valid_vast_config(), std::move(operations_storage)};
@@ -533,7 +478,6 @@ TEST_CASE("duplicated Vast cancellation signal reaches a running invocation fd",
     CHECK(token.cancelled());
     CHECK_FALSE(signal.RequestCancel());
 }
-
 TEST_CASE("Vast client owns bounded conversion and reconciliation over injected operations", "[gui][services]") {
     auto operations_storage = std::make_unique<VastTestOperations>();
     auto* const operations = operations_storage.get();
@@ -562,8 +506,7 @@ TEST_CASE("Vast client owns bounded conversion and reconciliation over injected 
     CHECK(operations->creates == 1U);
     CHECK(operations->starts == 1U);
     CHECK(operations->stops == 1U);
-    const auto reconciliation =
-        client.reconcile({.mutation = domain::ProviderMutation::Start, .instance_id = 9, .launch_token = {}}, cancellation);
+    const auto reconciliation = client.reconcile({.mutation = domain::ProviderMutation::Start, .instance_id = 9, .launch_token = {}}, cancellation);
     CHECK(reconciliation.disposition == VastReconciliation::Disposition::Applied);
     CHECK(client.instance(9, cancellation).instance_id == 9);
     CHECK(client.logs(9, 1U, cancellation).size() == kVastLogCapacity);
@@ -577,7 +520,6 @@ TEST_CASE("Vast client owns bounded conversion and reconciliation over injected 
     CHECK_FALSE(cancelled_attempt.started());
     CHECK(operations->starts == 1U);
 }
-
 TEST_CASE("Vast client rejects duplicate offer identities at the injected service boundary", "[gui][services]") {
     auto operations_storage = std::make_unique<VastTestOperations>();
     auto* const operations = operations_storage.get();
@@ -592,12 +534,10 @@ TEST_CASE("Vast client rejects duplicate offer identities at the injected servic
     static_cast<void>(source);
     auto preferences = valid_provider_preferences();
     preferences.result_limit = 2U;
-
     const auto unique = client.query(preferences, cancellation);
     REQUIRE(unique.size() == 2U);
     CHECK(unique[0].offer_id == 7);
     CHECK(unique[1].offer_id == 8);
-
     operations->offers[1].offer_id = 7;
     bool duplicate_rejected = false;
     try {
@@ -609,7 +549,6 @@ TEST_CASE("Vast client rejects duplicate offer identities at the injected servic
     CHECK(duplicate_rejected);
     CHECK(operations->queries == 2U);
 }
-
 TEST_CASE("Vast client rejects mismatched exact-instance provider records", "[gui][services]") {
     auto operations_storage = std::make_unique<VastTestOperations>();
     auto* const operations = operations_storage.get();
@@ -623,7 +562,6 @@ TEST_CASE("Vast client rejects mismatched exact-instance provider records", "[gu
     CHECK_THROWS(client.reconcile({.mutation = domain::ProviderMutation::Start, .instance_id = 9, .launch_token = {}}, cancellation));
     CHECK(operations->shows == 2U);
 }
-
 TEST_CASE("Vast client validates before provider effects and classifies all reconciliation states", "[gui][services]") {
     auto operations_storage = std::make_unique<VastTestOperations>();
     auto* const operations = operations_storage.get();
@@ -670,8 +608,7 @@ TEST_CASE("Vast client validates before provider effects and classifies all reco
     CHECK(create_reconciliation.disposition == VastReconciliation::Disposition::Applied);
     CHECK(create_reconciliation.instance->instance_id == 17);
     operations->records.clear();
-    const auto missing =
-        client.reconcile({.mutation = domain::ProviderMutation::Create, .instance_id = 0, .launch_token = "missing"}, cancellation);
+    const auto missing = client.reconcile({.mutation = domain::ProviderMutation::Create, .instance_id = 0, .launch_token = "missing"}, cancellation);
     CHECK(missing.disposition == VastReconciliation::Disposition::NotApplied);
     CHECK_FALSE(missing.instance.has_value());
     VastInstanceInfo duplicate_a;
@@ -681,8 +618,7 @@ TEST_CASE("Vast client validates before provider effects and classifies all reco
     duplicate_b.instance_id = 19;
     duplicate_b.label = "duplicate";
     operations->records = {duplicate_a, duplicate_b};
-    const auto duplicate =
-        client.reconcile({.mutation = domain::ProviderMutation::Create, .instance_id = 0, .launch_token = "duplicate"}, cancellation);
+    const auto duplicate = client.reconcile({.mutation = domain::ProviderMutation::Create, .instance_id = 0, .launch_token = "duplicate"}, cancellation);
     CHECK(duplicate.disposition == VastReconciliation::Disposition::Inconclusive);
     CHECK_FALSE(duplicate.instance.has_value());
     operations->records = {duplicate_b, duplicate_a};
@@ -698,27 +634,23 @@ TEST_CASE("Vast client validates before provider effects and classifies all reco
     CHECK_FALSE(cancelled_create_attempt.started());
     CHECK(operations->creates == 0U);
 }
-
 TEST_CASE("Vast effect attempt records the exact external mutation edge", "[gui][services]") {
     VastClientFixture fixture;
     auto& operations = fixture.operations();
     auto& client = fixture.client();
     const auto& cancellation = fixture.cancellation();
     const auto preferences = valid_provider_preferences();
-
     operations.throw_create = true;
     VastEffectAttempt create_attempt;
     CHECK_THROWS(client.create(7, preferences, "launch-7", create_attempt, cancellation));
     CHECK(create_attempt.started());
     CHECK(operations.creates == 1U);
-
     operations.throw_start = true;
     VastEffectAttempt start_attempt;
     CHECK_THROWS(client.mutate(domain::ProviderMutation::Start, 9, start_attempt, cancellation));
     CHECK(start_attempt.started());
     CHECK(operations.starts == 1U);
 }
-
 TEST_CASE("Vast admission rejects malformed input before provider effects", "[gui][services]") {
     VastClientFixture fixture;
     auto& operations = fixture.operations();
@@ -748,13 +680,11 @@ TEST_CASE("Vast admission rejects malformed input before provider effects", "[gu
     CHECK_THROWS(client.create(1, preferences, "token", image_attempt, cancellation));
     CHECK_FALSE(image_attempt.started());
     VastEffectAttempt token_attempt;
-    CHECK_THROWS(
-        client.create(1, valid_provider_preferences(), std::string(kVastLaunchTokenCapacity + 1U, 't'), token_attempt, cancellation));
+    CHECK_THROWS(client.create(1, valid_provider_preferences(), std::string(kVastLaunchTokenCapacity + 1U, 't'), token_attempt, cancellation));
     CHECK_FALSE(token_attempt.started());
     CHECK(operations.queries == 0U);
     CHECK(operations.creates == 0U);
 }
-
 TEST_CASE("Vast create accepts only complete provider result records", "[gui][services]") {
     VastClientFixture fixture;
     auto& operations = fixture.operations();
@@ -765,14 +695,12 @@ TEST_CASE("Vast create accepts only complete provider result records", "[gui][se
         VastEffectAttempt attempt;
         return client.create(17, preferences, "launch-17", attempt, cancellation);
     };
-
     operations.create_result = {.success = true, .offer_id = 17, .instance_id = 31, .instance_api_key = {}};
     const auto success_without_credential = create();
     CHECK(success_without_credential.success);
     CHECK(success_without_credential.instance_id == 31);
     CHECK(operations.creates == 1U);
-    operations.create_result = {
-        .success = true, .offer_id = 17, .instance_id = 32, .instance_api_key = std::string(kVastApiKeyCapacity, 'k')};
+    operations.create_result = {.success = true, .offer_id = 17, .instance_id = 32, .instance_api_key = std::string(kVastApiKeyCapacity, 'k')};
     const auto success_with_credential = create();
     CHECK(success_with_credential.success);
     CHECK(success_with_credential.instance_api_key.size() == kVastApiKeyCapacity);
@@ -781,7 +709,6 @@ TEST_CASE("Vast create accepts only complete provider result records", "[gui][se
     const auto failure = create();
     CHECK_FALSE(failure.success);
     CHECK(operations.creates == 3U);
-
     const std::array<VastCreateInstanceResult, 11U> malformed{{
         {.success = true, .offer_id = 0, .instance_id = 31, .instance_api_key = {}},
         {.success = true, .offer_id = 16, .instance_id = 31, .instance_api_key = {}},
@@ -803,7 +730,6 @@ TEST_CASE("Vast create accepts only complete provider result records", "[gui][se
     }
     CHECK(operations.creates == malformed.size() + 3U);
 }
-
 TEST_CASE("artifact compile reports synchronously through the caller-owned observer", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temporary("mmltk-artifact-progress");
     const mmltk::backend::data::testsupport::FixtureSpec fixture{
@@ -829,7 +755,6 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
     CHECK(result.inspection.detail.empty());
     CHECK(std::filesystem::exists(result.output));
     CHECK(reports.count >= 1U);
-
     const auto compiled = result.output / "train.bin";
     data::FileHeader header{};
     {
@@ -850,7 +775,6 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
     REQUIRE(accepted.splits.size() == 1U);
     CHECK(accepted.splits.front().class_names.size() == header.num_classes);
     CHECK(accepted.splits.front().class_names.front().value.size() == header.class_names.front().size() - 1U);
-
     {
         std::fstream stream(compiled, std::ios::binary | std::ios::in | std::ios::out);
         REQUIRE(stream);
@@ -865,7 +789,6 @@ TEST_CASE("artifact compile reports synchronously through the caller-owned obser
     CHECK_FALSE(oversized_catalog.detail.empty());
     CHECK(oversized_catalog.detail.size() <= domain::kArtifactErrorCapacity);
 }
-
 TEST_CASE("Train process client exposes setup failure and one terminal", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
     auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), temp.path() / "missing");
@@ -875,7 +798,6 @@ TEST_CASE("Train process client exposes setup failure and one terminal", "[gui][
     CHECK(terminal->setup_failure);
     CHECK_FALSE(client.consume_exit().has_value());
 }
-
 TEST_CASE("Train process run owns its stop token, forwards progress, and reaps success", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-run");
     const auto output = temp.path() / "output";
@@ -888,16 +810,15 @@ TEST_CASE("Train process run owns its stop token, forwards progress, and reaps s
     auto client = TrainProcessClient::launch(train_request(output), executable);
     auto [source, token] = TrainProcessStopSource::Mint();
     std::size_t progress_reports = 0U;
-    const auto result = client.Run(
-        std::move(token), {.context = &progress_reports,
-                           .report = [](void* context, const TrainProcessProgress&) noexcept { ++*static_cast<std::size_t*>(context); }});
+    const auto result = client.Run(std::move(token), {.context = &progress_reports, .report = [](void* context, const TrainProcessProgress&) noexcept {
+                                                          ++*static_cast<std::size_t*>(context);
+                                                      }});
     CHECK(result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded);
     CHECK_FALSE(result.terminal.setup_failure);
     CHECK_FALSE(client.active());
     CHECK(progress_reports >= 1U);
     CHECK(source.RequestCancel());
 }
-
 TEST_CASE("Train process run consumes a separately-owned stop capability and escalates", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-run-stop");
     auto client = launch_train_ignoring_term(temp);
@@ -910,7 +831,6 @@ TEST_CASE("Train process run consumes a separately-owned stop capability and esc
     CHECK_FALSE(client.active());
     CHECK_FALSE(source.RequestCancel());
 }
-
 // CLEANUP-IGNORE: The independently named "Train process client observes bounded output and inotify progress" scenario
 // keeps its own setup and oracle adjacent.
 TEST_CASE("Train process client observes bounded output and inotify progress", "[gui][services]") {
@@ -947,7 +867,6 @@ TEST_CASE("Train process client observes bounded output and inotify progress", "
     REQUIRE(terminal.has_value());
     CHECK(terminal->outcome == services::TrainProcessExitOutcome::Succeeded);
 }
-
 // CLEANUP-IGNORE: The independently named "Train process client rejects oversized public progress fields" scenario
 // keeps its own setup and oracle adjacent.
 TEST_CASE("Train process client rejects oversized public progress fields", "[gui][services]") {
@@ -955,12 +874,11 @@ TEST_CASE("Train process client rejects oversized public progress fields", "[gui
     const auto output = temp.path() / "output";
     std::filesystem::create_directories(output);
     REQUIRE(::mkfifo((temp.path() / "gate").c_str(), 0600) == 0);
-    const auto executable =
-        script(temp,
-               "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
-               "read ignored < \"$(dirname \"$out\")/gate\"\n"
-               "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
-               "printf '{\"phase\":\"%s\",\"checkpoint_path\":\"checkpoint.pt\"}' \"$long\" > \"$out/progress.json\"\n");
+    const auto executable = script(temp,
+                                   "out=''; while [ $# -gt 0 ]; do [ \"$1\" = '--output-dir' ] && { out=\"$2\"; break; }; shift; done\n"
+                                   "read ignored < \"$(dirname \"$out\")/gate\"\n"
+                                   "long=$(yes x | tr -d '\\n' | head -c 4097)\n"
+                                   "printf '{\"phase\":\"%s\",\"checkpoint_path\":\"checkpoint.pt\"}' \"$long\" > \"$out/progress.json\"\n");
     auto client = TrainProcessClient::launch(train_request(output), executable);
     {
         std::ofstream gate(temp.path() / "gate");
@@ -969,7 +887,6 @@ TEST_CASE("Train process client rejects oversized public progress fields", "[gui
     REQUIRE(ready(client.progress_fd()));
     CHECK_THROWS(client.consume_progress());
 }
-
 TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
     const auto output = temp.path() / "output";
@@ -988,7 +905,6 @@ TEST_CASE("Train process client rejects oversized public checkpoint paths", "[gu
     REQUIRE(ready(client.progress_fd()));
     CHECK_THROWS(client.consume_progress());
 }
-
 TEST_CASE("Train process client escalates a stopped process group", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
     auto client = launch_train_ignoring_term(temp);
@@ -1004,12 +920,10 @@ TEST_CASE("Train process client escalates a stopped process group", "[gui][servi
     REQUIRE(WIFSIGNALED(terminal->wait_status));
     CHECK(WTERMSIG(terminal->wait_status) == SIGKILL);
 }
-
 TEST_CASE("Train process client retains group custody after its leader exits", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
     const auto executable = script(temp, "(trap '' TERM; exec sleep 30) &\nexit 0\n");
-    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {},
-                                             {.escalation_delay = std::chrono::milliseconds{10}});
+    auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable, {}, {.escalation_delay = std::chrono::milliseconds{10}});
     REQUIRE(ready(client.pid_fd()));
     CHECK_FALSE(client.consume_exit().has_value());
     REQUIRE(client.request_stop(true));
@@ -1021,7 +935,6 @@ TEST_CASE("Train process client retains group custody after its leader exits", "
     REQUIRE(terminal.has_value());
     CHECK_FALSE(client.consume_exit().has_value());
 }
-
 TEST_CASE("Train process client destructor reaps a live process group", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-service");
     const auto executable = script(temp, "exec sleep 30\n");
@@ -1034,14 +947,11 @@ TEST_CASE("Train process client destructor reaps a live process group", "[gui][s
     CHECK(::kill(-group, 0) == -1);
     CHECK(errno == ESRCH);
 }
-
-}  // namespace mmltk::controller::subsystems::system
-
 TEST_CASE("Train observes persistence failure beyond bounded console output without a progress file", "[gui][services][train]") {
     mmltk::testsupport::ScopedTempDir temp("mmltk-train-persistence-marker");
     const auto executable = script(temp,
-        "head -c 131064 /dev/zero\n"
-        "printf '\\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\\n'\n");
+                                   "head -c 131064 /dev/zero\n"
+                                   "printf '\\nMMLTK_TRAIN_PERSISTENCE_FAILED_V1\\n'\n");
     auto client = TrainProcessClient::launch(train_request(temp.path() / "output"), executable);
     auto [source, token] = TrainProcessStopSource::Mint();
     const auto result = client.Run(std::move(token));
@@ -1051,3 +961,4 @@ TEST_CASE("Train observes persistence failure beyond bounded console output with
     CHECK(result.output.size() <= kTrainProcessReadBudget);
     CHECK_FALSE(result.terminal.final_progress->persistence.error.empty());
 }
+}  // namespace mmltk::controller::subsystems::system

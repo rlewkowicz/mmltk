@@ -50,11 +50,9 @@ namespace mmltk::controller::test_support {
     settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Onnx;
     REQUIRE(contracts::gui_settings_valid(settings));
     const services::SettingsLocation location{(root / "settings.json").string()};
-    REQUIRE(
-        services::save_persistence_settings(location, services::make_persistence_settings_snapshot(std::move(settings)), 1U).succeeded());
+    REQUIRE(services::save_persistence_settings(location, services::make_persistence_settings_snapshot(std::move(settings)), 1U).succeeded());
     return location;
 }
-
 [[nodiscard]] inline contracts::ArtifactSplitFact split(const std::filesystem::path& path) {
     return {.path = path.string(),
             .image_count = 1U,
@@ -64,32 +62,27 @@ namespace mmltk::controller::test_support {
             .max_instances_per_image = 1U,
             .class_names = {{.value = "object"}}};
 }
-
 class FakeDatasetRuntime final : public DatasetRuntime {
    public:
     FakeDatasetRuntime(std::shared_ptr<StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
-
     services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest& request, const std::stop_token stop,
                                             const std::function<void(const contracts::ArtifactProgress&)>& progress) override {
         progress(fail_ ? contracts::ArtifactProgress{.phase = static_cast<contracts::ArtifactCompilePhase>(255U),
                                                      .activity = std::string(contracts::kArtifactProgressTextCapacity + 1U, 'x'),
                                                      .completed = 2U,
                                                      .total = 1U}
-                       : contracts::ArtifactProgress{
-                             .phase = contracts::ArtifactCompilePhase::Pixels, .activity = "compiling", .completed = 1U, .total = 2U});
+                       : contracts::ArtifactProgress{.phase = contracts::ArtifactCompilePhase::Pixels, .activity = "compiling", .completed = 1U, .total = 2U});
         if (!gate_->Wait(stop)) return {.output = request.output, .cancelled = true};
         if (fail_)
             return {.output = request.output,
                     .inspection = {.compatible = true,
-                                   .splits = {split(request.output / "train.bin"), split(request.output / "val.bin"),
-                                              split(request.output / "test.bin"), split(request.output / "overflow.bin")},
+                                   .splits = {split(request.output / "train.bin"), split(request.output / "val.bin"), split(request.output / "test.bin"),
+                                              split(request.output / "overflow.bin")},
                                    .detail = {}}};
-        return {.output = request.output,
-                .inspection = {.compatible = true, .splits = {split(request.output / "train.bin")}, .detail = {}}};
+        return {.output = request.output, .inspection = {.compatible = true, .splits = {split(request.output / "train.bin")}, .detail = {}}};
     }
-
-    contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
-                                          std::string_view, std::uint32_t, std::stop_token) override {
+    contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, std::string_view, std::uint32_t,
+                                          std::stop_token) override {
         contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
         for (const auto& path : paths)
             if (!path.empty()) result.splits.push_back(split(path));
@@ -100,12 +93,11 @@ class FakeDatasetRuntime final : public DatasetRuntime {
     std::shared_ptr<StopGate> gate_;
     bool fail_ = false;
 };
-
 class BlockingModelRuntime final : public ModelRuntime {
    public:
     explicit BlockingModelRuntime(std::shared_ptr<StopGate> gate) : gate_(std::move(gate)) {}
     ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& custom, int, const std::stop_token stop,
-                        const std::function<void(const contracts::ModelProgress&)>& progress) override {
+                                   const std::function<void(const contracts::ModelProgress&)>& progress) override {
         progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "verifying fixture model"});
         if (!gate_->Wait(stop)) throw std::runtime_error("fixture model selection cancelled");
         return {.artifact = custom.string()};
@@ -114,7 +106,6 @@ class BlockingModelRuntime final : public ModelRuntime {
    private:
     std::shared_ptr<StopGate> gate_;
 };
-
 class ApplicationDataFixture final {
    public:
     explicit ApplicationDataFixture(std::filesystem::path root)
@@ -123,7 +114,12 @@ class ApplicationDataFixture final {
           dataset_gate_(std::make_shared<StopGate>()),
           dataset_(loaded_.settings, [gate = dataset_gate_] { return std::make_unique<FakeDatasetRuntime>(gate, false); }),
           model_(
-              loaded_.settings, [] { auto gate = std::make_shared<StopGate>(); gate->Release(); return std::make_unique<BlockingModelRuntime>(std::move(gate)); },
+              loaded_.settings,
+              [] {
+                  auto gate = std::make_shared<StopGate>();
+                  gate->Release();
+                  return std::make_unique<BlockingModelRuntime>(std::move(gate));
+              },
               [this](ModelSystem::event_type event) {
                   if (std::holds_alternative<ModelChanged>(event)) {
                       {
@@ -135,7 +131,6 @@ class ApplicationDataFixture final {
               }) {
         dataset_gate_->Release();
     }
-
     void PrepareModel(const contracts::FeatureId workflow = contracts::FeatureId::Train) {
         std::ofstream(root_ / "train.bin").put('\0');
         std::ofstream(root_ / "val.bin").put('\0');
@@ -160,7 +155,6 @@ class ApplicationDataFixture final {
         CHECK(accepted.selection.key == expected->key);
         CHECK(accepted.selection.artifact == expected->custom_artifact);
     }
-
     [[nodiscard]] auto systems() noexcept { return std::tie(loaded_.settings, dataset_, model_); }
 
    private:
@@ -169,7 +163,6 @@ class ApplicationDataFixture final {
         explicit LoadedSettings(const std::filesystem::path& root) { REQUIRE(settings.Load(install_settings(root)).applied()); }
         SettingsSystem settings;
     };
-
     std::filesystem::path root_;
     LoadedSettings loaded_;
     std::shared_ptr<StopGate> dataset_gate_;
@@ -179,7 +172,6 @@ class ApplicationDataFixture final {
     std::vector<contracts::ModelUiState> model_terminals_;
     ModelSystem model_;
 };
-
 struct DatasetRuntimeObservation final {
     std::shared_ptr<StopGate> inspect_gate = std::make_shared<StopGate>();
     std::promise<void> inspect_started;
@@ -187,23 +179,20 @@ struct DatasetRuntimeObservation final {
     std::atomic_int maximum_active_calls = 0;
     std::atomic_int compile_calls = 0;
 };
-
 class BlockingInspectRuntime final : public DatasetRuntime {
    public:
     explicit BlockingInspectRuntime(std::shared_ptr<DatasetRuntimeObservation> observation) : observation_(std::move(observation)) {}
-
     services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest& request, std::stop_token,
                                             const std::function<void(const contracts::ArtifactProgress&)>&) override {
         ++observation_->compile_calls;
         Enter();
-        const auto result = services::ArtifactCompileResult{
-            .output = request.output, .inspection = {.compatible = true, .splits = {split(request.output / "train.bin")}, .detail = {}}};
+        const auto result = services::ArtifactCompileResult{.output = request.output,
+                                                            .inspection = {.compatible = true, .splits = {split(request.output / "train.bin")}, .detail = {}}};
         Leave();
         return result;
     }
-
-    contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
-                                          std::string_view, std::uint32_t, const std::stop_token stop) override {
+    contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, std::string_view, std::uint32_t,
+                                          const std::stop_token stop) override {
         Enter();
         observation_->inspect_started.set_value();
         static_cast<void>(observation_->inspect_gate->Wait(stop));
@@ -223,6 +212,4 @@ class BlockingInspectRuntime final : public DatasetRuntime {
     void Leave() noexcept { --observation_->active_calls; }
     std::shared_ptr<DatasetRuntimeObservation> observation_;
 };
-
-
-}
+}  // namespace mmltk::controller::test_support

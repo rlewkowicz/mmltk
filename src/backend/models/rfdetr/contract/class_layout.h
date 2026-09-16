@@ -10,7 +10,6 @@
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "mmltk/frameworks/reflection/materializer.h"
-
 namespace mmltk::backend::models::rfdetr {
 inline constexpr std::uint32_t kClassLayoutVersion = 1U;
 inline constexpr std::size_t kMaximumClassOutputSlots = 4096U;
@@ -64,7 +63,7 @@ struct ModelClassDescriptor final {
     std::uint32_t version = 1U;
     [[= mmltk::frameworks::reflection::MaxBytes{64U}]] std::string artifact_sha256;
     ModelClassLayout layout;
-    [[= mmltk::frameworks::reflection::MaxItems{3U}]] std::vector<RfdetrNamedOutputRole> output_roles;
+    [[= mmltk::frameworks::reflection::MaxItems{3U}]] std::vector<RfdetrNamedOutputRole> output_roles{};
 };
 MMLTK_REFLECT_FIELDS(ModelClassDescriptor)
 }  // namespace mmltk::backend::models::rfdetr

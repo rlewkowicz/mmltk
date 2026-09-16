@@ -11,25 +11,18 @@
 namespace mmltk::common::io {
 namespace {
 constexpr std::size_t kHashReadBytes = std::size_t{16U} * 1024U * 1024U;
-
 struct DigestContextDestroy {
     void operator()(EVP_MD_CTX* context) const noexcept { EVP_MD_CTX_free(context); }
 };
-
 using DigestContext = std::unique_ptr<EVP_MD_CTX, DigestContextDestroy>;
-
 [[nodiscard]] DigestContext make_digest_context(const EVP_MD* algorithm) {
     DigestContext context(EVP_MD_CTX_new());
-    if (!context || EVP_DigestInit_ex(context.get(), algorithm, nullptr) != 1) {
-        throw std::runtime_error("cannot initialize SHA-256 digest");
-    }
+    if (!context || EVP_DigestInit_ex(context.get(), algorithm, nullptr) != 1) { throw std::runtime_error("cannot initialize SHA-256 digest"); }
     return context;
 }
-
 void update_digest(EVP_MD_CTX* context, const void* data, const std::size_t size) {
     if (size != 0U && EVP_DigestUpdate(context, data, size) != 1) { throw std::runtime_error("cannot update SHA-256 digest"); }
 }
-
 [[nodiscard]] Sha256Digest finish_digest(EVP_MD_CTX* context) {
     Sha256Digest digest{};
     unsigned int digest_size = 0U;
@@ -38,17 +31,18 @@ void update_digest(EVP_MD_CTX* context, const void* data, const std::size_t size
     }
     return digest;
 }
-
-
 FileSnapshot snapshot(const struct stat& value) {
-    return {static_cast<std::uint64_t>(value.st_dev), static_cast<std::uint64_t>(value.st_ino),
-        static_cast<std::uint64_t>(value.st_size), value.st_mtim.tv_sec, value.st_mtim.tv_nsec,
-        value.st_ctim.tv_sec, value.st_ctim.tv_nsec};
+    return {static_cast<std::uint64_t>(value.st_dev),
+            static_cast<std::uint64_t>(value.st_ino),
+            static_cast<std::uint64_t>(value.st_size),
+            value.st_mtim.tv_sec,
+            value.st_mtim.tv_nsec,
+            value.st_ctim.tv_sec,
+            value.st_ctim.tv_nsec};
 }
 FileSnapshot snapshot(int fd) {
     struct stat value{};
-    if (::fstat(fd, &value) != 0 || !S_ISREG(value.st_mode) || value.st_size < 0)
-        throw std::runtime_error("cannot inspect digest input file");
+    if (::fstat(fd, &value) != 0 || !S_ISREG(value.st_mode) || value.st_size < 0) throw std::runtime_error("cannot inspect digest input file");
     return snapshot(value);
 }
 }  // namespace
@@ -60,8 +54,7 @@ FileSnapshot FileSnapshot::Read(const std::filesystem::path& path) {
 void FileSnapshot::RequireUnchanged(const std::filesystem::path& path) const {
     if (*this != Read(path)) throw std::runtime_error("artifact changed during admission: " + path.string());
 }
-std::optional<FileDigests> try_file_digests(const std::filesystem::path& path, bool include_md5,
-    std::function_ref<bool()> cancelled) {
+std::optional<FileDigests> try_file_digests(const std::filesystem::path& path, bool include_md5, std::function_ref<bool()> cancelled) {
     if (cancelled()) return std::nullopt;
     const auto file = FileHandle::open_readonly(path.string());
     FileDigests result;
@@ -84,8 +77,7 @@ std::optional<FileDigests> try_file_digests(const std::filesystem::path& path, b
     if (md5) {
         std::array<std::uint8_t, 16> bytes{};
         unsigned int size = 0;
-        if (EVP_DigestFinal_ex(md5.get(), bytes.data(), &size) != 1 || size != bytes.size())
-            throw std::runtime_error("cannot finalize MD5 digest");
+        if (EVP_DigestFinal_ex(md5.get(), bytes.data(), &size) != 1 || size != bytes.size()) throw std::runtime_error("cannot finalize MD5 digest");
         result.md5 = mmltk::common::types::hex_encode(bytes);
     }
     return result;
@@ -105,9 +97,7 @@ Sha256Digest sha256_bytes(const std::span<const std::uint8_t> bytes) {
     update_digest(context.get(), bytes.data(), bytes.size());
     return finish_digest(context.get());
 }
-
 std::string sha256_hex(const Sha256Digest& digest) { return mmltk::common::types::hex_encode(digest); }
-
 Sha256Digest parse_sha256_hex(const std::string& value) {
     Sha256Digest digest{};
     if (value.size() != digest.size() * 2U) { throw std::runtime_error("SHA-256 digest must contain 64 hexadecimal characters"); }
@@ -122,5 +112,4 @@ Sha256Digest parse_sha256_hex(const std::string& value) {
     }
     return digest;
 }
-
 }  // namespace mmltk::common::io

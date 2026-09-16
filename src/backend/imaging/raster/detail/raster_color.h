@@ -1,22 +1,14 @@
 #pragma once
-
 #include <cmath>
 #include <cstdint>
-
 #if defined(__CUDACC__)
 #define MMLTK_RASTER_COLOR_INLINE __host__ __device__ __forceinline__
 #else
 #define MMLTK_RASTER_COLOR_INLINE inline
 #endif
-
 namespace mmltk::backend::imaging::raster::detail::color {
-
 [[nodiscard]] MMLTK_RASTER_COLOR_INLINE int safe_class_count(const int num_classes) { return num_classes < 1 ? 1 : num_classes; }
-
-[[nodiscard]] MMLTK_RASTER_COLOR_INLINE int normalize_label(const int label, const int safe_count) {
-    return (label < 0 || label >= safe_count) ? 0 : label;
-}
-
+[[nodiscard]] MMLTK_RASTER_COLOR_INLINE int normalize_label(const int label, const int safe_count) { return (label < 0 || label >= safe_count) ? 0 : label; }
 MMLTK_RASTER_COLOR_INLINE void hsv_to_rgb(const float h, const float s, const float v, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b) {
     const float c = v * s;
     const float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
@@ -24,7 +16,6 @@ MMLTK_RASTER_COLOR_INLINE void hsv_to_rgb(const float h, const float s, const fl
     float rf = 0.0f;
     float gf = 0.0f;
     float bf = 0.0f;
-
     if (h >= 0.0f && h < 60.0f) {
         rf = c;
         gf = x;
@@ -50,17 +41,14 @@ MMLTK_RASTER_COLOR_INLINE void hsv_to_rgb(const float h, const float s, const fl
         gf = 0.0f;
         bf = x;
     }
-
     r = static_cast<std::uint8_t>((rf + m) * 255.0f);
     g = static_cast<std::uint8_t>((gf + m) * 255.0f);
     b = static_cast<std::uint8_t>((bf + m) * 255.0f);
 }
-
 MMLTK_RASTER_COLOR_INLINE void class_hsv(const int label, const int safe_count, float& h, float& s, float& v) {
     const int normalized_label = normalize_label(label, safe_count);
     const float hue_step = 360.0f / static_cast<float>(safe_count);
     h = static_cast<float>(normalized_label) * hue_step;
-
     // A cycle uses two alternating tones and, for odd catalogs, a third
     // closing tone. Both S and V differ across every edge, including C-1/0.
     const int tone = safe_count > 12 ? ((safe_count % 2 != 0 && normalized_label == safe_count - 1) ? 2 : normalized_label % 2) : 0;
@@ -72,7 +60,5 @@ MMLTK_RASTER_COLOR_INLINE void class_color(const int label, const int safe_count
     class_hsv(label, safe_count, h, s, v);
     hsv_to_rgb(h, s, v, r, g, b);
 }
-
 }  // namespace mmltk::backend::imaging::raster::detail::color
-
 #undef MMLTK_RASTER_COLOR_INLINE

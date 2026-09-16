@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -8,7 +7,6 @@
 #include <stop_token>
 #include <string>
 #include <variant>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/services/file_dialog_catalog.h"
 #include "src/controller/services/file_dialog_client.h"
@@ -16,9 +14,7 @@
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/system_events.h"
-
 namespace mmltk::controller {
-
 struct FileDialogSnapshot final {
     std::uint64_t generation = 0U;
     bool active = false;
@@ -41,7 +37,6 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     FileDialogSnapshot snapshot{};
     [[= mmltk::frameworks::reflection::MaxBytes{services::kFileDialogTextCapacity}]] std::string detail;
 };
-
 class FileDialogRuntime {
    public:
     virtual ~FileDialogRuntime() = default;
@@ -56,7 +51,6 @@ class NativeFileDialogRuntime final : public FileDialogRuntime {
     services::FileDialogClient client_;
     SettingsSystem& settings_;
 };
-
 class FileDialogSystem final {
    public:
     using event_type = std::variant<FileDialogCompleted, FileDialogFailed>;
@@ -76,9 +70,7 @@ class FileDialogSystem final {
     std::unique_ptr<FileDialogRuntime> runtime_;
     direct::LocalRun run_;
 };
-
 MMLTK_REFLECT_FIELDS(FileDialogSnapshot)
 MMLTK_REFLECT_FIELDS(FileDialogCompleted)
 MMLTK_REFLECT_FIELDS(FileDialogFailed)
-
 }  // namespace mmltk::controller

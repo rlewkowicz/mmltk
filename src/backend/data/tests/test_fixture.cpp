@@ -1,7 +1,5 @@
 #include "test_fixture.h"
-
 #include <stb_image_write.h>
-
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -12,25 +10,16 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 namespace fs = std::filesystem;
-
 namespace mmltk::backend::data::testsupport {
-
 namespace {
-
 std::vector<uint8_t> stub_rgb_pixels(const std::string& path, int width, int height) {
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 3);
     uint32_t hash = 0;
-    for (char c : path) {
-        hash = hash * 31u + static_cast<uint8_t>(c);
-    }
-    for (size_t i = 0; i < pixels.size(); ++i) {
-        pixels[i] = static_cast<uint8_t>((hash + i * 7u) & 0xFFu);
-    }
+    for (char c : path) { hash = hash * 31u + static_cast<uint8_t>(c); }
+    for (size_t i = 0; i < pixels.size(); ++i) { pixels[i] = static_cast<uint8_t>((hash + i * 7u) & 0xFFu); }
     return pixels;
 }
-
 void write_png_stub(const std::string& path, int width, int height, bool pixel_evidence) {
     std::vector<uint8_t> pixels = stub_rgb_pixels(path, width, height);
     if (pixel_evidence) {
@@ -42,17 +31,14 @@ void write_png_stub(const std::string& path, int width, int height, bool pixel_e
     }
     stbi_write_png(path.c_str(), width, height, 3, pixels.data(), width * 3);
 }
-
 constexpr std::array<const char*, 6> kClassNames{
     "person", "ret", "scope", "iron_sight", "anchor_dot", "glint",
 };
-
-void write_synthetic_sample(const fs::path& split_dir, const int image_index, const int width, const int height,
-                            const int background_images, const bool pixel_evidence) {
+void write_synthetic_sample(const fs::path& split_dir, const int image_index, const int width, const int height, const int background_images,
+                            const bool pixel_evidence) {
     std::array<char, 64> fname{};
     std::snprintf(fname.data(), fname.size(), "%06d.png", image_index);
     write_png_stub((split_dir / fname.data()).string(), width, height, pixel_evidence);
-
     std::snprintf(fname.data(), fname.size(), "%06d.jsonl", image_index);
     std::ofstream annotations(split_dir / fname.data(), std::ios::trunc);
     if (image_index <= background_images) return;
@@ -75,28 +61,20 @@ void write_synthetic_sample(const fs::path& split_dir, const int image_index, co
         }
     }
     annotations << R"({"class":")" << kClassNames[cls] << R"(","bbox_xyxy":[)" << x1 << "," << y1 << "," << x2 << "," << y2
-                << R"(],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << rle << R"(","image_size_wh":[)" << width << ","
-                << height << R"(]})"
+                << R"(],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << rle << R"(","image_size_wh":[)" << width << "," << height << R"(]})"
                 << "\n";
 }
-
 }  // namespace
-
 std::string dataset_dir(const FixtureSpec& spec) { return spec.root_dir + "/dataset"; }
-
 std::string compiled_dir(const FixtureSpec& spec) { return spec.root_dir + "/compiled"; }
-
 std::string compiled_bin_path(const FixtureSpec& spec) { return compiled_dir(spec) + "/" + spec.split + ".bin"; }
-
 void create_synthetic_dataset(const FixtureSpec& spec) {
     const std::string data_dir = dataset_dir(spec);
     const fs::path split_dir = fs::path(data_dir) / spec.split;
-
     std::error_code remove_error;
     fs::remove_all(spec.root_dir, remove_error);
     if (remove_error) { throw std::runtime_error("failed to clear synthetic dataset root: " + remove_error.message()); }
     fs::create_directories(split_dir);
-
     const int background_images = std::clamp(spec.background_images, 0, spec.num_images);
     const int annotated_images = std::max(spec.num_images - background_images, 0);
     {
@@ -116,26 +94,19 @@ void create_synthetic_dataset(const FixtureSpec& spec) {
           << R"({"id":)" << spec.first_class_id + 5 << R"(,"name":"glint"}
 )" << R"(  ],
 )" << R"json(  "splits": {")json"
-          << spec.split << R"json(":{"total":)json" << spec.num_images << R"(,"background":)" << background_images << R"(,"annotated":)"
-          << annotated_images << R"(}}
+          << spec.split << R"json(":{"total":)json" << spec.num_images << R"(,"background":)" << background_images << R"(,"annotated":)" << annotated_images
+          << R"(}}
 )" << "}";
     }
-
-    for (int i = 1; i <= spec.num_images; ++i) {
-        write_synthetic_sample(split_dir, i, spec.width, spec.height, background_images, spec.pixel_evidence);
-    }
+    for (int i = 1; i <= spec.num_images; ++i) { write_synthetic_sample(split_dir, i, spec.width, spec.height, background_images, spec.pixel_evidence); }
 }
-
 void replace_synthetic_image(const FixtureSpec& spec, const int image_index, const int width, const int height) {
-    if (image_index < 1 || image_index > spec.num_images || width <= 30 || height <= 30)
-        throw std::invalid_argument("synthetic replacement image is invalid");
-    write_synthetic_sample(fs::path(dataset_dir(spec)) / spec.split, image_index, width, height,
-                           std::clamp(spec.background_images, 0, spec.num_images), spec.pixel_evidence);
+    if (image_index < 1 || image_index > spec.num_images || width <= 30 || height <= 30) throw std::invalid_argument("synthetic replacement image is invalid");
+    write_synthetic_sample(fs::path(dataset_dir(spec)) / spec.split, image_index, width, height, std::clamp(spec.background_images, 0, spec.num_images),
+                           spec.pixel_evidence);
 }
-
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height) {
     const std::vector<uint8_t> pixels = stub_rgb_pixels(path, width, height);
-
     const size_t hw = static_cast<size_t>(width) * height;
     std::vector<float> nchw(size_t{3} * hw);
     for (size_t i = 0; i < hw; ++i) {
@@ -145,14 +116,10 @@ std::vector<float> expected_nchw_stub(const std::string& path, int width, int he
     }
     return nchw;
 }
-
 void assert_image_matches(const float* actual, const std::vector<float>& expected) {
     if (expected.size() <= 8) { throw std::runtime_error("expected image fixture must contain more than eight samples"); }
     for (size_t i = 0; i < expected.size(); ++i) {
-        if (std::fabs(actual[i] - expected[i]) >= 1e-6f) {
-            throw std::runtime_error("fixture image mismatch at index " + std::to_string(i));
-        }
+        if (std::fabs(actual[i] - expected[i]) >= 1e-6f) { throw std::runtime_error("fixture image mismatch at index " + std::to_string(i)); }
     }
 }
-
 }  // namespace mmltk::backend::data::testsupport

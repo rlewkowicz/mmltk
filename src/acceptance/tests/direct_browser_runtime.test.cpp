@@ -1,8 +1,6 @@
 #include "catch2_compat.hpp"
 #include "src/controller/presentation/presentation_system.h"
-
 namespace {
-
 MMLTK_TEST_CASE("[browser_runtime][direct][presentation]", test_direct_presentation_descriptor) {
     const mmltk::controller::PresentationPublication publication{
         .capability =
@@ -18,5 +16,4 @@ MMLTK_TEST_CASE("[browser_runtime][direct][presentation]", test_direct_presentat
     };
     CHECK(publication.valid());
 }
-
 }  // namespace

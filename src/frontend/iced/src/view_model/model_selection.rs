@@ -28,13 +28,21 @@ pub(crate) fn model_settings_projection(
     workflow: FeatureId,
 ) -> Option<ModelSettingsProjection> {
     let selection = crate::generated::project_model_settings(settings, workflow)?;
-    let matching = || crate::generated::MODEL_ARTIFACT_DIALOGS.iter().filter(|dialog| {
-        dialog.target.workflow == workflow
-            && crate::generated::model_dialog_predicate_matches(settings, dialog)
-    });
+    let matching = || {
+        crate::generated::MODEL_ARTIFACT_DIALOGS
+            .iter()
+            .filter(|dialog| {
+                dialog.target.workflow == workflow
+                    && crate::generated::model_dialog_predicate_matches(settings, dialog)
+            })
+    };
     let fields = matching().next()?;
     let artifact_field = matching().find(|dialog| dialog.target.input == selection.key.input);
-    Some(ModelSettingsProjection { fields, artifact_field, selection })
+    Some(ModelSettingsProjection {
+        fields,
+        artifact_field,
+        selection,
+    })
 }
 
 impl ModelSettingsProjection {
@@ -236,32 +244,79 @@ mod tests {
     #[test]
     fn descriptors_and_partial_drafts_keep_complete_keys_on_every_workflow() {
         let mut model = bootstrapped();
-        let mut settings = model.settings_snapshot.as_ref().unwrap().settingsstate.clone();
+        let mut settings = model
+            .settings_snapshot
+            .as_ref()
+            .unwrap()
+            .settingsstate
+            .clone();
         for dialog in crate::generated::MODEL_ARTIFACT_DIALOGS {
             let row = compatibility_for_dialog(dialog).unwrap();
             if let Some(predicate) = dialog.predicate_field_id {
-                write_field(&mut settings, predicate, SettingsFieldValue::Bool(row.requiredexportbuildtensorrt.unwrap()));
+                write_field(
+                    &mut settings,
+                    predicate,
+                    SettingsFieldValue::Bool(row.requiredexportbuildtensorrt.unwrap()),
+                );
             }
-            write_field(&mut settings, dialog.key_fields.input, SettingsFieldValue::ModelArtifactInputKind(row.input));
-            write_field(&mut settings, dialog.key_fields.source, SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Custom));
-            write_field(&mut settings, dialog.stable_field_id, SettingsFieldValue::String("/tmp/custom-model".into()));
-            write_field(&mut settings, dialog.key_fields.classlayoutpath, SettingsFieldValue::String("/tmp/first.classes.json".into()));
+            write_field(
+                &mut settings,
+                dialog.key_fields.input,
+                SettingsFieldValue::ModelArtifactInputKind(row.input),
+            );
+            write_field(
+                &mut settings,
+                dialog.key_fields.source,
+                SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Custom),
+            );
+            write_field(
+                &mut settings,
+                dialog.stable_field_id,
+                SettingsFieldValue::String("/tmp/custom-model".into()),
+            );
+            write_field(
+                &mut settings,
+                dialog.key_fields.classlayoutpath,
+                SettingsFieldValue::String("/tmp/first.classes.json".into()),
+            );
             let accepted = accepted_model_for(&model, &settings, row.workflow);
-            assert_eq!(accepted.selection.key.classlayoutpath, "/tmp/first.classes.json");
+            assert_eq!(
+                accepted.selection.key.classlayoutpath,
+                "/tmp/first.classes.json"
+            );
             model.model_snapshot = Some(accepted);
             assert!(model.model_selection_matches(&settings, row.workflow));
-            write_field(&mut settings, dialog.key_fields.classlayoutpath, SettingsFieldValue::String("/tmp/second.classes.json".into()));
+            write_field(
+                &mut settings,
+                dialog.key_fields.classlayoutpath,
+                SettingsFieldValue::String("/tmp/second.classes.json".into()),
+            );
             assert!(!model.model_selection_matches(&settings, row.workflow));
             if row.canonicalallowed {
-                write_field(&mut settings, dialog.key_fields.source, SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Canonical));
+                write_field(
+                    &mut settings,
+                    dialog.key_fields.source,
+                    SettingsFieldValue::ModelSelectionSource(ModelSelectionSource::Canonical),
+                );
                 model.model_snapshot = Some(accepted_model_for(&model, &settings, row.workflow));
-                write_field(&mut settings, dialog.stable_field_id, SettingsFieldValue::String("/tmp/unused-custom-model".into()));
+                write_field(
+                    &mut settings,
+                    dialog.stable_field_id,
+                    SettingsFieldValue::String("/tmp/unused-custom-model".into()),
+                );
                 assert!(model.model_selection_matches(&settings, row.workflow));
             }
-            write_field(&mut settings, dialog.key_fields.input, SettingsFieldValue::ModelArtifactInputKind(ModelArtifactInputKind::None));
+            write_field(
+                &mut settings,
+                dialog.key_fields.input,
+                SettingsFieldValue::ModelArtifactInputKind(ModelArtifactInputKind::None),
+            );
             let partial = model_settings_projection(&settings, row.workflow).unwrap();
             assert_eq!(partial.selection.key.input, ModelArtifactInputKind::None);
-            assert_eq!(partial.selection.key.classlayoutpath, "/tmp/second.classes.json");
+            assert_eq!(
+                partial.selection.key.classlayoutpath,
+                "/tmp/second.classes.json"
+            );
             assert!(partial.selection.artifact.is_empty());
             assert!(partial.artifact_field.is_none());
             assert!(!partial.can_prepare());
@@ -278,8 +333,15 @@ mod tests {
     #[test]
     fn model_event_before_reply_and_stale_reply_keep_newest_selection() {
         let mut model = bootstrapped();
-        model.settings_snapshot.as_mut().unwrap().settingsstate.workflows.train.request.classlayoutpath =
-            "/tmp/event.classes.json".into();
+        model
+            .settings_snapshot
+            .as_mut()
+            .unwrap()
+            .settingsstate
+            .workflows
+            .train
+            .request
+            .classlayoutpath = "/tmp/event.classes.json".into();
         let settings = model
             .settings_snapshot
             .as_ref()

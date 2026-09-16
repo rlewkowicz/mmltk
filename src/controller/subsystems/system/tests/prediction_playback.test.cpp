@@ -7,15 +7,13 @@
 #include <stop_token>
 #include "src/acceptance/tests/async_test_utils.hpp"
 #include "src/controller/subsystems/system/detail/prediction_playback.h"
-
 namespace {
 using Playback = mmltk::controller::detail::PredictionPlayback;
 using namespace std::chrono_literals;
 constexpr auto start = Playback::Clock::time_point{10s};
 constexpr auto invalid_timestamp = std::numeric_limits<double>::quiet_NaN();
 constexpr auto infinity = std::numeric_limits<double>::infinity();
-}
-
+}  // namespace
 TEST_CASE("video cadence uses monotonic presentation timing and honest fallback", "[controller][video]") {
     CHECK(Playback::Interval(1.0, 1.25, 30.0) == 0.25);
     CHECK(Playback::Interval(1.0, 1.0, 4.0) == 0.25);
@@ -28,7 +26,6 @@ TEST_CASE("video cadence uses monotonic presentation timing and honest fallback"
     playback.Pause(true);
     CHECK_FALSE(playback.Wait(0.0, 30.0, stop.get_token()));
 }
-
 TEST_CASE("video scheduling accounts for fallback before timestamp recovery", "[controller][video]") {
     Playback playback;
     CHECK(playback.Schedule(10.0, 4.0, start) == start);
@@ -36,7 +33,6 @@ TEST_CASE("video scheduling accounts for fallback before timestamp recovery", "[
     CHECK(playback.Schedule(10.5, 4.0, start) == start + 500ms);
     CHECK(playback.Schedule(10.75, 0.0, start) == start + 750ms);
 }
-
 TEST_CASE("video fallback retains the valid cursor through invalid timestamps", "[controller][video]") {
     Playback playback;
     CHECK(playback.Schedule(10.0, 4.0, start) == start);
@@ -51,7 +47,6 @@ TEST_CASE("video fallback retains the valid cursor through invalid timestamps", 
     CHECK(playback.Schedule({}, 2.0, start) == start + 2250ms);
     CHECK(playback.Schedule(12.5, 0.0, start) == start + 2500ms);
 }
-
 TEST_CASE("video recovery never moves a deadline backward when fallback overtakes PTS", "[controller][video]") {
     for (const double recovered : {10.25, 10.5}) {
         Playback playback;
@@ -62,7 +57,6 @@ TEST_CASE("video recovery never moves a deadline backward when fallback overtake
         CHECK(playback.Schedule(recovered + 0.25, 0.0, start) == start + 750ms);
     }
 }
-
 TEST_CASE("video first timing and failed scheduling leave a usable source baseline", "[controller][video]") {
     Playback playback;
     for (const auto timestamp : std::array<std::optional<double>, 3>{{{}, invalid_timestamp, infinity}})
@@ -82,17 +76,14 @@ TEST_CASE("video first timing and failed scheduling leave a usable source baseli
     CHECK(playback.Schedule(-10.0, 0.0, start) == start);
     CHECK(playback.Schedule(-9.75, 0.0, start) == start + 250ms);
 }
-
 TEST_CASE("video deadlines account for inference time and rebase overdue frames", "[controller][video]") {
     CHECK(Playback::Advance(start, start + 100ms, 0.5) == start + 500ms);
     const auto late = Playback::Advance(start, start + 2s, 0.5);
     CHECK(late == start + 2s);
     CHECK(Playback::Advance(late, late + 100ms, 0.5) == late + 500ms);
-    for (const double seconds : {0.0, -1.0, invalid_timestamp, infinity, 1e300})
-        CHECK_THROWS_AS(Playback::Advance(start, start, seconds), std::runtime_error);
+    for (const double seconds : {0.0, -1.0, invalid_timestamp, infinity, 1e300}) CHECK_THROWS_AS(Playback::Advance(start, start, seconds), std::runtime_error);
     const auto limit = Playback::Clock::time_point::max() - 1s;
     CHECK_THROWS_AS(Playback::Advance(limit, limit, 1.0), std::runtime_error);
-
     Playback playback;
     CHECK(playback.Schedule(10.0, 4.0, start) == start);
     CHECK(playback.Schedule({}, 4.0, start + 2s) == start + 2s);
@@ -102,7 +93,6 @@ TEST_CASE("video deadlines account for inference time and rebase overdue frames"
     CHECK(playback.Schedule(11.0, 4.0, start + 4100ms) == start + 4100ms);
     CHECK(playback.Schedule(11.25, 4.0, start + 4200ms) == start + 4350ms);
 }
-
 TEST_CASE("video pause excludes wall time without consuming source fallback credit", "[controller][video]") {
     Playback playback;
     CHECK(playback.Schedule(10.0, 4.0, start) == start);
@@ -119,7 +109,6 @@ TEST_CASE("video pause excludes wall time without consuming source fallback cred
     CHECK(playback.Schedule(1.0, 4.0, start) == start);
     CHECK(playback.Schedule(1.25, 0.0, start) == start + 250ms);
 }
-
 TEST_CASE("video pause rejects clock overflow without corrupting the pending deadline", "[controller][video]") {
     Playback playback;
     const auto limit = Playback::Clock::time_point::max() - 1s;
@@ -130,7 +119,6 @@ TEST_CASE("video pause rejects clock overflow without corrupting the pending dea
     playback.Pause(false, start + 250ms);
     CHECK(playback.Schedule(10.25, 4.0, limit) == limit + 500ms);
 }
-
 TEST_CASE("video live wait shares fallback and recovery scheduling", "[controller][video]") {
     for (const bool recover_in_wait : {false, true}) {
         Playback playback;
@@ -138,8 +126,7 @@ TEST_CASE("video live wait shares fallback and recovery scheduling", "[controlle
         // exposes the exact live scheduling transition without timing tolerances.
         const auto future_start = Playback::Clock::now() + 100s;
         REQUIRE(playback.Schedule(10.0, 4.0, future_start) == future_start);
-        if (recover_in_wait)
-            REQUIRE(playback.Schedule({}, 4.0, future_start) == future_start + 250ms);
+        if (recover_in_wait) REQUIRE(playback.Schedule({}, 4.0, future_start) == future_start + 250ms);
         std::stop_source stop;
         std::promise<void> entered;
         auto waiting = std::async(std::launch::async, [&] {
@@ -157,7 +144,6 @@ TEST_CASE("video live wait shares fallback and recovery scheduling", "[controlle
             CHECK(playback.Schedule(10.5, 0.0, future_start) == future_start + 500ms);
     }
 }
-
 TEST_CASE("video stop interrupts pause and outstanding pacing", "[controller][video]") {
     for (const bool paused : {true, false}) {
         Playback playback;
@@ -178,7 +164,6 @@ TEST_CASE("video stop interrupts pause and outstanding pacing", "[controller][vi
         CHECK(playback.Wait(0.0, 1.0, {}));
     }
 }
-
 TEST_CASE("video resume excludes time spent paused from its pending frame", "[controller][video]") {
     Playback playback;
     REQUIRE(playback.Wait(0.0, 1.0, {}));

@@ -1,10 +1,8 @@
 #pragma once
-
 #include <cuda.h>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-
 namespace mmltk::frameworks::gpu::detail {
 struct GdrMappingInfo final {
     CUdeviceptr base = 0;
@@ -13,7 +11,6 @@ struct GdrMappingInfo final {
     int mapping_type = 0;
     bool mapped = false;
 };
-
 // Physical driver boundary, injected by standard ownership/failure tests.
 // Acquisition throws; release reports failure without relinquishing ownership.
 class GdrBufferBackend {

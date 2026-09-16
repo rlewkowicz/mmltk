@@ -14,22 +14,16 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 #include "archive_utils.h"
 #include "model_technical.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "torch_api.h"
 #include "detail/checkpoint_private.h"
-
 import mmltk.backend.models.rfdetr.training.checkpoint;
-
 #include "detail/native_optimizer_private.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 namespace torch_api = mmltk::backend::ml::torch_api;
-
 bool muon_parameter_eligible(const std::string_view name, const torch_api::Tensor& parameter) {
     if ((parameter.dim() != 2 && parameter.dim() != 4) || name.find(".weight") == std::string_view::npos) { return false; }
     if (name.find("embeddings") != std::string_view::npos || name.find("position_embeddings") != std::string_view::npos ||
@@ -41,9 +35,7 @@ bool muon_parameter_eligible(const std::string_view name, const torch_api::Tenso
     }
     return true;
 }
-
 namespace {
-
 constexpr const char* kNativeAdamWFormat = "mmltk.rfdetr.native_adamw";
 constexpr int64_t kNativeAdamWFormatVersion = 1;
 constexpr double kAdamBeta1 = 0.9;
@@ -59,40 +51,33 @@ constexpr int64_t kMuonNsSteps = 5;
 constexpr double kAuxAdamBeta1 = 0.9;
 constexpr double kAuxAdamBeta2 = 0.95;
 constexpr double kAuxAdamEps = 1.0e-10;
-
 bool finite_equal(const double value, const double expected, const double tolerance = 1.0e-12) {
     return std::isfinite(value) && std::abs(value - expected) <= tolerance;
 }
-
 NativeOptimizerBackend parse_backend_name(const std::string& name) {
     if (name == "eager") { return NativeOptimizerBackend::eager; }
     if (name == "foreach") { return NativeOptimizerBackend::foreach; }
     if (name == "fused") { return NativeOptimizerBackend::fused; }
     throw std::runtime_error("unknown native AdamW backend in archive: " + name);
 }
-
 torch_api::Tensor align_tensor_like_param(const torch_api::Tensor& source, const torch_api::Tensor& param) {
     auto aligned = torch_api::zeros_like(param);
     if (source.defined()) { aligned.copy_(source.to(param.device(), param.scalar_type(), false, false)); }
     return aligned;
 }
-
 void ensure_aligned(torch_api::Tensor& t, const torch_api::Tensor& param) {
-    if (!t.defined() || t.sizes() != param.sizes() || t.device() != param.device() || t.scalar_type() != param.scalar_type() ||
-        t.layout() != param.layout() || t.strides() != param.strides()) {
+    if (!t.defined() || t.sizes() != param.sizes() || t.device() != param.device() || t.scalar_type() != param.scalar_type() || t.layout() != param.layout() ||
+        t.strides() != param.strides()) {
         t = align_tensor_like_param(t, param);
     }
 }
-
 torch_api::Device step_device_for_backend(const torch_api::Tensor& param, NativeOptimizerBackend backend) {
     if (backend == NativeOptimizerBackend::fused || backend == NativeOptimizerBackend::foreach) { return param.device(); }
     return {torch_api::kCPU};
 }
-
 torch_api::Tensor make_step_tensor(const torch_api::Tensor& param, NativeOptimizerBackend backend) {
     return torch_api::zeros({}, torch_api::TensorOptions().dtype(torch_api::kFloat32).device(step_device_for_backend(param, backend)));
 }
-
 struct AdamWBatch {
     std::vector<torch_api::Tensor> params;
     std::vector<torch_api::Tensor> grads;
@@ -101,19 +86,13 @@ struct AdamWBatch {
     std::vector<torch_api::Tensor> max_exp_avg_sqs;
     std::vector<torch_api::Tensor> steps;
 };
-
 using AdamWBatchKey = std::pair<int, int>;
 using AdamWBatchMap = std::map<AdamWBatchKey, AdamWBatch>;
-
 template <typename GroupCollection>
-void set_scaled_group_lrs(GroupCollection& groups, const std::vector<double>& base_lrs, const double scale,
-                          const char* size_mismatch_message) {
+void set_scaled_group_lrs(GroupCollection& groups, const std::vector<double>& base_lrs, const double scale, const char* size_mismatch_message) {
     if (base_lrs.size() != groups.size()) { throw std::runtime_error(size_mismatch_message); }
-    for (size_t index = 0; index < groups.size(); ++index) {
-        groups[index].config.lr = base_lrs[index] * scale;
-    }
+    for (size_t index = 0; index < groups.size(); ++index) { groups[index].config.lr = base_lrs[index] * scale; }
 }
-
 void zero_grad_parameters(std::vector<torch_api::Tensor>& params, const bool set_to_none) {
     torch_api::NoGradGuard no_grad;
     for (auto& param : params) {
@@ -127,14 +106,12 @@ void zero_grad_parameters(std::vector<torch_api::Tensor>& params, const bool set
         grad.zero_();
     }
 }
-
 template <typename Group>
 void validate_group_indices(const Group& group, const size_t param_count, const char* out_of_range_message) {
     for (const size_t index : group.param_indices) {
         if (index >= param_count) { throw std::runtime_error(out_of_range_message); }
     }
 }
-
 template <typename NamedParameterCollection>
 void populate_named_parameter_views(const NamedParameterCollection& params, std::vector<torch_api::Tensor>& all_params,
                                     std::vector<std::string>& all_param_names, const char* undefined_param_message) {
@@ -146,19 +123,14 @@ void populate_named_parameter_views(const NamedParameterCollection& params, std:
         all_param_names.push_back(param.name);
     }
 }
-
 template <typename GroupCollection>
 void validate_group_collection_indices(const GroupCollection& groups, const size_t param_count, const char* out_of_range_message) {
-    for (const auto& group : groups) {
-        validate_group_indices(group, param_count, out_of_range_message);
-    }
+    for (const auto& group : groups) { validate_group_indices(group, param_count, out_of_range_message); }
 }
-
 void write_archive_layout_counts(torch_api::OutputArchive& archive, const size_t group_count, const size_t param_count) {
     write_int(archive, "group_count", static_cast<int64_t>(group_count));
     write_int(archive, "param_count", static_cast<int64_t>(param_count));
 }
-
 void validate_archive_layout_counts(torch_api::InputArchive& archive, const size_t expected_group_count, const size_t expected_param_count,
                                     const char* mismatch_message) {
     const auto group_count = require_int(archive, "group_count");
@@ -167,54 +139,43 @@ void validate_archive_layout_counts(torch_api::InputArchive& archive, const size
         throw std::runtime_error(mismatch_message);
     }
 }
-
 template <typename WriteEntryFn>
-void write_indexed_optimizer_archive(torch_api::OutputArchive& archive, const char* entry_name, const size_t entry_count,
-                                     WriteEntryFn&& write_entry) {
+void write_indexed_optimizer_archive(torch_api::OutputArchive& archive, const char* entry_name, const size_t entry_count, WriteEntryFn&& write_entry) {
     for (size_t index = 0; index < entry_count; ++index) {
         torch_api::OutputArchive entry_archive;
         write_entry(index, entry_archive);
         archive.write(archive_entry_name(entry_name, index), entry_archive);
     }
 }
-
 template <typename ReadEntryFn>
-void read_indexed_optimizer_archive(torch_api::InputArchive& archive, const char* entry_name, const size_t entry_count,
-                                    ReadEntryFn&& read_entry) {
+void read_indexed_optimizer_archive(torch_api::InputArchive& archive, const char* entry_name, const size_t entry_count, ReadEntryFn&& read_entry) {
     for (size_t index = 0; index < entry_count; ++index) {
         torch_api::InputArchive entry_archive;
         archive.read(archive_entry_name(entry_name, index), entry_archive);
         read_entry(index, entry_archive);
     }
 }
-
 void write_named_parameter_archive(torch_api::OutputArchive& archive, const std::string& name) { write_string(archive, "name", name); }
-
 void validate_named_parameter_archive(torch_api::InputArchive& archive, const std::string& expected_name, const char* mismatch_message) {
     if (require_string(archive, "name") != expected_name) { throw std::runtime_error(mismatch_message); }
 }
-
 torch_api::Tensor require_parameter_state_tensor(torch_api::InputArchive& archive, const char* entry_name, const torch_api::Tensor& param,
                                                  const char* shape_mismatch_message) {
     auto state_tensor = require_tensor(archive, entry_name);
     if (state_tensor.sizes() != param.sizes() || !state_tensor.device().is_cpu() || !state_tensor.is_floating_point() ||
-        state_tensor.scalar_type() != param.scalar_type() || state_tensor.layout() != param.layout() ||
-        !torch_api::isfinite(state_tensor).all().item<bool>()) {
+        state_tensor.scalar_type() != param.scalar_type() || state_tensor.layout() != param.layout() || !torch_api::isfinite(state_tensor).all().item<bool>()) {
         throw std::runtime_error(shape_mismatch_message);
     }
     return align_tensor_like_param(state_tensor, param);
 }
-
-torch_api::Tensor require_adam_step_tensor(torch_api::InputArchive& archive, const torch_api::Tensor& param,
-                                           const NativeOptimizerBackend backend) {
+torch_api::Tensor require_adam_step_tensor(torch_api::InputArchive& archive, const torch_api::Tensor& param, const NativeOptimizerBackend backend) {
     auto step = require_tensor(archive, "step");
-    if (!step.defined() || !step.device().is_cpu() || step.dim() != 0 || step.scalar_type() != torch_api::kFloat32 ||
-        !torch_api::isfinite(step).item<bool>() || step.item<float>() < 0.0F) {
+    if (!step.defined() || !step.device().is_cpu() || step.dim() != 0 || step.scalar_type() != torch_api::kFloat32 || !torch_api::isfinite(step).item<bool>() ||
+        step.item<float>() < 0.0F) {
         throw std::runtime_error("native AdamW archive step does not match the current optimizer");
     }
     return step.to(step_device_for_backend(param, backend), torch_api::kFloat32).contiguous();
 }
-
 template <typename ParamIndexCollection>
 void write_group_param_indices(torch_api::OutputArchive& archive, const ParamIndexCollection& param_indices) {
     write_int(archive, "param_index_count", static_cast<int64_t>(param_indices.size()));
@@ -222,13 +183,11 @@ void write_group_param_indices(torch_api::OutputArchive& archive, const ParamInd
         write_int(archive, archive_entry_name("param_index", param_index).c_str(), static_cast<int64_t>(param_indices[param_index]));
     }
 }
-
 template <typename GroupConfig>
 void write_group_lr_weight_decay(torch_api::OutputArchive& archive, const GroupConfig& config) {
     write_double(archive, "lr", config.lr);
     write_double(archive, "weight_decay", config.weight_decay);
 }
-
 // Every native optimizer stamps its archive with the same format tag and version, so one reader
 // rejects legacy and future archives for all of them. `label` names the optimizer in both failures.
 void validate_optimizer_archive_format(torch_api::InputArchive& archive, const char* expected_format, const int64_t expected_version,
@@ -243,10 +202,9 @@ void validate_optimizer_archive_format(torch_api::InputArchive& archive, const c
     const auto version = require_int(archive, "format_version");
     if (version != expected_version) { throw std::runtime_error(std::format("unsupported native {} archive version: {}", label, version)); }
 }
-
 template <typename ParamIndexCollection>
-void validate_group_param_indices(torch_api::InputArchive& archive, const ParamIndexCollection& param_indices,
-                                  const char* size_mismatch_message, const char* order_mismatch_message) {
+void validate_group_param_indices(torch_api::InputArchive& archive, const ParamIndexCollection& param_indices, const char* size_mismatch_message,
+                                  const char* order_mismatch_message) {
     const auto param_index_count = require_int(archive, "param_index_count");
     if (param_index_count != static_cast<int64_t>(param_indices.size())) { throw std::runtime_error(size_mismatch_message); }
     for (size_t param_index = 0; param_index < param_indices.size(); ++param_index) {
@@ -254,7 +212,6 @@ void validate_group_param_indices(torch_api::InputArchive& archive, const ParamI
         if (stored_param_index != static_cast<int64_t>(param_indices[param_index])) { throw std::runtime_error(order_mismatch_message); }
     }
 }
-
 // Reads the parameter-group layout every native optimizer shares: the learning rate, the weight
 // decay, whatever optimizer-specific fields `read_config` claims, and the parameter index roster.
 // The mirror of write_group_lr_weight_decay plus write_group_param_indices on the save path.
@@ -269,26 +226,21 @@ void read_optimizer_group_archives(torch_api::InputArchive& archive, GroupCollec
         validate_group_param_indices(group_archive, group.param_indices, size_mismatch_message, order_mismatch_message);
     });
 }
-
 template <typename GroupCollection, typename FlagAccessor>
 std::vector<bool> collect_group_param_flags(const GroupCollection& groups, size_t param_count, FlagAccessor&& flag_accessor) {
     std::vector<bool> flags(param_count, false);
     for (const auto& group : groups) {
         const bool enabled = flag_accessor(group);
-        for (const auto index : group.param_indices) {
-            flags[index] = enabled;
-        }
+        for (const auto index : group.param_indices) { flags[index] = enabled; }
     }
     return flags;
 }
-
 // Muon routes each parameter through either the Muon or the auxiliary Adam path; state setup, save
 // and load all need the same per-parameter routing decision.
 template <typename GroupCollection>
 std::vector<bool> collect_muon_param_flags(const GroupCollection& groups, const size_t param_count) {
     return collect_group_param_flags(groups, param_count, [](const auto& group) { return group.config.use_muon; });
 }
-
 // Shared state-initialization skeleton for the native optimizers: size the per-parameter state to
 // the parameter list, resolve the per-parameter group flag once, then let the caller fill each slot.
 template <typename States, typename NamedParameters, typename GroupCollection, typename FlagAccessor, typename StateInitializer>
@@ -297,14 +249,10 @@ void initialize_param_states(States& states, const NamedParameters& params, cons
     states.clear();
     states.resize(params.size());
     const std::vector<bool> flags = collect_group_param_flags(groups, params.size(), std::forward<FlagAccessor>(flag_accessor));
-    for (size_t index = 0; index < params.size(); ++index) {
-        state_initializer(states[index], params[index].tensor, flags[index]);
-    }
+    for (size_t index = 0; index < params.size(); ++index) { state_initializer(states[index], params[index].tensor, flags[index]); }
 }
-
 torch_api::Tensor muon_zeropower_via_newtonschulz5(const torch_api::Tensor& grad, const int64_t steps = kMuonNsSteps) {
     if (grad.dim() < 2) { throw std::runtime_error("native Muon zeropower requires tensors with rank >= 2"); }
-
     auto update = grad.to(torch_api::kBFloat16);
     const bool transpose = update.size(-2) > update.size(-1);
     if (transpose) { update = update.transpose(-2, -1); }
@@ -318,7 +266,6 @@ torch_api::Tensor muon_zeropower_via_newtonschulz5(const torch_api::Tensor& grad
     if (transpose) { update = update.transpose(-2, -1); }
     return update;
 }
-
 void validate_adamw_param_for_backend(const torch_api::Tensor& param, const torch_api::Tensor& grad, const NativeOptimizerBackend backend) {
     if (grad.is_sparse()) { throw std::runtime_error("native AdamW does not support sparse gradients"); }
     if (backend == NativeOptimizerBackend::fused) {
@@ -330,10 +277,8 @@ void validate_adamw_param_for_backend(const torch_api::Tensor& param, const torc
     }
     if (torch_api::is_complex(param)) { throw std::runtime_error("native AdamW does not support complex parameters"); }
 }
-
-void align_adamw_state_tensors(torch_api::Tensor& step, torch_api::Tensor& exp_avg, torch_api::Tensor& exp_avg_sq,
-                               torch_api::Tensor& max_exp_avg_sq, torch_api::Tensor& grad, const torch_api::Tensor& param,
-                               const NativeOptimizerBackend backend, const bool amsgrad) {
+void align_adamw_state_tensors(torch_api::Tensor& step, torch_api::Tensor& exp_avg, torch_api::Tensor& exp_avg_sq, torch_api::Tensor& max_exp_avg_sq,
+                               torch_api::Tensor& grad, const torch_api::Tensor& param, const NativeOptimizerBackend backend, const bool amsgrad) {
     const auto step_device = step_device_for_backend(param, backend);
     if (!step.defined() || step.device() != step_device) { step = step.to(step_device, torch_api::kFloat32).contiguous(); }
     if (step.scalar_type() != torch_api::kFloat32) { step = step.to(step_device, torch_api::kFloat32).contiguous(); }
@@ -342,7 +287,6 @@ void align_adamw_state_tensors(torch_api::Tensor& step, torch_api::Tensor& exp_a
     ensure_aligned(grad, param);
     if (amsgrad) { ensure_aligned(max_exp_avg_sq, param); }
 }
-
 void collect_adamw_batch(std::map<std::pair<int, int>, AdamWBatch>& batches, const torch_api::Tensor& param, const torch_api::Tensor& grad,
                          const torch_api::Tensor& exp_avg, const torch_api::Tensor& exp_avg_sq, const torch_api::Tensor& max_exp_avg_sq,
                          const torch_api::Tensor& step, const bool amsgrad) {
@@ -356,7 +300,6 @@ void collect_adamw_batch(std::map<std::pair<int, int>, AdamWBatch>& batches, con
     if (amsgrad) { batch.max_exp_avg_sqs.push_back(max_exp_avg_sq); }
     batch.steps.push_back(step);
 }
-
 template <typename Params, typename States, typename Group, typename Fn>
 void for_each_adamw_grad_state(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend, Fn&& fn) {
     for (const auto index : group.param_indices) {
@@ -367,47 +310,38 @@ void for_each_adamw_grad_state(Params& params, States& states, const Group& grou
         fn(index, param, grad, states[index]);
     }
 }
-
 template <typename Params, typename States, typename Group>
 AdamWBatchMap collect_adamw_batches(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend) {
     AdamWBatchMap batches;
     for_each_adamw_grad_state(params, states, group, backend, [&](const auto, auto& param, auto grad, auto& state) {
-        align_adamw_state_tensors(state.step, state.exp_avg, state.exp_avg_sq, state.max_exp_avg_sq, grad, param, backend,
-                                  group.config.amsgrad);
+        align_adamw_state_tensors(state.step, state.exp_avg, state.exp_avg_sq, state.max_exp_avg_sq, grad, param, backend, group.config.amsgrad);
         collect_adamw_batch(batches, param, grad, state.exp_avg, state.exp_avg_sq, state.max_exp_avg_sq, state.step, group.config.amsgrad);
     });
     return batches;
 }
-
 void apply_foreach_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& config) {
     torch_api::_foreach_add_(batch.steps, 1.0);
-
     if (config.weight_decay != 0.0) { torch_api::_foreach_mul_(batch.params, 1.0 - config.lr * config.weight_decay); }
-
     torch_api::_foreach_mul_(batch.exp_avgs, kAdamBeta1);
     torch_api::_foreach_add_(batch.exp_avgs, batch.grads, 1.0 - kAdamBeta1);
     torch_api::_foreach_mul_(batch.exp_avg_sqs, kAdamBeta2);
     torch_api::_foreach_addcmul_(batch.exp_avg_sqs, batch.grads, batch.grads, 1.0 - kAdamBeta2);
-
     const auto step_value = batch.steps[0].item<double>();
     const double bias_correction1 = 1.0 - std::pow(kAdamBeta1, step_value);
     const double bias_correction2 = 1.0 - std::pow(kAdamBeta2, step_value);
     const double step_size = config.lr / bias_correction1;
     const double bias_correction2_sqrt = std::sqrt(bias_correction2);
-
     if (config.amsgrad) { torch_api::_foreach_maximum_(batch.max_exp_avg_sqs, batch.exp_avg_sqs); }
     auto denoms = torch_api::_foreach_sqrt(config.amsgrad ? batch.max_exp_avg_sqs : batch.exp_avg_sqs);
     torch_api::_foreach_div_(denoms, bias_correction2_sqrt);
     torch_api::_foreach_add_(denoms, kAdamEps);
     torch_api::_foreach_addcdiv_(batch.params, batch.exp_avgs, denoms, -step_size);
 }
-
 void apply_fused_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& config) {
     torch_api::_foreach_add_(batch.steps, 1.0);
-    torch_api::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr,
-                             kAdamBeta1, kAdamBeta2, config.weight_decay, kAdamEps, config.amsgrad, false, std::nullopt, std::nullopt);
+    torch_api::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr, kAdamBeta1,
+                             kAdamBeta2, config.weight_decay, kAdamEps, config.amsgrad, false, std::nullopt, std::nullopt);
 }
-
 template <typename Params, typename States, typename Group>
 void step_adamw_group_batched(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend) {
     auto batches = collect_adamw_batches(params, states, group, backend);
@@ -420,7 +354,6 @@ void step_adamw_group_batched(Params& params, States& states, const Group& group
         }
     }
 }
-
 torch_api::Tensor muon_update(const torch_api::Tensor& grad, torch_api::Tensor& momentum, const double beta, const bool nesterov) {
     momentum.lerp_(grad, 1.0 - beta);
     auto update = nesterov ? grad.lerp(momentum, beta) : momentum;
@@ -429,9 +362,7 @@ torch_api::Tensor muon_update(const torch_api::Tensor& grad, torch_api::Tensor& 
     update.mul_(std::sqrt(std::max(1.0, static_cast<double>(update.size(-2)) / static_cast<double>(update.size(-1)))));
     return update;
 }
-
-torch_api::Tensor adam_update(const torch_api::Tensor& grad, torch_api::Tensor& exp_avg, torch_api::Tensor& exp_avg_sq,
-                              const int64_t step) {
+torch_api::Tensor adam_update(const torch_api::Tensor& grad, torch_api::Tensor& exp_avg, torch_api::Tensor& exp_avg_sq, const int64_t step) {
     exp_avg.lerp_(grad, 1.0 - kAuxAdamBeta1);
     exp_avg_sq.lerp_(grad.square(), 1.0 - kAuxAdamBeta2);
     const double bias_correction1 = 1.0 - std::pow(kAuxAdamBeta1, static_cast<double>(step));
@@ -440,13 +371,11 @@ torch_api::Tensor adam_update(const torch_api::Tensor& grad, torch_api::Tensor& 
     auto exp_avg_sq_corrected = exp_avg_sq.div(bias_correction2);
     return exp_avg_corrected.div(exp_avg_sq_corrected.sqrt().add(kAuxAdamEps));
 }
-
 // Reconstruct only the saved CPU layout, then reuse the optimizer's complete
 // continuation parser. No model construction, zero-state allocation, or CUDA.
 template <class Groups, class Parameters>
-void read_inspection_layout(torch_api::InputArchive& archive,
-                            const std::unordered_map<std::string, torch_api::Tensor>& tensors,
-                            Groups& groups, Parameters& parameters) {
+void read_inspection_layout(torch_api::InputArchive& archive, const std::unordered_map<std::string, torch_api::Tensor>& tensors, Groups& groups,
+                            Parameters& parameters) {
     const auto count = require_int(archive, "param_count");
     const auto group_count = require_int(archive, "group_count");
     if (count <= 0 || static_cast<std::uint64_t>(count) > tensors.size() || group_count <= 0 || group_count > count)
@@ -477,21 +406,15 @@ void read_inspection_layout(torch_api::InputArchive& archive,
     });
     if (std::ranges::find(assigned, false) != assigned.end()) throw std::runtime_error("optimizer group inventory is incomplete");
 }
-
 }  // namespace
-
 const char* native_optimizer_backend_name(const NativeOptimizerBackend backend) {
     switch (backend) {
-        case NativeOptimizerBackend::eager:
-            return "eager";
-        case NativeOptimizerBackend::foreach:
-            return "foreach";
-        case NativeOptimizerBackend::fused:
-            return "fused";
+        case NativeOptimizerBackend::eager: return "eager";
+        case NativeOptimizerBackend::foreach: return "foreach";
+        case NativeOptimizerBackend::fused: return "fused";
     }
     return "unknown";
 }
-
 bool native_optimizer_supports_foreach(const std::vector<torch_api::Tensor>& params) {
     if (params.empty()) { return false; }
     for (const auto& param : params) {
@@ -499,7 +422,6 @@ bool native_optimizer_supports_foreach(const std::vector<torch_api::Tensor>& par
     }
     return true;
 }
-
 bool native_optimizer_supports_fused(const std::vector<torch_api::Tensor>& params) {
     if (!native_optimizer_supports_foreach(params)) { return false; }
     for (const auto& param : params) {
@@ -511,18 +433,14 @@ bool native_optimizer_supports_fused(const std::vector<torch_api::Tensor>& param
     }
     return true;
 }
-
 NativeAdamW::NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, const NativeOptimizerBackend backend)
     : NativeOptimizerStorage(std::move(groups), std::move(params)), backend_(backend) {
     populate_named_parameter_views(params_, all_params_, all_param_names_, "native AdamW received an undefined parameter tensor");
     validate_group_collection_indices(groups_, params_.size(), "native AdamW parameter group index is out of range");
     initialize_state();
 }
-
 NativeOptimizerBackend NativeAdamW::backend() const { return backend_; }
-
 const char* NativeAdamW::backend_name() const { return native_optimizer_backend_name(backend_); }
-
 void NativeAdamW::initialize_state() {
     initialize_param_states(
         state_, params_, groups_, [](const auto& group) { return group.config.amsgrad; },
@@ -533,13 +451,10 @@ void NativeAdamW::initialize_state() {
             if (needs_amsgrad) { state.max_exp_avg_sq = torch_api::zeros_like(param); }
         });
 }
-
 void NativeAdamW::zero_grad(const bool set_to_none) { zero_grad_parameters(all_params_, set_to_none); }
-
 void NativeAdamW::set_lrs(const std::vector<double>& base_lrs, const double scale) {
     set_scaled_group_lrs(groups_, base_lrs, scale, "native AdamW base LR count does not match param group count");
 }
-
 void NativeAdamW::step() {
     torch_api::NoGradGuard no_grad;
     for (const auto& group : groups_) {
@@ -552,43 +467,32 @@ void NativeAdamW::step() {
         }
     }
 }
-
 void NativeAdamW::step_group_eager(const Group& group) {
-    for_each_adamw_grad_state(params_, state_, group, NativeOptimizerBackend::eager,
-                              [&](const auto, auto& param, const auto& grad, auto& state) {
-                                  state.step.add_(1.0);
-                                  const auto step_value = state.step.template item<double>();
-
-                                  if (group.config.weight_decay != 0.0) { param.mul_(1.0 - group.config.lr * group.config.weight_decay); }
-
-                                  state.exp_avg.mul_(kAdamBeta1).add_(grad, 1.0 - kAdamBeta1);
-                                  state.exp_avg_sq.mul_(kAdamBeta2).addcmul_(grad, grad, 1.0 - kAdamBeta2);
-
-                                  const double bias_correction1 = 1.0 - std::pow(kAdamBeta1, step_value);
-                                  const double bias_correction2 = 1.0 - std::pow(kAdamBeta2, step_value);
-                                  torch_api::Tensor denom;
-                                  if (group.config.amsgrad) {
-                                      if (!state.max_exp_avg_sq.defined()) { state.max_exp_avg_sq = torch_api::zeros_like(param); }
-                                      state.max_exp_avg_sq = torch_api::maximum(state.max_exp_avg_sq, state.exp_avg_sq);
-                                      denom = state.max_exp_avg_sq.sqrt();
-                                  } else {
-                                      denom = state.exp_avg_sq.sqrt();
-                                  }
-                                  denom.div_(std::sqrt(bias_correction2)).add_(kAdamEps);
-                                  param.addcdiv_(state.exp_avg, denom, -group.config.lr / bias_correction1);
-                              });
+    for_each_adamw_grad_state(params_, state_, group, NativeOptimizerBackend::eager, [&](const auto, auto& param, const auto& grad, auto& state) {
+        state.step.add_(1.0);
+        const auto step_value = state.step.template item<double>();
+        if (group.config.weight_decay != 0.0) { param.mul_(1.0 - group.config.lr * group.config.weight_decay); }
+        state.exp_avg.mul_(kAdamBeta1).add_(grad, 1.0 - kAdamBeta1);
+        state.exp_avg_sq.mul_(kAdamBeta2).addcmul_(grad, grad, 1.0 - kAdamBeta2);
+        const double bias_correction1 = 1.0 - std::pow(kAdamBeta1, step_value);
+        const double bias_correction2 = 1.0 - std::pow(kAdamBeta2, step_value);
+        torch_api::Tensor denom;
+        if (group.config.amsgrad) {
+            if (!state.max_exp_avg_sq.defined()) { state.max_exp_avg_sq = torch_api::zeros_like(param); }
+            state.max_exp_avg_sq = torch_api::maximum(state.max_exp_avg_sq, state.exp_avg_sq);
+            denom = state.max_exp_avg_sq.sqrt();
+        } else {
+            denom = state.exp_avg_sq.sqrt();
+        }
+        denom.div_(std::sqrt(bias_correction2)).add_(kAdamEps);
+        param.addcdiv_(state.exp_avg, denom, -group.config.lr / bias_correction1);
+    });
 }
-
-void NativeAdamW::step_group_foreach(const Group& group) {
-    step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::foreach);
-}
-
+void NativeAdamW::step_group_foreach(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::foreach); }
 void NativeAdamW::step_group_fused(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::fused); }
-
 namespace {
 template <class State>
-void reserve_optimizer_readback(const std::vector<State>& states, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
-                                std::size_t first_slot) {
+void reserve_optimizer_readback(const std::vector<State>& states, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
     std::vector<torch_api::Tensor> tensors;
     for (const auto& state : states) {
         template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^State, std::meta::access_context::current()))) {
@@ -600,8 +504,8 @@ void reserve_optimizer_readback(const std::vector<State>& states, mmltk::backend
     readback.Reserve(tensors, first_slot);
 }
 template <class State>
-void write_optimizer_state(torch_api::OutputArchive& archive, const State& state,
-                           mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t& slot) {
+void write_optimizer_state(torch_api::OutputArchive& archive, const State& state, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
+                           std::size_t& slot) {
     template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^State, std::meta::access_context::current()))) {
         if constexpr (std::is_same_v<std::remove_cvref_t<decltype(state.[:member:])>, torch_api::Tensor>) {
             if (state.[:member:].defined()) archive.write(std::string(std::meta::identifier_of(member)), readback.Stage(slot++));
@@ -609,7 +513,6 @@ void write_optimizer_state(torch_api::OutputArchive& archive, const State& state
     }
 }
 }  // namespace
-
 void NativeAdamW::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     reserve_optimizer_readback(state_, readback, first_slot);
 }
@@ -621,23 +524,19 @@ void NativeAdamW::save(torch_api::OutputArchive& archive, mmltk::backend::ml::cu
     write_double(archive, "beta2", kAdamBeta2);
     write_double(archive, "eps", kAdamEps);
     write_archive_layout_counts(archive, groups_.size(), params_.size());
-
     write_indexed_optimizer_archive(archive, "group", groups_.size(), [&](const size_t index, auto& group_archive) {
         write_group_lr_weight_decay(group_archive, groups_[index].config);
         write_int(group_archive, "amsgrad", groups_[index].config.amsgrad ? 1 : 0);
         write_group_param_indices(group_archive, groups_[index].param_indices);
     });
-
     write_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
         write_named_parameter_archive(param_archive, params_[index].name);
         write_optimizer_state(param_archive, state_[index], readback, first_slot);
         write_int(param_archive, "has_max_exp_avg_sq", state_[index].max_exp_avg_sq.defined() ? 1 : 0);
     });
 }
-
 void NativeAdamW::load(torch_api::InputArchive& archive) {
     validate_optimizer_archive_format(archive, kNativeAdamWFormat, kNativeAdamWFormatVersion, "AdamW");
-
     const auto stored_backend = parse_backend_name(require_string(archive, "backend"));
     (void)stored_backend;
     const auto stored_beta1 = require_double(archive, "beta1");
@@ -648,10 +547,7 @@ void NativeAdamW::load(torch_api::InputArchive& archive) {
             "native AdamW archive hyperparameters do not "
             "match the compiled optimizer");
     }
-
-    validate_archive_layout_counts(archive, groups_.size(), params_.size(),
-                                   "native AdamW archive layout does not match the current optimizer");
-
+    validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native AdamW archive layout does not match the current optimizer");
     auto candidate_groups = groups_;
     read_optimizer_group_archives(archive, candidate_groups,
                                   "native AdamW archive parameter group size does not match the "
@@ -660,15 +556,12 @@ void NativeAdamW::load(torch_api::InputArchive& archive) {
                                   "current optimizer",
                                   [](auto& group_archive, auto& config) { config.amsgrad = require_int(group_archive, "amsgrad") != 0; });
     for (const auto& group : candidate_groups) {
-        if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) ||
-            group.config.weight_decay < 0.0) {
+        if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0) {
             throw std::runtime_error("native AdamW archive parameter group does not match the current optimizer");
         }
     }
-    const auto uses_amsgrad =
-        collect_group_param_flags(candidate_groups, params_.size(), [](const auto& group) { return group.config.amsgrad; });
+    const auto uses_amsgrad = collect_group_param_flags(candidate_groups, params_.size(), [](const auto& group) { return group.config.amsgrad; });
     std::vector<NativeAdamWParamState> candidate_state(params_.size());
-
     read_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
         validate_named_parameter_archive(param_archive, params_[index].name,
                                          "native AdamW archive parameter order "
@@ -682,10 +575,7 @@ void NativeAdamW::load(torch_api::InputArchive& archive) {
                                                                 "native AdamW archive tensor shape "
                                                                 "does not match the current model");
         const bool has_max_exp_avg_sq = require_int(param_archive, "has_max_exp_avg_sq") != 0;
-        if (has_max_exp_avg_sq != uses_amsgrad[index]) {
-            throw std::runtime_error("native AdamW archive AMSGrad state does not match the current optimizer");
-        }
-
+        if (has_max_exp_avg_sq != uses_amsgrad[index]) { throw std::runtime_error("native AdamW archive AMSGrad state does not match the current optimizer"); }
         auto& state = candidate_state[index];
         state.step = std::move(loaded_step);
         state.exp_avg = std::move(loaded_exp_avg);
@@ -701,30 +591,24 @@ void NativeAdamW::load(torch_api::InputArchive& archive) {
     groups_.swap(candidate_groups);
     state_.swap(candidate_state);
 }
-
-std::vector<std::string> NativeAdamW::InspectCheckpoint(torch_api::InputArchive& archive,
-    const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
+std::vector<std::string> NativeAdamW::InspectCheckpoint(torch_api::InputArchive& archive, const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
     NativeAdamW candidate;
     read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
     populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
     candidate.load(archive);
     return std::move(candidate.all_param_names_);
 }
-
 void NativeAdamW::commit(NativeAdamW candidate) noexcept {
     groups_.swap(candidate.groups_);
     state_.swap(candidate.state_);
 }
-
 NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params)
     : NativeOptimizerStorage(std::move(groups), std::move(params)) {
     populate_named_parameter_views(params_, all_params_, all_param_names_, "native Muon received an undefined parameter tensor");
     validate_group_collection_indices(groups_, params_.size(), "native Muon parameter group index is out of range");
     initialize_state();
 }
-
 const char* NativeMuonWithAuxAdam::backend_name() const { return "eager"; }
-
 void NativeMuonWithAuxAdam::initialize_state() {
     initialize_param_states(
         state_, params_, groups_, [](const auto& group) { return group.config.use_muon; },
@@ -737,35 +621,25 @@ void NativeMuonWithAuxAdam::initialize_state() {
             }
         });
 }
-
 void NativeMuonWithAuxAdam::zero_grad(const bool set_to_none) { zero_grad_parameters(all_params_, set_to_none); }
-
 void NativeMuonWithAuxAdam::set_lrs(const std::vector<double>& base_lrs, const double scale) {
     set_scaled_group_lrs(groups_, base_lrs, scale, "native Muon base LR count does not match param group count");
 }
-
 void NativeMuonWithAuxAdam::set_muon_momentum(const double momentum) {
     for (auto& group : groups_) {
         if (!group.config.use_muon) { continue; }
         group.config.momentum = momentum;
     }
 }
-
 void NativeMuonWithAuxAdam::step() {
     torch_api::NoGradGuard no_grad;
     for (const auto& group : groups_) {
         for (const auto index : group.param_indices) {
             auto& param = params_[index].tensor;
-            if (!param.is_floating_point() || torch_api::is_complex(param)) {
-                throw std::runtime_error("native Muon requires real floating-point parameters");
-            }
-
+            if (!param.is_floating_point() || torch_api::is_complex(param)) { throw std::runtime_error("native Muon requires real floating-point parameters"); }
             auto grad = param.grad().defined() ? param.grad() : torch_api::zeros_like(param);
             if (grad.is_sparse()) { throw std::runtime_error("native Muon does not support sparse gradients"); }
-            if (grad.device() != param.device() || grad.scalar_type() != param.scalar_type()) {
-                grad = align_tensor_like_param(grad, param);
-            }
-
+            if (grad.device() != param.device() || grad.scalar_type() != param.scalar_type()) { grad = align_tensor_like_param(grad, param); }
             auto& state = state_[index];
             if (group.config.use_muon) {
                 ensure_aligned(state.momentum_buffer, param);
@@ -774,7 +648,6 @@ void NativeMuonWithAuxAdam::step() {
                 param.add_(update.reshape_as(param), -group.config.lr);
                 continue;
             }
-
             ensure_aligned(state.exp_avg, param);
             ensure_aligned(state.exp_avg_sq, param);
             ++state.step;
@@ -784,7 +657,6 @@ void NativeMuonWithAuxAdam::step() {
         }
     }
 }
-
 void NativeMuonWithAuxAdam::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     reserve_optimizer_readback(state_, readback, first_slot);
 }
@@ -800,7 +672,6 @@ void NativeMuonWithAuxAdam::save(torch_api::OutputArchive& archive, mmltk::backe
     write_double(archive, "aux_adam_beta2", kAuxAdamBeta2);
     write_double(archive, "aux_adam_eps", kAuxAdamEps);
     write_archive_layout_counts(archive, groups_.size(), params_.size());
-
     write_indexed_optimizer_archive(archive, "group", groups_.size(), [&](const size_t index, auto& group_archive) {
         write_group_lr_weight_decay(group_archive, groups_[index].config);
         write_double(group_archive, "momentum", groups_[index].config.momentum);
@@ -808,9 +679,7 @@ void NativeMuonWithAuxAdam::save(torch_api::OutputArchive& archive, mmltk::backe
         write_int(group_archive, "nesterov", groups_[index].config.nesterov ? 1 : 0);
         write_group_param_indices(group_archive, groups_[index].param_indices);
     });
-
     const std::vector<bool> use_muon = collect_muon_param_flags(groups_, params_.size());
-
     write_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
         write_named_parameter_archive(param_archive, params_[index].name);
         write_int(param_archive, "use_muon", use_muon[index] ? 1 : 0);
@@ -818,24 +687,17 @@ void NativeMuonWithAuxAdam::save(torch_api::OutputArchive& archive, mmltk::backe
         write_optimizer_state(param_archive, state_[index], readback, first_slot);
     });
 }
-
 void NativeMuonWithAuxAdam::load(torch_api::InputArchive& archive) {
     validate_optimizer_archive_format(archive, kNativeMuonFormat, kNativeMuonFormatVersion, "Muon");
     if (require_int(archive, "ns_steps") != kMuonNsSteps || !finite_equal(require_double(archive, "muon_coeff_a"), kMuonCoeffA) ||
-        !finite_equal(require_double(archive, "muon_coeff_b"), kMuonCoeffB) ||
-        !finite_equal(require_double(archive, "muon_coeff_c"), kMuonCoeffC) ||
-        !finite_equal(require_double(archive, "muon_eps"), kMuonNormEps) ||
-        !finite_equal(require_double(archive, "aux_adam_beta1"), kAuxAdamBeta1) ||
-        !finite_equal(require_double(archive, "aux_adam_beta2"), kAuxAdamBeta2) ||
-        !finite_equal(require_double(archive, "aux_adam_eps"), kAuxAdamEps)) {
+        !finite_equal(require_double(archive, "muon_coeff_b"), kMuonCoeffB) || !finite_equal(require_double(archive, "muon_coeff_c"), kMuonCoeffC) ||
+        !finite_equal(require_double(archive, "muon_eps"), kMuonNormEps) || !finite_equal(require_double(archive, "aux_adam_beta1"), kAuxAdamBeta1) ||
+        !finite_equal(require_double(archive, "aux_adam_beta2"), kAuxAdamBeta2) || !finite_equal(require_double(archive, "aux_adam_eps"), kAuxAdamEps)) {
         throw std::runtime_error(
             "native Muon archive hyperparameters do not match "
             "the compiled optimizer");
     }
-
-    validate_archive_layout_counts(archive, groups_.size(), params_.size(),
-                                   "native Muon archive layout does not match the current optimizer");
-
+    validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native Muon archive layout does not match the current optimizer");
     auto candidate_groups = groups_;
     read_optimizer_group_archives(archive, candidate_groups,
                                   "native Muon archive parameter group size does not match the "
@@ -847,17 +709,14 @@ void NativeMuonWithAuxAdam::load(torch_api::InputArchive& archive) {
                                       config.use_muon = require_int(group_archive, "use_muon") != 0;
                                       config.nesterov = require_int(group_archive, "nesterov") != 0;
                                   });
-
     for (const auto& group : candidate_groups) {
-        if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) ||
-            group.config.weight_decay < 0.0 || !std::isfinite(group.config.momentum) || group.config.momentum < 0.0 ||
-            group.config.momentum > 1.0) {
+        if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0 ||
+            !std::isfinite(group.config.momentum) || group.config.momentum < 0.0 || group.config.momentum > 1.0) {
             throw std::runtime_error("native Muon archive parameter group does not match the current optimizer");
         }
     }
     const std::vector<bool> use_muon = collect_muon_param_flags(candidate_groups, params_.size());
     std::vector<NativeMuonParamState> candidate_state(params_.size());
-
     read_indexed_optimizer_archive(archive, "param", params_.size(), [&](const size_t index, auto& param_archive) {
         validate_named_parameter_archive(param_archive, params_[index].name,
                                          "native Muon archive parameter order "
@@ -868,7 +727,6 @@ void NativeMuonWithAuxAdam::load(torch_api::InputArchive& archive) {
                 "native Muon archive parameter routing does "
                 "not match the current optimizer");
         }
-
         const auto& param = params_[index].tensor;
         auto& state = candidate_state[index];
         if (stored_use_muon) {
@@ -881,7 +739,6 @@ void NativeMuonWithAuxAdam::load(torch_api::InputArchive& archive) {
             state.momentum_buffer = std::move(momentum_buffer);
             return;
         }
-
         const auto step = require_int(param_archive, "step");
         if (step < 0) { throw std::runtime_error("native Muon archive step does not match the current optimizer"); }
         auto exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
@@ -898,37 +755,29 @@ void NativeMuonWithAuxAdam::load(torch_api::InputArchive& archive) {
     groups_.swap(candidate_groups);
     state_.swap(candidate_state);
 }
-
 std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch_api::InputArchive& archive,
-    const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
+                                                                  const std::unordered_map<std::string, torch_api::Tensor>& tensors) {
     NativeMuonWithAuxAdam candidate;
     read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
     populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
     candidate.load(archive);
     return std::move(candidate.all_param_names_);
 }
-
 void NativeMuonWithAuxAdam::commit(NativeMuonWithAuxAdam candidate) noexcept {
     groups_.swap(candidate.groups_);
     state_.swap(candidate.state_);
 }
-
 NativeOptimizer::NativeOptimizer(NativeAdamW optimizer) : storage_(std::move(optimizer)) {}
-
 NativeOptimizer::NativeOptimizer(NativeMuonWithAuxAdam optimizer) : storage_(std::move(optimizer)) {}
-
 TrainOptimizerKind NativeOptimizer::kind() const {
     return std::holds_alternative<NativeAdamW>(storage_) ? TrainOptimizerKind::AdamW : TrainOptimizerKind::Muon;
 }
-
 std::string_view NativeOptimizer::kind_name() const { return cli_enum_spelling(kind()); }
-
 NativeOptimizer NativeOptimizer::stage_load(torch_api::InputArchive& archive) const {
     NativeOptimizer candidate = *this;
     candidate.load(archive);
     return candidate;
 }
-
 void NativeOptimizer::commit(NativeOptimizer candidate) noexcept {
     if (std::holds_alternative<NativeAdamW>(storage_)) {
         std::get<NativeAdamW>(storage_).commit(std::get<NativeAdamW>(std::move(candidate.storage_)));
@@ -936,31 +785,24 @@ void NativeOptimizer::commit(NativeOptimizer candidate) noexcept {
     }
     std::get<NativeMuonWithAuxAdam>(storage_).commit(std::get<NativeMuonWithAuxAdam>(std::move(candidate.storage_)));
 }
-
 const char* NativeOptimizer::backend_name() const {
     return std::visit([](const auto& optimizer) { return optimizer.backend_name(); }, storage_);
 }
-
 std::vector<torch_api::Tensor>& NativeOptimizer::parameters() {
     return std::visit([](auto& optimizer) -> std::vector<torch_api::Tensor>& { return optimizer.parameters(); }, storage_);
 }
-
 const std::vector<torch_api::Tensor>& NativeOptimizer::parameters() const {
     return std::visit([](const auto& optimizer) -> const std::vector<torch_api::Tensor>& { return optimizer.parameters(); }, storage_);
 }
-
 const std::vector<std::string>& NativeOptimizer::parameter_names() const {
     return std::visit([](const auto& optimizer) -> const std::vector<std::string>& { return optimizer.parameter_names(); }, storage_);
 }
-
 void NativeOptimizer::zero_grad(const bool set_to_none) {
     std::visit([&](auto& optimizer) { optimizer.zero_grad(set_to_none); }, storage_);
 }
-
 void NativeOptimizer::set_lrs(const std::vector<double>& base_lrs, const double scale) {
     std::visit([&](auto& optimizer) { optimizer.set_lrs(base_lrs, scale); }, storage_);
 }
-
 void NativeOptimizer::set_muon_momentum(const double momentum) {
     std::visit(
         [&](auto& optimizer) {
@@ -973,20 +815,16 @@ void NativeOptimizer::set_muon_momentum(const double momentum) {
         },
         storage_);
 }
-
 void NativeOptimizer::step() {
     std::visit([](auto& optimizer) { optimizer.step(); }, storage_);
 }
-
 void NativeOptimizer::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     std::visit([&](const auto& optimizer) { optimizer.reserve_checkpoint(readback, first_slot); }, storage_);
 }
 void NativeOptimizer::save(torch_api::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     std::visit([&](const auto& optimizer) { optimizer.save(archive, readback, first_slot); }, storage_);
 }
-
 void NativeOptimizer::load(torch_api::InputArchive& archive) {
     std::visit([&](auto& optimizer) { optimizer.load(archive); }, storage_);
 }
-
 }  // namespace mmltk::backend::models::rfdetr

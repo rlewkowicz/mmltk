@@ -4,7 +4,6 @@
 #include "src/controller/browser/tests/annotation_wire_fixture.h"
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/model_selection.h"
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -19,12 +18,10 @@
 #include <type_traits>
 #include <variant>
 #include <vector>
-
 int main(const int argument_count, char* const* const arguments) {
     using namespace mmltk::controller;
     using namespace mmltk::controller::browser;
     if (argument_count != 2 || arguments[1] == nullptr || std::string_view(arguments[1]).empty()) return EXIT_FAILURE;
-
     std::size_t system_count = 0U;
     std::size_t intent_count = 0U;
     std::size_t interaction_count = 0U;
@@ -45,7 +42,6 @@ int main(const int argument_count, char* const* const arguments) {
         if (!mmltk::frameworks::reflection::enum_contains(annotation.delivery)) event_count = 0U;
     });
     if (system_count != 13U || intent_count == 0U || interaction_count == 0U || event_count == 0U) return EXIT_FAILURE;
-
     using SettingsEvent = ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::settings, SettingsChanged>;
     Bootstrap bootstrap{.schema_fingerprint = application_schema_fingerprint<ApplicationSystems>().words, .snapshots = {}};
     bool snapshots_valid = true;
@@ -59,8 +55,7 @@ int main(const int argument_count, char* const* const arguments) {
             frame.content = {1U, 2U, 20U, 16U};
             frame.clean_revision = 43U;
             mmltk::frameworks::reflection::access<Snapshot, Projection::revision>(snapshot) =
-                Projection::kind == PresentationSourceKind::Predict ? 7U + session :
-                    std::numeric_limits<std::uint64_t>::max() - session;
+                Projection::kind == PresentationSourceKind::Predict ? 7U + session : std::numeric_limits<std::uint64_t>::max() - session;
             snapshots_valid = snapshots_valid && visual_clean_content_identity(frame).revision == 43U;
         }
         if constexpr (std::same_as<Snapshot, ValidationSnapshot>) {
@@ -156,9 +151,8 @@ int main(const int argument_count, char* const* const arguments) {
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture input unavailable"}},
         InteractionRejected{.endpoint_id = application_stable_id("explore", "UpdateViewport"),
                             .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "fixture unavailable"}},
-        InteractionRejected{
-            .endpoint_id = application_stable_id("annotation", "Input"),
-            .error = {.category = contracts::ApplicationErrorCategory::Failed, .detail = std::string(kMaxErrorDetailBytes, 'r')}},
+        InteractionRejected{.endpoint_id = application_stable_id("annotation", "Input"),
+                            .error = {.category = contracts::ApplicationErrorCategory::Failed, .detail = std::string(kMaxErrorDetailBytes, 'r')}},
         IntegrationControl{.receipt = {.kind = contracts::IntegrationControlKind::Advance, .sequence = 2U}},
     };
     // An independent named persistence projection is test data, carried as a
@@ -168,8 +162,8 @@ int main(const int argument_count, char* const* const arguments) {
     using ControlKind = contracts::IntegrationControlKind;
     contracts::visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
         if constexpr (Policy.server && Kind != ControlKind::Advance) {
-            records.emplace_back(IntegrationControl{
-                .receipt = {.kind = Kind, .sequence = 2U, .read_generation = Policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
+            records.emplace_back(
+                IntegrationControl{.receipt = {.kind = Kind, .sequence = 2U, .read_generation = Policy.read_generation ? 7U : 0U, .compiled_index = 0U}});
         }
     });
     // Native settings/projection pairs exercise every relation row through the
@@ -184,13 +178,19 @@ int main(const int argument_count, char* const* const arguments) {
             Row::artifact(settings) = "/tmp/fixture-model";
             Row::class_layout(settings) = "/tmp/fixture-model.classes.json";
             if constexpr (std::tuple_size_v<decltype(Row::predicate)> != 0U)
-                std::get<0>(Row::predicate)(settings) = mode == 3U ? !*compatibility.required_export_build_tensorrt
-                                                                 : *compatibility.required_export_build_tensorrt;
+                std::get<0>(Row::predicate)(settings) =
+                    mode == 3U ? !*compatibility.required_export_build_tensorrt : *compatibility.required_export_build_tensorrt;
             const auto projection = contracts::model_settings_projection(settings, compatibility.workflow);
-            if (!projection) { model_projections_valid = false; return; }
+            if (!projection) {
+                model_projections_valid = false;
+                return;
+            }
             auto encoded_settings = mmltk::frameworks::serialization::reflected_value(settings);
             auto encoded_projection = mmltk::frameworks::serialization::reflected_value(*projection);
-            if (!encoded_settings || !encoded_projection) { model_projections_valid = false; return; }
+            if (!encoded_settings || !encoded_projection) {
+                model_projections_valid = false;
+                return;
+            }
             records.emplace_back(IntentReply{.correlation = model_correlation++, .result = std::move(*encoded_settings)});
             records.emplace_back(IntentReply{.correlation = model_correlation++, .result = std::move(*encoded_projection)});
         }
@@ -213,8 +213,10 @@ int main(const int argument_count, char* const* const arguments) {
     sample_image.content_identity = 71U;
     sample_image.overlays = {false, true, false, true};
     auto& sample = sample_image.samples[0];
-    sample.identity = {7U, 3U}; sample.available = true;
-    sample.crop = {0U, 0U, 256U, 256U}; sample.original_extent = {640U, 640U};
+    sample.identity = {7U, 3U};
+    sample.available = true;
+    sample.crop = {0U, 0U, 256U, 256U};
+    sample.original_extent = {640U, 640U};
     sample.labels.push_back({{{1.25F, 2.5F}, {15.0F, 19.0F}}, {}, 5U, true, 0.0F, "last"});
     std::uint64_t validation_correlation = 600U;
     const auto append_validation = [&](const auto& value) {
@@ -227,7 +229,8 @@ int main(const int argument_count, char* const* const arguments) {
     };
     if (!append_validation(metric_page) || !append_validation(sample_image)) return EXIT_FAILURE;
     if (!append_validation(rfdetr::kEvaluationAxes.iou) || !append_validation(rfdetr::kEvaluationAxes.recall) ||
-        !append_validation(rfdetr::kEvaluationAxes.confidence)) return EXIT_FAILURE;
+        !append_validation(rfdetr::kEvaluationAxes.confidence))
+        return EXIT_FAILURE;
     // Malformed pages cross the real native record encoder and Rust decoders.
     // Mutating wire values deliberately bypasses native output admission.
     const auto named_member = [](wire::Value& value, std::string_view name) -> wire::Value& {
@@ -243,8 +246,8 @@ int main(const int argument_count, char* const* const arguments) {
             named_member(named_member(named_rows[1], "category_name"), "value").storage = std::string(257U, 'x');
             // Field index is derived from the actual native named projection.
             const auto& named_fields = std::get<wire::Value::Object>(named_rows[1].storage);
-            const auto index = static_cast<std::size_t>(std::ranges::find_if(named_fields,
-                [](const auto& field) { return field.first == "category_name"; }) - named_fields.begin());
+            const auto index = static_cast<std::size_t>(std::ranges::find_if(named_fields, [](const auto& field) { return field.first == "category_name"; }) -
+                                                        named_fields.begin());
             auto& name = std::get<wire::Value::Array>(positional_rows[1].storage)[index];
             std::get<wire::Value::Array>(name.storage).front().storage = std::string(257U, 'x');
         } else {
@@ -262,7 +265,6 @@ int main(const int argument_count, char* const* const arguments) {
         rfdetr::EvaluationDetailQuery rejected;
         if (mmltk::frameworks::serialization::decode_into(rejected, invalid_query)) return EXIT_FAILURE;
     }
-
     validation_correlation = 700U;
     rfdetr::TrainingRecord training_record;
     training_record.run_id = "run-native";
@@ -292,12 +294,10 @@ int main(const int argument_count, char* const* const arguments) {
         rfdetr::TrainingHistoryQuery rejected;
         if (mmltk::frameworks::serialization::decode_into(rejected, invalid_query)) return EXIT_FAILURE;
     }
-
     bool complete_record_surface = true;
     application_schema_detail::Variant<ServerRecord>::Visit([&]<class Alternative>() {
-        complete_record_surface = complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) {
-                                      return std::holds_alternative<Alternative>(record);
-                                  });
+        complete_record_surface =
+            complete_record_surface && std::ranges::any_of(records, [](const ServerRecord& record) { return std::holds_alternative<Alternative>(record); });
     });
     if (!complete_record_surface) return EXIT_FAILURE;
     std::ofstream output(arguments[1], std::ios::binary | std::ios::trunc);

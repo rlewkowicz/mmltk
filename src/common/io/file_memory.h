@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -8,9 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
-
 namespace mmltk::common::io {
-
 class UniqueFd {
    public:
     explicit UniqueFd(int fd = -1) noexcept;
@@ -24,12 +21,10 @@ class UniqueFd {
    private:
     int fd_ = -1;
 };
-
 [[nodiscard]] std::runtime_error errno_error(const char* action, const std::string& path = {});
 void sync_parent_directory(const std::filesystem::path& path);
 [[nodiscard]] bool remove_tree_no_follow(const std::filesystem::path& path, std::error_code& error) noexcept;
 void publish_staged_path_atomically(const std::filesystem::path& staging, const std::filesystem::path& destination, bool overwrite = true);
-
 class FileHandle {
    public:
     FileHandle() = default;
@@ -52,7 +47,6 @@ class FileHandle {
    private:
     UniqueFd fd_;
 };
-
 class MappedByteRegion {
    public:
     MappedByteRegion() = default;
@@ -73,7 +67,6 @@ class MappedByteRegion {
     void* address_ = nullptr;
     std::size_t bytes_ = 0;
 };
-
 class MappedFile {
    public:
     MappedFile() = default;
@@ -94,7 +87,6 @@ class MappedFile {
     FileHandle file_;
     MappedByteRegion region_;
 };
-
 template <typename T>
 class OwnedBuffer {
    public:
@@ -120,19 +112,16 @@ class OwnedBuffer {
    private:
     MappedByteRegion region_;
 };
-
 template <typename T>
 [[nodiscard]] OwnedBuffer<T> allocate_hugepage_buffer(const std::size_t count) {
     OwnedBuffer<T> buffer = OwnedBuffer<T>::allocate(count);
     buffer.advise_hugepage();
     return buffer;
 }
-
 template <typename T>
 [[nodiscard]] OwnedBuffer<T> load_hugepage_block(const FileHandle& file, const std::size_t count, const std::size_t offset) {
     OwnedBuffer<T> block = allocate_hugepage_buffer<T>(count);
     if (!block.empty()) { file.pread_all(block.data(), block.bytes(), offset); }
     return block;
 }
-
 }  // namespace mmltk::common::io

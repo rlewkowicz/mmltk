@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -9,7 +8,6 @@
 #include <string>
 #include <variant>
 #include <vector>
-
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/contracts/application_boundary.h"
@@ -28,9 +26,7 @@
 #include "src/frameworks/gpu/image_product_pool.h"
 #include "src/frameworks/gpu/image_workspace.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-
 namespace mmltk::controller {
-
 struct PredictLabel final {
     contracts::AnnotationBox box{};
     int class_reference = 0;
@@ -39,7 +35,9 @@ struct PredictLabel final {
     contracts::AnnotationColor color{};
     [[= mmltk::frameworks::reflection::MaxBytes{256U}]] std::string name;
 };
-namespace detail { class PredictionPreviewFrame; }
+namespace detail {
+class PredictionPreviewFrame;
+}
 class PredictRuntime {
    public:
     struct Product final {
@@ -55,26 +53,28 @@ class PredictRuntime {
     virtual ~PredictRuntime() = default;
     virtual void Close() noexcept {}
     [[nodiscard]] virtual bool HasUnsafeCustody() const noexcept { return false; }
-    [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token,
-                                                         const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&, const PreviewRetirement&) = 0;
+    [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&,
+                                                         const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&,
+                                                         const PreviewRetirement&) = 0;
 };
-
 class CudaPredictRuntime final : public PredictRuntime {
    public:
     explicit CudaPredictRuntime(DirectComputeConfiguration);
     ~CudaPredictRuntime() override;
     void Close() noexcept override;
     [[nodiscard]] bool HasUnsafeCustody() const noexcept override;
-    [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&, const PreviewRetirement&) override;
+    [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&,
+                                                 const ProductSink&, const PlaybackGate&, VisualExtent maximum, const ContextProvider&,
+                                                 const PreviewRetirement&) override;
 
    private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 using PredictRuntimeFactory = std::function<std::unique_ptr<PredictRuntime>()>;
-
-struct PredictPauseIntent final { bool paused = false; };
+struct PredictPauseIntent final {
+    bool paused = false;
+};
 struct PredictImageMetadata final {
     std::uint64_t content_identity = 0U;
     VisualFrame frame{};
@@ -116,15 +116,13 @@ class PredictSystem final {
    public:
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
     void SetInputPeer(std::uint64_t);
-
-    using visual_source = VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict,
-                                                 mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
-                                                 // Logical progress does not invalidate committed pixels or metadata.
-                                                 mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame, &VisualFrame::revision>, PredictImageMetadata>;
+    using visual_source =
+        VisualSourceProjection<PredictSnapshot, PresentationSourceKind::Predict, mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame>,
+                               // Logical progress does not invalidate committed pixels or metadata.
+                               mmltk::frameworks::reflection::member_path<&PredictSnapshot::frame, &VisualFrame::revision>, PredictImageMetadata>;
     using progress_type = PredictProgressState;
     using event_type = std::variant<PredictProgress, PredictChanged, PredictFailed>;
-    PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory,
-                  SystemEventSink<event_type> = {});
+    PredictSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, VisualDeviceSettings, PredictRuntimeFactory, SystemEventSink<event_type> = {});
     ~PredictSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Start(contracts::PredictWorkflowIntent);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PredictSnapshot Pause(PredictPauseIntent);
@@ -146,7 +144,6 @@ class PredictSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 MMLTK_REFLECT_FIELDS(PredictPauseIntent)
 MMLTK_REFLECT_FIELDS(PredictLabel)
 MMLTK_REFLECT_FIELDS(PredictImageMetadata)

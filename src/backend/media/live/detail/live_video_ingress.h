@@ -1,7 +1,6 @@
 #pragma once
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -9,22 +8,17 @@
 #include <memory>
 #include <mutex>
 #include <string>
-
 #include "live_device_types.h"
 #include "live_state_signal.h"
-
 namespace mmltk::backend::media::live {
 namespace capture = mmltk::backend::media::capture;
-
 class LiveVideoIngress final {
    public:
     using FailureListener = std::function<void(capture::Status)>;
-
     LiveVideoIngress(capture::CaptureConfig config, std::uint32_t slot_count, LivePhysicalCudaContext cuda);
     ~LiveVideoIngress();
     LiveVideoIngress(const LiveVideoIngress&) = delete;
     LiveVideoIngress& operator=(const LiveVideoIngress&) = delete;
-
     [[nodiscard]] capture::CaptureSessionStartResult start();
     [[nodiscard]] capture::Status request_stop() noexcept;
     [[nodiscard]] std::shared_ptr<const capture::CaptureStopTerminal> try_take_terminal() noexcept;
@@ -54,7 +48,6 @@ class LiveVideoIngress final {
         LiveVideoIngress* owner = nullptr;
         std::uint32_t index = 0U;
     };
-
     static void CUDART_CB CompleteSlot(void* context) noexcept;
     static void ScrubProduct(DeviceSlot& slot) noexcept;
     void publish_slot(DeviceSlot& slot, SlotState published) noexcept;
@@ -63,7 +56,6 @@ class LiveVideoIngress final {
     void fail_upload(DeviceSlot& slot, cudaError_t failure, capture::Status capture_failure = capture::Status::Ok()) noexcept;
     void publish_failure(capture::Status failure) const noexcept;
     void release_resources() noexcept;
-
     capture::CaptureConfig config_{};
     LivePhysicalCudaContext cuda_{};
     capture::CaptureSession capture_;

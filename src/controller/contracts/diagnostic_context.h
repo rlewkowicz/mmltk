@@ -1,13 +1,10 @@
 #pragma once
-
 #include <cstdint>
 #include <string_view>
 #include "src/common/types/strong_id.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
-
 namespace mmltk::controller::contracts {
-
 enum class DiagnosticOwner : std::uint8_t {
     BrowserRuntime,
     BrowserServer,
@@ -21,7 +18,6 @@ enum class DiagnosticOwner : std::uint8_t {
     // CLEANUP-IGNORE: Closing the diagnostic-owner enum before the source schema is a canonical reflected boundary,
     // not a reusable scalar record shared with kernel ABIs.
 };
-
 // Copies of identities owned elsewhere. None of these facts participates in
 // ordering, resource release, or source matching.
 // CLEANUP-IGNORE: DiagnosticSource is the canonical trace source schema, not a common ABI shared with CUDA records.
@@ -172,7 +168,6 @@ struct DiagnosticContext final {
     DiagnosticSpanTiming span{};
     DiagnosticPixel pixel{};
 };
-
 MMLTK_REFLECT_ENUM(DiagnosticOwner)
 MMLTK_REFLECT_ENUM(DiagnosticSpanOutcome)
 MMLTK_REFLECT_FIELDS(DiagnosticSource)
@@ -187,5 +182,4 @@ MMLTK_REFLECT_FIELDS(DiagnosticLink)
 MMLTK_REFLECT_FIELDS(DiagnosticSpanTiming)
 MMLTK_REFLECT_FIELDS(DiagnosticPixel)
 MMLTK_REFLECT_FIELDS(DiagnosticContext)
-
 }  // namespace mmltk::controller::contracts

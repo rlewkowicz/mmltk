@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cctype>
 #include <cstdint>
 #include <meta>
@@ -9,14 +8,11 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-
 #include "src/controller/presentation/detail/workspace_surface_import_abi.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
 #include "src/frameworks/gpu/image_workspace.h"
-
 namespace mmltk::controller::browser {
-
 // This projection deliberately has no application codec vocabulary. Untrusted
 // enum fields use their integer wire representation, never Rust discriminants.
 class ApplicationWorkspaceAbiEmitter final {
@@ -96,16 +92,14 @@ class ApplicationWorkspaceAbiEmitter final {
         }
         output_ << "}\n";
         template for (constexpr auto entry : std::define_static_array(std::meta::enumerators_of(^^T))) {
-            Constant(std::string(prefix) + UpperSnake(std::meta::identifier_of(entry)), WireType<T>(),
-                     static_cast<std::uint64_t>([:entry:]));
+            Constant(std::string(prefix) + UpperSnake(std::meta::identifier_of(entry)), WireType<T>(), static_cast<std::uint64_t>([:entry:]));
         }
     }
     template <class T>
     void Record() {
         static_assert(std::is_standard_layout_v<T> && std::is_trivially_copyable_v<T>);
         constexpr auto name = std::meta::identifier_of(^^T);
-        static constexpr auto members =
-            std::define_static_array(std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()));
+        static constexpr auto members = std::define_static_array(std::meta::nonstatic_data_members_of(^^T, std::meta::access_context::current()));
         Reserve(name);
         output_ << "#[repr(C, align(" << alignof(T) << "))]\n#[derive(Clone, Copy, Default)]\npub struct " << name << " {\n";
         template for (constexpr auto member : members) {
@@ -122,5 +116,4 @@ class ApplicationWorkspaceAbiEmitter final {
     std::ostream& output_;
     std::set<std::string, std::less<>> symbols_;
 };
-
 }  // namespace mmltk::controller::browser

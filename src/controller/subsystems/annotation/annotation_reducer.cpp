@@ -17,17 +17,13 @@
 #include <stdexcept>
 #include <meta>
 #include "src/controller/subsystems/annotation/detail/annotation_mask.h"
-
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
-
 namespace mmltk::controller::subsystems::annotation {
 namespace {
-
 using domain::AnnotationEditorFacts;
 using domain::AnnotationSceneContent;
-
 [[nodiscard]] bool annotation_diagnostics_enabled() noexcept {
     static const bool enabled = [] {
         const char* value = std::getenv("MMLTK_ANNOTATION_DIAGNOSTICS");
@@ -35,20 +31,8 @@ using domain::AnnotationSceneContent;
     }();
     return enabled;
 }
-
 inline constexpr std::size_t kHistoryCapacity = 32U;
-
-enum class AnnotationPointerAction : std::uint8_t {
-    Select,
-    BoxDrag,
-    PointPlace,
-    Brush,
-    Fill,
-    SplineKnot,
-    SkeletonJoint,
-    HandleDrag,
-    ColorSample
-};
+enum class AnnotationPointerAction : std::uint8_t { Select, BoxDrag, PointPlace, Brush, Fill, SplineKnot, SkeletonJoint, HandleDrag, ColorSample };
 struct PointerFacts final {
     bool active = false;
     std::uint64_t interaction_id = 0U;
@@ -110,55 +94,41 @@ struct DocumentState final {
     std::deque<JournalEntry> redo{};
     std::string_view rejection = "The action requires a compatible selected object or handle";
 };
-
-[[nodiscard]] DocumentOutcome refused(DocumentState& state,
-                                      const std::string_view reason = "The action requires a compatible selected object or handle") {
+[[nodiscard]] DocumentOutcome refused(DocumentState& state, const std::string_view reason = "The action requires a compatible selected object or handle") {
     state.rejection = reason;
     return DocumentOutcome::Rejected;
 }
-
 [[nodiscard]] DocumentOutcome capacity(const DocumentState&) { return DocumentOutcome::Capacity; }
-
 // Open validates the imported scene; journal admission validates each committed mutation.
 // Pointer previews never mutate this established document invariant.
 [[nodiscard]] bool pointer_ready(const DocumentState& state) { return state.ui.scene.document.valid(); }
 [[nodiscard]] bool current(const DocumentState& state) { return pointer_ready(state) && state.ui.valid(); }
-
 [[nodiscard]] bool next_revision_available(const DocumentState& state) {
-    return state.ui.document_revision != std::numeric_limits<std::uint64_t>::max() &&
-           state.ui.scene_revision != std::numeric_limits<std::uint64_t>::max() &&
+    return state.ui.document_revision != std::numeric_limits<std::uint64_t>::max() && state.ui.scene_revision != std::numeric_limits<std::uint64_t>::max() &&
            state.ui.interaction_revision != std::numeric_limits<std::uint64_t>::max();
 }
-
 [[nodiscard]] bool point_in_frame(const AnnotationSceneContent& scene, const domain::AnnotationPoint point) {
-    return point.finite() &&
-           (!scene.frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= scene.frame_width && point.y <= scene.frame_height));
+    return point.finite() && (!scene.frame_ready || (point.x >= 0.0F && point.y >= 0.0F && point.x <= scene.frame_width && point.y <= scene.frame_height));
 }
-
 [[nodiscard]] domain::AnnotationBox box_between(const domain::AnnotationPoint first, const domain::AnnotationPoint second) {
     return {.first = {.x = std::min(first.x, second.x), .y = std::min(first.y, second.y)},
             .second = {.x = std::max(first.x, second.x), .y = std::max(first.y, second.y)}};
 }
-
-[[nodiscard]] bool object_valid_for(const domain::AnnotationObject& object, const std::size_t categories,
-                                    const AnnotationSceneContent& scene) {
-    if (!object.valid() || object.category >= categories || !point_in_frame(scene, object.point) ||
-        !point_in_frame(scene, object.box.first) || !point_in_frame(scene, object.box.second)) {
+[[nodiscard]] bool object_valid_for(const domain::AnnotationObject& object, const std::size_t categories, const AnnotationSceneContent& scene) {
+    if (!object.valid() || object.category >= categories || !point_in_frame(scene, object.point) || !point_in_frame(scene, object.box.first) ||
+        !point_in_frame(scene, object.box.second)) {
         return false;
     }
     return std::ranges::all_of(object.mask_points, [&scene](const auto& point) { return point_in_frame(scene, point); }) &&
            std::ranges::all_of(object.spline_knots,
                                [&scene](const auto& knot) {
-                                   return point_in_frame(scene, knot.point) && point_in_frame(scene, knot.in.point) &&
-                                          point_in_frame(scene, knot.out.point);
+                                   return point_in_frame(scene, knot.point) && point_in_frame(scene, knot.in.point) && point_in_frame(scene, knot.out.point);
                                }) &&
            std::ranges::all_of(object.skeleton_nodes, [&scene](const auto& node) { return point_in_frame(scene, node.point); });
 }
-
 struct ObjectAfterView final {
     const AnnotationSceneContent& scene;
     const JournalEntry* entry = nullptr;
-
     [[nodiscard]] std::size_t size() const {
         if (const auto* objects = entry ? std::get_if<JournalEntry::Objects>(&entry->mutation) : nullptr) return objects->after.size();
         const auto* mutation = entry ? std::get_if<JournalEntry::Object>(&entry->mutation) : nullptr;
@@ -167,7 +137,6 @@ struct ObjectAfterView final {
         if (mutation->before_present && !mutation->after_present) return scene.objects.size() - 1U;
         return scene.objects.size();
     }
-
     [[nodiscard]] const domain::AnnotationObject* at(const std::size_t index) const {
         if (const auto* objects = entry ? std::get_if<JournalEntry::Objects>(&entry->mutation) : nullptr)
             return index < objects->after.size() ? &objects->after[index] : nullptr;
@@ -189,7 +158,6 @@ struct ObjectAfterView final {
         return nullptr;
     }
 };
-
 [[nodiscard]] bool target_valid_for(const domain::AnnotationPointerTarget& target, const ObjectAfterView& objects) {
     if (!target.valid() || (target.object && *target.object >= objects.size()) || (target.element && !target.object) ||
         target.element.has_value() != target.role.has_value())
@@ -199,10 +167,8 @@ struct ObjectAfterView final {
     if (!object) return false;
     switch (*target.role) {
         case domain::AnnotationHandleRole::BoxCorner:
-            return (object->shape == domain::AnnotationShape::Box || object->shape == domain::AnnotationShape::Mask) &&
-                   *target.element < 4U;
-        case domain::AnnotationHandleRole::Point:
-            return object->shape == domain::AnnotationShape::Point && *target.element == 0U;
+            return (object->shape == domain::AnnotationShape::Box || object->shape == domain::AnnotationShape::Mask) && *target.element < 4U;
+        case domain::AnnotationHandleRole::Point: return object->shape == domain::AnnotationShape::Point && *target.element == 0U;
         case domain::AnnotationHandleRole::SplineKnot:
         case domain::AnnotationHandleRole::SplineInHandle:
         case domain::AnnotationHandleRole::SplineOutHandle:
@@ -212,15 +178,12 @@ struct ObjectAfterView final {
     }
     return false;
 }
-
-[[nodiscard]] bool facts_valid_for(const AnnotationSceneContent& scene, const AnnotationEditorFacts& facts,
-                                   const JournalEntry* entry = nullptr) {
+[[nodiscard]] bool facts_valid_for(const AnnotationSceneContent& scene, const AnnotationEditorFacts& facts, const JournalEntry* entry = nullptr) {
     if (!mmltk::frameworks::reflection::enum_contains(facts.tool)) { return false; }
     ObjectAfterView objects{.scene = scene, .entry = entry};
     if (facts.selected_object && *facts.selected_object >= objects.size()) return false;
     const auto* category = entry ? std::get_if<JournalEntry::Category>(&entry->mutation) : nullptr;
-    const std::size_t category_count = scene.categories.size() +
-                                       ((category && !category->before_present && category->after_present) ? 1U : 0U) -
+    const std::size_t category_count = scene.categories.size() + ((category && !category->before_present && category->after_present) ? 1U : 0U) -
                                        ((category && category->before_present && !category->after_present) ? 1U : 0U);
     if (facts.selected_category && *facts.selected_category >= category_count) return false;
     if (facts.selected_spline_segment) {
@@ -239,7 +202,6 @@ struct ObjectAfterView final {
     }
     return true;
 }
-
 [[nodiscard]] bool entry_forward_valid(const DocumentState& state, const JournalEntry& entry) {
     if (entry.before != state.ui.editor || entry.mutation.valueless_by_exception()) return false;
     const auto& scene = state.ui.scene;
@@ -250,9 +212,7 @@ struct ObjectAfterView final {
                 return true;
             } else if constexpr (std::same_as<Mutation, JournalEntry::Object>) {
                 if (mutation.before_present == mutation.after_present) {
-                    if (!mutation.before_present || mutation.index >= scene.objects.size() ||
-                        scene.objects[mutation.index] != mutation.before)
-                        return false;
+                    if (!mutation.before_present || mutation.index >= scene.objects.size() || scene.objects[mutation.index] != mutation.before) return false;
                 } else if (mutation.before_present) {
                     if (mutation.index >= scene.objects.size() || scene.objects[mutation.index] != mutation.before) return false;
                 } else if (mutation.index > scene.objects.size()) {
@@ -262,8 +222,7 @@ struct ObjectAfterView final {
             } else if constexpr (std::same_as<Mutation, JournalEntry::Category>) {
                 if (mutation.before_present == mutation.after_present) return false;
                 if (mutation.before_present) {
-                    return !scene.categories.empty() && mutation.index + 1U == scene.categories.size() &&
-                           scene.categories[mutation.index] == mutation.before;
+                    return !scene.categories.empty() && mutation.index + 1U == scene.categories.size() && scene.categories[mutation.index] == mutation.before;
                 }
                 return mutation.index == scene.categories.size() && mutation.after.valid();
             } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
@@ -275,7 +234,6 @@ struct ObjectAfterView final {
         entry.mutation);
     return mutation_valid && facts_valid_for(scene, entry.after, &entry);
 }
-
 [[nodiscard]] JournalEntry inverse(JournalEntry entry) {
     std::swap(entry.before, entry.after);
     std::visit(
@@ -296,7 +254,6 @@ struct ObjectAfterView final {
         entry.mutation);
     return entry;
 }
-
 void apply_forward(DocumentState& state, const JournalEntry& entry) {
     auto& scene = state.ui.scene;
     std::visit(
@@ -330,7 +287,6 @@ void apply_forward(DocumentState& state, const JournalEntry& entry) {
         entry.mutation);
     state.ui.editor = entry.after;
 }
-
 void mark_edited(DocumentState& state) {
     state.pointer = {};
     ++state.ui.document_revision;
@@ -339,7 +295,6 @@ void mark_edited(DocumentState& state) {
     state.ui.scene.document.revision = state.ui.document_revision;
     state.ui.save_status = domain::AnnotationSaveStatus::Idle;
 }
-
 [[nodiscard]] bool entry_changes(const JournalEntry& entry) {
     if (entry.before != entry.after) return true;
     return std::visit(
@@ -357,29 +312,23 @@ void mark_edited(DocumentState& state) {
         },
         entry.mutation);
 }
-
 [[nodiscard]] std::size_t identity_element_count(const domain::AnnotationObject& object) noexcept {
     if (object.shape == domain::AnnotationShape::Spline) return object.spline_knots.size();
     if (object.shape == domain::AnnotationShape::Skeleton) return object.skeleton_nodes.size();
     return 0U;
 }
-
 [[nodiscard]] std::uint64_t allocate_identity(DocumentState& state) {
-    if (state.next_identity == std::numeric_limits<std::uint64_t>::max())
-        throw std::length_error("Annotation runtime identity capacity exhausted");
+    if (state.next_identity == std::numeric_limits<std::uint64_t>::max()) throw std::length_error("Annotation runtime identity capacity exhausted");
     return state.next_identity++;
 }
-
 [[nodiscard]] domain::AnnotationObjectIdentity make_identity(DocumentState& state, const domain::AnnotationObject& object,
                                                              const std::uint64_t created_identity = 0U) {
     domain::AnnotationObjectIdentity identity{.object = created_identity ? created_identity : allocate_identity(state)};
     const auto count = identity_element_count(object);
     if (count != 0U) identity.elements.reserve(domain::kAnnotationGeometryCapacity);
-    for (std::size_t index = 0; index < count; ++index)
-        identity.elements.push_back(allocate_identity(state));
+    for (std::size_t index = 0; index < count; ++index) identity.elements.push_back(allocate_identity(state));
     return identity;
 }
-
 void identify_mutation(DocumentState& state, JournalEntry& entry) {
     if (auto* object = std::get_if<JournalEntry::Object>(&entry.mutation)) {
         if (object->before_present) object->before_identity = state.identities.at(object->index);
@@ -395,21 +344,17 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
         if (elements.size() > count) {
             // The sole element-removal operation removes the selected spline
             // knot. Keep the surviving knots' identities even at reused indices.
-            if (object->before.shape != domain::AnnotationShape::Spline || elements.size() != count + 1U ||
-                !entry.before.selected_spline_segment)
+            if (object->before.shape != domain::AnnotationShape::Spline || elements.size() != count + 1U || !entry.before.selected_spline_segment)
                 throw std::logic_error("Annotation element identity mutation is incomplete");
             elements.erase(elements.begin() + *entry.before.selected_spline_segment);
         }
-        while (elements.size() < count)
-            elements.push_back(allocate_identity(state));
+        while (elements.size() < count) elements.push_back(allocate_identity(state));
     } else if (auto* objects = std::get_if<JournalEntry::Objects>(&entry.mutation)) {
         objects->before_identities = state.identities;
         objects->after_identities.reserve(objects->after.size());
-        for (const auto& next_object : objects->after)
-            objects->after_identities.push_back(make_identity(state, next_object));
+        for (const auto& next_object : objects->after) objects->after_identities.push_back(make_identity(state, next_object));
     }
 }
-
 [[nodiscard]] DocumentOutcome commit(DocumentState& state, JournalEntry entry) {
     if (!current(state)) return refused(state);
     if (!entry_forward_valid(state, entry)) return refused(state);
@@ -433,11 +378,9 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
     mark_edited(state);
     return DocumentOutcome::Applied;
 }
-
 [[nodiscard]] JournalEntry facts_entry(const AnnotationEditorFacts& before, const AnnotationEditorFacts& after) {
     return {.before = before, .after = after, .mutation = JournalEntry::Facts{}};
 }
-
 [[nodiscard]] DocumentOutcome change_editor_facts(DocumentState& state, const std::function_ref<void(AnnotationEditorFacts&)> mutate) {
     auto after = state.ui.editor;
     mutate(after);
@@ -449,12 +392,10 @@ void identify_mutation(DocumentState& state, JournalEntry& entry) {
     ++state.ui.scene_revision;
     return DocumentOutcome::Applied;
 }
-
 enum class JournalDirection : std::uint8_t {
     Undo,
     Redo,
 };
-
 [[nodiscard]] DocumentOutcome apply_journal(DocumentState& state, const JournalDirection direction) {
     auto& source = direction == JournalDirection::Undo ? state.undo : state.redo;
     auto& destination = direction == JournalDirection::Undo ? state.redo : state.undo;
@@ -462,7 +403,6 @@ enum class JournalDirection : std::uint8_t {
     if (source.empty()) return DocumentOutcome::Applied;
     if (destination.size() == kHistoryCapacity) destination.pop_front();
     if (!next_revision_available(state)) return refused(state);
-
     const auto entry = source.back();
     auto applied = direction == JournalDirection::Undo ? inverse(entry) : entry;
     applied.before = state.ui.editor;
@@ -473,13 +413,11 @@ enum class JournalDirection : std::uint8_t {
     mark_edited(state);
     return DocumentOutcome::Applied;
 }
-
 [[nodiscard]] JournalEntry journal_entry(
     const AnnotationEditorFacts& before, const AnnotationEditorFacts& after,
     std::variant<JournalEntry::Facts, JournalEntry::Object, JournalEntry::Category, JournalEntry::Objects, JournalEntry::Frame> mutation) {
     return {.before = before, .after = after, .mutation = std::move(mutation)};
 }
-
 [[nodiscard]] JournalEntry object_entry(const AnnotationEditorFacts& before, const AnnotationEditorFacts& after, const std::uint16_t index,
                                         const bool before_present, const domain::AnnotationObject& before_object, const bool after_present,
                                         const domain::AnnotationObject& after_object, const std::uint64_t created_identity = 0U) {
@@ -491,10 +429,9 @@ enum class JournalDirection : std::uint8_t {
                                               .after = after_object,
                                               .after_identity = {.object = created_identity}});
 }
-
 template <class Mutate>
-[[nodiscard]] DocumentOutcome change_object(DocumentState& state, const std::uint16_t index, const AnnotationEditorFacts& before,
-                                            AnnotationEditorFacts after, Mutate&& mutate) {
+[[nodiscard]] DocumentOutcome change_object(DocumentState& state, const std::uint16_t index, const AnnotationEditorFacts& before, AnnotationEditorFacts after,
+                                            Mutate&& mutate) {
     const domain::AnnotationObject original = state.ui.scene.objects[index];
     domain::AnnotationObject changed = original;
     std::forward<Mutate>(mutate)(changed, after);
@@ -502,112 +439,75 @@ template <class Mutate>
     // alternatives.
     return commit(state, object_entry(before, after, index, true, original, true, changed));
 }
-
-[[nodiscard]] JournalEntry category_entry(const AnnotationEditorFacts& before, const AnnotationEditorFacts& after,
-                                          const std::uint16_t index, const bool before_present,
-                                          const mmltk::backend::data::catalog::ClassName& before_category, const bool after_present,
+[[nodiscard]] JournalEntry category_entry(const AnnotationEditorFacts& before, const AnnotationEditorFacts& after, const std::uint16_t index,
+                                          const bool before_present, const mmltk::backend::data::catalog::ClassName& before_category, const bool after_present,
                                           const mmltk::backend::data::catalog::ClassName& after_category) {
-    return journal_entry(before, after,
-                         JournalEntry::Category{.index = index,
-                                                .before_present = before_present,
-                                                .after_present = after_present,
-                                                .before = before_category,
-                                                .after = after_category});
+    return journal_entry(
+        before, after,
+        JournalEntry::Category{
+            .index = index, .before_present = before_present, .after_present = after_present, .before = before_category, .after = after_category});
 }
-
-[[nodiscard]] bool target_valid(const AnnotationSceneContent& scene, const AnnotationEditorFacts& editor,
-                                const domain::AnnotationPointerTarget& target) {
+[[nodiscard]] bool target_valid(const AnnotationSceneContent& scene, const AnnotationEditorFacts& editor, const domain::AnnotationPointerTarget& target) {
     (void)editor;
     return target_valid_for(target, ObjectAfterView{.scene = scene});
 }
-
 [[nodiscard]] bool action_matches_tool(const AnnotationPointerAction action, const domain::AnnotationTool tool) {
     switch (action) {
-        case AnnotationPointerAction::Select:
-            return true;
-        case AnnotationPointerAction::BoxDrag:
-            return tool == domain::AnnotationTool::Box;
-        case AnnotationPointerAction::PointPlace:
-            return tool == domain::AnnotationTool::Point;
-        case AnnotationPointerAction::Brush:
-            return tool == domain::AnnotationTool::MaskPaint || tool == domain::AnnotationTool::MaskErase;
-        case AnnotationPointerAction::Fill:
-            return tool == domain::AnnotationTool::MaskFill;
-        case AnnotationPointerAction::SplineKnot:
-            return tool == domain::AnnotationTool::Spline;
-        case AnnotationPointerAction::SkeletonJoint:
-            return tool == domain::AnnotationTool::Skeleton;
-        case AnnotationPointerAction::HandleDrag:
-            return true;
-        case AnnotationPointerAction::ColorSample:
-            return tool == domain::AnnotationTool::ColorSample;
+        case AnnotationPointerAction::Select: return true;
+        case AnnotationPointerAction::BoxDrag: return tool == domain::AnnotationTool::Box;
+        case AnnotationPointerAction::PointPlace: return tool == domain::AnnotationTool::Point;
+        case AnnotationPointerAction::Brush: return tool == domain::AnnotationTool::MaskPaint || tool == domain::AnnotationTool::MaskErase;
+        case AnnotationPointerAction::Fill: return tool == domain::AnnotationTool::MaskFill;
+        case AnnotationPointerAction::SplineKnot: return tool == domain::AnnotationTool::Spline;
+        case AnnotationPointerAction::SkeletonJoint: return tool == domain::AnnotationTool::Skeleton;
+        case AnnotationPointerAction::HandleDrag: return true;
+        case AnnotationPointerAction::ColorSample: return tool == domain::AnnotationTool::ColorSample;
     }
     return false;
 }
-
 [[nodiscard]] AnnotationPointerAction pointer_action(const domain::AnnotationTool tool, const domain::AnnotationPointerTarget& target) {
     if (target.role == domain::AnnotationHandleRole::SplineInHandle || target.role == domain::AnnotationHandleRole::SplineOutHandle)
         return AnnotationPointerAction::HandleDrag;
     switch (tool) {
-        case domain::AnnotationTool::Select:
-            return AnnotationPointerAction::Select;
-        case domain::AnnotationTool::Box:
-            return AnnotationPointerAction::BoxDrag;
+        case domain::AnnotationTool::Select: return AnnotationPointerAction::Select;
+        case domain::AnnotationTool::Box: return AnnotationPointerAction::BoxDrag;
         case domain::AnnotationTool::MaskPaint:
-        case domain::AnnotationTool::MaskErase:
-            return AnnotationPointerAction::Brush;
-        case domain::AnnotationTool::MaskFill:
-            return AnnotationPointerAction::Fill;
-        case domain::AnnotationTool::Spline:
-            return AnnotationPointerAction::SplineKnot;
-        case domain::AnnotationTool::Point:
-            return AnnotationPointerAction::PointPlace;
-        case domain::AnnotationTool::Skeleton:
-            return AnnotationPointerAction::SkeletonJoint;
-        case domain::AnnotationTool::ColorSample:
-            return AnnotationPointerAction::ColorSample;
+        case domain::AnnotationTool::MaskErase: return AnnotationPointerAction::Brush;
+        case domain::AnnotationTool::MaskFill: return AnnotationPointerAction::Fill;
+        case domain::AnnotationTool::Spline: return AnnotationPointerAction::SplineKnot;
+        case domain::AnnotationTool::Point: return AnnotationPointerAction::PointPlace;
+        case domain::AnnotationTool::Skeleton: return AnnotationPointerAction::SkeletonJoint;
+        case domain::AnnotationTool::ColorSample: return AnnotationPointerAction::ColorSample;
     }
     return AnnotationPointerAction::Select;
 }
-
-[[nodiscard]] bool selected_shape(const AnnotationSceneContent& scene, const std::optional<std::uint16_t> selected,
-                                  const domain::AnnotationShape shape) {
+[[nodiscard]] bool selected_shape(const AnnotationSceneContent& scene, const std::optional<std::uint16_t> selected, const domain::AnnotationShape shape) {
     return selected && *selected < scene.objects.size() && scene.objects[*selected].shape == shape;
 }
-
 [[nodiscard]] bool tool_applicable(const AnnotationSceneContent& scene, domain::AnnotationTool tool, std::optional<std::uint16_t> target,
                                    bool pointer_target) noexcept {
     if (!scene.frame_ready || !mmltk::frameworks::reflection::enum_contains(tool)) return false;
     if (target && *target >= scene.objects.size()) return false;
     const auto is_shape = [&](domain::AnnotationShape shape) { return target && scene.objects[*target].shape == shape; };
     switch (tool) {
-        case domain::AnnotationTool::Select:
-            return true;
+        case domain::AnnotationTool::Select: return true;
         case domain::AnnotationTool::MaskErase:
         case domain::AnnotationTool::MaskFill:
-        case domain::AnnotationTool::ColorSample:
-            return is_shape(domain::AnnotationShape::Mask);
-        case domain::AnnotationTool::MaskPaint:
-            return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Mask));
+        case domain::AnnotationTool::ColorSample: return is_shape(domain::AnnotationShape::Mask);
+        case domain::AnnotationTool::MaskPaint: return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Mask));
         case domain::AnnotationTool::Box:
             return !scene.categories.empty() &&
                    (!pointer_target || !target || is_shape(domain::AnnotationShape::Box) || is_shape(domain::AnnotationShape::Mask));
-        case domain::AnnotationTool::Point:
-            return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Point));
-        case domain::AnnotationTool::Spline:
-            return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Spline));
-        case domain::AnnotationTool::Skeleton:
-            return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Skeleton));
+        case domain::AnnotationTool::Point: return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Point));
+        case domain::AnnotationTool::Spline: return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Spline));
+        case domain::AnnotationTool::Skeleton: return !scene.categories.empty() && (!pointer_target || !target || is_shape(domain::AnnotationShape::Skeleton));
     }
     return false;
 }
-
-[[nodiscard]] bool continues_pointer(const PointerFacts& active, const mmltk::controller::AnnotationPointer& request,
-                                     const AnnotationPointerAction action) {
-    return active.active && active.interaction_id == request.interaction_id && request.sequence > active.sequence &&
-           active.action == action && active.target == request.target;
+[[nodiscard]] bool continues_pointer(const PointerFacts& active, const mmltk::controller::AnnotationPointer& request, const AnnotationPointerAction action) {
+    return active.active && active.interaction_id == request.interaction_id && request.sequence > active.sequence && active.action == action &&
+           active.target == request.target;
 }
-
 void set_spline_handle(domain::AnnotationSplineKnot& knot, domain::AnnotationHandleRole role, domain::AnnotationPoint point,
                        const AnnotationSceneContent& scene) {
     auto& selected = role == domain::AnnotationHandleRole::SplineInHandle ? knot.in : knot.out;
@@ -667,38 +567,32 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         object.category = state.ui.editor.selected_category.value_or(0U);
         object.box = box_between(pointer.origin, point);
         pointer.preview = true;
-    } else if ((pointer.action == AnnotationPointerAction::Select || pointer.action == AnnotationPointerAction::HandleDrag) &&
-               pointer.target.object) {
+    } else if ((pointer.action == AnnotationPointerAction::Select || pointer.action == AnnotationPointerAction::HandleDrag) && pointer.target.object) {
         pointer.preview = true;
     }
 }
 }  // namespace
-
-[[nodiscard]] DocumentOutcome reduce_pointer(DocumentState& state, const mmltk::controller::AnnotationPointer& request,
-                                             const std::uint16_t brush_radius) {
+[[nodiscard]] DocumentOutcome reduce_pointer(DocumentState& state, const mmltk::controller::AnnotationPointer& request, const std::uint16_t brush_radius) {
     const auto tool = state.ui.editor.tool;
     const auto action = pointer_action(tool, request.target);
     const auto refuse_pointer = [&](const std::string_view reason = "Pointer coordinates or target are invalid for this tool") {
-        if ((request.phase == domain::AnnotationPointerPhase::End || request.phase == domain::AnnotationPointerPhase::Cancel) &&
-            state.pointer.active && state.pointer.interaction_id == request.interaction_id) {
+        if ((request.phase == domain::AnnotationPointerPhase::End || request.phase == domain::AnnotationPointerPhase::Cancel) && state.pointer.active &&
+            state.pointer.interaction_id == request.interaction_id) {
             state.pointer = {};
         }
         return refused(state, reason);
     };
     if (!pointer_ready(state)) return refused(state, "Open an image before editing");
-    if (!request.valid() || !mmltk::frameworks::reflection::enum_contains(request.phase) ||
-        !mmltk::frameworks::reflection::enum_contains(tool) || request.interaction_id == 0U || request.sequence == 0U ||
-        !point_in_frame(state.ui.scene, request.point) || !target_valid(state.ui.scene, state.ui.editor, request.target) ||
+    if (!request.valid() || !mmltk::frameworks::reflection::enum_contains(request.phase) || !mmltk::frameworks::reflection::enum_contains(tool) ||
+        request.interaction_id == 0U || request.sequence == 0U || !point_in_frame(state.ui.scene, request.point) ||
+        !target_valid(state.ui.scene, state.ui.editor, request.target) ||
         (!action_matches_tool(action, tool) || !tool_applicable(state.ui.scene, tool, request.target.object, true))) {
         return refuse_pointer();
     }
-
     const auto before = state.ui.editor;
     auto after = before;
     if (request.phase == domain::AnnotationPointerPhase::Begin) {
-        if (request.sequence != 1U || state.pointer.active) {
-            return refused(state, "A new gesture requires sequence one and no active gesture");
-        }
+        if (request.sequence != 1U || state.pointer.active) { return refused(state, "A new gesture requires sequence one and no active gesture"); }
         state.pointer = {.active = true,
                          .interaction_id = request.interaction_id,
                          .action = action,
@@ -742,8 +636,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
             state.pointer.brush = true;
         }
         update_drag_preview(state, request.point);
-        if (!request.target.object && (state.pointer.preview || state.pointer.brush))
-            state.pointer.created_identity = allocate_identity(state);
+        if (!request.target.object && (state.pointer.preview || state.pointer.brush)) state.pointer.created_identity = allocate_identity(state);
         return DocumentOutcome::Applied;
     }
     if (request.phase == domain::AnnotationPointerPhase::Update) {
@@ -752,8 +645,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         }
         const bool changed = state.pointer.latest != request.point || state.pointer.brush_radius != brush_radius;
         if (state.pointer.brush && changed)
-            state.brush_rows.Stroke(state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width,
-                                    state.ui.scene.frame_height, tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
+            state.brush_rows.Stroke(state.pointer.latest, request.point, brush_radius, state.ui.scene.frame_width, state.ui.scene.frame_height,
+                                    tool == domain::AnnotationTool::MaskErase, state.mask_scratch);
         if (changed) update_drag_preview(state, request.point);
         state.pointer.latest = request.point;
         state.pointer.sequence = request.sequence;
@@ -767,10 +660,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         state.pointer = {};
         return DocumentOutcome::Applied;
     }
-    if (!continues_pointer(state.pointer, request, action)) {
-        return refuse_pointer("Gesture identity, target or sequence does not match the active gesture");
-    }
-
+    if (!continues_pointer(state.pointer, request, action)) { return refuse_pointer("Gesture identity, target or sequence does not match the active gesture"); }
     after.tool = tool;
     const auto origin = state.pointer.origin;
     const auto target = state.pointer.target;
@@ -809,8 +699,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 object.box = box_between(origin, request.point);
                 object.category = after.selected_category.value_or(0U);
                 after.selected_object = static_cast<std::uint16_t>(scene.objects.size());
-                return commit(state, object_entry(before, after, static_cast<std::uint16_t>(scene.objects.size()), false, {}, true, object,
-                                                  created_identity));
+                return commit(state, object_entry(before, after, static_cast<std::uint16_t>(scene.objects.size()), false, {}, true, object, created_identity));
             }
             const auto& existing = scene.objects[*target.object];
             if (existing.shape != domain::AnnotationShape::Box && existing.shape != domain::AnnotationShape::Mask) return refuse_pointer();
@@ -827,8 +716,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         case AnnotationPointerAction::SkeletonJoint:
         case AnnotationPointerAction::HandleDrag:
         case AnnotationPointerAction::ColorSample: {
-            if (!target.object && (scene.categories.empty() || scene.objects.size() >= domain::kAnnotationObjectCapacity))
-                return capacity(state);
+            if (!target.object && (scene.categories.empty() || scene.objects.size() >= domain::kAnnotationObjectCapacity)) return capacity(state);
             const auto index = target.object.value_or(static_cast<std::uint16_t>(scene.objects.size()));
             const domain::AnnotationObject existing = target.object ? scene.objects[index] : domain::AnnotationObject{};
             auto object = existing;
@@ -836,21 +724,12 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 object.category = after.selected_category.value_or(0U);
                 object.name = domain::AnnotationText::From("annotation");
                 switch (action) {
-                    case AnnotationPointerAction::PointPlace:
-                        object.shape = domain::AnnotationShape::Point;
-                        break;
+                    case AnnotationPointerAction::PointPlace: object.shape = domain::AnnotationShape::Point; break;
                     case AnnotationPointerAction::Brush:
-                    case AnnotationPointerAction::Fill:
-                        object.shape = domain::AnnotationShape::Mask;
-                        break;
-                    case AnnotationPointerAction::SplineKnot:
-                        object.shape = domain::AnnotationShape::Spline;
-                        break;
-                    case AnnotationPointerAction::SkeletonJoint:
-                        object.shape = domain::AnnotationShape::Skeleton;
-                        break;
-                    default:
-                        return refuse_pointer();
+                    case AnnotationPointerAction::Fill: object.shape = domain::AnnotationShape::Mask; break;
+                    case AnnotationPointerAction::SplineKnot: object.shape = domain::AnnotationShape::Spline; break;
+                    case AnnotationPointerAction::SkeletonJoint: object.shape = domain::AnnotationShape::Skeleton; break;
+                    default: return refuse_pointer();
                 }
             }
             switch (action) {
@@ -877,8 +756,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                     if (object.shape != domain::AnnotationShape::Skeleton) return refuse_pointer();
                     if (object.skeleton_nodes.size() >= domain::kAnnotationGeometryCapacity) return capacity(state);
                     if (!object.skeleton_nodes.empty())
-                        object.skeleton_edges.push_back({static_cast<std::uint16_t>(object.skeleton_nodes.size() - 1),
-                                                         static_cast<std::uint16_t>(object.skeleton_nodes.size())});
+                        object.skeleton_edges.push_back(
+                            {static_cast<std::uint16_t>(object.skeleton_nodes.size() - 1), static_cast<std::uint16_t>(object.skeleton_nodes.size())});
                     object.skeleton_nodes.push_back({.key = domain::AnnotationText::From("joint"), .point = request.point});
                     after.selected_skeleton_joint = static_cast<std::uint16_t>(object.skeleton_nodes.size() - 1U);
                     break;
@@ -889,8 +768,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                 case AnnotationPointerAction::ColorSample:
                     return DocumentOutcome::Applied;  // The native clean-image owner applies the sampled color.
                     break;
-                default:
-                    return refuse_pointer();
+                default: return refuse_pointer();
             }
             after.selected_object = index;
             if (object.shape != domain::AnnotationShape::Spline) after.selected_spline_segment.reset();
@@ -900,24 +778,20 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
     }
     return refuse_pointer();
 }
-
 [[nodiscard]] DocumentOutcome reduce_tool(DocumentState& state, const domain::AnnotationTool tool) {
     if (!current(state) || !tool_applicable(state.ui.scene, tool, state.ui.editor.selected_object, false))
         return refused(state, "The selected tool is unavailable for this image and object");
     return change_editor_facts(state, [tool](AnnotationEditorFacts& editor) { editor.tool = tool; });
 }
-
 [[nodiscard]] DocumentOutcome reduce_setup(DocumentState& state, const domain::AnnotationSetupAction action) {
     if (!current(state) || !mmltk::frameworks::reflection::enum_contains(action)) return refused(state);
     return refused(state, "This imported image has no live or timeline frame provider");
 }
-
 [[nodiscard]] DocumentOutcome reduce_hold(DocumentState& state, const bool enabled) {
     // CLEANUP-IGNORE: Hold and tool requests mutate distinct editor facts through the shared change_editor_facts owner.
     if (!current(state)) return refused(state);
     return change_editor_facts(state, [enabled](AnnotationEditorFacts& editor) { editor.hold_save = enabled; });
 }
-
 [[nodiscard]] DocumentOutcome reduce_object(DocumentState& state, const std::uint16_t object) {
     if (!current(state) || object >= state.ui.scene.objects.size()) return refused(state);
     return change_editor_facts(state, [object](AnnotationEditorFacts& editor) {
@@ -926,7 +800,6 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         editor.selected_skeleton_joint.reset();
     });
 }
-
 [[nodiscard]] DocumentOutcome reduce_category(DocumentState& state, const domain::AnnotationText& category) {
     if (!current(state) || !category.valid()) return refused(state);
     const auto& scene = state.ui.scene;
@@ -938,18 +811,15 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
     return commit(state, category_entry(state.ui.editor, after, static_cast<std::uint16_t>(scene.categories.size()), false, {}, true,
                                         {.value = std::string{category.view()}}));
 }
-
 [[nodiscard]] DocumentOutcome reduce_object_facts(DocumentState& state, const std::uint16_t category, const bool enabled) {
     if (!current(state) || !state.ui.editor.selected_object || category >= state.ui.scene.categories.size()) return refused(state);
     const auto index = *state.ui.editor.selected_object;
-    return change_object(state, index, state.ui.editor, state.ui.editor,
-                         [category, enabled](domain::AnnotationObject& object, AnnotationEditorFacts&) {
-                             object.category = category;
-                             object.enabled = enabled;  // CLEANUP-IGNORE: CPD crosses distinct object-facts and
-                                                        // spline-selection reducer transitions.
-                         });
+    return change_object(state, index, state.ui.editor, state.ui.editor, [category, enabled](domain::AnnotationObject& object, AnnotationEditorFacts&) {
+        object.category = category;
+        object.enabled = enabled;  // CLEANUP-IGNORE: CPD crosses distinct object-facts and
+                                   // spline-selection reducer transitions.
+    });
 }
-
 [[nodiscard]] DocumentOutcome reduce_spline(DocumentState& state, const std::uint16_t segment) {
     const auto& scene = state.ui.scene;
     if (!current(state) || !selected_shape(scene, state.ui.editor.selected_object, domain::AnnotationShape::Spline) ||
@@ -960,9 +830,8 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                                // editor-fact commit path.
                                [segment](AnnotationEditorFacts& editor) { editor.selected_spline_segment = segment; });
 }
-
-[[nodiscard]] DocumentOutcome reduce_handle(DocumentState& state, const domain::AnnotationHandleRole handle,
-                                            const domain::AnnotationSplineHandleMode mode, const domain::AnnotationPoint point) {
+[[nodiscard]] DocumentOutcome reduce_handle(DocumentState& state, const domain::AnnotationHandleRole handle, const domain::AnnotationSplineHandleMode mode,
+                                            const domain::AnnotationPoint point) {
     const auto& scene = state.ui.scene;
     if (!current(state) || !selected_shape(scene, state.ui.editor.selected_object, domain::AnnotationShape::Spline) ||
         !state.ui.editor.selected_spline_segment || !point_in_frame(scene, point) ||
@@ -977,7 +846,6 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                              set_spline_handle(knot, handle, point, scene);
                          });
 }
-
 [[nodiscard]] DocumentOutcome reduce_skeleton(DocumentState& state, const std::uint16_t joint) {
     const auto& scene = state.ui.scene;
     if (!current(state) || !selected_shape(scene, state.ui.editor.selected_object, domain::AnnotationShape::Skeleton) ||
@@ -985,9 +853,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         return refused(state);
     return change_editor_facts(state, [joint](AnnotationEditorFacts& editor) { editor.selected_skeleton_joint = joint; });
 }
-
-[[nodiscard]] DocumentOutcome reduce_mask_cleanup(DocumentState& state, const domain::AnnotationMaskCleanup operation,
-                                                  const std::uint16_t cleanup_radius) {
+[[nodiscard]] DocumentOutcome reduce_mask_cleanup(DocumentState& state, const domain::AnnotationMaskCleanup operation, const std::uint16_t cleanup_radius) {
     const auto& scene = state.ui.scene;
     if (!current(state) || !selected_shape(scene, state.ui.editor.selected_object, domain::AnnotationShape::Mask) ||
         cleanup_radius < domain::kMinAnnotationMaskCleanupRadius || cleanup_radius > domain::kMaxAnnotationMaskCleanupRadius ||
@@ -999,21 +865,17 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
                              cleanup_mask(object, operation, cleanup_radius, scene.frame_width, scene.frame_height);
                          });
 }
-
-[[nodiscard]] DocumentOutcome reduce_mask_colors(DocumentState& state, const domain::AnnotationColorRange& sup,
-                                                 const domain::AnnotationColorRange& nosup) {
+[[nodiscard]] DocumentOutcome reduce_mask_colors(DocumentState& state, const domain::AnnotationColorRange& sup, const domain::AnnotationColorRange& nosup) {
     if (!current(state) || !selected_shape(state.ui.scene, state.ui.editor.selected_object, domain::AnnotationShape::Mask) ||
         // CLEANUP-IGNORE: Mask-color validation and object-category validation guard different domain invariants.
         !sup.valid() || !nosup.valid())
         return refused(state);
     const auto index = *state.ui.editor.selected_object;
-    return change_object(state, index, state.ui.editor, state.ui.editor,
-                         [&sup, &nosup](domain::AnnotationObject& object, AnnotationEditorFacts&) {
-                             object.sup = sup;
-                             object.nosup = nosup;
-                         });
+    return change_object(state, index, state.ui.editor, state.ui.editor, [&sup, &nosup](domain::AnnotationObject& object, AnnotationEditorFacts&) {
+        object.sup = sup;
+        object.nosup = nosup;
+    });
 }
-
 [[nodiscard]] DocumentOutcome reduce_scene(DocumentState& state) {
     if (!current(state) || !next_revision_available(state)) { return refused(state); }
     if (state.ui.scene.objects.empty()) return DocumentOutcome::Applied;
@@ -1021,19 +883,15 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
     after.selected_object.reset();
     after.selected_spline_segment.reset();
     after.selected_skeleton_joint.reset();
-    return commit(
-        state,
-        {.before = state.ui.editor, .after = after, .mutation = JournalEntry::Objects{.before = state.ui.scene.objects, .after = {}}});
+    return commit(state, {.before = state.ui.editor, .after = after, .mutation = JournalEntry::Objects{.before = state.ui.scene.objects, .after = {}}});
 }
-
 [[nodiscard]] DocumentOutcome reduce_open(DocumentState& state, domain::AnnotationSceneContent content) {
     if (state.ui.document_revision == std::numeric_limits<std::uint64_t>::max() || !content.valid()) return DocumentOutcome::Rejected;
     DocumentState replacement{};
     const std::uint64_t revision = state.ui.document_revision + 1U;
     replacement.ui.scene = std::move(content);
     replacement.identities.reserve(domain::kAnnotationObjectCapacity);
-    for (const auto& object : replacement.ui.scene.objects)
-        replacement.identities.push_back(make_identity(replacement, object));
+    for (const auto& object : replacement.ui.scene.objects) replacement.identities.push_back(make_identity(replacement, object));
     replacement.ui.document_revision = revision;
     replacement.ui.scene_revision = revision;
     replacement.ui.interaction_revision = revision;
@@ -1042,15 +900,12 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
     state = std::move(replacement);
     return DocumentOutcome::Applied;
 }
-
 [[nodiscard]] DocumentOutcome reduce_undo(DocumentState& state);
 [[nodiscard]] DocumentOutcome reduce_redo(DocumentState& state);
-
 [[nodiscard]] DocumentOutcome reduce_sidebar(DocumentState& state, const domain::AnnotationSidebarCommand command) {
     if (!current(state) || !mmltk::frameworks::reflection::enum_contains(command)) return refused(state);
     if (command == domain::AnnotationSidebarCommand::Undo) return reduce_undo(state);
     if (command == domain::AnnotationSidebarCommand::Redo) return reduce_redo(state);
-
     const auto& scene = state.ui.scene;
     const auto before = state.ui.editor;
     auto after = before;
@@ -1101,14 +956,12 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
             });
         }
         case domain::AnnotationSidebarCommand::SplineDeleteKnot: {
-            if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Spline) || !before.selected_spline_segment)
-                return refused(state);
+            if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Spline) || !before.selected_spline_segment) return refused(state);
             const auto index = *before.selected_object;
-            return change_object(state, index, before, after,
-                                 [&before](domain::AnnotationObject& changed, AnnotationEditorFacts& changed_facts) {
-                                     changed.spline_knots.erase(changed.spline_knots.begin() + *before.selected_spline_segment);
-                                     changed_facts.selected_spline_segment.reset();
-                                 });
+            return change_object(state, index, before, after, [&before](domain::AnnotationObject& changed, AnnotationEditorFacts& changed_facts) {
+                changed.spline_knots.erase(changed.spline_knots.begin() + *before.selected_spline_segment);
+                changed_facts.selected_spline_segment.reset();
+            });
         }
         case domain::AnnotationSidebarCommand::SkeletonSkip: {
             if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton)) return refused(state);
@@ -1119,9 +972,7 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
             return commit(state, facts_entry(before, after));
         }
         case domain::AnnotationSidebarCommand::SkeletonReseed: {
-            if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton) || !before.selected_skeleton_joint) {
-                return refused(state);
-            }
+            if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton) || !before.selected_skeleton_joint) { return refused(state); }
             const auto index = *before.selected_object;
             return change_object(state, index, before, after, [&before](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
                 auto& joint = changed.skeleton_nodes[*before.selected_skeleton_joint];
@@ -1131,33 +982,25 @@ void update_drag_preview(DocumentState& state, const domain::AnnotationPoint poi
         }
         case domain::AnnotationSidebarCommand::SkeletonHide:
         case domain::AnnotationSidebarCommand::SkeletonShow: {
-            if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton) || !before.selected_skeleton_joint)
-                return refused(state);
+            if (!selected_shape(scene, before.selected_object, domain::AnnotationShape::Skeleton) || !before.selected_skeleton_joint) return refused(state);
             const auto index = *before.selected_object;
-            return change_object(state, index, before, after,
-                                 [&before, command](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
-                                     changed.skeleton_nodes[*before.selected_skeleton_joint].visible =
-                                         command == domain::AnnotationSidebarCommand::SkeletonShow;
-                                 });
+            return change_object(state, index, before, after, [&before, command](domain::AnnotationObject& changed, AnnotationEditorFacts&) {
+                changed.skeleton_nodes[*before.selected_skeleton_joint].visible = command == domain::AnnotationSidebarCommand::SkeletonShow;
+            });
         }
         case domain::AnnotationSidebarCommand::Undo:
-        case domain::AnnotationSidebarCommand::Redo:
-            break;
+        case domain::AnnotationSidebarCommand::Redo: break;
     }
     return refused(state);
 }
-
 [[nodiscard]] DocumentOutcome reduce_undo(DocumentState& state) { return apply_journal(state, JournalDirection::Undo); }
-
 [[nodiscard]] DocumentOutcome reduce_redo(DocumentState& state) { return apply_journal(state, JournalDirection::Redo); }
-
 class AnnotationDocument::Impl final {
    public:
     [[nodiscard]] DocumentResult Open(domain::AnnotationSceneContent content) {
         if (!content.valid()) return Result(DocumentOutcome::Rejected, "open");
         try {
-            const mmltk::backend::data::catalog::ClassCatalog catalog(
-                mmltk::backend::data::catalog::OrderedClassCatalog{content.categories});
+            const mmltk::backend::data::catalog::ClassCatalog catalog(mmltk::backend::data::catalog::OrderedClassCatalog{content.categories});
         } catch (...) { return Result(DocumentOutcome::Rejected, "open"); }
         for (auto& object : content.objects)
             if (object.shape == domain::AnnotationShape::Mask) normalize_mask(object);
@@ -1179,16 +1022,16 @@ class AnnotationDocument::Impl final {
             const bool was_preview = before.brush || before.preview;
             const bool is_preview = after.brush || after.preview;
             return scene_revision != state_.ui.scene_revision || was_preview != is_preview ||
-                   (is_preview && (before.latest != after.latest || before.brush_radius != after.brush_radius ||
-                                   before.interaction_id != after.interaction_id));
+                   (is_preview &&
+                    (before.latest != after.latest || before.brush_radius != after.brush_radius || before.interaction_id != after.interaction_id));
         };
         if (diagnostics_enabled_) {
             std::fprintf(stderr,
                          "{\"event\":\"annotation.pointer\",\"interaction_id\":%llu,\"sequence\":%llu,\"phase\":%u,\"target\":%d,\"x\":%."
                          "3f,\"y\":%.3f,\"radius\":%u}\n",
                          static_cast<unsigned long long>(pointer.interaction_id), static_cast<unsigned long long>(pointer.sequence),
-                         static_cast<unsigned>(pointer.phase), pointer.target.object ? static_cast<int>(*pointer.target.object) : -1,
-                         pointer.point.x, pointer.point.y, static_cast<unsigned>(pointer.brush_radius));
+                         static_cast<unsigned>(pointer.phase), pointer.target.object ? static_cast<int>(*pointer.target.object) : -1, pointer.point.x,
+                         pointer.point.y, static_cast<unsigned>(pointer.brush_radius));
         }
         try {
             auto result = Result(reduce_pointer(state_, pointer, pointer.brush_radius), "pointer");
@@ -1265,8 +1108,7 @@ class AnnotationDocument::Impl final {
             state_.ui.save_status = domain::AnnotationSaveStatus::Failed;
             return {.outcome = DocumentOutcome::Rejected, .detail = "Annotation document save failed"};
         }
-        state_.ui.save_status =
-            effect == DocumentSaveEffect::Committed ? domain::AnnotationSaveStatus::Saved : domain::AnnotationSaveStatus::Uncertain;
+        state_.ui.save_status = effect == DocumentSaveEffect::Committed ? domain::AnnotationSaveStatus::Saved : domain::AnnotationSaveStatus::Uncertain;
         if (effect == DocumentSaveEffect::Committed) state_.ui.saved_revision = state_.ui.document_revision;
         return {.outcome = DocumentOutcome::Applied, .detail = {}};
     }
@@ -1282,8 +1124,7 @@ class AnnotationDocument::Impl final {
         if (tool != Tool::Select) {
             if (!selected || *selected >= scene.objects.size()) return {};
             const auto shape = scene.objects[*selected].shape;
-            if (((tool == Tool::MaskPaint || tool == Tool::MaskErase || tool == Tool::MaskFill || tool == Tool::ColorSample) &&
-                 shape == Shape::Mask) ||
+            if (((tool == Tool::MaskPaint || tool == Tool::MaskErase || tool == Tool::MaskFill || tool == Tool::ColorSample) && shape == Shape::Mask) ||
                 (tool == Tool::Spline && shape == Shape::Spline) || (tool == Tool::Skeleton && shape == Shape::Skeleton))
                 return {.object = selected};
             return {};
@@ -1311,8 +1152,7 @@ class AnnotationDocument::Impl final {
                 if (knot.out.enabled && near(knot.out.point)) return handle(index, Role::SplineOutHandle);
             }
             for (std::size_t index = 0U; index != object.skeleton_nodes.size(); ++index)
-                if (object.skeleton_nodes[index].visible && near(object.skeleton_nodes[index].point))
-                    return handle(index, Role::SkeletonNode);
+                if (object.skeleton_nodes[index].visible && near(object.skeleton_nodes[index].point)) return handle(index, Role::SkeletonNode);
         }
         for (std::size_t index = scene.objects.size(); index-- != 0U;) {
             const auto& object = scene.objects[index];
@@ -1320,21 +1160,16 @@ class AnnotationDocument::Impl final {
             bool hit = false;
             switch (object.shape) {
                 case Shape::Box:
-                    hit = point.x >= object.box.first.x - 3.0F && point.x <= object.box.second.x + 3.0F &&
-                          point.y >= object.box.first.y - 3.0F && point.y <= object.box.second.y + 3.0F;
+                    hit = point.x >= object.box.first.x - 3.0F && point.x <= object.box.second.x + 3.0F && point.y >= object.box.first.y - 3.0F &&
+                          point.y <= object.box.second.y + 3.0F;
                     break;
                 case Shape::Mask:
                     hit = std::ranges::any_of(object.mask.runs, [point](const auto& run) {
-                        return run.row == static_cast<std::uint16_t>(std::clamp(point.y, 0.0F, 65535.0F)) && point.x >= run.first &&
-                               point.x < run.last + 1.0F;
+                        return run.row == static_cast<std::uint16_t>(std::clamp(point.y, 0.0F, 65535.0F)) && point.x >= run.first && point.x < run.last + 1.0F;
                     });
                     break;
-                case Shape::Point:
-                    hit = near(object.point);
-                    break;
-                case Shape::Spline:
-                    hit = std::ranges::any_of(object.spline_knots, [&](const auto& knot) { return near(knot.point); });
-                    break;
+                case Shape::Point: hit = near(object.point); break;
+                case Shape::Spline: hit = std::ranges::any_of(object.spline_knots, [&](const auto& knot) { return near(knot.point); }); break;
                 case Shape::Skeleton:
                     hit = std::ranges::any_of(object.skeleton_nodes, [&](const auto& node) { return node.visible && near(node.point); });
                     break;
@@ -1360,10 +1195,9 @@ class AnnotationDocument::Impl final {
                 pointer.identity.object = identity.object;
                 if (pointer.target.element) {
                     const auto role = *pointer.target.role;
-                    pointer.identity.element =
-                        role == domain::AnnotationHandleRole::BoxCorner || role == domain::AnnotationHandleRole::Point
-                            ? static_cast<std::uint64_t>(*pointer.target.element) + 1U
-                            : identity.elements[*pointer.target.element];
+                    pointer.identity.element = role == domain::AnnotationHandleRole::BoxCorner || role == domain::AnnotationHandleRole::Point
+                                                   ? static_cast<std::uint64_t>(*pointer.target.element) + 1U
+                                                   : identity.elements[*pointer.target.element];
                 }
             }
             return true;
@@ -1374,9 +1208,8 @@ class AnnotationDocument::Impl final {
         // Ordinary edits cancel the active reducer gesture, so its accepted
         // current-index mapping remains valid for every ordered update. Only a
         // new gesture searches the bounded identity vector.
-        if (pointer.phase != domain::AnnotationPointerPhase::Begin && state_.pointer.active &&
-            pointer.interaction_id == state_.pointer.interaction_id && pointer.identity == state_.pointer.identity &&
-            pointer.target.role == state_.pointer.target.role) {
+        if (pointer.phase != domain::AnnotationPointerPhase::Begin && state_.pointer.active && pointer.interaction_id == state_.pointer.interaction_id &&
+            pointer.identity == state_.pointer.identity && pointer.target.role == state_.pointer.target.role) {
             pointer.target = state_.pointer.target;
             return true;
         }
@@ -1452,20 +1285,16 @@ class AnnotationDocument::Impl final {
             std::fprintf(stderr,
                          "{\"event\":\"annotation.document\",\"operation\":\"%.*s\",\"outcome\":%u,\"tool\":%u,\"document_revision\":%llu,"
                          "\"interaction_revision\":%llu,\"selected\":%d,\"reason\":\"%.*s\"}\n",
-                         static_cast<int>(operation.size()), operation.data(), static_cast<unsigned>(result),
-                         static_cast<unsigned>(state_.ui.editor.tool), static_cast<unsigned long long>(state_.ui.document_revision),
-                         static_cast<unsigned long long>(state_.ui.interaction_revision),
+                         static_cast<int>(operation.size()), operation.data(), static_cast<unsigned>(result), static_cast<unsigned>(state_.ui.editor.tool),
+                         static_cast<unsigned long long>(state_.ui.document_revision), static_cast<unsigned long long>(state_.ui.interaction_revision),
                          state_.ui.editor.selected_object ? static_cast<int>(*state_.ui.editor.selected_object) : -1,
                          result == DocumentOutcome::Applied ? 0 : static_cast<int>(state_.rejection.size()), state_.rejection.data());
         }
         if (result == DocumentOutcome::Applied) return {.outcome = DocumentOutcome::Applied, .detail = {}};
         if (result == DocumentOutcome::Capacity)
-            return {.outcome = DocumentOutcome::Capacity,
-                    .detail = std::string{"Annotation "} + std::string{operation} + " exceeds bounded editor capacity"};
-        return {.outcome = DocumentOutcome::Rejected,
-                .detail = std::string{"Annotation "} + std::string{operation} + ": " + std::string{state_.rejection}};
+            return {.outcome = DocumentOutcome::Capacity, .detail = std::string{"Annotation "} + std::string{operation} + " exceeds bounded editor capacity"};
+        return {.outcome = DocumentOutcome::Rejected, .detail = std::string{"Annotation "} + std::string{operation} + ": " + std::string{state_.rejection}};
     }
-
     const bool diagnostics_enabled_ = annotation_diagnostics_enabled();
     DocumentState state_;
     // The document's current content plus the three scratch/pending/active
@@ -1482,14 +1311,11 @@ class AnnotationDocument::Impl final {
     std::uint64_t next_save_generation_ = 1U;
     std::uint64_t capabilities_revision_ = 0U;
 };
-
 AnnotationDocument::AnnotationDocument() : impl_(std::make_unique<Impl>()) {}
 AnnotationDocument::~AnnotationDocument() = default;
 DocumentResult AnnotationDocument::Open(domain::AnnotationSceneContent content) { return impl_->Open(std::move(content)); }
 DocumentResult AnnotationDocument::Pointer(const mmltk::controller::AnnotationPointer& pointer) { return impl_->Pointer(pointer); }
-bool AnnotationDocument::ResolveTarget(mmltk::controller::AnnotationPointer& pointer) const noexcept {
-    return impl_->ResolveTarget(pointer);
-}
+bool AnnotationDocument::ResolveTarget(mmltk::controller::AnnotationPointer& pointer) const noexcept { return impl_->ResolveTarget(pointer); }
 bool AnnotationDocument::PeerClosed() noexcept { return impl_->PeerClosed(); }
 DocumentResult AnnotationDocument::Edit(const mmltk::controller::AnnotationEdit& edit) {
     const bool preview = impl_->HasPreview();
@@ -1497,21 +1323,16 @@ DocumentResult AnnotationDocument::Edit(const mmltk::controller::AnnotationEdit&
     try {
         return impl_->Edit(edit);
     } catch (const std::length_error& error) {
-        return {.outcome = DocumentOutcome::Capacity,
-                .detail = error.what(),
-                .render_changed = preview || revision != impl_->ui().scene_revision};
+        return {.outcome = DocumentOutcome::Capacity, .detail = error.what(), .render_changed = preview || revision != impl_->ui().scene_revision};
     }
 }
 DocumentResult AnnotationDocument::Save(const std::string_view destination) { return impl_->Save(destination); }
 const domain::AnnotationUiState& AnnotationDocument::ui() const noexcept { return impl_->ui(); }
-
 bool AnnotationDocument::ToolAvailable(domain::AnnotationTool tool, std::optional<std::uint16_t> target) const noexcept {
     return impl_->ToolAvailable(tool, target);
 }
 void AnnotationDocument::CaptureRender(AnnotationRenderState& target) { impl_->CaptureRender(target); }
-
 }  // namespace mmltk::controller::subsystems::annotation
-
 namespace mmltk::controller {
 contracts::AnnotationSplineKnot annotation_drag_knot(contracts::AnnotationSplineKnot knot, const AnnotationDragPreview& drag,
                                                      const contracts::AnnotationSceneContent& scene) {
@@ -1522,14 +1343,13 @@ contracts::AnnotationSplineKnot annotation_drag_knot(contracts::AnnotationSpline
             handle->point.y = std::clamp(handle->point.y + dy, 0.0F, static_cast<float>(scene.frame_height));
         }
         knot.point = drag.point;
-    } else if (drag.target.role == contracts::AnnotationHandleRole::SplineInHandle ||
-               drag.target.role == contracts::AnnotationHandleRole::SplineOutHandle) {
+    } else if (drag.target.role == contracts::AnnotationHandleRole::SplineInHandle || drag.target.role == contracts::AnnotationHandleRole::SplineOutHandle) {
         subsystems::annotation::set_spline_handle(knot, *drag.target.role, drag.point, scene);
     }
     return knot;
 }
-void materialize_annotation_drag(contracts::AnnotationObject& object, const AnnotationDragPreview& drag,
-                                 const contracts::AnnotationSceneContent& scene, subsystems::annotation::MaskScratch& scratch) {
+void materialize_annotation_drag(contracts::AnnotationObject& object, const AnnotationDragPreview& drag, const contracts::AnnotationSceneContent& scene,
+                                 subsystems::annotation::MaskScratch& scratch) {
     subsystems::annotation::drag_object(object, drag.target, drag.origin, drag.point, scene, scratch);
 }
 }  // namespace mmltk::controller

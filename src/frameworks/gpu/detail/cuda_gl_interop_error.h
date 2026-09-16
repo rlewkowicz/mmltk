@@ -1,12 +1,8 @@
 #pragma once
-
 #include <cuda_runtime_api.h>
-
 #include <string>
 #include <string_view>
-
 namespace mmltk::frameworks::gpu::detail {
-
 inline std::string cuda_gl_interop_error_message(const cudaError_t error, const char* label) {
     std::string message(label);
     message += " failed: ";
@@ -19,9 +15,7 @@ inline std::string cuda_gl_interop_error_message(const cudaError_t error, const 
     }
     return message;
 }
-
 inline bool is_invalid_graphics_context_error(const std::string_view error_message) {
     return error_message.find("invalid OpenGL or DirectX context") != std::string_view::npos;
 }
-
 }  // namespace mmltk::frameworks::gpu::detail

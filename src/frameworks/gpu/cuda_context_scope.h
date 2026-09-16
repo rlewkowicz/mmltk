@@ -1,33 +1,28 @@
 #pragma once
-
 #include <cuda.h>
 #include <exception>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-
 namespace mmltk::frameworks::gpu {
-
 struct CudaContextApi final {
     void* context = nullptr;
     CUresult (*get)(void*, CUcontext*) noexcept = [](void*, CUcontext* current) noexcept { return cuCtxGetCurrent(current); };
     CUresult (*set)(void*, CUcontext) noexcept = [](void*, CUcontext current) noexcept { return cuCtxSetCurrent(current); };
 };
-
 class CudaContextFailure final : public std::exception {
    public:
     explicit CudaContextFailure(bool terminal) noexcept : terminal_(terminal) {}
     [[nodiscard]] const char* what() const noexcept override { return "CUDA caller context restoration failed"; }
     [[nodiscard]] bool terminal() const noexcept { return terminal_; }
+
    private:
     bool terminal_;
 };
-
 struct CudaContextOwner final {
     void* state;
     void (*retain)(void*) noexcept;
 };
-
 // Captures exact driver identity, including null and same-device isolated contexts.
 // Owners reserve physical custody before construction. Run is the explicit
 // operation/Finalize boundary; the destructor never performs CUDA or callbacks.
@@ -35,10 +30,14 @@ class CudaContextScope final {
    public:
     explicit CudaContextScope(CudaContextOwner owner, CudaContextApi api = {}) noexcept : owner_(owner), api_(api) {
         status_ = api_.get && api_.set ? api_.get(api_.context, &previous_) : CUDA_ERROR_INVALID_VALUE;
-        if (status_ == CUDA_SUCCESS) active_ = true;
-        else Abandon();
+        if (status_ == CUDA_SUCCESS)
+            active_ = true;
+        else
+            Abandon();
     }
-    ~CudaContextScope() { if (active_) std::terminate(); }
+    ~CudaContextScope() {
+        if (active_) std::terminate();
+    }
     CudaContextScope(const CudaContextScope&) = delete;
     CudaContextScope& operator=(const CudaContextScope&) = delete;
     [[nodiscard]] explicit operator bool() const noexcept { return active_; }
@@ -72,12 +71,14 @@ class CudaContextScope final {
         if (!active_) return status_;
         active_ = false;
         const auto first = api_.set(api_.context, previous_);
-        if (Lost(first)) Abandon();
-        else if (first != CUDA_SUCCESS && api_.set(api_.context, previous_) != CUDA_SUCCESS) Abandon();
+        if (Lost(first))
+            Abandon();
+        else if (first != CUDA_SUCCESS && api_.set(api_.context, previous_) != CUDA_SUCCESS)
+            Abandon();
         if (status_ == CUDA_SUCCESS) status_ = first;
         return status_;
     }
-    template<class Operation>
+    template <class Operation>
     decltype(auto) Run(Operation&& operation) {
         using Result = std::invoke_result_t<Operation>;
         try {
@@ -102,10 +103,9 @@ class CudaContextScope final {
             throw;
         }
     }
+
    private:
-    [[nodiscard]] static bool Lost(CUresult status) noexcept {
-        return status == CUDA_ERROR_DEINITIALIZED || status == CUDA_ERROR_CONTEXT_IS_DESTROYED;
-    }
+    [[nodiscard]] static bool Lost(CUresult status) noexcept { return status == CUDA_ERROR_DEINITIALIZED || status == CUDA_ERROR_CONTEXT_IS_DESTROYED; }
     void Finish() {
         if (active_ && Finalize() != CUDA_SUCCESS) throw CudaContextFailure(terminal_);
     }
@@ -116,4 +116,4 @@ class CudaContextScope final {
     bool active_ = false;
     bool terminal_ = false;
 };
-}
+}  // namespace mmltk::frameworks::gpu

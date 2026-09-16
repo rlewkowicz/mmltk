@@ -1,13 +1,9 @@
 #include "src/controller/subsystems/system/dataset_system.h"
-
 #include <atomic>
 #include <stdexcept>
 #include <utility>
-
 #include "src/controller/contracts/compute.h"
-
 namespace mmltk::controller {
-
 ArtifactDatasetRuntime::ArtifactDatasetRuntime() = default;
 ArtifactDatasetRuntime::ArtifactDatasetRuntime(services::ArtifactStore store, services::ArtifactDiagnosticObserver diagnostics)
     : store_(std::move(store)), diagnostics_(diagnostics) {}
@@ -15,36 +11,31 @@ services::ArtifactCompileResult ArtifactDatasetRuntime::Compile(const services::
                                                                 const std::function<void(const contracts::ArtifactProgress&)>& progress) {
     auto cancellation = services::ArtifactCancellationSource::Mint();
     std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
-    services::ArtifactProgressObserver observer{
-        .context = const_cast<std::function<void(const contracts::ArtifactProgress&)>*>(&progress),
-        .report = [](void* context, const contracts::ArtifactProgress& value) noexcept {
-            try {
-                (*static_cast<std::function<void(const contracts::ArtifactProgress&)>*>(context))(value);
-            } catch (...) {}
-        }};
+    services::ArtifactProgressObserver observer{.context = const_cast<std::function<void(const contracts::ArtifactProgress&)>*>(&progress),
+                                                .report = [](void* context, const contracts::ArtifactProgress& value) noexcept {
+                                                    try {
+                                                        (*static_cast<std::function<void(const contracts::ArtifactProgress&)>*>(context))(value);
+                                                    } catch (...) {}
+                                                }};
     return store_.compile(request, cancellation.second, observer, diagnostics_);
 }
-contracts::ArtifactInspection ArtifactDatasetRuntime::Inspect(
-    const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, const std::string_view preset,
-    const std::uint32_t resolution, const std::stop_token stop) {
+contracts::ArtifactInspection ArtifactDatasetRuntime::Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
+                                                              const std::string_view preset, const std::uint32_t resolution, const std::stop_token stop) {
     auto cancellation = services::ArtifactCancellationSource::Mint();
     std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
     return store_.inspect(paths, preset, resolution, cancellation.second);
 }
-
 DatasetSystem::DatasetSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events)
     : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {
     if (!factory_) throw contracts::UnavailableError("dataset runtime factory is unavailable");
 }
 DatasetSystem::~DatasetSystem() = default;
-
 direct::LocalRun::Notification DatasetSystem::changed(std::optional<contracts::ArtifactUiState> settled) {
     if (!settled) return {};
     return [this, settled = std::move(*settled)]() mutable noexcept {
         direct::PublishLazyNoexcept(events_, [&] { return event_type{DatasetChanged{std::move(settled)}}; });
     };
 }
-
 contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<contracts::FeatureId::Train>) {
     const auto settings = settings_.materialization_facts();
     if (!settings.loaded) throw contracts::UnavailableError("settings are unavailable");
@@ -82,15 +73,14 @@ contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<cont
                     }
                     progress(value);
                 });
-                failed = malformed_progress.load(std::memory_order_relaxed) ||
-                         result.output.string().size() > contracts::kArtifactPathCapacity || !result.inspection.valid() ||
-                         (!result.cancelled && (result.output.empty() || !result.inspection.available()));
+                failed = malformed_progress.load(std::memory_order_relaxed) || result.output.string().size() > contracts::kArtifactPathCapacity ||
+                         !result.inspection.valid() || (!result.cancelled && (result.output.empty() || !result.inspection.available()));
                 if (failed)
-                    detail = contracts::bounded_artifact_detail(
-                        malformed_progress.load(std::memory_order_relaxed) ? "dataset compiler returned invalid progress"
-                        : !result.inspection.valid()                       ? "dataset compiler returned an invalid inspection"
-                        : result.inspection.detail.empty()                 ? "dataset compiler returned no compatible artifact"
-                                                                           : result.inspection.detail);
+                    detail =
+                        contracts::bounded_artifact_detail(malformed_progress.load(std::memory_order_relaxed) ? "dataset compiler returned invalid progress"
+                                                           : !result.inspection.valid()       ? "dataset compiler returned an invalid inspection"
+                                                           : result.inspection.detail.empty() ? "dataset compiler returned no compatible artifact"
+                                                                                              : result.inspection.detail);
             } catch (const std::exception& error) {
                 failed = true;
                 detail = contracts::bounded_artifact_detail(error.what());
@@ -151,7 +141,6 @@ contracts::ArtifactUiState DatasetSystem::Compile(contracts::WorkflowIntent<cont
     });
     return snapshot();
 }
-
 contracts::ArtifactUiState DatasetSystem::Stop() noexcept {
     static_cast<void>(run_.Stop());
     std::scoped_lock lock(mutex_);
@@ -167,8 +156,8 @@ void DatasetSystem::Shutdown() noexcept {
     static_cast<void>(Stop());
     run_.StopAndJoin();
 }
-contracts::ArtifactInspection DatasetSystem::Inspect(std::array<std::filesystem::path, contracts::kArtifactSplitCapacity> paths,
-                                                     std::string preset, const std::uint32_t resolution, const std::stop_token stop) {
+contracts::ArtifactInspection DatasetSystem::Inspect(std::array<std::filesystem::path, contracts::kArtifactSplitCapacity> paths, std::string preset,
+                                                     const std::uint32_t resolution, const std::stop_token stop) {
     for (std::size_t index = 0; index < paths.size(); ++index) {
         if (paths[index].empty()) continue;
         paths[index] = paths[index].lexically_normal();
@@ -248,5 +237,4 @@ void DatasetSystem::progress(const contracts::ArtifactProgress& value) noexcept 
     }
     direct::PublishLazyNoexcept(events_, [&] { return event_type{DatasetProgress{generation, active, std::move(terminal), value}}; });
 }
-
 }  // namespace mmltk::controller

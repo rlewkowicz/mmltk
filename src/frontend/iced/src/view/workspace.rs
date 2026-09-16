@@ -56,8 +56,10 @@ pub fn view(
 ) -> Element<'static, Message> {
     let prediction = surface.and_then(crate::presentation_surface::drawable_prediction);
     let surface = prediction.as_ref().map(|(surface, _)| *surface).or(surface);
-    let labels = prediction.map_or(crate::presentation_surface::labels::Source::Hidden,
-        |(_, prediction)| crate::presentation_surface::labels::Source::Prediction(prediction));
+    let labels = prediction.map_or(
+        crate::presentation_surface::labels::Source::Hidden,
+        |(_, prediction)| crate::presentation_surface::labels::Source::Prediction(prediction),
+    );
     let (surface_width, surface_height) = surface_extent(center_width, selected);
     let content: Element<'static, Message> = crate::presentation_surface::labels::view(
         crate::presentation_surface::Program {

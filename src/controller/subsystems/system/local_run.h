@@ -1,5 +1,4 @@
 #pragma once
-
 #include <atomic>
 #include <exception>
 #include <functional>
@@ -11,11 +10,8 @@
 #include <stop_token>
 #include <thread>
 #include <utility>
-
 #include "src/controller/contracts/application_boundary.h"
-
 namespace mmltk::controller::direct {
-
 class LocalRun final {
    public:
     using Notification = std::move_only_function<void()>;
@@ -28,14 +24,11 @@ class LocalRun final {
         Work work{};
         Failure failure{};
     };
-
     LocalRun() = default;
     ~LocalRun() noexcept;
     LocalRun(const LocalRun&) = delete;
     LocalRun& operator=(const LocalRun&) = delete;
-
     void Start(Job);
-
     [[nodiscard]] std::stop_source CurrentStopSource() const noexcept;
     [[nodiscard]] bool Stop() noexcept;
     [[nodiscard]] bool active() const noexcept;
@@ -55,7 +48,6 @@ class LocalRun final {
     std::jthread worker_;
     bool active_ = false;
 };
-
 template <class Sink, class Factory>
 void PublishLazyNoexcept(const Sink& sink, Factory factory) noexcept {
     if (!sink) return;
@@ -63,5 +55,4 @@ void PublishLazyNoexcept(const Sink& sink, Factory factory) noexcept {
         sink(factory());
     } catch (...) {}
 }
-
 }  // namespace mmltk::controller::direct

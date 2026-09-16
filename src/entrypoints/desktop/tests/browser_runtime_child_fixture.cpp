@@ -1,19 +1,14 @@
 #include <unistd.h>
-
 #include <cerrno>
 #include <csignal>
 #include <cstdint>
 #include <string_view>
-
 #include "browser_runtime_fixture_args.hpp"
-
 namespace {
-
 [[nodiscard]] int publish_readiness(const int descriptor) noexcept {
     const std::uint64_t fact = 1U;
     return ::write(descriptor, &fact, sizeof(fact)) == static_cast<ssize_t>(sizeof(fact)) ? 0 : 67;
 }
-
 [[nodiscard]] int wait_for_term(const int readiness_descriptor) noexcept {
     sigset_t signals{};
     if (::sigemptyset(&signals) != 0 || ::sigaddset(&signals, SIGTERM) != 0) { return 65; }
@@ -24,11 +19,8 @@ namespace {
     const int signal = ::sigwaitinfo(&signals, nullptr);
     return signal == SIGTERM ? 0 : 68;
 }
-
 volatile sig_atomic_t term_handled = 0;
-
 void handle_term(const int) noexcept { term_handled = 1; }
-
 [[nodiscard]] int handle_term_normally(const int readiness_descriptor) noexcept {
     struct sigaction action{};
     action.sa_handler = &handle_term;
@@ -39,7 +31,6 @@ void handle_term(const int) noexcept { term_handled = 1; }
     }
     return 0;
 }
-
 [[nodiscard]] int refuse_term_until_kill(const int readiness_descriptor) noexcept {
     if (wait_for_term(readiness_descriptor) != 0) return 69;
     sigset_t unblocked{};
@@ -48,7 +39,6 @@ void handle_term(const int) noexcept { term_handled = 1; }
     // without a timer until the process owner selects its one KILL escalation.
     return ::sigsuspend(&unblocked) == -1 ? 71 : 72;
 }
-
 [[nodiscard]] int parse_readiness_descriptor(const std::string_view argument, std::string_view* const mode) noexcept {
     const std::size_t separator = argument.find(':');
     if (separator == std::string_view::npos || mode == nullptr || separator == 0U || separator + 1U == argument.size()) { return -1; }
@@ -60,9 +50,7 @@ void handle_term(const int) noexcept { term_handled = 1; }
     }
     return descriptor;
 }
-
 }  // namespace
-
 int main(const int argc, char* argv[]) {
     if (!valid_browser_runtime_fixture_args(argc, argv)) { return 64; }
     const std::string_view argument{argv[9]};

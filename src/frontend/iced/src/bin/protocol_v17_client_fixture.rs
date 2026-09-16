@@ -124,10 +124,12 @@ fn validate_generated_surfaces() -> io::Result<()> {
                 && schema::SETTINGS_LEAVES.iter().any(|leaf| {
                     leaf.stable_field_id == dialog.stable_field_id && leaf.path == dialog.field_path
                 })
-                && dialog.key_fields.all()
-                .into_iter()
-                .chain(dialog.predicate_field_id)
-                .all(|id| settings_ids.contains(&id))
+                && dialog
+                    .key_fields
+                    .all()
+                    .into_iter()
+                    .chain(dialog.predicate_field_id)
+                    .all(|id| settings_ids.contains(&id))
                 && schema::MODEL_SELECTION_COMPATIBILITY_CATALOG
                     .iter()
                     .any(|row| {
@@ -454,23 +456,42 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         let Some(ServerRecord::IntentReply(reply)) = records.iter().find(
             |record| matches!(record, ServerRecord::IntentReply(reply) if reply.correlation == correlation),
         ) else { return Err(io::Error::other("native model projection pair is missing")); };
-        reply.result.clone().map_err(|_| io::Error::other("native model projection pair is an error"))
+        reply
+            .result
+            .clone()
+            .map_err(|_| io::Error::other("native model projection pair is an error"))
     };
     let mut model_correlation = 400;
     for dialog in generated::MODEL_ARTIFACT_DIALOGS {
         for mode in 0..4 {
-            let settings = generated::GuiSettingsState::from_application_value(model_reference(model_correlation)?)
-                .map_err(io::Error::other)?;
-            let expected_projection = generated::ModelSettingsProjection::from_application_value(model_reference(model_correlation + 1)?)
-                .map_err(io::Error::other)?;
+            let settings = generated::GuiSettingsState::from_application_value(model_reference(
+                model_correlation,
+            )?)
+            .map_err(io::Error::other)?;
+            let expected_projection = generated::ModelSettingsProjection::from_application_value(
+                model_reference(model_correlation + 1)?,
+            )
+            .map_err(io::Error::other)?;
             model_correlation += 2;
             let actual = generated::project_model_settings(&settings, dialog.target.workflow)
                 .ok_or_else(|| io::Error::other("generated model draft projection is missing"))?;
-            require(actual == expected_projection, "native and Rust model projections differ")?;
-            require(actual.key.classlayoutpath == "/tmp/fixture-model.classes.json",
-                    "descriptor disappeared from a workflow projection")?;
-            require(actual.key.input == if mode == 2 { generated::ModelArtifactInputKind::None } else { dialog.target.input },
-                    "draft input meaning changed")?;
+            require(
+                actual == expected_projection,
+                "native and Rust model projections differ",
+            )?;
+            require(
+                actual.key.classlayoutpath == "/tmp/fixture-model.classes.json",
+                "descriptor disappeared from a workflow projection",
+            )?;
+            require(
+                actual.key.input
+                    == if mode == 2 {
+                        generated::ModelArtifactInputKind::None
+                    } else {
+                        dialog.target.input
+                    },
+                "draft input meaning changed",
+            )?;
         }
     }
     let expected = mmltk_browser_app::generated::AnnotationSnapshot::from_application_value(
@@ -516,80 +537,193 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         "positional output decoder accepted named persistence data",
     )?;
     use mmltk_browser_app::generated;
-    let training = generated::TrainingRecord::from_application_value(model_reference(700)?).map_err(io::Error::other)?;
-    let training_transport = generated::TrainingRecord::from_application_transport_value(model_reference(701)?).map_err(io::Error::other)?;
-    require(training == training_transport && training.evaluatedweights == generated::EvaluatedWeights::Ema
-        && training.progress.scalars.total == Some(1.25) && training.progress.scalars.classification.is_none()
-        && training.progress.val.as_ref().is_some_and(|value| value.bbox.ap == 0.625)
-        && training.droppedbefore == 2 && training.sequence == 17,
-        "training metric values, unavailability or selected weight provenance changed")?;
+    let training = generated::TrainingRecord::from_application_value(model_reference(700)?)
+        .map_err(io::Error::other)?;
+    let training_transport =
+        generated::TrainingRecord::from_application_transport_value(model_reference(701)?)
+            .map_err(io::Error::other)?;
+    require(
+        training == training_transport
+            && training.evaluatedweights == generated::EvaluatedWeights::Ema
+            && training.progress.scalars.total == Some(1.25)
+            && training.progress.scalars.classification.is_none()
+            && training
+                .progress
+                .val
+                .as_ref()
+                .is_some_and(|value| value.bbox.ap == 0.625)
+            && training.droppedbefore == 2
+            && training.sequence == 17,
+        "training metric values, unavailability or selected weight provenance changed",
+    )?;
     let scalar_values = training.progress.scalars.values();
-    let scalar = |field| generated::TrainingScalars::FIELDS.iter().position(|(id, _)| *id == field).and_then(|index| scalar_values[index]);
-    require(scalar(generated::TrainingScalarsField::LearningRate) == Some(0.0001)
-        && scalar(generated::TrainingScalarsField::LearningRateMin) == Some(0.00001)
-        && scalar(generated::TrainingScalarsField::LearningRateMax) == Some(0.001)
-        && scalar(generated::TrainingScalarsField::CorrespondenceWeighted) == Some(0.25)
-        && scalar(generated::TrainingScalarsField::Classification).is_none()
-        && training.progress.fullcheckpointpath == "/copied/full.pt"
-        && training.progress.checkpointpath == "/run/epoch.pth",
-        "reflected scalar projection or distinct resumable artifact paths changed")?;
-    let training_page = generated::TrainingHistoryPage::from_application_value(model_reference(702)?).map_err(io::Error::other)?;
-    let transported_training_page = generated::TrainingHistoryPage::from_application_transport_value(model_reference(703)?).map_err(io::Error::other)?;
-    require(training_page == transported_training_page && training_page.generation == 9
-        && training_page.nextcursor == 123 && training_page.records == [training],
-        "bounded training history did not survive both codecs")?;
-    let history = generated::encode_training_History(1, generated::TrainingHistoryQuery { generation: 9, cursor: 123, count: 32 });
-    require(history.record.endpoint_id == 6009522715651029925,
-        "training history endpoint identity changed")?;
-    let metric_page = generated::EvaluationDetailPage::from_application_value(model_reference(600)?).map_err(io::Error::other)?;
-    let transported_page = generated::EvaluationDetailPage::from_application_transport_value(model_reference(601)?).map_err(io::Error::other)?;
-    require(metric_page == transported_page && metric_page.rows.len() == 2 && metric_page.rows[0].precisioncurve[9][100] == 0.125,
-        "native validation detail grid did not survive both codecs")?;
-    require(metric_page.rows[0].category.is_none() && metric_page.rows[0].categoryname.is_none()
-        && metric_page.rows[1].category == Some(5)
-        && metric_page.rows[1].categoryname.as_ref().is_some_and(|name| name.value == "é".repeat(128)),
-        "bounded evaluated names or aggregate identity were lost")?;
+    let scalar = |field| {
+        generated::TrainingScalars::FIELDS
+            .iter()
+            .position(|(id, _)| *id == field)
+            .and_then(|index| scalar_values[index])
+    };
+    require(
+        scalar(generated::TrainingScalarsField::LearningRate) == Some(0.0001)
+            && scalar(generated::TrainingScalarsField::LearningRateMin) == Some(0.00001)
+            && scalar(generated::TrainingScalarsField::LearningRateMax) == Some(0.001)
+            && scalar(generated::TrainingScalarsField::CorrespondenceWeighted) == Some(0.25)
+            && scalar(generated::TrainingScalarsField::Classification).is_none()
+            && training.progress.fullcheckpointpath == "/copied/full.pt"
+            && training.progress.checkpointpath == "/run/epoch.pth",
+        "reflected scalar projection or distinct resumable artifact paths changed",
+    )?;
+    let training_page =
+        generated::TrainingHistoryPage::from_application_value(model_reference(702)?)
+            .map_err(io::Error::other)?;
+    let transported_training_page =
+        generated::TrainingHistoryPage::from_application_transport_value(model_reference(703)?)
+            .map_err(io::Error::other)?;
+    require(
+        training_page == transported_training_page
+            && training_page.generation == 9
+            && training_page.nextcursor == 123
+            && training_page.records == [training],
+        "bounded training history did not survive both codecs",
+    )?;
+    let history = generated::encode_training_History(
+        1,
+        generated::TrainingHistoryQuery {
+            generation: 9,
+            cursor: 123,
+            count: 32,
+        },
+    );
+    require(
+        history.record.endpoint_id == 6009522715651029925,
+        "training history endpoint identity changed",
+    )?;
+    let metric_page =
+        generated::EvaluationDetailPage::from_application_value(model_reference(600)?)
+            .map_err(io::Error::other)?;
+    let transported_page =
+        generated::EvaluationDetailPage::from_application_transport_value(model_reference(601)?)
+            .map_err(io::Error::other)?;
+    require(
+        metric_page == transported_page
+            && metric_page.rows.len() == 2
+            && metric_page.rows[0].precisioncurve[9][100] == 0.125,
+        "native validation detail grid did not survive both codecs",
+    )?;
+    require(
+        metric_page.rows[0].category.is_none()
+            && metric_page.rows[0].categoryname.is_none()
+            && metric_page.rows[1].category == Some(5)
+            && metric_page.rows[1]
+                .categoryname
+                .as_ref()
+                .is_some_and(|name| name.value == "é".repeat(128)),
+        "bounded evaluated names or aggregate identity were lost",
+    )?;
     let axes = &generated::EVALUATION_AXIS_CATALOG[0];
-    require(axes.iou == <[f64; 10]>::from_application_value(model_reference(604)?).map_err(io::Error::other)?
-        && axes.iou == <[f64; 10]>::from_application_transport_value(model_reference(605)?).map_err(io::Error::other)?
-        && axes.recall == <[f64; 101]>::from_application_value(model_reference(606)?).map_err(io::Error::other)?
-        && axes.recall == <[f64; 101]>::from_application_transport_value(model_reference(607)?).map_err(io::Error::other)?
-        && axes.confidence == <[f64; 101]>::from_application_value(model_reference(608)?).map_err(io::Error::other)?
-        && axes.confidence == <[f64; 101]>::from_application_transport_value(model_reference(609)?).map_err(io::Error::other)?
-        && axes.iou.len() == metric_page.rows[0].precisioncurve.len()
-        && axes.recall.len() == metric_page.rows[0].precisioncurve[0].len(),
-        "static metric axes differ from native values or actual curve extents")?;
+    require(
+        axes.iou
+            == <[f64; 10]>::from_application_value(model_reference(604)?)
+                .map_err(io::Error::other)?
+            && axes.iou
+                == <[f64; 10]>::from_application_transport_value(model_reference(605)?)
+                    .map_err(io::Error::other)?
+            && axes.recall
+                == <[f64; 101]>::from_application_value(model_reference(606)?)
+                    .map_err(io::Error::other)?
+            && axes.recall
+                == <[f64; 101]>::from_application_transport_value(model_reference(607)?)
+                    .map_err(io::Error::other)?
+            && axes.confidence
+                == <[f64; 101]>::from_application_value(model_reference(608)?)
+                    .map_err(io::Error::other)?
+            && axes.confidence
+                == <[f64; 101]>::from_application_transport_value(model_reference(609)?)
+                    .map_err(io::Error::other)?
+            && axes.iou.len() == metric_page.rows[0].precisioncurve.len()
+            && axes.recall.len() == metric_page.rows[0].precisioncurve[0].len(),
+        "static metric axes differ from native values or actual curve extents",
+    )?;
     for correlation in [610, 612] {
-        require(generated::EvaluationDetailPage::from_application_value(model_reference(correlation)?).is_err()
-            && generated::EvaluationDetailPage::from_application_transport_value(model_reference(correlation + 1)?).is_err(),
-            "metric page codec accepted oversized rows or category names")?;
+        require(
+            generated::EvaluationDetailPage::from_application_value(model_reference(correlation)?)
+                .is_err()
+                && generated::EvaluationDetailPage::from_application_transport_value(
+                    model_reference(correlation + 1)?,
+                )
+                .is_err(),
+            "metric page codec accepted oversized rows or category names",
+        )?;
     }
-    let query = generated::encode_validation_Details(1, generated::EvaluationDetailQuery { generation: 7, offset: 0, count: 4 });
-    require(query.record.endpoint_id == 8227943998713357562
-        && query.record.fields.iter().map(|field| field.field_id).collect::<Vec<_>>() ==
-            [14315253701558637748, 17534743922720314413, 12467602364773788561],
-        "validation detail endpoint or stable request field identities changed")?;
-    require(generated::REFLECTED_FIELD_FACTS.iter().any(|field| field.owner == "EvaluationMetricDetail"
-        && field.name == "precision_curve" && field.catalog_provider == Some("EvaluationAxisCatalog")),
-        "curve declaration lost its canonical axis provider")?;
-    let sample_image = generated::ValidationImageMetadata::from_application_value(model_reference(602)?).map_err(io::Error::other)?;
-    let transported_image = generated::ValidationImageMetadata::from_application_transport_value(model_reference(603)?).map_err(io::Error::other)?;
-    require(sample_image == transported_image && sample_image.samples[0].identity.datasetindex == 3 && sample_image.samples[0].labels[0].groundtruth
-        && !sample_image.overlays.predictionboxes && sample_image.overlays.predictionmasks
-        && !sample_image.overlays.groundtruthboxes && sample_image.overlays.groundtruthmasks,
-        "native validation sample image metadata did not survive both codecs")?;
+    let query = generated::encode_validation_Details(
+        1,
+        generated::EvaluationDetailQuery {
+            generation: 7,
+            offset: 0,
+            count: 4,
+        },
+    );
+    require(
+        query.record.endpoint_id == 8227943998713357562
+            && query
+                .record
+                .fields
+                .iter()
+                .map(|field| field.field_id)
+                .collect::<Vec<_>>()
+                == [
+                    14315253701558637748,
+                    17534743922720314413,
+                    12467602364773788561,
+                ],
+        "validation detail endpoint or stable request field identities changed",
+    )?;
+    require(
+        generated::REFLECTED_FIELD_FACTS.iter().any(|field| {
+            field.owner == "EvaluationMetricDetail"
+                && field.name == "precision_curve"
+                && field.catalog_provider == Some("EvaluationAxisCatalog")
+        }),
+        "curve declaration lost its canonical axis provider",
+    )?;
+    let sample_image =
+        generated::ValidationImageMetadata::from_application_value(model_reference(602)?)
+            .map_err(io::Error::other)?;
+    let transported_image =
+        generated::ValidationImageMetadata::from_application_transport_value(model_reference(603)?)
+            .map_err(io::Error::other)?;
+    require(
+        sample_image == transported_image
+            && sample_image.samples[0].identity.datasetindex == 3
+            && sample_image.samples[0].labels[0].groundtruth
+            && !sample_image.overlays.predictionboxes
+            && sample_image.overlays.predictionmasks
+            && !sample_image.overlays.groundtruthboxes
+            && sample_image.overlays.groundtruthmasks,
+        "native validation sample image metadata did not survive both codecs",
+    )?;
     let paired_product = generated::decode_workspace_image_product(
         generated::application_system_stable_id(generated::ApplicationSystem::Validation),
-        model_reference(603)?).map_err(io::Error::other)?;
+        model_reference(603)?,
+    )
+    .map_err(io::Error::other)?;
     let copied_product = paired_product.clone();
-    require(matches!((&paired_product, &copied_product),
+    require(
+        matches!((&paired_product, &copied_product),
         (generated::WorkspaceImageProduct::Validation(first), generated::WorkspaceImageProduct::Validation(next))
             if std::sync::Arc::ptr_eq(first, next) && first.as_ref() == &sample_image),
-        "image product cloning copied or changed the immutable native metadata")?;
-    let validation = visual.validation.ok_or_else(|| io::Error::other("validation bootstrap is missing"))?;
-    require(validation.metrics.as_ref().is_some_and(|summary| summary.bbox.areaap == [Some(0.0), None, Some(1.0)] && summary.mask.is_none())
-        && validation.sampleavailable[0] && validation.sampleidentities[0].generation == 7,
-        "validation summary availability or sample identity was lost")?;
+        "image product cloning copied or changed the immutable native metadata",
+    )?;
+    let validation = visual
+        .validation
+        .ok_or_else(|| io::Error::other("validation bootstrap is missing"))?;
+    require(
+        validation.metrics.as_ref().is_some_and(|summary| {
+            summary.bbox.areaap == [Some(0.0), None, Some(1.0)] && summary.mask.is_none()
+        }) && validation.sampleavailable[0]
+            && validation.sampleidentities[0].generation == 7,
+        "validation summary availability or sample identity was lost",
+    )?;
     for (kind, session) in [
         (generated::PresentationSourceKind::None, 0),
         (generated::PresentationSourceKind::Explore, 1),
@@ -607,7 +741,12 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
         require(
-            observed.snapshotrevision == if kind == generated::PresentationSourceKind::Predict { 7 + session } else { u64::MAX - session }
+            observed.snapshotrevision
+                == if kind == generated::PresentationSourceKind::Predict {
+                    7 + session
+                } else {
+                    u64::MAX - session
+                }
                 && observed.frame.revision == 7 + session,
             "native visual observation differs from Rust projection",
         )?;

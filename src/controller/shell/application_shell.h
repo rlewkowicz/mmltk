@@ -20,12 +20,10 @@
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/transport/browser_server.h"
-
 namespace mmltk::controller::shell {
 namespace browser = mmltk::controller::browser;
 namespace services = mmltk::controller::services;
 namespace transport = mmltk::frameworks::transport;
-
 struct ApplicationShellConfig final {
     struct PresentationConfig final {
         std::filesystem::path import_socket;
@@ -35,8 +33,7 @@ struct ApplicationShellConfig final {
         std::size_t pitch_bytes = 1'200U * 4U;
         std::size_t minimum_allocation_bytes = 0U;
     };
-    PresentationConfig presentation{
-        .import_socket = {}, .cuda_device_index = 0, .extent = {.width = 1'200U, .height = 800U}, .pitch_bytes = 1'200U * 4U};
+    PresentationConfig presentation{.import_socket = {}, .cuda_device_index = 0, .extent = {.width = 1'200U, .height = 800U}, .pitch_bytes = 1'200U * 4U};
     LiveNativeConfiguration live{};
     ExploreNativeConfiguration explore{};
     services::DiagnosticsClient diagnostics{};
@@ -52,7 +49,6 @@ struct ApplicationShellConfig final {
     std::filesystem::path training_executable{};
 };
 MMLTK_REFLECT_FIELDS(ApplicationShellConfig::PresentationConfig)
-
 class ApplicationShell final {
    public:
     explicit ApplicationShell(ApplicationShellConfig);
@@ -78,7 +74,6 @@ class ApplicationShell final {
     void emit_shutdown_event(std::string_view) noexcept;
     void request_system_stops() noexcept;
     [[nodiscard]] bool join_systems() noexcept;
-
     services::DiagnosticsClient diagnostics_client_;
     services::RuntimeDiagnostics runtime_diagnostics_;
     services::RuntimeDiagnosticTarget visual_diagnostic_target_;

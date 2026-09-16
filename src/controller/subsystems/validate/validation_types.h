@@ -54,9 +54,12 @@ struct ValidationSnapshot final {
     std::uint32_t detail_rows = 0U;
     ValidationOverlays overlays{};
 };
-struct [[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] ValidationChanged final { ValidationSnapshot snapshot{}; };
-struct [[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] ValidationProgress final { contracts::ComputeUiState operation{}; };
-
+struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] ValidationChanged final {
+    ValidationSnapshot snapshot{};
+};
+struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] ValidationProgress final {
+    contracts::ComputeUiState operation{};
+};
 MMLTK_REFLECT_FIELDS(ValidationSampleIdentity)
 MMLTK_REFLECT_FIELDS(ValidationLabel)
 MMLTK_REFLECT_FIELDS(ValidationSampleMetadata)
@@ -65,5 +68,4 @@ MMLTK_REFLECT_FIELDS(ValidationImageMetadata)
 MMLTK_REFLECT_FIELDS(ValidationSnapshot)
 MMLTK_REFLECT_FIELDS(ValidationChanged)
 MMLTK_REFLECT_FIELDS(ValidationProgress)
-
 }  // namespace mmltk::controller

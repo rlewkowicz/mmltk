@@ -1,5 +1,4 @@
 #pragma once
-
 #include "src/controller/presentation/presentation_system.h"
 #include "src/controller/services/file_dialog_system.h"
 #include "src/controller/services/settings_system.h"
@@ -13,9 +12,7 @@
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/train/training_system.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
-
 namespace mmltk::controller {
-
 // The application contract is reflected from this composition. A member name
 // is the stable system identity and the pointed-to ordinary system owns its
 // annotated intents, snapshot, and event variant. ApplicationShell supplies

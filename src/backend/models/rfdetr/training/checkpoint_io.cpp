@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
-
 #include "archive_utils.h"
 #include "model_technical.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
@@ -20,24 +19,17 @@
 #include "model_state_access.h"
 #include <unordered_map>
 #include <type_traits>
-
 import mmltk.common.logging.profile_utils;
-
 namespace mmltk::backend::models::rfdetr::detail {
-
 namespace torch_api = mmltk::backend::ml::torch_api;
-
 void publish_native_checkpoint_archive(torch_api::OutputArchive& archive, const std::filesystem::path& destination,
-    const std::filesystem::path& explicit_descriptor) {
+                                       const std::filesystem::path& explicit_descriptor) {
     ClassArtifactPublication publication(destination, explicit_descriptor);
     archive.save_to(publication.staged_artifact().string());
     publication.Publish();
 }
-
 namespace serialization = mmltk::frameworks::serialization;
-
 namespace {
-
 constexpr char kTrainingSupervisionKey[] = "training_supervision_config_cbor";
 constexpr std::string_view kTrainingSupervisionPrefix = "training_supervision.";
 constexpr std::size_t kTrainingSupervisionCborCapacity = serialization::reflected_maximum_cbor_bytes<TrainingSupervisionConfig>();
@@ -46,7 +38,6 @@ constexpr serialization::wire::Limits kTrainingSupervisionCborLimits{
     .max_items = 64U,
     .max_depth = 8U,
 };
-
 void write_state_archive_impl(torch_api::OutputArchive& archive, const char* key, const std::vector<NormalizedModelStateEntry>& entries,
                               const bool include_training_supervision, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_checkpoint_save_write_state_archive{"rfdetr.checkpoint.save.write_state_archive"};
@@ -67,9 +58,7 @@ void write_state_archive_impl(torch_api::OutputArchive& archive, const char* key
     }
     archive.write(key, state_archive);
 }
-
 }  // namespace
-
 void write_native_checkpoint_metadata(torch_api::OutputArchive& archive, const NativeCheckpointMetadata& metadata) {
     if (metadata.num_queries <= 0 || metadata.num_select <= 0 || metadata.num_select > metadata.num_queries) {
         throw std::runtime_error("RF-DETR native checkpoint requires positive num_queries and num_select <= num_queries");
@@ -87,14 +76,16 @@ void write_native_checkpoint_metadata(torch_api::OutputArchive& archive, const N
     write_int(archive, "num_queries", metadata.num_queries);
     write_int(archive, "num_select", metadata.num_select);
     metadata.for_each_detection_field([&]<class Optional>(const char* key, const Optional& value) {
-        if constexpr (std::is_same_v<typename Optional::value_type, bool>) write_optional_bool(archive, key, value);
-        else if constexpr (std::is_same_v<typename Optional::value_type, int64_t>) write_optional_int(archive, key, value);
-        else write_optional_double(archive, key, value);
+        if constexpr (std::is_same_v<typename Optional::value_type, bool>)
+            write_optional_bool(archive, key, value);
+        else if constexpr (std::is_same_v<typename Optional::value_type, int64_t>)
+            write_optional_int(archive, key, value);
+        else
+            write_optional_double(archive, key, value);
     });
 }
-
-void reserve_state_archive(const std::vector<NormalizedModelStateEntry>& entries,
-                           mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
+void reserve_state_archive(const std::vector<NormalizedModelStateEntry>& entries, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
+                           std::size_t first_slot) {
     std::vector<torch_api::Tensor> sources;
     sources.reserve(entries.size());
     for (const auto& entry : entries) sources.push_back(entry.tensor);
@@ -108,48 +99,40 @@ void write_resume_state_archive(torch_api::OutputArchive& archive, const char* k
                                 mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
     write_state_archive_impl(archive, key, entries, true, readback, first_slot);
 }
-
 void write_training_supervision_config(torch_api::OutputArchive& archive, const TrainingSupervisionConfig& config) {
     if (config == TrainingSupervisionConfig{}) { return; }
     std::array<std::byte, kTrainingSupervisionCborCapacity> bytes{};
     const auto encoded = serialization::encode(config, std::span<std::byte>(bytes), kTrainingSupervisionCborLimits);
     if (!encoded.has_value()) { throw std::runtime_error("failed to encode bounded RF-DETR training supervision configuration"); }
-    auto tensor =
-        torch_api::empty({static_cast<int64_t>(*encoded)}, torch_api::TensorOptions().dtype(torch_api::kUInt8).device(torch_api::kCPU));
+    auto tensor = torch_api::empty({static_cast<int64_t>(*encoded)}, torch_api::TensorOptions().dtype(torch_api::kUInt8).device(torch_api::kCPU));
     std::memcpy(tensor.data_ptr<std::uint8_t>(), bytes.data(), *encoded);
     archive.write(kTrainingSupervisionKey, tensor);
 }
-
 TrainingSupervisionConfig read_training_supervision_config(torch_api::InputArchive& archive) {
     torch_api::Tensor tensor;
     if (!archive.try_read(kTrainingSupervisionKey, tensor)) {
         torch_api::IValue value;
-        if (archive.try_read(kTrainingSupervisionKey, value))
-            throw std::runtime_error("invalid RF-DETR training supervision CBOR blob");
+        if (archive.try_read(kTrainingSupervisionKey, value)) throw std::runtime_error("invalid RF-DETR training supervision CBOR blob");
         return {};
     }
-    if (!tensor.defined() || !tensor.device().is_cpu() || tensor.scalar_type() != torch_api::kUInt8 || tensor.dim() != 1 ||
-        tensor.numel() <= 0 || static_cast<std::uint64_t>(tensor.numel()) > kTrainingSupervisionCborCapacity) {
+    if (!tensor.defined() || !tensor.device().is_cpu() || tensor.scalar_type() != torch_api::kUInt8 || tensor.dim() != 1 || tensor.numel() <= 0 ||
+        static_cast<std::uint64_t>(tensor.numel()) > kTrainingSupervisionCborCapacity) {
         throw std::runtime_error("invalid RF-DETR training supervision CBOR blob");
     }
     tensor = tensor.contiguous();
-    const auto bytes =
-        std::span(reinterpret_cast<const std::byte*>(tensor.data_ptr<std::uint8_t>()), static_cast<std::size_t>(tensor.numel()));
+    const auto bytes = std::span(reinterpret_cast<const std::byte*>(tensor.data_ptr<std::uint8_t>()), static_cast<std::size_t>(tensor.numel()));
     const auto decoded = serialization::decode<TrainingSupervisionConfig>({bytes, {}}, kTrainingSupervisionCborLimits);
     if (!decoded.has_value() || !training_supervision_config_valid(*decoded)) {
         throw std::runtime_error("invalid RF-DETR training supervision CBOR configuration");
     }
     return *decoded;
 }
-
 void require_resume_training_supervision_config(torch_api::InputArchive& archive, const TrainingSupervisionConfig& expected) {
     if (read_training_supervision_config(archive) != expected) {
         throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");
     }
 }
-
-std::vector<torch_api::Tensor> read_ema_shadow_archive(torch_api::InputArchive& archive,
-                                                       std::span<const std::string> expected_names) {
+std::vector<torch_api::Tensor> read_ema_shadow_archive(torch_api::InputArchive& archive, std::span<const std::string> expected_names) {
     const auto count = require_int(archive, "entry_count");
     if (count < 0 || static_cast<std::uint64_t>(count) != expected_names.size())
         throw std::runtime_error("RF-DETR training checkpoint state count does not match the bounded active inventory");
@@ -164,9 +147,7 @@ std::vector<torch_api::Tensor> read_ema_shadow_archive(torch_api::InputArchive& 
     }
     return shadow;
 }
-
 }  // namespace mmltk::backend::models::rfdetr::detail
-
 namespace mmltk::backend::models::rfdetr {
 TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path) {
     namespace torch_api = mmltk::backend::ml::torch_api;
@@ -191,8 +172,8 @@ TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path
     std::unordered_map<std::string, torch_api::Tensor> tensors;
     tensors.reserve(state.entries.size());
     for (const auto& entry : state.entries) tensors.emplace(entry.name, entry.tensor);
-    const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors) :
-                                                                      NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors);
+    const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors)
+                                                                      : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors);
     if (request.use_ema) {
         torch_api::InputArchive ema;
         archive.read("ema_state", ema);

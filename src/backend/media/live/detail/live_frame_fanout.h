@@ -1,43 +1,34 @@
 #pragma once
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
-
 #include "live_video_ingress.h"
-
 namespace mmltk::backend::media::live {
-
 struct LiveRawFrameReadbackWork final {
     LiveFrameId frame{};
     std::size_t destination_bytes = 0U;
-
     [[nodiscard]] inline bool valid() const noexcept { return frame.valid() && destination_bytes != 0U; }
 };
-
 struct LiveRawFrameReadbackResult final {
     LiveFrameId frame{};
     const std::uint8_t* pixels = nullptr;
     std::size_t bytes = 0U;
     bool completed = false;
-
     [[nodiscard]] inline bool valid() const noexcept {
         return frame.valid() && ((completed && pixels != nullptr && bytes != 0U) || (!completed && pixels == nullptr && bytes == 0U));
     }
 };
-
 class LiveRawFrameCache final {
    public:
     LiveRawFrameCache(std::uint32_t slots, std::uint32_t width, std::uint32_t height, LivePhysicalCudaContext cuda);
     ~LiveRawFrameCache();
     LiveRawFrameCache(const LiveRawFrameCache&) = delete;
     LiveRawFrameCache& operator=(const LiveRawFrameCache&) = delete;
-
     [[nodiscard]] cudaEvent_t store(const DeviceFrameView& source);
     [[nodiscard]] bool begin_readback(LiveRawFrameReadbackWork work);
     [[nodiscard]] std::optional<LiveRawFrameReadbackResult> take_readback_result() noexcept;
@@ -55,14 +46,12 @@ class LiveRawFrameCache final {
         LiveCaptureRegion region{};
         std::uint32_t index = 0U;
     };
-
     static void CUDART_CB ReadbackComplete(void* context) noexcept;
     static void ScrubProduct(Slot& slot) noexcept;
     void publish_slot(Slot& slot, SlotState published) noexcept;
     [[nodiscard]] Slot* reserve() noexcept;
     [[nodiscard]] std::optional<LiveRawFrameReadbackResult> finish_readback(bool completed) noexcept;
     void destroy() noexcept;
-
     LivePhysicalCudaContext cuda_{};
     std::unique_ptr<Slot[]> slots_;
     std::uint32_t slot_count_ = 0U;
@@ -79,9 +68,7 @@ class LiveRawFrameCache final {
     std::atomic<bool> readback_complete_{false};
     LiveStateSignal ready_;
 };
-
 }  // namespace mmltk::backend::media::live
-
 namespace mmltk::backend::media::live {
 class LiveFrameFanout final {
    public:
@@ -92,8 +79,7 @@ class LiveFrameFanout final {
         std::uint64_t unstarted_replaced = 0U;
     };
     // CLEANUP-IGNORE: LiveFrameFanout owns frame-distribution slots rather than compositor or overlay-worker resources.
-    LiveFrameFanout(LiveVideoIngress& ingress, std::uint32_t slot_count, std::uint32_t width, std::uint32_t height,
-                    LivePhysicalCudaContext cuda);
+    LiveFrameFanout(LiveVideoIngress& ingress, std::uint32_t slot_count, std::uint32_t width, std::uint32_t height, LivePhysicalCudaContext cuda);
     ~LiveFrameFanout();
     LiveFrameFanout(const LiveFrameFanout&) = delete;
     LiveFrameFanout& operator=(const LiveFrameFanout&) = delete;

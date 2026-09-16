@@ -1,11 +1,7 @@
 #pragma once
-
 #include <cuda_runtime.h>
-
 #include <cstdint>
-
 namespace mmltk::backend::imaging::raster::detail {
-
 struct PackBoolMasksLaunch {
     const bool* masks = nullptr;
     std::uint8_t* packed_masks = nullptr;
@@ -14,7 +10,5 @@ struct PackBoolMasksLaunch {
     std::int64_t bytes_per_mask = 0;
     cudaStream_t stream = nullptr;
 };
-
 [[nodiscard]] cudaError_t launch_pack_bool_masks_cuda(const PackBoolMasksLaunch& launch) noexcept;
-
 }  // namespace mmltk::backend::imaging::raster::detail

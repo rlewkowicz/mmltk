@@ -8,7 +8,6 @@
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
-
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -21,7 +20,6 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-
 #include <chrono>
 #include <algorithm>
 #include <array>
@@ -52,7 +50,6 @@
 #include <thread>
 #include <utility>
 #include <vector>
-
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/controller/subsystems/explore/explore_system.h"
@@ -77,21 +74,17 @@
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "filesystem_test_utils.hpp"
-
 namespace mmltk::controller {
 namespace {
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-
 TEST_CASE("Graphics signal publishes exact bounded image metadata with its physical transfer", "[presentation][metadata]") {
     namespace graphics = presentation::detail;
     auto owned = presentation::WorkspaceSurfaceFrameSignal::create();
     auto* signal = owned.mapping();
     const std::array first{std::byte{0x83}, std::byte{0x01}, std::byte{0x02}, std::byte{0x03}};
-    graphics::publish_workspace_frame_signal(signal, 1U, 1U, presentation::WorkspacePresentationLayer::Primary, {1U, 7U}, 3U, 640U, 480U,
-                                             7U, first);
+    graphics::publish_workspace_frame_signal(signal, 1U, 1U, presentation::WorkspacePresentationLayer::Primary, {1U, 7U}, 3U, 640U, 480U, 7U, first);
     CHECK(signal->metadata_bytes == first.size());
     CHECK(signal->transfer_sequence == 1U);
     CHECK(signal->physical_revision == 7U);
@@ -100,20 +93,18 @@ TEST_CASE("Graphics signal publishes exact bounded image metadata with its physi
     CHECK(std::equal(first.begin(), first.end(), payload));
     const auto sequence = signal->sequence_lock;
     const std::vector<std::byte> oversized(graphics::kWorkspaceMetadataByteCapacity + 1U);
-    CHECK_THROWS_AS(graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary, {1U, 8U},
-                                                             4U, 640U, 480U, 8U, oversized),
-                    std::length_error);
+    CHECK_THROWS_AS(
+        graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary, {1U, 8U}, 4U, 640U, 480U, 8U, oversized),
+        std::length_error);
     CHECK(signal->sequence_lock == sequence);
     CHECK(signal->transfer_sequence == 1U);
     CHECK(std::equal(first.begin(), first.end(), payload));
     const std::array second{std::byte{0x81}, std::byte{0x09}};
-    graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary, {1U, 8U}, 4U, 640U, 480U,
-                                             8U, second);
+    graphics::publish_workspace_frame_signal(signal, 3U, 2U, presentation::WorkspacePresentationLayer::Primary, {1U, 8U}, 4U, 640U, 480U, 8U, second);
     CHECK(signal->metadata_bytes == second.size());
     CHECK(signal->transfer_sequence == 2U);
     CHECK(std::equal(second.begin(), second.end(), payload));
 }
-
 TEST_CASE("Gallery demand clips four neighboring rows independently", "[explore][cache]") {
     using explore_detail::GalleryThumbnailCache;
     const auto columns = GENERATE(4U, 10U);
@@ -130,7 +121,6 @@ TEST_CASE("Gallery demand clips four neighboring rows independently", "[explore]
     viewport.first_row = 0U;
     CHECK(GalleryThumbnailCache::WindowCount(columns + 1U, viewport) == columns + 1U);
 }
-
 TEST_CASE("Gallery cache identity survives five six five demand and reorder with bounded collision rollback", "[explore][cache]") {
     using explore_detail::GalleryThumbnailCache;
     GalleryThumbnailCache cache;
@@ -141,8 +131,7 @@ TEST_CASE("Gallery cache identity survives five six five demand and reorder with
     std::array<std::uint32_t, 14U> images{};
     std::iota(images.begin(), images.end(), 0U);
     cache.Admit(std::span{images}.first(13U), 0U);
-    for (auto image : std::span{images}.first(13U))
-        cache.Complete(image, image, meaning, 1U, 1U, 0U);
+    for (auto image : std::span{images}.first(13U)) cache.Complete(image, image, meaning, 1U, 1U, 0U);
     const auto original_slot = cache.Slot(4U);
     for (const auto rows : {6U, 5U, 6U, 5U}) {
         cache.Configure(rows + 8U, identity);
@@ -165,11 +154,9 @@ TEST_CASE("Gallery cache identity survives five six five demand and reorder with
     cache.RollbackUpdate();
     CHECK(cache.Position(4U) == 4U);
     CHECK(cache.Slot(4U) == original_slot);
-
     // Every hash bucket collides. All incumbent slots are needed on rollback,
     // while the candidate pins a disjoint replacement demand.
-    for (std::size_t index = 0U; index < images.size(); ++index)
-        images[index] = static_cast<std::uint32_t>((index + 1U) * 29U);
+    for (std::size_t index = 0U; index < images.size(); ++index) images[index] = static_cast<std::uint32_t>((index + 1U) * 29U);
     cache.BeginUpdate();
     cache.Admit(images, 50U);
     for (std::size_t index = 0U; index < images.size(); ++index) {
@@ -186,7 +173,6 @@ TEST_CASE("Gallery cache identity survives five six five demand and reorder with
         CHECK(cache.Find(image)->bank == 1U);
     }
 }
-
 TEST_CASE("Gallery cache candidate replacement preserves incumbent meaning and content identity", "[explore][cache]") {
     using explore_detail::GalleryThumbnailCache;
     explore_detail::GalleryProductState incumbent;
@@ -206,7 +192,6 @@ TEST_CASE("Gallery cache candidate replacement preserves incumbent meaning and c
     CHECK(incumbent.cache.Find(7U)->bank == 0U);
     CHECK(candidate.cache.Find(7U)->semantic_identity != incumbent.cache.Find(7U)->semantic_identity);
     CHECK(candidate.cache.MeaningBytes() - candidate.cache.MetadataBytes() == bytes - incumbent.cache.MetadataBytes());
-
     SECTION("Changing the loaded artifact invalidates even when stable seed identity is unchanged") {
         // Only identity comparison is exercised; the cache never dereferences
         // an incarnation. Product storage retains the real artifact owner.
@@ -247,7 +232,6 @@ TEST_CASE("Gallery cache candidate replacement preserves incumbent meaning and c
     CHECK(candidate.Capacity() == capacity);
     REQUIRE(incumbent.cache.Find(7U));
 }
-
 TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions", "[explore][cache]") {
     explore_detail::GalleryThumbnailCache cache;
     cache.Configure(20U, {.extent = 8U});
@@ -273,7 +257,6 @@ TEST_CASE("Gallery cache memory deduplicates shared meaning across slot versions
     CHECK(cache.MeaningBytes(&candidate) == incumbent_bytes + candidate.MetadataBytes() + explore_detail::GallerySharedBytes(replacement) +
                                                 replacement->runs.capacity() * sizeof(decltype(replacement->runs)::value_type));
 }
-
 TEST_CASE("Gallery product metadata accounts both retained vector high waters and bit storage", "[explore][cache]") {
     explore_detail::GalleryProductState product;
     product.visible_indices.resize(256U);
@@ -286,8 +269,7 @@ TEST_CASE("Gallery product metadata accounts both retained vector high waters an
     const auto expected = (product.visible_indices.capacity() + product.window_indices.capacity() + product.priority_slots.capacity() +
                            product.plan.overlay.class_selection.classes.capacity()) *
                               sizeof(std::uint32_t) +
-                          product.active_classes.capacity() * sizeof(decltype(product.active_classes)::value_type) +
-                          product.completed_slots.capacity() / 8U +
+                          product.active_classes.capacity() * sizeof(decltype(product.active_classes)::value_type) + product.completed_slots.capacity() / 8U +
                           product.tile_meanings.capacity() * sizeof(decltype(product.tile_meanings)::value_type);
     CHECK(product.MetadataBytes() == expected);
     explore_detail::GalleryProductState inactive;
@@ -298,7 +280,6 @@ TEST_CASE("Gallery product metadata accounts both retained vector high waters an
     CHECK(product.MetadataBytes() == expected);
     CHECK(inactive.MetadataBytes() >= expected);
 }
-
 struct LiveReceiverCopyProbe final {
     static inline cudaError_t wait_status = cudaSuccess;
     static inline cudaError_t copy_status = cudaSuccess;
@@ -306,7 +287,6 @@ struct LiveReceiverCopyProbe final {
     static inline std::size_t waits = 0U;
     static inline std::size_t copies = 0U;
     static inline std::size_t synchronizations = 0U;
-
     static void Reset() noexcept {
         wait_status = cudaSuccess;
         copy_status = cudaSuccess;
@@ -328,13 +308,11 @@ struct LiveReceiverCopyProbe final {
         return synchronize_status;
     }
 };
-
 constexpr detail::LiveReceiverCopyOperations kLiveReceiverCopyProbe{
     .wait = &LiveReceiverCopyProbe::Wait,
     .copy = &LiveReceiverCopyProbe::Copy,
     .synchronize = &LiveReceiverCopyProbe::Synchronize,
 };
-
 [[nodiscard]] constexpr mmltk::frameworks::gpu::ImagePlaneView live_receiver_copy_target() noexcept {
     return {
         .data = 1U,
@@ -348,48 +326,38 @@ constexpr detail::LiveReceiverCopyOperations kLiveReceiverCopyProbe{
             },
     };
 }
-
 TEST_CASE("Live receiver copy completes only after synchronization") {
     LiveReceiverCopyProbe::Reset();
     const auto target = live_receiver_copy_target();
-
     CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaSuccess);
     CHECK(LiveReceiverCopyProbe::waits == 1U);
     CHECK(LiveReceiverCopyProbe::copies == 1U);
     CHECK(LiveReceiverCopyProbe::synchronizations == 1U);
 }
-
 TEST_CASE("Live receiver submission and synchronization failures stop progress") {
     const auto target = live_receiver_copy_target();
-
     LiveReceiverCopyProbe::Reset();
     LiveReceiverCopyProbe::copy_status = cudaErrorLaunchFailure;
     CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
     CHECK(LiveReceiverCopyProbe::synchronizations == 0U);
-
     LiveReceiverCopyProbe::Reset();
     LiveReceiverCopyProbe::synchronize_status = cudaErrorLaunchFailure;
     CHECK(detail::copy_live_receiver_frame(target, 2U, 16U, 3U, 4U, kLiveReceiverCopyProbe) == cudaErrorLaunchFailure);
     CHECK(LiveReceiverCopyProbe::synchronizations == 1U);
 }
-
 TEST_CASE("Committed visual frames exactly authorize one- and two-plane products") {
     auto backend = std::make_shared<FakeImageBackend>();
-    mmltk::frameworks::gpu::SystemImageRuntime clean{
-        {.device = 0, .backend = backend, .output_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean}};
+    mmltk::frameworks::gpu::SystemImageRuntime clean{{.device = 0, .backend = backend, .output_layout = mmltk::frameworks::gpu::ImageProductLayout::Clean}};
     clean.Publish(8U, 6U, [](auto, auto, auto) {});
     auto clean_product = clean.Borrow();
     REQUIRE(clean_product.valid());
     const auto clean_frame = visual_frame({PresentationSourceKind::Explore, 1U}, {8U, 6U}, clean_product.plane(0U).revision());
-
     CHECK(visual_product_matches_frame(clean_frame, clean_product));
     CHECK_FALSE(visual_product_matches_frame({}, clean_product));
-    CHECK_FALSE(
-        visual_product_matches_frame(visual_frame(clean_frame.source, clean_frame.extent, clean_frame.revision + 1U), clean_product));
-    CHECK_FALSE(visual_product_matches_frame(
-        visual_frame(clean_frame.source, {clean_frame.extent.width + 1U, clean_frame.extent.height}, clean_frame.revision), clean_product));
+    CHECK_FALSE(visual_product_matches_frame(visual_frame(clean_frame.source, clean_frame.extent, clean_frame.revision + 1U), clean_product));
+    CHECK_FALSE(visual_product_matches_frame(visual_frame(clean_frame.source, {clean_frame.extent.width + 1U, clean_frame.extent.height}, clean_frame.revision),
+                                             clean_product));
     CHECK_FALSE(visual_product_matches_frame(clean_frame, {}));
-
     mmltk::frameworks::gpu::SystemImageRuntime layered{
         {.device = 0, .backend = backend, .output_layout = mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic}};
     layered.Publish(9U, 7U, [](auto, auto, auto) {});
@@ -399,7 +367,6 @@ TEST_CASE("Committed visual frames exactly authorize one- and two-plane products
     const auto layered_frame = visual_frame({PresentationSourceKind::Annotation, 1U}, {9U, 7U}, layered_product.plane(0U).revision());
     CHECK(visual_product_matches_frame(layered_frame, layered_product));
 }
-
 TEST_CASE("Receiver-owned copy retains its source lease through completion") {
     auto backend = std::make_shared<FakeImageBackend>();
     mmltk::frameworks::gpu::SystemImageRuntime source{{.device = 0, .backend = backend}};
@@ -408,7 +375,6 @@ TEST_CASE("Receiver-owned copy retains its source lease through completion") {
     auto event_gate = backend->HoldEventWaits("receiver source event wait");
     source.Publish(8U, 8U, [](auto, auto, auto) {});
     const auto source_revision = source.Completed().revision();
-
     std::future<std::uint64_t> copy;
     std::future<void> superseding_publish;
     mmltk::testsupport::ScopedTestCleanup release_wait{[&] {
@@ -425,24 +391,20 @@ TEST_CASE("Receiver-owned copy retains its source lease through completion") {
     mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
     REQUIRE_FALSE(source.TryAcquireOutput(baseline).valid());
     superseding_publish = std::async(std::launch::async, [&source] { source.Publish(4U, 4U, [](auto, auto, auto) {}); });
-
     event_gate->Release();
     backend->CompleteEvents();
     CHECK(mmltk::testsupport::await_test_future(copy, "receiver-owned source copy") == source_revision);
     mmltk::testsupport::await_test_future(superseding_publish, "superseding source publication");
 }
-
 void Fill(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::uint8_t value) {
     std::memset(reinterpret_cast<void*>(plane.data), value, plane.descriptor.pitch_bytes * plane.descriptor.height);
 }
-
 struct ExploreRenderGate final {
     std::atomic<std::size_t> calls{0U};
     std::promise<void> entered;
     std::promise<void> release;
     std::shared_future<void> released = release.get_future().share();
 };
-
 struct ExploreFinalizationGate final {
     void Arm() noexcept { armed.store(true, std::memory_order_release); }
     std::atomic_bool armed{false};
@@ -450,7 +412,6 @@ struct ExploreFinalizationGate final {
     std::promise<void> release;
     std::shared_future<void> released = release.get_future().share();
 };
-
 struct ExplorePostRenderGate final {
     explicit ExplorePostRenderGate(const std::size_t target) : target_call(target) {}
     std::size_t target_call;
@@ -459,7 +420,6 @@ struct ExplorePostRenderGate final {
     std::promise<void> release;
     std::shared_future<void> released = release.get_future().share();
 };
-
 struct ExploreWorkProbe final {
     std::atomic<std::size_t> opens{0U};
     std::atomic<std::size_t> prepares{0U};
@@ -468,17 +428,14 @@ struct ExploreWorkProbe final {
     std::atomic<float> rendered_copy_paste_probability{0.0F};
     std::array<std::atomic<std::uint32_t>, 2U> rendered_slots{};
 };
-
 struct ExploreDetailExtentProbe final {
     VisualExtent padded{64U, 64U};
     VisualExtent original{48U, 32U};
 };
-
 [[nodiscard]] ExploreAtlasLayout test_atlas_layout(const ExploreRenderPlan& plan, const mmltk::frameworks::gpu::ImagePlaneView plane) {
     const auto side = explore_atlas_card_extent(plan.viewport);
     return {plan.viewport.first_row, plan.viewport.row_count, plane.descriptor.height / side, 0U, plan.viewport.columns, side};
 }
-
 class SynchronousExploreAlgorithm : public ExploreAlgorithm {
    public:
     void SetCurrentDemand(ExploreDemandCheck demand) override {
@@ -486,9 +443,7 @@ class SynchronousExploreAlgorithm : public ExploreAlgorithm {
         demand_ = std::move(demand);
         demand_bound_ = true;
     }
-    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override {
-        return ExploreOutputChange::Initialize;
-    }
+    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override { return ExploreOutputChange::Initialize; }
     void AbortRenderGeneration() override { generation_ = 0U; }
     void DiscardCandidate() override {}
     void SetGalleryReadySink(GalleryReadySink) final {}
@@ -497,16 +452,15 @@ class SynchronousExploreAlgorithm : public ExploreAlgorithm {
     void CommitOutputPublication() noexcept final {}
     bool RollbackOutputPublication() noexcept final { return true; }
     ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                                           const mmltk::frameworks::gpu::ImagePlaneView clean,
-                                           const mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) final {
+                                           const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                                           const std::uintptr_t stream) final {
         RenderProduct(plan, candidate, nproc, clean, semantic, stream);
         generation_ = plan.generation;
         return {.generation = generation_, .layout = test_atlas_layout(plan, clean)};
     }
     ExploreGalleryPublication AdvanceGallery() final { return {.generation = generation_}; }
     bool HasGalleryTiles() const final { return false; }
-    ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
-                                                  std::uintptr_t) final {
+    ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) final {
         return {.generation = generation_};
     }
     void RenderDetail(const ExploreRenderPlan& plan, const std::size_t nproc, const mmltk::frameworks::gpu::ImagePlaneView clean,
@@ -524,7 +478,6 @@ class SynchronousExploreAlgorithm : public ExploreAlgorithm {
     bool demand_bound_ = false;
     std::uint64_t generation_ = 0U;
 };
-
 struct ExplorePublicationDemandGate final {
     ExploreDemandCheck demand;
     std::uint64_t generation = 0U;
@@ -533,7 +486,6 @@ struct ExplorePublicationDemandGate final {
     std::shared_future<void> released = release.get_future().share();
     std::atomic_bool release_timed_out{false};
 };
-
 struct StreamingExploreAssignment final {
     std::uint64_t generation = 0U;
     std::uint32_t compiled_index = 0U;
@@ -542,7 +494,6 @@ struct StreamingExploreAssignment final {
     bool ready = false;
     bool gpu_pending = false;
 };
-
 struct StreamingExplorePublicationState {
     std::vector<StreamingExploreAssignment> assignments;
     std::vector<std::uint32_t> visible;
@@ -554,7 +505,6 @@ struct StreamingExplorePublicationState {
     std::size_t cumulative = 0U;
     ExploreAtlasLayout layout{};
 };
-
 struct StreamingExploreProbe final : StreamingExplorePublicationState {
     void Release(const std::uint32_t compiled_index) {
         ExploreAlgorithm::GalleryReadySink wake;
@@ -568,13 +518,11 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
         }
         if (wake) wake();
     }
-
     void ReleaseAll() {
         ExploreAlgorithm::GalleryReadySink wake;
         {
             std::scoped_lock lock(mutex);
-            for (auto& assignment : assignments)
-                assignment.ready = true;
+            for (auto& assignment : assignments) assignment.ready = true;
             wake = ready_sink;
             changed.notify_all();
         }
@@ -623,7 +571,6 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
         std::unique_lock lock(mutex);
         return changed.wait_for(lock, 2s, std::move(predicate));
     }
-
     mutable std::mutex mutex;
     std::condition_variable changed;
     ExploreAlgorithm::GalleryReadySink ready_sink;
@@ -663,14 +610,12 @@ struct StreamingExploreProbe final : StreamingExplorePublicationState {
         if (wake) wake();
     }
 };
-
 [[nodiscard]] std::vector<std::uint32_t> visible_test_order(const std::vector<std::uint32_t>& order, const ExploreViewport viewport) {
     if (!viewport.valid()) return order;
     const auto first = std::min<std::size_t>(static_cast<std::size_t>(viewport.first_row) * viewport.columns, order.size());
     const auto count = std::min<std::size_t>(static_cast<std::size_t>(viewport.row_count) * viewport.columns, order.size() - first);
     return {order.begin() + static_cast<std::ptrdiff_t>(first), order.begin() + static_cast<std::ptrdiff_t>(first + count)};
 }
-
 class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     void SetCurrentDemand(ExploreDemandCheck demand) override {
         if (demand_bound_) throw std::logic_error("test streaming Explore demand rebound");
@@ -679,9 +624,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         std::scoped_lock lock(probe_->mutex);
         probe_->bound_demands.push_back(demand_);
     }
-    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override {
-        return ExploreOutputChange::Initialize;
-    }
+    ExploreOutputChange OutputChange(const ExploreRenderPlan&, const ExploreOrderCandidate*) const override { return ExploreOutputChange::Initialize; }
 
    public:
     explicit ControlledStreamingExploreAlgorithm(std::shared_ptr<StreamingExploreProbe> probe) : probe_(std::move(probe)) {}
@@ -691,7 +634,6 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         probe_->assignments.clear();
         probe_->ready_sink = {};
     }
-
     ExploreOpened Open(const std::string_view source, std::stop_token) override {
         if (!demand_bound_ || !demand_.generation()) throw std::logic_error("Explore ingress preceded demand binding");
         std::scoped_lock lock(probe_->mutex);
@@ -789,8 +731,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         return {};
     }
     ExploreGalleryPublication BeginGallery(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                                           const mmltk::frameworks::gpu::ImagePlaneView clean,
-                                           const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+                                           const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                                           std::uintptr_t) override {
         std::shared_ptr<ExplorePostRenderGate> gate;
         {
             std::scoped_lock lock(probe_->mutex);
@@ -826,8 +768,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     ExploreGalleryPublication AdvanceGallery() override {
         std::scoped_lock lock(probe_->mutex);
         const auto before = probe_->assignments.size();
-        std::erase_if(probe_->assignments,
-                      [this](const auto& assignment) { return assignment.ready && assignment.generation != probe_->generation; });
+        std::erase_if(probe_->assignments, [this](const auto& assignment) { return assignment.ready && assignment.generation != probe_->generation; });
         const auto discarded = before - probe_->assignments.size();
         probe_->stale += discarded;
         if (probe_->allocation_allowed) ScheduleLocked();
@@ -848,8 +789,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
             return assignment.ready && !assignment.gpu_pending && assignment.generation == probe_->generation;
         });
     }
-    ExploreGalleryPublication PublishGalleryTiles(const mmltk::frameworks::gpu::ImagePlaneView clean,
-                                                  const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
+    ExploreGalleryPublication PublishGalleryTiles(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                                                  std::uintptr_t) override {
         GalleryReadySink wake;
         ExploreGalleryPublication facts;
         {
@@ -890,7 +831,6 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
 
    private:
     using PublicationCheckpoint = StreamingExplorePublicationState;
-
     void RestorePixels(const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic) const {
         Fill(clean, 0x11U);
         Fill(semantic, 0U);
@@ -903,12 +843,10 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         for (const auto& assignment : probe_->assignments)
             if (assignment.gpu_pending && assignment.generation == probe_->generation) place(assignment.slot, assignment.compiled_index);
     }
-
     void PrioritizeLocked(const ExploreRenderPlan& plan) {
         probe_->scroll_direction = plan.scroll_direction;
         probe_->priority_slots.clear();
-        for (std::size_t slot = 0U; slot != probe_->visible.size(); ++slot)
-            probe_->priority_slots.push_back(static_cast<std::uint32_t>(slot));
+        for (std::size_t slot = 0U; slot != probe_->visible.size(); ++slot) probe_->priority_slots.push_back(static_cast<std::uint32_t>(slot));
     }
     void ClearStreamingState() noexcept {
         std::scoped_lock lock(probe_->mutex);
@@ -921,8 +859,7 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
         probe_->next_slot = 0U;
         probe_->cumulative = 0U;
     }
-    static void FillSlot(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::size_t slot, const std::size_t count,
-                         const std::uint8_t value) {
+    static void FillSlot(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::size_t slot, const std::size_t count, const std::uint8_t value) {
         const auto width = plane.descriptor.width / static_cast<std::uint32_t>(std::max<std::size_t>(count, 1U));
         for (std::uint32_t y = 0U; y != plane.descriptor.height; ++y) {
             auto* row = reinterpret_cast<std::uint8_t*>(plane.data) + y * plane.descriptor.pitch_bytes;
@@ -932,9 +869,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     void ScheduleLocked() {
         while (probe_->assignments.size() < probe_->nproc && probe_->next_slot != probe_->visible.size()) {
             const auto slot = probe_->priority_slots[probe_->next_slot++];
-            if (probe_->completed_slots[slot] != 0U || std::ranges::any_of(probe_->assignments, [&](const auto& work) {
-                    return work.generation == probe_->generation && work.slot == slot;
-                }))
+            if (probe_->completed_slots[slot] != 0U ||
+                std::ranges::any_of(probe_->assignments, [&](const auto& work) { return work.generation == probe_->generation && work.slot == slot; }))
                 continue;
             probe_->assignments.push_back({
                 .generation = probe_->generation,
@@ -958,7 +894,6 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
             .stale_discarded = stale,
         };
     }
-
     std::shared_ptr<StreamingExploreProbe> probe_;
     ExploreDemandCheck demand_;
     bool demand_bound_ = false;
@@ -966,14 +901,11 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     std::uint64_t candidate_generation_ = 0U;
     std::optional<PublicationCheckpoint> checkpoint_;
 };
-
-[[nodiscard]] VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
-                                                                     std::shared_ptr<StreamingExploreProbe> probe) {
+[[nodiscard]] VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<StreamingExploreProbe> probe) {
     return RuntimeFactory(
         0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
         [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 3U);
 }
-
 class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
    public:
     explicit TestExploreAlgorithm(
@@ -981,8 +913,7 @@ class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
         std::shared_ptr<std::atomic_uint64_t> commits = {}, std::shared_ptr<ExploreFinalizationGate> finalization_gate = {},
         std::shared_ptr<ExploreWorkProbe> work_probe = {}, std::shared_ptr<ExplorePostRenderGate> post_render_gate = {},
         std::shared_ptr<ExploreDetailExtentProbe> detail_extent = {})  // CLEANUP-IGNORE: This test algorithm has its own injected controls.
-        : observed_nproc_(
-              std::move(observed_nproc)),  // CLEANUP-IGNORE: Distinct test algorithms directly retain their own injected controls.
+        : observed_nproc_(std::move(observed_nproc)),                  // CLEANUP-IGNORE: Distinct test algorithms directly retain their own injected controls.
           gate_(std::move(gate)),
           commits_(std::move(commits)),
           finalization_gate_(std::move(finalization_gate)),
@@ -1007,9 +938,7 @@ class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
         if (filter.minimum_instances == 8U) candidate_render_failure_ = true;
         if (candidate_order_.empty()) candidate_order_ = order_;
         return {.filter = filter,
-                .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()),
-                          .shuffle_seed = seed,
-                          .visible_indices = candidate_order_},
+                .order = {.matching_count = static_cast<std::uint32_t>(candidate_order_.size()), .shuffle_seed = seed, .visible_indices = candidate_order_},
                 .generation = ++candidate_generation_};
     }
     void Commit(ExploreOrderCandidate) noexcept override {
@@ -1048,16 +977,14 @@ class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
     }
     VisualRegion DetailContent(const ExploreRenderPlan&) const override {
         if (!detail_extent_) return {};
-        return {(detail_extent_->padded.width - detail_extent_->original.width) / 2U,
-                (detail_extent_->padded.height - detail_extent_->original.height) / 2U, detail_extent_->original.width,
-                detail_extent_->original.height};
+        return {(detail_extent_->padded.width - detail_extent_->original.width) / 2U, (detail_extent_->padded.height - detail_extent_->original.height) / 2U,
+                detail_extent_->original.width, detail_extent_->original.height};
     }
     std::optional<std::uint32_t> Adjacent(std::uint32_t selected, std::int64_t offset) const override {
         return static_cast<std::uint32_t>((static_cast<std::int64_t>(selected) + offset % 3 + 3) % 3);
     }
     void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                       const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                       std::uintptr_t) override {
+                       const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
         if (candidate != nullptr && candidate_render_failure_) throw std::runtime_error("deterministic Explore candidate render failure");
         if (work_probe_) work_probe_->renders.fetch_add(1U, std::memory_order_release);
         if (work_probe_) {
@@ -1094,7 +1021,6 @@ class TestExploreAlgorithm : public SynchronousExploreAlgorithm {
     std::uint64_t candidate_generation_ = 0U;
     bool candidate_render_failure_ = false;
 };
-
 class FailingExploreAlgorithm final : public SynchronousExploreAlgorithm {
    public:
     ExploreOpened Open(std::string_view, std::stop_token) override {
@@ -1114,12 +1040,10 @@ class FailingExploreAlgorithm final : public SynchronousExploreAlgorithm {
         throw std::runtime_error("deterministic compiled renderer failure");
     }
 };
-
 struct CancellationProbe final {
     std::promise<void> entered;
     std::promise<void> cancelled;
 };
-
 [[nodiscard]] bool wait_for_cancellation(const std::stop_token stop, CancellationProbe& probe) {
     probe.entered.set_value();
     std::mutex mutex;
@@ -1131,7 +1055,6 @@ struct CancellationProbe final {
     probe.cancelled.set_value();
     return true;
 }
-
 class CancellableExploreAlgorithm final : public SynchronousExploreAlgorithm {
    public:
     explicit CancellableExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<ExploreDemandCheck> demand = {})
@@ -1163,9 +1086,8 @@ class CancellableExploreAlgorithm final : public SynchronousExploreAlgorithm {
     }
     bool Contains(std::uint32_t value) const override { return value == 0U; }
     std::optional<std::uint32_t> Adjacent(std::uint32_t, std::int64_t) const override { return 0U; }
-    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t,
-                       const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                       std::uintptr_t) override {
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean,
+                       const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
         Fill(clean, static_cast<std::uint8_t>(plan.generation));
         Fill(semantic, 2U);
     }
@@ -1176,7 +1098,6 @@ class CancellableExploreAlgorithm final : public SynchronousExploreAlgorithm {
     std::vector<std::uint32_t> order_;
     bool opened_ = false;
 };
-
 struct OpenPreparationProbe final {
     explicit OpenPreparationProbe(const std::size_t blocked) : blocked_call(blocked) {}
     std::size_t blocked_call;
@@ -1186,7 +1107,6 @@ struct OpenPreparationProbe final {
     std::promise<void> entered;
     std::promise<void> cancelled;
 };
-
 class CancellableOpenPreparationAlgorithm final : public SynchronousExploreAlgorithm {
    public:
     explicit CancellableOpenPreparationAlgorithm(std::shared_ptr<OpenPreparationProbe> probe) : probe_(std::move(probe)) {}
@@ -1195,8 +1115,7 @@ class CancellableOpenPreparationAlgorithm final : public SynchronousExploreAlgor
         return {.dataset = {.image_count = 1U, .image_width = 32U, .image_height = 32U, .class_names = {{"person"}}},
                 .order = {.matching_count = 1U, .visible_indices = candidate_order_}};
     }
-    ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t seed, std::size_t,
-                                        const std::stop_token stop) override {
+    ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, const std::uint64_t seed, std::size_t, const std::stop_token stop) override {
         const auto call = probe_->prepare_calls.fetch_add(1U, std::memory_order_acq_rel);
         if (call == probe_->blocked_call) {
             probe_->entered.set_value();
@@ -1226,17 +1145,15 @@ class CancellableOpenPreparationAlgorithm final : public SynchronousExploreAlgor
         probe_->resets.fetch_add(1U, std::memory_order_release);
     }
     ExploreOrderFacts Visible(ExploreViewport, const ExploreOrderCandidate* candidate = nullptr) const override {
-        return candidate == nullptr
-                   ? ExploreOrderFacts{.matching_count = static_cast<std::uint32_t>(order_.size()), .visible_indices = order_}
-                   : candidate->order;
+        return candidate == nullptr ? ExploreOrderFacts{.matching_count = static_cast<std::uint32_t>(order_.size()), .visible_indices = order_}
+                                    : candidate->order;
     }
     bool Contains(const std::uint32_t value) const override { return std::ranges::find(order_, value) != order_.end(); }
     std::optional<std::uint32_t> Adjacent(const std::uint32_t value, std::int64_t) const override {
         return Contains(value) ? std::optional{value} : std::nullopt;
     }
-    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t,
-                       const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                       std::uintptr_t) override {
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean,
+                       const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
         Fill(clean, static_cast<std::uint8_t>(plan.generation));
         Fill(semantic, 0U);
     }
@@ -1246,7 +1163,6 @@ class CancellableOpenPreparationAlgorithm final : public SynchronousExploreAlgor
     std::vector<std::uint32_t> order_;
     std::vector<std::uint32_t> candidate_order_;
 };
-
 class AtomicFilterExploreAlgorithm final : public SynchronousExploreAlgorithm {
    public:
     AtomicFilterExploreAlgorithm(std::shared_ptr<CancellationProbe> probe, std::shared_ptr<std::atomic_uint64_t> commits)
@@ -1256,12 +1172,10 @@ class AtomicFilterExploreAlgorithm final : public SynchronousExploreAlgorithm {
         return {.dataset = {.image_count = 2U, .image_width = 32U, .image_height = 32U, .class_names = {}},
                 .order = {.matching_count = 1U, .visible_indices = {0U}}};
     }
-    ExploreOrderCandidate PrepareFilter(
-        const ExploreFilter& filter, std::uint64_t seed, std::size_t,
-        // CLEANUP-IGNORE: Atomic-filter cancellation and reopen cancellation exercise different algorithm boundaries.
-        const std::stop_token stop) override {
-        if (prepare_count_++ == 0U)
-            return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = {0U}}, .generation = 1U};
+    ExploreOrderCandidate PrepareFilter(const ExploreFilter& filter, std::uint64_t seed, std::size_t,
+                                        // CLEANUP-IGNORE: Atomic-filter cancellation and reopen cancellation exercise different algorithm boundaries.
+                                        const std::stop_token stop) override {
+        if (prepare_count_++ == 0U) return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = {0U}}, .generation = 1U};
         if (wait_for_cancellation(stop, *probe_)) return {};
         return {.filter = filter, .order = {.matching_count = 1U, .shuffle_seed = seed, .visible_indices = {1U}}, .generation = 1U};
     }
@@ -1278,12 +1192,9 @@ class AtomicFilterExploreAlgorithm final : public SynchronousExploreAlgorithm {
         return {.matching_count = static_cast<std::uint32_t>(committed_.size()), .visible_indices = committed_};
     }
     bool Contains(std::uint32_t value) const override { return std::ranges::find(committed_, value) != committed_.end(); }
-    std::optional<std::uint32_t> Adjacent(std::uint32_t value, std::int64_t) const override {
-        return Contains(value) ? std::optional{value} : std::nullopt;
-    }
-    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t,
-                       mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
-                       std::uintptr_t) override {
+    std::optional<std::uint32_t> Adjacent(std::uint32_t value, std::int64_t) const override { return Contains(value) ? std::optional{value} : std::nullopt; }
+    void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, mmltk::frameworks::gpu::ImagePlaneView clean,
+                       mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
         if (plan.generation == 1U) {
             Fill(clean, 1U);
             Fill(semantic, 0U);
@@ -1299,13 +1210,11 @@ class AtomicFilterExploreAlgorithm final : public SynchronousExploreAlgorithm {
     std::vector<std::uint32_t> committed_{0U};
     std::uint64_t prepare_count_ = 0U;
 };
-
 struct MutationCommitProbe final {
     std::promise<void> committed;
     std::promise<void> release;
     std::shared_future<void> released = release.get_future().share();
 };
-
 struct AnnotationRenderProbe final {
     std::atomic_uint64_t calls{0U};
     std::atomic_uint64_t samples{0U};
@@ -1317,7 +1226,6 @@ struct AnnotationRenderProbe final {
     std::shared_ptr<MutationCommitProbe> hold;
     std::shared_ptr<MutationCommitProbe> sample_hold;
     std::shared_ptr<MutationCommitProbe> open_hold;
-
     void Wait(std::shared_ptr<MutationCommitProbe>& pending) {
         std::shared_ptr<MutationCommitProbe> gate;
         {
@@ -1330,17 +1238,14 @@ struct AnnotationRenderProbe final {
         }
     }
 };
-
 struct AnnotationRenderHold final {
     std::shared_ptr<AnnotationRenderProbe> probe = std::make_shared<AnnotationRenderProbe>();
     std::shared_ptr<MutationCommitProbe> hold = std::make_shared<MutationCommitProbe>();
     std::future<void> entered = hold->committed.get_future();
 };
-
 class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
-    static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend,
-                                              std::shared_ptr<AnnotationRenderProbe> probe = {}) {
+    static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<AnnotationRenderProbe> probe = {}) {
         return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [probe = std::move(probe)] { return std::make_unique<TestAnnotationAlgorithm>(probe); });
     }
@@ -1355,8 +1260,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
         return {120.0F, 1.0F, 1.0F};
     }
     void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source,
-                const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                std::uintptr_t) const override {
+                const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
         if (probe_) {
             const auto scene = *description.scene;
             const auto editor = description.editor;
@@ -1364,8 +1268,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
             const auto preview_object = description.preview_object;
             probe_->calls.fetch_add(1U, std::memory_order_release);
             probe_->Wait(probe_->hold);
-            if (*description.scene != scene || description.editor != editor || description.preview != preview ||
-                description.preview_object != preview_object)
+            if (*description.scene != scene || description.editor != editor || description.preview != preview || description.preview_object != preview_object)
                 probe_->exact_content = false;
             if (probe_->fail_render.exchange(false)) throw std::runtime_error("deterministic render failure");
         }
@@ -1376,27 +1279,23 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
    private:
     std::shared_ptr<AnnotationRenderProbe> probe_;
 };
-
 class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
-    void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
-                   std::uintptr_t) override {
+    void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
         Fill(target, source.valid() ? *reinterpret_cast<const std::uint8_t*>(source.data) : 0U);
     }
     explicit TestUpscaleAlgorithm(std::shared_ptr<std::atomic<UpscaleKernel>> kernel, std::shared_ptr<MutationCommitProbe> gate = {},
                                   std::shared_ptr<std::atomic_uint32_t> runs = {}, std::uint32_t gate_run = 1U)
         : kernel_(std::move(kernel)), gate_(std::move(gate)), runs_(std::move(runs)), gate_run_(gate_run) {}
-    [[nodiscard]] static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend,
-                                                            std::shared_ptr<std::atomic<UpscaleKernel>> kernel,
+    [[nodiscard]] static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<std::atomic<UpscaleKernel>> kernel,
                                                             std::shared_ptr<std::atomic_uint32_t> runs) {
         return RuntimeFactory(
             0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-            [kernel = std::move(kernel), runs = std::move(runs)] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, runs); },
-            4U);
+            [kernel = std::move(kernel), runs = std::move(runs)] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, runs); }, 4U);
     }
     void Warm() override {}
-    void Run(const UpscaleKernel kernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target,
-             std::uintptr_t, const std::function<bool()>&) override {
+    void Run(const UpscaleKernel kernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
+             const std::function<bool()>&) override {
         kernel_->store(kernel, std::memory_order_release);
         if (runs_) runs_->fetch_add(1U, std::memory_order_acq_rel);
         if (gate_ && (!runs_ || runs_->load() == gate_run_)) {
@@ -1413,19 +1312,17 @@ class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
     std::shared_ptr<std::atomic_uint32_t> runs_;
     std::uint32_t gate_run_;
 };
-
 class FailingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
-    explicit FailingUpscaleAlgorithm(std::shared_ptr<std::atomic_uint32_t> runs, const bool physical = false)
-        : runs_(std::move(runs)), physical_(physical) {}
+    explicit FailingUpscaleAlgorithm(std::shared_ptr<std::atomic_uint32_t> runs, const bool physical = false) : runs_(std::move(runs)), physical_(physical) {}
     void Warm() override {}
     void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
              const std::function<bool()>&) override {
         if (runs_->fetch_add(1U, std::memory_order_acq_rel) == 1U) {
             if (physical_)
-                throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(std::make_exception_ptr(
-                    mmltk::frameworks::gpu::CudaError(cudaErrorIllegalAddress, "injected shared execution failure")));
+                throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(
+                    std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(cudaErrorIllegalAddress, "injected shared execution failure")));
             throw std::runtime_error("deterministic Upscale failure");
         }
         Fill(target, 1U);
@@ -1435,7 +1332,6 @@ class FailingUpscaleAlgorithm final : public UpscaleAlgorithm {
     std::shared_ptr<std::atomic_uint32_t> runs_;
     bool physical_ = false;
 };
-
 struct UpscaleActivationProbe final {
     std::atomic<std::size_t> warms{0U};
     std::atomic<std::size_t> runs{0U};
@@ -1450,7 +1346,6 @@ struct UpscaleActivationProbe final {
     // CLEANUP-IGNORE: First-warm completion is a separate one-shot activation observation.
     std::promise<void> first_warm_completed;
 };
-
 class ActivationUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
@@ -1465,8 +1360,8 @@ class ActivationUpscaleAlgorithm final : public UpscaleAlgorithm {
         Activate();
         if (call == 0U) probe_->first_warm_completed.set_value();
     }
-    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
-             std::uintptr_t, const std::function<bool()>&) override {
+    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
+             const std::function<bool()>&) override {
         if (!probe_->ready[0U].load(std::memory_order_acquire)) {
             probe_->fallback_activations.fetch_add(1U, std::memory_order_acq_rel);
             Activate();
@@ -1477,26 +1372,23 @@ class ActivationUpscaleAlgorithm final : public UpscaleAlgorithm {
 
    private:
     void Activate() noexcept {
-        for (auto& ready : probe_->ready)
-            ready.store(true, std::memory_order_release);
+        for (auto& ready : probe_->ready) ready.store(true, std::memory_order_release);
     }
     std::shared_ptr<UpscaleActivationProbe> probe_;
 };
-
 struct UpscaleExtentProbe final {
     std::mutex mutex;
     std::vector<mmltk::frameworks::gpu::ImagePlaneView> sources;
     // CLEANUP-IGNORE: Captured output views and scalar admission dimensions are distinct test evidence.
     std::vector<mmltk::frameworks::gpu::ImagePlaneView> targets;
 };
-
 class ExtentUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
     explicit ExtentUpscaleAlgorithm(std::shared_ptr<UpscaleExtentProbe> probe) : probe_(std::move(probe)) {}
     void Warm() override {}
-    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
-             std::uintptr_t, const std::function<bool()>&) override {
+    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
+             const std::function<bool()>&) override {
         {
             std::scoped_lock lock(probe_->mutex);
             probe_->sources.push_back(source);
@@ -1508,20 +1400,18 @@ class ExtentUpscaleAlgorithm final : public UpscaleAlgorithm {
    private:
     std::shared_ptr<UpscaleExtentProbe> probe_;
 };
-
 struct UpscaleAdmissionRaceProbe final {
     std::atomic<std::uint8_t> received_value{0U};
     std::atomic<std::uint32_t> received_width{0U};
     std::atomic<std::uint32_t> received_height{0U};
 };
-
 class RacingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
     explicit RacingUpscaleAlgorithm(std::shared_ptr<UpscaleAdmissionRaceProbe> probe) : probe_(std::move(probe)) {}
     void Warm() override {}
-    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
-             std::uintptr_t, const std::function<bool()>&) override {
+    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
+             const std::function<bool()>&) override {
         const auto value = *reinterpret_cast<const std::uint8_t*>(source.data);
         probe_->received_value.store(value, std::memory_order_release);
         probe_->received_width.store(source.descriptor.width, std::memory_order_release);
@@ -1532,13 +1422,11 @@ class RacingUpscaleAlgorithm final : public UpscaleAlgorithm {
    private:
     std::shared_ptr<UpscaleAdmissionRaceProbe> probe_;
 };
-
 struct UpscaleReleaseFailureProbe final {
     std::promise<void> warmed;
     std::atomic<std::size_t> releases{0U};
     std::atomic_bool destroyed{false};
 };
-
 class ReleaseFailingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
@@ -1557,7 +1445,6 @@ class ReleaseFailingUpscaleAlgorithm final : public UpscaleAlgorithm {
     std::shared_ptr<UpscaleReleaseFailureProbe> probe_;
     std::exception_ptr failure_;
 };
-
 class TestLiveAlgorithm final : public LiveAlgorithm {
    public:
     explicit TestLiveAlgorithm(std::shared_ptr<std::atomic<std::uint64_t>> captures, std::shared_ptr<std::atomic_bool> token_changed = {})
@@ -1582,20 +1469,13 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
     std::shared_ptr<std::atomic_bool> token_changed_;
     std::optional<std::stop_token> first_stop_;
 };
-
-[[nodiscard]] VisualRuntimeFactory test_live_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
-                                                             std::shared_ptr<std::atomic<std::uint64_t>> captures,
+[[nodiscard]] VisualRuntimeFactory test_live_runtime_factory(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<std::atomic<std::uint64_t>> captures,
                                                              std::shared_ptr<std::atomic_bool> token_changed = {}) {
-    return RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::Clean,
-                          [captures = std::move(captures), token_changed = std::move(token_changed)] {
-                              return std::make_unique<TestLiveAlgorithm>(captures, token_changed);
-                          });
+    return RuntimeFactory(
+        0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::Clean,
+        [captures = std::move(captures), token_changed = std::move(token_changed)] { return std::make_unique<TestLiveAlgorithm>(captures, token_changed); });
 }
-
-[[nodiscard]] detail::VisualRuntimeOwner::Notification no_op_visual_work(mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
-    return {};
-}
-
+[[nodiscard]] detail::VisualRuntimeOwner::Notification no_op_visual_work(mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) { return {}; }
 [[nodiscard]] auto settle_visual_on_exit(detail::VisualRuntimeOwner& owner, std::promise<void>& release) {
     return mmltk::testsupport::ScopedTestCleanup{[&owner, &release] {
         mmltk::testsupport::release_test_promise(release);
@@ -1603,17 +1483,14 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
         owner.StopAndWait();
     }};
 }
-
 [[nodiscard]] std::uint64_t borrowed_visual_revision(detail::VisualRuntimeOwner& owner) {
     const auto borrowed = owner.Borrow();
     REQUIRE(borrowed.valid());
     return borrowed.plane(0U).revision();
 }
-
-[[nodiscard]] VisualRuntimeFactory gated_visual_construction(VisualRuntimeFactory factory, std::promise<void>& constructing,
-                                                             std::shared_future<void> release, const std::size_t ordinal) {
-    return [factory = std::move(factory), &constructing, release = std::move(release), ordinal,
-            constructions = std::size_t{0U}](auto revisions) mutable {
+[[nodiscard]] VisualRuntimeFactory gated_visual_construction(VisualRuntimeFactory factory, std::promise<void>& constructing, std::shared_future<void> release,
+                                                             const std::size_t ordinal) {
+    return [factory = std::move(factory), &constructing, release = std::move(release), ordinal, constructions = std::size_t{0U}](auto revisions) mutable {
         if (ordinal == 0U || ++constructions == ordinal) {
             constructing.set_value();
             release.wait();
@@ -1621,7 +1498,6 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
         return factory(std::move(revisions));
     };
 }
-
 // The reader task owns both acquisition and destruction of its shared locks.
 // The test thread holds only the gate and the scalar completion result.
 class HeldVisualReader final {
@@ -1646,7 +1522,6 @@ class HeldVisualReader final {
     mmltk::testsupport::TestGate gate_;
     std::future<std::uint64_t> reading_;
 };
-
 void submit_visual_revision(detail::VisualRuntimeOwner& owner, std::promise<std::uint64_t>& completed, const bool staged = false) {
     auto work = [&completed](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
@@ -1658,39 +1533,31 @@ void submit_visual_revision(detail::VisualRuntimeOwner& owner, std::promise<std:
     else
         REQUIRE(owner.SubmitOrdered(std::move(work)));
 }
-
-mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate enqueue_test_output(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                                                std::uintptr_t& stream) {
+mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate enqueue_test_output(mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::uintptr_t& stream) {
     auto candidate = runtime.AcquireOutput();
-    runtime.PublishRetained(
-        candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, mmltk::frameworks::gpu::ImageSubmission::Enqueue);
+    runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, mmltk::frameworks::gpu::ImageSubmission::Enqueue);
     return candidate;
 }
-
 auto first_visual_failure(std::atomic_uint& count, std::promise<std::exception_ptr>& first) {
     return [&count, &first](std::exception_ptr failure) {
         if (count.fetch_add(1U) == 0U) first.set_value(failure);
     };
 }
-
 void submit_visual_workspace(detail::VisualRuntimeOwner& owner, const std::shared_ptr<FakeImageBackend>& backend,
                              std::promise<mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput>& created) {
     const bool submitted = owner.SubmitOrdered([&backend, &created](auto& runtime, std::stop_token) {
         auto [workspace, prepared] = mmltk::frameworks::gpu::test_support::PublishTestWorkspace(runtime, backend);
         REQUIRE(prepared);
-        return detail::VisualRuntimeOwner::Notification{
-            [&created, product = runtime.Completed()]() mutable { created.set_value(std::move(product)); }};
+        return detail::VisualRuntimeOwner::Notification{[&created, product = runtime.Completed()]() mutable { created.set_value(std::move(product)); }};
     });
     REQUIRE(submitted);
 }
-
 void submit_visual_completion(detail::VisualRuntimeOwner& owner, std::promise<void>& completed) {
     REQUIRE(owner.SubmitOrdered([&completed](auto& runtime, std::stop_token) {
         runtime.Publish(8U, 8U, [](auto, auto, auto) {});
         return detail::VisualRuntimeOwner::Notification{[&completed] { completed.set_value(); }};
     }));
 }
-
 // Declared before the runtime owner so recorded-work callbacks settle before
 // their result storage and completion promise are destroyed.
 class VisualWorkLog final {
@@ -1715,7 +1582,6 @@ class VisualWorkLog final {
     std::vector<int> values_;
     std::promise<void> completed_;
 };
-
 void submit_blocked_visual_work(detail::VisualRuntimeOwner& owner, std::promise<void>& entered, std::shared_future<void> release) {
     REQUIRE(owner.SubmitOrdered([&entered, release = std::move(release)](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         entered.set_value();
@@ -1724,7 +1590,6 @@ void submit_blocked_visual_work(detail::VisualRuntimeOwner& owner, std::promise<
     }));
     mmltk::testsupport::await_test_promise(entered, "entered");
 }
-
 void submit_counting_continuation(detail::VisualRuntimeOwner& owner, std::atomic_uint32_t& count) {
     owner.RegisterContinuation([&count](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
         count.fetch_add(1U, std::memory_order_release);
@@ -1732,7 +1597,6 @@ void submit_counting_continuation(detail::VisualRuntimeOwner& owner, std::atomic
     });
     REQUIRE(owner.NotifyContinuation());
 }
-
 class FailingLiveAlgorithm final : public LiveAlgorithm {
    public:
     void Start(const LiveStart&) override {}
@@ -1743,7 +1607,6 @@ class FailingLiveAlgorithm final : public LiveAlgorithm {
     }
     void Stop() noexcept override {}
 };
-
 struct TestPresentationWriterState final {
     std::atomic_bool advertise_waiting_candidate{false};
     TestPresentationWriterState() : readiness(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK)), pump_release(release_pump.get_future().share()) {}
@@ -1804,13 +1667,11 @@ struct TestPresentationWriterState final {
     std::condition_variable pump_changed;
     std::uint64_t pump_count = 0U;
 };
-
 // Declared immediately after the system, before assertions. Event/callback
 // storage precedes the system and therefore outlives terminal settlement.
 class PresentationScenario final {
    public:
-    PresentationScenario(PresentationSystem& system, std::shared_ptr<TestPresentationWriterState> state)
-        : system_(system), state_(std::move(state)) {}
+    PresentationScenario(PresentationSystem& system, std::shared_ptr<TestPresentationWriterState> state) : system_(system), state_(std::move(state)) {}
     ~PresentationScenario() {
         mmltk::testsupport::release_test_promise(state_->release_pump);
         if (system_.stopped()) return;
@@ -1825,16 +1686,12 @@ class PresentationScenario final {
     PresentationSystem& system_;
     std::shared_ptr<TestPresentationWriterState> state_;
 };
-
 class TestPresentationWriter final : public PresentationNativeWriter {
    public:
     [[nodiscard]] static PresentationNativeWriterFactory Factory(std::shared_ptr<FakeImageBackend> backend,
                                                                  std::shared_ptr<TestPresentationWriterState> state) {
-        return [backend = std::move(backend), state = std::move(state)] {
-            return std::make_unique<TestPresentationWriter>(0, backend, state);
-        };
+        return [backend = std::move(backend), state = std::move(state)] { return std::make_unique<TestPresentationWriter>(0, backend, state); };
     }
-
     TestPresentationWriter(const int device, std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<TestPresentationWriterState> state)
         : context_(device, std::move(backend)),
           stream_(context_),
@@ -1843,7 +1700,6 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         state_->constructions.fetch_add(1U, std::memory_order_acq_rel);
     }
     ~TestPresentationWriter() override { state_->retirements.fetch_add(1U, std::memory_order_acq_rel); }
-
     void Submit(PresentationSubmittedSource submitted, const VisualSourceReader& reader) override {
         context_.Bind();
         state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
@@ -1883,9 +1739,7 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
         std::uint64_t wake = 0U;
         ssize_t consumed = -1;
-        do {
-            consumed = ::read(state_->readiness.get(), &wake, sizeof(wake));
-        } while (consumed < 0 && errno == EINTR);
+        do { consumed = ::read(state_->readiness.get(), &wake, sizeof(wake)); } while (consumed < 0 && errno == EINTR);
         if (consumed < 0 && errno != EAGAIN) throw std::runtime_error("test presentation readiness read failed");
         if (state_->fail_pump.load(std::memory_order_acquire)) throw std::runtime_error("test presentation writer failure");
         if (state_->block_pump.load(std::memory_order_acquire)) {
@@ -1966,12 +1820,9 @@ class TestPresentationWriter final : public PresentationNativeWriter {
         std::uint32_t height = 0U;
         std::uint64_t generation = 0U;
     };
-
-    [[nodiscard]] static bool Contains(const std::optional<Allocation>& allocation, const std::uint32_t width,
-                                       const std::uint32_t height) noexcept {
+    [[nodiscard]] static bool Contains(const std::optional<Allocation>& allocation, const std::uint32_t width, const std::uint32_t height) noexcept {
         return allocation && width <= allocation->width && height <= allocation->height;
     }
-
     [[nodiscard]] PresentationCapability capability() const noexcept {
         const auto* allocation = candidate_ ? std::addressof(*candidate_) : active_ ? std::addressof(*active_) : nullptr;
         if (allocation == nullptr) return {};
@@ -1980,8 +1831,8 @@ class TestPresentationWriter final : public PresentationNativeWriter {
             .surface_low = allocation->generation + (state_->advertise_waiting_candidate.load() ? 100U : 0U),
             .extent = {allocation->width, allocation->height},
             .generation = allocation->generation + (state_->advertise_waiting_candidate.load() ? 100U : 0U),
-            .condition = state_->allow_publication.load(std::memory_order_acquire) ? PresentationCapabilityCondition::Ready
-                                                                                   : PresentationCapabilityCondition::Admitted,
+            .condition =
+                state_->allow_publication.load(std::memory_order_acquire) ? PresentationCapabilityCondition::Ready : PresentationCapabilityCondition::Admitted,
         };
     }
     mmltk::frameworks::gpu::DeviceContext context_;
@@ -1996,7 +1847,6 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     std::optional<Allocation> retiring_;
     std::uint64_t next_generation_ = 1U;
 };
-
 TEST_CASE("Workspace layout rejects delayed undersized capacity") {
     namespace abi = presentation::detail::workspace_surface_import;
     abi::Record layout{.opcode = abi::Opcode::ArenaReady,
@@ -2019,7 +1869,6 @@ TEST_CASE("Workspace layout rejects delayed undersized capacity") {
     layout.stride = 799U;
     CHECK_FALSE(abi::valid(layout));
 }
-
 class EventGate final {
    public:
     void Advance() {
@@ -2041,7 +1890,6 @@ class EventGate final {
     std::condition_variable changed_;
     std::uint64_t revision_ = 0U;
 };
-
 struct ExplorePressureProbe final {
     EventGate events{};
     std::atomic_size_t attempts{0U};
@@ -2050,13 +1898,11 @@ struct ExplorePressureProbe final {
     std::atomic_size_t runtimes{0U};
     std::shared_ptr<ExplorePostRenderGate> render_gate;
     std::atomic_bool semantic_detail{false};
-
     [[nodiscard]] VisualDiagnosticSink sink() noexcept {
         return {.context = this, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
                     auto& probe = *static_cast<ExplorePressureProbe*>(context);
                     if (fact.operation == VisualDiagnosticOperation::ExploreContinuationStarted &&
-                        fact.detail == 30U + static_cast<std::uint64_t>(detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) &&
-                        fact.value == 0U) {
+                        fact.detail == 30U + static_cast<std::uint64_t>(detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) && fact.value == 0U) {
                         probe.idle_attempts.store(probe.attempts.load(std::memory_order_acquire), std::memory_order_release);
                         probe.events.Advance();
                     }
@@ -2067,20 +1913,17 @@ struct ExplorePressureProbe final {
         CHECK(attempts.load(std::memory_order_acquire) == expected);
     }
 };
-
 class CapacityExploreAlgorithm final : public TestExploreAlgorithm {
    public:
     explicit CapacityExploreAlgorithm(ExplorePressureProbe& probe)
-        : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, nullptr, probe.render_gate),
-          probe_(probe) {}
+        : TestExploreAlgorithm(std::make_shared<std::atomic_size_t>(0U), nullptr, nullptr, nullptr, nullptr, probe.render_gate), probe_(probe) {}
     ExploreOutputChange OutputChange(const ExploreRenderPlan& plan, const ExploreOrderCandidate*) const override {
         probe_.attempts.fetch_add(1U, std::memory_order_release);
         probe_.events.Advance();
         return probe_.semantic_detail && plan.mode == ExploreMode::Detail ? ExploreOutputChange::Semantic : ExploreOutputChange::Initialize;
     }
     void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate* candidate, const std::size_t nproc,
-                       mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
-                       const std::uintptr_t stream) override {
+                       mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic, const std::uintptr_t stream) override {
         if (probe_.fail_render.exchange(false, std::memory_order_acq_rel)) throw std::runtime_error("Explore pending predecessor failed");
         TestExploreAlgorithm::RenderProduct(plan, candidate, nproc, clean, semantic, stream);
     }
@@ -2088,7 +1931,6 @@ class CapacityExploreAlgorithm final : public TestExploreAlgorithm {
    private:
     ExplorePressureProbe& probe_;
 };
-
 class DiagnosticCapture final {
    public:
     [[nodiscard]] VisualDiagnosticSink sink() noexcept {
@@ -2119,18 +1961,15 @@ class DiagnosticCapture final {
     std::atomic<contracts::DiagnosticOwner> last_system{contracts::DiagnosticOwner::Explore};
     // CLEANUP-ON
 };
-
 constexpr VisualDeviceSettings kDevice{
     .device = 0,
     .maximum_width = 1024U,
     .maximum_height = 1024U,
 };
-
 [[nodiscard]] bool has_cuda_device() noexcept {
     int device_count = 0;
     return ::cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
 }
-
 void check_gallery_first_pixels(ExploreSystem& explore, const std::uint8_t first, const std::uint8_t second) {
     auto product = explore.BorrowFrame();
     REQUIRE(product.valid());
@@ -2138,12 +1977,10 @@ void check_gallery_first_pixels(ExploreSystem& explore, const std::uint8_t first
     CHECK(*reinterpret_cast<const std::uint8_t*>(plane.data) == first);
     CHECK(*(reinterpret_cast<const std::uint8_t*>(plane.data) + 16U) == second);
 }
-
 void open_streaming_gallery(ExploreSystem& explore, EventGate& events, ExploreViewport viewport) {
     static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/stream"}));
     REQUIRE(events.Wait([&explore] { return explore.snapshot().ready; }));
 }
-
 class LoadedSettings final {
    public:
     explicit LoadedSettings(SystemEventSink<SettingsSystem::event_type> events = {}) : system_(std::move(events)) {
@@ -2163,15 +2000,12 @@ class LoadedSettings final {
         std::filesystem::create_directories(directory_.path() / "gui.json");
         REQUIRE_FALSE(system_.Load(location()).applied());
     }
-    [[nodiscard]] services::SettingsLocation location() const {
-        return services::SettingsLocation{(directory_.path() / "gui.json").string()};
-    }
+    [[nodiscard]] services::SettingsLocation location() const { return services::SettingsLocation{(directory_.path() / "gui.json").string()}; }
 
    private:
     mmltk::testsupport::ScopedTempDir directory_{"mmltk-explore-settings"};
     SettingsSystem system_;
 };
-
 class OpenedExplore final {
    public:
     OpenedExplore(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent)
@@ -2180,15 +2014,12 @@ class OpenedExplore final {
                        0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                        [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); }, 3U),
                    [this](ExploreSystem::event_type) { events_.Advance(); }) {
-        static_cast<void>(
-            explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/test"}));
+        static_cast<void>(explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/test"}));
         REQUIRE(events_.Wait([this] { return explore_.snapshot().ready; }));
     }
-
     [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
     void Reopen(const VisualExtent extent) {
-        const auto admitted =
-            explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/reopened"});
+        const auto admitted = explore_.Open({.viewport = {.extent = extent, .columns = extent.width / extent.height}, .compiled_source = "/reopened"});
         REQUIRE(events_.Wait([this, admitted] { return explore_.snapshot().ready && explore_.snapshot().revision > admitted.revision; }));
     }
 
@@ -2197,19 +2028,16 @@ class OpenedExplore final {
     LoadedSettings settings_;
     ExploreSystem explore_;
 };
-
 class ExploreScenario final {
    public:
     using ModelFactory = std::function<std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>()>;
     using Observer = std::function<void(ExploreSystem::event_type)>;
-
     ExploreScenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend, ModelFactory model = {}, Observer observer = {},
                     VisualDiagnosticSink diagnostics = {})
         : ExploreScenario(settings, 2U,
                           RuntimeFactory(0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                                          model ? std::move(model) : DefaultModel(), 3U),
                           std::move(observer), diagnostics) {}
-
     ExploreScenario(LoadedSettings& settings, const std::size_t nproc, VisualRuntimeFactory runtime, Observer observer = {},
                     VisualDiagnosticSink diagnostics = {})
         : observer_(std::move(observer)),
@@ -2220,9 +2048,7 @@ class ExploreScenario final {
                   events_.Advance();
               },
               diagnostics) {}
-
     [[nodiscard]] ExploreSystem& system() noexcept { return explore_; }
-
     void OpenAndWait(const ExploreViewport viewport, const std::string_view compiled_source = "/test") {
         const auto admitted = explore_.Open({.viewport = viewport, .compiled_source = std::string{compiled_source}});
         REQUIRE(Wait([this, admitted] {
@@ -2230,27 +2056,20 @@ class ExploreScenario final {
             return current.ready && !current.busy && current.revision > admitted.revision;
         }));
     }
-
     [[nodiscard]] bool Wait(std::function<bool()> predicate) { return events_.Wait(std::move(predicate)); }
-
     [[nodiscard]] static ModelFactory TrackCommits(std::shared_ptr<std::atomic_uint64_t> commits) {
-        return [commits = std::move(commits)] {
-            return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits);
-        };
+        return
+            [commits = std::move(commits)] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits); };
     }
-
     [[nodiscard]] static ModelFactory TrackWork(std::shared_ptr<ExploreWorkProbe> work) {
         return [work = std::move(work)] {
             return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work);
         };
     }
-
-    [[nodiscard]] static ModelFactory GateAfterRender(std::shared_ptr<ExplorePostRenderGate> gate,
-                                                      std::shared_ptr<std::atomic_uint64_t> commits = {},
+    [[nodiscard]] static ModelFactory GateAfterRender(std::shared_ptr<ExplorePostRenderGate> gate, std::shared_ptr<std::atomic_uint64_t> commits = {},
                                                       std::shared_ptr<ExploreWorkProbe> work = {}) {
         return [gate = std::move(gate), commits = std::move(commits), work = std::move(work)] {
-            return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits, nullptr, work,
-                                                          gate);
+            return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits, nullptr, work, gate);
         };
     }
 
@@ -2258,12 +2077,10 @@ class ExploreScenario final {
     [[nodiscard]] static ModelFactory DefaultModel() {
         return [] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U)); };
     }
-
     Observer observer_;
     EventGate events_;
     ExploreSystem explore_;
 };
-
 TEST_CASE("Explore announces the acquired detail allocation before framework prewrites can fail") {
     class DetailWriteAlgorithm final : public TestExploreAlgorithm {
        public:
@@ -2299,7 +2116,6 @@ TEST_CASE("Explore announces the acquired detail allocation before framework pre
     CHECK(explore.snapshot().frame == incumbent.frame);
     CHECK(explore.snapshot().mode == ExploreMode::Gallery);
 }
-
 class ExplorePressureFixture final {
    public:
     struct Observation final {
@@ -2317,8 +2133,8 @@ class ExplorePressureFixture final {
                    [this](ExploreSystem::event_type event) {
                        std::scoped_lock lock(observation_mutex);
                        const bool failed = std::holds_alternative<ExploreFailed>(event);
-                       observations.push_back({std::visit([](auto& value) { return std::move(value.snapshot); }, event),
-                                               probe.runtimes.load(std::memory_order_acquire), failed});
+                       observations.push_back(
+                           {std::visit([](auto& value) { return std::move(value.snapshot); }, event), probe.runtimes.load(std::memory_order_acquire), failed});
                    },
                    probe.sink()} {}
     ~ExplorePressureFixture() {
@@ -2360,7 +2176,6 @@ class ExplorePressureFixture final {
     const ExploreViewport viewport{.extent = {16U, 16U}};
     std::array<mmltk::frameworks::gpu::BorrowedImageProductReadView, 3U> held;
 };
-
 TEST_CASE("Explore retries only the newest desired product after held reads release output capacity") {
     ExplorePressureFixture fixture;
     fixture.HoldGalleryPool();
@@ -2389,7 +2204,6 @@ TEST_CASE("Explore retries only the newest desired product after held reads rele
     REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy; }));
     CHECK(explore.snapshot().frame == retained.frame);
 }
-
 TEST_CASE("Explore retains semantic detail baseline custody through an idle output wait") {
     ExplorePressureFixture fixture;
     auto& explore = fixture.scenario.system();
@@ -2439,7 +2253,6 @@ TEST_CASE("Explore retains semantic detail baseline custody through an idle outp
         CHECK(explore.snapshot().overlay == retained.overlay);
     }
 }
-
 TEST_CASE("Explore settles an accepted viewport before a discrete filter under output pressure") {
     ExplorePressureFixture fixture;
     fixture.HoldGalleryPool();
@@ -2514,7 +2327,6 @@ TEST_CASE("Explore settles an accepted viewport before a discrete filter under o
         CHECK(explore.snapshot().overlay == policy.overlay);
     }
 }
-
 TEST_CASE("Explore settles a pending predecessor on the incumbent before reconstructing Open") {
     ExplorePressureFixture fixture;
     fixture.HoldGalleryPool();
@@ -2522,23 +2334,21 @@ TEST_CASE("Explore settles a pending predecessor on the incumbent before reconst
     fixture.RequestViewport(0U);
     const bool initial_h2d = fixture.settings.system().explore_settings_candidate().loading.h2d_dataloader;
     contracts::SettingsUpdateRequest update;
-    update.updates.push_back(
-        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
+    update.updates.push_back({.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
     static_cast<void>(fixture.settings.system().Update(std::move(update)));
     CHECK(explore.Open({.viewport = fixture.viewport, .compiled_source = "/replacement"}).busy);
     CHECK(fixture.probe.runtimes.load(std::memory_order_acquire) == 1U);
     fixture.held = {};
     REQUIRE(fixture.scenario.Wait([&] { return !explore.snapshot().busy; }));
     const auto observations = fixture.Recorded();
-    const auto predecessor = std::ranges::find_if(
-        observations, [](const auto& event) { return event.snapshot.busy && event.snapshot.viewport.first_row == 0U; });
+    const auto predecessor =
+        std::ranges::find_if(observations, [](const auto& event) { return event.snapshot.busy && event.snapshot.viewport.first_row == 0U; });
     REQUIRE(predecessor != observations.end());
     CHECK(predecessor->runtimes == 1U);
     CHECK(predecessor->snapshot.order.visible_indices == std::vector<std::uint32_t>{0U});
     CHECK(fixture.probe.runtimes.load(std::memory_order_acquire) == 2U);
     CHECK(explore.snapshot().frame != predecessor->snapshot.frame);
 }
-
 TEST_CASE("Stop cancels Explore work resumed by an output availability continuation") {
     ExplorePressureFixture fixture{true};
     fixture.HoldGalleryPool();
@@ -2555,7 +2365,6 @@ TEST_CASE("Stop cancels Explore work resumed by an output availability continuat
     CHECK(explore.snapshot().viewport == incumbent.viewport);
     CHECK_FALSE(explore.snapshot().busy);
 }
-
 [[nodiscard]] auto settle_explore_on_exit(ExploreSystem& explore, std::promise<void>& release) {
     return mmltk::testsupport::ScopedTestCleanup{[&explore, &release] {
         mmltk::testsupport::release_test_promise(release);
@@ -2563,7 +2372,6 @@ TEST_CASE("Stop cancels Explore work resumed by an output availability continuat
         explore.Shutdown();
     }};
 }
-
 [[nodiscard]] auto settle_upscale_on_exit(UpscaleSystem& upscale, std::promise<void>& release) {
     return mmltk::testsupport::ScopedTestCleanup{[&upscale, &release] {
         mmltk::testsupport::release_test_promise(release);
@@ -2571,9 +2379,7 @@ TEST_CASE("Stop cancels Explore work resumed by an output availability continuat
         upscale.Shutdown();
     }};
 }
-
-[[nodiscard]] ExploreFilterPreferences select_explore_subset(LoadedSettings& settings, ExploreScenario& scenario,
-                                                             const std::uint32_t class_index) {
+[[nodiscard]] ExploreFilterPreferences select_explore_subset(LoadedSettings& settings, ExploreScenario& scenario, const std::uint32_t class_index) {
     auto& explore = scenario.system();
     const auto admitted = explore.UpdateFilter({
         .filter = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {class_index}}},
@@ -2582,19 +2388,16 @@ TEST_CASE("Stop cancels Explore work resumed by an output availability continuat
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     return settings.system().explore_settings_candidate().preferences;
 }
-
 void check_catalog_selection_preserved(const ExploreFilterPreferences& actual, const ExploreFilterPreferences& expected) {
     CHECK(actual.class_catalog_identity == expected.class_catalog_identity);
     CHECK(actual.policy.filter.class_selection == expected.policy.filter.class_selection);
     CHECK(actual.policy.overlay.class_selection == expected.policy.overlay.class_selection);
 }
-
 [[nodiscard]] ExploreScenario::Observer count_explore_failures(std::shared_ptr<std::atomic_uint64_t> failures) {
     return [failures = std::move(failures)](ExploreSystem::event_type event) {
         if (std::holds_alternative<ExploreFailed>(event)) failures->fetch_add(1U, std::memory_order_acq_rel);
     };
 }
-
 class StreamingExploreFixture final {
    public:
     explicit StreamingExploreFixture(const std::size_t nproc)
@@ -2602,7 +2405,6 @@ class StreamingExploreFixture final {
           probe_(std::make_shared<StreamingExploreProbe>()),
           failures_(std::make_shared<std::atomic_uint64_t>(0U)),
           scenario_(settings_, nproc, streaming_explore_runtime_factory(backend_, probe_), count_explore_failures(failures_)) {}
-
     [[nodiscard]] LoadedSettings& settings() noexcept { return settings_; }
     [[nodiscard]] FakeImageBackend& backend() noexcept { return *backend_; }
     [[nodiscard]] StreamingExploreProbe& probe() noexcept { return *probe_; }
@@ -2622,23 +2424,17 @@ class StreamingExploreFixture final {
     std::shared_ptr<std::atomic_uint64_t> failures_;
     ExploreScenario scenario_;
 };
-
 [[nodiscard]] ExploreScenario tracked_explore_scenario(LoadedSettings& settings, std::shared_ptr<FakeImageBackend> backend,
-                                                       std::shared_ptr<std::atomic_uint64_t> commits,
-                                                       ExploreScenario::Observer observer = {}) {
+                                                       std::shared_ptr<std::atomic_uint64_t> commits, ExploreScenario::Observer observer = {}) {
     return ExploreScenario{settings, std::move(backend), ExploreScenario::TrackCommits(std::move(commits)), std::move(observer)};
 }
-
 [[nodiscard]] ExploreSnapshot wait_for_explore_failure(ExploreScenario& scenario, const std::shared_ptr<std::atomic_uint64_t>& failures,
                                                        const std::uint64_t admission_revision) {
     auto& explore = scenario.system();
-    REQUIRE(scenario.Wait([&] {
-        return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy &&
-               explore.snapshot().revision > admission_revision;
-    }));
+    REQUIRE(scenario.Wait(
+        [&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy && explore.snapshot().revision > admission_revision; }));
     return explore.snapshot();
 }
-
 class TrackedExploreFailureFixture final {
    public:
     TrackedExploreFailureFixture()
@@ -2646,7 +2442,6 @@ class TrackedExploreFailureFixture final {
           failures_(std::make_shared<std::atomic_uint64_t>(0U)),
           commits_(std::make_shared<std::atomic_uint64_t>(0U)),
           scenario_(tracked_explore_scenario(settings_, backend_, commits_, count_explore_failures(failures_))) {}
-
     [[nodiscard]] ExploreScenario& scenario() noexcept { return scenario_; }
     [[nodiscard]] ExploreSystem& system() noexcept { return scenario_.system(); }
     [[nodiscard]] const std::shared_ptr<std::atomic_uint64_t>& failures() const noexcept { return failures_; }
@@ -2660,21 +2455,17 @@ class TrackedExploreFailureFixture final {
     std::shared_ptr<std::atomic_uint64_t> commits_;
     ExploreScenario scenario_;
 };
-
 void check_restored_filter(const ExploreSnapshot& restored, const ExploreSnapshot& committed) {
     CHECK(restored.ready);
     CHECK(restored.filter == committed.filter);
     CHECK(restored.order.visible_indices == committed.order.visible_indices);
     CHECK(restored.frame == committed.frame);
 }
-
 [[nodiscard]] bool assignments_match(const StreamingExploreProbe& probe, const std::span<const std::uint32_t> visible_indices) {
     return std::ranges::all_of(probe.assignments, [&](const auto& assignment) {
-        return assignment.generation == probe.generation &&
-               std::ranges::find(visible_indices, assignment.compiled_index) != visible_indices.end();
+        return assignment.generation == probe.generation && std::ranges::find(visible_indices, assignment.compiled_index) != visible_indices.end();
     });
 }
-
 [[nodiscard]] ExploreClassCatalogIdentity test_explore_catalog_identity() {
     const std::array names{
         mmltk::backend::data::catalog::ClassName{.value = "person"},
@@ -2682,7 +2473,6 @@ void check_restored_filter(const ExploreSnapshot& restored, const ExploreSnapsho
     };
     return explore_class_catalog_identity(names);
 }
-
 void persist_explore_catalog(SettingsSystem& settings, const ExploreClassCatalogIdentity identity) {
     const auto candidate = settings.explore_settings_candidate();
     auto preferences = candidate.preferences.policy;
@@ -2690,7 +2480,6 @@ void persist_explore_catalog(SettingsSystem& settings, const ExploreClassCatalog
     preferences.overlay.class_selection = {};
     settings.persist_explore_class_catalog(candidate, identity, preferences);
 }
-
 void queue_failed_explore_overlay_update(LoadedSettings& settings) {
     settings.BreakPersistence();
     contracts::SettingsUpdateRequest request;
@@ -2708,7 +2497,6 @@ void queue_failed_explore_overlay_update(LoadedSettings& settings) {
     CHECK_FALSE(pending.overlay.show_boxes);
     CHECK(pending.filter.minimum_instances == 2U);
 }
-
 void enable_dark_mode(LoadedSettings& settings) {
     contracts::SettingsUpdateRequest update;
     update.updates.push_back({
@@ -2717,12 +2505,10 @@ void enable_dark_mode(LoadedSettings& settings) {
     });
     static_cast<void>(settings.system().Update(std::move(update)));
 }
-
 void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& release) {
     release.set_value();
     REQUIRE(scenario.Wait([&scenario] { return !scenario.system().snapshot().busy; }));
 }
-
 [[nodiscard]] VisualDocumentRead test_document(mmltk::frameworks::gpu::BorrowedImageProductReadView pixels) {
     static const auto document = [] {
         auto value = std::make_shared<VisualDocument>();
@@ -2742,14 +2528,10 @@ void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& re
         return test_document(borrow_matching_visual_product(frame, explore.BorrowFrame()));
     };
 }
-
-[[nodiscard]] AnnotationSystem make_test_annotation(const std::shared_ptr<FakeImageBackend>& backend, ExploreSystem& source,
-                                                    EventGate& events) {
+[[nodiscard]] AnnotationSystem make_test_annotation(const std::shared_ptr<FakeImageBackend>& backend, ExploreSystem& source, EventGate& events) {
     return AnnotationSystem{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend), borrow_exactly_from(source),
-                            [&events](AnnotationSystem::event_type) { events.Advance(); },
-                            mmltk::testsupport::annotation_render_evidence()};
+                            [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
 }
-
 [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView hold_annotation_frame(AnnotationSystem& annotation, EventGate& events,
                                                                                          contracts::AnnotationTool tool) {
     const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{tool}}});
@@ -2759,14 +2541,12 @@ void release_and_wait_for_idle(ExploreScenario& scenario, std::promise<void>& re
     REQUIRE(retained.valid());
     return retained;
 }
-
 auto settle_annotation_on_exit(AnnotationSystem& annotation, std::promise<void>& release) {
     return mmltk::testsupport::ScopedTestCleanup{[&annotation, &release] {
         mmltk::testsupport::release_test_promise(release);
         annotation.Shutdown();
     }};
 }
-
 void complete_annotation_box_drag(AnnotationSystem& annotation, EventGate& events, std::uint64_t peer) {
     const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
     mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
@@ -2782,7 +2562,6 @@ void complete_annotation_box_drag(AnnotationSystem& annotation, EventGate& event
     CHECK(after.scene.objects.back().box == contracts::AnnotationBox{{1.25F, 2.5F}, {10.75F, 12.125F}});
     CHECK(after.can_undo);
 }
-
 template <class System>
 [[nodiscard]] VisualSourceReader read_from(System& system) {
     return {
@@ -2795,23 +2574,19 @@ template <class System>
         .borrow = [&system] { return system.BorrowFrame(); },
     };
 }
-
-void present_and_wait(PresentationSystem& presentation, TestPresentationWriterState& writer, EventGate& events,
-                      const VisualSourceReader& source, const std::uint64_t revision) {
+void present_and_wait(PresentationSystem& presentation, TestPresentationWriterState& writer, EventGate& events, const VisualSourceReader& source,
+                      const std::uint64_t revision) {
     static_cast<void>(presentation.Select(source.source));
     writer.SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == revision; }));
 }
-
 std::shared_ptr<VisualDocument> annotation_mask_document(std::string_view resource) {
     auto document = std::make_shared<VisualDocument>();
     document->scene.document = contracts::WorkspaceResource::From(resource, 1U);
     document->scene.categories = {{.value = "object"}};
-    document->scene.objects = {
-        {.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {16, 16}}}};
+    document->scene.objects = {{.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {16, 16}}}};
     return document;
 }
-
 class MutableVisualSource final {
    public:
     MutableVisualSource(std::shared_ptr<FakeImageBackend> backend, const VisualExtent extent, const std::uint8_t value = 1U)
@@ -2879,19 +2654,15 @@ class MutableVisualSource final {
     VisualFrame frame_{};
     std::uint64_t snapshot_revision_ = 0U;
 };
-
 struct UpscaleSourceFixture final {
     MutableVisualSource source;
     EventGate events;
     UpscaleSystem upscale;
-
-    UpscaleSourceFixture(const std::shared_ptr<FakeImageBackend>& backend, VisualExtent extent, std::uint8_t value,
-                         VisualRuntimeFactory runtime)
+    UpscaleSourceFixture(const std::shared_ptr<FakeImageBackend>& backend, VisualExtent extent, std::uint8_t value, VisualRuntimeFactory runtime)
         : source(backend, extent, value),
           upscale{kDevice, std::move(runtime), [this](const VisualFrame& frame) { return source.BorrowExact(frame); },
                   [this](UpscaleSystem::event_type) { events.Advance(); }} {}
 };
-
 class PresentationSourceFixture final {
    public:
     explicit PresentationSourceFixture(const std::size_t buffers = 1U)
@@ -2912,7 +2683,6 @@ class PresentationSourceFixture final {
           }} {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
     }
-
     [[nodiscard]] std::shared_ptr<FakeImageBackend> backend() const noexcept { return backend_; }
     [[nodiscard]] std::span<const VisualSourceReader> sources() const noexcept { return sources_; }
     [[nodiscard]] PresentationSourceIdentity identity() const noexcept { return identity_; }
@@ -2942,7 +2712,6 @@ class PresentationSourceFixture final {
         latest_revision_.store(borrowed.plane(0U).revision(), std::memory_order_release);
         snapshot_revision_.fetch_add(1U, std::memory_order_acq_rel);
     }
-
     std::shared_ptr<FakeImageBackend> backend_;
     std::shared_ptr<mmltk::frameworks::gpu::ImageProductRevisionSequence> revisions_;
     std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime> source_;
@@ -2951,7 +2720,6 @@ class PresentationSourceFixture final {
     PresentationSourceIdentity identity_{PresentationSourceKind::Explore, 1U};
     std::array<VisualSourceReader, 1U> sources_;
 };
-
 class ProductPresentationSources final {
    public:
     ProductPresentationSources() : backend_(std::make_shared<FakeImageBackend>()) {
@@ -2982,7 +2750,6 @@ class ProductPresentationSources final {
             });
         }
     }
-
     [[nodiscard]] std::shared_ptr<FakeImageBackend> backend() const noexcept { return backend_; }
     [[nodiscard]] std::span<const VisualSourceReader> sources() const noexcept { return sources_; }
 
@@ -2991,7 +2758,6 @@ class ProductPresentationSources final {
     std::vector<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>> runtimes_;
     std::vector<VisualSourceReader> sources_;
 };
-
 class PresentationFailureProbe final {
    public:
     void Observe(PresentationSystem::event_type event) {
@@ -3005,14 +2771,12 @@ class PresentationFailureProbe final {
     EventGate events_;
     std::atomic<std::size_t> failures_{0U};
 };
-
 [[nodiscard]] PresentationSystem make_failure_presentation(const PresentationSourceFixture& source,
                                                            const std::shared_ptr<TestPresentationWriterState>& writer_state,
                                                            PresentationFailureProbe& failures) {
     return PresentationSystem{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
                               [&failures](PresentationSystem::event_type event) { failures.Observe(std::move(event)); }};
 }
-
 TEST_CASE("Presentation monotonic identities fail before wrap") {
     namespace identity = mmltk::common::types;
     CHECK(identity::advance_monotonic_identity(0U) == 1U);
@@ -3031,7 +2795,6 @@ TEST_CASE("Presentation monotonic identities fail before wrap") {
     CHECK_THROWS_AS(identity::take_monotonic_identity(timeline, 2U), std::overflow_error);
     CHECK(timeline == std::numeric_limits<std::uint64_t>::max() - 1U);
 }
-
 TEST_CASE("Workspace transfer sequences map to their odd timeline values") {
     namespace workspace = mmltk::controller::presentation::detail;
     CHECK(workspace::workspace_timeline_ready(1U) == 1U);
@@ -3040,7 +2803,6 @@ TEST_CASE("Workspace transfer sequences map to their odd timeline values") {
     CHECK_THROWS_AS(workspace::workspace_timeline_ready(0U), std::overflow_error);
     CHECK_THROWS_AS(workspace::workspace_timeline_ready(std::numeric_limits<std::uint64_t>::max()), std::overflow_error);
 }
-
 TEST_CASE("Explore parallelism follows the current Linux affinity limit") {
     const auto automatic = normalize_explore_parallelism(0U);
     CHECK(automatic >= 1U);
@@ -3048,7 +2810,6 @@ TEST_CASE("Explore parallelism follows the current Linux affinity limit") {
     CHECK(normalize_explore_parallelism(kExploreMaximumParallelism + 100U) == automatic);
     CHECK(normalize_explore_parallelism(1U) == 1U);
 }
-
 TEST_CASE("Explore demand retains only its scalar and observes supersession and restoration", "[explore][demand]") {
     CHECK(ExploreDemandCheck{}(0U));
     CHECK(ExploreDemandCheck{}(99U));
@@ -3079,7 +2840,6 @@ TEST_CASE("Explore demand retains only its scalar and observes supersession and 
     retained = {};
     CHECK(lifetime.expired());
 }
-
 TEST_CASE("Explore demand completes on another thread while publication owns finalization", "[explore][demand]") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -3104,7 +2864,6 @@ TEST_CASE("Explore demand completes on another thread while publication owns fin
     REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
     CHECK_FALSE(gate->release_timed_out.load());
 }
-
 TEST_CASE("Each Explore runtime binds the same retained demand before ingress", "[explore][demand]") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -3119,8 +2878,7 @@ TEST_CASE("Each Explore runtime binds the same retained demand before ingress", 
         EventGate events;
         ExploreSystem explore{settings.system(), kDevice, 2U,
                               [first_factory, replacement_factory, constructions](auto revisions) {
-                                  return constructions->fetch_add(1U) == 0U ? first_factory(std::move(revisions))
-                                                                            : replacement_factory(std::move(revisions));
+                                  return constructions->fetch_add(1U) == 0U ? first_factory(std::move(revisions)) : replacement_factory(std::move(revisions));
                               },
                               [&events](ExploreSystem::event_type) { events.Advance(); }};
         const ExploreViewport viewport{.extent = {8U, 4U}, .row_count = 1U, .columns = 2U};
@@ -3134,9 +2892,9 @@ TEST_CASE("Each Explore runtime binds the same retained demand before ingress", 
         const auto first = explore.snapshot();
         CHECK(retained(first.gallery.generation));
         contracts::SettingsUpdateRequest update;
-        update.updates.push_back({.path = "workflows.explore.h2d_dataloader",
-                                  .value = mmltk::frameworks::serialization::wire::FlatValue{
-                                      !settings.system().explore_settings_candidate().loading.h2d_dataloader}});
+        update.updates.push_back(
+            {.path = "workflows.explore.h2d_dataloader",
+             .value = mmltk::frameworks::serialization::wire::FlatValue{!settings.system().explore_settings_candidate().loading.h2d_dataloader}});
         static_cast<void>(settings.system().Update(std::move(update)));
         static_cast<void>(explore.Open({.viewport = viewport, .compiled_source = "/replacement"}));
         REQUIRE(events.Wait([&] { return explore.snapshot().ready && explore.snapshot().frame.revision > first.frame.revision; }));
@@ -3152,7 +2910,6 @@ TEST_CASE("Each Explore runtime binds the same retained demand before ingress", 
     }
     CHECK_FALSE(retained(committed_generation));
 }
-
 TEST_CASE("Explore shutdown invalidates retained demand after cancelled replacement rollback", "[explore][demand]") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -3179,7 +2936,6 @@ TEST_CASE("Explore shutdown invalidates retained demand after cancelled replacem
     CHECK_FALSE((*retained)(incumbent.gallery.generation));
     CHECK_FALSE((*retained)(replacement));
 }
-
 TEST_CASE("Explore publishes placeholders before loaders and patches released lanes incrementally") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -3212,7 +2968,6 @@ TEST_CASE("Explore publishes placeholders before loaders and patches released la
         CHECK(probe->lane_preparations == 2U);
         CHECK(probe->queued_closures == 2U);
     }
-
     probe->Release(0U);
     REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > placeholder.frame.revision; }));
     const auto first_patch = explore.snapshot();
@@ -3230,7 +2985,6 @@ TEST_CASE("Explore publishes placeholders before loaders and patches released la
     std::scoped_lock lock(probe->mutex);
     CHECK(probe->lane_preparations == 2U);
 }
-
 TEST_CASE("Explore visible loading and independent producers progress through shared mouse input", "[explore][priority]") {
     StreamingExploreFixture scenario{1U};
     StreamingExploreFixture independent{1U};
@@ -3262,16 +3016,14 @@ TEST_CASE("Explore visible loading and independent producers progress through sh
     REQUIRE(scenario.Wait([&]() -> bool { return explore.snapshot().gallery.slots[1U]; }));
     CHECK(explore.BorrowFrame().valid());
 }
-
 TEST_CASE("Explore retains content and accepts input through pending image completion and source changes", "[explore][priority]") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto work = std::make_shared<ExploreWorkProbe>();
     auto gate = std::make_shared<ExplorePostRenderGate>(1U);
     LoadedSettings settings;
-    ExploreScenario scenario{settings, backend, [work, gate] {
-                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                               nullptr, nullptr, work, gate);
-                             }};
+    ExploreScenario scenario{
+        settings, backend,
+        [work, gate] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work, gate); }};
     auto& explore = scenario.system();
     mmltk::testsupport::ScopedTestCleanup release_gate{[&] { mmltk::testsupport::release_test_promise(gate->release); }};
     scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
@@ -3302,7 +3054,6 @@ TEST_CASE("Explore retains content and accepts input through pending image compl
     explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{1.5F, 1.5F}});
     static_cast<void>(explore.Stop());
 }
-
 TEST_CASE("Explore owns direction across accepted logical rows and zero-movement updates", "[explore][priority]") {
     StreamingExploreFixture scenario{2U};
     auto& explore = scenario.system();
@@ -3311,12 +3062,10 @@ TEST_CASE("Explore owns direction across accepted logical rows and zero-movement
     const auto check = [&](const std::uint32_t row, const ExploreScrollDirection direction) {
         const auto before = explore.snapshot();
         const auto generation = explore.LastInteractionGeneration();
-        explore.Input(
-            {.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{row % 2U == 0U ? 0.5F : 7.5F, 2.0F}});
+        explore.Input({.source = PresentationSourceKind::Explore, .peer_epoch = 1U, .point = WorkspacePoint{row % 2U == 0U ? 0.5F : 7.5F, 2.0F}});
         explore.UpdateViewport({.viewport = {.extent = {8U, 4U}, .first_row = row, .row_count = 1U, .columns = 2U}});
         if (before.viewport.first_row != row)
-            REQUIRE(scenario.Wait(
-                [&] { return explore.snapshot().viewport.first_row == row && explore.snapshot().revision > before.revision; }));
+            REQUIRE(scenario.Wait([&] { return explore.snapshot().viewport.first_row == row && explore.snapshot().revision > before.revision; }));
         else
             CHECK(explore.LastInteractionGeneration() == generation);
         std::scoped_lock lock(scenario.probe().mutex);
@@ -3329,7 +3078,6 @@ TEST_CASE("Explore owns direction across accepted logical rows and zero-movement
     check(0U, ExploreScrollDirection::Backward);
     check(2U, ExploreScrollDirection::Forward);
 }
-
 TEST_CASE("Explore batches ready lanes and stale viewport completions cannot publish") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -3358,7 +3106,6 @@ TEST_CASE("Explore batches ready lanes and stale viewport completions cannot pub
         CHECK(probe->cumulative == 2U);
         CHECK(probe->maximum_active == 2U);
     }
-
     const auto before_old_viewport = explore.snapshot().frame.revision;
     static_cast<void>(explore.UpdateAugmentation({.enabled = true}));
     REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > before_old_viewport; }));
@@ -3391,7 +3138,6 @@ TEST_CASE("Explore batches ready lanes and stale viewport completions cannot pub
     REQUIRE(events.Wait([&] { return explore.snapshot().frame.revision > newest_placeholder; }));
     CHECK(explore.snapshot().order.visible_indices == std::vector<std::uint32_t>{4U, 5U});
 }
-
 TEST_CASE("Explore filter rollback quiesces candidate lanes before restoring committed streaming work") {
     StreamingExploreFixture scenario{2U};
     auto& explore = scenario.system();
@@ -3401,8 +3147,7 @@ TEST_CASE("Explore filter rollback quiesces candidate lanes before restoring com
     const auto committed = explore.snapshot();
     scenario.settings().BreakPersistence();
     const auto admitted = explore.UpdateFilter({.filter = {.minimum_instances = 1U}});
-    REQUIRE(scenario.Wait(
-        [&] { return scenario.failure_count() == 1U && !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
+    REQUIRE(scenario.Wait([&] { return scenario.failure_count() == 1U && !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     const auto restored = explore.snapshot();
     CHECK(restored.ready);
     CHECK(restored.order.visible_indices == committed.order.visible_indices);
@@ -3419,7 +3164,6 @@ TEST_CASE("Explore filter rollback quiesces candidate lanes before restoring com
     scenario.ReleaseAndWaitForFrameAfter(restored_frame);
     CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
 }
-
 TEST_CASE("Explore prepared-product failure restores exact borrows or retires failed rollback") {
     const bool rollback_fails = GENERATE(false, true);
     // CLEANUP-IGNORE: This fixture configures prepared-product and rollback faults; the preceding scenario configures
@@ -3461,7 +3205,6 @@ TEST_CASE("Explore prepared-product failure restores exact borrows or retires fa
         scenario.ReleaseAndWaitForFrameAfter(incumbent.frame.revision);
     }
 }
-
 // CLEANUP-IGNORE: This test begins a lifecycle-stop contract distinct from the preceding rollback transaction.
 TEST_CASE("Explore Stop abandons unfinished thumbnails while retaining completed product meaning") {
     // CLEANUP-IGNORE: Stop coverage deliberately creates unfinished lanes but does not configure candidate failure.
@@ -3481,7 +3224,6 @@ TEST_CASE("Explore Stop abandons unfinished thumbnails while retaining completed
     CHECK(stopped.order.visible_indices == incumbent.order.visible_indices);
     CHECK(scenario.failure_count() == 0U);
 }
-
 TEST_CASE("Explore failed staged runtime construction resumes the incumbent unfinished gallery") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<StreamingExploreProbe>();
@@ -3491,8 +3233,7 @@ TEST_CASE("Explore failed staged runtime construction resumes the incumbent unfi
     const auto initial_h2d = settings.system().explore_settings_candidate().loading.h2d_dataloader;
     const auto select_transport = [&](const bool h2d) {
         contracts::SettingsUpdateRequest update;
-        update.updates.push_back(
-            {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{h2d}});
+        update.updates.push_back({.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{h2d}});
         static_cast<void>(settings.system().Update(std::move(update)));
     };
     auto incumbent_factory = streaming_explore_runtime_factory(backend, probe);
@@ -3528,8 +3269,7 @@ TEST_CASE("Explore failed staged runtime construction resumes the incumbent unfi
     auto held = explore.BorrowFrame();
     REQUIRE(held.valid());
     select_transport(!initial_h2d);
-    static_cast<void>(
-        explore.Open({.viewport = {.extent = {8U, 4U}, .first_row = 1U, .row_count = 1U, .columns = 2U}, .compiled_source = "/rejected"}));
+    static_cast<void>(explore.Open({.viewport = {.extent = {8U, 4U}, .first_row = 1U, .row_count = 1U, .columns = 2U}, .compiled_source = "/rejected"}));
     REQUIRE(failure.wait_for(2s) == std::future_status::ready);
     const auto restored = failure.get();
     CHECK(restored.ready);
@@ -3560,7 +3300,6 @@ TEST_CASE("Explore failed staged runtime construction resumes the incumbent unfi
     held = {};
     explore.Shutdown();
 }
-
 TEST_CASE("Explore render mutations abort queued lanes before failed cancelled and stale restoration") {
     enum class Mutation : std::uint8_t {
         Augmentation,
@@ -3604,10 +3343,8 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
         }
         const auto admitted = [&] {
             switch (mutation) {
-                case Mutation::Augmentation:
-                    return explore.UpdateAugmentation({.enabled = true});
-                case Mutation::Reroll:
-                    return explore.RerollAugmentation();
+                case Mutation::Augmentation: return explore.UpdateAugmentation({.enabled = true});
+                case Mutation::Reroll: return explore.RerollAugmentation();
             }
             std::terminate();
         }();
@@ -3652,14 +3389,12 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
         CHECK(explore.snapshot().order.visible_indices == committed.order.visible_indices);
         explore.Shutdown();
     };
-
     for (const auto mutation : {Mutation::Augmentation, Mutation::Reroll})
         for (const auto rejection : {Rejection::Failed, Rejection::Cancelled, Rejection::Stale}) {
             CAPTURE(static_cast<int>(mutation), static_cast<int>(rejection));
             run(mutation, rejection);
         }
 }
-
 TEST_CASE("Explore callback admission failure quiesces its runtime and permits a clean reopen") {
     StreamingExploreFixture scenario{1U};
     auto& explore = scenario.system();
@@ -3681,7 +3416,6 @@ TEST_CASE("Explore callback admission failure quiesces its runtime and permits a
         CHECK(scenario.probe().quiescences >= 1U);
         CHECK(scenario.probe().assignments.empty());
     }
-
     {
         std::scoped_lock lock(scenario.probe().mutex);
         scenario.probe().fail_callback_admission = false;
@@ -3691,7 +3425,6 @@ TEST_CASE("Explore callback admission failure quiesces its runtime and permits a
     REQUIRE(scenario.Wait([&] { return explore.snapshot().ready && explore.snapshot().failure.empty(); }));
     CHECK(scenario.backend().streams_destroyed == 1U);
 }
-
 TEST_CASE("Explore lane read and callback gates preserve the accepted atlas through shutdown") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -3725,7 +3458,6 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
     REQUIRE(events.Wait([&] { return explore.snapshot().gallery.slots == std::vector<bool>{true}; }));
     CHECK(explore.snapshot().frame.revision == submitted_revision);
     REQUIRE(probe->Wait([&] { return probe->assignments.empty(); }));
-
     explore.Shutdown();
     CHECK(explore.stopped());
     CHECK(backend->synchronized >= 1U);
@@ -3733,7 +3465,6 @@ TEST_CASE("Explore lane read and callback gates preserve the accepted atlas thro
     CHECK(probe->quiescences >= 1U);
     CHECK(probe->assignments.empty());
 }
-
 TEST_CASE("Explore storage diagnostics aggregate renderer and all three output slots lazily") {
     const bool logging_enabled = GENERATE(false, true);
     CAPTURE(logging_enabled);
@@ -3762,21 +3493,19 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
         std::atomic_bool enabled{true};
     } capture;
     capture.enabled.store(logging_enabled);
-    const VisualDiagnosticSink diagnostics{
-        .context = &capture,
-        .write =
-            [](void* context, VisualDiagnosticFact fact) noexcept {
-                if (fact.operation != VisualDiagnosticOperation::ExploreCacheStorage) return;
-                auto& observed_capture = *static_cast<Capture*>(context);
-                std::scoped_lock lock(observed_capture.mutex);
-                observed_capture.storage = fact;
-            },
-        .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled.load(); }};
+    const VisualDiagnosticSink diagnostics{.context = &capture,
+                                           .write =
+                                               [](void* context, VisualDiagnosticFact fact) noexcept {
+                                                   if (fact.operation != VisualDiagnosticOperation::ExploreCacheStorage) return;
+                                                   auto& observed_capture = *static_cast<Capture*>(context);
+                                                   std::scoped_lock lock(observed_capture.mutex);
+                                                   observed_capture.storage = fact;
+                                               },
+                                           .enabled = [](void* context) noexcept { return static_cast<Capture*>(context)->enabled.load(); }};
     auto calls = std::make_shared<std::atomic<std::size_t>>(0U);
     auto backend = std::make_shared<FakeImageBackend>();
     auto factory = RuntimeFactory(
-        0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-        [calls] { return std::make_unique<StorageAlgorithm>(calls); }, 3U);
+        0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [calls] { return std::make_unique<StorageAlgorithm>(calls); }, 3U);
     mmltk::frameworks::gpu::SystemImageRuntime* physical = nullptr;
     LoadedSettings settings;
     EventGate events;
@@ -3824,7 +3553,6 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
     explore.Shutdown();
     CHECK((calls->load() != 0U) == logging_enabled);
 }
-
 TEST_CASE("Explore Open rejects never-loaded settings before runtime construction") {
     SettingsSystem settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -3840,7 +3568,6 @@ TEST_CASE("Explore Open rejects never-loaded settings before runtime constructio
                           },
                           [events](ExploreSystem::event_type) { events->fetch_add(1U, std::memory_order_release); }};
     const auto before = explore.snapshot();
-
     CHECK_THROWS_AS(explore.Open({.viewport = {}, .compiled_source = "/test"}), contracts::InvalidIntentError);
     CHECK_THROWS_AS(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}), contracts::UnavailableError);
     CHECK(constructions->load(std::memory_order_acquire) == 0U);
@@ -3848,21 +3575,17 @@ TEST_CASE("Explore Open rejects never-loaded settings before runtime constructio
     CHECK(explore.snapshot().revision == before.revision);
     CHECK(explore.snapshot().busy == before.busy);
 }
-
 TEST_CASE("Explore settings guards reject reopen and live filter before candidate work") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
     auto work = std::make_shared<ExploreWorkProbe>();
     EventGate events;
-    ExploreSystem explore{settings.system(), kDevice, 2U,
-                          RuntimeFactory(
-                              0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                              [work] {
-                                  return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                                nullptr, nullptr, work);
-                              },
-                              3U),
-                          [&events](ExploreSystem::event_type) { events.Advance(); }};
+    ExploreSystem explore{
+        settings.system(), kDevice, 2U,
+        RuntimeFactory(
+            0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+            [work] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work); }, 3U),
+        [&events](ExploreSystem::event_type) { events.Advance(); }};
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
     REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
     const auto before = explore.snapshot();
@@ -3870,7 +3593,6 @@ TEST_CASE("Explore settings guards reject reopen and live filter before candidat
     const auto prepares = work->prepares.load(std::memory_order_acquire);
     const auto renders = work->renders.load(std::memory_order_acquire);
     settings.MakeUnavailable();
-
     CHECK_THROWS_AS(explore.UpdateFilter({
                         .filter = {.minimum_instances = 2U, .maximum_instances = 1U},
                     }),
@@ -3888,7 +3610,6 @@ TEST_CASE("Explore settings guards reject reopen and live filter before candidat
     CHECK(explore.snapshot().frame.extent == before.frame.extent);
     CHECK(explore.snapshot().frame.revision == before.frame.revision);
 }
-
 TEST_CASE("Explore viewport and Annotation pointer work preserve their intended ordering") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
@@ -3923,7 +3644,6 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     CHECK(observed_nproc->load(std::memory_order_acquire) == 4U);
     CHECK(diagnostics.count.load(std::memory_order_acquire) != 0U);
     CHECK(diagnostics.last_system.load(std::memory_order_acquire) == contracts::DiagnosticOwner::Explore);
-
     EventGate annotation_events;
     std::atomic_uint64_t failures{0U};
     auto probe = std::make_shared<AnnotationRenderProbe>();
@@ -3940,9 +3660,7 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     annotation.SetInputPeer(7U);
     auto retained = hold_annotation_frame(annotation, annotation_events, contracts::AnnotationTool::Box);
     const auto initial = annotation.snapshot();
-    const auto mouse = [&](WorkspaceMouseKind kind, float x) {
-        return mmltk::testsupport::annotation_mouse(annotation, 7U, kind, {x, 3.0F + x});
-    };
+    const auto mouse = [&](WorkspaceMouseKind kind, float x) { return mmltk::testsupport::annotation_mouse(annotation, 7U, kind, {x, 3.0F + x}); };
     auto invalid = mouse(WorkspaceMouseKind::Motion, std::numeric_limits<float>::infinity());
     CHECK_THROWS_AS(annotation.Input(invalid), contracts::InvalidIntentError);
     annotation.Input(mouse(WorkspaceMouseKind::Press, 2.0F));
@@ -3950,7 +3668,6 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     annotation.Input(mouse(WorkspaceMouseKind::Release, 9.0F));
     REQUIRE(annotation_events.Wait([&] { return annotation.snapshot().ui.document_revision > initial.ui.document_revision; }));
     CHECK(annotation.snapshot().ui.scene.objects.back().box == contracts::AnnotationBox{{2, 5}, {9, 12}});
-
     // Save and undo settle without waiting for the held output, and preserve the
     // ordered box commit in the real reducer/history rather than a mock journal.
     mmltk::testsupport::ScopedTempDir saved_document{"mmltk-annotation-independent-save"};
@@ -3978,7 +3695,6 @@ TEST_CASE("Explore viewport and Annotation pointer work preserve their intended 
     annotation.Shutdown();
     CHECK_THROWS_AS(annotation.Input(retired_mouse), contracts::UnavailableError);
 }
-
 TEST_CASE("Explore installs and atomically persists typed live filter preferences") {
     auto settings_events = std::make_shared<std::atomic_uint64_t>(0U);
     LoadedSettings settings{[settings_events](SettingsSystem::event_type) { settings_events->fetch_add(1U, std::memory_order_acq_rel); }};
@@ -3998,12 +3714,9 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
                     .shuffle_seed = 41U,
                     .require_boxes = true,
                 },
-            .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
-                        .show_boxes = false,
-                        .show_masks = true},
+            .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}}, .show_boxes = false, .show_masks = true},
         });
     CHECK(settings_events->load(std::memory_order_acquire) == initial_events + 1U);
-
     auto backend = std::make_shared<FakeImageBackend>();
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
     auto scenario = tracked_explore_scenario(settings, backend, commits);
@@ -4015,7 +3728,6 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
     CHECK(explore.snapshot().order.shuffle_seed == 41U);
     CHECK(explore.snapshot().overlay.class_selection.classes == std::vector<std::uint32_t>{1U});
     CHECK_FALSE(explore.snapshot().overlay.show_boxes);
-
     const ExploreFilterUpdate updated{
         .filter =
             {
@@ -4027,9 +3739,7 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
                 .order = ExploreOrder::Sequential,
                 .require_masks = true,
             },
-        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}},
-                    .show_boxes = true,
-                    .show_masks = false},
+        .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}}, .show_boxes = true, .show_masks = false},
     };
     const auto before_update_events = settings_events->load(std::memory_order_acquire);
     const auto admitted = explore.UpdateFilter(updated);
@@ -4044,7 +3754,6 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
     CHECK(settings_events->load(std::memory_order_acquire) == before_update_events + 1U);
     CHECK(commits->load(std::memory_order_acquire) == 2U);
 }
-
 TEST_CASE("Explore preserves classes for one catalog and resets both selections after a different successful catalog") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4053,7 +3762,6 @@ TEST_CASE("Explore preserves classes for one catalog and resets both selections 
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto first_identity = explore.snapshot().dataset.class_catalog_identity;
     REQUIRE(first_identity != 0U);
-
     const ExploreFilterUpdate selected{
         .filter =
             {
@@ -4064,13 +3772,11 @@ TEST_CASE("Explore preserves classes for one catalog and resets both selections 
     };
     auto admitted = explore.UpdateFilter(selected);
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
-
     admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/same-catalog"});
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     CHECK(explore.snapshot().dataset.class_catalog_identity == first_identity);
     CHECK(explore.snapshot().filter.class_selection == selected.filter.class_selection);
     CHECK(explore.snapshot().overlay.class_selection == selected.overlay.class_selection);
-
     admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     const auto changed = explore.snapshot();
@@ -4083,7 +3789,6 @@ TEST_CASE("Explore preserves classes for one catalog and resets both selections 
     CHECK(persisted.policy.filter.class_selection.mode == ExploreClassSelectionMode::All);
     CHECK(persisted.policy.overlay.class_selection.mode == ExploreClassSelectionMode::All);
 }
-
 TEST_CASE("Explore augmentation and detail mutations persist and keep reroll identities distinct") {
     auto backend = std::make_shared<FakeImageBackend>();
     LoadedSettings settings;
@@ -4092,7 +3797,6 @@ TEST_CASE("Explore augmentation and detail mutations persist and keep reroll ide
     scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
     REQUIRE_FALSE(explore.snapshot().augmentation.enabled);
     REQUIRE(explore.snapshot().augmentation.seed == 0U);
-
     auto admitted = explore.UpdateAugmentation({.enabled = true});
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     const auto order_seed = explore.snapshot().order.shuffle_seed;
@@ -4100,20 +3804,17 @@ TEST_CASE("Explore augmentation and detail mutations persist and keep reroll ide
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     CHECK(explore.snapshot().augmentation.seed == 1U);
     CHECK(explore.snapshot().order.shuffle_seed == order_seed);
-
     admitted = explore.UpdateDetail({.show_original_dimensions = true});
     CHECK(explore.snapshot().revision == admitted.revision);
     CHECK(explore.snapshot().detail.show_original_dimensions);
     const auto persisted = settings.system().explore_settings_candidate();
     CHECK(persisted.augmentation_preview_enabled);
     CHECK(persisted.show_original_dimensions);
-
     admitted = explore.UpdateAugmentation({.enabled = false});
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     CHECK(explore.snapshot().augmentation.seed == 1U);
     CHECK_THROWS_AS(explore.RerollAugmentation(), contracts::UnavailableError);
 }
-
 // CLEANUP-IGNORE: Detail-extent and focus-slot scenarios inject different algorithm evidence at distinct boundaries.
 TEST_CASE("Explore original-content sampling preserves the full native detail product") {
     class DocumentExploreAlgorithm final : public TestExploreAlgorithm {
@@ -4125,8 +3826,8 @@ TEST_CASE("Explore original-content sampling preserves the full native detail pr
     auto extents = std::make_shared<ExploreDetailExtentProbe>();
     LoadedSettings settings;
     ExploreScenario scenario{settings, backend, [extents] {
-                                 return std::make_unique<DocumentExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                                   nullptr, nullptr, nullptr, nullptr, extents);
+                                 return std::make_unique<DocumentExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr,
+                                                                                   nullptr, nullptr, extents);
                              }};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {96U, 48U}, .row_count = 1U, .columns = 2U});
@@ -4136,7 +3837,6 @@ TEST_CASE("Explore original-content sampling preserves the full native detail pr
     auto admitted = explore.Select({.compiled_index = 1U});
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     CHECK(explore.snapshot().frame.extent == extents->padded);
-
     const auto full_frame = explore.snapshot().frame;
     CHECK((full_frame.content == VisualRegion{8U, 16U, 48U, 32U}));
     const auto detail_metadata = explore.ImageSnapshot(full_frame);
@@ -4173,26 +3873,24 @@ TEST_CASE("Explore original-content sampling preserves the full native detail pr
         CHECK(settings.system().explore_settings_candidate().show_original_dimensions == original);
     }
 }
-
 TEST_CASE("Explore Open commits the effective pending filter with a different catalog") {
     auto settings_events = std::make_shared<std::atomic_uint64_t>(0U);
     auto emitted_revision = std::make_shared<std::atomic_uint64_t>(0U);
     auto emitted_catalog = std::make_shared<std::atomic_uint64_t>(0U);
     auto emitted_minimum_instances = std::make_shared<std::atomic_uint32_t>(0U);
     auto emitted_show_boxes = std::make_shared<std::atomic_bool>(true);
-    LoadedSettings settings{[settings_events, emitted_revision, emitted_catalog, emitted_minimum_instances,
-                             emitted_show_boxes](SettingsSystem::event_type event) {
-        const auto& snapshot = std::get<SettingsChanged>(event).snapshot;
-        emitted_revision->store(snapshot.revision, std::memory_order_release);
-        emitted_catalog->store(snapshot.settings_state.workflows.explore.class_catalog_identity, std::memory_order_release);
-        emitted_minimum_instances->store(snapshot.settings_state.workflows.explore.min_instances, std::memory_order_release);
-        emitted_show_boxes->store(snapshot.settings_state.workflows.explore.show_boxes, std::memory_order_release);
-        settings_events->fetch_add(1U, std::memory_order_acq_rel);
-    }};
+    LoadedSettings settings{
+        [settings_events, emitted_revision, emitted_catalog, emitted_minimum_instances, emitted_show_boxes](SettingsSystem::event_type event) {
+            const auto& snapshot = std::get<SettingsChanged>(event).snapshot;
+            emitted_revision->store(snapshot.revision, std::memory_order_release);
+            emitted_catalog->store(snapshot.settings_state.workflows.explore.class_catalog_identity, std::memory_order_release);
+            emitted_minimum_instances->store(snapshot.settings_state.workflows.explore.min_instances, std::memory_order_release);
+            emitted_show_boxes->store(snapshot.settings_state.workflows.explore.show_boxes, std::memory_order_release);
+            settings_events->fetch_add(1U, std::memory_order_acq_rel);
+        }};
     queue_failed_explore_overlay_update(settings);
     const auto events_before_open = settings_events->load(std::memory_order_acquire);
     settings.RestorePersistence();
-
     auto backend = std::make_shared<FakeImageBackend>();
     ExploreScenario scenario{settings, backend};
     auto& explore = scenario.system();
@@ -4202,7 +3900,6 @@ TEST_CASE("Explore Open commits the effective pending filter with a different ca
     CHECK(opened.filter.minimum_instances == 2U);
     CHECK(opened.filter.class_selection.mode == ExploreClassSelectionMode::All);
     CHECK(opened.overlay.class_selection.mode == ExploreClassSelectionMode::All);
-
     const auto committed = settings.system().explore_settings_candidate().preferences;
     CHECK(committed.class_catalog_identity == opened.dataset.class_catalog_identity);
     CHECK(committed.policy.filter == opened.filter);
@@ -4213,7 +3910,6 @@ TEST_CASE("Explore Open commits the effective pending filter with a different ca
     CHECK(emitted_catalog->load(std::memory_order_acquire) == committed.class_catalog_identity);
     CHECK(emitted_minimum_instances->load(std::memory_order_acquire) == committed.policy.filter.minimum_instances);
     CHECK_FALSE(emitted_show_boxes->load(std::memory_order_acquire));
-
     SettingsSystem reloaded;
     REQUIRE(reloaded.Load(settings.location()).applied());
     const auto durable = reloaded.explore_settings_candidate().preferences;
@@ -4222,7 +3918,6 @@ TEST_CASE("Explore Open commits the effective pending filter with a different ca
     CHECK(durable.policy.overlay == committed.policy.overlay);
     CHECK(reloaded.snapshot().revision == committed_snapshot.revision);
 }
-
 TEST_CASE("failed Explore catalog persistence restores the pending filter for ordinary Retry") {
     LoadedSettings settings;
     auto failures = std::make_shared<std::atomic_uint64_t>(0U);
@@ -4233,7 +3928,6 @@ TEST_CASE("failed Explore catalog persistence restores the pending filter for or
     const auto prior = select_explore_subset(settings, scenario, 1U);
     const auto committed = explore.snapshot();
     queue_failed_explore_overlay_update(settings);
-
     const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
     REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy; }));
     CHECK(explore.snapshot().ready);
@@ -4244,14 +3938,12 @@ TEST_CASE("failed Explore catalog persistence restores the pending filter for or
     CHECK(explore.snapshot().frame == committed.frame);
     CHECK(explore.snapshot().revision > admitted.revision);
     CHECK(settings.system().snapshot().settings_state.workflows.explore.class_catalog_identity == prior.class_catalog_identity);
-
     settings.RestorePersistence();
     REQUIRE(settings.system().Retry().applied());
     const auto recovered = settings.system().explore_settings_candidate().preferences;
     CHECK_FALSE(recovered.policy.overlay.show_boxes);
     CHECK(recovered.policy.filter.minimum_instances == 2U);
     check_catalog_selection_preserved(recovered, prior);
-
     SettingsSystem reloaded;
     REQUIRE(reloaded.Load(settings.location()).applied());
     const auto durable = reloaded.explore_settings_candidate().preferences;
@@ -4259,7 +3951,6 @@ TEST_CASE("failed Explore catalog persistence restores the pending filter for or
     CHECK(durable.policy.overlay == recovered.policy.overlay);
     CHECK(durable.class_catalog_identity == prior.class_catalog_identity);
 }
-
 TEST_CASE("Explore Open rejects a settings candidate made stale during rendering") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4272,7 +3963,6 @@ TEST_CASE("Explore Open rejects a settings candidate made stale during rendering
     static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"}));
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     entered.get();
-
     enable_dark_mode(settings);
     gate->release.set_value();
     REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U && !explore.snapshot().busy; }));
@@ -4282,7 +3972,6 @@ TEST_CASE("Explore Open rejects a settings candidate made stale during rendering
     CHECK(current.settings_state.ui.dark_mode);
     CHECK(current.settings_state.workflows.explore.class_catalog_identity == 0U);
 }
-
 TEST_CASE("failed and cancelled Explore opens preserve the last successful catalog preferences") {
     SECTION("failed open") {
         LoadedSettings settings;
@@ -4291,7 +3980,6 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
         auto& explore = scenario.system();
         scenario.OpenAndWait({.extent = {64U, 64U}});
         const auto before = select_explore_subset(settings, scenario, 0U);
-
         const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/failed"});
         REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
         CHECK_FALSE(explore.snapshot().failure.empty());
@@ -4300,21 +3988,18 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
         const auto after = settings.system().explore_settings_candidate().preferences;
         check_catalog_selection_preserved(after, before);
     }
-
     SECTION("cancelled open") {
         LoadedSettings settings;
         auto backend = std::make_shared<FakeImageBackend>();
         auto gate = std::make_shared<ExploreFinalizationGate>();
         auto entered = gate->entered.get_future();
         ExploreScenario scenario{settings, backend, [gate] {
-                                     return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                                   nullptr, gate);
+                                     return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, gate);
                                  }};
         auto& explore = scenario.system();
         auto settle_explore = settle_explore_on_exit(explore, gate->release);
         scenario.OpenAndWait({.extent = {64U, 64U}});
         const auto before = select_explore_subset(settings, scenario, 0U);
-
         gate->Arm();
         const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/different-catalog"});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
@@ -4326,14 +4011,12 @@ TEST_CASE("failed and cancelled Explore opens preserve the last successful catal
         check_catalog_selection_preserved(after, before);
     }
 }
-
 TEST_CASE("Explore candidate allocation and render failures restore the committed dataset and frame") {
     const auto run = [](const std::string_view source) {
         TrackedExploreFailureFixture fixture;
         auto& explore = fixture.system();
         fixture.OpenAndWait();
         const auto before = explore.snapshot();
-
         const auto admitted = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = std::string{source}});
         const auto restored = wait_for_explore_failure(fixture.scenario(), fixture.failures(), admitted.revision);
         CHECK(restored.ready);
@@ -4347,11 +4030,9 @@ TEST_CASE("Explore candidate allocation and render failures restore the committe
         CHECK_FALSE(restored.failure.empty());
         CHECK(fixture.commit_count() == 1U);
     };
-
     SECTION("candidate allocation") { run("/allocation-failed"); }
     SECTION("candidate render") { run("/render-failed"); }
 }
-
 TEST_CASE("Explore filter preparation and render failures discard candidates without invalidating the runtime") {
     const auto run = [](const std::uint32_t minimum_instances) {
         TrackedExploreFailureFixture fixture;
@@ -4367,11 +4048,9 @@ TEST_CASE("Explore filter preparation and render failures discard candidates wit
         REQUIRE(fixture.scenario().Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > selected.revision; }));
         CHECK(explore.snapshot().mode == ExploreMode::Detail);
     };
-
     SECTION("prepare allocation") { run(7U); }
     SECTION("candidate render") { run(8U); }
 }
-
 TEST_CASE("Explore shuffled policy rerolls with a fresh resolved seed and validates dataset policy") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4381,7 +4060,6 @@ TEST_CASE("Explore shuffled policy rerolls with a fresh resolved seed and valida
     CHECK(explore.snapshot().viewport.first_row == 0U);
     CHECK(explore.snapshot().viewport.row_count == 1U);
     CHECK(explore.snapshot().viewport.columns == 3U);
-
     ExploreFilterUpdate shuffled{
         .filter = {.maximum_compiled_index = 2U, .order = ExploreOrder::Shuffled, .shuffle_seed = 97U},
         .overlay = {},
@@ -4393,14 +4071,12 @@ TEST_CASE("Explore shuffled policy rerolls with a fresh resolved seed and valida
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     CHECK(explore.snapshot().order.shuffle_seed != 0U);
     CHECK(explore.snapshot().order.shuffle_seed != 97U);
-
     shuffled.filter.minimum_compiled_index = 3U;
     CHECK_THROWS_AS(explore.UpdateFilter(shuffled), contracts::InvalidIntentError);
     shuffled.filter.minimum_compiled_index = 0U;
     shuffled.overlay.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {2U}};
     CHECK_THROWS_AS(explore.UpdateFilter(shuffled), contracts::InvalidIntentError);
 }
-
 TEST_CASE("Explore normalizes saved dataset policy locally and projects every class selection mode") {
     LoadedSettings settings;
     persist_explore_catalog(settings.system(), test_explore_catalog_identity());
@@ -4415,7 +4091,6 @@ TEST_CASE("Explore normalizes saved dataset policy locally and projects every cl
     };
     (void)settings.system().persist_explore_filter(settings.system().explore_settings_candidate(), saved);
     const auto saved_revision = settings.system().snapshot().revision;
-
     auto backend = std::make_shared<FakeImageBackend>();
     ExploreScenario scenario{settings, backend};
     auto& explore = scenario.system();
@@ -4427,7 +4102,6 @@ TEST_CASE("Explore normalizes saved dataset policy locally and projects every cl
     CHECK(settings.system().explore_settings_candidate().preferences.policy.filter == saved.filter);
     CHECK(settings.system().explore_settings_candidate().preferences.policy.overlay == saved.overlay);
     CHECK(settings.system().snapshot().revision == saved_revision);
-
     const auto update_and_wait = [&scenario, &explore](ExploreFilterUpdate update) {
         const auto admitted = explore.UpdateFilter(std::move(update));
         REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
@@ -4440,7 +4114,6 @@ TEST_CASE("Explore normalizes saved dataset policy locally and projects every cl
     CHECK(explore.snapshot().filter.class_selection.classes.empty());
     CHECK(explore.snapshot().overlay.class_selection.mode == ExploreClassSelectionMode::None);
     CHECK(explore.snapshot().overlay.class_selection.classes.empty());
-
     update_and_wait({
         .filter = {.class_selection = {.mode = ExploreClassSelectionMode::None}, .maximum_compiled_index = 2U},
         .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {0U}}},
@@ -4449,22 +4122,19 @@ TEST_CASE("Explore normalizes saved dataset policy locally and projects every cl
     CHECK(explore.snapshot().filter.class_selection.classes.empty());
     CHECK(explore.snapshot().overlay.class_selection == ExploreClassSelection{.mode = ExploreClassSelectionMode::Subset, .classes = {0U}});
 }
-
 TEST_CASE("Explore persistence failure retains the ready runtime product") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
     auto failures = std::make_shared<std::atomic_uint64_t>(0U);
-    ExploreScenario scenario{
-        settings, backend,
-        [commits] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits); },
-        count_explore_failures(failures)};
+    ExploreScenario scenario{settings, backend,
+                             [commits] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits); },
+                             count_explore_failures(failures)};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {64U, 64U}});
     const auto prior = explore.snapshot();
     const auto persisted = settings.system().snapshot();
     settings.BreakPersistence();
-
     static_cast<void>(explore.UpdateFilter({
         .filter = {.minimum_instances = 3U},
         .overlay = {.show_boxes = false, .show_masks = false},
@@ -4486,7 +4156,6 @@ TEST_CASE("Explore persistence failure retains the ready runtime product") {
     CHECK(settings.system().snapshot().revision == persisted.revision);
     CHECK(commits->load(std::memory_order_acquire) == 1U);
 }
-
 TEST_CASE("Explore stale filter persistence discards the rendered candidate and restores the committed product") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4510,7 +4179,6 @@ TEST_CASE("Explore stale filter persistence discards the rendered candidate and 
     CHECK(settings.system().explore_settings_candidate().preferences.policy.filter == committed.filter);
     CHECK(commits->load(std::memory_order_acquire) == 1U);
 }
-
 TEST_CASE("Explore successful persistence is settled before Stop can observe it") {
     auto persistence_entered = std::make_shared<std::promise<void>>();
     auto release_persistence = std::make_shared<std::promise<void>>();
@@ -4548,7 +4216,6 @@ TEST_CASE("Explore successful persistence is settled before Stop can observe it"
     }));
     CHECK(commits->load(std::memory_order_acquire) == 2U);
 }
-
 TEST_CASE("Explore Open cancellation wins at its post-render finalization boundary") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4556,8 +4223,7 @@ TEST_CASE("Explore Open cancellation wins at its post-render finalization bounda
     auto gate = std::make_shared<ExploreFinalizationGate>();
     auto entered = gate->entered.get_future();
     ExploreScenario scenario{settings, backend, [commits, gate] {
-                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr,
-                                                                               commits, gate);
+                                 return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, commits, gate);
                              }};
     auto& explore = scenario.system();
     auto settle_explore = settle_explore_on_exit(explore, gate->release);
@@ -4573,7 +4239,6 @@ TEST_CASE("Explore Open cancellation wins at its post-render finalization bounda
     CHECK_FALSE(explore.BorrowFrame().valid());
     CHECK(commits->load(std::memory_order_acquire) == 0U);
 }
-
 TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
     auto persistence_entered = std::make_shared<std::promise<void>>();
     auto release_persistence = std::make_shared<std::promise<void>>();
@@ -4589,13 +4254,12 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
     auto changed_events = std::make_shared<std::atomic_uint64_t>(0U);
     auto changed_revision = std::make_shared<std::atomic_uint64_t>(0U);
-    auto scenario =
-        tracked_explore_scenario(settings, backend, commits, [changed_events, changed_revision](ExploreSystem::event_type event) {
-            if (const auto* changed = std::get_if<ExploreChanged>(&event)) {
-                changed_revision->store(changed->snapshot.revision, std::memory_order_release);
-                changed_events->fetch_add(1U, std::memory_order_acq_rel);
-            }
-        });
+    auto scenario = tracked_explore_scenario(settings, backend, commits, [changed_events, changed_revision](ExploreSystem::event_type event) {
+        if (const auto* changed = std::get_if<ExploreChanged>(&event)) {
+            changed_revision->store(changed->snapshot.revision, std::memory_order_release);
+            changed_events->fetch_add(1U, std::memory_order_acq_rel);
+        }
+    });
     auto& explore = scenario.system();
     std::future<ExploreSnapshot> stopped;
     auto settle_persistence = settle_explore_on_exit(explore, *release_persistence);
@@ -4603,7 +4267,6 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
     const auto first_identity = explore.snapshot().dataset.class_catalog_identity;
     static_cast<void>(select_explore_subset(settings, scenario, 1U));
     const auto events_before_open = changed_events->load(std::memory_order_acquire);
-
     block_persistence->store(true, std::memory_order_release);
     // CLEANUP-IGNORE: This Open drives catalog replacement through a blocked persistence boundary; the prior filter
     // operation tests successful persistence before Stop.
@@ -4613,12 +4276,10 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
     // Persistence has reached its dependency-owned publication boundary.
     // Stop must observe its committed outcome after release, independently of
     // when the concurrent call reaches the private admission mutex.
-
     release_persistence->set_value();
     REQUIRE(stopped.wait_for(2s) == std::future_status::ready);
     const auto stop_result = stopped.get();
-    REQUIRE(scenario.Wait(
-        [&] { return changed_events->load(std::memory_order_acquire) == events_before_open + 1U && !explore.snapshot().busy; }));
+    REQUIRE(scenario.Wait([&] { return changed_events->load(std::memory_order_acquire) == events_before_open + 1U && !explore.snapshot().busy; }));
     const auto settled = explore.snapshot();
     CHECK(settled.ready);
     CHECK_FALSE(settled.cancellation_requested);
@@ -4634,7 +4295,6 @@ TEST_CASE("Explore Open and Stop linearize around catalog persistence") {
     CHECK(settings.system().explore_settings_candidate().preferences.class_catalog_identity == settled.dataset.class_catalog_identity);
     CHECK(commits->load(std::memory_order_acquire) == 3U);
 }
-
 TEST_CASE("Explore cancellation during saved-filter preparation discards the unpublished native Open") {
     const auto run = [](const std::size_t blocked_call) {
         LoadedSettings settings;
@@ -4661,7 +4321,6 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
             wait_settled(opened);
             REQUIRE(explore.snapshot().ready);
         }
-
         const auto admission = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/cancelled"});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
         entered.get();
@@ -4679,7 +4338,6 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
         CHECK_FALSE(settled.cancellation_requested);
         CHECK(probe->resets.load(std::memory_order_acquire) == (blocked_call == 0U ? 1U : 0U));
         CHECK(probe->commits.load(std::memory_order_acquire) == blocked_call);
-
         const auto reopened = explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/fresh"});
         wait_settled(reopened);
         REQUIRE(explore.snapshot().ready);
@@ -4687,11 +4345,9 @@ TEST_CASE("Explore cancellation during saved-filter preparation discards the unp
         CHECK(explore.snapshot().frame.valid());
         CHECK(probe->commits.load(std::memory_order_acquire) == blocked_call + 1U);
     };
-
     SECTION("first Open") { run(0U); }
     SECTION("reopen") { run(1U); }
 }
-
 TEST_CASE("Annotation peer closure orders accepted input before replacement gestures") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore source{backend, {32U, 32U}};
@@ -4715,7 +4371,6 @@ TEST_CASE("Annotation peer closure orders accepted input before replacement gest
     CHECK(annotation.snapshot().ui.scene.objects.back().box == contracts::AnnotationBox{{6, 7}, {8, 9}});
     CHECK(annotation.snapshot().ready);
 }
-
 // CLEANUP-IGNORE: This settings-capture scenario and the overlay-retention scenario require independent fixture owners.
 TEST_CASE("Explore newest desired work renders the captured current Settings augmentation configuration") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4737,18 +4392,14 @@ TEST_CASE("Explore newest desired work renders the captured current Settings aug
         overlay.show_masks = !overlay.show_masks;
         static_cast<void>(scenario.system().UpdateOverlay(overlay));
     }
-    REQUIRE(scenario.Wait([&] {
-        return scenario.system().snapshot().frame != previous &&
-               probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested;
-    }));
+    REQUIRE(scenario.Wait(
+        [&] { return scenario.system().snapshot().frame != previous && probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested; }));
     CHECK(probe->rendered_copy_paste_probability.load(std::memory_order_acquire) == requested);
     CHECK(settings.system().explore_settings_candidate().augmentation.copy_paste_probability == requested);
 }
-
 struct ExploreViewportApplication final {
     ExploreSystem* explore;
 };
-
 TEST_CASE("Explore viewport admission rejects malformed grids and publishes native capacity results") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4759,8 +4410,7 @@ TEST_CASE("Explore viewport admission rejects malformed grids and publishes nati
     for (const auto viewport :
          {ExploreViewport{.extent = {64U, 64U}, .columns = 2U}, ExploreViewport{.extent = {65U, 32U}, .columns = 2U},
           ExploreViewport{.extent = {64U, 65U}, .row_count = 2U, .columns = 2U}, ExploreViewport{.extent = {64U, 64U}, .row_count = 0U},
-          ExploreViewport{.extent = {64U, 64U}, .columns = 0U},
-          ExploreViewport{.extent = {1U, 1U}, .row_count = UINT32_MAX, .columns = UINT32_MAX}}) {
+          ExploreViewport{.extent = {64U, 64U}, .columns = 0U}, ExploreViewport{.extent = {1U, 1U}, .row_count = UINT32_MAX, .columns = UINT32_MAX}}) {
         CHECK_FALSE(viewport.valid());
         CHECK_THROWS_AS(explore.UpdateViewport({.viewport = viewport}), contracts::InvalidIntentError);
     }
@@ -4776,15 +4426,13 @@ TEST_CASE("Explore viewport admission rejects malformed grids and publishes nati
     CHECK(rejected.frame == prior.frame);
     CHECK(rejected.gallery.generation == prior.gallery.generation);
     CHECK(rejected.failure.empty());
-
     ExploreViewportApplication application{&explore};
     browser::wire::ByteBuffer bytes(mmltk::frameworks::serialization::compact_maximum_cbor_bytes<ExploreViewportUpdate>());
     mmltk::frameworks::serialization::FixedCborEncoder writer(bytes);
     REQUIRE(mmltk::frameworks::serialization::encode_compact(writer, request));
     bytes.resize(writer.size());
     const auto dispatched = browser::dispatch_interaction(
-        application,
-        browser::Interaction{.endpoint_id = browser::application_stable_id("explore", "UpdateViewport"), .value = std::move(bytes)});
+        application, browser::Interaction{.endpoint_id = browser::application_stable_id("explore", "UpdateViewport"), .value = std::move(bytes)});
     CHECK(dispatched.disposition == browser::InteractionDispatchDisposition::Accepted);
     rejected = explore.snapshot();
     REQUIRE(rejected.viewport_result);
@@ -4796,19 +4444,16 @@ TEST_CASE("Explore viewport admission rejects malformed grids and publishes nati
     REQUIRE(decoded.viewport_result);
     CHECK(decoded.viewport_result->outcome == ExploreViewportOutcome::VisibleCapacityExceeded);
     CHECK(decoded.viewport_result->request.viewport == request.viewport);
-
     const auto side = std::max(kDevice.maximum_width, kDevice.maximum_height) + 1U;
     explore.UpdateViewport({.viewport = {.extent = {side, side}}});
     REQUIRE(explore.snapshot().viewport_result);
     CHECK(explore.snapshot().viewport_result->outcome == ExploreViewportOutcome::AtlasExtentExceeded);
     CHECK(explore.snapshot().frame == prior.frame);
-
     explore.UpdateViewport({.viewport = prior.viewport});
     REQUIRE(explore.snapshot().viewport_result);
     CHECK(explore.snapshot().viewport_result->outcome == ExploreViewportOutcome::Ready);
     CHECK(explore.snapshot().viewport.valid());
 }
-
 TEST_CASE("Explore end-of-order clamping preserves square native atlas cells") {
     LoadedSettings settings;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -4825,7 +4470,6 @@ TEST_CASE("Explore end-of-order clamping preserves square native atlas cells") {
     CHECK(end.frame.extent == initial.frame.extent);
     CHECK(end.gallery.layout.row_count == end.viewport.row_count);
 }
-
 TEST_CASE("Explore unavailable runtime and selected transport publish distinct typed failures") {
     const bool transport = GENERATE(false, true);
     LoadedSettings settings;
@@ -4839,11 +4483,9 @@ TEST_CASE("Explore unavailable runtime and selected transport publish distinct t
     const auto failed = scenario.system().snapshot();
     CHECK_FALSE(failed.busy);
     CHECK_FALSE(failed.ready);
-    CHECK(failed.failure_kind ==
-          (transport ? ExploreFailureKind::SelectedTransportUnavailable : ExploreFailureKind::RuntimeInitialization));
+    CHECK(failed.failure_kind == (transport ? ExploreFailureKind::SelectedTransportUnavailable : ExploreFailureKind::RuntimeInitialization));
     CHECK(failed.maximum_atlas_extent.valid());
 }
-
 class TransportFailingExploreAlgorithm final : public TestExploreAlgorithm {
    public:
     explicit TransportFailingExploreAlgorithm(bool safe)
@@ -4859,7 +4501,6 @@ class TransportFailingExploreAlgorithm final : public TestExploreAlgorithm {
     bool safe_;
     std::exception_ptr retirement_;
 };
-
 TEST_CASE("Explore preserves selected transport classification through safe and unsafe retirement failures") {
     const bool safe = GENERATE(false, true);
     LoadedSettings settings;
@@ -4872,7 +4513,6 @@ TEST_CASE("Explore preserves selected transport classification through safe and 
     CHECK_FALSE(scenario.system().snapshot().busy);
     CHECK_FALSE(scenario.system().snapshot().ready);
 }
-
 TEST_CASE("Explore visibility preserves active augmentation and labels preserve the product") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<ExploreWorkProbe>();
@@ -4901,7 +4541,6 @@ TEST_CASE("Explore visibility preserves active augmentation and labels preserve 
     CHECK(reopened.dataset.identity == semantic.dataset.identity);
     CHECK(reopened.frame.clean_revision > semantic.frame.clean_revision);
 }
-
 TEST_CASE("Explore discrete products use the viewport current at execution") {
     auto run = [](const bool select) {
         auto backend = std::make_shared<FakeImageBackend>();
@@ -4909,12 +4548,10 @@ TEST_CASE("Explore discrete products use the viewport current at execution") {
         auto gate = std::make_shared<ExploreRenderGate>();
         auto entered = gate->entered.get_future();
         LoadedSettings settings;
-        ExploreScenario scenario{settings, backend,
-                                 [observed_nproc, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate); }};
+        ExploreScenario scenario{settings, backend, [observed_nproc, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate); }};
         auto& explore = scenario.system();
         auto settle_explore = settle_explore_on_exit(explore, gate->release);
         scenario.OpenAndWait({.extent = {63U, 21U}, .row_count = 1U, .columns = 3U});
-
         explore.UpdateViewport({.viewport = {.extent = {48U, 16U}, .row_count = 1U, .columns = 3U}});
         REQUIRE(entered.wait_for(2s) == std::future_status::ready);
         entered.get();
@@ -4922,14 +4559,11 @@ TEST_CASE("Explore discrete products use the viewport current at execution") {
         if (select)
             static_cast<void>(explore.Select({.compiled_index = 1U}));
         else
-            static_cast<void>(
-                explore.UpdateFilter({.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false, .show_masks = true}}));
+            static_cast<void>(explore.UpdateFilter({.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false, .show_masks = true}}));
         gate->release.set_value();
-
         REQUIRE(scenario.Wait([&] {
             const auto state = explore.snapshot();
-            return !state.busy && state.viewport.extent.width == 30U &&
-                   (select ? state.mode == ExploreMode::Detail : state.filter.minimum_instances == 1U);
+            return !state.busy && state.viewport.extent.width == 30U && (select ? state.mode == ExploreMode::Detail : state.filter.minimum_instances == 1U);
         }));
         const auto state = explore.snapshot();
         CHECK(state.frame.extent == state.viewport.extent);
@@ -4939,11 +4573,9 @@ TEST_CASE("Explore discrete products use the viewport current at execution") {
         REQUIRE(borrowed.valid());
         CHECK(borrowed.plane(0U).revision() == state.frame.revision);
     };
-
     SECTION("filter") { run(false); }
     SECTION("selection") { run(true); }
 }
-
 TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto observed_nproc = std::make_shared<std::atomic<std::size_t>>(0U);
@@ -4955,9 +4587,8 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
                                                    {
                                                        .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 17U},
                                                    });
-    ExploreScenario scenario{settings, backend, [observed_nproc, commits, gate] {
-                                 return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate, commits);
-                             }};
+    ExploreScenario scenario{settings, backend,
+                             [observed_nproc, commits, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate, commits); }};
     auto& explore = scenario.system();
     auto settle_explore = settle_explore_on_exit(explore, gate->release);
     scenario.OpenAndWait({.extent = {64U, 64U}});
@@ -4967,20 +4598,17 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
     entered.get();
     const auto admitted = explore.Reroll();
     CHECK(admitted.busy);
-
     const auto stopped = explore.Stop();
     CHECK_FALSE(stopped.busy);
     CHECK_FALSE(stopped.cancellation_requested);
     CHECK(stopped.revision > admitted.revision);
     CHECK(commits->load(std::memory_order_acquire) == 1U);
-
     gate->release.set_value();
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy; }));
     CHECK(explore.snapshot().viewport.extent == committed.viewport.extent);
     CHECK_FALSE(explore.snapshot().busy);
     CHECK(commits->load(std::memory_order_acquire) == 1U);
 }
-
 TEST_CASE("post-render Explore cancellation restores the committed gallery product") {
     const auto run = [](const bool selection) {
         auto backend = std::make_shared<FakeImageBackend>();
@@ -5021,20 +4649,17 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
         CHECK(explore.BorrowFrame().plane(0U).revision() == restored.frame.revision);
         CHECK(commits->load(std::memory_order_acquire) == 1U);
     };
-
     SECTION("discrete order") { run(false); }
     SECTION("selection") { run(true); }
 }
-
 TEST_CASE("Explore shared input lifecycles preserve atlas content through scrolling and selection", "[explore][priority]") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto work = std::make_shared<ExploreWorkProbe>();
     LoadedSettings settings;
     // The old borrowed atlas, current atlas and detail remain independently
     // retained while the fake algorithm initializes the closing-gallery output.
-    ExploreScenario scenario{
-        settings, 2U,
-        RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(work), 4U)};
+    ExploreScenario scenario{settings, 2U,
+                             RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(work), 4U)};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {96U, 96U}, .row_count = 2U, .columns = 2U});
     explore.SetInputPeer(1U);
@@ -5052,13 +4677,10 @@ TEST_CASE("Explore shared input lifecycles preserve atlas content through scroll
     CHECK_THROWS_AS(explore.Input({.source = PresentationSourceKind::Predict, .peer_epoch = 1U, .point = WorkspacePoint{1.0F, 1.0F}}),
                     contracts::InvalidIntentError);
     CHECK_THROWS_AS(motion({std::numeric_limits<float>::infinity(), 0.0F}), contracts::InvalidIntentError);
-    for (const auto point :
-         {WorkspacePoint{48.0F, 48.0F}, WorkspacePoint{96.0F, 0.0F}, WorkspacePoint{0.0F, 96.0F}, WorkspacePoint{-0.125F, 0.0F}}) {
+    for (const auto point : {WorkspacePoint{48.0F, 48.0F}, WorkspacePoint{96.0F, 0.0F}, WorkspacePoint{0.0F, 96.0F}, WorkspacePoint{-0.125F, 0.0F}}) {
         motion(point);
     }
-    for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Release, WorkspaceMouseKind::Wheel}) {
-        motion({1.5F, 1.5F}, kind);
-    }
+    for (const auto kind : {WorkspaceMouseKind::Press, WorkspaceMouseKind::Release, WorkspaceMouseKind::Wheel}) { motion({1.5F, 1.5F}, kind); }
     for (const auto kind : {WorkspaceMouseKind::Leave, WorkspaceMouseKind::Cancel}) {
         motion({1.5F, 1.5F}, kind);
         motion({1.5F, 1.5F});
@@ -5076,7 +4698,6 @@ TEST_CASE("Explore shared input lifecycles preserve atlas content through scroll
     REQUIRE(scenario.Wait([&] { return explore.snapshot().mode == ExploreMode::Gallery; }));
     CHECK(pixels.valid());
 }
-
 TEST_CASE("Explore selection and detail navigation publish complete bounded snapshots") {
     auto backend = std::make_shared<FakeImageBackend>();
     LoadedSettings settings;
@@ -5098,7 +4719,6 @@ TEST_CASE("Explore selection and detail navigation publish complete bounded snap
     }));
     CHECK(explore.snapshot().order.visible_indices.size() <= kExploreVisibleItemCapacity);
 }
-
 TEST_CASE("Visual workspace retirement resumes queued work only after its delayed physical outcome", "[workspace]") {
     using mmltk::frameworks::gpu::SystemImageRuntime;
     using mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess;
@@ -5116,15 +4736,15 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
     auto failure_result = failed.get_future();
     std::atomic<std::size_t> failures{0U};
     mmltk::testsupport::TestGate staged_gate("workspace staged retirement");
-    detail::VisualRuntimeOwner owner{[&](auto revisions) {
-                                         ++constructions;
-                                         auto runtime = std::make_unique<SystemImageRuntime>(
-                                             mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
-                                         return runtime;
-                                     },
-                                     [&](std::exception_ptr failure) {
-                                         if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
-                                     }};
+    detail::VisualRuntimeOwner owner{
+        [&](auto revisions) {
+            ++constructions;
+            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
+            return runtime;
+        },
+        [&](std::exception_ptr failure) {
+            if (failures.fetch_add(1U) == 0U) failed.set_value(failure);
+        }};
     submit_visual_workspace(owner, backend, created_workspace);
     auto workspace = mmltk::testsupport::await_test_future(workspace_result, "external workspace creation");
     REQUIRE(owner.SubmitDiscrete(
@@ -5136,8 +4756,7 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
         {}, true));
     mmltk::testsupport::ScopedTestCleanup release_stage{[&] { staged_gate.Release(); }};
     REQUIRE(staged_gate.WaitEntered(2s));
-    REQUIRE(owner.SubmitOrdered(
-        [&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { queued_completed.set_value(); }}; }));
+    REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { queued_completed.set_value(); }}; }));
     staged_gate.Release();
     mmltk::testsupport::await_test_future(staged_result, "staged workspace retirement handoff");
     CHECK(failures.load() == 0U);
@@ -5162,7 +4781,6 @@ TEST_CASE("Visual workspace retirement resumes queued work only after its delaye
     owner.StopAndWait();
     CHECK(constructions.load() == 2U);
 }
-
 TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake", "[workspace]") {
     using mmltk::frameworks::gpu::SystemImageRuntime;
     using mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess;
@@ -5172,8 +4790,7 @@ TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake",
     auto ready = created.get_future();
     auto owner = std::make_unique<detail::VisualRuntimeOwner>(
         [&](auto revisions) {
-            auto runtime = std::make_unique<SystemImageRuntime>(
-                mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
+            auto runtime = std::make_unique<SystemImageRuntime>(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
             return runtime;
         },
         [](std::exception_ptr) { FAIL("healthy delayed workspace unexpectedly failed"); });
@@ -5185,22 +4802,20 @@ TEST_CASE("Visual owner destruction detaches a healthy deferred workspace wake",
     CHECK(backend->contexts_destroyed == 2U);
     CHECK(mmltk::frameworks::gpu::test_support::ImportedImageBufferTestAccess::unmaps == 1U);
 }
-
 TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto constructions = std::make_shared<std::atomic<std::uint64_t>>(0U);
     auto failures = std::make_shared<std::atomic<std::uint64_t>>(0U);
     LoadedSettings settings;
-    ExploreScenario scenario{
-        settings, backend,
-        [constructions] {
-            const auto generation = constructions->fetch_add(1U, std::memory_order_acq_rel);
-            if (generation == 0U)
-                return std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>{std::make_unique<FailingExploreAlgorithm>()};
-            return std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>{
-                std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U))};
-        },
-        count_explore_failures(failures)};
+    ExploreScenario scenario{settings, backend,
+                             [constructions] {
+                                 const auto generation = constructions->fetch_add(1U, std::memory_order_acq_rel);
+                                 if (generation == 0U)
+                                     return std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>{std::make_unique<FailingExploreAlgorithm>()};
+                                 return std::unique_ptr<mmltk::frameworks::gpu::SystemImageModel>{
+                                     std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U))};
+                             },
+                             count_explore_failures(failures)};
     auto& explore = scenario.system();
     static_cast<void>(explore.Open({.viewport = {.extent = {32U, 32U}}, .compiled_source = "/test"}));
     REQUIRE(scenario.Wait([&] { return failures->load(std::memory_order_acquire) == 1U; }));
@@ -5214,7 +4829,6 @@ TEST_CASE("a failed visual aggregate publishes once and reconstructs lazily") {
     CHECK(failures->load(std::memory_order_acquire) == 1U);
     CHECK(constructions->load(std::memory_order_acquire) == 2U);
 }
-
 TEST_CASE("stopping Explore retains busy until its admitted operation settles") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<CancellationProbe>();
@@ -5242,7 +4856,6 @@ TEST_CASE("stopping Explore retains busy until its admitted operation settles") 
     CHECK(explore.snapshot().revision > stopping.revision);
     CHECK(explore.snapshot().frame.revision == completed);
 }
-
 TEST_CASE("cancelled Explore filter retains one native and public committed order") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<CancellationProbe>();
@@ -5252,8 +4865,7 @@ TEST_CASE("cancelled Explore filter retains one native and public committed orde
     // scenario.
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
     LoadedSettings settings;
-    ExploreScenario scenario{settings, backend,
-                             [probe, commits] { return std::make_unique<AtomicFilterExploreAlgorithm>(probe, commits); }};
+    ExploreScenario scenario{settings, backend, [probe, commits] { return std::make_unique<AtomicFilterExploreAlgorithm>(probe, commits); }};
     auto& explore = scenario.system();
     scenario.OpenAndWait({.extent = {32U, 32U}});
     const auto before = explore.snapshot();
@@ -5274,7 +4886,6 @@ TEST_CASE("cancelled Explore filter retains one native and public committed orde
     REQUIRE(explore.BorrowFrame().valid());
     CHECK(explore.BorrowFrame().plane(0U).revision() == explore.snapshot().frame.revision);
 }
-
 // CLEANUP-IGNORE: Finalization-gate cancellation and viewport execution configure distinct algorithm seams.
 TEST_CASE("Explore stop at filter finalization cancels before persistence") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -5311,7 +4922,6 @@ TEST_CASE("Explore stop at filter finalization cancels before persistence") {
     REQUIRE(explore.BorrowFrame().valid());
     CHECK(explore.BorrowFrame().plane(0U).revision() == settled.frame.revision);
 }
-
 // CLEANUP-IGNORE: Annotation receiver-copy rejection and Upscale high-water publication are distinct system tests.
 TEST_CASE("Annotation renderer failure retires resources and allows source restart") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -5346,7 +4956,6 @@ TEST_CASE("Annotation renderer failure retires resources and allows source resta
     complete_annotation_box_drag(annotation, events, 1U);
     CHECK(failures.load() == 2U);
 }
-
 TEST_CASE("Annotation unavailable source settles ordered input and commands before queued Open recovery") {
     const auto tool = GENERATE(contracts::AnnotationTool::Box, contracts::AnnotationTool::ColorSample);
     const bool request_stop = GENERATE(false, true);
@@ -5427,7 +5036,6 @@ TEST_CASE("Annotation unavailable source settles ordered input and commands befo
     CHECK(annotation.snapshot().ui.save_status == contracts::AnnotationSaveStatus::Saved);
     CHECK(std::filesystem::exists(destination));
 }
-
 TEST_CASE("Annotation rejects an oversized incoming document without changing its existing editor or pixels") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {512U, 256U}};
@@ -5448,8 +5056,7 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
                                     if (reject_incoming) borrowed.document = rejected_document;
                                     return borrowed;
                                 },
-                                [&events](AnnotationSystem::event_type) { events.Advance(); },
-                                mmltk::testsupport::annotation_render_evidence()};
+                                [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::open_annotation(annotation, events, source.frame());
     static_cast<void>(annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("kept category")}}}));
     REQUIRE(events.Wait([&] { return !annotation.snapshot().busy; }));
@@ -5474,7 +5081,6 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
     REQUIRE(annotation.snapshot().ui.scene.categories.size() == prior.ui.scene.categories.size() + 1U);
     CHECK(annotation.snapshot().ui.scene.categories.back().value == "kept category");
 }
-
 TEST_CASE("Annotation reduces input and settles commands while rendering is held") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore source{backend, {32U, 32U}};
@@ -5482,9 +5088,8 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     EventGate events;
     std::atomic_uint64_t held_scene{0U};
     std::atomic_bool older_completed{false};
-    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe),
-                                borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type) { events.Advance(); },
-                                mmltk::testsupport::annotation_render_evidence()};
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), borrow_exactly_from(source.system()),
+                                [&](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
     auto release = settle_annotation_on_exit(annotation, render.hold->release);
     mmltk::testsupport::open_annotation(annotation, events, source.system().snapshot().frame);
     const auto initial = annotation.snapshot();
@@ -5516,7 +5121,6 @@ TEST_CASE("Annotation reduces input and settles commands while rendering is held
     CHECK(annotation.snapshot().frame.revision > initial.frame.revision);
     CHECK(render.probe->exact_content.load());
 }
-
 TEST_CASE("Annotation Open consumes retained prior-document input and accepts the replacement gesture") {
     const auto terminal = GENERATE(WorkspaceMouseKind::Release, WorkspaceMouseKind::Cancel);
     auto backend = std::make_shared<FakeImageBackend>();
@@ -5526,11 +5130,10 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
     std::atomic_uint64_t failures{0U};
     std::mutex observations_mutex;
     std::vector<AnnotationSnapshot> replacements;
-    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe),
-                                borrow_exactly_from(source.system()), [&](AnnotationSystem::event_type event) {
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend, render.probe), borrow_exactly_from(source.system()),
+                                [&](AnnotationSystem::event_type event) {
                                     if (std::holds_alternative<AnnotationFailed>(event)) ++failures;
-                                    if (const auto* changed = std::get_if<AnnotationChanged>(&event);
-                                        changed && changed->snapshot.input_document_epoch == 2U) {
+                                    if (const auto* changed = std::get_if<AnnotationChanged>(&event); changed && changed->snapshot.input_document_epoch == 2U) {
                                         std::scoped_lock lock(observations_mutex);
                                         replacements.push_back(changed->snapshot);
                                     }
@@ -5575,7 +5178,6 @@ TEST_CASE("Annotation Open consumes retained prior-document input and accepts th
     complete_annotation_box_drag(annotation, events, 1U);
     CHECK(failures.load() == 0U);
 }
-
 TEST_CASE("Workspace input retains ordered high-water records for independent native owners") {
     WorkspaceInputQueue<WorkspaceMouse> queue;
     for (std::size_t index = 0U; index != 1024U; ++index)
@@ -5617,7 +5219,6 @@ TEST_CASE("Workspace input retains ordered high-water records for independent na
         CHECK_FALSE(owner.latest());
     }
 }
-
 TEST_CASE("Annotation color sampling completes before following document commands under output pressure") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {32U, 32U}};
@@ -5643,8 +5244,7 @@ TEST_CASE("Annotation color sampling completes before following document command
     REQUIRE(entered.wait_for(2s) == std::future_status::ready);
     SECTION("ordered document backlog") {
         for (std::size_t index = 0U; index != 64U; ++index) {
-            annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Motion,
-                                                                  {static_cast<float>(index) + 0.25F, 5.125F}));
+            annotation.Input(mmltk::testsupport::annotation_mouse(annotation, 1U, WorkspaceMouseKind::Motion, {static_cast<float>(index) + 0.25F, 5.125F}));
             CHECK(annotation.Edit({.edit = {.value = AnnotationUndoEdit{}}}).busy);
             CHECK(annotation.Edit({.edit = {.value = AnnotationRedoEdit{}}}).busy);
         }
@@ -5670,12 +5270,10 @@ TEST_CASE("Annotation color sampling completes before following document command
     }
     held = {};
 }
-
 TEST_CASE("Upscale owns and publishes its receiver image") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore opened_explore{backend, {32U, 32U}};
     auto& explore = opened_explore.system();
-
     EventGate upscale_events;
     // CLEANUP-IGNORE: Upscale and Annotation are independently sealed receiver systems with different model factories,
     // intents, snapshots, and output invariants.
@@ -5705,16 +5303,15 @@ TEST_CASE("Upscale owns and publishes its receiver image") {
     })));
     REQUIRE(upscale_events.Wait([&] { return selected_kernel->load(std::memory_order_acquire) == UpscaleKernel::RealPlksr; }));
 }
-
 TEST_CASE("Upscale equal extent source changes replace actual receiver pixels") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<UpscaleExtentProbe>();
-    UpscaleSourceFixture subject{backend,
-                                 {16U, 8U},
-                                 3U,
-                                 RuntimeFactory(
-                                     0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                     [probe] { return std::make_unique<ExtentUpscaleAlgorithm>(probe); }, 4U)};
+    UpscaleSourceFixture subject{
+        backend,
+        {16U, 8U},
+        3U,
+        RuntimeFactory(
+            0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [probe] { return std::make_unique<ExtentUpscaleAlgorithm>(probe); }, 4U)};
     auto& source = subject.source;
     auto& events = subject.events;
     auto& upscale = subject.upscale;
@@ -5731,7 +5328,6 @@ TEST_CASE("Upscale equal extent source changes replace actual receiver pixels") 
         CHECK(pixels[(plane.descriptor.height - 1U) * plane.descriptor.pitch_bytes + plane.descriptor.row_bytes() - 1U] == value);
     }
 }
-
 TEST_CASE("Upscale exact repeats avoid copying and method switches preserve completed pixels") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {16U, 8U}, 3U};
@@ -5744,8 +5340,8 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
                                                    static_cast<std::atomic_uint32_t*>(context)->fetch_add(1U);
                                            }};
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
-                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-                          [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); },
+                          diagnostics};
     for (const auto selected : {UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::Default}) {
         const auto request = test_upscale_request({.source = source.frame(), .kernel = selected});
         static_cast<void>(upscale.Start(request));
@@ -5781,7 +5377,6 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == cropped; }));
     CHECK(runs->load() == 4U);
 }
-
 TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input provenance") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {16U, 8U}, 3U};
@@ -5834,7 +5429,6 @@ TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input 
     CHECK(output.document->facts().resource == test_document({}).document->facts().resource);
     CHECK(output.document->facts().meaning_identity != test_document({}).document->facts().meaning_identity);
 }
-
 TEST_CASE("Upscale cached selection cannot redirect an active candidate and all methods retain one input") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {16U, 8U}, 3U};
@@ -5882,14 +5476,12 @@ TEST_CASE("Upscale cached selection cannot redirect an active candidate and all 
     REQUIRE(events.Wait([&] { return !upscale.snapshot().busy; }));
     CHECK(upscale.snapshot().frame == cached[0U]);
     CHECK(upscale.ObserveWorkspace().product_revision == cached[0U].revision);
-    for (const auto& method : upscale.snapshot().methods)
-        CHECK(method.available);
+    for (const auto& method : upscale.snapshot().methods) CHECK(method.available);
     CHECK(upscale.Start(test_upscale_request({source.frame(), UpscaleKernel::RealPlksr})).kernel == UpscaleKernel::RealPlksr);
     CHECK(runs->load() == 3U);
     CHECK(borrows.load() == 1U);
     CHECK(backend->same_copies.load() == copies);
 }
-
 TEST_CASE("Held output readers prevent obsolete foreground and warm work from preparing a candidate") {
     const bool preempt_warm = GENERATE(false, true);
     auto backend = std::make_shared<FakeImageBackend>();
@@ -5902,15 +5494,14 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
     } admissions;
     auto blocked = admissions.blocked.get_future();
     auto returned = admissions.returned.get_future();
-    const VisualDiagnosticSink diagnostics{
-        .context = &admissions, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-            auto& probe = *static_cast<Admissions*>(context);
-            if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionStarted && ++probe.started == 5U)
-                probe.blocked.set_value();
-            if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted && ++probe.completed == 5U)
-                probe.returned.set_value();
-            if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAllocation) ++probe.prepared;
-        }};
+    const VisualDiagnosticSink diagnostics{.context = &admissions, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+                                               auto& probe = *static_cast<Admissions*>(context);
+                                               if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionStarted && ++probe.started == 5U)
+                                                   probe.blocked.set_value();
+                                               if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted && ++probe.completed == 5U)
+                                                   probe.returned.set_value();
+                                               if (fact.operation == VisualDiagnosticOperation::UpscaleOutputAllocation) ++probe.prepared;
+                                           }};
     EventGate events;
     std::atomic<mmltk::frameworks::gpu::SystemImageRuntime*> output_runtime{nullptr};
     const auto factory = TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs);
@@ -5920,8 +5511,8 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
                               output_runtime.store(runtime.get(), std::memory_order_release);
                               return runtime;
                           },
-                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-                          [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); },
+                          diagnostics};
     std::vector<mmltk::frameworks::gpu::BorrowedImageProductReadView> readers;
     for (std::uint8_t value = 1U; value <= 4U; ++value) {
         source.Publish({16U, 8U}, value);
@@ -5955,9 +5546,7 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
     readers[0U] = {};
     REQUIRE(returned.wait_for(2s) == std::future_status::ready);
     returned.get();
-    REQUIRE(events.Wait([&] {
-        return !upscale.snapshot().busy && upscale.snapshot().kernel == latest.kernel && upscale.snapshot().input == latest.source;
-    }));
+    REQUIRE(events.Wait([&] { return !upscale.snapshot().busy && upscale.snapshot().kernel == latest.kernel && upscale.snapshot().input == latest.source; }));
     CHECK(runs->load() == 5U);
     CHECK(admissions.prepared.load() == prepared + 1U);
     CHECK(backend->same_copies.load() == copied + 2U);
@@ -5965,7 +5554,6 @@ TEST_CASE("Held output readers prevent obsolete foreground and warm work from pr
     readers.clear();
     upscale.Stop();
 }
-
 TEST_CASE("Upscale publishes only the newest selected kernel after obsolete device work settles") {
     auto backend = std::make_shared<FakeImageBackend>();
     // CLEANUP-IGNORE: This source feeds a supersession/commit gate; the cached-selection scenario retains three
@@ -6001,7 +5589,6 @@ TEST_CASE("Upscale publishes only the newest selected kernel after obsolete devi
     CHECK(runs->load(std::memory_order_acquire) == 2U);
     CHECK(ready_publications.load(std::memory_order_acquire) == 1U);
 }
-
 TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settles") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {16U, 8U}};
@@ -6013,18 +5600,17 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
         std::promise<void> release;
         std::shared_future<void> released = release.get_future().share();
     } gate;
-    const VisualDiagnosticSink diagnostics{
-        .context = &gate, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-            auto& current = *static_cast<CopyGate*>(context);
-            if (fact.operation == VisualDiagnosticOperation::CopyCompleted && current.first.exchange(false)) {
-                current.copied.set_value();
-                current.released.wait();
-            }
-        }};
+    const VisualDiagnosticSink diagnostics{.context = &gate, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+                                               auto& current = *static_cast<CopyGate*>(context);
+                                               if (fact.operation == VisualDiagnosticOperation::CopyCompleted && current.first.exchange(false)) {
+                                                   current.copied.set_value();
+                                                   current.released.wait();
+                                               }
+                                           }};
     EventGate events;
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
-                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-                          [&events](UpscaleSystem::event_type) { events.Advance(); }, diagnostics};
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); },
+                          diagnostics};
     auto settle_upscale = settle_upscale_on_exit(upscale, gate.release);
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(gate.copied, "gate.copied", 2s));
@@ -6037,7 +5623,6 @@ TEST_CASE("Upscale Stop reaches active latest work after its receiver copy settl
     CHECK(runs->load(std::memory_order_acquire) == 1U);
     CHECK(upscale.snapshot().input == source.frame());
 }
-
 // CLEANUP-IGNORE: This cancellation-at-borrow test has a two-window source-custody gate, unlike held-output
 // admission pressure even though both begin with an Upscale fixture.
 TEST_CASE("Superseded Upscale demand releases source custody without copying at both borrow windows") {
@@ -6060,11 +5645,11 @@ TEST_CASE("Superseded Upscale demand releases source custody without copying at 
         }
     } gate;
     gate.after = after_borrow;
-    const VisualDiagnosticSink diagnostics{
-        .context = &gate, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
-            auto& observed_gate = *static_cast<Gate*>(context);
-            if (!observed_gate.after && fact.operation == VisualDiagnosticOperation::UpscaleWorkerStarted) observed_gate.Await();
-        }};
+    const VisualDiagnosticSink diagnostics{.context = &gate, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+                                               auto& observed_gate = *static_cast<Gate*>(context);
+                                               if (!observed_gate.after && fact.operation == VisualDiagnosticOperation::UpscaleWorkerStarted)
+                                                   observed_gate.Await();
+                                           }};
     EventGate events;
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
                           [&source, &gate](const VisualFrame& frame) {
@@ -6087,7 +5672,6 @@ TEST_CASE("Superseded Upscale demand releases source custody without copying at 
     CHECK(gate.borrows.load() == (after_borrow ? 2U : 1U));
     CHECK(backend->same_copies.load() == 2U);
 }
-
 TEST_CASE("Upscale completed and failed facts require exact immutable document meaning") {
     auto backend = std::make_shared<FakeImageBackend>();
     // CLEANUP-IGNORE: This source is mutated to an inconsistent document meaning; the semantic-revision scenario
@@ -6114,7 +5698,6 @@ TEST_CASE("Upscale completed and failed facts require exact immutable document m
     CHECK_FALSE(upscale.snapshot().methods[0U].failed);
     CHECK(runs->load() == 1U);
 }
-
 // CLEANUP-IGNORE: Warm idempotence and injected release-failure custody use distinct algorithms and lifecycle
 // assertions.
 TEST_CASE("Upscale warm activates every mode once and repeated ready signals are idempotent") {
@@ -6126,9 +5709,7 @@ TEST_CASE("Upscale warm activates every mode once and repeated ready signals are
                           RuntimeFactory(
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
-                          [](const VisualFrame&) { return VisualDocumentRead{}; },
-                          [&events](UpscaleSystem::event_type) { events.Advance(); }};
-
+                          [](const VisualFrame&) { return VisualDocumentRead{}; }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
     upscale.Warm({32U, 32U});
     upscale.Warm({32U, 32U});
     REQUIRE(completed.wait_for(2s) == std::future_status::ready);
@@ -6137,10 +5718,8 @@ TEST_CASE("Upscale warm activates every mode once and repeated ready signals are
     REQUIRE(events.Wait([&] { return std::ranges::all_of(upscale.snapshot().methods, [](const auto& method) { return method.warm; }); }));
     CHECK(activation->warms.load(std::memory_order_acquire) == 1U);
     CHECK(activation->runs.load(std::memory_order_acquire) == 9U);
-    for (const auto& ready : activation->ready)
-        CHECK(ready.load(std::memory_order_acquire));
+    for (const auto& ready : activation->ready) CHECK(ready.load(std::memory_order_acquire));
 }
-
 TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched receiver storage", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using namespace mmltk::frameworks::gpu;
@@ -6204,8 +5783,7 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
                 upload.Height = height;
                 REQUIRE(cuMemcpy2DAsync(&upload, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
             });
-            const auto copied = runtime->CopyInputFrom(
-                source.Borrow(), [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); });
+            const auto copied = runtime->CopyInputFrom(source.Borrow(), [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); });
             CHECK(copied[0U] == ImageCopyPath::SameDevice);
             const auto input = runtime->BorrowInput();
             REQUIRE(input.valid());
@@ -6258,25 +5836,20 @@ TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched recei
         REQUIRE(runtime->Retire().safe_to_destroy);
     }
 }
-
 TEST_CASE("Native Upscale warm aggregate retires before model and primary context destruction") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
-
     auto runtime = make_native_upscale_runtime_factory(kDevice)(std::make_shared<mmltk::frameworks::gpu::ImageProductRevisionSequence>());
     runtime->BeginWork();
     auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
     REQUIRE(model != nullptr);
     model->Warm();
-
     const auto retirement = runtime->Retire();
     CHECK(retirement.safe_to_destroy);
     CHECK_FALSE(retirement.failure);
     CHECK_FALSE(retirement.custody.valid());
     CHECK_NOTHROW(runtime.reset());
 }
-
-void run_native_upscale(mmltk::frameworks::gpu::SystemImageRuntime& runtime, UpscaleKernel kernel,
-                        const std::function<bool()>& current = {}) {
+void run_native_upscale(mmltk::frameworks::gpu::SystemImageRuntime& runtime, UpscaleKernel kernel, const std::function<bool()>& current = {}) {
     runtime.BeginWork();
     auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
     REQUIRE(model != nullptr);
@@ -6292,7 +5865,6 @@ void run_native_upscale(mmltk::frameworks::gpu::SystemImageRuntime& runtime, Ups
         model->Semantics({}, semantic, stream);
     });
 }
-
 class NativeUpscaleSource final {
    public:
     NativeUpscaleSource()
@@ -6302,50 +5874,42 @@ class NativeUpscaleSource final {
         runtime_.BeginWork();
         runtime_.Publish(8U, 8U, [](auto clean, auto semantic, auto stream) {
             for (auto plane : {clean, semantic})
-                REQUIRE(cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, 0, 32U, 8U, reinterpret_cast<CUstream>(stream)) ==
-                        CUDA_SUCCESS);
+                REQUIRE(cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, 0, 32U, 8U, reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
         });
         frame = visual_frame({PresentationSourceKind::Explore, 1U}, {8U, 8U}, runtime_.OutputFacts().revision);
         frame.clean_revision = frame.revision;
     }
-    VisualDocumentRead Borrow(const VisualFrame& requested) const {
-        return test_document(borrow_matching_visual_product(requested, runtime_.Borrow()));
-    }
+    VisualDocumentRead Borrow(const VisualFrame& requested) const { return test_document(borrow_matching_visual_product(requested, runtime_.Borrow())); }
     VisualFrame frame{};
 
    private:
     mmltk::frameworks::gpu::SystemImageRuntime runtime_;
 };
-
 class NativeUpscaleFailureScenario final {
    public:
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using Injection = std::function<void(Stage, std::atomic_bool&)>;
-
     explicit NativeUpscaleFailureScenario(Injection injection)
         : upscale{kDevice,
-                  make_native_upscale_runtime_factory(
-                      kDevice, [this, injection = std::move(injection)](const Stage reached) { injection(reached, armed); }),
+                  make_native_upscale_runtime_factory(kDevice, [this, injection = std::move(injection)](const Stage reached) { injection(reached, armed); }),
                   [this](const VisualFrame& frame) { return source.Borrow(frame); },
                   [this](UpscaleSystem::event_type event) {
                       if (auto* failure = std::get_if<UpscaleFailed>(&event)) failed.set_value(*failure);
                       events.Advance();
                   }} {}
-
     NativeUpscaleSource source;
     std::atomic_bool armed{true};
     std::promise<UpscaleFailed> failed;
     EventGate events;
     UpscaleSystem upscale;
 };
-
 TEST_CASE("Native Upscale cancellation settles admitted work without recording initialization failure", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
-    const auto stage = GENERATE(Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::BasicAllocationAdmitted,
-                                Stage::BasicLaunchAdmitted, Stage::PreprocessAdmitted, Stage::TargetAdmitted, Stage::TilePrepared,
-                                Stage::ContextCreated, Stage::WarmInputSubmitted, Stage::WarmSettled, Stage::CaptureBegan,
-                                Stage::CaptureEnded, Stage::GraphInstantiated, Stage::ReplaySettled, Stage::CacheLockAdmitted);
+    const auto stage =
+        GENERATE(Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::BasicAllocationAdmitted, Stage::BasicLaunchAdmitted, Stage::PreprocessAdmitted,
+                 Stage::TargetAdmitted, Stage::TilePrepared, Stage::ContextCreated, Stage::WarmInputSubmitted, Stage::WarmSettled, Stage::CaptureBegan,
+                 Stage::CaptureEnded, Stage::GraphInstantiated, Stage::ReplaySettled, Stage::CacheLockAdmitted);
     const bool stop = GENERATE(false, true);
     const bool basic = stage == Stage::BasicAllocationAdmitted || stage == Stage::BasicLaunchAdmitted;
     const bool neural_warm = (stage >= Stage::WarmInputSubmitted && stage <= Stage::ReplaySettled) || stage == Stage::CacheLockAdmitted;
@@ -6366,16 +5930,15 @@ TEST_CASE("Native Upscale cancellation settles admitted work without recording i
                                                                       released.wait();
                                                                   }
                                                               }),
-                          [&source](const VisualFrame& frame) { return source.Borrow(frame); },
-                          [&events](UpscaleSystem::event_type) { events.Advance(); }};
+                          [&source](const VisualFrame& frame) { return source.Borrow(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
     auto settle_native = settle_upscale_on_exit(upscale, release);
     static_cast<void>(upscale.Start(test_upscale_request({source.frame, method})));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(admitted, "native Upscale admitted boundary", 120s));
     if (stop)
         static_cast<void>(upscale.Stop());
     else
-        static_cast<void>(upscale.Start(
-            test_upscale_request({source.frame, method == UpscaleKernel::Default ? UpscaleKernel::ShiftLut : UpscaleKernel::Default})));
+        static_cast<void>(
+            upscale.Start(test_upscale_request({source.frame, method == UpscaleKernel::Default ? UpscaleKernel::ShiftLut : UpscaleKernel::Default})));
     release.set_value();
     if (stop) {
         // A subsequent request is queued behind settlement, proving Stop did
@@ -6386,14 +5949,13 @@ TEST_CASE("Native Upscale cancellation settles admitted work without recording i
     CHECK_FALSE(upscale.snapshot().methods[static_cast<std::size_t>(method)].initialization_failed);
     if (stage == Stage::ReplaySettled) CHECK(stages[static_cast<std::size_t>(Stage::ContextCreated)].load() == 1U);
 }
-
 TEST_CASE("Native CUDA failure scope reaches Upscale quarantine or isolated retry", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
-    const auto status = GENERATE(cudaErrorDeviceUninitialized, cudaErrorContained, cudaErrorTensorMemoryLeak, cudaErrorSystemNotReady,
-                                 cudaErrorMpsClientTerminated, cudaErrorExternalDevice, cudaErrorMemoryAllocation, cudaErrorInvalidValue,
-                                 cudaErrorLaunchOutOfResources);
+    const auto status =
+        GENERATE(cudaErrorDeviceUninitialized, cudaErrorContained, cudaErrorTensorMemoryLeak, cudaErrorSystemNotReady, cudaErrorMpsClientTerminated,
+                 cudaErrorExternalDevice, cudaErrorMemoryAllocation, cudaErrorInvalidValue, cudaErrorLaunchOutOfResources);
     NativeUpscaleFailureScenario scenario{[status](const Stage reached, std::atomic_bool& armed) {
         if (reached == Stage::ContextCreated && armed.exchange(false)) throw CudaError(status, "injected native CUDA scope");
     }};
@@ -6407,24 +5969,21 @@ TEST_CASE("Native CUDA failure scope reaches Upscale quarantine or isolated retr
     if (cuda_shared_failure(status)) {
         CHECK_FALSE(result.snapshot.ready);
         CHECK_FALSE(scenario.upscale.BorrowFrame().valid());
-        for (const auto& method : result.snapshot.methods)
-            CHECK_FALSE(method.available);
+        for (const auto& method : result.snapshot.methods) CHECK_FALSE(method.available);
     } else {
         CHECK(result.snapshot.ready);
         CHECK(result.snapshot.methods[0U].available);
         static_cast<void>(scenario.upscale.Start(test_upscale_request({scenario.source.frame, UpscaleKernel::ShiftLut})));
-        REQUIRE(scenario.events.Wait(
-            [&] { return scenario.upscale.snapshot().kernel == UpscaleKernel::ShiftLut && !scenario.upscale.snapshot().busy; }, 120s));
+        REQUIRE(scenario.events.Wait([&] { return scenario.upscale.snapshot().kernel == UpscaleKernel::ShiftLut && !scenario.upscale.snapshot().busy; }, 120s));
         CHECK_FALSE(scenario.upscale.snapshot().methods[1U].initialization_failed);
     }
 }
-
 TEST_CASE("Completed native activation survives same-method withdrawal without repeating initialization", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
-    const auto boundary = GENERATE(Stage::ReplaySettled, Stage::PreprocessAdmitted, Stage::TargetAdmitted, Stage::TilePrepared,
-                                   Stage::RuntimeEnqueued, Stage::BindingsReady);
+    const auto boundary =
+        GENERATE(Stage::ReplaySettled, Stage::PreprocessAdmitted, Stage::TargetAdmitted, Stage::TilePrepared, Stage::RuntimeEnqueued, Stage::BindingsReady);
     const auto method = boundary == Stage::BindingsReady ? UpscaleKernel::ShiftLut : UpscaleKernel::RealPlksr;
     std::array<unsigned, static_cast<std::size_t>(Stage::Count)> counts{};
     bool current = true;
@@ -6450,26 +6009,23 @@ TEST_CASE("Completed native activation survives same-method withdrawal without r
             CHECK(counts[static_cast<std::size_t>(stage)] == completed[static_cast<std::size_t>(stage)]);
         }
     };
-    check_unchanged({Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::CacheLockAdmitted, Stage::BuildAdmitted,
-                     Stage::ContextCreated, Stage::BuffersAllocated, Stage::StreamCreated, Stage::EventCreated, Stage::BindingsReady});
+    check_unchanged({Stage::InitializationAdmitted, Stage::ChecksumAdmitted, Stage::CacheLockAdmitted, Stage::BuildAdmitted, Stage::ContextCreated,
+                     Stage::BuffersAllocated, Stage::StreamCreated, Stage::EventCreated, Stage::BindingsReady});
     if (method == UpscaleKernel::RealPlksr) {
-        check_unchanged({Stage::WarmInputSubmitted, Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted,
-                         Stage::CaptureEnded, Stage::GraphInstantiated, Stage::ReplaySubmitted, Stage::ReplaySettled});
+        check_unchanged({Stage::WarmInputSubmitted, Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted, Stage::CaptureEnded,
+                         Stage::GraphInstantiated, Stage::ReplaySubmitted, Stage::ReplaySettled});
         CHECK(counts[static_cast<std::size_t>(Stage::ContextCreated)] == 2U);
         CHECK(counts[static_cast<std::size_t>(Stage::ReplaySettled)] == 2U);
     }
     CHECK(runtime->Retire().safe_to_destroy);
 }
-
 TEST_CASE("Native method failures are classified at the actual activation completion boundary", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
-    const auto boundary =
-        GENERATE(Stage::ContextCreated, Stage::PreprocessAdmitted, Stage::TargetAdmitted, Stage::WarmSubmitted, Stage::RuntimeEnqueued);
+    const auto boundary = GENERATE(Stage::ContextCreated, Stage::PreprocessAdmitted, Stage::TargetAdmitted, Stage::WarmSubmitted, Stage::RuntimeEnqueued);
     NativeUpscaleFailureScenario scenario{[boundary](const Stage reached, std::atomic_bool& armed) {
-        if (reached == boundary && armed.exchange(false))
-            throw CudaError(cudaErrorMemoryAllocation, "settled activation-boundary allocation failure");
+        if (reached == boundary && armed.exchange(false)) throw CudaError(cudaErrorMemoryAllocation, "settled activation-boundary allocation failure");
     }};
     const auto request = test_upscale_request({scenario.source.frame, UpscaleKernel::ShiftLut});
     static_cast<void>(scenario.upscale.Start(request));
@@ -6484,7 +6040,6 @@ TEST_CASE("Native method failures are classified at the actual activation comple
     REQUIRE(scenario.events.Wait([&] { return scenario.upscale.snapshot().ready && !scenario.upscale.snapshot().busy; }, 120s));
     CHECK_FALSE(scenario.upscale.snapshot().methods[1U].initialization_failed);
 }
-
 TEST_CASE("Native withdrawal does not erase a concurrently reported method failure", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
@@ -6505,7 +6060,6 @@ TEST_CASE("Native withdrawal does not erase a concurrently reported method failu
     CHECK(static_cast<bool>(find_image_failure<CudaError>(failure)));
     CHECK(runtime->Retire().safe_to_destroy);
 }
-
 TEST_CASE("Native cache lock admission remains cancellable while another process owns the cache", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
@@ -6533,11 +6087,9 @@ TEST_CASE("Native cache lock admission remains cancellable while another process
     UpscaleSystem upscale{kDevice,
                           make_native_upscale_runtime_factory(kDevice,
                                                               [&](Stage stage) {
-                                                                  if (stage == Stage::CacheLockWaiting && !observed.exchange(true))
-                                                                      waiting.set_value();
+                                                                  if (stage == Stage::CacheLockWaiting && !observed.exchange(true)) waiting.set_value();
                                                               }),
-                          [&source](const VisualFrame& frame) { return source.Borrow(frame); },
-                          [&events](UpscaleSystem::event_type) { events.Advance(); }};
+                          [&source](const VisualFrame& frame) { return source.Borrow(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
     static_cast<void>(upscale.Start(test_upscale_request({source.frame, UpscaleKernel::RealPlksr})));
     const auto reached = waiting.get_future().wait_for(120s);
     if (reached != std::future_status::ready) static_cast<void>(upscale.Stop());
@@ -6549,7 +6101,6 @@ TEST_CASE("Native cache lock admission remains cancellable while another process
     // Cache locks are still owned: completion therefore proves withdrawal,
     // rather than eventual admission after a lock happened to become free.
 }
-
 TEST_CASE("TensorRT build progress accepts cancellation without an initialization exception", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using namespace mmltk::backend::ml::runtime;
@@ -6558,8 +6109,7 @@ TEST_CASE("TensorRT build progress accepts cancellation without an initializatio
     std::atomic_uint32_t observations{0U};
     TensorRtEngineOptions options{};
     options.device = 0;
-    options.optimization_profiles = {
-        {.input_name = "input", .minimum = {1, 3, 256, 256}, .optimum = {1, 3, 256, 256}, .maximum = {1, 3, 256, 256}}};
+    options.optimization_profiles = {{.input_name = "input", .minimum = {1, 3, 256, 256}, .optimum = {1, 3, 256, 256}, .maximum = {1, 3, 256, 256}}};
     options.log = [&](std::string_view message) {
         if (message == "[trt:build] building serialized engine") building.store(true);
     };
@@ -6572,23 +6122,20 @@ TEST_CASE("TensorRT build progress accepts cancellation without an initializatio
     };
     std::optional<TensorRtEngine> engine;
     try {
-        engine.emplace(mmltk::common::system::runtime_paths::repository_root() / "src/backend/imaging/upscale/assets/RealPLKSR_fp16.onnx",
-                       std::move(options));
+        engine.emplace(mmltk::common::system::runtime_paths::repository_root() / "src/backend/imaging/upscale/assets/RealPLKSR_fp16.onnx", std::move(options));
     } catch (const TensorRtOperationError& failure) { FAIL("TensorRT cancellation reported operation error code " << failure.code()); }
     REQUIRE(engine);
     CHECK(engine->cancelled());
     CHECK(engine->native_engine_handle() == 0U);
     if (during_build) CHECK(observations.load() >= 2U);
 }
-
 TEST_CASE("Installed neural activation owns every submitted stage through settled failure and retry", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
-    const auto stage =
-        GENERATE(Stage::StreamCreated, Stage::EventCreated, Stage::ContextCreated, Stage::BuffersAllocated, Stage::WarmInputSubmitted,
-                 Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted, Stage::CaptureEnded,
-                 Stage::GraphInstantiated, Stage::ReplaySubmitted, Stage::ReplaySettled);
+    const auto stage = GENERATE(Stage::StreamCreated, Stage::EventCreated, Stage::ContextCreated, Stage::BuffersAllocated, Stage::WarmInputSubmitted,
+                                Stage::WarmSubmitted, Stage::WarmSettled, Stage::CaptureBegan, Stage::CaptureSubmitted, Stage::CaptureEnded,
+                                Stage::GraphInstantiated, Stage::ReplaySubmitted, Stage::ReplaySettled);
     const auto method = GENERATE(UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr);
     const auto occurrence = GENERATE(1U, 2U, 3U, 4U);
     CAPTURE(static_cast<std::uint32_t>(stage), static_cast<std::uint32_t>(method), occurrence);
@@ -6608,8 +6155,7 @@ TEST_CASE("Installed neural activation owns every submitted stage through settle
     })(std::make_shared<ImageProductRevisionSequence>());
     std::exception_ptr failure;
     try {
-        for (unsigned replay = 0U; replay < 3U && armed; ++replay)
-            run_native_upscale(*runtime, method);
+        for (unsigned replay = 0U; replay < 3U && armed; ++replay) run_native_upscale(*runtime, method);
     } catch (...) { failure = std::current_exception(); }
     REQUIRE_FALSE(armed);
     REQUIRE(failure);
@@ -6619,7 +6165,6 @@ TEST_CASE("Installed neural activation owns every submitted stage through settle
     CHECK_NOTHROW(run_native_upscale(*runtime, method));
     CHECK(runtime->Retire().safe_to_destroy);
 }
-
 TEST_CASE("Neural shared activation and release failures retain typed physical custody", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
@@ -6628,8 +6173,7 @@ TEST_CASE("Neural shared activation and release failures retain typed physical c
     bool armed = true;
     auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage reached) {
         const auto selected = release_failure ? Stage::ContextReleased : Stage::WarmSubmitted;
-        if (reached == selected && std::exchange(armed, false))
-            throw CudaError(cudaErrorIllegalAddress, "injected shared neural physical failure");
+        if (reached == selected && std::exchange(armed, false)) throw CudaError(cudaErrorIllegalAddress, "injected shared neural physical failure");
     })(std::make_shared<ImageProductRevisionSequence>());
     if (release_failure) {
         run_native_upscale(*runtime, UpscaleKernel::ShiftLut);
@@ -6650,13 +6194,12 @@ TEST_CASE("Neural shared activation and release failures retain typed physical c
         CHECK(runtime->Retire().safe_to_destroy);
     }
 }
-
 TEST_CASE("Neural cleanup attempts all settled releases after each destruction boundary fails", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
     using namespace mmltk::frameworks::gpu;
-    const auto stage = GENERATE(Stage::GraphExecutableDestroyed, Stage::GraphDestroyed, Stage::EventDestroyed, Stage::StreamDestroyed,
-                                Stage::BufferReleased, Stage::ContextReleased);
+    const auto stage = GENERATE(Stage::GraphExecutableDestroyed, Stage::GraphDestroyed, Stage::EventDestroyed, Stage::StreamDestroyed, Stage::BufferReleased,
+                                Stage::ContextReleased);
     std::array<unsigned, static_cast<std::size_t>(Stage::Count)> released{};
     bool injected = false;
     auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage reached) {
@@ -6676,7 +6219,6 @@ TEST_CASE("Neural cleanup attempts all settled releases after each destruction b
     CHECK(released[static_cast<std::size_t>(Stage::BufferReleased)] == 4U);
     CHECK(released[static_cast<std::size_t>(Stage::ContextReleased)] == 2U);
 }
-
 TEST_CASE("Valid TensorRT cache survives activation allocation and shared-context failures", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using namespace mmltk::frameworks::gpu;
@@ -6711,7 +6253,6 @@ TEST_CASE("Valid TensorRT cache survives activation allocation and shared-contex
     }
     CHECK(runtime->Retire().safe_to_destroy);
 }
-
 TEST_CASE("Native Basic settled allocation and launch failures permit neural work and lazy Basic retry", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     const bool allocation_failure = GENERATE(false, true);
@@ -6723,8 +6264,7 @@ TEST_CASE("Native Basic settled allocation and launch failures permit neural wor
     auto runtime = make_native_upscale_runtime_factory(kDevice, [&](const Stage stage) {
         if (stage == failure_stage && stage_occurrence.fetch_add(1U, std::memory_order_relaxed) == 1U) {
             injected.store(true, std::memory_order_relaxed);
-            throw CudaError(allocation_failure ? cudaErrorMemoryAllocation : cudaErrorInvalidPitchValue,
-                            "injected settled Basic operation failure");
+            throw CudaError(allocation_failure ? cudaErrorMemoryAllocation : cudaErrorInvalidPitchValue, "injected settled Basic operation failure");
         }
     })(std::make_shared<ImageProductRevisionSequence>());
     runtime->BeginWork();
@@ -6757,7 +6297,6 @@ TEST_CASE("Native Basic settled allocation and launch failures permit neural wor
     // The local error must not poison the aggregate's checked release.
     CHECK(runtime->Retire().safe_to_destroy);
 }
-
 TEST_CASE("Warmed Upscale retains physical custody when model release fails") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto release = std::make_shared<UpscaleReleaseFailureProbe>();
@@ -6767,7 +6306,6 @@ TEST_CASE("Warmed Upscale retains physical custody when model release fails") {
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [release] { return std::make_unique<ReleaseFailingUpscaleAlgorithm>(release); }, 4U),
                           [](const VisualFrame&) { return VisualDocumentRead{}; }};
-
     upscale.Warm({32U, 32U});
     REQUIRE(warmed.wait_for(2s) == std::future_status::ready);
     warmed.get();
@@ -6778,7 +6316,6 @@ TEST_CASE("Warmed Upscale retains physical custody when model release fails") {
     CHECK(backend->contexts_destroyed.load(std::memory_order_acquire) == 0U);
     CHECK(backend->streams_destroyed.load(std::memory_order_acquire) == 0U);
 }
-
 TEST_CASE("Upscale requests behind warmup retain identities without queued source leases") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {20U, 12U}, 7U};
@@ -6819,7 +6356,6 @@ TEST_CASE("Upscale requests behind warmup retain identities without queued sourc
     CHECK(borrows.load() == 2U);
     CHECK(activation->fallback_activations.load(std::memory_order_acquire) == 0U);
 }
-
 TEST_CASE("Upscale warm failure is isolated and Start retains first-use activation fallback") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {18U, 10U}, 5U};
@@ -6836,7 +6372,6 @@ TEST_CASE("Upscale warm failure is isolated and Start retains first-use activati
                               if (std::holds_alternative<UpscaleFailed>(event)) warm_failed.set_value();
                               events.Advance();
                           }};
-
     upscale.Warm({32U, 32U});
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(warm_failed, "warm_failed", 2s));
     upscale.Warm({32U, 32U});
@@ -6849,15 +6384,13 @@ TEST_CASE("Upscale warm failure is isolated and Start retains first-use activati
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
     REQUIRE(events.Wait([&] { return activation->runs.load(std::memory_order_acquire) == 7U; }));
     CHECK(activation->fallback_activations.load(std::memory_order_acquire) == 1U);
-    for (const auto& ready : activation->ready)
-        CHECK(ready.load(std::memory_order_acquire));
+    for (const auto& ready : activation->ready) CHECK(ready.load(std::memory_order_acquire));
     CHECK(upscale.snapshot().methods[0U].initialization_failed);
     CHECK_FALSE(upscale.snapshot().methods[2U].initialization_failed);
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::Default})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().kernel == UpscaleKernel::Default; }));
     CHECK_FALSE(upscale.snapshot().methods[0U].initialization_failed);
 }
-
 TEST_CASE("A preempted warm failure remains method-local through another method completion") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {18U, 10U}, 5U};
@@ -6868,17 +6401,16 @@ TEST_CASE("A preempted warm failure remains method-local through another method 
     std::promise<UpscaleSnapshot> completed;
     auto result = completed.get_future();
     std::atomic_bool observed{false};
-    UpscaleSystem upscale{
-        kDevice,
-        RuntimeFactory(
-            0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-            [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
-        [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
-        [&](UpscaleSystem::event_type event) {
-            if (const auto* changed = std::get_if<UpscaleChanged>(&event);
-                changed && changed->snapshot.ready && changed->snapshot.kernel == UpscaleKernel::RealPlksr && !observed.exchange(true))
-                completed.set_value(changed->snapshot);
-        }};
+    UpscaleSystem upscale{kDevice,
+                          RuntimeFactory(
+                              0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                              [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
+                          [&source](const VisualFrame& frame) { return source.BorrowExact(frame); },
+                          [&](UpscaleSystem::event_type event) {
+                              if (const auto* changed = std::get_if<UpscaleChanged>(&event);
+                                  changed && changed->snapshot.ready && changed->snapshot.kernel == UpscaleKernel::RealPlksr && !observed.exchange(true))
+                                  completed.set_value(changed->snapshot);
+                          }};
     auto settle_upscale = settle_upscale_on_exit(upscale, activation->warm_release);
     upscale.Warm({32U, 32U});
     const auto waiting = entered.wait_for(2s);
@@ -6893,7 +6425,6 @@ TEST_CASE("A preempted warm failure remains method-local through another method 
     CHECK(snapshot.methods[2U].warm);
     CHECK_FALSE(snapshot.methods[2U].initialization_failed);
 }
-
 TEST_CASE("Upscale exact-frame admission separates invalid kernels from unavailable sources") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {24U, 15U}};
@@ -6914,9 +6445,7 @@ TEST_CASE("Upscale exact-frame admission separates invalid kernels from unavaila
                               events.Advance();
                           }};
     const auto current = source.frame();
-
-    CHECK_THROWS_AS(upscale.Start(test_upscale_request({.source = current, .kernel = static_cast<UpscaleKernel>(255U)})),
-                    contracts::InvalidIntentError);
+    CHECK_THROWS_AS(upscale.Start(test_upscale_request({.source = current, .kernel = static_cast<UpscaleKernel>(255U)})), contracts::InvalidIntentError);
     CHECK(borrows.load(std::memory_order_acquire) == 0U);
     for (auto invalid : {VisualDocumentFacts{}, test_document({}).document->facts()}) {
         invalid.meaning_identity = 0U;
@@ -6941,17 +6470,16 @@ TEST_CASE("Upscale exact-frame admission separates invalid kernels from unavaila
     }
     CHECK(borrows.load(std::memory_order_acquire) == 3U);
 }
-
 TEST_CASE("Upscale copies the admitted exact revision before a source update can replace it") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto copy_gate = backend->HoldSameDeviceCopies("Presentation source copy");
     auto race = std::make_shared<UpscaleAdmissionRaceProbe>();
-    UpscaleSourceFixture subject{backend,
-                                 {24U, 15U},
-                                 11U,
-                                 RuntimeFactory(
-                                     0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                     [race] { return std::make_unique<RacingUpscaleAlgorithm>(race); }, 4U)};
+    UpscaleSourceFixture subject{
+        backend,
+        {24U, 15U},
+        11U,
+        RuntimeFactory(
+            0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [race] { return std::make_unique<RacingUpscaleAlgorithm>(race); }, 4U)};
     auto& source = subject.source;
     auto& events = subject.events;
     auto& upscale = subject.upscale;
@@ -6961,7 +6489,6 @@ TEST_CASE("Upscale copies the admitted exact revision before a source update can
         upscale.Stop();
         upscale.Shutdown();
     }};
-
     static_cast<void>(upscale.Start(test_upscale_request({.source = admitted_frame})));
     const bool copy_entered = copy_gate->WaitEntered(2s);
     if (!copy_entered) copy_gate->Release();
@@ -6982,18 +6509,14 @@ TEST_CASE("Upscale copies the admitted exact revision before a source update can
     REQUIRE(product.valid());
     CHECK(*reinterpret_cast<const std::uint8_t*>(product.plane(0U).plane().data) == 11U);
 }
-
 TEST_CASE("Upscale derives a checked fixed output envelope") {
     CHECK(kUpscaleOutputScale == 4U);
     CHECK((checked_upscale_output_extent({1U, 1U}) == VisualExtent{4U, 4U}));
     CHECK((checked_upscale_output_extent({320U, 180U}) == VisualExtent{1280U, 720U}));
     CHECK_THROWS_AS(checked_upscale_output_extent({}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(checked_upscale_output_extent({std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U, 1U}),
-                    contracts::InvalidIntentError);
-    CHECK_THROWS_AS(checked_upscale_output_extent({1U, std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U}),
-                    contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U, 1U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({1U, std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U}), contracts::InvalidIntentError);
 }
-
 TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore opened_explore{backend, {64U, 64U}};
@@ -7019,28 +6542,24 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
                               // CLEANUP-IGNORE: Upscale Start and Annotation Open are distinct typed runtime paths.
                               [selected_kernel] { return std::make_unique<TestUpscaleAlgorithm>(selected_kernel); }, 4U),
                           borrow_exactly_from(explore), [&events](UpscaleSystem::event_type) { events.Advance(); }};
-
     static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
     CHECK((upscale.snapshot().frame.extent == VisualExtent{256U, 256U}));
     REQUIRE(upscale.BorrowFrame().valid());
     CHECK(upscale.BorrowFrame().plane(0U).plane().descriptor.width == 256U);
     CHECK(upscale.BorrowFrame().plane(0U).plane().descriptor.height == 256U);
-
     const std::array sources{read_from(explore), read_from(upscale)};
     auto writer_state = std::make_shared<TestPresentationWriterState>();
     auto allocation_retired = writer_state->allocation_retired.get_future();
     EventGate presentation_events;
-    PresentationSystem presentation{
-        output_envelope, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-        std::span{sources}, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    PresentationSystem presentation{output_envelope, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+                                    std::span{sources}, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
     PresentationScenario scenario{presentation, writer_state};
     static_cast<void>(presentation.Select(sources[0].source));
     writer_state->SignalReadiness();
     REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().completed.source == sources[0].source; }));
     CHECK((presentation.snapshot().capability.extent == VisualExtent{64U, 64U}));
     const auto initial_generation = presentation.snapshot().capability.generation;
-
     static_cast<void>(presentation.Select(sources[1].source));
     writer_state->SignalReadiness();
     REQUIRE(presentation_events.Wait([&] { return presentation.snapshot().completed.source == sources[1].source; }));
@@ -7049,7 +6568,6 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
     CHECK(presentation.snapshot().completed.revision == upscale.snapshot().frame.revision);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == initial_generation);
-
     writer_state->AcknowledgeAllocationRetirement(initial_generation);
     REQUIRE(allocation_retired.wait_for(2s) == std::future_status::ready);
     allocation_retired.get();
@@ -7065,7 +6583,6 @@ TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
     upscale.Shutdown();
     CHECK(upscale.stopped());
 }
-
 TEST_CASE("Upscale and Presentation preserve complete non-square four-times high-water storage") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore opened_explore{backend, {80U, 40U}};
@@ -7077,7 +6594,6 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [extents] { return std::make_unique<ExtentUpscaleAlgorithm>(extents); }, 4U),
                           borrow_exactly_from(source), [&upscale_events](UpscaleSystem::event_type) { upscale_events.Advance(); }};
-
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.snapshot().frame})));
     REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
     REQUIRE((upscale.snapshot().frame.extent == VisualExtent{320U, 160U}));
@@ -7093,13 +6609,11 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
     CHECK(extents->targets[0U].descriptor.height == 160U);
     const auto input_address = extents->sources[0U].data;
     const auto output_address = extents->targets[0U].data;
-
     const std::array presentation_sources{read_from(upscale), read_from(source)};
     auto writer_state = std::make_shared<TestPresentationWriterState>();
     EventGate presentation_events;
-    PresentationSystem presentation{
-        kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-        presentation_sources, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    PresentationSystem presentation{kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+                                    presentation_sources, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
     PresentationScenario scenario{presentation, writer_state};
     present_and_wait(presentation, *writer_state, presentation_events, presentation_sources[0U], upscale.snapshot().frame.revision);
     CHECK((presentation.snapshot().completed.extent == VisualExtent{320U, 160U}));
@@ -7108,7 +6622,6 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
     const auto copies_at_high_water = backend->same_copies.load(std::memory_order_acquire);
     CHECK(backend->staged_downloads.load(std::memory_order_acquire) == 0U);
     CHECK(backend->staged_uploads.load(std::memory_order_acquire) == 0U);
-
     opened_explore.Reopen({32U, 16U});
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.snapshot().frame, .kernel = UpscaleKernel::ShiftLut})));
     REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().frame.extent == VisualExtent{128U, 64U}; }));
@@ -7117,7 +6630,6 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
     CHECK(extents->sources[1U].data == input_address);
     CHECK(extents->targets[1U].data != output_address);
     CHECK(backend->planes_allocated.load(std::memory_order_acquire) == allocations_at_high_water + 4U);
-
     present_and_wait(presentation, *writer_state, presentation_events, presentation_sources[0U], upscale.snapshot().frame.revision);
     CHECK((presentation.snapshot().completed.extent == VisualExtent{128U, 64U}));
     CHECK((presentation.snapshot().capability.extent == VisualExtent{320U, 160U}));
@@ -7132,7 +6644,6 @@ TEST_CASE("Upscale and Presentation preserve complete non-square four-times high
     CHECK(upscale.stopped());
     CHECK(backend->contexts_destroyed.load(std::memory_order_acquire) >= 2U);
 }
-
 TEST_CASE("Presentation serializes consecutive growth through exact retirement acknowledgements") {
     ProductPresentationSources products;
     const auto sources = products.sources();
@@ -7140,12 +6651,10 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
     auto writer_state = std::make_shared<TestPresentationWriterState>();
     auto third_submission = writer_state->third_submission.get_future();
     EventGate events;
-    PresentationSystem presentation{
-        kDevice,
-        [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-        sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationSystem presentation{kDevice,
+                                    [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+                                    sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
     PresentationScenario scenario{presentation, writer_state};
-
     const auto source_a = sources[0].source;
     const auto source_b = sources[2].source;
     const auto source_c = sources[4].source;
@@ -7153,7 +6662,6 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source_a; }));
     const auto generation_a = presentation.snapshot().capability.generation;
-
     static_cast<void>(presentation.Select(source_b));
     writer_state->SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source_b; }));
@@ -7161,7 +6669,6 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
     REQUIRE(generation_b > generation_a);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
-
     static_cast<void>(presentation.Select(source_c));
     writer_state->SignalReadiness();
     REQUIRE(third_submission.wait_for(2s) == std::future_status::ready);
@@ -7169,37 +6676,31 @@ TEST_CASE("Presentation serializes consecutive growth through exact retirement a
     CHECK(presentation.snapshot().completed.source == source_b);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
-
     auto pump_count = writer_state->PumpCount();
     writer_state->AcknowledgeAllocationRetirement(generation_b);
     REQUIRE(writer_state->WaitForPumpAfter(pump_count));
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_a);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 0U);
-
     writer_state->AcknowledgeAllocationRetirement(generation_a);
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.source == source_c; }));
     CHECK(presentation.snapshot().completed.revision == sources[4].observe().frame.revision);
     CHECK(presentation.snapshot().capability.generation > generation_b);
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_b);
-
     pump_count = writer_state->PumpCount();
     writer_state->AcknowledgeAllocationRetirement(generation_a);
     REQUIRE(writer_state->WaitForPumpAfter(pump_count));
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 1U);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == generation_b);
-
     pump_count = writer_state->PumpCount();
     writer_state->AcknowledgeAllocationRetirement(generation_b);
     REQUIRE(writer_state->WaitForPumpAfter(pump_count));
     CHECK(writer_state->allocation_retirements.load(std::memory_order_acquire) == 2U);
     CHECK(writer_state->retained_allocation_generation.load(std::memory_order_acquire) == 0U);
-
     presentation.CloseAdmission();
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
-
 TEST_CASE("Upscale invalid exact-source admission preserves the active operation snapshot") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore opened_explore{backend, {32U, 32U}};
@@ -7233,18 +6734,15 @@ TEST_CASE("Upscale invalid exact-source admission preserves the active operation
     gate->release.set_value();
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
 }
-
 TEST_CASE("Presentation forwards every private visual product to the simulated browser arena") {
     ProductPresentationSources products;
     const auto sources = products.sources();
     EventGate events;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
-    PresentationSystem presentation{
-        kDevice,
-        [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
-        sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
+    PresentationSystem presentation{kDevice,
+                                    [backend = products.backend(), writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+                                    sources, [&events](PresentationSystem::event_type) { events.Advance(); }};
     PresentationScenario scenario{presentation, writer_state};
-
     std::uint64_t previous_presentation_revision = 0U;
     for (auto source = sources.rbegin(); source != sources.rend(); ++source) {
         static_cast<void>(presentation.Select(source->source));
@@ -7262,7 +6760,6 @@ TEST_CASE("Presentation forwards every private visual product to the simulated b
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
-
 TEST_CASE("Source admission writes retain complete packet and frame provenance", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7298,8 +6795,7 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
         REQUIRE(::setsockopt(channel.poll_fd(), SOL_SOCKET, SO_SNDBUF, &send_bytes, sizeof(send_bytes)) == 0);
         // Fill the real outbound socket before admitting the source. The bounded
         // loop stops on EAGAIN; no sleeps or assumed kernel queue length.
-        while (queued_fillers < 256U && send_workspace_record(channel.poll_fd(), filler))
-            ++queued_fillers;
+        while (queued_fillers < 256U && send_workspace_record(channel.poll_fd(), filler)) ++queued_fillers;
         REQUIRE(queued_fillers > 0U);
         REQUIRE(queued_fillers < 256U);
     }
@@ -7343,8 +6839,7 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
     abi::Record sent{};
     const auto descriptors = receive_workspace_record(peer.get(), sent);
     REQUIRE(descriptors.descriptor_count == abi::kAllocateDescriptorCount);
-    for (std::size_t index = 0U; index < descriptors.descriptor_count; ++index)
-        CHECK(::fcntl(descriptors.descriptors[index].get(), F_GETFD) >= 0);
+    for (std::size_t index = 0U; index < descriptors.descriptor_count; ++index) CHECK(::fcntl(descriptors.descriptors[index].get(), F_GETFD) >= 0);
     CHECK(abi::valid(sent));
     // Record is the canonical allocation-request wire layout.
     CHECK(std::memcmp(&sent, &admitted, sizeof(sent)) == 0);
@@ -7375,7 +6870,6 @@ TEST_CASE("Source admission writes retain complete packet and frame provenance",
         CHECK(workspace.workspace_height == sent.height);
     }
 }
-
 class WorkspaceChannelFixture final {
     using Record = presentation::detail::workspace_surface_import::Record;
     using Opcode = presentation::detail::workspace_surface_import::Opcode;
@@ -7385,12 +6879,10 @@ class WorkspaceChannelFixture final {
    public:
     presentation::WorkspaceSurfaceImportChannel channel{root_.path() / "import.sock"};
     mmltk::common::io::ScopedFd peer = mmltk::testsupport::connect_workspace_surface_shell(root_.path() / "import.sock");
-
     WorkspaceChannelFixture() {
         channel.pump();
         REQUIRE(channel.connected());
     }
-
     [[nodiscard]] static Record Layout(const Id id) {
         return {.opcode = Opcode::ArenaReady,
                 .id_high = id.high,
@@ -7404,17 +6896,9 @@ class WorkspaceChannelFixture final {
                 .device_uuid = {1U},
                 .memory_type_bits = 1U};
     }
-
     [[nodiscard]] static Record Sample(const Id arena) {
-        return {.opcode = Opcode::Presented,
-                .id_high = arena.high,
-                .id_low = arena.low,
-                .stride = 7U,
-                .size = 8U,
-                .code = 1U,
-                .presentation_revision = 9U};
+        return {.opcode = Opcode::Presented, .id_high = arena.high, .id_low = arena.low, .stride = 7U, .size = 8U, .code = 1U, .presentation_revision = 9U};
     }
-
     [[nodiscard]] static Record Acquisition(const Id source) {
         auto acquired = Sample(source);
         acquired.opcode = Opcode::Acquired;
@@ -7422,7 +6906,6 @@ class WorkspaceChannelFixture final {
         acquired.offset = 1U;
         return acquired;
     }
-
     void ReleaseRead(Record acquired) {
         acquired.opcode = Opcode::ReleaseSubmitted;
         REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), acquired));
@@ -7433,7 +6916,6 @@ class WorkspaceChannelFixture final {
         static_cast<void>(mmltk::testsupport::receive_workspace_record(peer.get(), settled));
         CHECK(settled.opcode == Opcode::ReadSettled);
     }
-
     Record AdmitArena(const Id id, const std::uint64_t generation, const bool direct = false) {
         auto layout = Layout(id);
         layout.direct_sampling = direct ? 1U : 0U;
@@ -7447,7 +6929,6 @@ class WorkspaceChannelFixture final {
         REQUIRE(outcome->imported);
         return layout;
     }
-
     void AdmitSource(const Id id, const Id arena, const Record layout, const std::uint64_t generation) {
         auto memory = mmltk::testsupport::workspace_surface_event_descriptor();
         auto edge = mmltk::testsupport::workspace_surface_event_descriptor();
@@ -7472,12 +6953,10 @@ class WorkspaceChannelFixture final {
         REQUIRE(outcome.has_value());
         REQUIRE(outcome->imported);
     }
-
     void Withdraw(const Id id) {
         REQUIRE(channel.withdraw(id).progress == presentation::WorkspaceSurfaceWithdrawalProgress::Submitted);
         ExpectRecord(id, Opcode::Drop);
     }
-
     void Retire(const Id id, const std::uint64_t generation) {
         REQUIRE(mmltk::testsupport::send_workspace_record(peer.get(), {.opcode = Opcode::Retired, .id_high = id.high, .id_low = id.low}));
         channel.pump();
@@ -7496,7 +6975,6 @@ class WorkspaceChannelFixture final {
         CHECK(received.id_low == id.low);
     }
 };
-
 TEST_CASE("Retired source admission does not retire its occupied sample arena", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7565,7 +7043,6 @@ TEST_CASE("Retired source admission does not retire its occupied sample arena", 
     fixture.Retire(arena, 1U);
     CHECK_FALSE(channel.terminal_error());
 }
-
 // CLEANUP-IGNORE: Binding replacement and mailbox-independent completion use the same fixture for different channel identities and
 // transition sequences.
 TEST_CASE("Scoped binding retirement preserves a replacement while an old physical read settles", "[workspace][protocol]") {
@@ -7580,8 +7057,7 @@ TEST_CASE("Scoped binding retirement preserves a replacement while an old physic
     REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
     fixture.channel.pump();
     REQUIRE(fixture.channel.take_source_transition());
-    REQUIRE(send_workspace_record(fixture.peer.get(),
-                                  {.opcode = abi::Opcode::BindingRetired, .id_high = old_arena.high, .id_low = old_arena.low}));
+    REQUIRE(send_workspace_record(fixture.peer.get(), {.opcode = abi::Opcode::BindingRetired, .id_high = old_arena.high, .id_low = old_arena.low}));
     fixture.channel.pump();
     const auto binding = fixture.channel.take_source_transition();
     REQUIRE(binding);
@@ -7597,7 +7073,6 @@ TEST_CASE("Scoped binding retirement preserves a replacement while an old physic
     CHECK(fixture.channel.claimable(new_arena));
     CHECK_FALSE(fixture.channel.terminal_error());
 }
-
 TEST_CASE("A completed source can acquire and settle without any presented mailbox", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7624,7 +7099,6 @@ TEST_CASE("A completed source can acquire and settle without any presented mailb
     CHECK(fixture.channel.claimable(arena));
     CHECK_FALSE(fixture.channel.terminal_error());
 }
-
 TEST_CASE("A blocked acquisition notification retains exact settlement after a racing Drop", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7643,8 +7117,7 @@ TEST_CASE("A blocked acquisition notification retains exact settlement after a r
     REQUIRE(::setsockopt(peer.get(), SOL_SOCKET, SO_SNDBUF, &send_bytes, sizeof(send_bytes)) == 0);
     const abi::Record filler{.opcode = abi::Opcode::Drop, .id_high = 101U, .id_low = 102U};
     std::size_t fillers = 0U;
-    while (fillers < 256U && send_workspace_record(peer.get(), filler))
-        ++fillers;
+    while (fillers < 256U && send_workspace_record(peer.get(), filler)) ++fillers;
     REQUIRE(fillers > 0U);
     REQUIRE(fillers < 256U);
     const auto acquired = WorkspaceChannelFixture::Acquisition(source);
@@ -7744,7 +7217,6 @@ TEST_CASE("A blocked acquisition notification retains exact settlement after a r
     CHECK_FALSE(channel.take_retirement());
     CHECK_FALSE(channel.terminal_error());
 }
-
 TEST_CASE("Source admission rejects duplicate acquisition and retirement before exact settlement", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::send_workspace_record;
@@ -7767,7 +7239,6 @@ TEST_CASE("Source admission rejects duplicate acquisition and retirement before 
     CHECK(fixture.channel.terminal_error().has_value());
     CHECK_FALSE(fixture.channel.take_retirement());
 }
-
 TEST_CASE("Source release submission requires one exact acquired transfer", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::send_workspace_record;
@@ -7786,30 +7257,18 @@ TEST_CASE("Source release submission requires one exact acquired transfer", "[wo
         REQUIRE(fixture.channel.take_source_transition().has_value());
     }
     switch (invalid) {
-        case 0U:
-            break;  // Release before any acquisition.
+        case 0U: break;  // Release before any acquisition.
         case 1U:
             REQUIRE(send_workspace_record(fixture.peer.get(), release));
             fixture.channel.pump();
             REQUIRE(fixture.channel.take_source_transition().has_value());
             break;  // Duplicate release.
-        case 2U:
-            ++release.offset;
-            break;
-        case 3U:
-            ++release.presentation_revision;
-            break;
-        case 4U:
-            ++release.stride;
-            break;
-        case 5U:
-            ++release.size;
-            break;
-        case 6U:
-            ++release.id_low;
-            break;
-        default:
-            FAIL("unknown invalid source release case");
+        case 2U: ++release.offset; break;
+        case 3U: ++release.presentation_revision; break;
+        case 4U: ++release.stride; break;
+        case 5U: ++release.size; break;
+        case 6U: ++release.id_low; break;
+        default: FAIL("unknown invalid source release case");
     }
     REQUIRE(send_workspace_record(fixture.peer.get(), release));
     fixture.channel.pump();
@@ -7818,7 +7277,6 @@ TEST_CASE("Source release submission requires one exact acquired transfer", "[wo
     CHECK_FALSE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 1U));
     CHECK_FALSE(fixture.channel.take_retirement());
 }
-
 TEST_CASE("A release receipt from an earlier transfer cannot settle the next acquisition", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::send_workspace_record;
@@ -7850,7 +7308,6 @@ TEST_CASE("A release receipt from an earlier transfer cannot settle the next acq
     CHECK(fixture.channel.terminal_error().has_value());
     CHECK_FALSE(fixture.channel.read_settled(source, {7U, 8U}, 9U, 2U));
 }
-
 TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::send_workspace_record;
@@ -7867,7 +7324,6 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
     available.opcode = abi::Opcode::Available;
     REQUIRE(send_workspace_record(peer.get(), available));
     channel.pump();
-
     SECTION("one original availability survives unrelated outcomes and retirement") {
         // Model an ineligible consumer by leaving the ticket untouched. This
         // proves channel retention, not the native writer's GPU interleaving.
@@ -7927,7 +7383,6 @@ TEST_CASE("Arena capacity tickets remain exact until consumed or withdrawn", "[w
     CHECK_FALSE(channel.terminal_error());
     CHECK(channel.connected());
 }
-
 TEST_CASE("Held acquired-read completion retains page capacity in either arrival order", "[workspace][protocol]") {
     for (const bool capacity_first : {false, true}) {
         PresentationAcceptanceGate gate;
@@ -7953,7 +7408,6 @@ TEST_CASE("Held acquired-read completion retains page capacity in either arrival
         CHECK_FALSE(gate.Release());
     }
 }
-
 TEST_CASE("Workspace capability ledgers survive sequential retirement beyond concurrent capacity", "[workspace][protocol]") {
     namespace abi = presentation::detail::workspace_surface_import;
     using mmltk::testsupport::receive_workspace_record;
@@ -7993,11 +7447,10 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
                     REQUIRE(channel.take_outcome().has_value());
                 }
                 fixture.Withdraw(id);
-                REQUIRE(
-                    send_workspace_record(peer.get(), {.opcode = ready ? abi::Opcode::Retired : abi::Opcode::Failed,
-                                                       .id_high = id.high,
-                                                       .id_low = id.low,
-                                                       .code = ready ? 0U : static_cast<std::uint32_t>(abi::FailureCode::NotAdmitted)}));
+                REQUIRE(send_workspace_record(peer.get(), {.opcode = ready ? abi::Opcode::Retired : abi::Opcode::Failed,
+                                                           .id_high = id.high,
+                                                           .id_low = id.low,
+                                                           .code = ready ? 0U : static_cast<std::uint32_t>(abi::FailureCode::NotAdmitted)}));
                 channel.pump();
                 REQUIRE(channel.take_retirement().has_value());
                 CHECK_FALSE(channel.claimable(id));
@@ -8014,15 +7467,13 @@ TEST_CASE("Workspace capability ledgers survive sequential retirement beyond con
     CHECK_FALSE(channel.admit_arena(active, 301U, 4U, 3U));
     CHECK(channel.terminal_error().has_value());
 }
-
-void publish_first_presentation(PresentationSystem& presentation, const PresentationSourceFixture& source,
-                                const TestPresentationWriterState& writer, EventGate& events) {
+void publish_first_presentation(PresentationSystem& presentation, const PresentationSourceFixture& source, const TestPresentationWriterState& writer,
+                                EventGate& events) {
     static_cast<void>(presentation.Select(source.identity()));
     writer.SignalReadiness();
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 1U; }));
     CHECK(presentation.snapshot().completed_source_revision == 1U);
 }
-
 TEST_CASE("Published frames retain their physical allocation while a waiting candidate is advertised") {
     PresentationSourceFixture source;
     EventGate events;
@@ -8046,7 +7497,6 @@ TEST_CASE("Published frames retain their physical allocation while a waiting can
     presentation.BrowserPeerLost();
     REQUIRE(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
-
 TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one surface identity") {
     PresentationSourceFixture source;
     EventGate events;
@@ -8055,14 +7505,14 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
         std::vector<VisualDiagnosticFact> facts;
     } capture;
     capture.facts.reserve(16U);
-    const VisualDiagnosticSink diagnostics{.context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
-                                               if (fact.operation != VisualDiagnosticOperation::PresentationCapabilityPublished &&
-                                                   fact.operation != VisualDiagnosticOperation::TimelineReady)
-                                                   return;
-                                               auto& result = *static_cast<Capture*>(context);
-                                               std::scoped_lock lock(result.mutex);
-                                               result.facts.push_back(fact);
-                                           }};
+    const VisualDiagnosticSink diagnostics{
+        .context = &capture, .write = [](void* context, const VisualDiagnosticFact fact) noexcept {
+            if (fact.operation != VisualDiagnosticOperation::PresentationCapabilityPublished && fact.operation != VisualDiagnosticOperation::TimelineReady)
+                return;
+            auto& result = *static_cast<Capture*>(context);
+            std::scoped_lock lock(result.mutex);
+            result.facts.push_back(fact);
+        }};
     auto writer = std::make_shared<TestPresentationWriterState>();
     writer->allow_publication.store(false, std::memory_order_release);
     PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
@@ -8087,7 +7537,6 @@ TEST_CASE("Presentation diagnostics join admitted and completed snapshots to one
         CHECK(fact.context.frame_revision == completed.completed.revision);
     }
 }
-
 TEST_CASE("Presentation directly refreshes a selected private product") {
     PresentationSourceFixture source;
     EventGate events;
@@ -8095,21 +7544,18 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     std::atomic<std::uint64_t> last_completed_revision{0U};
     std::atomic<std::uint64_t> last_completed_product{0U};
     auto writer_state = std::make_shared<TestPresentationWriterState>();
-    PresentationSystem presentation{
-        kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
-        [&events, &completed_events, &last_completed_revision, &last_completed_product](PresentationSystem::event_type event) {
-            if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
-                last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
-                completed_events.fetch_add(1U, std::memory_order_acq_rel);
-                last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
-            }
-            events.Advance();
-        }};
+    PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer_state), source.sources(),
+                                    [&events, &completed_events, &last_completed_revision, &last_completed_product](PresentationSystem::event_type event) {
+                                        if (const auto* completed = std::get_if<PresentationCompleted>(&event)) {
+                                            last_completed_revision.store(completed->snapshot.revision, std::memory_order_release);
+                                            completed_events.fetch_add(1U, std::memory_order_acq_rel);
+                                            last_completed_product.store(completed->snapshot.completed.revision, std::memory_order_release);
+                                        }
+                                        events.Advance();
+                                    }};
     PresentationScenario scenario{presentation, writer_state};
-
     publish_first_presentation(presentation, source, *writer_state, events);
     REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 1U; }));
-
     source.Advance();
     presentation.SourceChanged(source.identity());
     writer_state->SignalReadiness();
@@ -8118,7 +7564,6 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 2U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 2U);
     REQUIRE(events.Wait([&] { return last_completed_product.load(std::memory_order_acquire) == 2U; }));
-
     writer_state->allow_publication.store(false, std::memory_order_release);
     source.Advance();
     presentation.SourceChanged(source.identity());
@@ -8136,7 +7581,6 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(presentation.snapshot().completed_source_revision == 4U);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 4U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 3U);
-
     presentation.SetApplicationPeerConnected(false);
     source.Advance();
     presentation.SourceChanged(source.identity());
@@ -8145,7 +7589,6 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     presentation.SetApplicationPeerConnected(true);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 5U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 4U);
-
     writer_state->allow_publication.store(false, std::memory_order_release);
     source.Advance();
     presentation.SourceChanged(source.identity());
@@ -8157,7 +7600,6 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     presentation.SetApplicationPeerConnected(true);
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 6U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 5U);
-
     // A producer can retire its old storage before newer metadata arrives.
     // The stale advertised frame must not resubmit itself on every pump.
     source.PublishUnobserved();
@@ -8175,7 +7617,6 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 8U; }));
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 8U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 6U);
-
     // If the newer observation is already available at rejection, catch up
     // immediately even before its separate source notification is delivered.
     writer_state->allow_publication.store(false, std::memory_order_release);
@@ -8188,12 +7629,10 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     REQUIRE(events.Wait([&] { return presentation.snapshot().completed.revision == 10U; }));
     CHECK(writer_state->submissions.load(std::memory_order_acquire) == 10U);
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 7U);
-
     presentation.CloseAdmission();
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
-
 TEST_CASE("Presentation republishes an unchanged completed product after scoped binding retirement") {
     PresentationSourceFixture source;
     EventGate events;
@@ -8211,7 +7650,6 @@ TEST_CASE("Presentation republishes an unchanged completed product after scoped 
     CHECK(presentation.snapshot().completed == prior.completed);
     CHECK(presentation.snapshot().selected == prior.selected);
 }
-
 TEST_CASE("Presentation carries its submitted observation through metadata changes and reselection") {
     PresentationSourceFixture source;
     EventGate events;
@@ -8238,7 +7676,6 @@ TEST_CASE("Presentation carries its submitted observation through metadata chang
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
-
 TEST_CASE("Presentation diagnostics retain exact observations across supersession cache reuse reconnect and reconstruction") {
     PresentationSourceFixture source{2U};
     EventGate events;
@@ -8246,12 +7683,11 @@ TEST_CASE("Presentation diagnostics retain exact observations across supersessio
         std::array<VisualDiagnosticFact, 6U> completed{};
         std::size_t count = 0U;
     } capture;
-    const VisualDiagnosticSink diagnostics{
-        .context = &capture, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-            auto& output = *static_cast<Capture*>(context);
-            if (fact.operation == VisualDiagnosticOperation::TimelineReady && output.count < output.completed.size())
-                output.completed[output.count++] = fact;
-        }};
+    const VisualDiagnosticSink diagnostics{.context = &capture, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+                                               auto& output = *static_cast<Capture*>(context);
+                                               if (fact.operation == VisualDiagnosticOperation::TimelineReady && output.count < output.completed.size())
+                                                   output.completed[output.count++] = fact;
+                                           }};
     auto writer = std::make_shared<TestPresentationWriterState>();
     PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
                                     [&events](PresentationSystem::event_type) { events.Advance(); }, diagnostics};
@@ -8306,23 +7742,17 @@ TEST_CASE("Presentation diagnostics retain exact observations across supersessio
     }
     CHECK(capture.completed[4U].context.selection_generation > capture.completed[3U].context.selection_generation);
 }
-
 TEST_CASE("Presentation operation projection never combines a new borrow with an incumbent publication") {
-    const PresentationCapability allocation{.surface_high = 10U,
-                                            .surface_low = 11U,
-                                            .extent = {32U, 32U},
-                                            .generation = 7U,
-                                            .condition = PresentationCapabilityCondition::Ready};
+    const PresentationCapability allocation{
+        .surface_high = 10U, .surface_low = 11U, .extent = {32U, 32U}, .generation = 7U, .condition = PresentationCapabilityCondition::Ready};
     const PresentationSubmittedSource first{
-        {.frame = {.source = {PresentationSourceKind::Explore, 1U}, .extent = {16U, 16U}, .revision = 9U, .clean_revision = 5U},
-         .snapshot_revision = 20U},
+        {.frame = {.source = {PresentationSourceKind::Explore, 1U}, .extent = {16U, 16U}, .revision = 9U, .clean_revision = 5U}, .snapshot_revision = 20U},
         30U};
     const PresentationSubmittedSource second{
-        {.frame = {.source = {PresentationSourceKind::Explore, 1U}, .extent = {16U, 16U}, .revision = 12U, .clean_revision = 8U},
-         .snapshot_revision = 21U},
+        {.frame = {.source = {PresentationSourceKind::Explore, 1U}, .extent = {16U, 16U}, .revision = 12U, .clean_revision = 8U}, .snapshot_revision = 21U},
         31U};
-    const PresentationDiagnosticRecord incumbent{
-        first, {.capability = allocation, .timeline_ready = 17U, .presentation_revision = 40U, .transfer_sequence = 9U}};
+    const PresentationDiagnosticRecord incumbent{first,
+                                                 {.capability = allocation, .timeline_ready = 17U, .presentation_revision = 40U, .transfer_sequence = 9U}};
     const auto released = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationReleaseWaitCompleted, incumbent, 0, 1U);
     CHECK(released.context.selection_generation == first.selection_generation);
     CHECK(released.context.frame_revision == released.context.source.source_revision);
@@ -8330,8 +7760,7 @@ TEST_CASE("Presentation operation projection never combines a new borrow with an
     CHECK(released.value == released.context.publication.presentation_revision);
     CHECK(released.value == 40U);
     CHECK(released.context.transfer.transfer_sequence == 9U);
-    const auto borrowed =
-        presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationSourceBorrowStarted, {second, {.capability = allocation}}, 0);
+    const auto borrowed = presentation_diagnostic_fact(VisualDiagnosticOperation::PresentationSourceBorrowStarted, {second, {.capability = allocation}}, 0);
     CHECK(borrowed.context.selection_generation == second.selection_generation);
     CHECK(borrowed.context.frame_revision == borrowed.context.source.source_revision);
     CHECK(borrowed.context.source.source_revision == 12U);
@@ -8340,17 +7769,14 @@ TEST_CASE("Presentation operation projection never combines a new borrow with an
     CHECK(borrowed.context.transfer.transfer_sequence == 0U);
     CHECK(borrowed.context.transfer.timeline_ready == 0U);
 }
-
 TEST_CASE("Presentation switches sources while Live advances in background") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore opened_explore{backend, {40U, 20U}};
     auto& explore = opened_explore.system();
-
     EventGate live_events;
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
     auto token_changed = std::make_shared<std::atomic_bool>(false);
-    LiveSystem live{kDevice, test_live_runtime_factory(backend, captures, token_changed),
-                    [&live_events](LiveSystem::event_type) { live_events.Advance(); }};
+    LiveSystem live{kDevice, test_live_runtime_factory(backend, captures, token_changed), [&live_events](LiveSystem::event_type) { live_events.Advance(); }};
     CHECK_FALSE(live.BorrowFrame().valid());
     const auto admitted_live = live.Start({.extent = {80U, 45U}, .frames_per_second = 120U});
     CHECK(admitted_live.revision != 0U);
@@ -8359,15 +7785,13 @@ TEST_CASE("Presentation switches sources while Live advances in background") {
     REQUIRE(live.BorrowFrame().valid());
     CHECK(live.snapshot().revision > admitted_live.revision);
     const auto before_switch = live.snapshot().completed_frames;
-
     const std::array sources{read_from(explore), read_from(live)};
     EventGate presentation_events;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
     writer_state->allow_publication.store(false, std::memory_order_release);
     auto first_submission = writer_state->first_submission.get_future();
-    PresentationSystem presentation{
-        kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); }, std::span{sources},
-        [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
+    PresentationSystem presentation{kDevice, [backend, writer_state] { return std::make_unique<TestPresentationWriter>(0, backend, writer_state); },
+                                    std::span{sources}, [&presentation_events](PresentationSystem::event_type) { presentation_events.Advance(); }};
     PresentationScenario scenario{presentation, writer_state};
     CHECK(writer_state->constructions.load(std::memory_order_acquire) == 1U);
     const auto first_selection = presentation.Select(sources[0].source);
@@ -8416,7 +7840,6 @@ TEST_CASE("Presentation switches sources while Live advances in background") {
     CHECK(live.snapshot().revision > stopping_live.revision);
     CHECK_FALSE(token_changed->load(std::memory_order_acquire));
 }
-
 TEST_CASE("Live queued discrete cancellation settles without running obsolete work") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8430,13 +7853,12 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
     detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures),
                                      [&owner_failed](std::exception_ptr) { owner_failed.store(true, std::memory_order_release); }};
     auto settle_owner = settle_visual_on_exit(owner, release_latest);
-    owner.SubmitLatest(
-        [&latest_entered, &active_cancelled, release](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token stop) mutable {
-            std::stop_callback observe_stop{stop, [&active_cancelled] { active_cancelled.set_value(); }};
-            latest_entered.set_value();
-            release.wait();
-            return detail::VisualRuntimeOwner::Notification{};
-        });
+    owner.SubmitLatest([&latest_entered, &active_cancelled, release](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token stop) mutable {
+        std::stop_callback observe_stop{stop, [&active_cancelled] { active_cancelled.set_value(); }};
+        latest_entered.set_value();
+        release.wait();
+        return detail::VisualRuntimeOwner::Notification{};
+    });
     mmltk::testsupport::await_test_promise(latest_entered, "latest_entered");
     REQUIRE(owner.SubmitDiscrete(
         [&queued_ran](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) {
@@ -8452,7 +7874,6 @@ TEST_CASE("Live queued discrete cancellation settles without running obsolete wo
     owner.StopAndWait();
     CHECK_FALSE(owner_failed.load(std::memory_order_acquire));
 }
-
 TEST_CASE("visual runtime reconstructs after consecutive factory failures") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8482,7 +7903,6 @@ TEST_CASE("visual runtime reconstructs after consecutive factory failures") {
     CHECK(attempts->load(std::memory_order_acquire) == 3U);
     CHECK(failures->load(std::memory_order_acquire) == 2U);
 }
-
 TEST_CASE("visual producer revisions remain unique across staged runtime reconstruction") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8493,11 +7913,9 @@ TEST_CASE("visual producer revisions remain unique across staged runtime reconst
     const auto first_revision = first_completed.get_future().get();
     submit_visual_revision(owner, replacement_completed, true);
     const auto replacement_revision = replacement_completed.get_future().get();
-
     CHECK(replacement_revision > first_revision);
     owner.StopAndWait();
 }
-
 TEST_CASE("failed visual runtime replacement keeps the exact completed product") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8515,15 +7933,12 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
     const auto first_revision = first_completed.get_future().get();
     REQUIRE(owner.SubmitDiscrete(no_op_visual_work, {}, true));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
-
     auto retained = owner.Borrow();
     REQUIRE(retained.valid());
     CHECK(retained.plane(0U).revision() == first_revision);
-
     std::promise<void> rejected;
     REQUIRE(owner.SubmitDiscrete(
-        [&rejected](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&rejected] { rejected.set_value(); }}; }, {},
-        true));
+        [&rejected](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&rejected] { rejected.set_value(); }}; }, {}, true));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(rejected, "rejected", 2s));
     retained = owner.Borrow();
     REQUIRE(retained.valid());
@@ -8531,7 +7946,6 @@ TEST_CASE("failed visual runtime replacement keeps the exact completed product")
     retained = {};
     owner.StopAndWait();
 }
-
 TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement settlement") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8572,7 +7986,6 @@ TEST_CASE("staged cancellation keeps incumbent pixels visible until replacement 
     retained = {};
     owner.StopAndWait();
 }
-
 TEST_CASE("staged completion wins late stop before promotion and publishes its exact borrowed product") {
     const bool producer_claims_completion = GENERATE(false, true);
     auto backend = std::make_shared<FakeImageBackend>();
@@ -8583,23 +7996,21 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
     auto released = release.get_future().share();
     std::promise<std::uint64_t> published;
     std::atomic_bool cancelled = false;
-    detail::VisualRuntimeOwner owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
-                                     [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t completed) noexcept {
-                                         if (!producer_claims_completion &&
-                                             stage == detail::VisualRuntimeOwner::ActivityStage::StagedCompletionLatched &&
-                                             completed != 0U) {
-                                             latched.set_value();
-                                             released.wait();
-                                         }
-                                     }};
+    detail::VisualRuntimeOwner owner{
+        test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
+        [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t completed) noexcept {
+            if (!producer_claims_completion && stage == detail::VisualRuntimeOwner::ActivityStage::StagedCompletionLatched && completed != 0U) {
+                latched.set_value();
+                released.wait();
+            }
+        }};
     auto settle_owner = settle_visual_on_exit(owner, release);
     submit_visual_completion(owner, first);
     mmltk::testsupport::await_test_promise(first, "first");
     const auto prior_revision = borrowed_visual_revision(owner);
     REQUIRE(owner.SubmitDiscrete(
         [&](auto& runtime, std::stop_token) {
-            if (producer_claims_completion && !owner.TryCompleteActiveWork())
-                throw std::runtime_error("producer completion unexpectedly cancelled");
+            if (producer_claims_completion && !owner.TryCompleteActiveWork()) throw std::runtime_error("producer completion unexpectedly cancelled");
             runtime.Publish(8U, 8U, [](auto, auto, auto) {});
             const auto revision = runtime.Completed().revision();
             if (producer_claims_completion) {
@@ -8623,7 +8034,6 @@ TEST_CASE("staged completion wins late stop before promotion and publishes its e
     borrowed = {};
     owner.StopAndWait();
 }
-
 TEST_CASE("runtime construction does not hold scheduler admission while stop is requested") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8648,7 +8058,6 @@ TEST_CASE("runtime construction does not hold scheduler admission while stop is 
     CHECK(owner.stopped());
     CHECK_FALSE(entered.load());
 }
-
 TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and permits later work") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8672,12 +8081,10 @@ TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and 
     REQUIRE(retained.valid());
     CHECK(retained.plane(0U).revision() == promoted.load(std::memory_order_acquire));
     retained = {};
-    REQUIRE(
-        owner.SubmitOrdered([&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { next.set_value(); }}; }));
+    REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { next.set_value(); }}; }));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(next, "next", 2s));
     owner.StopAndWait();
 }
-
 TEST_CASE("active stop during staged construction rejects replacement before domain work") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8710,7 +8117,6 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
     retained = {};
     owner.StopAndWait();
 }
-
 // CLEANUP-IGNORE: Ordered replaceable-input semantics are independent from queued discrete cancellation.
 TEST_CASE("ordered visual input retains boundaries and only the latest replaceable sample") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -8738,7 +8144,6 @@ TEST_CASE("ordered visual input retains boundaries and only the latest replaceab
     owner.StopAndWait();
     CHECK(work.values() == std::vector<int>{1, 3, 4});
 }
-
 // CLEANUP-IGNORE: Coalescing owns a boundary gate distinct from the blocked-borrow concurrency scenario.
 TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -8764,7 +8169,6 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     REQUIRE_NOTHROW(work.AwaitCompletion());
     owner.StopAndWait();
     CHECK(work.values() == std::vector<int>{1, 3, 4});
-
     EventGate retry_events;
     std::atomic_uint32_t retry_calls{0U}, cycles{0U};
     std::atomic_uint64_t wake_again{0U};
@@ -8817,9 +8221,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
         failed_try.store(!runtime.TryAcquireOutput(baseline).valid(), std::memory_order_release);
         // Retained-product notifications happen before physical receiver release;
         // several such signals must leave only one still-unsuccessful retry.
-        for (unsigned index = 0U; index != 2U; ++index) {
-            auto temporary = runtime.Completed();
-        }
+        for (unsigned index = 0U; index != 2U; ++index) { auto temporary = runtime.Completed(); }
         return detail::VisualRuntimeOwner::Notification{};
     }));
     REQUIRE(retry_events.Wait([&] { return retry_calls.load(std::memory_order_acquire) == 1U; }));
@@ -8830,7 +8232,6 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     retry_owner.StopAndWait();
     CHECK(retry_calls.load(std::memory_order_acquire) == 2U);
 }
-
 TEST_CASE("visual continuation cancellation policy is independent of output availability registration") {
     const bool output_wake = GENERATE(false, true);
     const bool preserve_input = GENERATE(false, true);
@@ -8848,8 +8249,7 @@ TEST_CASE("visual continuation cancellation policy is independent of output avai
             released.wait();
             const bool observed_stop = stop.stop_requested();
             const bool completed = owner.TryCompleteActiveWork();
-            return detail::VisualRuntimeOwner::Notification{
-                [&, observed_stop, completed] { cancelled.set_value(observed_stop && !completed); }};
+            return detail::VisualRuntimeOwner::Notification{[&, observed_stop, completed] { cancelled.set_value(observed_stop && !completed); }};
         },
         {}, output_wake,
         preserve_input ? detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput
@@ -8860,7 +8260,6 @@ TEST_CASE("visual continuation cancellation policy is independent of output avai
     release_work.set_value();
     CHECK(mmltk::testsupport::await_test_promise(cancelled, "continuation cancellation") == !preserve_input);
 }
-
 // CLEANUP-IGNORE: Borrow locking requires independent promises and runtime ownership from continuation draining.
 TEST_CASE("visual completion notification remains independent of a blocked product borrow") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -8906,7 +8305,6 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
         return view.valid() ? view.plane(0U).revision() : 0U;
     });
     mmltk::testsupport::await_test_promise(borrow_locked, "borrow_locked");
-
     notification = std::async(std::launch::async, [&] { return owner.NotifyContinuation(); });
     // BorrowLocked identifies the actual runtime lock. Notification must
     // complete while the first physical publication is still held; cleanup
@@ -8918,7 +8316,6 @@ TEST_CASE("visual completion notification remains independent of a blocked produ
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(notified, "notified", 2s));
     owner.StopAndWait();
 }
-
 TEST_CASE("visual continuation arrivals while draining survive without later input") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8948,7 +8345,6 @@ TEST_CASE("visual continuation arrivals while draining survive without later inp
     CHECK(drains.load() == 2U);
     CHECK_FALSE(owner.NotifyContinuation());
 }
-
 TEST_CASE("visual terminal and failure boundaries discard pending continuations") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -8969,7 +8365,6 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(terminal_completed, "terminal_completed", 2s));
     owner.StopAndWait();
     CHECK(continuations.load(std::memory_order_acquire) == 0U);
-
     std::promise<void> failed;
     std::promise<void> failure_boundary_entered;
     std::promise<void> release_failure_boundary;
@@ -8977,16 +8372,14 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     detail::VisualRuntimeOwner failing{test_live_runtime_factory(backend, captures), [&](std::exception_ptr) { failed.set_value(); }};
     auto settle_failing = settle_visual_on_exit(failing, release_failure_boundary);
     submit_blocked_visual_work(failing, failure_boundary_entered, failure_release);
-    REQUIRE(
-        failing.SubmitOrdered([](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
-            throw std::runtime_error("deterministic continuation boundary failure");
-        }));
+    REQUIRE(failing.SubmitOrdered([](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+        throw std::runtime_error("deterministic continuation boundary failure");
+    }));
     submit_counting_continuation(failing, continuations);
     release_failure_boundary.set_value();
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
     failing.StopAndWait();
     CHECK(continuations.load(std::memory_order_acquire) == 0U);
-
     std::promise<void> stop_boundary_entered;
     std::promise<void> release_stop_boundary;
     const auto stop_release = release_stop_boundary.get_future().share();
@@ -8999,15 +8392,13 @@ TEST_CASE("visual terminal and failure boundaries discard pending continuations"
     stopping.StopAndWait();
     CHECK(continuations.load(std::memory_order_acquire) == 0U);
 }
-
 class RetainedConstructionModel final : public mmltk::frameworks::gpu::SystemImageModel {
    public:
-    RetainedConstructionModel(std::shared_ptr<std::atomic_bool> destroyed, std::shared_ptr<std::atomic_uint64_t> release_calls,
-                              std::exception_ptr failure = {}, bool all_released = false)
+    RetainedConstructionModel(std::shared_ptr<std::atomic_bool> destroyed, std::shared_ptr<std::atomic_uint64_t> release_calls, std::exception_ptr failure = {},
+                              bool all_released = false)
         : destroyed_(std::move(destroyed)),
           release_calls_(std::move(release_calls)),
-          failure_(failure ? std::move(failure)
-                           : std::make_exception_ptr(std::runtime_error("deterministic retained construction resource"))),
+          failure_(failure ? std::move(failure) : std::make_exception_ptr(std::runtime_error("deterministic retained construction resource"))),
           all_released_(all_released) {}
     ~RetainedConstructionModel() override { destroyed_->store(true, std::memory_order_release); }
     [[nodiscard]] Release ReleaseResources() noexcept override {
@@ -9024,7 +8415,6 @@ class RetainedConstructionModel final : public mmltk::frameworks::gpu::SystemIma
     std::exception_ptr failure_;
     bool all_released_;
 };
-
 TEST_CASE("visual runtime failures retain initiating execution and model retirement identities") {
     using namespace mmltk::frameworks::gpu;
     const bool safe = GENERATE(false, true);
@@ -9054,14 +8444,12 @@ TEST_CASE("visual runtime failures retain initiating execution and model retirem
     const auto failure = result.get();
     CHECK(is_image_execution_failure(failure));
     CHECK(find_image_failure<GdrTransportUnavailable>(failure) == initiating);
-    for (const auto& expected : {initiating, settlement, retirement})
-        CHECK(mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, expected));
+    for (const auto& expected : {initiating, settlement, retirement}) CHECK(mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, expected));
     CHECK_THROWS_WITH(std::rethrow_exception(failure), "domain operation");
     CHECK(destroyed->load(std::memory_order_acquire) == safe);
     if (!safe) CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
     owner.StopAndWait();
 }
-
 void check_visual_construction_custody(const FakeImageBackend::FailurePoint failure_point, const std::string_view expected_failure,
                                        const std::uint64_t expected_contexts, const std::uint64_t expected_release_calls) {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -9087,11 +8475,10 @@ void check_visual_construction_custody(const FakeImageBackend::FailurePoint fail
                 try {
                     std::rethrow_exception(failure);
                 } catch (const std::runtime_error& error) {
-                    const bool identities = mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, construction_failure) &&
-                                            (expected_release_calls == 0U ||
-                                             mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, release_failure));
-                    reported_typed_failure.store(std::string_view{error.what()} == expected_failure && identities,
-                                                 std::memory_order_release);
+                    const bool identities =
+                        mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, construction_failure) &&
+                        (expected_release_calls == 0U || mmltk::frameworks::gpu::test_support::ContainsImageFailure(failure, release_failure));
+                    reported_typed_failure.store(std::string_view{error.what()} == expected_failure && identities, std::memory_order_release);
                 } catch (...) {}
                 failed.set_value();
             }};
@@ -9112,11 +8499,9 @@ void check_visual_construction_custody(const FakeImageBackend::FailurePoint fail
     CHECK_FALSE(destroyed->load(std::memory_order_acquire));
     CHECK(backend->contexts_destroyed == 0U);
 }
-
 TEST_CASE("visual runtime owner retains unsafe factory construction and blocks reconstruction") {
     check_visual_construction_custody(FakeImageBackend::FailurePoint::CreateStream, "injected image backend failure", 1U, 1U);
 }
-
 TEST_CASE("visual runtime retirement preserves the model and context while release remains incomplete") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto destroyed = std::make_shared<std::atomic_bool>(false);
@@ -9135,27 +8520,23 @@ TEST_CASE("visual runtime retirement preserves the model and context while relea
     CHECK(backend->contexts_destroyed == 0U);
     CHECK(backend->streams_destroyed == 0U);
 }
-
 TEST_CASE("visual runtime owner retains an adopted model when context creation fails") {
     check_visual_construction_custody(FakeImageBackend::FailurePoint::CreateContext, "injected image backend failure", 0U, 0U);
 }
-
 TEST_CASE("visual retirement reports an unestablished context boundary and disables unsafe reuse") {
     auto backend = std::make_shared<FakeImageBackend>();
     std::atomic_uint64_t constructions = 0U;
     std::promise<void> failed;
-    detail::VisualRuntimeOwner owner{
-        [&](auto revisions) {
-            constructions.fetch_add(1U, std::memory_order_acq_rel);
-            return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
-        },
-        [&failed](std::exception_ptr) { failed.set_value(); }};
-    REQUIRE(owner.SubmitOrdered(
-        [backend](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
-            backend->FailPersistently(FakeImageBackend::FailurePoint::Bind);
-            throw std::runtime_error("deterministic work failure before retirement");
-        }));
+    detail::VisualRuntimeOwner owner{[&](auto revisions) {
+                                         constructions.fetch_add(1U, std::memory_order_acq_rel);
+                                         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                                             .device = 0, .backend = backend, .product_revisions = std::move(revisions)});
+                                     },
+                                     [&failed](std::exception_ptr) { failed.set_value(); }};
+    REQUIRE(owner.SubmitOrdered([backend](mmltk::frameworks::gpu::SystemImageRuntime&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
+        backend->FailPersistently(FakeImageBackend::FailurePoint::Bind);
+        throw std::runtime_error("deterministic work failure before retirement");
+    }));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
     CHECK_FALSE(owner.SubmitOrdered(no_op_visual_work));
     owner.StopAndWait();
@@ -9164,13 +8545,11 @@ TEST_CASE("visual retirement reports an unestablished context boundary and disab
     CHECK(backend->streams_destroyed == 0U);
     CHECK(backend->contexts_destroyed == 0U);
 }
-
 TEST_CASE("Live failure publishes its newer settled snapshot") {
     auto backend = std::make_shared<FakeImageBackend>();
     std::promise<LiveFailed> failure;
     LiveSystem live{kDevice,
-                    RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean,
-                                   [] { return std::make_unique<FailingLiveAlgorithm>(); }),
+                    RuntimeFactory(0, backend, mmltk::frameworks::gpu::ImageProductLayout::Clean, [] { return std::make_unique<FailingLiveAlgorithm>(); }),
                     [&failure](LiveSystem::event_type event) {
                         if (auto* failed = std::get_if<LiveFailed>(&event)) failure.set_value(std::move(*failed));
                     }};
@@ -9184,7 +8563,6 @@ TEST_CASE("Live failure publishes its newer settled snapshot") {
     CHECK_FALSE(failed.snapshot.frame.valid());
     CHECK_FALSE(live.BorrowFrame().valid());
 }
-
 TEST_CASE("Upscale method failure preserves healthy resident products and permits isolated retry") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore opened_explore{backend, {32U, 32U}};
@@ -9192,14 +8570,14 @@ TEST_CASE("Upscale method failure preserves healthy resident products and permit
     auto runs = std::make_shared<std::atomic_uint32_t>(0U);
     std::promise<UpscaleFailed> failure;
     EventGate events;
-    UpscaleSystem upscale{kDevice,
-                          RuntimeFactory(
-                              0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                              [runs] { return std::make_unique<FailingUpscaleAlgorithm>(runs); }, 4U),
-                          borrow_exactly_from(explore), [&failure, &events](UpscaleSystem::event_type event) {
-                              events.Advance();
-                              if (auto* failed = std::get_if<UpscaleFailed>(&event)) failure.set_value(std::move(*failed));
-                          }};
+    UpscaleSystem upscale{
+        kDevice,
+        RuntimeFactory(
+            0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic, [runs] { return std::make_unique<FailingUpscaleAlgorithm>(runs); }, 4U),
+        borrow_exactly_from(explore), [&failure, &events](UpscaleSystem::event_type event) {
+            events.Advance();
+            if (auto* failed = std::get_if<UpscaleFailed>(&event)) failure.set_value(std::move(*failed));
+        }};
     static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
     REQUIRE(upscale.BorrowFrame().valid());
@@ -9220,7 +8598,6 @@ TEST_CASE("Upscale method failure preserves healthy resident products and permit
     CHECK(upscale.snapshot().input == explore.snapshot().frame);
     CHECK(*reinterpret_cast<const std::uint8_t*>(recovered.pixels.plane(0U).plane().data) == 1U);
 }
-
 TEST_CASE("Shared Upscale execution failure invalidates every resident product and preserves typed failure authority") {
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {16U, 8U}};
@@ -9247,12 +8624,10 @@ TEST_CASE("Shared Upscale execution failure invalidates every resident product a
     CHECK(result.request == request);
     CHECK_FALSE(result.snapshot.ready);
     CHECK_FALSE(upscale.BorrowFrame().valid());
-    for (const auto& method : result.snapshot.methods)
-        CHECK_FALSE(method.available);
+    for (const auto& method : result.snapshot.methods) CHECK_FALSE(method.available);
     CHECK(mmltk::frameworks::gpu::CudaError(cudaErrorIllegalAddress, "shared").shared_failure());
     CHECK_FALSE(mmltk::frameworks::gpu::CudaError(cudaErrorMemoryAllocation, "local").shared_failure());
 }
-
 TEST_CASE("Visual diagnostics name every canonical completion and failure") {
     using namespace mmltk::frameworks::reflection;
     CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::TimelineReady) == "timeline.ready");
@@ -9262,7 +8637,6 @@ TEST_CASE("Visual diagnostics name every canonical completion and failure") {
     CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::AcceptanceCompiledRead) == "acceptance.compiled.read.started");
     CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::ExploreSemanticPixels) == "explore.semantic.nonzero_pixels");
     CHECK(visual_diagnostic_event_name(VisualDiagnosticOperation::ExplorePrefetchReady) == "explore.prefetch.ready");
-
     for (const auto entry : enum_entries<VisualDiagnosticOperation>()) {
         const auto alias = visual_diagnostic_event_name(entry.value);
         CAPTURE(entry.name, alias);
@@ -9274,14 +8648,12 @@ TEST_CASE("Visual diagnostics name every canonical completion and failure") {
     }
     CHECK(enum_name(VisualDiagnosticOperation::AcceptanceCompiledRead) == "AcceptanceCompiledRead");
     CHECK(enum_name(VisualDiagnosticOperation::ExploreSemanticPixels) == "ExploreSemanticPixels");
-
     for (unsigned int raw = 0U; raw <= std::numeric_limits<std::uint8_t>::max(); ++raw) {
         const auto operation = static_cast<VisualDiagnosticOperation>(raw);
         CAPTURE(raw);
         CHECK(visual_diagnostic_event_name(operation).empty() == !enum_contains(operation));
     }
 }
-
 TEST_CASE("Visual worker failures submit bounded valid UTF8 from dependency exception text") {
     std::string payload;
     std::string expected;
@@ -9301,8 +8673,7 @@ TEST_CASE("Visual worker failures submit bounded valid UTF8 from dependency exce
                                         std::string_view{"\xf4\x90\x80\x80"}, std::string_view{"\xe2\x82"});
         payload = "failure: " + std::string{malformed} + " tail \xc3\xa9";
         expected = "failure: ";
-        for (std::size_t index = 0U; index < malformed.size(); ++index)
-            expected += "\xef\xbf\xbd";
+        for (std::size_t index = 0U; index < malformed.size(); ++index) expected += "\xef\xbf\xbd";
         expected += " tail \xc3\xa9";
     }
     SECTION("replacement also respects the byte limit") {
@@ -9314,7 +8685,6 @@ TEST_CASE("Visual worker failures submit bounded valid UTF8 from dependency exce
     CHECK(detail == expected);
     CHECK(detail.size() <= kVisualFailureByteCapacity);
     CHECK(visual_failure_detail({}, payload) == expected);
-
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-failure-text"};
     const auto path = temporary.path() / "trace.jsonl";
     const int descriptor = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
@@ -9333,7 +8703,6 @@ TEST_CASE("Visual worker failures submit bounded valid UTF8 from dependency exce
     CHECK(record["sequence"] == 17U);
     CHECK(record["message"] == expected);
 }
-
 TEST_CASE("Visual diagnostic boundaries capture immutable observations without owning products") {
     struct Capture final {
         std::array<VisualDiagnosticFact, 3U> facts{};
@@ -9390,7 +8759,6 @@ TEST_CASE("Visual diagnostic boundaries capture immutable observations without o
     CHECK_FALSE(collected);
     CHECK_FALSE(sink.pixel_probes_enabled());
 }
-
 TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retain its GPU owner") {
     struct Result final {
         std::array<std::vector<std::uint8_t>, 2U> pixels;
@@ -9415,18 +8783,16 @@ TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retai
         {
             // CLEANUP-IGNORE: This scoped system measures diagnostic enablement without changing pixels or
             // allocations; the settings-guard fixture owns different work probes and failure expectations.
-            ExploreSystem explore{settings.system(),
-                                  kDevice,
-                                  2U,
-                                  RuntimeFactory(
-                                      0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-                                      [work] {
-                                          return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U),
-                                                                                        nullptr, nullptr, nullptr, work);
-                                      },
-                                      2U),
-                                  [&events](ExploreSystem::event_type) { events.Advance(); },
-                                  sink};
+            ExploreSystem explore{
+                settings.system(),
+                kDevice,
+                2U,
+                RuntimeFactory(
+                    0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
+                    [work] { return std::make_unique<TestExploreAlgorithm>(std::make_shared<std::atomic<std::size_t>>(0U), nullptr, nullptr, nullptr, work); },
+                    2U),
+                [&events](ExploreSystem::event_type) { events.Advance(); },
+                sink};
             static_cast<void>(explore.Open({.viewport = {.extent = {64U, 64U}}, .compiled_source = "/test"}));
             REQUIRE(events.Wait([&] { return explore.snapshot().ready; }));
             {
@@ -9446,8 +8812,7 @@ TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retai
             explore.Shutdown();
             result.renders = work->renders.load();
             result.allocations = backend->planes_allocated.load();
-            result.copies = backend->same_copies.load() + backend->peer_copies.load() + backend->staged_downloads.load() +
-                            backend->staged_uploads.load();
+            result.copies = backend->same_copies.load() + backend->peer_copies.load() + backend->staged_downloads.load() + backend->staged_uploads.load();
         }
         CHECK(backend->contexts_created == backend->contexts_destroyed);
         CHECK(backend->planes_allocated == backend->planes_freed);
@@ -9457,7 +8822,6 @@ TEST_CASE("lifecycle diagnostics preserve Explore rendering work and never retai
     const auto enabled = run(true);
     CHECK(disabled == enabled);
 }
-
 TEST_CASE("Native retirement and real detach requests retain one durable cleanup responsibility", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -9472,14 +8836,14 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     auto observation = workspace->ObserveRetirement();
     std::exception_ptr producer_failure;
     unsigned failure_reports = 0U;
-    detail::VisualRuntimeOwner owner{[backend](auto revisions) {
-                                         return std::make_unique<gpu::SystemImageRuntime>(
-                                             mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
-                                     },
-                                     [&](std::exception_ptr failure) {
-                                         producer_failure = failure;
-                                         ++failure_reports;
-                                     }};
+    detail::VisualRuntimeOwner owner{
+        [backend](auto revisions) {
+            return std::make_unique<gpu::SystemImageRuntime>(mmltk::frameworks::gpu::test_support::WorkspaceRuntimeConfig(backend, std::move(revisions)));
+        },
+        [&](std::exception_ptr failure) {
+            producer_failure = failure;
+            ++failure_reports;
+        }};
     std::promise<void> initialized;
     bool prepared = false;
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
@@ -9518,8 +8882,7 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
                             .diagnostics = request_diagnostics});
     if (ordering == 0U) {
         std::promise<void> parked;
-        REQUIRE(owner.SubmitOrdered(
-            [&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { parked.set_value(); }}; }));
+        REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) { return detail::VisualRuntimeOwner::Notification{[&] { parked.set_value(); }}; }));
         mmltk::testsupport::await_test_promise(parked, "detach parked behind raw read");
     } else {
         REQUIRE(copy_gate->WaitEntered(2s));
@@ -9543,8 +8906,8 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
                                              observed.outcome = fact.context.outcome;
                                      }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-detach-handoff"};
-    auto writer = test_support::NativePresentationWriterTestAccess::Create(
-        gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
+    auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"},
+                                                                           std::move(workspace), diagnostics);
     auto terminal = std::async(std::launch::async, [&] { return writer->BrowserPeerLost(); });
     mmltk::testsupport::ScopedTestCleanup settle_terminal{[&] {
         raw = {};
@@ -9569,8 +8932,7 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     mmltk::testsupport::await_test_promise(ready, "detach request ready once");
     if (ordering == 2U) {
         REQUIRE(terminal.wait_for(2s) == std::future_status::ready);
-        CHECK(terminal.get() ==
-              (fail_release ? PresentationNativeWriter::Retirement::ReleasedWithFailure : PresentationNativeWriter::Retirement::Released));
+        CHECK(terminal.get() == (fail_release ? PresentationNativeWriter::Retirement::ReleasedWithFailure : PresentationNativeWriter::Retirement::Released));
         CHECK(facts.outcome == (fail_release ? 0U : 1U));
     }
     owner.StopAndWait();
@@ -9582,7 +8944,6 @@ TEST_CASE("Native retirement and real detach requests retain one durable cleanup
     CHECK(failure_reports == (fail_release && ordering != 2U ? 1U : 0U));
     if (fail_release && ordering != 2U) CHECK(fixture::ContainsImageFailure(producer_failure, released.settlement.failure));
 }
-
 TEST_CASE("Unretired adopted native sources release before their stream is destroyed", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -9595,10 +8956,10 @@ TEST_CASE("Unretired adopted native sources release before their stream is destr
     auto observation = workspace->ObserveRetirement();
     std::unique_ptr<gpu::SystemImageRuntime> producer;
     if (producer_attached) {
-        producer = std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-            .device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
-                fixture::CopyImagePlane(destination, clean);
-            }});
+        producer = std::make_unique<gpu::SystemImageRuntime>(
+            gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend, .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) {
+                                              fixture::CopyImagePlane(destination, clean);
+                                          }});
         producer->Publish(4U, 3U, [](auto, auto, auto) {});
         REQUIRE(producer->PrepareDisplay(producer->Completed().revision(), workspace));
     }
@@ -9610,27 +8971,26 @@ TEST_CASE("Unretired adopted native sources release before their stream is destr
         bool released_before_stream = false;
         std::uintptr_t source_context = 0U;
         bool source_context_restored = false;
-    } facts{backend.get(),
-            completed_failure ? std::make_exception_ptr(std::runtime_error("completed source rollback failure")) : std::exception_ptr{}};
-    VisualDiagnosticSink diagnostics{
-        .context = &facts, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
-            auto& observed = *static_cast<RollbackFacts*>(context);
-            if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamSettlementStarted) {
-                observed.source_context = observed.backend->last_bound_context.load();
-                if (observed.failure) observed.backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, observed.failure);
-            }
-            if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) {
-                ++observed.releases;
-                observed.outcome = fact.context.outcome;
-            }
-            if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted)
-                observed.released_before_stream = observed.releases == 1U;
-            if (fact.operation == VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted)
-                observed.source_context_restored = observed.backend->last_bound_context.load() == observed.source_context;
-        }};
+    } facts{backend.get(), completed_failure ? std::make_exception_ptr(std::runtime_error("completed source rollback failure")) : std::exception_ptr{}};
+    VisualDiagnosticSink diagnostics{.context = &facts, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
+                                         auto& observed = *static_cast<RollbackFacts*>(context);
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamSettlementStarted) {
+                                             observed.source_context = observed.backend->last_bound_context.load();
+                                             if (observed.failure)
+                                                 observed.backend->FailAfter(FakeImageBackend::FailurePoint::SynchronizeStream, 0U, observed.failure);
+                                         }
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted) {
+                                             ++observed.releases;
+                                             observed.outcome = fact.context.outcome;
+                                         }
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceStreamDestructionStarted)
+                                             observed.released_before_stream = observed.releases == 1U;
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceProbeDeviceReleaseStarted)
+                                             observed.source_context_restored = observed.backend->last_bound_context.load() == observed.source_context;
+                                     }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-admission-rollback"};
-    auto writer = test_support::NativePresentationWriterTestAccess::Create(
-        gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
+    auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"},
+                                                                           std::move(workspace), diagnostics);
     // Neither ordinary source removal nor terminal browser retirement ran.
     writer.reset();
     CHECK(facts.releases == 1U);
@@ -9655,7 +9015,6 @@ TEST_CASE("Unretired adopted native sources release before their stream is destr
     CHECK(backend->events_created == backend->events_destroyed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
-
 TEST_CASE("Native display-last retirement consumes physical cleanup and its diagnostic outcome", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -9678,12 +9037,10 @@ TEST_CASE("Native display-last retirement consumes physical cleanup and its diag
                                          auto& result = *static_cast<Outcomes*>(context);
                                          if (fact.operation == VisualDiagnosticOperation::PresentationSourceWorkspaceReleaseCompleted)
                                              result.workspace = fact.context.outcome;
-                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceRetirement)
-                                             result.source = fact.context.outcome;
+                                         if (fact.operation == VisualDiagnosticOperation::PresentationSourceRetirement) result.source = fact.context.outcome;
                                      }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-display-retirement"};
-    auto writer = Access::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace),
-                                 diagnostics);
+    auto writer = Access::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace), diagnostics);
     const auto cleanup = std::make_exception_ptr(std::runtime_error("display-last binding failure"));
     if (fail_release) backend->FailDeviceBinding(1, cleanup);
     if (terminal) {
@@ -9708,7 +9065,6 @@ TEST_CASE("Native display-last retirement consumes physical cleanup and its diag
         CHECK(fixture::ImportedImageBufferTestAccess::allocation_releases == 1U);
     }
 }
-
 TEST_CASE("Stopped visual owners finish released products without waiting for external readers", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -9738,7 +9094,6 @@ TEST_CASE("Stopped visual owners finish released products without waiting for ex
     CHECK(backend->events_created == backend->events_destroyed);
     CHECK(failures == 0U);
 }
-
 TEST_CASE("Native display release hands retained receiver cleanup to producer custody", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -9753,8 +9108,8 @@ TEST_CASE("Native display release hands retained receiver cleanup to producer cu
     auto retirement = producer.Retire();
     REQUIRE(retirement.custody.deferred());
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-receiver-retirement"};
-    auto writer = test_support::NativePresentationWriterTestAccess::Create(
-        gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, std::move(workspace));
+    auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"},
+                                                                           std::move(workspace));
     CHECK(writer->BrowserPeerLost() == PresentationNativeWriter::Retirement::Released);
     CHECK_FALSE(observation.TakeResult().complete);
     CHECK(retirement.custody.deferred());
@@ -9774,7 +9129,6 @@ TEST_CASE("Native display release hands retained receiver cleanup to producer cu
     CHECK_FALSE(result.claimed);
     retirement.custody.SetRetirementSink({});
 }
-
 TEST_CASE("Native pending allocation release wakes retirement without treating a wake as completion", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -9783,8 +9137,8 @@ TEST_CASE("Native pending allocation release wakes retirement without treating a
     auto& attempt = resources.workspace;
     auto observation = attempt->ObserveRetirement();
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-pending-retirement"};
-    auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend),
-                                                                           {.import_socket = temporary.path() / "import.sock"}, attempt);
+    auto writer =
+        test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, attempt);
     test_support::NativePresentationWriterTestAccess::RetireSource(*writer);
     CHECK_FALSE(observation.TakeResult().complete);
     // An unrelated writer wake cannot discharge the executing attempt's custody.
@@ -9801,7 +9155,6 @@ TEST_CASE("Native pending allocation release wakes retirement without treating a
     CHECK(observation.TakeResult().complete);
     CHECK(writer->BrowserPeerLost() == PresentationNativeWriter::Retirement::Released);
 }
-
 TEST_CASE("Native terminal retirement observes independently completing detached allocation cleanup", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -9815,8 +9168,8 @@ TEST_CASE("Native terminal retirement observes independently completing detached
                                              static_cast<std::promise<void>*>(context)->set_value();
                                      }};
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-native-terminal-pending"};
-    auto writer = test_support::NativePresentationWriterTestAccess::Create(
-        gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"}, attempt, diagnostics);
+    auto writer = test_support::NativePresentationWriterTestAccess::Create(gpu::DeviceContext(0, backend), {.import_socket = temporary.path() / "import.sock"},
+                                                                           attempt, diagnostics);
     auto terminal = std::async(std::launch::async, [&] { return writer->BrowserPeerLost(); });
     mmltk::testsupport::await_test_promise(releasing, "source release started");
     attempt.reset();
@@ -9824,9 +9177,7 @@ TEST_CASE("Native terminal retirement observes independently completing detached
     CHECK(terminal.get() == PresentationNativeWriter::Retirement::Released);
     CHECK(observation.TakeResult().complete);
 }
-
-TEST_CASE("Queued workspace requests release expired and displaced destinations without parking allocation custody",
-          "[presentation][workspace]") {
+TEST_CASE("Queued workspace requests release expired and displaced destinations without parking allocation custody", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
     fixture::ImageWorkspaceTestAccess::Reset();
@@ -9862,7 +9213,6 @@ TEST_CASE("Queued workspace requests release expired and displaced destinations 
     CHECK(rejected.load() == 1U);
     CHECK(failures.load() == 0U);
 }
-
 TEST_CASE("Workspace retries cancellation and worker failure settle their ready response", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -9872,21 +9222,21 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
     const auto injected = std::make_exception_ptr(std::runtime_error("workspace finalizer failure"));
     std::promise<void> failed;
     std::exception_ptr failure;
-    detail::VisualRuntimeOwner owner{[=](auto revisions) {
-                                         return std::make_unique<gpu::SystemImageRuntime>(
-                                             gpu::SystemImageRuntimeConfig{.device = 0,
-                                                                           .backend = backend,
-                                                                           .workspace_finalize =
-                                                                               [=](auto clean, auto, auto destination, auto, auto) {
-                                                                                   if (outcome == 2U) std::rethrow_exception(injected);
-                                                                                   fixture::CopyImagePlane(destination, clean);
-                                                                               },
-                                                                           .product_revisions = std::move(revisions)});
-                                     },
-                                     [&](std::exception_ptr value) {
-                                         failure = value;
-                                         failed.set_value();
-                                     }};
+    detail::VisualRuntimeOwner owner{
+        [=](auto revisions) {
+            return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{.device = 0,
+                                                                                           .backend = backend,
+                                                                                           .workspace_finalize =
+                                                                                               [=](auto clean, auto, auto destination, auto, auto) {
+                                                                                                   if (outcome == 2U) std::rethrow_exception(injected);
+                                                                                                   fixture::CopyImagePlane(destination, clean);
+                                                                                               },
+                                                                                           .product_revisions = std::move(revisions)});
+        },
+        [&](std::exception_ptr value) {
+            failure = value;
+            failed.set_value();
+        }};
     std::promise<void> published;
     REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
         runtime.Publish(4U, 3U, [](auto, auto, auto) {});
@@ -9900,11 +9250,10 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
     const auto source = owner.ObserveWorkspace();
     std::atomic<unsigned> responses{0U};
     std::promise<void> ready;
-    owner.RequestWorkspace(
-        {.product_owner = source.product_owner, .product_revision = source.product_revision, .destination = workspace, .ready = [&] {
-             ++responses;
-             ready.set_value();
-         }});
+    owner.RequestWorkspace({.product_owner = source.product_owner, .product_revision = source.product_revision, .destination = workspace, .ready = [&] {
+                                ++responses;
+                                ready.set_value();
+                            }});
     if (outcome != 2U) {
         std::promise<void> attempted;
         std::promise<void> resume;
@@ -9931,7 +9280,6 @@ TEST_CASE("Workspace retries cancellation and worker failure settle their ready 
     owner.StopAndWait();
     CHECK(responses.load() == 1U);
 }
-
 TEST_CASE("Presentation control remains available during a native wait") {
     PresentationSourceFixture source;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
@@ -9942,7 +9290,6 @@ TEST_CASE("Presentation control remains available during a native wait") {
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(pump_entered.wait_for(2s) == std::future_status::ready);
     pump_entered.get();
-
     auto admission_closed = std::async(std::launch::async, [&presentation] { presentation.CloseAdmission(); });
     mmltk::testsupport::ScopedTestCleanup release_wait{[&] {
         try {
@@ -9955,7 +9302,6 @@ TEST_CASE("Presentation control remains available during a native wait") {
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
 }
-
 TEST_CASE("Presentation release failure publishes once and still stops") {
     PresentationSourceFixture source;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
@@ -9965,18 +9311,15 @@ TEST_CASE("Presentation release failure publishes once and still stops") {
     PresentationScenario scenario{presentation, writer_state};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(failures.events().Wait([&] { return presentation.snapshot().completed.valid(); }));
-
     presentation.CloseAdmission();
     presentation.BrowserPeerLost();
     presentation.BrowserPeerLost();
     CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
-
     CHECK(presentation.stopped());
     CHECK(failures.failures() == 1U);
     CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
     CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
 }
-
 TEST_CASE("Presentation retains an unprovable native source read through terminal shutdown") {
     PresentationSourceFixture source;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
@@ -9991,14 +9334,12 @@ TEST_CASE("Presentation retains an unprovable native source read through termina
         presentation.BrowserPeerLost();
         CHECK(presentation.Shutdown() == PresentationShutdownResult::Stopped);
         CHECK(failures.failures() == (outcome == Retirement::UnsafeFailure ? 1U : 0U));
-        CHECK(writer_state->terminal_custody_notifications.load(std::memory_order_acquire) ==
-              (outcome == Retirement::RetainedBrowserRead ? 1U : 0U));
+        CHECK(writer_state->terminal_custody_notifications.load(std::memory_order_acquire) == (outcome == Retirement::RetainedBrowserRead ? 1U : 0U));
         CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
         CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
     }
     CHECK(writer_state->retirements.load(std::memory_order_acquire) == 0U);
 }
-
 TEST_CASE("Presentation worker failure rejects later direct selection") {
     PresentationSourceFixture source;
     auto writer_state = std::make_shared<TestPresentationWriterState>();
@@ -10006,7 +9347,6 @@ TEST_CASE("Presentation worker failure rejects later direct selection") {
     PresentationFailureProbe failures;
     auto presentation = make_failure_presentation(source, writer_state, failures);
     PresentationScenario scenario{presentation, writer_state};
-
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(failures.events().Wait([&] { return failures.failures() == 1U; }));
     CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 0U);
@@ -10018,10 +9358,8 @@ TEST_CASE("Presentation worker failure rejects later direct selection") {
     CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
     CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
 }
-
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 namespace {
 TEST_CASE("recoverable visual failure restores creator policy before rebuilding placed runtime") {
@@ -10034,16 +9372,14 @@ TEST_CASE("recoverable visual failure restores creator policy before rebuilding 
     std::vector<std::vector<int>> construction_affinities;
     std::promise<void> failed;
     std::promise<std::vector<int>> completed;
-    detail::VisualRuntimeOwner owner{
-        [&](auto revisions) {
-            construction_affinities.push_back(allowed_cpu_set());
-            return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend, .execution = execution, .product_revisions = std::move(revisions)});
-        },
-        [&](std::exception_ptr) { failed.set_value(); }};
-    REQUIRE(owner.SubmitOrdered([](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
-        throw std::runtime_error("recoverable operation failure");
-    }));
+    detail::VisualRuntimeOwner owner{[&](auto revisions) {
+                                         construction_affinities.push_back(allowed_cpu_set());
+                                         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{
+                                             .device = 0, .backend = backend, .execution = execution, .product_revisions = std::move(revisions)});
+                                     },
+                                     [&](std::exception_ptr) { failed.set_value(); }};
+    REQUIRE(owner.SubmitOrdered(
+        [](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification { throw std::runtime_error("recoverable operation failure"); }));
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(failed, "failed", 2s));
     REQUIRE(owner.SubmitOrdered([&](auto&, std::stop_token) -> detail::VisualRuntimeOwner::Notification {
         completed.set_value(allowed_cpu_set());
@@ -10056,7 +9392,6 @@ TEST_CASE("recoverable visual failure restores creator policy before rebuilding 
     CHECK(backend->contexts_created == 2U);
     CHECK(backend->contexts_destroyed == 2U);
 }
-
 TEST_CASE("saved Explore transport changes stage the prior runtime while reopening") {
     auto backend = std::make_shared<FakeImageBackend>();
     ExploreSystem* active = nullptr;
@@ -10070,8 +9405,7 @@ TEST_CASE("saved Explore transport changes stage the prior runtime while reopeni
     const auto before_frame = active->snapshot().frame;
     const auto before = active->snapshot().revision;
     contracts::SettingsUpdateRequest update;
-    update.updates.push_back(
-        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
+    update.updates.push_back({.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
     static_cast<void>(settings.system().Update(std::move(update)));
     REQUIRE(scenario.Wait([&] {
         const auto snapshot = active->snapshot();
@@ -10083,7 +9417,6 @@ TEST_CASE("saved Explore transport changes stage the prior runtime while reopeni
     CHECK(backend->contexts_destroyed == 2U);
     active = nullptr;
 }
-
 TEST_CASE("Explore applies a transport change after a pending settings mutation rolls back") {
     const bool initial_h2d = GENERATE(false, true);
     auto backend = std::make_shared<FakeImageBackend>();
@@ -10095,8 +9428,7 @@ TEST_CASE("Explore applies a transport change after a pending settings mutation 
         if (active) active->ExecutionSettingsChanged();
     }};
     contracts::SettingsUpdateRequest initial;
-    initial.updates.push_back(
-        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{initial_h2d}});
+    initial.updates.push_back({.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{initial_h2d}});
     static_cast<void>(settings.system().Update(std::move(initial)));
     ExploreScenario scenario{settings, backend, ExploreScenario::GateAfterRender(gate, {}, work), count_explore_failures(failures)};
     auto& explore = scenario.system();
@@ -10109,8 +9441,7 @@ TEST_CASE("Explore applies a transport change after a pending settings mutation 
     const auto admitted = active->UpdateFilter({.filter = current.filter, .overlay = overlay});
     mmltk::testsupport::await_test_promise(gate->entered, "gate->entered");
     contracts::SettingsUpdateRequest update;
-    update.updates.push_back(
-        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
+    update.updates.push_back({.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{!initial_h2d}});
     static_cast<void>(settings.system().Update(std::move(update)));
     gate->release.set_value();
     const bool reopened = scenario.Wait([&] {
@@ -10119,10 +9450,9 @@ TEST_CASE("Explore applies a transport change after a pending settings mutation 
                snapshot.revision > admitted.revision;
     });
     const auto observed = active->snapshot();
-    INFO("opens=" << work->opens.load(std::memory_order_acquire) << " ready=" << observed.ready << " busy=" << observed.busy
-                  << " failure=" << observed.failure << " revision=" << observed.revision << " admitted=" << admitted.revision
-                  << " contexts-created=" << backend->contexts_created << " contexts-destroyed=" << backend->contexts_destroyed
-                  << " failures=" << failures->load(std::memory_order_acquire));
+    INFO("opens=" << work->opens.load(std::memory_order_acquire) << " ready=" << observed.ready << " busy=" << observed.busy << " failure=" << observed.failure
+                  << " revision=" << observed.revision << " admitted=" << admitted.revision << " contexts-created=" << backend->contexts_created
+                  << " contexts-destroyed=" << backend->contexts_destroyed << " failures=" << failures->load(std::memory_order_acquire));
     REQUIRE(reopened);
     active->Shutdown();
     CHECK(backend->contexts_created == 2U);
@@ -10130,13 +9460,11 @@ TEST_CASE("Explore applies a transport change after a pending settings mutation 
     CHECK(failures->load(std::memory_order_acquire) == 1U);
     active = nullptr;
 }
-
 TEST_CASE("Explore locality selects automatic budget and preserves explicit overlapping budget") {
     const mmltk::common::system::ExecutionPlacement placement{.numa_node = 3, .cpus = {17, 25}};
     CHECK(normalize_explore_parallelism(0, placement) == 2U);
     CHECK(normalize_explore_parallelism(8, placement) == 8U);
 }
-
 TEST_CASE("Shared visual GPU completion preserves ordered work and independent producers", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -10188,7 +9516,6 @@ TEST_CASE("Shared visual GPU completion preserves ordered work and independent p
     CHECK(backend->planes_allocated == backend->planes_freed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
-
 TEST_CASE("Deferred product completion reports terminal failure without additional application traffic", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     const bool registration_failure = GENERATE(false, true);
@@ -10226,7 +9553,6 @@ TEST_CASE("Deferred product completion reports terminal failure without addition
     CHECK(backend->planes_allocated == backend->planes_freed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
-
 TEST_CASE("Stopping a deferred product settles pending notification before candidate destruction", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -10257,7 +9583,6 @@ TEST_CASE("Stopping a deferred product settles pending notification before candi
     CHECK(backend->planes_allocated == backend->planes_freed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
-
 TEST_CASE("Terminal product notification reports unproved settlement with physical custody retained", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     auto backend = std::make_shared<FakeImageBackend>();
@@ -10287,13 +9612,11 @@ TEST_CASE("Terminal product notification reports unproved settlement with physic
     CHECK(backend->contexts_created > backend->contexts_destroyed);
     CHECK(backend->streams_destroyed == 0U);
 }
-
 struct ProducerWorkspaceRequest final {
     std::shared_ptr<mmltk::frameworks::gpu::ImageWorkspace> workspace{};
     mmltk::frameworks::gpu::ImageWorkspaceContent content{};
     std::future<void> ready{};
     std::uintptr_t stream = 0U;
-
     template <class Producer>
     void Request(Producer& producer) {
         const auto observed = producer.ObserveWorkspace();
@@ -10302,11 +9625,8 @@ struct ProducerWorkspaceRequest final {
         auto completed = std::make_shared<std::promise<void>>();
         ready = completed->get_future();
         producer.RequestWorkspace(
-            {.product_owner = content.owner, .product_revision = content.revision, .destination = workspace, .ready = [completed] {
-                 completed->set_value();
-             }});
+            {.product_owner = content.owner, .product_revision = content.revision, .destination = workspace, .ready = [completed] { completed->set_value(); }});
     }
-
     template <class Producer>
     void CheckCompleted(Producer& producer) {
         mmltk::testsupport::await_test_future(ready, "producer workspace completion");
@@ -10321,7 +9641,6 @@ struct ProducerWorkspaceRequest final {
         CHECK(borrowed.plane().data == workspace->plane(borrowed.plane().descriptor.width, borrowed.plane().descriptor.height).data);
     }
 };
-
 TEST_CASE("Display terminal failure wakes request readiness and preserves the last completed display", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -10333,11 +9652,8 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     std::atomic_uint failures{0U};
     detail::VisualRuntimeOwner owner(
         [backend](auto revisions) {
-            return std::make_unique<gpu::SystemImageRuntime>(
-                gpu::SystemImageRuntimeConfig{.device = 0,
-                                              .backend = backend,
-                                              .workspace_finalize = fixture::FakeWorkspaceFinalizer(backend),
-                                              .product_revisions = std::move(revisions)});
+            return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
+                .device = 0, .backend = backend, .workspace_finalize = fixture::FakeWorkspaceFinalizer(backend), .product_revisions = std::move(revisions)});
         },
         first_visual_failure(failures, failed));
     std::promise<void> published;
@@ -10380,7 +9696,6 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     CHECK(backend->planes_allocated == backend->planes_freed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
-
 template <class Producer>
 ProducerWorkspaceRequest request_delayed_workspace(Producer& producer, const std::shared_ptr<FakeImageBackend>& backend) {
     namespace fixture = mmltk::frameworks::gpu::test_support;
@@ -10405,7 +9720,6 @@ ProducerWorkspaceRequest request_delayed_workspace(Producer& producer, const std
     CHECK(request.ready.wait_for(0s) == std::future_status::timeout);
     return request;
 }
-
 template <class Producer>
 void complete_producer_workspace(Producer& producer, const std::shared_ptr<FakeImageBackend>& backend, ProducerWorkspaceRequest& request) {
     auto settlement = backend->HoldStreamSettlements("producer workspace physical completion", request.stream);
@@ -10423,7 +9737,6 @@ void complete_producer_workspace(Producer& producer, const std::shared_ptr<FakeI
     request.CheckCompleted(producer);
     CHECK(backend->workspace_finalizations == finalizations);
 }
-
 TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained workspaces independently", "[presentation][workspace]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace fixture = gpu::test_support;
@@ -10434,49 +9747,44 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     auto explore_work = std::make_shared<ExploreWorkProbe>();
     LoadedSettings settings;
     ExploreScenario opened(settings, 2U,
-                           RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(explore_work),
-                                          3U, fixture::FakeWorkspaceFinalizer(backend)));
+                           RuntimeFactory(0, backend, gpu::ImageProductLayout::CleanAndSemantic, ExploreScenario::TrackWork(explore_work), 3U,
+                                          fixture::FakeWorkspaceFinalizer(backend)));
     opened.OpenAndWait({.extent = {32U, 32U}, .columns = 1U});
     auto& explore = opened.system();
-
     EventGate annotation_events, live_events, upscale_events;
     auto annotation_work = std::make_shared<AnnotationRenderProbe>();
-    AnnotationSystem annotation{kDevice,
-                                RuntimeFactory(
-                                    0, backend, gpu::ImageProductLayout::CleanAndSemantic,
-                                    [annotation_work] { return std::make_unique<TestAnnotationAlgorithm>(annotation_work); }, 3U,
-                                    fixture::FakeWorkspaceFinalizer(backend)),
-                                borrow_exactly_from(explore), [&](AnnotationSystem::event_type) { annotation_events.Advance(); },
-                                mmltk::testsupport::annotation_render_evidence()};
+    AnnotationSystem annotation{
+        kDevice,
+        RuntimeFactory(
+            0, backend, gpu::ImageProductLayout::CleanAndSemantic, [annotation_work] { return std::make_unique<TestAnnotationAlgorithm>(annotation_work); }, 3U,
+            fixture::FakeWorkspaceFinalizer(backend)),
+        borrow_exactly_from(explore), [&](AnnotationSystem::event_type) { annotation_events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::open_annotation(annotation, annotation_events, explore.snapshot().frame);
-
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
     LiveSystem live{kDevice,
                     RuntimeFactory(
-                        0, backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); },
-                        1U, fixture::FakeWorkspaceFinalizer(backend)),
+                        0, backend, gpu::ImageProductLayout::Clean, [captures] { return std::make_unique<TestLiveAlgorithm>(captures); }, 1U,
+                        fixture::FakeWorkspaceFinalizer(backend)),
                     [&](LiveSystem::event_type) { live_events.Advance(); }};
     static_cast<void>(live.Start({.extent = {32U, 32U}, .frames_per_second = 120U}));
     REQUIRE(live_events.Wait([&] { return live.snapshot().completed_frames != 0U; }));
     static_cast<void>(live.Stop());
     REQUIRE(live_events.Wait([&] { return !live.snapshot().running; }));
-
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
     auto upscale_runs = std::make_shared<std::atomic_uint32_t>(0U);
-    UpscaleSystem upscale{kDevice,
-                          RuntimeFactory(
-                              0, backend, gpu::ImageProductLayout::CleanAndSemantic,
-                              [=] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, upscale_runs); }, 4U,
-                              fixture::FakeWorkspaceFinalizer(backend)),
-                          borrow_exactly_from(explore), [&](UpscaleSystem::event_type) { upscale_events.Advance(); }};
+    UpscaleSystem upscale{
+        kDevice,
+        RuntimeFactory(
+            0, backend, gpu::ImageProductLayout::CleanAndSemantic, [=] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, upscale_runs); }, 4U,
+            fixture::FakeWorkspaceFinalizer(backend)),
+        borrow_exactly_from(explore), [&](UpscaleSystem::event_type) { upscale_events.Advance(); }};
     static_cast<void>(upscale.Start(test_upscale_request({.source = explore.snapshot().frame})));
     REQUIRE(upscale_events.Wait([&] { return upscale.snapshot().ready; }));
     {
         const std::array contexts{explore.BorrowFrame().plane(0U).context(), annotation.BorrowFrame().plane(0U).context(),
                                   live.BorrowFrame().plane(0U).context(), upscale.BorrowFrame().plane(0U).context()};
         for (std::size_t left = 0U; left != contexts.size(); ++left)
-            for (std::size_t right = left + 1U; right != contexts.size(); ++right)
-                CHECK_FALSE(contexts[left] == contexts[right]);
+            for (std::size_t right = left + 1U; right != contexts.size(); ++right) CHECK_FALSE(contexts[left] == contexts[right]);
     }
     const auto shutdown = [&] {
         backend->defer_notifications = false;
@@ -10487,7 +9795,6 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
         explore.Shutdown();
     };
     auto cleanup = mmltk::testsupport::ScopedTestCleanup{shutdown};
-
     const auto renders = explore_work->renders.load();
     const auto opens = explore_work->opens.load();
     const auto prepares = explore_work->prepares.load();
@@ -10500,7 +9807,6 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     CHECK(explore_work->prepares == prepares);
     CHECK(annotation_display.ready.wait_for(0s) == std::future_status::timeout);
     CHECK_FALSE(annotation.BorrowWorkspace().valid());
-
     const auto captured = captures->load();
     auto live_display = request_delayed_workspace(live, backend);
     complete_producer_workspace(live, backend, live_display);
@@ -10511,7 +9817,6 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     CHECK(upscale_runs->load() == upscaled);
     complete_producer_workspace(annotation, backend, annotation_display);
     CHECK(annotation_work->calls == annotations);
-
     // Hold the completed semantic image while a new document render is queued.
     auto previous = annotation.BorrowWorkspace();
     REQUIRE(previous.valid());
@@ -10520,8 +9825,7 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     annotation_work->semantic_value = 0xf0U;
     backend->defer_notifications = true;
     auto submitted = backend->ObserveNextNotificationStream();
-    const auto changed =
-        annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("workspace replacement")}}});
+    const auto changed = annotation.Edit({.edit = {.value = AnnotationCategoryEdit{contracts::AnnotationText::From("workspace replacement")}}});
     const auto replacement_stream = mmltk::testsupport::await_test_future(submitted, "replacement annotation render submitted");
     CHECK(annotation.ObserveWorkspace().product_revision == previous_content.revision);
     CHECK(annotation.BorrowWorkspace().revision() == previous_content.revision);
@@ -10550,6 +9854,5 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     CHECK(backend->contexts_created == backend->contexts_destroyed);
     CHECK(backend->events_created == backend->events_destroyed);
 }
-
 }  // namespace
 }  // namespace mmltk::controller

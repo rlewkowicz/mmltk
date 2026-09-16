@@ -296,12 +296,6 @@ impl VertexWriter {
         Self { data: Vec::new() }
     }
 
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            data: Vec::with_capacity(capacity),
-        }
-    }
-
     fn write_f32(&mut self, value: f32) {
         self.data.extend_from_slice(&value.to_le_bytes());
     }
@@ -2244,7 +2238,7 @@ mod reference_dependency_tests {
 
         let instance = Instance::new(InstanceDescriptor {
             backends: Backends::VULKAN,
-            ..Default::default()
+            ..InstanceDescriptor::new_without_display_handle()
         });
         let adapter = iced::futures::executor::block_on(instance.request_adapter(&Default::default()))
             .expect("browser-app picking acceptance requires the container Vulkan adapter");

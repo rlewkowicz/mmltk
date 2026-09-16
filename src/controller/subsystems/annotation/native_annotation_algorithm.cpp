@@ -1,9 +1,7 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
-
 #include <cuda_runtime_api.h>
-
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -13,24 +11,17 @@
 #include <utility>
 #include <iterator>
 #include <optional>
-
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/detail/raster_color.h"
-
 import mmltk.backend.imaging.raster;
-
 namespace mmltk::controller {
 namespace {
-
 namespace raster = mmltk::backend::imaging::raster;
 namespace domain = mmltk::controller::contracts;
-
 }  // namespace
-
 namespace {
-
 class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
@@ -54,11 +45,9 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         const auto device = mask_device_.ReleaseAll([](void* p) { return cudaFree(p); });
         const auto sample = sample_host_ ? sample_host_->ReleaseSettled() : CUDA_SUCCESS;
         const auto host = mask_host_ ? mask_host_->ReleaseSettled() : CUDA_SUCCESS;
-        if (!device.released() || host != CUDA_SUCCESS || sample != CUDA_SUCCESS)
-            return {.all_released = false, .failure = release_failure_};
+        if (!device.released() || host != CUDA_SUCCESS || sample != CUDA_SUCCESS) return {.all_released = false, .failure = release_failure_};
         return {};
     }
-
     [[nodiscard]] domain::AnnotationColor Sample(const domain::AnnotationPoint point) override {
         if (!sample_host_) sample_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
         sample_host_->ensure_bytes(4);
@@ -139,8 +128,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             if (knot.out.enabled) visit(knot.out.point);
         }
     }
-    static raster::IntRect Bounds(const AnnotationRenderState& description, std::size_t index, raster::IntRect runs, int width,
-                                  int height) {
+    static raster::IntRect Bounds(const AnnotationRenderState& description, std::size_t index, raster::IntRect runs, int width, int height) {
         const auto& object = description.DrawingObjectAt(index);
         if (!object.enabled) return {};
         const auto box = DrawingBox(description, index);
@@ -168,12 +156,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             bool visible = true;
             if (description.TransformsMask(index)) {
                 const auto target = description.TargetBox(index);
-                const float sx = object.box.second.x > object.box.first.x
-                                     ? (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x)
-                                     : 1.0F;
-                const float sy = object.box.second.y > object.box.first.y
-                                     ? (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y)
-                                     : 1.0F;
+                const float sx =
+                    object.box.second.x > object.box.first.x ? (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x) : 1.0F;
+                const float sy =
+                    object.box.second.y > object.box.first.y ? (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y) : 1.0F;
                 visible = sx > 0 && sy > 0;
                 const auto project = [](float value, float source, float target_coordinate, float scale) {
                     // Keep the same separate float operations as the raster kernel.
@@ -193,10 +179,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 y2 = std::max(y2, bottom);
             }
         }
-        return {static_cast<int>(std::clamp(x1, 0.0F, static_cast<float>(width))),
-                static_cast<int>(std::clamp(y1, 0.0F, static_cast<float>(height))),
-                static_cast<int>(std::clamp(x2, 0.0F, static_cast<float>(width))),
-                static_cast<int>(std::clamp(y2, 0.0F, static_cast<float>(height)))};
+        return {static_cast<int>(std::clamp(x1, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y1, 0.0F, static_cast<float>(height))),
+                static_cast<int>(std::clamp(x2, 0.0F, static_cast<float>(width))), static_cast<int>(std::clamp(y2, 0.0F, static_cast<float>(height)))};
     }
     void Render(const AnnotationRenderState& description, const mmltk::frameworks::gpu::ImagePlaneView source,
                 const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
@@ -212,11 +196,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                 retained.width != clean.descriptor.width || retained.height != clean.descriptor.height ||
                                 retained.semantic != semantic.allocation.identity;
         if (initialize) {
-            if (!source.valid() ||
-                cudaMemcpy2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes,
-                                  reinterpret_cast<const void*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
-                                  source.descriptor.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height,
-                                  cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+            if (!source.valid() || cudaMemcpy2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes,
+                                                     reinterpret_cast<const void*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
+                                                     source.descriptor.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height,
+                                                     cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
                 throw std::runtime_error("Annotation clean baseline preparation failed");
         }
         raster::IntRect clip{static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height), 0, 0};
@@ -239,12 +222,11 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 const auto& object = description.DrawingObjectAt(index);
                 auto& footprint = footprints_[index];
                 footprint.runs = same_runs ? retained.footprints[index].runs : RunBounds(object);
-                footprint.bounds = Bounds(description, index, footprint.runs, static_cast<int>(clean.descriptor.width),
-                                          static_cast<int>(clean.descriptor.height));
+                footprint.bounds =
+                    Bounds(description, index, footprint.runs, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height));
             }
             const auto bounds = current ? footprints_[index].bounds : raster::IntRect{};
-            const bool changed = !previous || !current || palette_changed ||
-                                 (retained.selected == index) != (description.editor.selected_object == index) ||
+            const bool changed = !previous || !current || palette_changed || (retained.selected == index) != (description.editor.selected_object == index) ||
                                  !SameDrawing(retained.objects[index], description.DrawingObjectAt(index), same_runs) ||
                                  retained.footprints[index].bounds.x1 != bounds.x1 || retained.footprints[index].bounds.y1 != bounds.y1 ||
                                  retained.footprints[index].bounds.x2 != bounds.x2 || retained.footprints[index].bounds.y2 != bounds.y2 ||
@@ -263,14 +245,13 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         full_damage_ = initialize;
         if (clip.x1 >= clip.x2 || clip.y1 >= clip.y2) return;
         if (cudaMemset2DAsync(reinterpret_cast<void*>(semantic.data + clip.y1 * semantic.descriptor.pitch_bytes + clip.x1 * 4U),
-                              semantic.descriptor.pitch_bytes, 0, static_cast<std::size_t>(clip.x2 - clip.x1) * 4U,
-                              static_cast<std::size_t>(clip.y2 - clip.y1), stream) != cudaSuccess)
+                              semantic.descriptor.pitch_bytes, 0, static_cast<std::size_t>(clip.x2 - clip.x1) * 4U, static_cast<std::size_t>(clip.y2 - clip.y1),
+                              stream) != cudaSuccess)
             throw std::runtime_error("Annotation semantic damage preparation failed");
         const auto& scene = *description.scene;
         // Reuse pinned staging only after its prior transfer has consumed it;
         // the rendering kernels themselves remain ordered on the runtime stream.
-        if (mask_upload_ != nullptr && cudaEventSynchronize(mask_upload_) != cudaSuccess)
-            throw std::runtime_error("Annotation mask upload settlement failed");
+        if (mask_upload_ != nullptr && cudaEventSynchronize(mask_upload_) != cudaSuccess) throw std::runtime_error("Annotation mask upload settlement failed");
         std::size_t run_count = 0U;
         for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
             const auto& object = description.DrawingObjectAt(index);
@@ -312,8 +293,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                     }
                 }
                 if (object.shape == domain::AnnotationShape::Skeleton) {
-                    for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
-                        point(description.DrawingNode(index, node));
+                    for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node) point(description.DrawingNode(index, node));
                     geometry.edge_offset = geometry.words.size();
                     for (const auto edge : object.skeleton_edges) {
                         if (!object.skeleton_nodes[edge.source].visible || !object.skeleton_nodes[edge.target].visible) continue;
@@ -361,11 +341,9 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             std::size_t first = 0U, last = total_words;
             if (!grew) {
                 const auto common = std::min(uploaded_words_.size(), total_words);
-                while (first < common && uploaded_words_[first] == pairs[first])
-                    ++first;
+                while (first < common && uploaded_words_[first] == pairs[first]) ++first;
                 if (uploaded_words_.size() == total_words)
-                    while (last > first && uploaded_words_[last - 1U] == pairs[last - 1U])
-                        --last;
+                    while (last > first && uploaded_words_[last - 1U] == pairs[last - 1U]) --last;
             }
             if (last > first && cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first,
                                                 (last - first) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess)
@@ -373,15 +351,14 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             uploaded_words_.assign(pairs, pairs + total_words);
             if (mask_upload_ == nullptr && cudaEventCreateWithFlags(&mask_upload_, cudaEventDisableTiming) != cudaSuccess)
                 throw std::runtime_error("Annotation mask upload event creation failed");
-            if (cudaEventRecord(mask_upload_, stream) != cudaSuccess)
-                throw std::runtime_error("Annotation mask upload event recording failed");
+            if (cudaEventRecord(mask_upload_, stream) != cudaSuccess) throw std::runtime_error("Annotation mask upload event recording failed");
         }
         std::size_t offset = 0U;
         if (palette_source_ != scene.palette) {
             palette_source_ = scene.palette;
             for (std::size_t index = 0U; index < scene.categories.size(); ++index)
-                raster::detail::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value,
-                                                  palette_[index].r, palette_[index].g, palette_[index].b);
+                raster::detail::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value, palette_[index].r,
+                                                  palette_[index].g, palette_[index].b);
         }
         for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
             const auto& object = description.DrawingObjectAt(index);
@@ -407,12 +384,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                          .source_y = object.box.first.y,
                          .target_x = target.first.x,
                          .target_y = target.first.y,
-                         .scale_x = object.box.second.x > object.box.first.x
-                                        ? (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x)
-                                        : 1.0F,
-                         .scale_y = object.box.second.y > object.box.first.y
-                                        ? (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y)
-                                        : 1.0F}) != 0)
+                         .scale_x =
+                             object.box.second.x > object.box.first.x ? (target.second.x - target.first.x) / (object.box.second.x - object.box.first.x) : 1.0F,
+                         .scale_y = object.box.second.y > object.box.first.y ? (target.second.y - target.first.y) / (object.box.second.y - object.box.first.y)
+                                                                             : 1.0F}) != 0)
                     throw std::runtime_error("Annotation mask rendering failed");
                 offset += object.mask.runs.size();
             }
@@ -421,8 +396,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             const raster::NativeStream native_stream{reinterpret_cast<void*>(stream_value)};
             const auto& geometry = geometry_[index];
             const auto* words = total_words ? static_cast<const std::uint32_t*>(mask_device_.active()) + run_count * 2 : nullptr;
-            const raster::PointBuffer points{geometry.count ? reinterpret_cast<const int*>(words + geometry.offset) : nullptr,
-                                             geometry.count};
+            const raster::PointBuffer points{geometry.count ? reinterpret_cast<const int*>(words + geometry.offset) : nullptr, geometry.count};
             int draw_status = 0;
             if (object.shape == domain::AnnotationShape::Spline && geometry.count > 1)
                 draw_status = raster::raster_polyline_rgba({overlay, points, object.spline_closed, color, 2, native_stream, clip});
@@ -433,13 +407,12 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                     {overlay, points, {words + geometry.offset + geometry.edge_offset, geometry.edges}, color, 2, native_stream, clip});
             if (draw_status != 0) throw std::runtime_error("Annotation geometry rendering failed");
             if (geometry.handles && (object.shape != domain::AnnotationShape::Spline || description.editor.selected_object == index) &&
-                raster::raster_points_rgba(
-                    {overlay,
-                     {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles},
-                     4,
-                     {color.r, color.g, color.b, 255},
-                     native_stream,
-                     clip}) != 0)
+                raster::raster_points_rgba({overlay,
+                                            {reinterpret_cast<const int*>(words + geometry.offset + geometry.handle_offset), geometry.handles},
+                                            4,
+                                            {color.r, color.g, color.b, 255},
+                                            native_stream,
+                                            clip}) != 0)
                 throw std::runtime_error("Annotation vertex rendering failed");
             if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
             if (description.editor.selected_object == index &&
@@ -475,7 +448,6 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             retained.transforms[index] = description.preview_object == index ? description.drag : std::nullopt;
         }
     }
-
     const std::exception_ptr release_failure_ = std::make_exception_ptr(std::runtime_error("Annotation mask release failed"));
     VisualRegion crop_{};
     // The runtime owns this input until the next Open or resource teardown.
@@ -498,9 +470,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     mutable cudaEvent_t mask_upload_ = nullptr;
     void EnsureMasks(const std::size_t bytes) const {
         if (bytes <= mask_capacity_) return;
-        const auto capacity = mask_capacity_ <= std::numeric_limits<std::size_t>::max() - mask_capacity_ / 2U
-                                  ? std::max(bytes, mask_capacity_ + mask_capacity_ / 2U)
-                                  : bytes;
+        const auto capacity =
+            mask_capacity_ <= std::numeric_limits<std::size_t>::max() - mask_capacity_ / 2U ? std::max(bytes, mask_capacity_ + mask_capacity_ / 2U) : bytes;
         if (!mask_host_) mask_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
         mask_host_->ensure_bytes(capacity);
         if (!mask_device_.AllocateCandidate([capacity](void*& p) { return cudaMalloc(&p, capacity); }).released() ||
@@ -509,9 +480,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         mask_capacity_ = capacity;
     }
 };
-
 }  // namespace
-
 VisualRuntimeFactory make_native_annotation_runtime_factory(const VisualDeviceSettings settings) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Annotation native configuration is invalid");
     return [settings, execution = resolve_visual_device_execution(settings)](auto revisions) {
@@ -529,5 +498,4 @@ VisualRuntimeFactory make_native_annotation_runtime_factory(const VisualDeviceSe
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
     };
 }
-
 }  // namespace mmltk::controller

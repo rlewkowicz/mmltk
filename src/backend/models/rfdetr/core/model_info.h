@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstddef>
 #include <algorithm>
 #include <span>
@@ -10,16 +9,13 @@
 #include "src/backend/models/rfdetr/contract/class_layout.h"
 #include <string>
 #include <vector>
-
 namespace mmltk::backend::models::rfdetr {
-
 struct TensorInfo {
     std::string name;
     std::vector<int64_t> shape;
     std::string dtype;
     RfdetrOutputRole role = RfdetrOutputRole::Unspecified;
 };
-
 struct ModelInfo {
     std::string backend;
     std::string model_path;
@@ -31,7 +27,6 @@ struct ModelInfo {
     bool has_masks = false;
     std::optional<ModelClassLayout> class_layout;
 };
-
 inline void apply_rfdetr_output_roles(ModelInfo& info, std::span<const RfdetrNamedOutputRole> roles) {
     if (roles.size() > 3) throw std::invalid_argument("too many RF-DETR output roles");
     for (const auto& declared : roles) {
@@ -58,7 +53,6 @@ inline void apply_rfdetr_output_roles(ModelInfo& info, std::span<const RfdetrNam
     stream << "]";
     return stream.str();
 }
-
 struct RfdetrOutputRoles final {
     std::size_t logits{}, boxes{};
     std::optional<std::size_t> masks;
@@ -68,25 +62,27 @@ struct RfdetrOutputRoles final {
     for (std::size_t index = 0; index < info.outputs.size(); ++index) {
         auto& output = info.outputs[index];
         auto role = output.role;
-        const auto canonical = output.name == "pred_logits" ? RfdetrOutputRole::Logits :
-            output.name == "pred_boxes" ? RfdetrOutputRole::Boxes :
-            output.name == "pred_masks" ? RfdetrOutputRole::Masks : RfdetrOutputRole::Unspecified;
-        if (role == RfdetrOutputRole::Unspecified) role = canonical;
+        const auto canonical = output.name == "pred_logits"  ? RfdetrOutputRole::Logits
+                               : output.name == "pred_boxes" ? RfdetrOutputRole::Boxes
+                               : output.name == "pred_masks" ? RfdetrOutputRole::Masks
+                                                             : RfdetrOutputRole::Unspecified;
+        if (role == RfdetrOutputRole::Unspecified)
+            role = canonical;
         else if (canonical != RfdetrOutputRole::Unspecified && canonical != role)
             throw std::invalid_argument("RF-DETR output role contradicts canonical tensor name");
-        auto* selected = role == RfdetrOutputRole::Logits ? &logits : role == RfdetrOutputRole::Boxes ? &boxes :
-            role == RfdetrOutputRole::Masks ? &masks : nullptr;
+        auto* selected = role == RfdetrOutputRole::Logits  ? &logits
+                         : role == RfdetrOutputRole::Boxes ? &boxes
+                         : role == RfdetrOutputRole::Masks ? &masks
+                                                           : nullptr;
         if (!selected || *selected) throw std::invalid_argument("ambiguous RF-DETR output roles");
         *selected = index;
         output.role = role;
         const auto rank = role == RfdetrOutputRole::Masks ? 4U : 3U;
-        if (output.shape.size() != rank || output.shape[1] <= 0 || output.shape[2] <= 0 ||
-            (role == RfdetrOutputRole::Boxes && output.shape[2] != 4) ||
+        if (output.shape.size() != rank || output.shape[1] <= 0 || output.shape[2] <= 0 || (role == RfdetrOutputRole::Boxes && output.shape[2] != 4) ||
             (role == RfdetrOutputRole::Masks && output.shape[3] <= 0))
             throw std::invalid_argument("invalid RF-DETR output shape");
     }
-    if (!logits || !boxes || info.outputs.size() != (masks ? 3U : 2U))
-        throw std::invalid_argument("RF-DETR requires declared logits and boxes outputs");
+    if (!logits || !boxes || info.outputs.size() != (masks ? 3U : 2U)) throw std::invalid_argument("RF-DETR requires declared logits and boxes outputs");
     const auto& shape = info.outputs[*logits].shape;
     for (const auto& output : info.outputs)
         if (output.shape[1] != shape[1] || (output.shape[0] > 0 && shape[0] > 0 && output.shape[0] != shape[0]))
@@ -96,5 +92,4 @@ struct RfdetrOutputRoles final {
     info.has_masks = masks.has_value();
     return {*logits, *boxes, masks};
 }
-
 }  // namespace mmltk::backend::models::rfdetr

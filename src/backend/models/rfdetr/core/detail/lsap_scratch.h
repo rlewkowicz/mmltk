@@ -4,7 +4,6 @@
 #include <memory_resource>
 #include <vector>
 #include "src/backend/models/rfdetr/core/detail/scipy_rectangular_lsap.h"
-
 namespace mmltk::backend::models::rfdetr {
 // One workspace per runtime solver worker, retained through its high-water size.
 struct LsapScratch final {
@@ -13,7 +12,6 @@ struct LsapScratch final {
     std::pmr::vector<double> costs;
     RectangularLsApWorkspace solver;
     std::pmr::vector<std::int64_t> row_indices, col_indices, batch_rows, batch_cols;
-
     void ensure_assignment_capacity(std::int64_t assignment_size, std::int64_t grouped_assignment_size) {
         row_indices.reserve(static_cast<std::size_t>(assignment_size));
         col_indices.reserve(static_cast<std::size_t>(assignment_size));

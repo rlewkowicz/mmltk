@@ -1,6 +1,5 @@
 #pragma once
 #include "src/frameworks/gpu/image_product_retirement.h"
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -9,11 +8,8 @@
 #include <mutex>
 #include <stop_token>
 #include <vector>
-
 #include "src/frameworks/gpu/image_buffer.h"
-
 namespace mmltk::frameworks::gpu {
-
 class ImageProductPool final {
     struct Admission;
     struct Slot;
@@ -135,5 +131,4 @@ class ImageProductPool final {
     std::shared_ptr<Admission> admission_;
     std::vector<std::shared_ptr<Slot>> slots_;
 };
-
 }  // namespace mmltk::frameworks::gpu

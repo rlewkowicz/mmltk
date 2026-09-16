@@ -1,33 +1,26 @@
 #pragma once
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-
 #include "gpu_augment_cuda_launch.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
-
 // The host solves each image's geometry and effects once. CUDA image kernels consume that
 // parameter block, while annotation consumers retain the same compact spatial-erasure plan.
 // Sampling preserves the original counter stream; these functions allocate no storage.
 namespace mmltk::backend::models::rfdetr::augment_math {
-
 inline constexpr float kPi = 3.14159265358979323846F;
 [[nodiscard]] __host__ __device__ __forceinline__ std::uint64_t image_key(const std::uint64_t seed, const int epoch, const int rank,
                                                                           const std::uint64_t sequence, const std::int64_t image) {
     return mix64(seed ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(epoch)) << 32U) ^
-                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rank)) * 0xd2b74407b1ce6e93ULL) ^
-                 (sequence * 0xca5a826395121157ULL) ^ (static_cast<std::uint64_t>(image) * kGoldenRatio));
+                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rank)) * 0xd2b74407b1ce6e93ULL) ^ (sequence * 0xca5a826395121157ULL) ^
+                 (static_cast<std::uint64_t>(image) * kGoldenRatio));
 }
-
-[[nodiscard]] __host__ __device__ __forceinline__ float sample_strength(const GpuAugmentationGroupLaunchConfig& group,
-                                                                        const std::uint64_t key, std::uint64_t& counter) {
+[[nodiscard]] __host__ __device__ __forceinline__ float sample_strength(const GpuAugmentationGroupLaunchConfig& group, const std::uint64_t key,
+                                                                        std::uint64_t& counter) {
     const float value = uniform01(key, counter++);
     return fmaf(group.max_strength - group.min_strength, value, group.min_strength);
 }
-
 [[nodiscard]] __host__ __device__ __forceinline__ float clamp01(const float value) { return fminf(1.0F, fmaxf(0.0F, value)); }
-
 // Affine transform sampled for one image, plus the resize factors the host planner records.
 struct GeometryPlan {
     float forward[6];
@@ -39,11 +32,10 @@ struct GeometryPlan {
     bool flip_x;
     bool flip_y;
 };
-
 // Draws flip/rotation/resize from `key`, advancing `counter` so callers stay on the same key stream,
 // and solves the forward transform together with its inverse.
-[[nodiscard]] __host__ __device__ __forceinline__ GeometryPlan solve_geometry_plan(const GpuAugmentationLaunchConfig& config,
-                                                                                   const std::uint64_t key, std::uint64_t& counter) {
+[[nodiscard]] __host__ __device__ __forceinline__ GeometryPlan solve_geometry_plan(const GpuAugmentationLaunchConfig& config, const std::uint64_t key,
+                                                                                   std::uint64_t& counter) {
     const bool flip_x = uniform01(key, counter++) < config.geometry.probability * 0.5F;
     const bool flip_y = uniform01(key, counter++) < config.geometry.probability * 0.5F;
     float angle = 0.0F;
@@ -51,7 +43,6 @@ struct GeometryPlan {
         const float strength = sample_strength(config.geometry, key, counter);
         angle = (uniform01(key, counter++) * 2.0F - 1.0F) * (10.0F * kPi / 180.0F) * strength;
     }
-
     const float cosine = cosf(angle);
     const float sine = sinf(angle);
     const float rotation_scale = 1.0F / (fabsf(cosine) + fabsf(sine));
@@ -63,7 +54,6 @@ struct GeometryPlan {
     float forward11 = rotation_scale * cosine * flip_scale_y;
     float forward02 = 0.5F - 0.5F * (forward00 + forward01);
     float forward12 = 0.5F - 0.5F * (forward10 + forward11);
-
     float resize_scale = 1.0F;
     float resize_offset_x = 0.0F;
     float resize_offset_y = 0.0F;
@@ -81,7 +71,6 @@ struct GeometryPlan {
         forward11 *= resize_scale;
         forward12 = fmaf(resize_scale, forward12, resize_offset_y);
     }
-
     const float determinant = forward00 * forward11 - forward01 * forward10;
     const float inverse_determinant = 1.0F / determinant;
     const float inverse00 = forward11 * inverse_determinant;
@@ -90,8 +79,7 @@ struct GeometryPlan {
     const float inverse11 = forward00 * inverse_determinant;
     return GeometryPlan{
         {forward00, forward01, forward02, forward10, forward11, forward12},
-        {inverse00, inverse01, -(inverse00 * forward02 + inverse01 * forward12), inverse10, inverse11,
-         -(inverse10 * forward02 + inverse11 * forward12)},
+        {inverse00, inverse01, -(inverse00 * forward02 + inverse01 * forward12), inverse10, inverse11, -(inverse10 * forward02 + inverse11 * forward12)},
         fabsf(determinant),
         resize_scale,
         resize_offset_x,
@@ -100,7 +88,6 @@ struct GeometryPlan {
         flip_y,
     };
 }
-
 enum ParameterIndex : std::uint8_t {
     kInverse00 = 0,
     kInverse01 = 1,
@@ -130,12 +117,9 @@ enum ParameterIndex : std::uint8_t {
     kFlipX = 36,
     kFlipY = 37,
 };
-
 // Plan all image effects once on the host; the image kernel consumes the staged parameters.
 [[nodiscard]] inline GeometryPlan solve_image_plan(float* values, const GpuAugmentationLaunchConfig& config, const std::uint64_t key) {
-    for (int index = 0; index < kGpuAugmentationParameterCount; ++index) {
-        values[index] = 0.0F;
-    }
+    for (int index = 0; index < kGpuAugmentationParameterCount; ++index) { values[index] = 0.0F; }
     values[kInverse00] = 1.0F;
     values[kInverse11] = 1.0F;
     values[kForward00] = 1.0F;
@@ -145,10 +129,8 @@ enum ParameterIndex : std::uint8_t {
     values[kColorMatrix + 8] = 1.0F;
     values[kAreaScale] = 1.0F;
     if (config.enabled == 0) {
-        return GeometryPlan{
-            {1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, 1.0F, 1.0F, 0.0F, 0.0F, false, false};
+        return GeometryPlan{{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F}, 1.0F, 1.0F, 0.0F, 0.0F, false, false};
     }
-
     std::uint64_t counter = 0;
     const augment_math::GeometryPlan geometry = augment_math::solve_geometry_plan(config, key, counter);
     for (int index = 0; index < 6; ++index) {
@@ -158,7 +140,6 @@ enum ParameterIndex : std::uint8_t {
     values[kAreaScale] = geometry.area_scale;
     values[kFlipX] = geometry.flip_x ? 1.0F : 0.0F;
     values[kFlipY] = geometry.flip_y ? 1.0F : 0.0F;
-
     // Preserve conditional draws in order: geometry/resize, color, noise, blur, then occlusion.
     // Donor and cache choices use their independent 0x4000/0x5000 counter ranges.
     if (uniform01(key, counter++) < config.color.probability) {
@@ -176,7 +157,6 @@ enum ParameterIndex : std::uint8_t {
             values[kColorOffset + output_channel] = 0.5F * (1.0F - contrast) + brightness;
         }
     }
-
     if (uniform01(key, counter++) < config.noise.probability) {
         values[kNoiseMode] = uniform01(key, counter++) < 0.5F ? 1.0F : 2.0F;
         values[kNoiseStrength] = sample_strength(config.noise, key, counter);
@@ -203,7 +183,6 @@ enum ParameterIndex : std::uint8_t {
     }
     return geometry;
 }
-
 [[nodiscard]] __host__ __device__ __forceinline__ AugmentationSpatialErasure spatial_erasure(const float* values, const std::uint64_t key) {
     return {key,
             values[kOcclusionMode] == 2.0F ? 0.05F * values[kOcclusionStrength] : 0.0F,
@@ -213,5 +192,4 @@ enum ParameterIndex : std::uint8_t {
             values[kEraseY1],
             values[kOcclusionMode] == 3.0F ? 1U : 0U};
 }
-
 }  // namespace mmltk::backend::models::rfdetr::augment_math

@@ -1,9 +1,7 @@
 #include "src/controller/presentation/presentation_system.h"
-
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -14,15 +12,13 @@
 #include <stop_token>
 #include <thread>
 #include <utility>
-
 #include "src/common/io/event_fd.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/types/generation.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-
 namespace mmltk::controller {
-VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation, const PresentationDiagnosticRecord& record,
-                                                  const int device, const std::uint64_t outcome) noexcept {
+VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperation operation, const PresentationDiagnosticRecord& record, const int device,
+                                                  const std::uint64_t outcome) noexcept {
     const auto& capability = record.publication.capability;
     return {.system = contracts::DiagnosticOwner::Presentation,
             .operation = operation,
@@ -41,25 +37,20 @@ VisualDiagnosticFact presentation_diagnostic_fact(const VisualDiagnosticOperatio
                         .source = visual_diagnostic_source(record.submitted.observation),
                         .publication = {.presentation_revision = record.publication.presentation_revision},
                         .allocation = {.allocation_generation = capability.generation},
-                        .transfer = {.transfer_sequence = record.publication.transfer_sequence,
-                                     .timeline_ready = record.publication.timeline_ready},
+                        .transfer = {.transfer_sequence = record.publication.transfer_sequence, .timeline_ready = record.publication.timeline_ready},
                         .link = record.link}};
 }
-
 namespace gpu = mmltk::frameworks::gpu;
-
 class PresentationSystem::Impl final {
    public:
     static constexpr std::size_t kMaximumSources = 8U;
-
     Impl(const VisualDeviceSettings settings, PresentationNativeWriterFactory factory, const std::span<const VisualSourceReader> sources,
          SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
         : settings_(settings), events_(std::move(events)), diagnostics_(diagnostics), writer_(CreateWriter(settings, factory)) {
         if (!settings_.valid() || sources.empty() || sources.size() > kMaximumSources)
             throw contracts::InvalidIntentError("Presentation configuration is invalid");
         for (const auto& source : sources) {
-            if (!source.source.valid() || !source.observe || !source.borrow ||
-                std::ranges::count(sources, source.source, &VisualSourceReader::source) != 1)
+            if (!source.source.valid() || !source.observe || !source.borrow || std::ranges::count(sources, source.source, &VisualSourceReader::source) != 1)
                 throw contracts::InvalidIntentError("Presentation source registry is invalid");
         }
         sources_ = sources;
@@ -71,7 +62,6 @@ class PresentationSystem::Impl final {
             } catch (...) { Failed(std::current_exception()); }
         });
     }
-
     PresentationSnapshot Select(const PresentationSourceIdentity source) {
         if (Find(source) == sources_.end()) throw contracts::InvalidIntentError("Presentation source is unknown");
         {
@@ -92,7 +82,6 @@ class PresentationSystem::Impl final {
         }
         return snapshot();
     }
-
     void SourceChanged(const PresentationSourceIdentity source) noexcept {
         bool wake = false;
         {
@@ -106,7 +95,6 @@ class PresentationSystem::Impl final {
         }
         if (wake && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation source notification failed")));
     }
-
     void SetApplicationPeerConnected(const bool connected) noexcept {
         bool wake = false;
         {
@@ -114,14 +102,12 @@ class PresentationSystem::Impl final {
             if (stopping_ || application_peer_connected_ == connected) return;
             application_peer_connected_ = connected;
             if (connected) {
-                if (state_.selected.valid() && !pending_)
-                    pending_ = Pending{.source = state_.selected, .generation = selection_generation_, .force = false};
+                if (state_.selected.valid() && !pending_) pending_ = Pending{.source = state_.selected, .generation = selection_generation_, .force = false};
                 wake = true;
             }
         }
         if (wake && !Wake()) Failed(std::make_exception_ptr(std::runtime_error("Presentation peer notification failed")));
     }
-
     void SetExpectedBrowserProcessGroup(const pid_t process_group) {
         {
             std::scoped_lock lock(mutex_);
@@ -132,12 +118,10 @@ class PresentationSystem::Impl final {
             throw contracts::FailedError("Presentation control notification failed");
         }
     }
-
     void BrowserPeerLost() noexcept {
         std::scoped_lock lock(mutex_);
         browser_terminal_ = true;
     }
-
     void CloseAdmission() noexcept {
         {
             std::scoped_lock lock(mutex_);
@@ -146,12 +130,10 @@ class PresentationSystem::Impl final {
         }
         static_cast<void>(Wake());
     }
-
     PresentationSnapshot snapshot() const {
         std::scoped_lock lock(mutex_);
         return state_;
     }
-
     PresentationShutdownResult Shutdown() noexcept {
         {
             std::scoped_lock lock(mutex_);
@@ -183,13 +165,10 @@ class PresentationSystem::Impl final {
         std::uint64_t generation = 0U;
         bool force = true;
     };
-
     void AdvanceRevision() { state_.revision = mmltk::common::types::advance_monotonic_identity(state_.revision); }
-
     std::span<const VisualSourceReader>::iterator Find(const PresentationSourceIdentity source) {
         return std::ranges::find(sources_, source, &VisualSourceReader::source);
     }
-
     [[nodiscard]] static std::unique_ptr<PresentationNativeWriter> CreateWriter(const VisualDeviceSettings settings,
                                                                                 const PresentationNativeWriterFactory& factory) {
         if (!settings.valid() || !factory) throw contracts::InvalidIntentError("Presentation configuration is invalid");
@@ -197,7 +176,6 @@ class PresentationSystem::Impl final {
         if (!writer) throw std::runtime_error("Presentation native writer is unavailable");
         return writer;
     }
-
     void RunCycle(const std::stop_token stop) {
         std::optional<Pending> pending;
         const VisualSourceReader* reader = nullptr;
@@ -230,8 +208,8 @@ class PresentationSystem::Impl final {
             bool submit = false;
             {
                 std::scoped_lock lock(mutex_);
-                const bool reserved = in_flight_ && in_flight_->selection_generation == pending->generation &&
-                                      in_flight_->observation.frame.source == pending->source;
+                const bool reserved =
+                    in_flight_ && in_flight_->selection_generation == pending->generation && in_flight_->observation.frame.source == pending->source;
                 if (reserved && !stopping_ && !stop.stop_requested() && observation.valid() && frame.source == pending->source &&
                     pending->generation == selection_generation_ && state_.selected == pending->source &&
                     (pending->force || state_.completed != frame || state_.completed_source_revision != observation.snapshot_revision)) {
@@ -281,8 +259,7 @@ class PresentationSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (stopping_) return;
-            const auto capability =
-                outcome.progress == PresentationNativeProgress::Published ? outcome.publication.capability : outcome.capability;
+            const auto capability = outcome.progress == PresentationNativeProgress::Published ? outcome.publication.capability : outcome.capability;
             if (state_.capability != capability) {
                 state_.capability = capability;
                 AdvanceRevision();
@@ -295,8 +272,7 @@ class PresentationSystem::Impl final {
                     pending_ = Pending{.source = state_.selected, .generation = selection_generation_, .force = true};
                     wake_again = true;
                     break;
-                case PresentationNativeProgress::Waiting:
-                    break;
+                case PresentationNativeProgress::Waiting: break;
                 case PresentationNativeProgress::Superseded:
                     if (in_flight_ && *in_flight_ == outcome.submitted) {
                         // Catch up to already-published source progress once.
@@ -312,8 +288,7 @@ class PresentationSystem::Impl final {
                     }
                     wake_again = pending_.has_value();
                     break;
-                case PresentationNativeProgress::Published:
-                    break;
+                case PresentationNativeProgress::Published: break;
             }
             if (outcome.progress != PresentationNativeProgress::Published) {
                 completed = state_;
@@ -361,15 +336,13 @@ class PresentationSystem::Impl final {
         }
         if (!publish) return;
         diagnostics_.Emit([&] {
-            auto fact =
-                presentation_diagnostic_fact(VisualDiagnosticOperation::TimelineReady,
-                                             {outcome.submitted, outcome.publication, outcome.diagnostic_link}, settings_.device, 1U);
+            auto fact = presentation_diagnostic_fact(VisualDiagnosticOperation::TimelineReady,
+                                                     {outcome.submitted, outcome.publication, outcome.diagnostic_link}, settings_.device, 1U);
             fact.value = completed.timeline_ready;
             return fact;
         });
         Publish(event_type{PresentationCompleted{completed}});
     }
-
     void Run(const std::stop_token stop) {
         while (!stop.stop_requested()) {
             const int native_fd = writer_->poll_fd();
@@ -390,9 +363,7 @@ class PresentationSystem::Impl final {
             if ((descriptors[1].revents & POLLIN) != 0) {
                 std::uint64_t wake = 0U;
                 ssize_t consumed = -1;
-                do {
-                    consumed = ::read(control_fd_.get(), &wake, sizeof(wake));
-                } while (consumed < 0 && errno == EINTR);
+                do { consumed = ::read(control_fd_.get(), &wake, sizeof(wake)); } while (consumed < 0 && errno == EINTR);
                 if (consumed < 0 && errno != EAGAIN) throw std::runtime_error("Presentation control wake failed");
                 if (stop.stop_requested()) return;
             }
@@ -400,9 +371,7 @@ class PresentationSystem::Impl final {
             RunCycle(stop);
         }
     }
-
     [[nodiscard]] bool Wake() noexcept { return mmltk::common::io::signal_event_fd(control_fd_.get()); }
-
     void Failed(const std::exception_ptr failure) noexcept {
         auto detail = visual_failure_detail(failure, "Presentation native writer failed");
         bool publish = false;
@@ -423,11 +392,9 @@ class PresentationSystem::Impl final {
             failed_selection_generation = selection_generation_;
         }
         if (!publish) return;
-        report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Presentation, settings_.device, detail,
-                                     failed_selection_generation);
+        report_visual_worker_failure(diagnostics_, contracts::DiagnosticOwner::Presentation, settings_.device, detail, failed_selection_generation);
         Publish(event_type{PresentationFailed{{failed.revision, failed.selected}, std::move(detail)}});
     }
-
     void RetireWriter() noexcept {
         std::shared_ptr<PresentationNativeWriter> retired;
         {
@@ -445,15 +412,12 @@ class PresentationSystem::Impl final {
             // A terminal receiver retains its borrowed source and CUDA resources.
             auto* retained_writer = retired.get();
             std::move(retirement_)
-                .Install(gpu::TerminalCudaCustody::Share(std::move(retired)),
-                         result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
+                .Install(gpu::TerminalCudaCustody::Share(std::move(retired)), result == Retirement::RetainedBrowserRead ? cudaSuccess : cudaErrorUnknown);
             if (result == Retirement::RetainedBrowserRead) retained_writer->TerminalCustodyInstalled();
         }
         if (result == Retirement::UnsafeFailure || result == Retirement::ReleasedWithFailure) Failed({});
     }
-
     void Publish(event_type event) noexcept { publish_visual_event_noexcept(events_, std::move(event)); }
-
     VisualDeviceSettings settings_;
     std::span<const VisualSourceReader> sources_;
     SystemEventSink<event_type> events_;
@@ -477,10 +441,8 @@ class PresentationSystem::Impl final {
     mmltk::common::io::ScopedFd control_fd_;
     std::jthread worker_;
 };
-
 PresentationSystem::PresentationSystem(const VisualDeviceSettings settings, PresentationNativeWriterFactory factory,
-                                       const std::span<const VisualSourceReader> sources, SystemEventSink<event_type> events,
-                                       VisualDiagnosticSink diagnostics)
+                                       const std::span<const VisualSourceReader> sources, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
     : impl_(std::make_unique<Impl>(settings, std::move(factory), sources, std::move(events), diagnostics)) {}
 PresentationSystem::~PresentationSystem() {
     if (!impl_->stopped()) std::terminate();
@@ -502,5 +464,4 @@ PresentationShutdownResult PresentationSystem::Stop() noexcept { return impl_->S
 PresentationShutdownResult PresentationSystem::Shutdown() noexcept { return impl_->Shutdown(); }
 bool PresentationSystem::stopped() const noexcept { return impl_->stopped(); }
 PresentationSnapshot PresentationSystem::snapshot() const { return impl_->snapshot(); }
-
 }  // namespace mmltk::controller

@@ -1,12 +1,10 @@
 #include "src/frameworks/gpu/detail/gdr_buffer_backend.h"
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
-
 #include <gdrapi.h>
 #include <cerrno>
 #include <system_error>
 #include <stdexcept>
 #include <string>
-
 namespace mmltk::frameworks::gpu::detail {
 namespace {
 void check_cuda(CUresult result, const char* operation) {
@@ -58,11 +56,9 @@ class NativeGdrBackend final : public GdrBufferBackend {
             int version{};
             check_cuda(cuDriverGetVersion(&version), "query DMA-BUF driver version");
             if (version < 13030) throw GdrTransportUnavailable("GDR DMA-BUF mmap requires driver 13.3+");
-            check_cuda(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_MMAP_SUPPORTED, device),
-                       "query selected device DMA-BUF mmap support");
+            check_cuda(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_MMAP_SUPPORTED, device), "query selected device DMA-BUF mmap support");
         } else {
-            check_cuda(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, device),
-                       "query selected device GPUDirect support");
+            check_cuda(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, device), "query selected device GPUDirect support");
         }
         if (!supported) throw GdrTransportUnavailable("selected GPU does not support the required GDR backend");
     }
@@ -74,8 +70,7 @@ class NativeGdrBackend final : public GdrBufferBackend {
     }
     void sync_memops(CUdeviceptr allocation) override {
         unsigned value = 1;
-        check_cuda(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, allocation),
-                   "enable synchronous memops on original GDR allocation");
+        check_cuda(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, allocation), "enable synchronous memops on original GDR allocation");
     }
     int free(CUdeviceptr allocation) noexcept override { return static_cast<int>(cuMemFree(allocation)); }
     std::uintptr_t pin(void* handle, CUdeviceptr data, std::size_t bytes) override {

@@ -1,6 +1,5 @@
 #include <fcntl.h>
 #include <unistd.h>
-
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -11,25 +10,18 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 #include "catch2_compat.hpp"
 #include "spdmon/spdmon.hpp"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/controller/services/console_output.h"
-
 namespace {
-
 using ProgressClock = spdmon::ProgressBar::clock_t;
 using ProgressTimePoint = ProgressClock::time_point;
-
 ProgressClock::duration::rep g_progress_elapsed_ticks = 0;
-
 ProgressTimePoint test_progress_now() { return ProgressTimePoint{ProgressClock::duration{g_progress_elapsed_ticks}}; }
-
 void set_progress_now(const std::chrono::milliseconds elapsed) {
     g_progress_elapsed_ticks = std::chrono::duration_cast<ProgressClock::duration>(elapsed).count();
 }
-
 class ScopedEnvVar final {
    public:
     ScopedEnvVar(const char* name, const std::string& value) : name_(name) {
@@ -37,11 +29,8 @@ class ScopedEnvVar final {
             had_previous_value_ = true;
             previous_value_ = existing;
         }
-        if (::setenv(name_.c_str(), value.c_str(), 1) != 0) {
-            throw std::runtime_error("setenv failed for " + name_ + ": " + std::strerror(errno));
-        }
+        if (::setenv(name_.c_str(), value.c_str(), 1) != 0) { throw std::runtime_error("setenv failed for " + name_ + ": " + std::strerror(errno)); }
     }
-
     ~ScopedEnvVar() {
         if (had_previous_value_) {
             static_cast<void>(::setenv(name_.c_str(), previous_value_.c_str(), 1));
@@ -49,7 +38,6 @@ class ScopedEnvVar final {
             static_cast<void>(::unsetenv(name_.c_str()));
         }
     }
-
     ScopedEnvVar(const ScopedEnvVar&) = delete;
     ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
 
@@ -58,7 +46,6 @@ class ScopedEnvVar final {
     std::string previous_value_;
     bool had_previous_value_ = false;
 };
-
 class ScopedStderrCapture final {
    public:
     ScopedStderrCapture() {
@@ -78,7 +65,6 @@ class ScopedStderrCapture final {
         static_cast<void>(::close(pipe_fds_[1]));
         pipe_fds_[1] = -1;
     }
-
     ~ScopedStderrCapture() noexcept {
         if (finished_) return;
         try {
@@ -88,10 +74,8 @@ class ScopedStderrCapture final {
             close_pipe();
         }
     }
-
     ScopedStderrCapture(const ScopedStderrCapture&) = delete;
     ScopedStderrCapture& operator=(const ScopedStderrCapture&) = delete;
-
     std::string finish() {
         if (finished_) return output_;
         std::fflush(stderr);
@@ -108,14 +92,12 @@ class ScopedStderrCapture final {
     int saved_stderr_ = -1;
     bool finished_ = false;
     std::string output_;
-
     void restore_stderr() noexcept {
         if (saved_stderr_ < 0) return;
         static_cast<void>(::dup2(saved_stderr_, STDERR_FILENO));
         static_cast<void>(::close(saved_stderr_));
         saved_stderr_ = -1;
     }
-
     void close_pipe() noexcept {
         for (int& descriptor : pipe_fds_) {
             if (descriptor < 0) continue;
@@ -124,7 +106,6 @@ class ScopedStderrCapture final {
         }
     }
 };
-
 std::vector<std::string> normalize_terminal_output(const std::string& output) {
     std::vector<std::string> lines;
     std::string current;
@@ -146,7 +127,6 @@ std::vector<std::string> normalize_terminal_output(const std::string& output) {
     if (!current.empty()) lines.push_back(current);
     return lines;
 }
-
 std::size_t count_substring(const std::string& haystack, const std::string_view needle) {
     std::size_t count = 0U;
     std::size_t offset = 0U;
@@ -156,7 +136,6 @@ std::size_t count_substring(const std::string& haystack, const std::string_view 
     }
     return count;
 }
-
 void test_compile_postfix_formatting() {
     mmltk::backend::data::CompileProgress progress{};
     progress.phase = mmltk::backend::data::DatasetCompilePhase::Pixels;
@@ -167,7 +146,6 @@ void test_compile_postfix_formatting() {
     CHECK(spdmon::format_progress_postfix(phase_label, progress.active_workers, 2U) == "pixels 2 active -");
     CHECK(spdmon::format_progress_postfix(phase_label, progress.active_workers, 3U) == "pixels 2 active \\");
 }
-
 void test_progress_bar_non_tty_width() {
     ScopedEnvVar columns{"COLUMNS", "40"};
     ScopedStderrCapture capture;
@@ -182,7 +160,6 @@ void test_progress_bar_non_tty_width() {
     CHECK(lines.back().find("compile-progress-fallback-width-check") == std::string::npos);
     CHECK(lines.back().size() <= 40U);
 }
-
 void test_progress_bar_redraw_throttling() {
     ScopedEnvVar columns{"COLUMNS", "120"};
     ScopedStderrCapture capture;
@@ -197,7 +174,6 @@ void test_progress_bar_redraw_throttling() {
     }
     CHECK(count_substring(capture.finish(), "\r\033[2K") == 1U);
 }
-
 void test_progress_bar_log_preserves_lines() {
     ScopedEnvVar columns{"COLUMNS", "120"};
     ScopedStderrCapture capture;
@@ -215,7 +191,6 @@ void test_progress_bar_log_preserves_lines() {
     CHECK(lines.front() == "worker started");
     CHECK(lines.back().find("compile") != std::string::npos);
 }
-
 void test_progress_bar_counter_rollback() {
     ScopedEnvVar columns{"COLUMNS", "120"};
     ScopedStderrCapture capture;
@@ -231,9 +206,7 @@ void test_progress_bar_counter_rollback() {
     REQUIRE(lines.size() == 1U);
     CHECK(lines.back().find("20/100") != std::string::npos);
 }
-
 }  // namespace
-
 MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][postfix]", test_compile_postfix_formatting);
 MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][width]", test_progress_bar_non_tty_width);
 MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][throttle]", test_progress_bar_redraw_throttling);

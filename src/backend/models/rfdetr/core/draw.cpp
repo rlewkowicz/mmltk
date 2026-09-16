@@ -1,11 +1,9 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "detail/draw.h"
-
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <stb_image_write.h>
 #include <torch/torch.h>
-
 #include <atomic>
 #include <cstddef>
 #include <deque>
@@ -16,7 +14,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
@@ -26,18 +23,13 @@
 #include "src/frameworks/gpu/cuda_priority.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "torch_cuda_utils.h"
-
 import mmltk.backend.imaging.raster;
 import mmltk.backend.ml.cuda.gpu_quiescence;
 import mmltk.backend.ml.cuda.shared_cuda_event;
-
 namespace mmltk::backend::models::rfdetr {
-
 using mmltk::backend::ml::cuda::get_priority_cuda_stream;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
-
 namespace {
-
 struct PendingEvalSampleWrite {
     std::string output_path;
     int width = 0;
@@ -46,21 +38,17 @@ struct PendingEvalSampleWrite {
     torch::Tensor image_host;
     mmltk::backend::ml::cuda::CudaEventPool::Lease ready_event;
 };
-
 class EvalSampleWriterState final {
    public:
     explicit EvalSampleWriterState(const int device)
         : device_id(device),
           retirement_owner(1U),
-          event_pool(
-              mmltk::frameworks::gpu::make_cuda_device_owner<EvalSampleWriterState, &EvalSampleWriterState::record_failure>(this, device),
-              1U, retirement_owner) {
+          event_pool(mmltk::frameworks::gpu::make_cuda_device_owner<EvalSampleWriterState, &EvalSampleWriterState::record_failure>(this, device), 1U,
+                     retirement_owner) {
         mmltk::frameworks::gpu::CudaDeviceScope scope(device);
-        ensure_cuda_ok(
-            scope ? scope.FinalizeStatus(cudaStreamCreateWithFlags(&settlement_stream, cudaStreamNonBlocking)) : scope.Finalize(),
-            "create eval sample settlement stream");
+        ensure_cuda_ok(scope ? scope.FinalizeStatus(cudaStreamCreateWithFlags(&settlement_stream, cudaStreamNonBlocking)) : scope.Finalize(),
+                       "create eval sample settlement stream");
     }
-
     ~EvalSampleWriterState() noexcept {
         pool.wait_idle();
         if (settlement_stream != nullptr) {
@@ -69,9 +57,7 @@ class EvalSampleWriterState final {
             static_cast<void>(scope.FinalizeStatus(status));
         }
     }
-
     void record_failure(const cudaError_t status) noexcept { mmltk::frameworks::gpu::record_first_cuda_failure(first_failure, status); }
-
     int device_id = -1;
     mmltk::common::concurrency::WorkerPool pool{1, {}, "rfdwrite"};
     std::mutex mutex;
@@ -81,35 +67,28 @@ class EvalSampleWriterState final {
     mmltk::backend::ml::cuda::CudaEventPool event_pool;
     cudaStream_t settlement_stream = nullptr;
 };
-
 std::unique_ptr<EvalSampleWriterState>& eval_sample_writer_storage() {
     static std::unique_ptr<EvalSampleWriterState> state;
     return state;
 }
-
 EvalSampleWriterState& eval_sample_writer_state(const int device_id) {
     auto& state = eval_sample_writer_storage();
     if (!state) state = std::make_unique<EvalSampleWriterState>(device_id);
     if (state->device_id != device_id) throw std::invalid_argument("eval sample writer has one fixed CUDA device");
     return *state;
 }
-
 void write_eval_sample_image(const PendingEvalSampleWrite& pending) {
     const std::string extension = mmltk::common::types::to_lower(std::filesystem::path(pending.output_path).extension().string());
     if (extension == ".jpg" || extension == ".jpeg") {
-        if (stbi_write_jpg(pending.output_path.c_str(), pending.width, pending.height, 3, pending.image_host.data_ptr<uint8_t>(), 98) ==
-            0) {
+        if (stbi_write_jpg(pending.output_path.c_str(), pending.width, pending.height, 3, pending.image_host.data_ptr<uint8_t>(), 98) == 0) {
             throw std::runtime_error("failed to write eval sample image: " + pending.output_path);
         }
         return;
     }
-
-    if (stbi_write_png(pending.output_path.c_str(), pending.width, pending.height, 3, pending.image_host.data_ptr<uint8_t>(),
-                       pending.width * 3) == 0) {
+    if (stbi_write_png(pending.output_path.c_str(), pending.width, pending.height, 3, pending.image_host.data_ptr<uint8_t>(), pending.width * 3) == 0) {
         throw std::runtime_error("failed to write eval sample image: " + pending.output_path);
     }
 }
-
 void enqueue_eval_sample_write(PendingEvalSampleWrite pending) {
     auto& state = eval_sample_writer_state(pending.device_id);
     std::future<void> future = state.pool.enqueue([&state, pending = std::move(pending)]() mutable {
@@ -131,42 +110,31 @@ void enqueue_eval_sample_write(PendingEvalSampleWrite pending) {
     std::lock_guard<std::mutex> lock(state.mutex);
     state.futures.push_back(std::move(future));
 }
-
 }  // namespace
-
 void build_instance_colors_async(const std::int32_t* labels, const std::size_t count, const int num_classes, std::uint8_t* colors_rgb,
                                  const cudaStream_t stream) {
     if (count == 0U) { return; }
     if (labels == nullptr || colors_rgb == nullptr || stream == nullptr) {
         throw std::invalid_argument("RF-DETR instance color generation requires device buffers and a stream");
     }
-    ensure_cuda_ok(static_cast<cudaError_t>(
-                       mmltk::backend::imaging::raster::build_category_colors_cuda({labels, count, num_classes, colors_rgb, stream})),
+    ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::build_category_colors_cuda({labels, count, num_classes, colors_rgb, stream})),
                    "RF-DETR instance color generation");
 }
-
-void draw_eval_sample_async_gpu(const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels,
-                                const at::Tensor& result_masks, const RenderSampleOptions& options) {
+void draw_eval_sample_async_gpu(const at::Tensor& image_chw, const at::Tensor& result_boxes, const at::Tensor& result_labels, const at::Tensor& result_masks,
+                                const RenderSampleOptions& options) {
     if (image_chw.numel() == 0) { return; }
-
     const auto device = image_chw.device();
     c10::cuda::CUDAGuard guard(device.index());
     const auto draw_stream = get_priority_cuda_stream(device.index(), mmltk::frameworks::gpu::current_cuda_highest_stream_priority());
-
     const int height = static_cast<int>(image_chw.size(1));
     const int width = static_cast<int>(image_chw.size(2));
     const auto labels_t = result_labels.to(torch::kCPU, torch::kInt64).contiguous();
     const int num_instances = static_cast<int>(labels_t.size(0));
-
     const int64_t* label_data = labels_t.data_ptr<int64_t>();
     std::vector<int> labels_int(num_instances);
-    for (int i = 0; i < num_instances; ++i) {
-        labels_int[static_cast<std::size_t>(i)] = static_cast<int>(label_data[i]);
-    }
+    for (int i = 0; i < num_instances; ++i) { labels_int[static_cast<std::size_t>(i)] = static_cast<int>(label_data[i]); }
     std::vector<uint8_t> colors = mmltk::backend::imaging::raster::category_colors(labels_int, options.num_classes);
-
     std::filesystem::create_directories(options.output_path.parent_path());
-
     torch::Tensor image_hwc;
     torch::Tensor image_u8;
     torch::Tensor boxes_t;
@@ -191,7 +159,6 @@ void draw_eval_sample_async_gpu(const at::Tensor& image_chw, const at::Tensor& r
         }
         colors_gpu = torch::tensor(colors, torch::TensorOptions().dtype(torch::kUInt8).device(device));
         labels_gpu = torch::tensor(labels_int, torch::TensorOptions().dtype(torch::kInt32).device(device));
-
         if (num_instances > 0) {
             ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::raster_mask_boxes_rgb({
                                {image_u8.data_ptr<uint8_t>(), width, height},
@@ -208,10 +175,8 @@ void draw_eval_sample_async_gpu(const at::Tensor& image_chw, const at::Tensor& r
                            })),
                            "RF-DETR eval sample raster");
         }
-
         image_host = mmltk::backend::ml::cuda::numa_empty({height, width, 3}, torch::kUInt8, device.index());
         image_host.copy_(image_u8, true);
-
         image_chw.record_stream(draw_stream);
         image_hwc.record_stream(draw_stream);
         image_u8.record_stream(draw_stream);
@@ -220,9 +185,8 @@ void draw_eval_sample_async_gpu(const at::Tensor& image_chw, const at::Tensor& r
         colors_gpu.record_stream(draw_stream);
         labels_gpu.record_stream(draw_stream);
     }
-
-    auto ready_event = eval_sample_writer_state(device.index())
-                           .event_pool.record(reinterpret_cast<std::uintptr_t>(draw_stream.stream()), "record eval sample write event");
+    auto ready_event =
+        eval_sample_writer_state(device.index()).event_pool.record(reinterpret_cast<std::uintptr_t>(draw_stream.stream()), "record eval sample write event");
     if (!ready_event) throw std::runtime_error("eval sample writer CUDA event capacity is exhausted");
     enqueue_eval_sample_write(PendingEvalSampleWrite{
         options.output_path.string(),
@@ -233,7 +197,6 @@ void draw_eval_sample_async_gpu(const at::Tensor& image_chw, const at::Tensor& r
         std::move(*ready_event),
     });
 }
-
 void flush_eval_sample_writes() {
     auto& storage = eval_sample_writer_storage();
     if (!storage) return;
@@ -244,9 +207,6 @@ void flush_eval_sample_writes() {
         std::lock_guard<std::mutex> lock(state.mutex);
         futures.swap(state.futures);
     }
-    for (auto& future : futures) {
-        future.get();
-    }
+    for (auto& future : futures) { future.get(); }
 }
-
 }  // namespace mmltk::backend::models::rfdetr

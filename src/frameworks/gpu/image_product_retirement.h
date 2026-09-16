@@ -1,15 +1,11 @@
 #pragma once
-
 #include <cstddef>
 #include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
-
 #include "src/frameworks/gpu/image_types.h"
-
 namespace mmltk::frameworks::gpu {
-
 // Counts product states and display allocations whose cleanup responsibility
 // they accepted. It owns settlement bookkeeping, never the physical resources.
 class ImageProductRetirement final {
@@ -32,5 +28,4 @@ class ImageProductRetirement final {
     friend class ImageProductBuffer;
     friend class ImageWorkspace;
 };
-
 }  // namespace mmltk::frameworks::gpu

@@ -4,7 +4,6 @@
 #include <span>
 #include <vector>
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
-
 namespace mmltk::backend::models::rfdetr::detail {
 // One O(C) index per cached donor batch; each exact circular choice is O(1).
 class CachedAugmentationDonorIndex final {
@@ -19,5 +18,4 @@ class CachedAugmentationDonorIndex final {
     std::vector<std::int64_t> first_valid_;
     std::vector<std::int64_t> next_different_;
 };
-
 }  // namespace mmltk::backend::models::rfdetr::detail

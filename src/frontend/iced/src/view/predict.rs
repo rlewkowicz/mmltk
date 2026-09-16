@@ -92,33 +92,71 @@ impl Component {
                     "Prediction",
                     "Select a compiled dataset, image, or local video file.",
                     column![
-                        button("Compiled dataset").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::CompiledDataset))),
-                        button("Single image").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::SingleImage))),
-                        button("Video file").on_press_maybe(settings_edit_available.then_some(Message::SourceChanged(crate::generated::SourceKind::VideoFile))),
+                        button("Compiled dataset").on_press_maybe(
+                            settings_edit_available.then_some(Message::SourceChanged(
+                                crate::generated::SourceKind::CompiledDataset
+                            ))
+                        ),
+                        button("Single image").on_press_maybe(settings_edit_available.then_some(
+                            Message::SourceChanged(crate::generated::SourceKind::SingleImage)
+                        )),
+                        button("Video file").on_press_maybe(settings_edit_available.then_some(
+                            Message::SourceChanged(crate::generated::SourceKind::VideoFile)
+                        )),
                         text(draft.map_or("", |value| match value.source.kind {
-                            crate::generated::SourceKind::CompiledDataset => "Source: compiled dataset",
+                            crate::generated::SourceKind::CompiledDataset =>
+                                "Source: compiled dataset",
                             crate::generated::SourceKind::SingleImage => "Source: single image",
                             crate::generated::SourceKind::VideoFile => "Source: local video file",
                             _ => "Select a supported prediction source",
                         })),
                         crate::view::workflow::fields::text_field(
-                            "Compiled dataset", crate::generated::constraint_workflowspredictsourcecompiledpath().stable_field_id,
-                            draft.map_or("", |value| value.source.compiledpath.as_str()), settings_edit_available, Message::CompiledPathChanged,
+                            "Compiled dataset",
+                            crate::generated::constraint_workflowspredictsourcecompiledpath()
+                                .stable_field_id,
+                            draft.map_or("", |value| value.source.compiledpath.as_str()),
+                            settings_edit_available,
+                            Message::CompiledPathChanged,
                         ),
                         crate::view::workflow::fields::text_field(
-                            "Image", crate::generated::constraint_workflowspredictsourcesingleimagepath().stable_field_id,
-                            draft.map_or("", |value| value.source.singleimagepath.as_str()), settings_edit_available, Message::ImagePathChanged,
+                            "Image",
+                            crate::generated::constraint_workflowspredictsourcesingleimagepath()
+                                .stable_field_id,
+                            draft.map_or("", |value| value.source.singleimagepath.as_str()),
+                            settings_edit_available,
+                            Message::ImagePathChanged,
                         ),
                         crate::view::workflow::fields::text_field(
-                            "Video file", crate::generated::constraint_workflowspredictsourcevideofilepath().stable_field_id,
-                            draft.map_or("", |value| value.source.videofilepath.as_str()), settings_edit_available, Message::VideoPathChanged,
+                            "Video file",
+                            crate::generated::constraint_workflowspredictsourcevideofilepath()
+                                .stable_field_id,
+                            draft.map_or("", |value| value.source.videofilepath.as_str()),
+                            settings_edit_available,
+                            Message::VideoPathChanged,
                         ),
-                        model.workflow.dialogs(crate::generated::FeatureId::Predict)
-                            .filter(|fact| [crate::generated::constraint_workflowspredictsourcecompiledpath().stable_field_id,
-                                crate::generated::constraint_workflowspredictsourcesingleimagepath().stable_field_id,
-                                crate::generated::constraint_workflowspredictsourcevideofilepath().stable_field_id].contains(&fact.stable_field_id))
-                            .fold(column![], |column, fact| column.push(button(fact.title).on_press_maybe(
-                                model.file_dialog_open_available(fact, crate::generated::FeatureId::Predict).then_some(Message::DialogRequested(fact.stable_field_id))))),
+                        model
+                            .workflow
+                            .dialogs(crate::generated::FeatureId::Predict)
+                            .filter(|fact| [
+                                crate::generated::constraint_workflowspredictsourcecompiledpath()
+                                    .stable_field_id,
+                                crate::generated::constraint_workflowspredictsourcesingleimagepath(
+                                )
+                                .stable_field_id,
+                                crate::generated::constraint_workflowspredictsourcevideofilepath()
+                                    .stable_field_id
+                            ]
+                            .contains(&fact.stable_field_id))
+                            .fold(column![], |column, fact| column.push(
+                                button(fact.title).on_press_maybe(
+                                    model
+                                        .file_dialog_open_available(
+                                            fact,
+                                            crate::generated::FeatureId::Predict
+                                        )
+                                        .then_some(Message::DialogRequested(fact.stable_field_id))
+                                )
+                            )),
                         crate::view::workflow::fields::text_field(
                             "Output JSON",
                             crate::generated::constraint_workflowspredictrequestoutputpath()
@@ -131,7 +169,11 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING),
                 )
             ),
-            text(model.workflow.start_detail(crate::generated::FeatureId::Predict)),
+            text(
+                model
+                    .workflow
+                    .start_detail(crate::generated::FeatureId::Predict)
+            ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Predict,
                 "Run prediction",
@@ -139,10 +181,7 @@ impl Component {
                     .draft
                     .as_ref()
                     .is_some_and(|draft| {
-                        model.compute_start_available(
-                                draft,
-                                crate::generated::FeatureId::Predict,
-                            )
+                        model.compute_start_available(draft, crate::generated::FeatureId::Predict)
                     })
                     .then_some(Message::StartRequested),
                 crate::view::workflow::progress::compute(operation),
@@ -177,9 +216,29 @@ impl Component {
                     settings_edit_available,
                     Message::ThresholdChanged,
                 ),
-                button(if model.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.paused) { "Resume" } else { "Pause" })
-                    .on_press_maybe(model.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.operation.active && snapshot.video).then(|| Message::PauseRequested(
-                        !model.predict_snapshot.as_ref().is_some_and(|snapshot| snapshot.paused)))),
+                button(
+                    if model
+                        .predict_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.paused)
+                    {
+                        "Resume"
+                    } else {
+                        "Pause"
+                    }
+                )
+                .on_press_maybe(
+                    model
+                        .predict_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.operation.active && snapshot.video)
+                        .then(|| Message::PauseRequested(
+                            !model
+                                .predict_snapshot
+                                .as_ref()
+                                .is_some_and(|snapshot| snapshot.paused)
+                        ))
+                ),
                 button("Stop").on_press_maybe(
                     model
                         .compute_stop_available(crate::generated::FeatureId::Predict)
@@ -239,18 +298,26 @@ impl Component {
                     crate::generated::edit_workflowspredictrequestthreshold(draft, value)
                 })?,
             ),
-            Message::SourceChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
-                crate::generated::edit_workflowspredictsourcekind(draft, value)
-            })?),
-            Message::CompiledPathChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
-                crate::generated::edit_workflowspredictsourcecompiledpath(draft, value)
-            })?),
-            Message::ImagePathChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
-                crate::generated::edit_workflowspredictsourcesingleimagepath(draft, value)
-            })?),
-            Message::VideoPathChanged(value) => Outcome::SettingsEdited(settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
-                crate::generated::edit_workflowspredictsourcevideofilepath(draft, value)
-            })?),
+            Message::SourceChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Immediate, |draft| {
+                    crate::generated::edit_workflowspredictsourcekind(draft, value)
+                })?,
+            ),
+            Message::CompiledPathChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowspredictsourcecompiledpath(draft, value)
+                })?,
+            ),
+            Message::ImagePathChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowspredictsourcesingleimagepath(draft, value)
+                })?,
+            ),
+            Message::VideoPathChanged(value) => Outcome::SettingsEdited(
+                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
+                    crate::generated::edit_workflowspredictsourcevideofilepath(draft, value)
+                })?,
+            ),
             Message::DialogRequested(id) => Outcome::DialogRequested(id),
             // CLEANUP-IGNORE: Predict alone converts its child workspace result into its local outcome.
             Message::Workspace(message) => {

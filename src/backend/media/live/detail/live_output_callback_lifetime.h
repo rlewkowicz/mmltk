@@ -1,17 +1,11 @@
 #pragma once
-
 #include <atomic>
 #include <cstddef>
-
 namespace mmltk::backend::media::live {
-
 class LiveOutputCallbackLifetime final {
    public:
     using Wake = void (*)(void*) noexcept;
-
-    LiveOutputCallbackLifetime(const std::size_t capacity, void* owner, const Wake wake) noexcept
-        : capacity_(capacity), owner_(owner), wake_(wake) {}
-
+    LiveOutputCallbackLifetime(const std::size_t capacity, void* owner, const Wake wake) noexcept : capacity_(capacity), owner_(owner), wake_(wake) {}
     [[nodiscard]] bool acquire() noexcept {
         std::size_t active = active_.load(std::memory_order_relaxed);
         while (active < capacity_) {
@@ -19,7 +13,6 @@ class LiveOutputCallbackLifetime final {
         }
         return false;
     }
-
     void release() noexcept {
         std::size_t active = active_.load(std::memory_order_relaxed);
         for (;;) {
@@ -29,7 +22,6 @@ class LiveOutputCallbackLifetime final {
         if (wake_ == nullptr) return;
         wake_(owner_);
     }
-
     [[nodiscard]] bool idle() const noexcept { return active_.load(std::memory_order_acquire) == 0U; }
 
    private:
@@ -38,7 +30,6 @@ class LiveOutputCallbackLifetime final {
     Wake wake_ = nullptr;
     std::atomic<std::size_t> active_{0U};
 };
-
 class LiveOutputCallbackGuard final {
    public:
     explicit LiveOutputCallbackGuard(LiveOutputCallbackLifetime& lifetime) noexcept : lifetime_(&lifetime) {}
@@ -49,5 +40,4 @@ class LiveOutputCallbackGuard final {
    private:
     LiveOutputCallbackLifetime* lifetime_;
 };
-
 }  // namespace mmltk::backend::media::live

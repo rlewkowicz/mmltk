@@ -4,7 +4,6 @@
 #include <limits>
 #include <stdexcept>
 #include "src/frameworks/serialization/reflected_json.h"
-
 namespace mmltk::controller::services {
 namespace r = mmltk::backend::models::rfdetr;
 namespace serial = mmltk::frameworks::serialization;
@@ -20,8 +19,7 @@ r::TrainingRun ReadRun(const std::filesystem::path& directory) {
     std::string text(manifest_bytes + 1, '\0');
     input.read(text.data(), static_cast<std::streamsize>(text.size()));
     text.resize(static_cast<std::size_t>(input.gcount()));
-    const auto run = serial::decode_reflected_json<r::TrainingRun>(
-        text, {.max_bytes = manifest_bytes, .max_items = 65536, .max_depth = 32});
+    const auto run = serial::decode_reflected_json<r::TrainingRun>(text, {.max_bytes = manifest_bytes, .max_items = 65536, .max_depth = 32});
     if (run.format_version != r::kTrainingRunFormat || run.run_id.empty() || run.attempt_id.empty() ||
         run.evaluated_weights != (run.configuration.use_ema ? r::EvaluatedWeights::Ema : r::EvaluatedWeights::Ordinary))
         throw std::runtime_error("unsupported or inconsistent training run format");
@@ -60,7 +58,8 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
     if (query.cursor) {
         metrics_.seekg(static_cast<std::streamoff>(query.cursor - 1));
         if (metrics_.get() != '\n') throw std::invalid_argument("training history cursor is not a record boundary");
-    } else metrics_.seekg(0);
+    } else
+        metrics_.seekg(0);
     r::TrainingHistoryPage page;
     page.generation = generation_;
     page.next_cursor = query.cursor;
@@ -72,11 +71,14 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
         char byte{};
         while (metrics_.get(byte)) {
             ++consumed;
-            if (byte == '\n') { complete = true; break; }
+            if (byte == '\n') {
+                complete = true;
+                break;
+            }
             if (line_.size() == line_bytes) throw std::runtime_error("training history record exceeds byte limit");
             line_.push_back(byte);
         }
-        if (!complete) break; // A partial append is retried from its initial byte.
+        if (!complete) break;  // A partial append is retried from its initial byte.
         if (consumed > page_bytes) break;
         auto record = serial::decode_reflected_json<r::TrainingRecord>(line_, record_limits);
         if (record.format_version != r::kTrainingRunFormat || record.run_id != run_->run_id || record.attempt_id.empty() ||
@@ -92,10 +94,13 @@ std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& 
     const auto root = std::filesystem::absolute(selected).lexically_normal();
     if (resume && std::filesystem::exists(root / "run.json") && std::filesystem::exists(root / "metrics.jsonl")) {
         std::optional<r::TrainingRun> run;
-        try { run = ReadRun(root); } catch (const std::exception&) {}
+        try {
+            run = ReadRun(root);
+        } catch (const std::exception&) {}
         if (run && (std::filesystem::weakly_canonical(resume->path.parent_path()) == std::filesystem::weakly_canonical(root) &&
-            resume->path.filename() == "checkpoint.pt" && resume->attempt_id == run->checkpoint_attempt_id &&
-            resume->evaluated_weights == run->evaluated_weights && resume->class_layout == run->class_layout)) return root;
+                    resume->path.filename() == "checkpoint.pt" && resume->attempt_id == run->checkpoint_attempt_id &&
+                    resume->evaluated_weights == run->evaluated_weights && resume->class_layout == run->class_layout))
+            return root;
         (void)run;
     }
     if (!std::filesystem::exists(root) || std::filesystem::is_empty(root)) {

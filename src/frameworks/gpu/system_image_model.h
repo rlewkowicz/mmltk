@@ -1,13 +1,9 @@
 #pragma once
-
 #include <exception>
 #include <memory>
-
 namespace mmltk::frameworks::gpu {
-
 class DeviceContext;
 class ImageStream;
-
 class SystemImageModel {
    public:
     struct Release final {
@@ -20,5 +16,4 @@ class SystemImageModel {
     virtual void StopIngress() noexcept {}
     [[nodiscard]] virtual Release ReleaseResources() noexcept { return {}; }
 };
-
 }  // namespace mmltk::frameworks::gpu

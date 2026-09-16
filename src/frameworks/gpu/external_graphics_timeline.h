@@ -1,17 +1,11 @@
 #pragma once
-
 #include <cuda_runtime_api.h>
-
 #include <cstdint>
-
 #include "src/common/io/scoped_fd.h"
-
 namespace mmltk::frameworks::gpu {
-
 namespace test_support {
 struct ExternalGraphicsTimelineTestAccess;
 }
-
 class ExternalGraphicsTimeline final {
    public:
     ExternalGraphicsTimeline() noexcept = default;
@@ -21,7 +15,6 @@ class ExternalGraphicsTimeline final {
     ExternalGraphicsTimeline& operator=(const ExternalGraphicsTimeline&) = delete;
     ExternalGraphicsTimeline(ExternalGraphicsTimeline&&) noexcept;
     ExternalGraphicsTimeline& operator=(ExternalGraphicsTimeline&&) noexcept;
-
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] cudaError_t Release() noexcept;
     void SignalReady(cudaStream_t, std::uint64_t ready_value);
@@ -31,9 +24,7 @@ class ExternalGraphicsTimeline final {
    private:
     using ImportOperation = cudaError_t (*)(cudaExternalSemaphore_t*, const cudaExternalSemaphoreHandleDesc*);
     ExternalGraphicsTimeline(mmltk::common::io::ScopedFd, ImportOperation);
-
     cudaExternalSemaphore_t semaphore_ = nullptr;
     friend struct test_support::ExternalGraphicsTimelineTestAccess;
 };
-
 }  // namespace mmltk::frameworks::gpu

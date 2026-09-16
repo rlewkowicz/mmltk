@@ -1,5 +1,4 @@
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
-
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -12,12 +11,10 @@
 #include <utility>
 #include <vector>
 #include <unistd.h>
-
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/detail/gdr_buffer_backend.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-
 namespace mmltk::frameworks::gpu {
 namespace {
 constexpr std::size_t mapping_alignment = 65536;
@@ -79,7 +76,6 @@ struct GdrMappedBuffer::Storage {
         std::size_t pending_consumers = 0;
         std::vector<Consumer> consumers;
         mmltk::common::io::ScopedFd trace;
-
         Physical(std::shared_ptr<detail::GdrBufferBackend> api, CUcontext owner, std::size_t count)
             : backend(std::move(api)), context(owner), consumers(count) {
             if (const char* path = std::getenv("MMLTK_GDR_TRACE_FILE"); path && *path)
@@ -88,14 +84,13 @@ struct GdrMappedBuffer::Storage {
         void log(const char* event, std::size_t bytes = 0) const noexcept {
             if (trace.get() < 0) return;
             char text[512];
-            const int length =
-                std::snprintf(text, sizeof(text),
-                              "{\"event\":\"%s\",\"device\":%d,\"context\":%llu,\"backend\":\"%s\",\"allocation\":%llu,"
-                              "\"allocated_bytes\":%zu,\"capacity\":%zu,\"mapped_bytes\":%zu,\"mapping_type\":%d,"
-                              "\"owned_export_fds\":%d,\"bytes\":%zu}\n",
-                              event, device, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(context)),
-                              backend_known ? (dmabuf ? "dmabuf" : "gdrdrv") : "unselected", static_cast<unsigned long long>(allocation),
-                              allocated_bytes, capacity, mapped_bytes, mapping_type, dmabuf && registration ? 1 : 0, bytes);
+            const int length = std::snprintf(text, sizeof(text),
+                                             "{\"event\":\"%s\",\"device\":%d,\"context\":%llu,\"backend\":\"%s\",\"allocation\":%llu,"
+                                             "\"allocated_bytes\":%zu,\"capacity\":%zu,\"mapped_bytes\":%zu,\"mapping_type\":%d,"
+                                             "\"owned_export_fds\":%d,\"bytes\":%zu}\n",
+                                             event, device, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(context)),
+                                             backend_known ? (dmabuf ? "dmabuf" : "gdrdrv") : "unselected", static_cast<unsigned long long>(allocation),
+                                             allocated_bytes, capacity, mapped_bytes, mapping_type, dmabuf && registration ? 1 : 0, bytes);
             if (length > 0 && static_cast<std::size_t>(length) < sizeof(text)) {
                 const auto written = ::write(trace.get(), text, static_cast<std::size_t>(length));
                 (void)written;
@@ -105,8 +100,7 @@ struct GdrMappedBuffer::Storage {
             if (unrecorded) {
                 backend->synchronize_context();
                 unrecorded = false;
-                for (auto& consumer : consumers)
-                    consumer.pending = false;
+                for (auto& consumer : consumers) consumer.pending = false;
                 pending_consumers = 0;
             } else {
                 for (auto& consumer : consumers) {
@@ -157,7 +151,6 @@ struct GdrMappedBuffer::Storage {
     std::shared_ptr<Lifetime> lifetime;
     std::mutex mutex;
     std::size_t readers = 0;
-
     Storage(std::shared_ptr<detail::GdrBufferBackend> backend, CUcontext context, std::size_t count, std::shared_ptr<Lifetime> family)
         : physical(std::make_shared<Physical>(std::move(backend), context, count)), lifetime(std::move(family)) {
         lifetime->allocations.fetch_add(1, std::memory_order_relaxed);
@@ -190,8 +183,8 @@ struct GdrMappedBuffer::Storage {
             p.registration = p.backend->pin(p.handle, p.device_pointer, p.capacity);
             const auto before = p.backend->info(p.handle, p.registration);
             if (before.page_size == 0 || before.page_size > mapping_alignment || (before.page_size & (before.page_size - 1)) != 0 ||
-                before.base % before.page_size != 0 || before.bytes % before.page_size != 0 || before.base > p.device_pointer ||
-                before.bytes < p.capacity || p.device_pointer - before.base > before.bytes - p.capacity || before.base < p.allocation ||
+                before.base % before.page_size != 0 || before.bytes % before.page_size != 0 || before.base > p.device_pointer || before.bytes < p.capacity ||
+                p.device_pointer - before.base > before.bytes - p.capacity || before.base < p.allocation ||
                 before.bytes > p.allocated_bytes - (before.base - p.allocation))
                 throw std::runtime_error("GDR registration exceeds its owning allocation");
             p.mapped_bytes = before.bytes;
@@ -201,8 +194,7 @@ struct GdrMappedBuffer::Storage {
                 throw std::runtime_error("GDR mapping geometry changed during registration");
             p.mapping_type = after.mapping_type;
             p.cpu_pointer = static_cast<std::byte*>(p.mapping) + (p.device_pointer - after.base);
-            for (auto& consumer : p.consumers)
-                consumer.event = p.backend->create_event();
+            for (auto& consumer : p.consumers) consumer.event = p.backend->create_event();
             p.log("allocated");
             binding.finish();
         } catch (...) {
@@ -211,9 +203,7 @@ struct GdrMappedBuffer::Storage {
         }
     }
 };
-
-GdrMappedBuffer::GdrMappedBuffer(CUcontext owner, std::size_t consumers)
-    : GdrMappedBuffer(owner, consumers, detail::gdr_buffer_backend()) {}
+GdrMappedBuffer::GdrMappedBuffer(CUcontext owner, std::size_t consumers) : GdrMappedBuffer(owner, consumers, detail::gdr_buffer_backend()) {}
 GdrMappedBuffer::GdrMappedBuffer(CUcontext owner, std::size_t consumers, std::shared_ptr<detail::GdrBufferBackend> backend)
     : context_(owner), consumer_capacity_(consumers), backend_(std::move(backend)), lifetime_(std::make_shared<Lifetime>()) {
     if (!owner || !backend_ || consumers == 0) throw std::invalid_argument("GDR buffer requires an owner context and bounded consumers");
@@ -282,8 +272,7 @@ GdrMappedBuffer::ReadLease::ReadLease(std::shared_ptr<Storage> storage) : storag
     ++storage_->readers;
 }
 GdrMappedBuffer::ReadLease::~ReadLease() noexcept { reset(); }
-GdrMappedBuffer::ReadLease::ReadLease(ReadLease&& other) noexcept
-    : storage_(std::move(other.storage_)), recorded_(std::exchange(other.recorded_, false)) {}
+GdrMappedBuffer::ReadLease::ReadLease(ReadLease&& other) noexcept : storage_(std::move(other.storage_)), recorded_(std::exchange(other.recorded_, false)) {}
 GdrMappedBuffer::ReadLease& GdrMappedBuffer::ReadLease::operator=(ReadLease&& other) noexcept {
     if (this != &other) {
         reset();
@@ -309,10 +298,9 @@ void GdrMappedBuffer::ReadLease::record_consumed(CUstream stream) {
     auto& p = *storage_->physical;
     try {
         Context binding(*p.backend, p.context);
-        auto entry = std::find_if(p.consumers.begin(), p.consumers.end(),
-                                  [stream](const auto& consumer) { return consumer.pending && consumer.stream == stream; });
-        if (entry == p.consumers.end())
-            entry = std::find_if(p.consumers.begin(), p.consumers.end(), [](const auto& consumer) { return !consumer.pending; });
+        auto entry =
+            std::find_if(p.consumers.begin(), p.consumers.end(), [stream](const auto& consumer) { return consumer.pending && consumer.stream == stream; });
+        if (entry == p.consumers.end()) entry = std::find_if(p.consumers.begin(), p.consumers.end(), [](const auto& consumer) { return !consumer.pending; });
         if (entry == p.consumers.end()) throw std::runtime_error("GDR consumer stream capacity exhausted");
         p.backend->record_event(entry->event, stream);
         entry->stream = stream;

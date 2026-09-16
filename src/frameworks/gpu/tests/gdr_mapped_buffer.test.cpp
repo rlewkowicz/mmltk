@@ -2,7 +2,6 @@
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
 #include "src/frameworks/gpu/detail/gdr_buffer_backend.h"
 #include "third_party/gdrcopy/src/gdr_backend_selection.h"
-
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <array>
@@ -23,7 +22,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
 namespace {
 using mmltk::frameworks::gpu::GdrMappedBuffer;
 namespace detail = mmltk::frameworks::gpu::detail;
@@ -31,7 +29,6 @@ constexpr std::size_t page = 65536;
 const auto owner_context = reinterpret_cast<CUcontext>(1);
 const auto first_stream = reinterpret_cast<CUstream>(1);
 const auto second_stream = reinterpret_cast<CUstream>(2);
-
 class FakeGdrBackend final : public detail::GdrBufferBackend {
    public:
     struct Allocation {
@@ -60,7 +57,6 @@ class FakeGdrBackend final : public detail::GdrBufferBackend {
     std::size_t copied = 0, waits = 0, context_waits = 0, events_created = 0, events_destroyed = 0;
     CUdeviceptr sync_allocation = 0;
     std::optional<mmltk::testsupport::TestGate::Receipt> copy_gate;
-
     void fail(const char* operation) {
         if (failure == operation) {
             failure.clear();
@@ -197,7 +193,6 @@ class FakeGdrBackend final : public detail::GdrBufferBackend {
     std::uintptr_t next_mapping = 0;
     std::uintptr_t next_event = 0;
 };
-
 void check_no_live_resources(const FakeGdrBackend& api) {
     // CLEANUP-IGNORE: Physical GDR balance invariants are unrelated to reflected browser identity comparisons.
     CHECK(api.created == api.freed);
@@ -208,13 +203,10 @@ void check_no_live_resources(const FakeGdrBackend& api) {
     CHECK(api.events_created == api.events_destroyed);
     CHECK(api.context_stack.empty());
 }
-
 template <std::size_t Size>
 void check_consumed_values(const std::array<std::byte, Size>& values, const std::array<unsigned char, Size>& result) {
-    for (std::size_t i = 0; i < result.size(); ++i)
-        CHECK(result[i] == (std::to_integer<unsigned char>(values[i]) ^ 90));
+    for (std::size_t i = 0; i < result.size(); ++i) CHECK(result[i] == (std::to_integer<unsigned char>(values[i]) ^ 90));
 }
-
 TEST_CASE("Mapped storage owns alignment offsets tails and persistent capacity", "[frameworks][gpu][gdr]") {
     auto api = std::make_shared<FakeGdrBackend>();
     {
@@ -224,8 +216,7 @@ TEST_CASE("Mapped storage owns alignment offsets tails and persistent capacity",
         CHECK(buffer.uses_dmabuf());
         CHECK(api->allocations.contains(api->sync_allocation));
         std::array<std::byte, 71> values{};
-        for (std::size_t i = 0; i < values.size(); ++i)
-            values[i] = static_cast<std::byte>(i);
+        for (std::size_t i = 0; i < values.size(); ++i) values[i] = static_cast<std::byte>(i);
         REQUIRE(buffer.write(3, values));
         auto lease = buffer.borrow();
         const auto data = lease.device_data();
@@ -249,7 +240,6 @@ TEST_CASE("Mapped storage owns alignment offsets tails and persistent capacity",
     }
     check_no_live_resources(*api);
 }
-
 TEST_CASE("Mapped construction failures release every acquired physical resource", "[frameworks][gpu][gdr]") {
     for (const auto* failure :
          {"bind", "device", "open", "backend", "support", "allocate", "sync_memops", "pin", "pinned_info", "map", "mapped_info", "event"}) {
@@ -270,7 +260,6 @@ TEST_CASE("Mapped construction failures release every acquired physical resource
         CHECK(buffer.capacity_bytes() == page);
     }
 }
-
 TEST_CASE("GDR fallback selection preserves operation failures across unsupported backends", "[frameworks][gpu][gdr]") {
     CHECK(gdr_backend_selection_error(EIO, ENOTSUP) == EIO);
     CHECK(gdr_backend_selection_error(ENOTSUP, ENOTSUP) == ENOTSUP);
@@ -283,7 +272,6 @@ TEST_CASE("GDR fallback selection preserves operation failures across unsupporte
         CHECK(gdr_backend_selection_error(0, failure) == 0);
     }
 }
-
 TEST_CASE("Verified GDR backend support failure retains its typed classification", "[frameworks][gpu][gdr]") {
     auto api = std::make_shared<FakeGdrBackend>();
     GdrMappedBuffer buffer(owner_context, 1, api);
@@ -300,7 +288,6 @@ TEST_CASE("Verified GDR backend support failure retains its typed classification
     buffer.ensure_bytes(64);
     CHECK(buffer.capacity_bytes() == page);
 }
-
 TEST_CASE("Mapped growth preserves old leases and failed growth preserves current storage", "[frameworks][gpu][gdr]") {
     auto api = std::make_shared<FakeGdrBackend>();
     GdrMappedBuffer buffer(owner_context, 1, api);
@@ -324,7 +311,6 @@ TEST_CASE("Mapped growth preserves old leases and failed growth preserves curren
     buffer.close();
     CHECK(api->freed == 3);
 }
-
 TEST_CASE("Mapped selected device context and consumer failure paths are explicit", "[frameworks][gpu][gdr]") {
     auto api = std::make_shared<FakeGdrBackend>();
     CHECK_THROWS_AS(GdrMappedBuffer(reinterpret_cast<CUcontext>(2), 1, api), std::invalid_argument);
@@ -360,7 +346,6 @@ TEST_CASE("Mapped selected device context and consumer failure paths are explici
     buffer.close();
     CHECK(api->freed == 1);
 }
-
 TEST_CASE("Failed GPU settlement prevents mapped overwrite until completion succeeds", "[frameworks][gpu][gdr]") {
     auto api = std::make_shared<FakeGdrBackend>();
     GdrMappedBuffer buffer(owner_context, 1, api);
@@ -384,7 +369,6 @@ TEST_CASE("Failed GPU settlement prevents mapped overwrite until completion succ
     CHECK(api->context_waits == 1);
     CHECK(api->context_stack.empty());
 }
-
 TEST_CASE("Independent mapped owners register and copy while another CPU writer is blocked", "[frameworks][gpu][gdr]") {
     auto first = std::make_shared<FakeGdrBackend>();
     auto second = std::make_shared<FakeGdrBackend>();
@@ -409,7 +393,6 @@ TEST_CASE("Independent mapped owners register and copy while another CPU writer 
     CHECK(mmltk::testsupport::await_test_future(copying, "released independent mapped copy"));
     CHECK(gate.WaitSettled(std::chrono::seconds{2}));
 }
-
 TEST_CASE("Mapped retirement retries retain dependent resources and zero capacity stays empty", "[frameworks][gpu][gdr]") {
     for (const auto* boundary : {"unmap", "unpin", "free", "destroy_event", "close"}) {
         CAPTURE(boundary);
@@ -434,7 +417,6 @@ TEST_CASE("Mapped retirement retries retain dependent resources and zero capacit
         CHECK(api->exported_fds == 0);
     }
 }
-
 TEST_CASE("Cancellation cannot relinquish an active mapped CPU writer", "[frameworks][gpu][gdr]") {
     auto api = std::make_shared<FakeGdrBackend>();
     GdrMappedBuffer buffer(owner_context, 1, api);
@@ -463,13 +445,11 @@ TEST_CASE("Cancellation cannot relinquish an active mapped CPU writer", "[framew
     CHECK(api->freed == 1);
 }
 }  // namespace
-
 namespace {
 class HardwareGdrContext final {
    public:
     explicit HardwareGdrContext(CUdevice device) {
-        if (cuCtxCreate(&context, nullptr, CU_CTX_SCHED_AUTO, device) != CUDA_SUCCESS)
-            throw std::runtime_error("create isolated GDR hardware context");
+        if (cuCtxCreate(&context, nullptr, CU_CTX_SCHED_AUTO, device) != CUDA_SUCCESS) throw std::runtime_error("create isolated GDR hardware context");
     }
     ~HardwareGdrContext() { (void)cuCtxDestroy(context); }
     CUcontext context{};
@@ -539,7 +519,6 @@ struct HardwareConsumer final {
             throw std::runtime_error("launch GDR hardware consumer");
     }
 };
-
 CUdevice hardware_device() {
     const auto initialized = cuInit(0);
     if (initialized == CUDA_ERROR_NO_DEVICE) SKIP("No CUDA-visible GPU; GDR hardware behavior unverified");
@@ -581,18 +560,15 @@ void require_hardware_backend() {
     }
     INFO("GDR hardware backend: " << (dmabuf ? "dmabuf" : "gdrdrv"));
 }
-
 std::vector<int> mapped_descriptors() {
     std::vector<int> result;
     for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd")) {
         std::error_code error;
         const auto target = std::filesystem::read_symlink(entry.path(), error).string();
-        if (!error && (target.find("dmabuf") != std::string::npos || target == "/dev/gdrdrv"))
-            result.push_back(std::stoi(entry.path().filename().string()));
+        if (!error && (target.find("dmabuf") != std::string::npos || target == "/dev/gdrdrv")) result.push_back(std::stoi(entry.path().filename().string()));
     }
     return result;
 }
-
 TEST_CASE("GDR CPU writes precede real CUDA consumption on an isolated context", "[frameworks][gpu][gdr][hardware]") {
     HardwareGdrContext owner(hardware_device());
     require_hardware_backend();
@@ -602,15 +578,12 @@ TEST_CASE("GDR CPU writes precede real CUDA consumption on an isolated context",
     auto descriptors = mapped_descriptors();
     std::erase_if(descriptors, [&](int fd) { return std::ranges::find(descriptors_before, fd) != descriptors_before.end(); });
     REQUIRE(descriptors.size() == 1);
-    for (int fd : descriptors)
-        CHECK((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
+    for (int fd : descriptors) CHECK((fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
     HardwareConsumer consumer;
     std::array<std::byte, 71> values{};
     std::array<unsigned char, 71> result{};
-    for (std::size_t i = 0; i < values.size(); ++i)
-        values[i] = static_cast<std::byte>(i + 1);
-    for (const std::size_t offset :
-         {std::size_t{0}, std::size_t{1}, std::size_t{3}, std::size_t{15}, std::size_t{31}, page - values.size()}) {
+    for (std::size_t i = 0; i < values.size(); ++i) values[i] = static_cast<std::byte>(i + 1);
+    for (const std::size_t offset : {std::size_t{0}, std::size_t{1}, std::size_t{3}, std::size_t{15}, std::size_t{31}, page - values.size()}) {
         CAPTURE(offset);
         REQUIRE(buffer.write(offset, values));
         auto lease = buffer.borrow();
@@ -639,7 +612,6 @@ TEST_CASE("GDR CPU writes precede real CUDA consumption on an isolated context",
     }
     buffer.close();
 }
-
 TEST_CASE("Independent GDR handles copy while another isolated owner registers and retires", "[frameworks][gpu][gdr][hardware]") {
     const auto device = hardware_device();
     {
@@ -669,8 +641,7 @@ TEST_CASE("Independent GDR handles copy while another isolated owner registers a
             lease.record_consumed(consumer.stream);
             lease = {};
             if (!buffer.write(0, values)) throw std::runtime_error("unexpected hardware cancellation");
-            if (cuMemcpyDtoH(result.data(), consumer.output, result.size()) != CUDA_SUCCESS)
-                throw std::runtime_error("GDR concurrent readback failed");
+            if (cuMemcpyDtoH(result.data(), consumer.output, result.size()) != CUDA_SUCCESS) throw std::runtime_error("GDR concurrent readback failed");
             if (std::ranges::any_of(result, [](auto value) { return value != (0x3c ^ 90); }))
                 throw std::runtime_error("GDR concurrent CUDA consumer observed incorrect bytes");
         }

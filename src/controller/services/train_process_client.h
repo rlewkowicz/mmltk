@@ -1,6 +1,5 @@
 #pragma once
 #include <sys/types.h>
-
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -11,7 +10,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/common/concurrency/event_cancellation.h"
@@ -20,22 +18,17 @@
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/contracts/compute.h"
 #include "src/frameworks/process/subprocess_utils.h"
-
 namespace mmltk::controller::services {
-
 inline constexpr std::size_t kTrainProcessReadBudget = std::size_t{64U} * 1024U;
-
 struct TrainProcessProgress final {
     mmltk::controller::contracts::ComputeProgress progress;
-    std::filesystem::path checkpoint_path;
-    std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
-    mmltk::backend::models::rfdetr::TrainingPersistence persistence;
+    std::filesystem::path checkpoint_path{};
+    std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics{};
+    mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
 };
-
 // This is a service-process exit observation, not a second public compute
 // operation vocabulary.  LocalTrain maps it into mmltk::controller::contracts::ComputeTerminal.
 enum class TrainProcessExitOutcome : std::uint8_t { Succeeded, Failed, Cancelled };
-
 struct TrainProcessExit final {
     TrainProcessExitOutcome outcome = TrainProcessExitOutcome::Failed;
     std::int32_t wait_status = 0;
@@ -43,22 +36,18 @@ struct TrainProcessExit final {
     std::optional<TrainProcessProgress> final_progress;
     std::string error;
 };
-
 struct TrainProcessOptions final {
     std::chrono::milliseconds escalation_delay{std::chrono::seconds{5}};
 };
-
 // A stop capability is minted with its token for one run.  The source may be
 // retained by a system; the token is consumed exclusively by the process work.
 struct TrainProcessStopTag;
 using TrainProcessStopSource = mmltk::common::concurrency::EventCancellationSource<TrainProcessStopTag, false>;
 using TrainProcessStopToken = mmltk::common::concurrency::EventCancellationToken<TrainProcessStopTag>;
-
 struct TrainProcessRunResult final {
     TrainProcessExit terminal;
     std::string output;
 };
-
 struct TrainProcessProgressObserver final {
     void* context = nullptr;
     void (*report)(void*, const TrainProcessProgress&) noexcept = nullptr;
@@ -66,7 +55,6 @@ struct TrainProcessProgressObserver final {
         if (report != nullptr) report(context, progress);
     }
 };
-
 // Owns one local train process group, all Linux readiness sources, and exact
 // terminal reaping. Callers only consume owner-neutral observations.
 class TrainProcessClient final {
@@ -77,10 +65,8 @@ class TrainProcessClient final {
     TrainProcessClient& operator=(const TrainProcessClient&) = delete;
     TrainProcessClient(TrainProcessClient&&) noexcept;
     TrainProcessClient& operator=(TrainProcessClient&&) noexcept = delete;
-
-    [[nodiscard]] static TrainProcessClient launch(const mmltk::backend::models::rfdetr::TrainRequest& request,
-                                                   const std::filesystem::path& cli_path, std::string_view fallback_preset_name = {},
-                                                   TrainProcessOptions options = {});
+    [[nodiscard]] static TrainProcessClient launch(const mmltk::backend::models::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
+                                                   std::string_view fallback_preset_name = {}, TrainProcessOptions options = {});
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] std::int32_t process_group_id() const noexcept;
     [[nodiscard]] int stdout_fd() const noexcept;
@@ -105,13 +91,10 @@ class TrainProcessClient final {
             pid_t pid = -1;
             mmltk::common::io::ScopedFd pidfd;
         };
-
         static constexpr std::size_t kGroupMemberCapacity = 16U;
-
         [[nodiscard]] bool tracks(pid_t candidate) const noexcept;
         void refresh_group_members();
         [[nodiscard]] bool consume_lifecycle();
-
         pid_t pid = -1;
         pid_t group = -1;
         mmltk::common::io::ScopedFd pidfd;
@@ -139,10 +122,8 @@ class TrainProcessClient final {
         bool terminal_consumed = false;
         std::chrono::milliseconds escalation_delay{std::chrono::seconds{5}};
     };
-
     explicit TrainProcessClient(State state) noexcept;
     [[nodiscard]] std::optional<TrainProcessProgress> read_progress();
     std::optional<State> state_;
 };
-
 }  // namespace mmltk::controller::services

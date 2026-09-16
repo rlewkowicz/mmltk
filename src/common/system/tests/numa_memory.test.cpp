@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <vector>
 #include <system_error>
-
 namespace {
 using namespace mmltk::common::system;
 TEST_CASE("Owned local pages keep high-water storage and verify placement", "[common][system][numa-memory]") {

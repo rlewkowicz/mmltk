@@ -1,5 +1,4 @@
 #include "src/frameworks/serialization/cbor_wire.h"
-
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -18,18 +17,15 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 namespace mmltk::frameworks::serialization::wire {
 namespace {
-
 [[nodiscard]] bool dynamic_value_within_limits(const Value& value, const DynamicValueLimits limits, const std::size_t depth) noexcept {
     if (depth > limits.max_depth) return false;
     if (const auto* text = std::get_if<std::string>(&value.storage)) return text->size() <= limits.max_bytes;
     if (const auto* bytes = std::get_if<ByteBuffer>(&value.storage)) return bytes->size() <= limits.max_bytes;
     if (const auto* array = std::get_if<Value::Array>(&value.storage)) {
-        return array->size() <= limits.max_items && std::all_of(array->begin(), array->end(), [&](const Value& child) {
-                   return dynamic_value_within_limits(child, limits, depth + 1U);
-               });
+        return array->size() <= limits.max_items &&
+               std::all_of(array->begin(), array->end(), [&](const Value& child) { return dynamic_value_within_limits(child, limits, depth + 1U); });
     }
     if (const auto* object = std::get_if<Value::Object>(&value.storage)) {
         return object->size() <= limits.max_items && std::all_of(object->begin(), object->end(), [&](const auto& member) {
@@ -38,13 +34,11 @@ namespace {
     }
     return true;
 }
-
 [[nodiscard]] bool valid_utf8(const std::string_view text) noexcept {
     const auto* data = reinterpret_cast<const unsigned char*>(text.data());
     for (std::size_t index = 0U; index < text.size();) {
         const unsigned char first = data[index++];
         if (first <= 0x7fU) { continue; }
-
         std::size_t continuation_count = 0U;
         std::uint32_t codepoint = 0U;
         if ((first & 0xe0U) == 0xc0U) {
@@ -59,20 +53,17 @@ namespace {
         } else {
             return false;
         }
-
         if (continuation_count > text.size() - index) { return false; }
         for (std::size_t part = 0U; part < continuation_count; ++part) {
             const unsigned char next = data[index++];
             if ((next & 0xc0U) != 0x80U) { return false; }
             codepoint = (codepoint << 6U) | (next & 0x3fU);
         }
-
         const std::uint32_t minimum = continuation_count == 1U ? 0x80U : continuation_count == 2U ? 0x800U : 0x10000U;
         if (codepoint < minimum || codepoint > 0x10ffffU || (codepoint >= 0xd800U && codepoint <= 0xdfffU)) { return false; }
     }
     return true;
 }
-
 [[nodiscard]] std::uint64_t structural_key_hash(const ByteView key, const std::uintptr_t salt) noexcept {
     std::uint64_t hash = 0x9e3779b97f4a7c15ULL ^ static_cast<std::uint64_t>(salt);
     for (const std::byte value : key) {
@@ -85,15 +76,12 @@ namespace {
     hash *= 0x94d049bb133111ebULL;
     return hash ^ (hash >> 31U);
 }
-
 [[nodiscard]] std::uint16_t float_to_half(const float value) noexcept {
     const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
     const std::uint32_t sign = (bits >> 16U) & 0x8000U;
     const std::uint32_t exponent = (bits >> 23U) & 0xffU;
     std::uint32_t fraction = bits & 0x7fffffU;
-
     if (exponent == 0xffU) { return static_cast<std::uint16_t>(sign | 0x7c00U | (fraction == 0U ? 0U : 0x0200U)); }
-
     const int half_exponent = static_cast<int>(exponent) - 127 + 15;
     if (half_exponent >= 31) { return static_cast<std::uint16_t>(sign | 0x7c00U); }
     if (half_exponent <= 0) {
@@ -103,13 +91,11 @@ namespace {
     }
     return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(half_exponent) << 10U) | ((fraction + 0x1000U) >> 13U));
 }
-
 [[nodiscard]] float half_to_float(const std::uint16_t half) noexcept {
     const std::uint32_t sign = static_cast<std::uint32_t>(half & 0x8000U) << 16U;
     const std::uint32_t exponent = (half >> 10U) & 0x1fU;
     std::uint32_t fraction = half & 0x03ffU;
     std::uint32_t bits = sign;
-
     if (exponent == 0U) {
         if (fraction != 0U) {
             std::uint32_t normalized_exponent = 113U;
@@ -128,13 +114,10 @@ namespace {
     }
     return std::bit_cast<float>(bits);
 }
-
 [[nodiscard]] EncodeError encode_error(const ErrorCode code = ErrorCode::LimitExceeded) { return {.code = code, .offset = 0U, .path = {}}; }
-
 [[nodiscard]] bool fits_remaining(const std::size_t value, const std::size_t used, const std::size_t limit) noexcept {
     return used <= limit && value <= limit - used;
 }
-
 [[nodiscard]] bool duplicate_object_key(const Value::Object& object) {
     std::set<std::string_view, std::less<>> names;
     for (const auto& [name, ignored] : object) {
@@ -143,14 +126,12 @@ namespace {
     }
     return false;
 }
-
 [[nodiscard]] std::expected<void, EncodeError> begin_encode_item(const std::size_t depth, std::size_t& items, const Limits& limits) {
     if (depth > limits.max_depth) { return std::unexpected(encode_error(ErrorCode::DepthExceeded)); }
     if (items >= limits.max_items) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
     ++items;
     return {};
 }
-
 template <class Range, class Operation>
 [[nodiscard]] std::expected<void, EncodeError> encode_each(const Range& range, Operation&& operation) {
     for (const auto& item : range) {
@@ -159,9 +140,7 @@ template <class Range, class Operation>
     }
     return {};
 }
-
-[[nodiscard]] std::expected<void, EncodeError> validate_object_encoding(const Value::Object& object, const std::size_t items,
-                                                                        const Limits& limits) {
+[[nodiscard]] std::expected<void, EncodeError> validate_object_encoding(const Value::Object& object, const std::size_t items, const Limits& limits) {
     if (duplicate_object_key(object)) { return std::unexpected(encode_error(ErrorCode::DuplicateKey)); }
     constexpr std::size_t kMapEntriesItemCount = 2U;
     if (items > limits.max_items || object.size() > (limits.max_items - items) / kMapEntriesItemCount) {
@@ -169,29 +148,19 @@ template <class Range, class Operation>
     }
     return {};
 }
-
 [[nodiscard]] constexpr std::uint8_t additional_info_for_head_size(const std::size_t size) noexcept {
     switch (size) {
-        case 1U:
-            return 0U;
-        case 2U:
-            return 24U;
-        case 3U:
-            return 25U;
-        case 5U:
-            return 26U;
-        case 9U:
-            return 27U;
-        default:
-            return 31U;
+        case 1U: return 0U;
+        case 2U: return 24U;
+        case 3U: return 25U;
+        case 5U: return 26U;
+        case 9U: return 27U;
+        default: return 31U;
     }
 }
-
 }  // namespace
-
 std::expected<CanonicalFloatEncoding, ErrorCode> canonical_float_encoding(const double value) noexcept {
     if (!std::isfinite(value)) return std::unexpected(ErrorCode::InvalidFloat);
-
     const float narrowed = static_cast<float>(value);
     if (static_cast<double>(narrowed) != value) {
         return CanonicalFloatEncoding{
@@ -211,46 +180,28 @@ std::expected<CanonicalFloatEncoding, ErrorCode> canonical_float_encoding(const 
         .bits = std::bit_cast<std::uint32_t>(narrowed),
     };
 }
-
 bool dynamic_value_within_limits(const Value& value, const DynamicValueLimits limits) noexcept {
     return limits.max_bytes != 0U && limits.max_items != 0U && dynamic_value_within_limits(value, limits, 0U);
 }
-
 FlatValue::FlatValue(const std::monostate) noexcept : storage(std::monostate{}) {}
-
 FlatValue::FlatValue(const bool value) noexcept : storage(value) {}
-
-FlatValue::FlatValue(const std::int64_t value) noexcept
-    : storage(value < 0 ? Storage{value} : Storage{static_cast<std::uint64_t>(value)}) {}
-
+FlatValue::FlatValue(const std::int64_t value) noexcept : storage(value < 0 ? Storage{value} : Storage{static_cast<std::uint64_t>(value)}) {}
 FlatValue::FlatValue(const std::uint64_t value) noexcept : storage(value) {}
-
 FlatValue::FlatValue(const double value) noexcept : storage(value) {}
-
 FlatValue::FlatValue(std::string value) : storage(std::move(value)) {}
-
 FlatValue::FlatValue(ByteBuffer value) : storage(std::move(value)) {}
-
 std::expected<FlatValue, DecodeError> FlatValue::text(const std::string_view value, const std::size_t max_bytes) {
-    if (max_bytes == 0U || value.size() > max_bytes) {
-        return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}});
-    }
+    if (max_bytes == 0U || value.size() > max_bytes) { return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}}); }
     return FlatValue(std::string(value));
 }
-
 std::expected<FlatValue, DecodeError> FlatValue::bytes(const ByteView value, const std::size_t max_bytes) {
-    if (max_bytes == 0U || value.size() > max_bytes) {
-        return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}});
-    }
+    if (max_bytes == 0U || value.size() > max_bytes) { return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}}); }
     return FlatValue(ByteBuffer(value.begin(), value.end()));
 }
-
 std::expected<FlatValue, DecodeError> FlatValue::array(const std::span<const FlatValue> values, const DynamicValueLimits limits) {
-    if (limits.max_bytes == 0U || limits.max_items == 0U || values.size() > limits.max_items ||
-        (limits.max_depth == 0U && !values.empty())) {
+    if (limits.max_bytes == 0U || limits.max_items == 0U || values.size() > limits.max_items || (limits.max_depth == 0U && !values.empty())) {
         return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}});
     }
-
     for (const FlatValue& value : values) {
         const bool valid_scalar = value.visit([limits]<class T>(const T& leaf) {
             if constexpr (std::is_same_v<T, Array>) {
@@ -262,12 +213,10 @@ std::expected<FlatValue, DecodeError> FlatValue::array(const std::span<const Fla
             }
         });
         if (!valid_scalar) {
-            const ErrorCode code = value.visit(
-                []<class T>(const T&) { return std::is_same_v<T, Array> ? ErrorCode::TypeMismatch : ErrorCode::LimitExceeded; });
+            const ErrorCode code = value.visit([]<class T>(const T&) { return std::is_same_v<T, Array> ? ErrorCode::TypeMismatch : ErrorCode::LimitExceeded; });
             return std::unexpected(DecodeError{.code = code, .offset = 0U, .path = {}});
         }
     }
-
     Array result;
     result.reserve(values.size());
     for (const FlatValue& value : values) {
@@ -281,15 +230,11 @@ std::expected<FlatValue, DecodeError> FlatValue::array(const std::span<const Fla
     }
     return FlatValue(Storage(std::move(result)));
 }
-
 std::expected<FlatValue, DecodeError> FlatValue::from_value(const Value& value, const DynamicValueLimits limits) {
-    if (limits.max_bytes == 0U || limits.max_items == 0U) {
-        return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}});
-    }
+    if (limits.max_bytes == 0U || limits.max_items == 0U) { return std::unexpected(DecodeError{.code = ErrorCode::LimitExceeded, .offset = 0U, .path = {}}); }
     return std::visit(
         [limits]<class T>(const T& leaf) -> std::expected<FlatValue, DecodeError> {
-            if constexpr (std::is_same_v<T, std::monostate> || std::is_same_v<T, bool> || std::is_same_v<T, std::int64_t> ||
-                          std::is_same_v<T, std::uint64_t>) {
+            if constexpr (std::is_same_v<T, std::monostate> || std::is_same_v<T, bool> || std::is_same_v<T, std::int64_t> || std::is_same_v<T, std::uint64_t>) {
                 return FlatValue(leaf);
             } else if constexpr (std::is_same_v<T, double>) {
                 return std::isfinite(leaf) ? std::expected<FlatValue, DecodeError>(FlatValue(leaf))
@@ -311,9 +256,8 @@ std::expected<FlatValue, DecodeError> FlatValue::from_value(const Value& value, 
                                           std::is_same_v<U, std::uint64_t>) {
                                 return FlatValue::Scalar(item_leaf);
                             } else if constexpr (std::is_same_v<U, double>) {
-                                return std::isfinite(item_leaf)
-                                           ? std::expected<FlatValue::Scalar, DecodeError>(FlatValue::Scalar(item_leaf))
-                                           : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
+                                return std::isfinite(item_leaf) ? std::expected<FlatValue::Scalar, DecodeError>(FlatValue::Scalar(item_leaf))
+                                                                : std::unexpected(DecodeError{.code = ErrorCode::InvalidFloat, .offset = 0U, .path = {}});
                             } else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, ByteBuffer>) {
                                 return item_leaf.size() <= limits.max_bytes
                                            ? std::expected<FlatValue::Scalar, DecodeError>(FlatValue::Scalar(item_leaf))
@@ -333,7 +277,6 @@ std::expected<FlatValue, DecodeError> FlatValue::from_value(const Value& value, 
         },
         value.storage);
 }
-
 bool dynamic_value_within_limits(const FlatValue& value, const DynamicValueLimits limits) noexcept {
     if (limits.max_bytes == 0U || limits.max_items == 0U) { return false; }
     return value.visit([limits]<class T>(const T& leaf) {
@@ -342,9 +285,7 @@ bool dynamic_value_within_limits(const FlatValue& value, const DynamicValueLimit
             return std::all_of(leaf.begin(), leaf.end(), [limits](const FlatValue::Scalar& scalar) {
                 return std::visit(
                     [limits]<class U>(const U& item) {
-                        if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, ByteBuffer>) {
-                            return item.size() <= limits.max_bytes;
-                        }
+                        if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, ByteBuffer>) { return item.size() <= limits.max_bytes; }
                         return true;
                     },
                     scalar);
@@ -355,22 +296,18 @@ bool dynamic_value_within_limits(const FlatValue& value, const DynamicValueLimit
         return true;
     });
 }
-
 Reader::Reader(const ByteSegments bytes, const Limits limits, const StructuralValidationScratch scratch) noexcept
     : input_(bytes), limits_(limits), structural_scratch_(scratch) {}
-
 void Reader::PathScope::release() noexcept {
     if (reader_ != nullptr) {
         reader_->path_.pop_back();
         reader_ = nullptr;
     }
 }
-
 Reader::PathScope Reader::enter_path(const std::string_view name) {
     path_.push_back({.name = name, .object_kind = {}});
     return PathScope(*this);
 }
-
 DecodeError Reader::error(const ErrorCode code) const {
     DecodeError result{.code = code, .offset = offset_, .path = {}};
     for (const DecodePathElement& element : path_) {
@@ -379,49 +316,34 @@ DecodeError Reader::error(const ErrorCode code) const {
     }
     return result;
 }
-
 DecodeError Reader::contextualize(DecodeError result) const {
     if (result.path.empty()) { result.path = error(result.code).path; }
     return result;
 }
-
 std::expected<bool, DecodeError> Reader::next_is_null() const {
     if (input_.size() > limits_.max_bytes) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
     if (offset_ >= input_.size()) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
     const std::byte next = offset_ < input_.first.size() ? input_.first[offset_] : input_.second[offset_ - input_.first.size()];
     return next == std::byte{0xf6};
 }
-
 std::expected<std::byte, DecodeError> Reader::byte() {
     if (offset_ >= input_.size()) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
     const std::byte result = offset_ < input_.first.size() ? input_.first[offset_] : input_.second[offset_ - input_.first.size()];
     ++offset_;
     return result;
 }
-
 std::expected<std::uint64_t, DecodeError> Reader::argument(const std::uint8_t additional) {
     if (additional < 24U) { return additional; }
     if (additional == 31U) { return std::unexpected(error(ErrorCode::IndefiniteContainer)); }
-
     std::size_t byte_count = 0U;
     switch (additional) {
-        case 24U:
-            byte_count = 1U;
-            break;
-        case 25U:
-            byte_count = 2U;
-            break;
-        case 26U:
-            byte_count = 4U;
-            break;
-        case 27U:
-            byte_count = 8U;
-            break;
-        default:
-            break;
+        case 24U: byte_count = 1U; break;
+        case 25U: byte_count = 2U; break;
+        case 26U: byte_count = 4U; break;
+        case 27U: byte_count = 8U; break;
+        default: break;
     }
     if (byte_count == 0U) { return std::unexpected(error(ErrorCode::InvalidAdditionalInfo)); }
-
     std::uint64_t value = 0U;
     for (std::size_t index = 0U; index < byte_count; ++index) {
         auto next = byte();
@@ -431,18 +353,15 @@ std::expected<std::uint64_t, DecodeError> Reader::argument(const std::uint8_t ad
     if (head_size(value) != byte_count + 1U) { return std::unexpected(error(ErrorCode::NonMinimal)); }
     return value;
 }
-
 std::expected<std::size_t, DecodeError> Reader::size_argument(const std::uint8_t additional) {
     auto encoded = argument(additional);
     if (!encoded) return std::unexpected(encoded.error());
     if (*encoded > std::numeric_limits<std::size_t>::max()) { return std::unexpected(error(ErrorCode::Overflow)); }
     return static_cast<std::size_t>(*encoded);
 }
-
 std::expected<ByteBuffer, DecodeError> Reader::bytes(const std::size_t count) {
     if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
     if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
-
     ByteBuffer result(count);
     for (std::byte& destination : result) {
         auto next = byte();
@@ -451,11 +370,9 @@ std::expected<ByteBuffer, DecodeError> Reader::bytes(const std::size_t count) {
     }
     return result;
 }
-
 std::expected<std::string, DecodeError> Reader::text(const std::size_t count) {
     if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
     if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
-
     std::string result(count, '\0');
     for (char& destination : result) {
         auto next = byte();
@@ -465,43 +382,32 @@ std::expected<std::string, DecodeError> Reader::text(const std::size_t count) {
     if (!valid_utf8(result)) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
     return result;
 }
-
 bool Reader::allocation_allowed(const AllocationKind kind, const std::size_t size) const noexcept {
     if (limits_.allocation_policy.allows == nullptr) { return true; }
-    return limits_.allocation_policy.allows(limits_.allocation_policy.context,
-                                            AllocationRequest{.path = path_, .kind = kind, .size = size});
+    return limits_.allocation_policy.allows(limits_.allocation_policy.context, AllocationRequest{.path = path_, .kind = kind, .size = size});
 }
-
 std::expected<Reader::ItemHead, DecodeError> Reader::item_head(const std::size_t depth) {
     if (input_.size() > limits_.max_bytes) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
     if (depth > limits_.max_depth) { return std::unexpected(error(ErrorCode::DepthExceeded)); }
     if (items_ >= limits_.max_items) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
     ++items_;
-
     auto lead = byte();
     if (!lead) { return std::unexpected(lead.error()); }
     const std::uint8_t initial = std::to_integer<std::uint8_t>(*lead);
-    return ItemHead{
-        .initial = initial, .major = static_cast<std::uint8_t>(initial >> 5U), .additional = static_cast<std::uint8_t>(initial & 31U)};
+    return ItemHead{.initial = initial, .major = static_cast<std::uint8_t>(initial >> 5U), .additional = static_cast<std::uint8_t>(initial & 31U)};
 }
-
-std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead head, const bool apply_allocation_policy,
-                                                               const bool materialize) {
+std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead head, const bool apply_allocation_policy, const bool materialize) {
     if (head.major == 7U) {
         switch (head.initial) {
-            case 0xf4U:
-                return FlatValue(false);
-            case 0xf5U:
-                return FlatValue(true);
-            case 0xf6U:
-                return FlatValue();
+            case 0xf4U: return FlatValue(false);
+            case 0xf5U: return FlatValue(true);
+            case 0xf6U: return FlatValue();
             case 0xf9U: {
                 auto first = byte();
                 if (!first) { return std::unexpected(first.error()); }
                 auto second = byte();
                 if (!second) { return std::unexpected(second.error()); }
-                const auto bits =
-                    static_cast<std::uint16_t>((std::to_integer<std::uint8_t>(*first) << 8U) | std::to_integer<std::uint8_t>(*second));
+                const auto bits = static_cast<std::uint16_t>((std::to_integer<std::uint8_t>(*first) << 8U) | std::to_integer<std::uint8_t>(*second));
                 const double value = half_to_float(bits);
                 if (!std::isfinite(value)) { return std::unexpected(error(ErrorCode::InvalidFloat)); }
                 return FlatValue(value);
@@ -530,23 +436,16 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead he
                 if (static_cast<double>(static_cast<float>(value)) == value) { return std::unexpected(error(ErrorCode::NonMinimal)); }
                 return FlatValue(value);
             }
-            default:
-                return std::unexpected(error(ErrorCode::InvalidMajorType));
+            default: return std::unexpected(error(ErrorCode::InvalidMajorType));
         }
     }
-
     if (head.major == 4U || head.major == 5U) { return std::unexpected(error(ErrorCode::TypeMismatch)); }
-    if (head.major != 0U && head.major != 1U && head.major != 2U && head.major != 3U) {
-        return std::unexpected(error(ErrorCode::InvalidMajorType));
-    }
-
+    if (head.major != 0U && head.major != 1U && head.major != 2U && head.major != 3U) { return std::unexpected(error(ErrorCode::InvalidMajorType)); }
     auto encoded_argument = argument(head.additional);
     if (!encoded_argument) { return std::unexpected(encoded_argument.error()); }
     if (head.major == 0U) { return FlatValue(*encoded_argument); }
     if (head.major == 1U) {
-        if (*encoded_argument > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-            return std::unexpected(error(ErrorCode::Overflow));
-        }
+        if (*encoded_argument > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) { return std::unexpected(error(ErrorCode::Overflow)); }
         return FlatValue(-1 - static_cast<std::int64_t>(*encoded_argument));
     }
     if (*encoded_argument > std::numeric_limits<std::size_t>::max()) { return std::unexpected(error(ErrorCode::Overflow)); }
@@ -568,7 +467,6 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_scalar(const ItemHead he
     };
     return head.major == 2U ? as_flat(bytes(count)) : as_flat(text(count));
 }
-
 std::expected<std::size_t, DecodeError> Reader::begin_container_item(const std::size_t depth, const std::uint8_t expected_major,
                                                                      const AllocationKind allocation_kind) {
     auto head = item_head(depth);
@@ -585,15 +483,8 @@ std::expected<std::size_t, DecodeError> Reader::begin_container_item(const std::
     }
     return *count;
 }
-
-std::expected<std::size_t, DecodeError> Reader::begin_array_item(const std::size_t depth) {
-    return begin_container_item(depth, 4U, AllocationKind::Sequence);
-}
-
-std::expected<std::size_t, DecodeError> Reader::begin_object_item(const std::size_t depth) {
-    return begin_container_item(depth, 5U, AllocationKind::Object);
-}
-
+std::expected<std::size_t, DecodeError> Reader::begin_array_item(const std::size_t depth) { return begin_container_item(depth, 4U, AllocationKind::Sequence); }
+std::expected<std::size_t, DecodeError> Reader::begin_object_item(const std::size_t depth) { return begin_container_item(depth, 5U, AllocationKind::Object); }
 std::expected<std::string, DecodeError> Reader::read_object_key(const std::size_t depth) {
     auto scalar = read_scalar_item(depth);
     if (!scalar) { return std::unexpected(scalar.error()); }
@@ -601,9 +492,7 @@ std::expected<std::string, DecodeError> Reader::read_object_key(const std::size_
     if (key == nullptr) { return std::unexpected(error(ErrorCode::TypeMismatch)); }
     return std::move(*key);
 }
-
 std::expected<ByteSegments, DecodeError> Reader::borrow_bytes_item(const std::size_t depth) { return borrow_string_item(depth, 2U); }
-
 std::expected<ByteSegments, DecodeError> Reader::borrow_string_item(const std::size_t depth, const std::uint8_t major) {
     auto head = item_head(depth);
     if (!head) return std::unexpected(head.error());
@@ -623,7 +512,6 @@ std::expected<ByteSegments, DecodeError> Reader::borrow_string_item(const std::s
     offset_ += *count;
     return result;
 }
-
 std::expected<std::size_t, DecodeError> Reader::read_text_choice(const std::size_t depth, const std::span<const std::string_view> choices) {
     auto bytes = borrow_string_item(depth, 3U);
     if (!bytes) return std::unexpected(bytes.error());
@@ -636,7 +524,6 @@ std::expected<std::size_t, DecodeError> Reader::read_text_choice(const std::size
     }
     return std::unexpected(error(ErrorCode::UnknownKey));
 }
-
 std::expected<void, DecodeError> Reader::expect_text_item(const std::size_t depth, const std::string_view expected) {
     auto head = item_head(depth);
     if (!head) return std::unexpected(head.error());
@@ -651,7 +538,6 @@ std::expected<void, DecodeError> Reader::expect_text_item(const std::size_t dept
     }
     return {};
 }
-
 std::expected<Reader::TextRange, DecodeError> Reader::read_structural_object_key(const std::size_t depth) {
     const std::size_t item_offset = offset_;
     auto head = item_head(depth);
@@ -667,11 +553,8 @@ std::expected<Reader::TextRange, DecodeError> Reader::read_structural_object_key
     offset_ += *count;
     return TextRange{.item_offset = item_offset, .data_offset = data_offset, .size = *count};
 }
-
 std::expected<void, DecodeError> Reader::insert_structural_object_key(const TextRange key, const std::span<std::uint32_t> table) {
-    if (table.empty() || key.item_offset >= std::numeric_limits<std::uint32_t>::max()) {
-        return std::unexpected(error(ErrorCode::LimitExceeded));
-    }
+    if (table.empty() || key.item_offset >= std::numeric_limits<std::uint32_t>::max()) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
     const ByteView key_bytes = input_.first.subspan(key.data_offset, key.size);
     const std::uintptr_t salt = reinterpret_cast<std::uintptr_t>(input_.first.data()) ^ reinterpret_cast<std::uintptr_t>(table.data());
     std::size_t slot = static_cast<std::size_t>(structural_key_hash(key_bytes, salt) % table.size());
@@ -691,24 +574,20 @@ std::expected<void, DecodeError> Reader::insert_structural_object_key(const Text
     }
     return std::unexpected(error(ErrorCode::LimitExceeded));
 }
-
 std::expected<FlatValue, DecodeError> Reader::read_scalar_item(const std::size_t depth) {
     auto head = item_head(depth);
     if (!head) { return std::unexpected(head.error()); }
     return read_flat_scalar(*head, true);
 }
-
 std::expected<FlatValue, DecodeError> Reader::read_flat_item(const std::size_t depth) {
     auto head = item_head(depth);
     if (!head) { return std::unexpected(head.error()); }
     if (head->major != 4U) { return read_flat_scalar(*head, true); }
-
     auto count = size_argument(head->additional);
     if (!count) return std::unexpected(count.error());
     if (!allocation_allowed(AllocationKind::Sequence, *count) || !fits_remaining(*count, items_, limits_.max_items)) {
         return std::unexpected(error(ErrorCode::LimitExceeded));
     }
-
     FlatValue::Array result;
     result.reserve(*count);
     for (std::size_t index = 0U; index < *count; ++index) {
@@ -730,14 +609,11 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_item(const std::size_t d
     }
     return FlatValue(FlatValue::Storage(std::move(result)));
 }
-
 std::expected<FlatValue, DecodeError> Reader::read_flat() { return read_document(&Reader::read_flat_item); }
-
 std::expected<void, DecodeError> Reader::finish() {
     if (offset_ != input_.size()) { return std::unexpected(error(ErrorCode::TrailingData)); }
     return {};
 }
-
 std::expected<Value, DecodeError> Reader::read_item(const std::size_t depth, const bool apply_allocation_policy, const bool materialize) {
     auto head = item_head(depth);
     if (!head) { return std::unexpected(head.error()); }
@@ -753,10 +629,8 @@ std::expected<Value, DecodeError> Reader::read_item(const std::size_t depth, con
             }
         });
     }
-
     auto count = size_argument(head->additional);
     if (!count) return std::unexpected(count.error());
-
     if (head->major == 4U) {
         if (materialize && apply_allocation_policy && !allocation_allowed(AllocationKind::Sequence, *count)) {
             return std::unexpected(error(ErrorCode::LimitExceeded));
@@ -778,9 +652,7 @@ std::expected<Value, DecodeError> Reader::read_item(const std::size_t depth, con
         constexpr std::size_t kMapEntriesItemCount = 2U;
         if (*count > (limits_.max_items - items_) / kMapEntriesItemCount) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
         if (!materialize) {
-            if (structural_scratch_cursor_ > structural_scratch_.key_offsets.size()) {
-                return std::unexpected(error(ErrorCode::LimitExceeded));
-            }
+            if (structural_scratch_cursor_ > structural_scratch_.key_offsets.size()) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
             const std::size_t available = structural_scratch_.key_offsets.size() - structural_scratch_cursor_;
             if (*count > available / kMapEntriesItemCount) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
             const std::size_t previous_cursor = structural_scratch_cursor_;
@@ -825,9 +697,7 @@ std::expected<Value, DecodeError> Reader::read_item(const std::size_t depth, con
     }
     return std::unexpected(error(ErrorCode::InvalidMajorType));
 }
-
 std::expected<Value, DecodeError> Reader::read() { return read_document(&Reader::read_value_item); }
-
 std::expected<void, DecodeError> Reader::validate_structural() {
     if (!input_.second.empty()) { return std::unexpected(error(ErrorCode::MalformedItem)); }
     if (input_.size() > limits_.max_bytes) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
@@ -839,15 +709,9 @@ std::expected<void, DecodeError> Reader::validate_structural() {
     if (!result) { return std::unexpected(result.error()); }
     return finish();
 }
-
 std::expected<Value, DecodeError> Reader::read_value_item(const std::size_t depth) { return read_item(depth); }
-
-std::size_t Writer::destination_size() const noexcept {
-    return dynamic_destination_ != nullptr ? dynamic_destination_->size() : fixed_size_;
-}
-
+std::size_t Writer::destination_size() const noexcept { return dynamic_destination_ != nullptr ? dynamic_destination_->size() : fixed_size_; }
 std::size_t Writer::bytes_written() const noexcept { return destination_size(); }
-
 void Writer::truncate(const std::size_t size) noexcept {
     if (dynamic_destination_ != nullptr) {
         dynamic_destination_->resize(size);
@@ -855,7 +719,6 @@ void Writer::truncate(const std::size_t size) noexcept {
         fixed_size_ = size;
     }
 }
-
 std::expected<void, EncodeError> Writer::append(const ByteView bytes) {
     const std::size_t size = destination_size();
     if (size > limits_.max_bytes || bytes.size() > limits_.max_bytes - size) { return std::unexpected(encode_error()); }
@@ -870,18 +733,15 @@ std::expected<void, EncodeError> Writer::append(const ByteView bytes) {
     }
     return {};
 }
-
 std::expected<void, EncodeError> Writer::put(const std::byte value) {
     const std::array bytes{value};
     auto result = append(bytes);
     if (!result) return result;
     return {};
 }
-
 std::expected<void, EncodeError> Writer::head(const std::uint8_t major, const std::uint64_t argument_value) {
     const std::size_t encoded_bytes = head_size(argument_value);
-    const std::uint8_t additional =
-        encoded_bytes == 1U ? static_cast<std::uint8_t>(argument_value) : additional_info_for_head_size(encoded_bytes);
+    const std::uint8_t additional = encoded_bytes == 1U ? static_cast<std::uint8_t>(argument_value) : additional_info_for_head_size(encoded_bytes);
     auto result = put(std::byte((major << 5U) | additional));
     if (!result) { return result; }
     for (std::size_t byte_index = encoded_bytes - 1U; byte_index > 0U; --byte_index) {
@@ -890,7 +750,6 @@ std::expected<void, EncodeError> Writer::head(const std::uint8_t major, const st
     }
     return {};
 }
-
 std::expected<void, EncodeError> Writer::write_item(const Value& value, const std::size_t depth) {
     auto begun = begin_encode_item(depth, items_, limits_);
     if (!begun) return begun;
@@ -928,14 +787,11 @@ std::expected<void, EncodeError> Writer::write_item(const Value& value, const st
             } else if constexpr (std::is_same_v<T, Value::Array>) {
                 const bool substitute = raw_array_.target == &item;
                 const std::size_t element_count = substitute ? raw_array_.items.size() : item.size();
-                if (!fits_remaining(element_count, items_, limits_.max_items)) {
-                    return std::unexpected(encode_error(ErrorCode::LimitExceeded));
-                }
+                if (!fits_remaining(element_count, items_, limits_.max_items)) { return std::unexpected(encode_error(ErrorCode::LimitExceeded)); }
                 auto result = head(4U, element_count);
                 if (!result) { return result; }
                 if (substitute) {
-                    return encode_each(raw_array_.items,
-                                       [this, depth](const ByteSegments encoded) { return append_raw_item(encoded, depth + 1U); });
+                    return encode_each(raw_array_.items, [this, depth](const ByteSegments encoded) { return append_raw_item(encoded, depth + 1U); });
                 }
                 return encode_each(item, [this, depth](const Value& element) { return write_item(element, depth + 1U); });
             } else {
@@ -952,7 +808,6 @@ std::expected<void, EncodeError> Writer::write_item(const Value& value, const st
         },
         value.storage);
 }
-
 std::expected<void, EncodeError> Writer::write(const Value& value) {
     const std::size_t initial_size = destination_size();
     const std::size_t initial_items = items_;
@@ -963,9 +818,7 @@ std::expected<void, EncodeError> Writer::write(const Value& value) {
     }
     return result;
 }
-
 std::expected<void, EncodeError> Writer::append_raw_item(const ByteSegments item) { return append_raw_item(item, 0U); }
-
 std::expected<void, EncodeError> Writer::append_raw_item(const ByteSegments item, const std::size_t depth) {
     if (depth > limits_.max_depth) { return std::unexpected(encode_error(ErrorCode::DepthExceeded)); }
     const Limits raw_limits{
@@ -975,9 +828,7 @@ std::expected<void, EncodeError> Writer::append_raw_item(const ByteSegments item
     };
     Reader reader(item, raw_limits);
     auto decoded = reader.read();
-    if (!decoded) {
-        return std::unexpected(EncodeError{.code = decoded.error().code, .offset = decoded.error().offset, .path = decoded.error().path});
-    }
+    if (!decoded) { return std::unexpected(EncodeError{.code = decoded.error().code, .offset = decoded.error().offset, .path = decoded.error().path}); }
     auto appended = append(item.first);
     if (!appended) return appended;
     appended = append(item.second);
@@ -988,30 +839,21 @@ std::expected<void, EncodeError> Writer::append_raw_item(const ByteSegments item
     items_ += reader.items_read();
     return {};
 }
-
 std::expected<std::size_t, EncodeError> CountingEncoder::measure(const Value& value) {
     Writer writer{limits_, raw_array_};
     auto result = writer.write(value);
     return result ? std::expected<std::size_t, EncodeError>{writer.bytes_written()} : std::unexpected(result.error());
 }
-
 std::expected<Value, DecodeError> decode(const ByteSegments bytes, const Limits limits) { return Reader(bytes, limits).read(); }
-
 std::expected<void, DecodeError> validate_raw_item(const ByteSegments bytes, const Limits limits) {
     auto result = decode(bytes, limits);
     if (!result) { return std::unexpected(result.error()); }
     return {};
 }
-
-std::expected<void, DecodeError> validate_raw_item_structural(const ByteView bytes, const Limits limits,
-                                                              const StructuralValidationScratch scratch) {
+std::expected<void, DecodeError> validate_raw_item_structural(const ByteView bytes, const Limits limits, const StructuralValidationScratch scratch) {
     return Reader({.first = bytes}, limits, scratch).validate_structural();
 }
-
-std::expected<void, EncodeError> encode(const Value& value, ByteBuffer& destination, const Limits limits) {
-    return encode(value, {}, destination, limits);
-}
-
+std::expected<void, EncodeError> encode(const Value& value, ByteBuffer& destination, const Limits limits) { return encode(value, {}, destination, limits); }
 std::expected<void, EncodeError> encode(const Value& value, const RawArrayItems raw_array, ByteBuffer& destination, const Limits limits) {
     auto measured = CountingEncoder(limits, raw_array).measure(value);
     if (!measured) { return std::unexpected(measured.error()); }
@@ -1019,7 +861,6 @@ std::expected<void, EncodeError> encode(const Value& value, const RawArrayItems 
     if (destination.capacity() < *measured) { destination.reserve(*measured); }
     return Writer(destination, limits, raw_array).write(value);
 }
-
 std::expected<std::size_t, EncodeError> encode(const Value& value, const std::span<std::byte> destination, const Limits limits) {
     auto measured = CountingEncoder(limits).measure(value);
     if (!measured) return std::unexpected(measured.error());
@@ -1029,5 +870,4 @@ std::expected<std::size_t, EncodeError> encode(const Value& value, const std::sp
     if (!written) return std::unexpected(written.error());
     return writer.bytes_written();
 }
-
 }  // namespace mmltk::frameworks::serialization::wire

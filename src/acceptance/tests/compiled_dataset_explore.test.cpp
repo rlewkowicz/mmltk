@@ -19,7 +19,6 @@
 #include <variant>
 #include <vector>
 #include <cuda_runtime_api.h>
-
 #include "catch2_compat.hpp"
 #include <catch2/generators/catch_generators.hpp>
 #include "filesystem_test_utils.hpp"
@@ -32,15 +31,11 @@
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/frameworks/serialization/serialization.h"
-
 import mmltk.backend.imaging.explore.compiled_explore_store;
-
 namespace {
-
 namespace data = mmltk::backend::data;
 namespace explore = mmltk::backend::imaging::explore;
 namespace controller = mmltk::controller;
-
 class NativeExploreAudit final {
     struct PublicationObservation final {
         void Observe(const std::uint64_t sequence, const controller::VisualDiagnosticFact& fact) noexcept {
@@ -50,7 +45,6 @@ class NativeExploreAudit final {
             staging.store(fact.context.staging_bytes, std::memory_order_release);
             count.fetch_add(1U, std::memory_order_acq_rel);
         }
-
         std::atomic_uint64_t first_sequence{0U};
         std::atomic_uint64_t last_generation{0U};
         std::atomic_uint64_t count{0U};
@@ -81,12 +75,10 @@ class NativeExploreAudit final {
         }
         Wake();
     }
-
     [[nodiscard]] std::optional<controller::ExploreSnapshot> pending_snapshot() {
         std::scoped_lock lock(mutex_);
         return pending_snapshot_;
     }
-
     [[nodiscard]] controller::VisualDiagnosticSink diagnostics() noexcept {
         return {
             .context = this,
@@ -99,8 +91,7 @@ class NativeExploreAudit final {
                     } else if (fact.operation == controller::VisualDiagnosticOperation::PlaceholderPublished) {
                         audit.placeholder_.Observe(sequence, fact);
                     } else if (fact.operation == controller::VisualDiagnosticOperation::ExplorePrefetchReady) {
-                        if (fact.value < 64U)
-                            audit.prefetched_indices_.fetch_or(std::uint64_t{1U} << fact.value, std::memory_order_acq_rel);
+                        if (fact.value < 64U) audit.prefetched_indices_.fetch_or(std::uint64_t{1U} << fact.value, std::memory_order_acq_rel);
                     } else if (fact.operation == controller::VisualDiagnosticOperation::TileBatchPublished) {
                         audit.tile_.Observe(sequence, fact);
                         audit.last_tile_cumulative_.store(fact.value, std::memory_order_release);
@@ -146,7 +137,6 @@ class NativeExploreAudit final {
             .pixel_probes = true,
         };
     }
-
     template <class Predicate>
     [[nodiscard]] bool Wait(Predicate predicate) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
@@ -163,7 +153,6 @@ class NativeExploreAudit final {
             observed = wake_revision_;
         }
     }  // CLEANUP-IGNORE: The wait terminator and independent scalar observation getters are not a repeated operation.
-
     void RequireRetainedReady(const bool enabled) noexcept { require_retained_ready_.store(enabled, std::memory_order_release); }
     // CLEANUP-IGNORE: Retained-ready loss is an independent atomic observation, not a repeated multi-field mapping.
     [[nodiscard]] bool LostRetainedReady() const noexcept { return lost_retained_ready_.load(std::memory_order_acquire); }
@@ -178,9 +167,7 @@ class NativeExploreAudit final {
     }
     [[nodiscard]] std::uint64_t reused_tiles() const noexcept { return reused_tiles_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t prefetched_indices() const noexcept { return prefetched_indices_.load(std::memory_order_acquire); }
-    [[nodiscard]] std::uint64_t last_placeholder_generation() const noexcept {
-        return placeholder_.last_generation.load(std::memory_order_acquire);
-    }
+    [[nodiscard]] std::uint64_t last_placeholder_generation() const noexcept { return placeholder_.last_generation.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_tile_generation() const noexcept { return tile_.last_generation.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_tile_cumulative() const noexcept { return last_tile_cumulative_.load(std::memory_order_acquire); }
     [[nodiscard]] std::size_t last_tile_staging() const noexcept { return tile_.staging.load(std::memory_order_acquire); }
@@ -215,9 +202,7 @@ class NativeExploreAudit final {
         // CLEANUP-IGNORE: Each named audit getter exposes a distinct fact without a runtime field registry.
         return descriptor_count_.load(std::memory_order_acquire);
     }
-    [[nodiscard]] std::uint64_t last_descriptor_annotations() const noexcept {
-        return last_descriptor_annotations_.load(std::memory_order_acquire);
-    }
+    [[nodiscard]] std::uint64_t last_descriptor_annotations() const noexcept { return last_descriptor_annotations_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t last_descriptor_rle() const noexcept { return last_descriptor_rle_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t semantic_count() const noexcept {
         // CLEANUP-IGNORE: Semantic and image/checksum facts retain independent names and storage.
@@ -226,23 +211,19 @@ class NativeExploreAudit final {
     [[nodiscard]] std::uint64_t last_semantic_pixels() const noexcept { return last_semantic_pixels_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t semantic_nonzero_cards() const noexcept { return semantic_nonzero_cards_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t image_pixel_count() const noexcept { return image_pixel_count_.load(std::memory_order_acquire); }
-    [[nodiscard]] std::uint64_t image_seed(const std::size_t image) const noexcept {
-        return image_seeds_[image].load(std::memory_order_acquire);
-    }
+    [[nodiscard]] std::uint64_t image_seed(const std::size_t image) const noexcept { return image_seeds_[image].load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t image_checksum(const std::size_t image) const noexcept {
         return image_checksums_[image].load(std::memory_order_acquire);
     }  // CLEANUP-IGNORE: Indexed image checksums and donor counters are independent observations with distinct storage.
     [[nodiscard]] std::uint64_t donor_count() const noexcept { return donor_count_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t detail_checksum() const noexcept { return detail_checksum_.load(std::memory_order_acquire); }
-
     [[nodiscard]] std::uint64_t donor_descriptor_count() const noexcept { return donor_descriptor_count_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t donor_rle() const noexcept { return donor_rle_.load(std::memory_order_acquire); }
-    [[nodiscard]] bool GalleryPublishedAfter(const controller::ExploreSystem& system, const std::uint64_t admission_revision,
-                                             const std::uint64_t prior_images, const std::uint64_t prior_placeholders) const {
+    [[nodiscard]] bool GalleryPublishedAfter(const controller::ExploreSystem& system, const std::uint64_t admission_revision, const std::uint64_t prior_images,
+                                             const std::uint64_t prior_placeholders) const {
         const auto snapshot = system.snapshot();
         return !snapshot.busy && snapshot.revision > admission_revision && image_pixel_count() >= prior_images + 2U &&
-               last_tile_generation() == last_placeholder_generation() && placeholder_count() > prior_placeholders &&
-               last_tile_cumulative() == 2U;
+               last_tile_generation() == last_placeholder_generation() && placeholder_count() > prior_placeholders && last_tile_cumulative() == 2U;
     }
     void CheckInitialOrdering() const {
         CHECK(first_ready_frame() != 0U);
@@ -261,7 +242,6 @@ class NativeExploreAudit final {
         }
         changed_.notify_all();
     }
-
     mutable std::mutex mutex_;
     std::condition_variable changed_;
     std::string failure_detail_;
@@ -304,44 +284,39 @@ class NativeExploreAudit final {
     std::atomic_uint64_t donor_rle_{0U};
     std::atomic_bool failed_{false};
 };
-
 struct NativeExploreFixture final {
     static constexpr controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
     NativeExploreAudit audit;
     const std::size_t parallelism = controller::normalize_explore_parallelism(2U);
     controller::ExploreSystem system;
-
     NativeExploreFixture(controller::SettingsSystem& settings, bool h2d)
         : system{settings,
                  device,
                  parallelism,
-                 controller::make_native_explore_runtime_factory(
-                     device, parallelism, {.loading = data::data_loading_options(h2d), .diagnostics = audit.diagnostics()}),
+                 controller::make_native_explore_runtime_factory(device, parallelism,
+                                                                 {.loading = data::data_loading_options(h2d), .diagnostics = audit.diagnostics()}),
                  [this](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
                  audit.diagnostics()} {}
 };
-
 void wait_for_native_gallery(NativeExploreAudit& audit, const controller::ExploreSystem& system, const std::uint64_t placeholder_count,
                              const std::uint64_t tile_count, const std::uint32_t ready_tiles = 2U) {
     REQUIRE(audit.Wait([&] { return audit.placeholder_count() > placeholder_count; }));
     const auto generation = audit.last_placeholder_generation();
     const bool completed = audit.Wait([&] {
         const auto snapshot = system.snapshot();
-        return audit.tile_count() > tile_count && audit.last_tile_generation() == generation &&
-               audit.last_tile_cumulative() == ready_tiles && snapshot.mode == controller::ExploreMode::Gallery &&
-               snapshot.gallery.generation == generation && !snapshot.busy && audit.last_ready_frame() == snapshot.frame.revision;
+        return audit.tile_count() > tile_count && audit.last_tile_generation() == generation && audit.last_tile_cumulative() == ready_tiles &&
+               snapshot.mode == controller::ExploreMode::Gallery && snapshot.gallery.generation == generation && !snapshot.busy &&
+               audit.last_ready_frame() == snapshot.frame.revision;
     });
     if (!completed) {
         const auto snapshot = system.snapshot();
         INFO("gallery wait generation=" << generation << " placeholder=" << audit.placeholder_count() << " tiles=" << audit.tile_count()
-                                        << " tile generation=" << audit.last_tile_generation() << " cumulative="
-                                        << audit.last_tile_cumulative() << " last ready frame=" << audit.last_ready_frame()
-                                        << " frame=" << snapshot.frame.revision << " busy=" << snapshot.busy << " ready=" << snapshot.ready
-                                        << " failed=" << audit.failed() << " failure=" << audit.failure_detail());
+                                        << " tile generation=" << audit.last_tile_generation() << " cumulative=" << audit.last_tile_cumulative()
+                                        << " last ready frame=" << audit.last_ready_frame() << " frame=" << snapshot.frame.revision << " busy=" << snapshot.busy
+                                        << " ready=" << snapshot.ready << " failed=" << audit.failed() << " failure=" << audit.failure_detail());
         REQUIRE(completed);
     }
 }
-
 void check_published_frame(const controller::ExploreSystem& system) {
     const auto snapshot = system.snapshot();
     const auto product = system.BorrowFrame();
@@ -366,15 +341,12 @@ void check_published_frame(const controller::ExploreSystem& system) {
         CHECK(snapshot.gallery.slots.size() == snapshot.order.visible_indices.size());
     }
 }
-
 void load_explore_transport(controller::SettingsSystem& settings, const std::filesystem::path& settings_path, const bool h2d) {
     REQUIRE(settings.Load(controller::services::SettingsLocation{settings_path.string()}).applied());
     controller::contracts::SettingsUpdateRequest loading;
-    loading.updates.push_back(
-        {.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{h2d}});
+    loading.updates.push_back({.path = "workflows.explore.h2d_dataloader", .value = mmltk::frameworks::serialization::wire::FlatValue{h2d}});
     static_cast<void>(settings.Update(std::move(loading)));
 }
-
 void require_explore_transport(const bool h2d) {
     if (h2d) return;
     int dmabuf = 0;
@@ -382,7 +354,6 @@ void require_explore_transport(const bool h2d) {
     if (!(status == CUDA_SUCCESS && dmabuf != 0) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0)
         SKIP("GDR hardware unavailable; Explore GDR acceptance remains unverified");
 }
-
 void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     const bool h2d = GENERATE(true, false);
     INFO("h2d_dataloader=" << h2d);
@@ -396,7 +367,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     REQUIRE(info.width == 32U);
     REQUIRE(info.height == 32U);
     REQUIRE(info.class_names().front() == "person");
-
     const mmltk::backend::data::CompiledDataset store = mmltk::backend::data::CompiledDataset::open(compiled);
     const mmltk::backend::data::CompiledDataset non_square_store = mmltk::backend::data::CompiledDataset::open(non_square_compiled);
     const std::vector<explore::ExploreImageSummary> summaries = explore::build_explore_summaries(store);
@@ -428,10 +398,8 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
         CHECK(runs.front().start >= letterbox.offset_y * 32U);
         CHECK(runs.back().start + runs.back().length <= (letterbox.offset_y + letterbox.resized_height) * 32U);
     }
-
     explore::ExploreSampleFilter filter;
     filter.require_boxes = true;
-
     std::vector<std::uint32_t> first_order;
     std::vector<std::uint32_t> first_scratch;
     std::vector<std::uint32_t> second_order;
@@ -443,7 +411,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     std::vector<std::uint32_t> sorted_order = first_order;
     std::ranges::sort(sorted_order);
     CHECK(sorted_order == std::vector<std::uint32_t>{10U, 11U});
-
     const explore::ExploreViewport gallery_viewport{
         .first_row = 0U,
         .row_count = 1U,
@@ -460,17 +427,14 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     REQUIRE(adjacent);
     CHECK(store.image_pixels(*adjacent) != nullptr);
     CHECK(store.image_entry(*adjacent).pixel_offset != 0U);
-
     constexpr std::array<std::uint32_t, 3U> navigation{7U, 11U, 19U};
     CHECK(explore::adjacent_explore_index(navigation, 7U, false) == 19U);
     CHECK(explore::adjacent_explore_index(navigation, 19U, true) == 7U);
     CHECK_FALSE(explore::adjacent_explore_index(navigation, 3U, true).has_value());
-
     const std::vector<std::uint32_t> retained_order = first_order;
     std::atomic<bool> cancelled{true};
     CHECK_FALSE(explore::rebuild_explore_order(summaries, filter, false, 0U, first_order, first_scratch, &cancelled));
     CHECK(first_order == retained_order);
-
     controller::SettingsSystem settings;
     load_explore_transport(settings, root.path() / "gui.json", h2d);
     controller::contracts::SettingsUpdateRequest deterministic_augmentation;
@@ -505,7 +469,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(system.snapshot().gallery.slots == std::vector<bool>{true, true});
     REQUIRE(audit.Wait([&] { return (audit.prefetched_indices() & ((1U << 2U) | (1U << 3U))) == ((1U << 2U) | (1U << 3U)); }));
     { check_published_frame(system); }
-
     const auto enlarged_placeholders = audit.placeholder_count();
     const auto enlarged_tiles = audit.tile_count();
     system.UpdateViewport({.viewport = {.extent = {64U, 64U}, .row_count = 2U, .columns = 2U}});
@@ -522,7 +485,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     const auto restore_tiles = audit.tile_count();
     system.UpdateViewport({.viewport = first_view});
     wait_for_native_gallery(audit, system, restore_placeholders, restore_tiles);
-
     // Materialize all twelve fixture images, then challenge every published
     // readiness set during five/six/five row oscillation at unchanged extent.
     const auto warm_placeholders = audit.placeholder_count();
@@ -541,32 +503,27 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
         check_published_frame(system);
     }
     audit.RequireRetainedReady(false);
-
     auto placeholder_count = audit.placeholder_count();
     auto tile_count = audit.tile_count();
     system.UpdateViewport({.viewport = {.extent = {64U, 32U}, .first_row = 1U, .row_count = 1U, .columns = 2U}});
     wait_for_native_gallery(audit, system, placeholder_count, tile_count);
     CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{2U, 3U});
     CHECK(audit.augmentation_count() == 0U);
-
     const auto stable_order = system.snapshot().order.visible_indices;
     const auto stable_shuffle_seed = system.snapshot().order.shuffle_seed;
     auto preview_admission = system.UpdateAugmentation({.enabled = true});
-    const bool preview_completed = audit.Wait([&] {
-        return !system.snapshot().busy && system.snapshot().revision > preview_admission.revision && audit.augmentation_count() != 0U;
-    });
+    const bool preview_completed =
+        audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > preview_admission.revision && audit.augmentation_count() != 0U; });
     const auto preview_state = system.snapshot();
     INFO("preview busy=" << preview_state.busy << " revision=" << preview_state.revision << " admission=" << preview_admission.revision
                          << " enabled=" << preview_state.augmentation.enabled << " failure=" << preview_state.failure
-                         << " placeholders=" << audit.placeholder_count() << " tiles=" << audit.tile_count()
-                         << " augmentations=" << audit.augmentation_count() << " render_flags=" << audit.last_render_flags()
-                         << " configured=" << settings.explore_settings_candidate().augmentation.enabled);
+                         << " placeholders=" << audit.placeholder_count() << " tiles=" << audit.tile_count() << " augmentations=" << audit.augmentation_count()
+                         << " render_flags=" << audit.last_render_flags() << " configured=" << settings.explore_settings_candidate().augmentation.enabled);
     REQUIRE(preview_completed);
     const auto first_preview_count = audit.augmentation_count();
     preview_admission = system.RerollAugmentation();
     REQUIRE(audit.Wait([&] {
-        return !system.snapshot().busy && system.snapshot().revision > preview_admission.revision &&
-               audit.augmentation_count() > first_preview_count;
+        return !system.snapshot().busy && system.snapshot().revision > preview_admission.revision && audit.augmentation_count() > first_preview_count;
     }));
     CHECK(system.snapshot().augmentation.seed == 1U);
     CHECK(audit.last_augmentation_seed() == 1U);
@@ -580,8 +537,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     REQUIRE(audit.Wait([&] {
         const auto snapshot = system.snapshot();
         return snapshot.revision > final_preview.revision && snapshot.augmentation.enabled && snapshot.augmentation.seed == 2U &&
-               snapshot.gallery.generation == system.LastInteractionGeneration() &&
-               snapshot.gallery.slots.size() == snapshot.order.visible_indices.size() &&
+               snapshot.gallery.generation == system.LastInteractionGeneration() && snapshot.gallery.slots.size() == snapshot.order.visible_indices.size() &&
                std::ranges::all_of(snapshot.gallery.slots, [](auto ready) { return ready == 1U; });
     }));
     check_published_frame(system);
@@ -593,7 +549,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     system.UpdateViewport({.viewport = {.extent = {64U, 32U}, .first_row = 0U, .row_count = 1U, .columns = 2U}});
     wait_for_native_gallery(audit, system, placeholder_count, tile_count);
     CHECK(audit.augmentation_count() == disabled_augmentation_count);
-
     REQUIRE_FALSE(system.snapshot().order.visible_indices.empty());
     const auto retained_gallery = system.snapshot();
     const auto selected_image = system.snapshot().order.visible_indices.front();
@@ -606,14 +561,13 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(detail.selected_image == selected_image);
     CHECK(detail.scene.objects.empty());
     check_published_frame(system);
-
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
     const auto returned = system.CloseDetail();
     REQUIRE(audit.Wait([&] {
         const auto snapshot = system.snapshot();
-        return snapshot.revision > returned.revision && snapshot.mode == controller::ExploreMode::Gallery &&
-               snapshot.frame == retained_gallery.frame && snapshot.gallery.slots == retained_gallery.gallery.slots;
+        return snapshot.revision > returned.revision && snapshot.mode == controller::ExploreMode::Gallery && snapshot.frame == retained_gallery.frame &&
+               snapshot.gallery.slots == retained_gallery.gallery.slots;
     }));
     CHECK(system.snapshot().gallery.layout == retained_gallery.gallery.layout);
     CHECK(audit.placeholder_count() == placeholder_count);
@@ -622,7 +576,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(system.snapshot().mode == controller::ExploreMode::Gallery);
     CHECK_FALSE(audit.failed());
     CHECK(system.snapshot().failure.empty());
-
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
     static_cast<void>(system.UpdateFilter({
@@ -632,7 +585,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     wait_for_native_gallery(audit, system, placeholder_count, tile_count);
     CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
     CHECK(audit.observed_semantic_diagnostics());
-
     const auto retained_staging = audit.last_tile_staging();
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
@@ -641,7 +593,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(system.snapshot().ready);
     CHECK(audit.last_tile_staging() >= retained_staging);
     CHECK_FALSE(audit.failed());
-
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
     static_cast<void>(system.Open({.viewport = first_view, .compiled_source = non_square_compiled.string()}));
@@ -649,25 +600,19 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(system.snapshot().augmentation.seed == 0U);
     CHECK_FALSE(system.snapshot().augmentation.enabled);
     check_published_frame(system);
-
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
     auto descriptor_count = audit.descriptor_count();
     auto semantic_count = audit.semantic_count();
     static_cast<void>(system.UpdateFilter({
         .filter = {.minimum_compiled_index = 10U, .maximum_compiled_index = 11U, .require_boxes = true, .require_masks = true},
-        .overlay = {.class_selection = {.mode = controller::ExploreClassSelectionMode::Subset, .classes = {0U}},
-                    .show_boxes = true,
-                    .show_masks = true},
+        .overlay = {.class_selection = {.mode = controller::ExploreClassSelectionMode::Subset, .classes = {0U}}, .show_boxes = true, .show_masks = true},
     }));
     wait_for_native_gallery(audit, system, placeholder_count, tile_count);
-    const bool semantic_ready = audit.Wait([&] {
-        return audit.descriptor_count() > descriptor_count && audit.semantic_count() > semantic_count &&
-               audit.semantic_nonzero_cards() != 0U;
-    });
-    INFO("descriptor count=" << audit.descriptor_count() << " before=" << descriptor_count
-                             << " annotations=" << audit.last_descriptor_annotations() << " rle=" << audit.last_descriptor_rle()
-                             << " semantic count=" << audit.semantic_count() << " before=" << semantic_count
+    const bool semantic_ready = audit.Wait(
+        [&] { return audit.descriptor_count() > descriptor_count && audit.semantic_count() > semantic_count && audit.semantic_nonzero_cards() != 0U; });
+    INFO("descriptor count=" << audit.descriptor_count() << " before=" << descriptor_count << " annotations=" << audit.last_descriptor_annotations()
+                             << " rle=" << audit.last_descriptor_rle() << " semantic count=" << audit.semantic_count() << " before=" << semantic_count
                              << " pixels=" << audit.last_semantic_pixels() << " nonzero cards=" << audit.semantic_nonzero_cards()
                              << " failed=" << audit.failed() << " placeholder generation=" << audit.last_placeholder_generation()
                              << " tile generation=" << audit.last_tile_generation());
@@ -676,7 +621,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
     CHECK(audit.last_descriptor_annotations() == 2U);
     CHECK(audit.last_descriptor_rle() != 0U);
-
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
     semantic_count = audit.semantic_count();
@@ -687,7 +631,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     wait_for_native_gallery(audit, system, placeholder_count, tile_count);
     REQUIRE(audit.Wait([&] { return audit.semantic_count() > semantic_count; }));
     CHECK(audit.semantic_nonzero_cards() == 0U);
-
     placeholder_count = audit.placeholder_count();
     tile_count = audit.tile_count();
     semantic_count = audit.semantic_count();
@@ -696,13 +639,11 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
         .overlay = {.show_boxes = true, .show_masks = true},
     }));
     wait_for_native_gallery(audit, system, placeholder_count, tile_count);
-    const bool restored_semantics =
-        audit.Wait([&] { return audit.semantic_count() > semantic_count && audit.semantic_nonzero_cards() != 0U; });
-    INFO("restored semantic count=" << audit.semantic_count() << " before=" << semantic_count
-                                    << " nonzero cards=" << audit.semantic_nonzero_cards() << " generation=" << audit.last_tile_generation()
-                                    << " failure=" << audit.failure_detail() << " snapshot failure=" << system.snapshot().failure);
+    const bool restored_semantics = audit.Wait([&] { return audit.semantic_count() > semantic_count && audit.semantic_nonzero_cards() != 0U; });
+    INFO("restored semantic count=" << audit.semantic_count() << " before=" << semantic_count << " nonzero cards=" << audit.semantic_nonzero_cards()
+                                    << " generation=" << audit.last_tile_generation() << " failure=" << audit.failure_detail()
+                                    << " snapshot failure=" << system.snapshot().failure);
     REQUIRE(restored_semantics);
-
     const auto source_annotation_count = audit.last_descriptor_annotations();
     const auto source_rle_count = audit.last_descriptor_rle();
     const auto seed_zero_image_count = audit.image_pixel_count();
@@ -716,11 +657,10 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     });
     const auto seed_zero_state = system.snapshot();
     INFO("seed-zero busy=" << seed_zero_state.busy << " revision=" << seed_zero_state.revision << " admission=" << augmented.revision
-                           << " failure=" << seed_zero_state.failure << " placeholders=" << audit.placeholder_count()
-                           << " tiles=" << audit.tile_count() << " placeholder generation=" << audit.last_placeholder_generation()
-                           << " tile generation=" << audit.last_tile_generation() << " cumulative tiles=" << audit.last_tile_cumulative()
-                           << " augmentations=" << audit.augmentation_count() << " before=" << seed_zero_augmentation_count
-                           << " images=" << audit.image_pixel_count() << " before=" << seed_zero_image_count
+                           << " failure=" << seed_zero_state.failure << " placeholders=" << audit.placeholder_count() << " tiles=" << audit.tile_count()
+                           << " placeholder generation=" << audit.last_placeholder_generation() << " tile generation=" << audit.last_tile_generation()
+                           << " cumulative tiles=" << audit.last_tile_cumulative() << " augmentations=" << audit.augmentation_count()
+                           << " before=" << seed_zero_augmentation_count << " images=" << audit.image_pixel_count() << " before=" << seed_zero_image_count
                            << " donors=" << audit.donor_descriptor_count() << " before=" << donor_descriptor_count << " donor annotations="
                            << audit.donor_count() << " donor rle=" << audit.donor_rle() << " render flags=" << audit.last_render_flags()
                            << " valid donors=" << audit.last_valid_donors() << " planned pastes=" << audit.last_planned_pastes()
@@ -741,10 +681,8 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     const auto image_pixel_count = audit.image_pixel_count();
     placeholder_count = audit.placeholder_count();
     augmented = system.RerollAugmentation();
-    REQUIRE(audit.Wait([&] {
-        return audit.GalleryPublishedAfter(system, augmented.revision, image_pixel_count, placeholder_count) &&
-               audit.last_augmentation_seed() == 1U;
-    }));
+    REQUIRE(audit.Wait(
+        [&] { return audit.GalleryPublishedAfter(system, augmented.revision, image_pixel_count, placeholder_count) && audit.last_augmentation_seed() == 1U; }));
     const auto pending_replacement = audit.pending_snapshot();
     REQUIRE(pending_replacement.has_value());
     CHECK(pending_replacement->gallery.generation == system.snapshot().gallery.generation);
@@ -764,7 +702,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(rerolled_checksums[0] != augmented_checksums[0]);
     CHECK(rerolled_checksums[1] != augmented_checksums[1]);
     check_published_frame(system);
-
     const auto augmentation_seed = system.snapshot().augmentation.seed;
     const auto shuffled = system.UpdateFilter({
         .filter = {.minimum_compiled_index = 10U,
@@ -776,8 +713,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     });
     REQUIRE(audit.Wait([&] {
         const auto snapshot = system.snapshot();
-        return !snapshot.busy && snapshot.revision > shuffled.revision &&
-               snapshot.gallery.slots.size() == snapshot.order.visible_indices.size() &&
+        return !snapshot.busy && snapshot.revision > shuffled.revision && snapshot.gallery.slots.size() == snapshot.order.visible_indices.size() &&
                std::ranges::all_of(snapshot.gallery.slots, [](const bool ready) { return ready; });
     }));
     const auto order_seed = system.snapshot().order.shuffle_seed;
@@ -798,7 +734,6 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(audit.image_checksum(0U) == rerolled_checksums[0]);
     CHECK(audit.image_checksum(1U) == rerolled_checksums[1]);
     check_published_frame(system);
-
     const auto gallery = system.snapshot();
     const auto source_slot = std::ranges::find(gallery.order.visible_indices, 10U) - gallery.order.visible_indices.begin();
     std::vector<controller::ExploreLabel> gallery_labels;
@@ -833,8 +768,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     auto borrowed_document = system.BorrowDocument(full_detail);
     REQUIRE(borrowed_document.valid());
     CHECK(borrowed_document.document->scene.objects == detail_scene.objects);
-    for (const auto& object : borrowed_document.document->scene.objects)
-        CHECK(object.mask.runs.empty());
+    for (const auto& object : borrowed_document.document->scene.objects) CHECK(object.mask.runs.empty());
     const auto document = controller::materialize_visual_document(*borrowed_document.document, full_detail.extent, full_detail.content);
     CHECK(document.frame_width == 32U);
     CHECK(document.frame_height == 16U);
@@ -866,12 +800,10 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     system.Shutdown();
     CHECK(system.stopped());
 }
-
 void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     mmltk::testsupport::ScopedTempDir root{"mmltk-explore-tiny-support"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(
-        root.path(), "tiny", 11, {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 4},
-        {.objects = 1, .runs_per_object = 1});
+        root.path(), "tiny", 11, {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 4}, {.objects = 1, .runs_per_object = 1});
     const auto store = data::CompiledDataset::open(compiled);
     const auto labels = store.image_labels(10U);
     REQUIRE(labels.size() == 1);
@@ -884,7 +816,6 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     REQUIRE(runs.size() == 1);
     CHECK(runs[0].start == 0);
     CHECK(runs[0].length == 1);
-
     controller::SettingsSystem settings;
     load_explore_transport(settings, root.path() / "gui.json", true);
     const auto candidate = settings.explore_settings_candidate();
@@ -895,18 +826,17 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     NativeExploreAudit audit;
     constexpr controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
     const auto nproc = controller::normalize_explore_parallelism(2U);
-    controller::ExploreSystem system{settings,
-                                     device,
-                                     nproc,
-                                     controller::make_native_explore_runtime_factory(
-                                         device, nproc, {.loading = data::data_loading_options(true), .diagnostics = audit.diagnostics()}),
-                                     [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
-                                     audit.diagnostics()};
-    static_cast<void>(system.Open(
-        {.viewport = {.extent = {32U, 32U}, .first_row = 10U, .row_count = 1U, .columns = 1U}, .compiled_source = compiled.string()}));
+    controller::ExploreSystem system{
+        settings,
+        device,
+        nproc,
+        controller::make_native_explore_runtime_factory(device, nproc, {.loading = data::data_loading_options(true), .diagnostics = audit.diagnostics()}),
+        [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
+        audit.diagnostics()};
+    static_cast<void>(
+        system.Open({.viewport = {.extent = {32U, 32U}, .first_row = 10U, .row_count = 1U, .columns = 1U}, .compiled_source = compiled.string()}));
     wait_for_native_gallery(audit, system, 0U, 0U, 1U);
     REQUIRE(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U});
-
     namespace gpu = mmltk::frameworks::gpu;
     const auto backend = gpu::cuda_image_copy_backend();
     gpu::DeviceContext receiver_context{0, backend};
@@ -936,8 +866,7 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
             for (std::uint32_t x = 0; x < width; ++x) {
                 CAPTURE(atlas, x, y);
                 const bool supported = x < scale && y >= image_top && y < image_top + scale;
-                const bool border = y >= image_top && y < image_bottom &&
-                                    ((x == scale && y <= image_top + scale) || (y == image_top + scale && x <= scale));
+                const bool border = y >= image_top && y < image_bottom && ((x == scale && y <= image_top + scale) || (y == image_top + scale && x <= scale));
                 const std::array<std::uint8_t, 4> expected = supported ? std::array<std::uint8_t, 4>{255, 0, 0, 92}
                                                              : border  ? std::array<std::uint8_t, 4>{255, 0, 0, 255}
                                                                        : std::array<std::uint8_t, 4>{0, 0, 0, 0};
@@ -948,9 +877,8 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     check_semantics(true);
     const auto previous = system.snapshot().frame;
     static_cast<void>(system.Select({.compiled_index = 10U}));
-    REQUIRE(audit.Wait([&] {
-        return !system.snapshot().busy && system.snapshot().mode == controller::ExploreMode::Detail && system.snapshot().frame != previous;
-    }));
+    REQUIRE(audit.Wait(
+        [&] { return !system.snapshot().busy && system.snapshot().mode == controller::ExploreMode::Detail && system.snapshot().frame != previous; }));
     check_semantics(false);
     const auto detail = system.snapshot().frame;
     {
@@ -971,7 +899,6 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     system.Shutdown();
     CHECK(system.stopped());
 }
-
 void test_compiled_explore_optional_donors_respect_source_capacity() {
     const bool h2d = GENERATE(true, false);
     INFO("h2d_dataloader=" << h2d);
@@ -988,8 +915,7 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
         const auto labels = store.image_labels(10U);
         REQUIRE(labels.size() == annotations.objects);
         std::size_t runs = 0U;
-        for (const auto& label : labels)
-            runs += store.instance_rle(label).size();
+        for (const auto& label : labels) runs += store.instance_rle(label).size();
         REQUIRE(runs == annotations.objects * annotations.runs_per_object);
         const bool donor_fits = annotations.objects < controller::contracts::kAnnotationObjectCapacity &&
                                 annotations.runs_per_object <= controller::contracts::kAnnotationMaskRunCapacity - runs;
@@ -998,8 +924,7 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
         controller::contracts::SettingsUpdateRequest update;
         update.updates = {
             {.path = "workflows.train.request.gpu_augmentation.enabled", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
-            {.path = "workflows.train.request.gpu_augmentation.copy_paste_probability",
-             .value = mmltk::frameworks::serialization::wire::FlatValue{1.0}},
+            {.path = "workflows.train.request.gpu_augmentation.copy_paste_probability", .value = mmltk::frameworks::serialization::wire::FlatValue{1.0}},
             {.path = "workflows.explore.show_labels", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
         };
         static_cast<void>(settings.Update(std::move(update)));
@@ -1011,8 +936,7 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
         auto& audit = subject.audit;
         auto& system = subject.system;
         static_cast<void>(system.UpdateAugmentation({.enabled = true}));
-        static_cast<void>(
-            system.Open({.viewport = {.extent = {64U, 32U}, .row_count = 1U, .columns = 2U}, .compiled_source = compiled.string()}));
+        static_cast<void>(system.Open({.viewport = {.extent = {64U, 32U}, .row_count = 1U, .columns = 2U}, .compiled_source = compiled.string()}));
         wait_for_native_gallery(audit, system, 0U, 0U);
         REQUIRE(system.snapshot().order.visible_indices == std::vector<std::uint32_t>{10U, 11U});
         REQUIRE(audit.Wait([&] { return audit.augmentation_count() != 0U; }));
@@ -1022,15 +946,13 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
         check_published_frame(system);
         const auto previous = system.snapshot().frame;
         static_cast<void>(system.Select({.compiled_index = 10U}));
-        REQUIRE(
-            audit.Wait([&] { return system.snapshot().mode == controller::ExploreMode::Detail && system.snapshot().frame != previous; }));
+        REQUIRE(audit.Wait([&] { return system.snapshot().mode == controller::ExploreMode::Detail && system.snapshot().frame != previous; }));
         CHECK_FALSE(audit.failed());
         CHECK(system.snapshot().scene.objects.size() <= annotations.objects + (donor_fits ? 1U : 0U));
         const auto augmented_frame = system.snapshot().frame;
         const auto disabled = system.UpdateAugmentation({.enabled = false});
-        REQUIRE(audit.Wait([&] {
-            return !system.snapshot().busy && system.snapshot().revision > disabled.revision && system.snapshot().frame != augmented_frame;
-        }));
+        REQUIRE(audit.Wait(
+            [&] { return !system.snapshot().busy && system.snapshot().revision > disabled.revision && system.snapshot().frame != augmented_frame; }));
         // Identity projection retains the complete source and its compact RLE,
         // including the exact per-image object and run boundaries.
         const auto identity = system.snapshot();
@@ -1073,8 +995,7 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
             REQUIRE(label.category == labels.front().class_id);
         }
         namespace cbor = mmltk::frameworks::serialization;
-        constexpr cbor::wire::Limits limits{.max_bytes = controller::browser::kMaxOutputValueBytes,
-                                            .max_items = controller::browser::kMaxOutputValueItems};
+        constexpr cbor::wire::Limits limits{.max_bytes = controller::browser::kMaxOutputValueBytes, .max_items = controller::browser::kMaxOutputValueItems};
         cbor::wire::ByteBuffer encoded;
         REQUIRE(cbor::encode(gallery, encoded, limits));
         const auto decoded = cbor::decode<controller::ExploreSnapshot>({.first = encoded}, limits);
@@ -1087,14 +1008,12 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
         system.Shutdown();
     }
 }
-
 void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
     const bool h2d = GENERATE(true, false);
     require_explore_transport(h2d);
     mmltk::testsupport::ScopedTempDir root{"mmltk-explore-ring"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(
-        root.path(), "ring", 2, {.source_width = 8, .source_height = 8, .compiled_width = 8, .compiled_height = 8},
-        {.ring_and_dots = true});
+        root.path(), "ring", 2, {.source_width = 8, .source_height = 8, .compiled_width = 8, .compiled_height = 8}, {.ring_and_dots = true});
     const auto store = data::CompiledDataset::open(compiled);
     REQUIRE(store.image_labels(0).size() == 7);
     REQUIRE(store.image_labels(1).size() == 1);
@@ -1119,8 +1038,7 @@ void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
     using Value = mmltk::frameworks::serialization::wire::FlatValue;
     update.updates = {{.path = "workflows.train.request.gpu_augmentation.copy_paste_probability", .value = Value{1.0}}};
     for (const auto group : {"geometry", "resize", "color", "noise", "blur", "occlusion"})
-        update.updates.push_back(
-            {.path = std::string{"workflows.train.request.gpu_augmentation."} + group + ".probability", .value = Value{0.0}});
+        update.updates.push_back({.path = std::string{"workflows.train.request.gpu_augmentation."} + group + ".probability", .value = Value{0.0}});
     (void)settings.Update(std::move(update));
     NativeExploreFixture subject{settings, h2d};
     auto& audit = subject.audit;
@@ -1178,8 +1096,7 @@ void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
     for (const auto& label : gallery.labels)
         if (label.compiled_index == 0) source_labels.push_back(label);
     REQUIRE(source_labels.size() == editable.objects.size());
-    for (std::size_t i = 0; i < source_labels.size(); ++i)
-        CHECK(source_labels[i].box == editable.objects[i].box);
+    for (std::size_t i = 0; i < source_labels.size(); ++i) CHECK(source_labels[i].box == editable.objects[i].box);
     borrowed = {};
     auto overlay = system.snapshot().overlay;
     overlay.class_selection = {.mode = controller::ExploreClassSelectionMode::Subset, .classes = {source_class}};
@@ -1196,7 +1113,6 @@ void test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer() {
     CHECK_FALSE(audit.failed());
     system.Shutdown();
 }
-
 void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     const bool h2d = GENERATE(true, false);
     INFO("h2d_dataloader=" << h2d);
@@ -1205,7 +1121,6 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 6);
     controller::SettingsSystem settings;
     load_explore_transport(settings, root.path() / "gui.json", h2d);
-
     std::array<int, 2U> sockets{-1, -1};
     REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.data()) == 0);
     mmltk::common::io::ScopedFd commands{sockets[0]};
@@ -1237,14 +1152,13 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
             observed.audit.diagnostics()(fact);
         }};
     const controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
-    controller::ExploreSystem system{
-        settings,
-        device,
-        1U,
-        controller::make_native_explore_runtime_factory(
-            device, 1U, {.loading = data::data_loading_options(h2d), .acceptance = gate, .diagnostics = diagnostics}),
-        [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
-        diagnostics};
+    controller::ExploreSystem system{settings,
+                                     device,
+                                     1U,
+                                     controller::make_native_explore_runtime_factory(
+                                         device, 1U, {.loading = data::data_loading_options(h2d), .acceptance = gate, .diagnostics = diagnostics}),
+                                     [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
+                                     diagnostics};
     // Stop blocked I/O before system destruction, including assertion unwinding.
     struct StopGate {
         controller::ExploreAcceptanceGate& gate;
@@ -1254,12 +1168,8 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
             lane.Release();
         }
     } stop{*gate, stale_lane};
-    const auto send = [&](const std::uint8_t command) {
-        REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
-    };
-    const auto viewport = [](const std::uint32_t rows) {
-        return controller::ExploreViewport{.extent = {32U, 32U * rows}, .row_count = rows, .columns = 1U};
-    };
+    const auto send = [&](const std::uint8_t command) { REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command)); };
+    const auto viewport = [](const std::uint32_t rows) { return controller::ExploreViewport{.extent = {32U, 32U * rows}, .row_count = rows, .columns = 1U}; };
     static_cast<void>(system.Open({.viewport = viewport(1U), .compiled_source = compiled.string()}));
     REQUIRE(audit.Wait([&] { return (reads.started.load(std::memory_order_acquire) & 1U) != 0U; }));
     // Explore owns a blocked source worker. The training loader must still
@@ -1290,8 +1200,7 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
         training_lease.leased = true;
         training.wait_batch(batch);
         REQUIRE(batch.device_images != nullptr);
-        for (std::size_t image = 0U; image < batch.num_images; ++image)
-            CHECK(batch.image_indices[image] == next_image++);
+        for (std::size_t image = 0U; image < batch.num_images; ++image) CHECK(batch.image_indices[image] == next_image++);
         training_lease.Release();
     }
     training.synchronize();
@@ -1305,8 +1214,8 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     training.wait_batch(batch);
     const auto* retained_training_images = batch.device_images;
     std::vector<float> retained_training_pixels(batch.num_images * training.image_stride() / sizeof(float));
-    REQUIRE(cudaMemcpy(retained_training_pixels.data(), batch.device_images, retained_training_pixels.size() * sizeof(float),
-                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(retained_training_pixels.data(), batch.device_images, retained_training_pixels.size() * sizeof(float), cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
     CHECK(std::ranges::equal(retained_training_pixels, training.host_images(batch)));
     send(1U);
     REQUIRE(audit.Wait([&] { return audit.last_tile_cumulative() == 1U && (audit.prefetched_indices() & 2U) != 0U; }));
@@ -1315,10 +1224,8 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     reads.hold_third.store(true);
     system.UpdateViewport({.viewport = viewport(3U)});
     REQUIRE(stale_lane.WaitEntered(std::chrono::seconds{2}));
-    REQUIRE(audit.Wait([&] {
-        return (reads.started.load(std::memory_order_acquire) & 4U) != 0U &&
-               system.snapshot().gallery.slots == std::vector<bool>{true, true, false};
-    }));
+    REQUIRE(audit.Wait(
+        [&] { return (reads.started.load(std::memory_order_acquire) & 4U) != 0U && system.snapshot().gallery.slots == std::vector<bool>{true, true, false}; }));
     const auto reused = audit.reused_tiles();
     const auto discarded = reads.discarded.load(std::memory_order_acquire);
     const auto placeholders = audit.placeholder_count();
@@ -1335,14 +1242,12 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     send(1U);
     const bool replacement_ready = audit.Wait([&] {
         const auto snapshot = system.snapshot();
-        return reads.discarded.load(std::memory_order_acquire) > discarded && audit.reused_tiles() >= reused + 2U &&
-               snapshot.gallery.slots.size() == 4U && snapshot.gallery.slots[0] && snapshot.gallery.slots[1] &&
-               audit.last_tile_generation() == audit.last_placeholder_generation();
+        return reads.discarded.load(std::memory_order_acquire) > discarded && audit.reused_tiles() >= reused + 2U && snapshot.gallery.slots.size() == 4U &&
+               snapshot.gallery.slots[0] && snapshot.gallery.slots[1] && audit.last_tile_generation() == audit.last_placeholder_generation();
     });
     INFO("discarded=" << reads.discarded.load() << " baseline=" << discarded << " reused=" << audit.reused_tiles() << " baseline=" << reused
-                      << " slots=" << system.snapshot().gallery.slots.size() << " ready slots="
-                      << std::ranges::count(system.snapshot().gallery.slots, true) << " tile generation=" << audit.last_tile_generation()
-                      << " placeholder generation=" << audit.last_placeholder_generation());
+                      << " slots=" << system.snapshot().gallery.slots.size() << " ready slots=" << std::ranges::count(system.snapshot().gallery.slots, true)
+                      << " tile generation=" << audit.last_tile_generation() << " placeholder generation=" << audit.last_placeholder_generation());
     REQUIRE(replacement_ready);
     INFO(audit.failure_detail());
     REQUIRE_FALSE(audit.failed());
@@ -1363,8 +1268,7 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
         static_cast<void>(system.UpdateOverlay(overlay));
         REQUIRE(audit.Wait([&] {
             const auto now = system.snapshot();
-            return now.overlay == overlay && now.gallery.slots == std::vector<bool>(6U, true) &&
-                   (!semantics || now.frame.revision > before.frame.revision);
+            return now.overlay == overlay && now.gallery.slots == std::vector<bool>(6U, true) && (!semantics || now.frame.revision > before.frame.revision);
         }));
         if (!semantics) CHECK(system.snapshot().frame == before.frame);
         CHECK(audit.augmentation_count() == augmentations);
@@ -1385,8 +1289,8 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     system.Shutdown();
     CHECK(batch.device_images == retained_training_images);
     std::vector<float> settled_training_pixels(retained_training_pixels.size());
-    REQUIRE(cudaMemcpy(settled_training_pixels.data(), batch.device_images, settled_training_pixels.size() * sizeof(float),
-                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(settled_training_pixels.data(), batch.device_images, settled_training_pixels.size() * sizeof(float), cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
     CHECK(settled_training_pixels == retained_training_pixels);
     training_lease.Release();
     while (training.next_batch(batch)) {
@@ -1396,7 +1300,6 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     }
     training.synchronize();
 }
-
 void test_native_explore_transaction_faults_and_inactive_release() {
     enum class Outcome { Commit, Descriptors, CompletedProduct, Cancel };
     const auto outcome = GENERATE(Outcome::Commit, Outcome::Descriptors, Outcome::CompletedProduct, Outcome::Cancel);
@@ -1443,8 +1346,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     NativeExploreAudit audit;
     const controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
     controller::ExploreSystem system{
-        settings, device, 1U,
-        controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
+        settings, device, 1U, controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
         [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }};
     struct StopGate {
         controller::ExploreAcceptanceGate& gate;
@@ -1536,13 +1438,10 @@ void test_native_explore_transaction_faults_and_inactive_release() {
         CHECK(observation.prepared.expired());
     }
 }
-
 }  // namespace
-
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore]", test_compiled_dataset_explore_projection_navigation_and_streaming);
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][capacity]", test_compiled_explore_optional_donors_respect_source_capacity);
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][completion]", test_compiled_explore_cancelled_lane_preserves_atomic_product);
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][transaction]", test_native_explore_transaction_faults_and_inactive_release);
-
 MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][support]", test_compiled_explore_magnified_tiny_mask_and_transfer);
 MMLTK_REGISTER_TEST_CASE("[acceptance][explore][copy_paste]", test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer);

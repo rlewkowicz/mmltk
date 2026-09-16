@@ -1,31 +1,25 @@
 #pragma once
-
 #include <cstdint>
 #include <memory>
 #include <vector>
 #include <cuda_runtime_api.h>
-
 #include "src/backend/data/dataset_loader.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/backend/ml/torch/detail/torch_api.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
-
 namespace mmltk::backend::models::rfdetr {
-namespace test_support { struct GpuBatchAugmenterTestAccess; }
-
+namespace test_support {
+struct GpuBatchAugmenterTestAccess;
+}
 namespace torch_types = mmltk::backend::ml::torch_api;
-
 class GpuBatchPreprocessor {
    public:
     GpuBatchPreprocessor(std::int64_t batch_capacity, int height, int width, int device_id, torch_types::ScalarType output_type);
     ~GpuBatchPreprocessor();
-
     GpuBatchPreprocessor(const GpuBatchPreprocessor&) = delete;
     GpuBatchPreprocessor& operator=(const GpuBatchPreprocessor&) = delete;
-
     [[nodiscard]] torch_types::Tensor run(const mmltk::backend::data::Batch& batch, std::int64_t output_batch_size = 0);
     void record_consumer(cudaStream_t stream);
-
     [[nodiscard]] inline std::int64_t batch_capacity() const noexcept { return batch_capacity_; }
     [[nodiscard]] inline torch_types::ScalarType output_type() const noexcept { return output_type_; }
 
@@ -40,24 +34,28 @@ class GpuBatchPreprocessor {
     bool consumer_pending_ = false;
     bool has_run_ = false;
 };
-
 class GpuBatchAugmenter {
    public:
     GpuBatchAugmenter(const GpuAugmentationConfig& config, std::int64_t batch_capacity, int height, int width, mmltk::frameworks::gpu::DeviceContext context);
     ~GpuBatchAugmenter();
-
     GpuBatchAugmenter(const GpuBatchAugmenter&) = delete;
     GpuBatchAugmenter& operator=(const GpuBatchAugmenter&) = delete;
-
     void reconfigure(const GpuAugmentationConfig& config);
-    [[nodiscard]] torch_types::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank,
-                                          std::uint64_t sequence);
-    [[nodiscard]] inline AugmentationBatchPlan& batch_plan() { RequireActive(); return batch_plan_; }
+    [[nodiscard]] torch_types::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence);
+    [[nodiscard]] inline AugmentationBatchPlan& batch_plan() {
+        RequireActive();
+        return batch_plan_;
+    }
     [[nodiscard]] cudaStream_t prepare_batch_consumer();
     [[nodiscard]] cudaStream_t finish_batch(const mmltk::backend::data::Batch& batch);
-
-    [[nodiscard]] inline bool enabled() const { RequireActive(); return executor_->enabled(); }
-    [[nodiscard]] inline bool transforms_geometry() const { RequireActive(); return executor_->transforms_geometry(); }
+    [[nodiscard]] inline bool enabled() const {
+        RequireActive();
+        return executor_->enabled();
+    }
+    [[nodiscard]] inline bool transforms_geometry() const {
+        RequireActive();
+        return executor_->transforms_geometry();
+    }
 
    private:
     void RequireActive() const;
@@ -68,7 +66,6 @@ class GpuBatchAugmenter {
     friend struct test_support::GpuBatchAugmenterTestAccess;
     void ensure_copy_paste_resources();
     [[nodiscard]] cudaError_t release_copy_paste_resources() noexcept;
-
     GpuAugmentationConfig config_;
     struct Resources final {
         explicit Resources(mmltk::frameworks::gpu::DeviceContext value) : context(std::move(value)) {}
@@ -107,5 +104,4 @@ class GpuBatchAugmenter {
     bool batch_run_pending_ = false;
     bool cache_consumer_prepared_ = false;
 };
-
 }  // namespace mmltk::backend::models::rfdetr

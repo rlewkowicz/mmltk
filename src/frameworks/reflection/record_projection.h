@@ -1,13 +1,9 @@
 #pragma once
-
 #include <concepts>
 #include <cstddef>
 #include <type_traits>
-
 #include "src/frameworks/reflection/reflected_field_policy.h"
-
 namespace mmltk::frameworks::reflection {
-
 // A destination declaration is the complete projection inventory. Source field
 // identity and exact type compatibility are resolved once at compile time.
 template <class Destination, class Source>
@@ -32,5 +28,4 @@ template <class Destination, class Source>
     });
     return result;
 }
-
 }  // namespace mmltk::frameworks::reflection

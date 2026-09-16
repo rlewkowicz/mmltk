@@ -1,7 +1,6 @@
 #pragma once
 #include <string>
 #include "src/common/system/numa_topology.h"
-
 namespace mmltk::frameworks::gpu {
 struct DeviceExecution final {
     bool operator==(const DeviceExecution&) const = default;

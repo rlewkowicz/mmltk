@@ -1,24 +1,18 @@
 #pragma once
-
 #include "src/controller/contracts/workspace_input.h"
-
 #include "src/controller/presentation/visual_source_projection.h"
-
 #include <chrono>
 #include <memory>
 #include <stop_token>
 #include <string>
 #include <variant>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/system_image_model.h"
-
 namespace mmltk::controller {
-
 struct LiveStart final {
     VisualExtent extent{};
     std::uint32_t frames_per_second = 30U;
@@ -65,18 +59,14 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     LiveSnapshot snapshot{};
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
 };
-
 // CLEANUP-IGNORE: Live runtime construction, input endpoint, and source projection are independent canonical domain declarations.
 [[nodiscard]] VisualRuntimeFactory make_native_live_runtime_factory(VisualDeviceSettings, LiveNativeConfiguration = {});
-
 class LiveSystem final {
    public:
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
     void SetInputPeer(std::uint64_t);
-
-    using visual_source =
-        VisualSourceProjection<LiveSnapshot, PresentationSourceKind::Live, mmltk::frameworks::reflection::member_path<&LiveSnapshot::frame>,
-                               mmltk::frameworks::reflection::member_path<&LiveSnapshot::revision>>;
+    using visual_source = VisualSourceProjection<LiveSnapshot, PresentationSourceKind::Live, mmltk::frameworks::reflection::member_path<&LiveSnapshot::frame>,
+                                                 mmltk::frameworks::reflection::member_path<&LiveSnapshot::revision>>;
     using event_type = std::variant<LiveFrameCompleted, LiveChanged, LiveFailed>;
     LiveSystem(VisualDeviceSettings, VisualRuntimeFactory, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
     ~LiveSystem();
@@ -100,11 +90,9 @@ class LiveSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 MMLTK_REFLECT_FIELDS(LiveStart)
 MMLTK_REFLECT_FIELDS(LiveSnapshot)
 MMLTK_REFLECT_FIELDS(LiveFrameCompleted)
 MMLTK_REFLECT_FIELDS(LiveChanged)
 MMLTK_REFLECT_FIELDS(LiveFailed)
-
 }  // namespace mmltk::controller

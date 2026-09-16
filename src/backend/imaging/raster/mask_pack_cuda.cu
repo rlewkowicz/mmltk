@@ -1,11 +1,7 @@
 #include "detail/mask_pack_cuda_abi.h"
-
 namespace mmltk::backend::imaging::raster::detail {
-
 namespace {
-
 constexpr int kCudaThreads = 256;
-
 __global__ void pack_bool_masks_kernel(const bool* masks, std::uint8_t* packed_masks, std::int64_t mask_count, std::int64_t pixels_per_mask,
                                        std::int64_t bytes_per_mask) {
     const std::int64_t output_index = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -23,15 +19,12 @@ __global__ void pack_bool_masks_kernel(const bool* masks, std::uint8_t* packed_m
     }
     packed_masks[output_index] = packed;
 }
-
 }  // namespace
-
 cudaError_t launch_pack_bool_masks_cuda(const PackBoolMasksLaunch& launch) noexcept {
     const std::int64_t total_bytes = launch.mask_count * launch.bytes_per_mask;
     const int blocks = static_cast<int>((total_bytes + kCudaThreads - 1) / kCudaThreads);
-    pack_bool_masks_kernel<<<blocks, kCudaThreads, 0, launch.stream>>>(launch.masks, launch.packed_masks, launch.mask_count,
-                                                                       launch.pixels_per_mask, launch.bytes_per_mask);
+    pack_bool_masks_kernel<<<blocks, kCudaThreads, 0, launch.stream>>>(launch.masks, launch.packed_masks, launch.mask_count, launch.pixels_per_mask,
+                                                                       launch.bytes_per_mask);
     return cudaGetLastError();
 }
-
 }  // namespace mmltk::backend::imaging::raster::detail

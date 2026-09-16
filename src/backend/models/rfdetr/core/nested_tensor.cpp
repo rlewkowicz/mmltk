@@ -3,28 +3,21 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-
 #include "detail/model_technical.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 NestedTensor NestedTensor::to(const torch::Device& device) const {
     NestedTensor result{tensors.to(device), {}};
     if (mask.defined()) result.mask = mask.to(device);
     return result;
 }
-
 NestedTensor NestedTensor::pin_memory() const {
     NestedTensor result{tensors.pin_memory(), {}};
     if (mask.defined()) result.mask = mask.pin_memory();
     return result;
 }
-
 std::pair<torch::Tensor, torch::Tensor> NestedTensor::decompose() const { return {tensors, mask}; }
-
 NestedTensor nested_tensor_from_tensor_list(const std::vector<torch::Tensor>& tensor_list) {
-    if (tensor_list.empty() || tensor_list.front().dim() != 3)
-        throw std::runtime_error("nested_tensor_from_tensor_list requires nonempty CHW tensors");
+    if (tensor_list.empty() || tensor_list.front().dim() != 3) throw std::runtime_error("nested_tensor_from_tensor_list requires nonempty CHW tensors");
     std::vector<std::int64_t> maximum(tensor_list.front().sizes().begin(), tensor_list.front().sizes().end());
     for (std::size_t index = 1U; index < tensor_list.size(); ++index) {
         const auto& tensor = tensor_list[index];
@@ -44,5 +37,4 @@ NestedTensor nested_tensor_from_tensor_list(const std::vector<torch::Tensor>& te
     }
     return {std::move(padded), std::move(mask)};
 }
-
 }  // namespace mmltk::backend::models::rfdetr

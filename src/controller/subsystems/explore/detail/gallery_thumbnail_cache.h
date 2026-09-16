@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -8,13 +7,10 @@
 #include <vector>
 #include <type_traits>
 #include <utility>
-
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/controller/subsystems/explore/explore_system.h"
-
 namespace mmltk::controller::explore_detail {
-
 // Track the standard library's actual control-block allocation without
 // depending on its private layout. The result pointer is used only during
 // synchronous construction; deallocation never accesses it.
@@ -42,8 +38,7 @@ template <class T, class... Arguments>
 [[nodiscard]] std::shared_ptr<T> MakeGalleryShared(Arguments&&... arguments) {
     using Value = std::remove_const_t<T>;
     std::size_t control_bytes = 0U;
-    std::shared_ptr<T> result{new Value(std::forward<Arguments>(arguments)...), GallerySharedDelete<Value>{},
-                              GallerySharedAllocator<std::byte>{control_bytes}};
+    std::shared_ptr<T> result{new Value(std::forward<Arguments>(arguments)...), GallerySharedDelete<Value>{}, GallerySharedAllocator<std::byte>{control_bytes}};
     std::get_deleter<GallerySharedDelete<Value>>(result)->bytes += control_bytes;
     return result;
 }
@@ -53,13 +48,11 @@ template <class T>
     const auto* allocation = std::get_deleter<GallerySharedDelete<std::remove_const_t<T>>>(value);
     return allocation ? allocation->bytes : sizeof(T);
 }
-
 struct GalleryTileMeaning final {
     mmltk::backend::imaging::explore::detail::ExploreRenderCardDescriptorAbi card{};
     std::vector<mmltk::backend::imaging::explore::detail::ExploreRenderAnnotationDescriptorAbi> annotations;
     std::vector<mmltk::backend::imaging::explore::detail::ExploreRenderRlePairAbi> runs;
 };
-
 // Pixel identities occupy retained physical slots. Demand positions only map to
 // those slots; reorder and viewport size are not pixel identity. The product
 // retains the artifact behind incarnation throughout every physical use.
@@ -90,7 +83,6 @@ class GalleryThumbnailCache final {
         std::shared_ptr<const GalleryTileMeaning> meaning{};
         std::uint64_t semantic_identity = 0U;
     };
-
     [[nodiscard]] static std::size_t WindowCount(std::size_t matching, const ExploreViewport&) noexcept;
     [[nodiscard]] static std::size_t WindowFirst(std::size_t matching, const ExploreViewport&) noexcept;
     void Configure(std::size_t count, Identity);
@@ -112,8 +104,8 @@ class GalleryThumbnailCache final {
     [[nodiscard]] const Entry* Retained(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] const Entry& Physical(std::size_t slot) const { return entries_.at(slot); }
     void Restore(std::size_t slot, Entry entry) noexcept;
-    void Complete(std::size_t position, std::uint32_t compiled_index, std::shared_ptr<const GalleryTileMeaning>,
-                  std::uint64_t semantic_identity, std::uint8_t bank = 0U, std::uint8_t semantic_bank = 0U);
+    void Complete(std::size_t position, std::uint32_t compiled_index, std::shared_ptr<const GalleryTileMeaning>, std::uint64_t semantic_identity,
+                  std::uint8_t bank = 0U, std::uint8_t semantic_bank = 0U);
     void UpdateSemantics(std::size_t position, std::uint64_t semantic_identity, std::uint8_t semantic_bank);
     [[nodiscard]] std::size_t MeaningBytes(const GalleryThumbnailCache* other = nullptr,
                                            std::span<const std::shared_ptr<const GalleryTileMeaning>> additional_meanings = {}) const;
@@ -140,5 +132,4 @@ class GalleryThumbnailCache final {
     std::size_t prior_first_ = 0U;
     bool updating_ = false;
 };
-
 }  // namespace mmltk::controller::explore_detail

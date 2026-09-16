@@ -1,5 +1,4 @@
 #pragma once
-
 #include <chrono>
 #include <cstddef>
 #include <condition_variable>
@@ -10,31 +9,25 @@
 #include <string_view>
 #include <stdexcept>
 #include <utility>
-
 namespace mmltk::testsupport {
-
 inline void release_test_promise(std::promise<void>& promise) noexcept {
     try {
         promise.set_value();
     } catch (const std::future_error&) {}
 }
-
 // The future stays with its domain owner so a deadline unwinds through that
 // scenario's release/stop guard before any joining future is destroyed.
 template <class T>
 T await_test_future(std::future<T>& future, std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
-    if (future.wait_for(timeout) != std::future_status::ready)
-        throw std::runtime_error(std::string(name) + ": settlement deadline expired");
+    if (future.wait_for(timeout) != std::future_status::ready) throw std::runtime_error(std::string(name) + ": settlement deadline expired");
     return future.get();
 }
-
 // Promise futures never join on destruction; their lifetime remains local.
 template <class T>
 T await_test_promise(std::promise<T>& promise, std::string_view name, std::chrono::milliseconds timeout = std::chrono::seconds{2}) {
     auto future = promise.get_future();
     return await_test_future(future, name, timeout);
 }
-
 // Declare after the asynchronous owner/future, while everything captured by
 // cleanup is still alive. Cleanup releases dependencies before that owner joins.
 template <class Cleanup>
@@ -48,7 +41,6 @@ class ScopedTestCleanup final {
    private:
     Cleanup cleanup_;
 };
-
 // One object is one named engagement. Copies of the receipt retain its storage,
 // never reset a previous engagement, and never assert from a worker thread.
 class TestGate final {
@@ -79,7 +71,6 @@ class TestGate final {
         explicit Receipt(std::shared_ptr<State> state) : state_(std::move(state)) {}
         std::shared_ptr<State> state_;
     };
-
     explicit TestGate(std::string name) : state_(std::make_shared<State>(std::move(name))) {}
     ~TestGate() { Release(); }
     TestGate(const TestGate&) = delete;
@@ -105,5 +96,4 @@ class TestGate final {
    private:
     std::shared_ptr<State> state_;
 };
-
 }  // namespace mmltk::testsupport

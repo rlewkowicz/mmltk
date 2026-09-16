@@ -5,15 +5,11 @@
 #include <optional>
 #include <span>
 #include <string_view>
-
 #include "src/controller/contracts/settings_commands.h"
 #include "src/controller/contracts/workflows.h"
 #include "src/controller/services/file_dialog_types.h"
-
 namespace mmltk::controller::services {
-
 inline constexpr std::size_t kFileDialogCatalogCapacity = 64U;
-
 // The service retains each declaration-derived entry once. Browser requests
 // carry only the declaration's stable reflected field identity.
 struct FileDialogDescriptor final {
@@ -27,18 +23,15 @@ struct FileDialogDescriptor final {
     [[nodiscard]] constexpr bool defer_apply() const noexcept { return model_input.has_value(); }
     constexpr bool operator==(const FileDialogDescriptor&) const noexcept = default;
 };
-
 struct ResolvedFileDialog final {
     FileDialogDescriptor descriptor{};
     FileDialogTarget target{};
     constexpr bool operator==(const ResolvedFileDialog&) const noexcept = default;
 
    private:
-    explicit constexpr ResolvedFileDialog(FileDialogDescriptor value, FileDialogTarget requested) noexcept
-        : descriptor(value), target(requested) {}
+    explicit constexpr ResolvedFileDialog(FileDialogDescriptor value, FileDialogTarget requested) noexcept : descriptor(value), target(requested) {}
     friend class FileDialogCatalog;
 };
-
 class FileDialogCatalog final {
    public:
     [[nodiscard]] std::optional<ResolvedFileDialog> resolve(mmltk::controller::services::FileDialogOpen request) const noexcept;
@@ -52,9 +45,6 @@ class FileDialogCatalog final {
     [[nodiscard]] static FileDialogCatalog Create(std::span<const FileDialogDescriptor> entries);
     friend const FileDialogCatalog& file_dialog_catalog();
 };
-
 [[nodiscard]] const FileDialogCatalog& file_dialog_catalog();
-[[nodiscard]] std::optional<mmltk::controller::contracts::SettingsValueUpdate> resolve_file_dialog_path(std::uint64_t stable_field_id,
-                                                                                                        std::string_view path);
-
+[[nodiscard]] std::optional<mmltk::controller::contracts::SettingsValueUpdate> resolve_file_dialog_path(std::uint64_t stable_field_id, std::string_view path);
 }  // namespace mmltk::controller::services

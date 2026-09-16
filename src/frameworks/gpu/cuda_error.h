@@ -1,12 +1,9 @@
 #pragma once
-
 #include <cuda_runtime_api.h>
 #include <cuda.h>
 #include <stdexcept>
 #include <string>
-
 namespace mmltk::frameworks::gpu {
-
 [[nodiscard]] constexpr bool cuda_shared_failure(cudaError_t status) noexcept {
     switch (status) {
         case cudaErrorInitializationError:
@@ -46,10 +43,8 @@ namespace mmltk::frameworks::gpu {
         case cudaErrorMpsClientTerminated:
         case cudaErrorExternalDevice:
         case cudaErrorStreamDetached:
-        case cudaErrorUnknown:
-            return true;
-        default:
-            return false;
+        case cudaErrorUnknown: return true;
+        default: return false;
     }
 }
 // Driver/runtime error identities share CUDA's status numbers, including the
@@ -58,18 +53,14 @@ namespace mmltk::frameworks::gpu {
 static_assert(static_cast<int>(CUDA_ERROR_INVALID_CONTEXT) == static_cast<int>(cudaErrorDeviceUninitialized));
 static_assert(static_cast<int>(CUDA_ERROR_DEINITIALIZED) == static_cast<int>(cudaErrorCudartUnloading));
 static_assert(static_cast<int>(CUDA_ERROR_OUT_OF_MEMORY) == static_cast<int>(cudaErrorMemoryAllocation));
-
 class CudaError final : public std::runtime_error {
    public:
-    CudaError(cudaError_t status, const char* context)
-        : std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status)), status_(status) {}
+    CudaError(cudaError_t status, const char* context) : std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status)), status_(status) {}
     [[nodiscard]] cudaError_t status() const noexcept { return status_; }
     [[nodiscard]] bool shared_failure() const noexcept { return cuda_shared_failure(status_); }
 
    private:
     cudaError_t status_;
 };
-
 void ensure_cuda_ok(cudaError_t status, const char* context);
-
 }  // namespace mmltk::frameworks::gpu

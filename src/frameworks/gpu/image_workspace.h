@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cuda_runtime_api.h>
 #include <array>
 #include <atomic>
@@ -12,13 +11,10 @@
 #include <optional>
 #include <span>
 #include <utility>
-
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/device_execution.h"
-
 namespace mmltk::frameworks::gpu {
-
 class DeviceContext;
 class ImageStream;
 class ImageProductBuffer;
@@ -29,14 +25,12 @@ class ImportedImageBuffer;
 namespace test_support {
 struct ImageWorkspaceTestAccess;
 }
-
 inline constexpr std::uint64_t kWorkspaceAccessEmpty = 0U;
 inline constexpr std::uint64_t kWorkspaceAccessWriting = 1U;
 inline constexpr std::uint64_t kWorkspaceAccessAvailable = 2U;
 inline constexpr std::uint64_t kWorkspaceAccessReading = 3U;
 inline constexpr std::uint64_t kWorkspaceAccessMask = 3U;
 inline constexpr std::uint64_t kWorkspaceAccessRevoked = std::uint64_t{1U} << 63U;
-
 // The native producer owns this shared, generation-scoped physical access gate.
 // Availability advertises completed pixels; it grants no reader custody.
 struct alignas(64) ImageWorkspaceAccessSignal final {
@@ -50,7 +44,6 @@ struct alignas(64) ImageWorkspaceAccessSignal final {
 };
 static_assert(sizeof(ImageWorkspaceAccessSignal) == 64U);
 static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free);
-
 struct ImageWorkspaceLayout final {
     std::uint64_t device_incarnation = 0U;
     std::array<std::uint8_t, 16U> device_uuid{};
@@ -67,7 +60,6 @@ struct ImageWorkspaceLayout final {
     [[nodiscard]] bool valid() const noexcept;
     constexpr bool operator==(const ImageWorkspaceLayout&) const noexcept = default;
 };
-
 struct ImageWorkspaceRegion final {
     std::int32_t x1 = 0;
     std::int32_t y1 = 0;
@@ -107,9 +99,8 @@ class ImageWorkspaceDamage final {
     ImageWorkspaceContent newest_{};
     ImageWorkspaceRegion accumulated_{};
 };
-using ImageWorkspaceFinalize = std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
-                                                  ImageWorkspaceCoverage, std::uintptr_t stream)>;
-
+using ImageWorkspaceFinalize =
+    std::function<void(ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination, ImageWorkspaceCoverage, std::uintptr_t stream)>;
 // One physical Vulkan opaque-FD allocation, producer-context mappings, and
 // display-device transfer storage when the producer resides on another GPU.
 // Admission precedes writes; raw products and browser imports have their own
@@ -213,8 +204,7 @@ class ImageWorkspace final {
     struct State;
     std::shared_ptr<State> state_;
     ImageWorkspace(DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>, const Operations*);
-    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>,
-                                                                const Operations*);
+    [[nodiscard]] static std::shared_ptr<ImageWorkspace> Create(DeviceContext, ImageWorkspaceLayout, std::optional<DeviceExecution>, const Operations*);
     [[nodiscard]] std::exception_ptr Release(std::exception_ptr = {}) noexcept;
     void CheckOwner() const;
     void Attach(std::uint64_t product_owner, std::shared_ptr<ImageProductRetirement>);
@@ -226,7 +216,6 @@ class ImageWorkspace final {
     friend class ImageStream;
     friend struct test_support::ImageWorkspaceTestAccess;
 };
-
 class BorrowedImageWorkspace final {
    public:
     BorrowedImageWorkspace() noexcept;
@@ -252,11 +241,9 @@ class BorrowedImageWorkspace final {
     friend class ImageProductBuffer;
     friend class ImageStream;
 };
-
 struct ImageWorkspaceObservation final {
     std::uint64_t product_owner = 0U;
     std::uint64_t product_revision = 0U;
     std::shared_ptr<ImageWorkspace> workspace{};
 };
-
 }  // namespace mmltk::frameworks::gpu

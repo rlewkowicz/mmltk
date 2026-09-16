@@ -1,18 +1,14 @@
 #pragma once
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
-
 #if defined(__CUDACC__)
 #define MMLTK_SHIFTLUT_FORMAT_HD __host__ __device__
 #else
 #define MMLTK_SHIFTLUT_FORMAT_HD
 #endif
-
 namespace mmltk::backend::imaging::upscale::shiftlut {
-
 inline constexpr const char* kDomain = "mmltk.upscale";
 inline constexpr const char* kOperator = "ShiftLutS7";
 inline constexpr int kVersion = 1;
@@ -33,49 +29,36 @@ enum class TableFamily : std::uint8_t { Low, Depthwise, Pointwise, Up, Shifts };
 enum class Decision : std::uint8_t { Shifted, Pointwise };
 inline constexpr std::size_t kDecisionsPerStage = 2;
 inline constexpr std::size_t kDecisionCheckpoints = kStages * kDecisionsPerStage;
-
 struct Dimensions {
     std::size_t outer;
     std::size_t inner;
     std::size_t domain;
     MMLTK_SHIFTLUT_FORMAT_HD constexpr std::size_t elements() const noexcept { return outer * inner * domain; }
 };
-
 MMLTK_SHIFTLUT_FORMAT_HD constexpr Dimensions dimensions(TableFamily family) noexcept {
     switch (family) {
-        case TableFamily::Low:
-            return {kChannels, kSpatialTaps, kLowDomain};
-        case TableFamily::Depthwise:
-            return {kChannels, kSpatialTaps, kHighDomain};
-        case TableFamily::Pointwise:
-            return {kChannels, kChannels, kHighDomain};
-        case TableFamily::Up:
-            return {kOutputPhases, kChannels, kHighDomain};
-        case TableFamily::Shifts:
-            return {kStages, kShiftAxes, kChannels};
+        case TableFamily::Low: return {kChannels, kSpatialTaps, kLowDomain};
+        case TableFamily::Depthwise: return {kChannels, kSpatialTaps, kHighDomain};
+        case TableFamily::Pointwise: return {kChannels, kChannels, kHighDomain};
+        case TableFamily::Up: return {kOutputPhases, kChannels, kHighDomain};
+        case TableFamily::Shifts: return {kStages, kShiftAxes, kChannels};
     }
     return {};
 }
-
 MMLTK_SHIFTLUT_FORMAT_HD constexpr std::size_t table_offset(TableFamily family, Stage stage = Stage::First) noexcept {
     const auto low = dimensions(TableFamily::Low).elements();
     const auto depthwise = dimensions(TableFamily::Depthwise).elements();
     const auto pair = depthwise + dimensions(TableFamily::Pointwise).elements();
     switch (family) {
-        case TableFamily::Low:
-            return 0;
-        case TableFamily::Depthwise:
-            return low + static_cast<std::size_t>(stage) * pair;
-        case TableFamily::Pointwise:
-            return low + static_cast<std::size_t>(stage) * pair + depthwise;
-        case TableFamily::Up:
-            return low + kStages * pair;
+        case TableFamily::Low: return 0;
+        case TableFamily::Depthwise: return low + static_cast<std::size_t>(stage) * pair;
+        case TableFamily::Pointwise: return low + static_cast<std::size_t>(stage) * pair + depthwise;
+        case TableFamily::Up: return low + kStages * pair;
         case TableFamily::Shifts:
             return low + kStages * pair + dimensions(TableFamily::Up).elements() + static_cast<std::size_t>(stage) * kShiftAxes * kChannels;
     }
     return 0;
 }
-
 // The ordered external inventory is a projection of the typed stage/family layout.
 struct TableBlock {
     TableFamily family;
@@ -112,11 +95,9 @@ constexpr TableBlock table_block(std::size_t index) noexcept {
     }
     return result;
 }
-
 inline constexpr std::size_t kTableElements = table_offset(TableFamily::Shifts) + dimensions(TableFamily::Shifts).elements();
 inline constexpr std::size_t kTableBytes = kTableElements * sizeof(float);
-inline constexpr std::size_t kMaximumTilePixels =
-    static_cast<std::size_t>(kMaximumTileExtent) * static_cast<std::size_t>(kMaximumTileExtent);
+inline constexpr std::size_t kMaximumTilePixels = static_cast<std::size_t>(kMaximumTileExtent) * static_cast<std::size_t>(kMaximumTileExtent);
 constexpr std::size_t scratch_elements(std::size_t pixels) noexcept {
     return static_cast<std::size_t>(kRotatedBatch) * static_cast<std::size_t>(kChannels) * pixels;
 }
@@ -129,10 +110,7 @@ inline constexpr std::size_t kDecisionStorageOffset = 2 * kScratchElements;
 constexpr std::size_t resident_bytes(std::size_t decision_capacity) noexcept {
     return kTableBytes + (kDecisionStorageOffset + decision_elements(decision_capacity)) * sizeof(std::int8_t);
 }
-
 // Cold-path validation accepts unaligned little-endian FP32 storage.
 void validate_tables(std::span<const std::byte> bytes);
-
 }  // namespace mmltk::backend::imaging::upscale::shiftlut
-
 #undef MMLTK_SHIFTLUT_FORMAT_HD

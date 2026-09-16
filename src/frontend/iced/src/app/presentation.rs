@@ -544,10 +544,7 @@ impl Controller {
             .suspended
             .as_ref()
             .map_or(feature, |suspended| suspended.route);
-        if matches!(
-            feature,
-            FeatureId::Train | FeatureId::Export
-        ) {
+        if matches!(feature, FeatureId::Train | FeatureId::Export) {
             self.retire_frame();
             return Ok(());
         }

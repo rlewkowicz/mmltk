@@ -7,7 +7,6 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -41,7 +40,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
 #include <catch2/generators/catch_generators.hpp>
 #include <cuda.h>
 #include "catch2_compat.hpp"
@@ -62,9 +60,7 @@
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/services/firefox_process_owner.h"
 #include "test_fixture.h"
-
 namespace {
-
 // CLEANUP-IGNORE: The Wayland product driver imports its own typed test helpers and hardware-only termination
 // vocabulary.
 using mmltk::common::io::ScopedFd;
@@ -73,7 +69,6 @@ using mmltk::testsupport::arm_timerfd;
 using mmltk::testsupport::consume_timerfd;
 using mmltk::testsupport::reap_pidfd;
 using mmltk::testsupport::ScopedTempDir;
-
 constexpr int kCompiledResolution = 512;
 constexpr auto kWaylandStartupDeadline = std::chrono::seconds{20};
 constexpr auto kWaylandInteractionDeadline = std::chrono::seconds{6};
@@ -87,59 +82,45 @@ constexpr std::size_t kAcceptanceSnapshotLimit = 256U;
 constexpr std::size_t kAcceptanceSlotLimit = mmltk::controller::kExploreVisibleItemCapacity;
 constexpr std::size_t kAcceptanceRecordLimit = 4096U;
 constexpr const char* kExploreGalleryControl = "explore.gallery.workspace";
-
 [[nodiscard]] constexpr std::string_view first_failed_check() noexcept { return {}; }
-
 template <typename... Remaining>
-[[nodiscard]] constexpr std::string_view first_failed_check(const bool passed, const std::string_view label,
-                                                            Remaining&&... remaining) noexcept {
+[[nodiscard]] constexpr std::string_view first_failed_check(const bool passed, const std::string_view label, Remaining&&... remaining) noexcept {
     return passed ? first_failed_check(std::forward<Remaining>(remaining)...) : label;
 }
-
 enum class TerminationMode : std::uint8_t {
     SignalInterrupt,
     WindowClose,
     AbruptPeerLoss,
 };
-
 [[nodiscard]] constexpr std::string_view termination_label(const TerminationMode mode) noexcept {
     switch (mode) {
-        case TerminationMode::SignalInterrupt:
-            return "sigint";
-        case TerminationMode::WindowClose:
-            return "window-close";
-        case TerminationMode::AbruptPeerLoss:
-            return "peer-loss";
+        case TerminationMode::SignalInterrupt: return "sigint";
+        case TerminationMode::WindowClose: return "window-close";
+        case TerminationMode::AbruptPeerLoss: return "peer-loss";
     }
     std::terminate();
 }
-
 [[nodiscard]] bool execution_requested() noexcept {
     const char* const requested = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION");
     return requested != nullptr && std::string_view{requested} == "1";
 }
-
 [[nodiscard]] bool gdr_transport_available() noexcept {
     if (::access("/dev/gdrdrv", R_OK | W_OK) == 0) return true;
     if (cuInit(0U) != CUDA_SUCCESS) return false;
     CUdevice device{};
     int dmabuf = 0;
-    return cuDeviceGet(&device, 0) == CUDA_SUCCESS &&
-           cuDeviceGetAttribute(&dmabuf, static_cast<CUdevice_attribute>(152), device) == CUDA_SUCCESS && dmabuf != 0;
+    return cuDeviceGet(&device, 0) == CUDA_SUCCESS && cuDeviceGetAttribute(&dmabuf, static_cast<CUdevice_attribute>(152), device) == CUDA_SUCCESS &&
+           dmabuf != 0;
 }
-
 [[nodiscard]] std::filesystem::path configured_path(const char* const name, const std::filesystem::path& fallback) {
     const char* const configured = std::getenv(name);
     return configured != nullptr && configured[0] != '\0' ? std::filesystem::absolute(configured) : std::filesystem::absolute(fallback);
 }
-
 [[nodiscard]] std::filesystem::path latest_wayland_artifact(const std::string_view filename) {
     const char* const configured_root = std::getenv("MMLTK_REPO_ROOT");
-    const std::filesystem::path repository =
-        configured_root != nullptr && configured_root[0] != '\0' ? configured_root : std::filesystem::current_path();
+    const std::filesystem::path repository = configured_root != nullptr && configured_root[0] != '\0' ? configured_root : std::filesystem::current_path();
     return repository / "build" / "validation" / filename;
 }
-
 void prepare_latest_log(const std::filesystem::path& path, const std::string_view description, const std::string& identity) {
     std::filesystem::create_directories(path.parent_path());
     if (std::filesystem::is_regular_file(path) && std::filesystem::file_size(path) != 0U) {
@@ -150,11 +131,9 @@ void prepare_latest_log(const std::filesystem::path& path, const std::string_vie
     if (!std::ofstream{path, std::ios::binary | std::ios::trunc})
         throw std::runtime_error("failed to prepare " + std::string{description} + " at " + path.string());
 }
-
 [[nodiscard]] std::filesystem::path artifact_sibling(const std::filesystem::path& native, const std::string_view suffix) {
     return native.parent_path() / (native.stem().string() + std::string{suffix});
 }
-
 void require_independent_artifacts(const std::span<const std::filesystem::path> paths) {
     for (std::size_t index = 0U; index != paths.size(); ++index) {
         const auto canonical = std::filesystem::weakly_canonical(paths[index]);
@@ -166,7 +145,6 @@ void require_independent_artifacts(const std::span<const std::filesystem::path> 
         }
     }
 }
-
 void rotate_process_log_family(const std::filesystem::path& native, const std::string& identity) {
     const std::string prefix = native.stem().string() + "-mozilla-";
     const std::string application_prefix = native.stem().string() + "-application.";
@@ -177,7 +155,6 @@ void rotate_process_log_family(const std::filesystem::path& native, const std::s
         std::filesystem::remove(entry.path());
     }
 }
-
 void append_acceptance_record(const std::filesystem::path& path, nlohmann::json record) {
     record["kind"] = "acceptance_runtime";
     record["owner"] = "acceptance";
@@ -188,14 +165,11 @@ void append_acceptance_record(const std::filesystem::path& path, nlohmann::json 
     std::size_t offset = 0U;
     while (offset != payload.size()) {
         ssize_t written = -1;
-        do {
-            written = ::write(output.get(), payload.data() + offset, payload.size() - offset);
-        } while (written < 0 && errno == EINTR);
+        do { written = ::write(output.get(), payload.data() + offset, payload.size() - offset); } while (written < 0 && errno == EINTR);
         if (written <= 0) throw std::runtime_error("failed to write workspace Wayland acceptance evidence");
         offset += static_cast<std::size_t>(written);
     }
 }
-
 [[nodiscard]] std::string read_from(const std::filesystem::path& path, const std::uintmax_t offset) {
     std::ifstream input(path, std::ios::binary);
     if (!input) return {};
@@ -205,7 +179,6 @@ void append_acceptance_record(const std::filesystem::path& path, nlohmann::json 
     input.seekg(static_cast<std::streamoff>(offset));
     return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
 }
-
 [[nodiscard]] std::string read_tail(const std::filesystem::path& path) {
     constexpr std::size_t maximum = 96U * 1024U;
     std::ifstream input{path, std::ios::binary | std::ios::ate};
@@ -218,25 +191,21 @@ void append_acceptance_record(const std::filesystem::path& path, nlohmann::json 
     if (!input.read(result.data(), static_cast<std::streamsize>(size))) return "[artifact tail read failed]";
     return result;
 }
-
 [[nodiscard]] std::size_t permitted_cpu_count() noexcept {
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     if (::sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return 0U;
     return static_cast<std::size_t>(CPU_COUNT(&allowed));
 }
-
 [[nodiscard]] std::string process_status_text(const int status) {
     if (WIFEXITED(status)) return "exit " + std::to_string(WEXITSTATUS(status));
     if (WIFSIGNALED(status)) return "signal " + std::to_string(WTERMSIG(status)) + (WCOREDUMP(status) ? " (core dumped)" : "");
     return "wait status " + std::to_string(status);
 }
-
 class BrowserHostProcess final {
    public:
-    BrowserHostProcess(const std::filesystem::path& executable, const std::filesystem::path& diagnostics,
-                       const std::filesystem::path& runtime_log, const std::filesystem::path& firefox_log,
-                       const std::filesystem::path& working_directory, const TerminationMode termination,
+    BrowserHostProcess(const std::filesystem::path& executable, const std::filesystem::path& diagnostics, const std::filesystem::path& runtime_log,
+                       const std::filesystem::path& firefox_log, const std::filesystem::path& working_directory, const TerminationMode termination,
                        const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::filesystem::path& compiled_directory,
                        const std::string& viewer_scenario, const bool logging = true, const bool high_dpi = false, const bool h2d = true,
                        const bool pixel_probes = false, const std::string& probe_failure = {},
@@ -265,21 +234,19 @@ class BrowserHostProcess final {
             control_write.reset();
             ScopedFd runtime_output{::open(runtime_log_text.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC)};
             const bool configured =
-                runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 &&
-                ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 && ::fcntl(control_read.get(), F_SETFD, 0) == 0 &&
-                ::chdir(working_directory.c_str()) == 0 &&
-                (logging
-                     ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
-                        ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 &&
-                        ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
-                        ::setenv("MOZ_LOG",
-                                 "WebGPU:5,Widget:5,WidgetVSync:5,WidgetWayland:5,Dmabuf:5,WidgetCompositor:5,"
-                                 "nsRefreshDriver:5,PresShell:5,Clipboard:5,WidgetClipboard:5,rotate:16",
-                                 1) == 0 &&
-                        ::setenv("MOZ_LOG_FILE", mozilla_text.c_str(), 1) == 0 && ::setenv("RUST_BACKTRACE", "full", 1) == 0)
-                     : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 && ::unsetenv("MMLTK_LOG_DIR") == 0 &&
-                        ::unsetenv("MMLTK_GUI_TRACE_FILE") == 0 && ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 &&
-                        ::unsetenv("MOZ_LOG") == 0 && ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
+                runtime_output.get() >= 0 && ::dup2(runtime_output.get(), STDOUT_FILENO) >= 0 && ::dup2(runtime_output.get(), STDERR_FILENO) >= 0 &&
+                ::fcntl(control_read.get(), F_SETFD, 0) == 0 && ::chdir(working_directory.c_str()) == 0 &&
+                (logging ? (::setenv("MMLTK_LOG_LEVEL", "trace", 1) == 0 && ::setenv("MMLTK_LOG_FILE", application_log_text.c_str(), 1) == 0 &&
+                            ::setenv("MMLTK_GUI_TRACE_FILE", diagnostics_text.c_str(), 1) == 0 &&
+                            ::setenv("MMLTK_FIREFOX_LOG_FILE", firefox_text.c_str(), 1) == 0 &&
+                            ::setenv("MOZ_LOG",
+                                     "WebGPU:5,Widget:5,WidgetVSync:5,WidgetWayland:5,Dmabuf:5,WidgetCompositor:5,"
+                                     "nsRefreshDriver:5,PresShell:5,Clipboard:5,WidgetClipboard:5,rotate:16",
+                                     1) == 0 &&
+                            ::setenv("MOZ_LOG_FILE", mozilla_text.c_str(), 1) == 0 && ::setenv("RUST_BACKTRACE", "full", 1) == 0)
+                         : (::unsetenv("MMLTK_LOG_LEVEL") == 0 && ::unsetenv("MMLTK_LOG_FILE") == 0 && ::unsetenv("MMLTK_LOG_DIR") == 0 &&
+                            ::unsetenv("MMLTK_GUI_TRACE_FILE") == 0 && ::unsetenv("MMLTK_FIREFOX_LOG_FILE") == 0 && ::unsetenv("MOZ_LOG") == 0 &&
+                            ::unsetenv("MOZ_LOG_FILE") == 0 && ::unsetenv("RUST_BACKTRACE") == 0)) &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", "1", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DPI", high_dpi ? "1.5" : "1", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_VIEWER_SCENARIO", viewer_scenario.c_str(), 1) == 0 &&
@@ -288,8 +255,8 @@ class BrowserHostProcess final {
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PIXEL_FIXTURE",
                          fixture.pixel_evidence && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_COMPLETION_GATE", viewer_scenario == "retained" ? "1" : "0", 1) == 0 &&
-                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION",
-                         logging && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0", 1) == 0 &&
+                ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_PENDING_SUPERSESSION", logging && (viewer_scenario == "retained" || viewer_scenario == "dpi") ? "1" : "0",
+                         1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_SOURCE", square_source.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_SQUARE_COMPILED", square_compiled.c_str(), 1) == 0 &&
                 ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", dataset_source.c_str(), 1) == 0 &&
@@ -316,44 +283,34 @@ class BrowserHostProcess final {
             throw std::runtime_error(std::string{"failed to open browser host pidfd: "} + std::strerror(errno));
         }
     }
-
     ~BrowserHostProcess() { terminate(); }
-
     BrowserHostProcess(const BrowserHostProcess&) = delete;
     BrowserHostProcess& operator=(const BrowserHostProcess&) = delete;
-
     [[nodiscard]] int control_fd() const noexcept { return control_write_.get(); }
     [[nodiscard]] std::string_view frontend_failure() const noexcept { return frontend_failure_; }
     [[nodiscard]] bool explore_control_closed() const noexcept { return explore_control_closed_; }
     [[nodiscard]] int pidfd() const noexcept { return pidfd_.get(); }
     [[nodiscard]] bool active() const noexcept { return child_ > 0 && pidfd_.get() >= 0; }
     [[nodiscard]] int status() const noexcept { return status_; }
-
     void interrupt() noexcept {
         control_write_.reset();
         signal_process(SIGINT);
     }
-
     [[nodiscard]] bool command_explore(const std::uint8_t command) noexcept {
         if (control_write_.get() < 0) return false;
         ssize_t written = -1;
-        do {
-            written = ::send(control_write_.get(), &command, sizeof(command), MSG_NOSIGNAL);
-        } while (written < 0 && errno == EINTR);
+        do { written = ::send(control_write_.get(), &command, sizeof(command), MSG_NOSIGNAL); } while (written < 0 && errno == EINTR);
         if (written == sizeof(command)) return true;
         control_write_.reset();
         return false;
     }
-
     [[nodiscard]] std::optional<mmltk::controller::ExploreAcceptanceGate::ControlObservation> receive_explore_event() noexcept {
         if (control_write_.get() < 0) return std::nullopt;
         using Observation = ExploreAcceptanceGate::ControlObservation;
         Observation event{};
         frontend_failure_ = {};
         ssize_t consumed = -1;
-        do {
-            consumed = ::recv(control_write_.get(), control_buffer_.data(), control_buffer_.size(), MSG_TRUNC);
-        } while (consumed < 0 && errno == EINTR);
+        do { consumed = ::recv(control_write_.get(), control_buffer_.data(), control_buffer_.size(), MSG_TRUNC); } while (consumed < 0 && errno == EINTR);
         if (consumed >= static_cast<ssize_t>(sizeof(event)) && consumed <= static_cast<ssize_t>(control_buffer_.size())) {
             std::memcpy(&event, control_buffer_.data(), sizeof(event));
             const auto bytes = static_cast<std::size_t>(consumed) - sizeof(event);
@@ -364,16 +321,13 @@ class BrowserHostProcess final {
                 return event;
             }
         }
-        if (consumed == 1 &&
-            static_cast<unsigned char>(control_buffer_[0]) == static_cast<unsigned char>(ExploreAcceptanceGate::ControlEvent::InitialWait))
+        if (consumed == 1 && static_cast<unsigned char>(control_buffer_[0]) == static_cast<unsigned char>(ExploreAcceptanceGate::ControlEvent::InitialWait))
             return event;
         explore_control_closed_ = consumed == 0;
         control_write_.reset();
         return std::nullopt;
     }
-
     void close_explore_control() noexcept { control_write_.reset(); }
-
     void retain_peer(const pid_t peer) {
         if (peer_group_ == peer && peer_pidfd_.get() >= 0) return;
         if (peer <= 0 || peer_group_ > 0) throw std::runtime_error("invalid Firefox peer custody transition");
@@ -384,12 +338,10 @@ class BrowserHostProcess final {
         peer_group_ = group;
         peer_pidfd_ = std::move(peer_pidfd);
     }
-
     [[nodiscard]] bool kill_peer(const pid_t peer) noexcept {
         if (peer <= 0 || peer != peer_group_ || peer_pidfd_.get() < 0) return false;
         return ::syscall(SYS_pidfd_send_signal, peer_pidfd_.get(), SIGKILL, nullptr, 0U) == 0 || errno == ESRCH;
     }
-
     [[nodiscard]] int reap() noexcept {
         if (!active()) return status_;
         const auto terminal = reap_pidfd(pidfd_.get(), child_);
@@ -399,21 +351,17 @@ class BrowserHostProcess final {
         pidfd_.reset();
         return status_;
     }
-
     [[nodiscard]] std::optional<int> reap_if_exited() noexcept {
         if (!active()) return status_;
         int terminal = 0;
         pid_t result = -1;
-        do {
-            result = ::waitpid(child_, &terminal, WNOHANG);
-        } while (result < 0 && errno == EINTR);
+        do { result = ::waitpid(child_, &terminal, WNOHANG); } while (result < 0 && errno == EINTR);
         if (result != child_) return std::nullopt;
         status_ = terminal;
         child_ = -1;
         pidfd_.reset();
         return status_;
     }
-
     void terminate() noexcept {
         control_write_.reset();
         terminate_peer();
@@ -435,31 +383,24 @@ class BrowserHostProcess final {
         if (peer_pidfd_.get() >= 0) {
             pollfd peer_exit{.fd = peer_pidfd_.get(), .events = POLLIN, .revents = 0};
             int ready = -1;
-            do {
-                ready = ::poll(&peer_exit, 1U, 1000);
-            } while (ready < 0 && errno == EINTR);
+            do { ready = ::poll(&peer_exit, 1U, 1000); } while (ready < 0 && errno == EINTR);
         }
         peer_pidfd_.reset();
     }
-
     void signal_process(const int signal) noexcept {
         if (!active()) return;
-        if (::syscall(SYS_pidfd_send_signal, pidfd_.get(), signal, nullptr, 0U) != 0 && errno != ESRCH)
-            static_cast<void>(::kill(child_, signal));
+        if (::syscall(SYS_pidfd_send_signal, pidfd_.get(), signal, nullptr, 0U) != 0 && errno != ESRCH) static_cast<void>(::kill(child_, signal));
     }
-
     pid_t child_ = -1;
     ScopedFd pidfd_;
     pid_t peer_group_ = -1;
     ScopedFd peer_pidfd_;
     ScopedFd control_write_;
-    std::array<char, sizeof(ExploreAcceptanceGate::ControlObservation) + mmltk::controller::contracts::kIntegrationFailureMaxBytes>
-        control_buffer_;
+    std::array<char, sizeof(ExploreAcceptanceGate::ControlObservation) + mmltk::controller::contracts::kIntegrationFailureMaxBytes> control_buffer_;
     std::string_view frontend_failure_;
     bool explore_control_closed_ = false;
     int status_ = -1;
 };
-
 [[nodiscard]] std::uint64_t scalar(const nlohmann::json& value, const char* const field) noexcept {
     const auto found = value.find(field);
     if (found == value.end()) return 0U;
@@ -470,12 +411,10 @@ class BrowserHostProcess final {
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
     return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() ? result : 0U;
 }
-
 [[nodiscard]] std::string_view textual(const nlohmann::json& value, const char* const field) noexcept {
     const auto found = value.find(field);
     return found != value.end() && found->is_string() ? std::string_view{found->get_ref<const std::string&>()} : std::string_view{};
 }
-
 [[nodiscard]] double numeric(const nlohmann::json& value, const char* const field) noexcept {
     const auto found = value.find(field);
     if (found == value.end()) return 0.0;
@@ -486,7 +425,6 @@ class BrowserHostProcess final {
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
     return parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() ? result : 0.0;
 }
-
 // Native and browser files are drained independently. Validate ordering within
 // each producer stream, then join their facts by the physical capability; file
 // read order is not a cross-process happens-before relation.
@@ -671,8 +609,7 @@ struct SurfaceAudit final {
         }
         // Withdrawal closes admission while an already claimed import may
         // still finish. Physical retirement is the terminal boundary.
-        if (!lifecycle.Observe(next, native_shutdown && !browser))
-            reject("source admission or retirement is missing, duplicate, or reordered");
+        if (!lifecycle.Observe(next, native_shutdown && !browser)) reject("source admission or retirement is missing, duplicate, or reordered");
     }
     struct Draw final {
         std::string selected;
@@ -693,11 +630,9 @@ struct SurfaceAudit final {
     bool native_shutdown = false;
     bool browser_shutdown = false;
     bool browser_exited = false;
-
     void reject(const std::string_view why) {
         if (failure.empty()) failure = why;
     }
-
     [[nodiscard]] bool admit(const std::string& id) {
         if (!failure.empty()) return false;
         const auto existing = surfaces.find(id);
@@ -715,50 +650,43 @@ struct SurfaceAudit final {
         reject("physical lifecycle evidence exceeded its bounded acceptance capacity");
         return false;
     }
-
     static std::string native_identity(const nlohmann::json& record, const bool workspace = false) {
         std::string result(32U, '0');
         for (const auto& [offset, field] : {std::pair{0U, "surface_high"}, std::pair{16U, "surface_low"}}) {
             std::array<char, 16U> digits{};
-            const auto converted =
-                std::to_chars(digits.data(), digits.data() + digits.size(),
-                              scalar(record, workspace ? (offset == 0U ? "workspace_source_high" : "workspace_source_low") : field), 16);
+            const auto converted = std::to_chars(digits.data(), digits.data() + digits.size(),
+                                                 scalar(record, workspace ? (offset == 0U ? "workspace_source_high" : "workspace_source_low") : field), 16);
             const auto count = static_cast<std::size_t>(converted.ptr - digits.data());
             result.replace(offset + 16U - count, count, digits.data(), count);
         }
         return result;
     }
-
     static bool valid_identity(const std::string_view id) {
         return id.size() == 32U && id != std::string(32U, '0') &&
                std::ranges::all_of(id, [](const char value) { return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f'); });
     }
-
     [[nodiscard]] std::optional<MetadataReceipt> metadata_receipt(const nlohmann::json& record) {
         const auto bytes = scalar(record, "metadata_bytes");
         const std::string fingerprint = record.value("metadata_fingerprint", "");
-        if (bytes == 0U || fingerprint.size() != 16U || !std::ranges::all_of(fingerprint, [](const char digit) {
-                return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f');
-            })) {
+        if (bytes == 0U || fingerprint.size() != 16U ||
+            !std::ranges::all_of(fingerprint, [](const char digit) { return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f'); })) {
             reject("image metadata receipt lacks its byte extent or fingerprint");
             return {};
         }
         return MetadataReceipt{bytes, fingerprint};
     }
-
     [[nodiscard]] static bool valid_transfer_timeline(const nlohmann::json& record, const std::uint64_t transfer) {
-        return transfer != 0U && transfer <= std::numeric_limits<std::uint64_t>::max() / 2U &&
-               scalar(record, "timeline_ready") == transfer * 2U - 1U && scalar(record, "timeline_release") == transfer * 2U;
+        return transfer != 0U && transfer <= std::numeric_limits<std::uint64_t>::max() / 2U && scalar(record, "timeline_ready") == transfer * 2U - 1U &&
+               scalar(record, "timeline_release") == transfer * 2U;
     }
-
     void native(const nlohmann::json& record) {
         const std::string event = record.value("event", "");
         if (event.starts_with("presentation.copy.")) reject("Presentation performed an obsolete pixel copy");
         native_shutdown = native_shutdown || event == "shutdown.requested";
         browser_shutdown = browser_shutdown || event == "shutdown.firefox_terminal";
         browser_exited = browser_exited || event == "shutdown.firefox_terminal";
-        if (event.starts_with("presentation.source.admission.") || event == "presentation.source.ready" ||
-            event == "presentation.source.withdrawal" || event == "presentation.source.retirement") {
+        if (event.starts_with("presentation.source.admission.") || event == "presentation.source.ready" || event == "presentation.source.withdrawal" ||
+            event == "presentation.source.retirement") {
             if (scalar(record, "outcome") != 1U) reject("native source admission or retirement failed");
             const auto id = native_identity(record);
             source_transition(id, event, false);
@@ -769,9 +697,8 @@ struct SurfaceAudit final {
             const auto height = scalar(record, "capacity_height");
             const auto allocation = scalar(record, "workspace_allocation");
             if (generation == 0U || width == 0U || height == 0U || allocation == 0U || native_identity(record, true) != id ||
-                (source.generation != 0U &&
-                 (source.generation != generation || source.width != width || source.height != height || source.allocation != allocation ||
-                  source.direct_sampling != record.value("direct_sampling", false))))
+                (source.generation != 0U && (source.generation != generation || source.width != width || source.height != height ||
+                                             source.allocation != allocation || source.direct_sampling != record.value("direct_sampling", false))))
                 reject("native source admission has missing or inconsistent physical provenance");
             source.generation = generation;
             source.width = width;
@@ -815,29 +742,27 @@ struct SurfaceAudit final {
         const auto generation = scalar(record, "sequence");
         const auto width = scalar(record, "capacity_width");
         const auto height = scalar(record, "capacity_height");
-        if (generation == 0U || width == 0U || height == 0U || scalar(record, "selection_generation") == 0U ||
-            scalar(record, "frame_revision") == 0U || !record.contains("condition") || !record.contains("outcome") ||
+        if (generation == 0U || width == 0U || height == 0U || scalar(record, "selection_generation") == 0U || scalar(record, "frame_revision") == 0U ||
+            !record.contains("condition") || !record.contains("outcome") ||
             (state.generation != 0U && (state.generation != generation || state.width != width || state.height != height)))
             reject("native surface provenance is missing or inconsistent");
         state.generation = generation;
         state.width = width;
         state.height = height;
-        const bool copying = event == "presentation.source_borrow.started" || event == "presentation.source_borrow.completed" ||
-                             event == "presentation.source.read_submitted";
+        const bool copying =
+            event == "presentation.source_borrow.started" || event == "presentation.source_borrow.completed" || event == "presentation.source.read_submitted";
         const bool terminal_read = event == "presentation.terminal_read.completed" || event == "presentation.terminal_read.retained";
-        const bool source_release =
-            event == "presentation.release_wait.started" || event == "presentation.release_wait.completed" || terminal_read;
-        const bool transferred = event == "presentation.ready_sync.started" || event == "presentation.ready_sync.completed" ||
-                                 event == "presentation.frame.edge" || source_release;
+        const bool source_release = event == "presentation.release_wait.started" || event == "presentation.release_wait.completed" || terminal_read;
+        const bool transferred =
+            event == "presentation.ready_sync.started" || event == "presentation.ready_sync.completed" || event == "presentation.frame.edge" || source_release;
         if (copying || transferred) {
-            if (scalar(record, "source_revision") != scalar(record, "frame_revision") ||
-                scalar(record, "allocation_generation") != generation || scalar(record, "presentation_revision") != scalar(record, "value"))
+            if (scalar(record, "source_revision") != scalar(record, "frame_revision") || scalar(record, "allocation_generation") != generation ||
+                scalar(record, "presentation_revision") != scalar(record, "value"))
                 reject("native operation mixes source allocation or publication identities");
-            if (copying && (scalar(record, "presentation_revision") != 0U || scalar(record, "transfer_sequence") != 0U ||
-                            scalar(record, "timeline_ready") != 0U))
+            if (copying &&
+                (scalar(record, "presentation_revision") != 0U || scalar(record, "transfer_sequence") != 0U || scalar(record, "timeline_ready") != 0U))
                 reject("new native source read inherited an incumbent physical publication");
-            if (transferred && (scalar(record, "transfer_sequence") == 0U ||
-                                scalar(record, "timeline_ready") != scalar(record, "transfer_sequence") * 2U - 1U))
+            if (transferred && (scalar(record, "transfer_sequence") == 0U || scalar(record, "timeline_ready") != scalar(record, "transfer_sequence") * 2U - 1U))
                 reject("native physical operation omitted its transfer identity");
         }
         if (source_release) {
@@ -915,8 +840,8 @@ struct SurfaceAudit final {
                                           scalar(record, "source_width"),
                                           scalar(record, "source_height")};
                     if (admitted == sources.end() || !admitted->second.native.live() || read.allocation == 0U ||
-                        admitted->second.allocation != read.allocation || read.session == 0U || read.frame == 0U || read.width == 0U ||
-                        read.height == 0U || read.width > admitted->second.width || read.height > admitted->second.height)
+                        admitted->second.allocation != read.allocation || read.session == 0U || read.frame == 0U || read.width == 0U || read.height == 0U ||
+                        read.width > admitted->second.width || read.height > admitted->second.height)
                         reject("source read does not name its admitted workspace allocation");
                     if (!state.reads.emplace(source_operation, read).second) reject("source read repeats an already submitted operation");
                 }
@@ -940,22 +865,19 @@ struct SurfaceAudit final {
                     const auto publication_revision = scalar(record, "value");
                     const auto frame_revision = scalar(record, "frame_revision");
                     const auto [existing, inserted] = state.publications.emplace(publication_revision, frame_revision);
-                    if (!inserted && existing->second != frame_revision)
-                        reject("native frame publication changed within one publication revision");
+                    if (!inserted && existing->second != frame_revision) reject("native frame publication changed within one publication revision");
                 }
             }
             if (transferred) {
                 const auto receipt = state.transfers.find(publication_key);
-                const SourceRead observed{native_identity(record, true),    scalar(record, "workspace_allocation"),
-                                          scalar(record, "source_session"), scalar(record, "source_revision"),
-                                          scalar(record, "source_width"),   scalar(record, "source_height")};
+                const SourceRead observed{native_identity(record, true),     scalar(record, "workspace_allocation"), scalar(record, "source_session"),
+                                          scalar(record, "source_revision"), scalar(record, "source_width"),         scalar(record, "source_height")};
                 if (receipt == state.transfers.end() || receipt->second.read != observed)
                     reject("physical publication changed source read provenance");
                 else if (event == "presentation.frame.edge") {
                     receipt->second.metadata = metadata_receipt(record);
                 } else if (event == "presentation.release_wait.started") {
-                    if (receipt->second.releasing || receipt->second.terminal == TerminalRead::Retained ||
-                        state.publication_steps.at(publication_key) != 3U)
+                    if (receipt->second.releasing || receipt->second.terminal == TerminalRead::Retained || state.publication_steps.at(publication_key) != 3U)
                         reject("source release wait lacks its unique published transfer");
                     receipt->second.releasing = true;
                 } else if (event == "presentation.release_wait.completed") {
@@ -963,32 +885,27 @@ struct SurfaceAudit final {
                         reject("source release wait is missing, duplicated, or contradicts installed terminal custody");
                     receipt->second.released = true;
                 } else if (terminal_read) {
-                    if (!native_shutdown || !browser_exited || scalar(record, "outcome") != 1U ||
-                        receipt->second.terminal != TerminalRead::None || receipt->second.released ||
-                        state.publication_steps.at(publication_key) != 3U || !sources.contains(observed.source) ||
+                    if (!native_shutdown || !browser_exited || scalar(record, "outcome") != 1U || receipt->second.terminal != TerminalRead::None ||
+                        receipt->second.released || state.publication_steps.at(publication_key) != 3U || !sources.contains(observed.source) ||
                         record.value("direct_sampling", false) != sources.at(observed.source).direct_sampling) {
                         reject("terminal read outcome lacks its exact live read and completed browser boundary");
                     } else {
-                        receipt->second.terminal =
-                            event == "presentation.terminal_read.completed" ? TerminalRead::Completed : TerminalRead::Retained;
+                        receipt->second.terminal = event == "presentation.terminal_read.completed" ? TerminalRead::Completed : TerminalRead::Retained;
                     }
                 }
             }
         }
     }
-
     void browser(const nlohmann::json& record) {
         ++browser_ordinal;
         const std::string event = record.value("event", "");
         if (event == "browser.invalid_webgpu_texture") reject("Firefox reported an invalid WebGPU texture");
-        browser_shutdown =
-            browser_shutdown || (event == "firefox.workspace.channel_terminal" && record.value("terminal", "") == "orderly_bridge_close");
+        browser_shutdown = browser_shutdown || (event == "firefox.workspace.channel_terminal" && record.value("terminal", "") == "orderly_bridge_close");
         // An unavailable draw has no acquired image or physical transition.
         // BrowserAudit separately checks missing draws after owned atlas content.
         if (event == "iced.surface.sample_draw_missing") return;
         if (event.starts_with("firefox.workspace.source.")) {
-            if (event.ends_with("claim_outcome") && record.value("outcome", "") != "claimed")
-                reject("Firefox failed to claim an admitted source");
+            if (event.ends_with("claim_outcome") && record.value("outcome", "") != "claimed") reject("Firefox failed to claim an admitted source");
             const std::string id = record.value("surface", "");
             source_transition(id, event, true, scalar(record, "code"));
             if (event == "firefox.workspace.source.admitted" && failure.empty()) {
@@ -998,19 +915,17 @@ struct SurfaceAudit final {
                 source.browser_allocation = scalar(record, "workspace_allocation");
                 source.arena = record.value("arena", "");
                 source.browser_direct_sampling = record.value("direct_sampling", false);
-                if (source.browser_width == 0U || source.browser_height == 0U || source.browser_allocation == 0U ||
-                    !valid_identity(source.arena))
+                if (source.browser_width == 0U || source.browser_height == 0U || source.browser_allocation == 0U || !valid_identity(source.arena))
                     reject("Firefox source admission omitted its allocation or arena");
             }
             return;
         }
-        if (event.find("capture") != std::string::npos && event.starts_with("iced.surface."))
-            reject("Iced performed an obsolete capture pass");
+        if (event.find("capture") != std::string::npos && event.starts_with("iced.surface.")) reject("Iced performed an obsolete capture pass");
         if (!event.starts_with("firefox.workspace.") && !event.starts_with("iced.surface.") && !event.starts_with("iced.frame.")) return;
         if (!record.contains("surface")) {
             if (event.starts_with("iced.surface.") || event == "firefox.workspace.admitted" || event == "firefox.workspace.claim_outcome" ||
-                event == "firefox.workspace.registry_inserted" || event == "firefox.workspace.import_ready_emitted" ||
-                event == "firefox.workspace.ready" || event == "firefox.workspace.withdrawal" || event == "firefox.workspace.retired")
+                event == "firefox.workspace.registry_inserted" || event == "firefox.workspace.import_ready_emitted" || event == "firefox.workspace.ready" ||
+                event == "firefox.workspace.withdrawal" || event == "firefox.workspace.retired")
                 reject("browser lifecycle record has no physical identity");
             return;
         }
@@ -1021,14 +936,12 @@ struct SurfaceAudit final {
         }
         if (!admit(id)) return;
         auto& state = surfaces[id];
-        if ((event == "firefox.workspace.admitted" || event == "firefox.workspace.claim_outcome") &&
-            (!record.contains("width") || !record.contains("height")))
+        if ((event == "firefox.workspace.admitted" || event == "firefox.workspace.claim_outcome") && (!record.contains("width") || !record.contains("height")))
             reject("Firefox admission or claim has no dimensions");
         if (record.contains("width")) {
             const auto width = scalar(record, "width");
             const auto height = scalar(record, "height");
-            if (width == 0U || height == 0U ||
-                (state.browser_width != 0U && (state.browser_width != width || state.browser_height != height)))
+            if (width == 0U || height == 0U || (state.browser_width != 0U && (state.browser_width != width || state.browser_height != height)))
                 reject("browser dimensions are missing or inconsistent");
             state.browser_width = width;
             state.browser_height = height;
@@ -1069,8 +982,8 @@ struct SurfaceAudit final {
             const auto frame = scalar(record, "content_sequence");
             const std::string source_id = record.value("source", "");
             const auto source = sources.find(source_id);
-            if (publication == 0U || session == 0U || frame == 0U || !valid_transfer_timeline(record, transfer) ||
-                record.contains("layer") || record.contains("slot") || source == sources.end() || source->second.arena != id) {
+            if (publication == 0U || session == 0U || frame == 0U || !valid_transfer_timeline(record, transfer) || record.contains("layer") ||
+                record.contains("slot") || source == sources.end() || source->second.arena != id) {
                 reject("release-only settlement lacks its exact physical source and timeline");
                 return;
             }
@@ -1095,8 +1008,8 @@ struct SurfaceAudit final {
             }
             return;
         }
-        if (event == "firefox.workspace.frame_forwarded" || event == "firefox.workspace.frame_dispatched" ||
-            event == "firefox.workspace.copy_completed" || event == "firefox.workspace.read_settled") {
+        if (event == "firefox.workspace.frame_forwarded" || event == "firefox.workspace.frame_dispatched" || event == "firefox.workspace.copy_completed" ||
+            event == "firefox.workspace.read_settled") {
             const auto publication = scalar(record, "presentation_revision");
             const ReceiverReceipt observed{record.value("source", ""),
                                            scalar(record, "transfer_sequence"),
@@ -1114,10 +1027,9 @@ struct SurfaceAudit final {
             auto& receipt = state.receipts[publication];
             if (event == "firefox.workspace.frame_forwarded") {
                 const auto source = sources.find(observed.source);
-                if (receipt.stage != 0U || observed.transfer == 0U || source == sources.end() || !source->second.browser.live() ||
-                    source->second.arena != id || observed.width > source->second.browser_width ||
-                    observed.direct_sampling != source->second.browser_direct_sampling || observed.height > source->second.browser_height ||
-                    !valid_transfer_timeline(record, observed.transfer))
+                if (receipt.stage != 0U || observed.transfer == 0U || source == sources.end() || !source->second.browser.live() || source->second.arena != id ||
+                    observed.width > source->second.browser_width || observed.direct_sampling != source->second.browser_direct_sampling ||
+                    observed.height > source->second.browser_height || !valid_transfer_timeline(record, observed.transfer))
                     reject("Firefox forwarding lacks its exact admitted source transfer");
                 receipt = observed;
                 receipt.stage = 1U;
@@ -1126,8 +1038,7 @@ struct SurfaceAudit final {
                 if (receipt.release_only || receipt.stage != required || receipt.layer != observed.layer || receipt.slot != observed.slot ||
                     receipt.session != observed.session || receipt.frame != observed.frame || receipt.width != observed.width ||
                     receipt.height != observed.height || receipt.source != observed.source || receipt.transfer != observed.transfer ||
-                    receipt.direct_sampling != observed.direct_sampling ||
-                    (event == "firefox.workspace.copy_completed" && receipt.direct_sampling) ||
+                    receipt.direct_sampling != observed.direct_sampling || (event == "firefox.workspace.copy_completed" && receipt.direct_sampling) ||
                     (event == "firefox.workspace.read_settled" && !receipt.direct_sampling))
                     reject("receiver dispatch or copy completion is missing, duplicate, reordered, or mismatched");
                 else
@@ -1165,8 +1076,7 @@ struct SurfaceAudit final {
                     }
                 }
             } else if (event == "iced.frame.sample_released") {
-                if (custody.encoded != custody.settled + custody.abandoned)
-                    reject("Iced final sample release preceded encoded reader settlement");
+                if (custody.encoded != custody.settled + custody.abandoned) reject("Iced final sample release preceded encoded reader settlement");
                 custody.released = true;
             } else if (custody.settled + custody.abandoned >= custody.encoded) {
                 reject("Iced batch settlement is missing, duplicate, or reordered");
@@ -1198,10 +1108,9 @@ struct SurfaceAudit final {
             const auto custody = state.custody.find(publication);
             const auto found = state.draw_indices.find(scalar(record, "draw_identity"));
             auto* draw = found != state.draw_indices.end() ? &draws[found->second] : nullptr;
-            if (!valid_identity(requested) || sample == state.samples.end() || sample->second != scalar(record, "frame_revision") ||
-                draw == nullptr || draw->publication != publication || draw->requested != requested || draw->submitted != 0U ||
-                draw->settled != 0U || draw->encoded == 0U || draw->encoded >= browser_ordinal || state.retired != 0U ||
-                custody == state.custody.end() || custody->second.released ||
+            if (!valid_identity(requested) || sample == state.samples.end() || sample->second != scalar(record, "frame_revision") || draw == nullptr ||
+                draw->publication != publication || draw->requested != requested || draw->submitted != 0U || draw->settled != 0U || draw->encoded == 0U ||
+                draw->encoded >= browser_ordinal || state.retired != 0U || custody == state.custody.end() || custody->second.released ||
                 custody->second.settled + custody->second.abandoned >= custody->second.encoded)
                 reject("Iced submission lacks its exact prior encoded draw");
             else
@@ -1256,8 +1165,7 @@ struct SurfaceAudit final {
             } else {
                 if (!custody.acquired) reject("Iced selected image without an exact sample lease");
                 ++custody.selected;
-                if (!valid_identity(record.value("requested_surface", "")))
-                    reject("Iced selected draw lacks requested capability identity");
+                if (!valid_identity(record.value("requested_surface", ""))) reject("Iced selected draw lacks requested capability identity");
                 if (draws.size() >= kAcceptanceRecordLimit) {
                     reject("Iced draw identity inventory exhausted");
                     return;
@@ -1272,15 +1180,15 @@ struct SurfaceAudit final {
             const auto retained = state.custody.find(scalar(record, "presentation_revision"));
             if (state.retired != 0U)
                 reject("Iced surface used after texture retirement");
-            else if (!valid_identity(requested) || requested == id || state.acquired == 0U || retained == state.custody.end() ||
-                     !retained->second.acquired || retained->second.released)
+            else if (!valid_identity(requested) || requested == id || state.acquired == 0U || retained == state.custody.end() || !retained->second.acquired ||
+                     retained->second.released)
                 reject("pipeline reconstruction lacks its retained sample");
             else {
                 if (!admit(requested)) return;
                 auto& pending = surfaces[requested];
                 const auto preparation = pending.admitted;
-                if (pending.reconstruction || preparation == 0U || retained->second.acquired_at >= browser_ordinal ||
-                    pending.acquired != 0U || pending.discarded != 0U || pending.retired != 0U)
+                if (pending.reconstruction || preparation == 0U || retained->second.acquired_at >= browser_ordinal || pending.acquired != 0U ||
+                    pending.discarded != 0U || pending.retired != 0U)
                     reject("renderer reconstruction is duplicate or outside its exact pending ownership window");
                 else
                     pending.reconstruction = Reconstruction{id, requested, scalar(record, "presentation_revision"), browser_ordinal};
@@ -1291,8 +1199,7 @@ struct SurfaceAudit final {
         } else if (event == "iced.surface.texture_destroyed") {
             if (state.created == 0U || state.retired != 0U) reject("Iced retirement lacks texture creation");
             for (const auto& [publication, custody] : state.custody) {
-                if ((custody.acquired && !custody.released) || custody.selected != custody.encoded ||
-                    custody.encoded != custody.settled + custody.abandoned)
+                if ((custody.acquired && !custody.released) || custody.selected != custody.encoded || custody.encoded != custody.settled + custody.abandoned)
                     reject("Iced texture destruction preceded its exact final readers");
             }
             if (std::ranges::any_of(state.source_textures, [](const auto& source) { return source.second != 0U; }))
@@ -1300,7 +1207,6 @@ struct SurfaceAudit final {
             state.retired = browser_ordinal;
         }
     }
-
     [[nodiscard]] bool source_joined(const SourceState& source) const {
         // A withdrawn native request consumes its terminal acknowledgement
         // without installing a timeline. The receiver still proves whether
@@ -1311,20 +1217,18 @@ struct SurfaceAudit final {
                source.height == source.browser_height && source.allocation != 0U && source.allocation == source.browser_allocation &&
                source.direct_sampling == source.browser_direct_sampling && valid_identity(source.arena);
     }
-
     [[nodiscard]] bool receipts_joined(const std::string& id, const SurfaceState& state, const bool permit_held = false) const {
         const auto terminal_read = [&](const TransferReceipt& transfer) {
             if (!native_shutdown || !browser_exited) return false;
             const auto source = sources.find(transfer.read.source);
             if (source == sources.end() || source->second.allocation != transfer.read.allocation) return false;
             if (transfer.terminal == TerminalRead::Retained) return !transfer.released && !source->second.native.retired();
-            return transfer.terminal == TerminalRead::Completed ||
-                   (transfer.releasing && transfer.released && source->second.native.retired());
+            return transfer.terminal == TerminalRead::Completed || (transfer.releasing && transfer.released && source->second.native.retired());
         };
         const auto retained_read = [&](const std::uint64_t publication, const ReceiverReceipt& receipt) {
             const auto custody = state.custody.find(publication);
-            return permit_held && !receipt.release_only && receipt.direct_sampling && receipt.stage == 2U &&
-                   custody != state.custody.end() && custody->second.acquired && !custody->second.released;
+            return permit_held && !receipt.release_only && receipt.direct_sampling && receipt.stage == 2U && custody != state.custody.end() &&
+                   custody->second.acquired && !custody->second.released;
         };
         for (const auto& [publication, receipt] : state.receipts) {
             const auto transfer = state.transfers.find({publication, receipt.transfer});
@@ -1366,28 +1270,24 @@ struct SurfaceAudit final {
             // JavaScript callbacks. It does not establish a successful draw.
             // A released sample or explicitly destroyed texture still needs
             // every ordinary receipt; bridge closure alone is insufficient.
-            if (custody.encoded != custody.settled + custody.abandoned && !live_draw && !(browser_exited && state.retired == 0U))
-                return false;
+            if (custody.encoded != custody.settled + custody.abandoned && !live_draw && !(browser_exited && state.retired == 0U)) return false;
             if (state.retired != 0U && custody.acquired && !custody.released) return false;
         }
         for (const auto& [publication, frame] : state.samples) {
             const auto receipt = state.receipts.find(publication);
-            const auto transfer =
-                receipt != state.receipts.end() ? state.transfers.find({publication, receipt->second.transfer}) : state.transfers.end();
+            const auto transfer = receipt != state.receipts.end() ? state.transfers.find({publication, receipt->second.transfer}) : state.transfers.end();
             const bool terminal = transfer != state.transfers.end() && terminal_read(transfer->second);
             if (receipt == state.receipts.end() || receipt->second.release_only ||
-                (receipt->second.stage != 3U && !terminal &&
-                 !(permit_held && receipt->second.direct_sampling && receipt->second.stage == 2U)) ||
+                (receipt->second.stage != 3U && !terminal && !(permit_held && receipt->second.direct_sampling && receipt->second.stage == 2U)) ||
                 receipt->second.frame != frame)
                 return false;
             const auto custody = state.custody.find(publication);
-            if (transfer == state.transfers.end() || custody == state.custody.end() || !transfer->second.metadata ||
-                !custody->second.metadata || transfer->second.metadata != custody->second.metadata)
+            if (transfer == state.transfers.end() || custody == state.custody.end() || !transfer->second.metadata || !custody->second.metadata ||
+                transfer->second.metadata != custody->second.metadata)
                 return false;
         }
         return true;
     }
-
     [[nodiscard]] std::string joined_failure() const {
         if (!failure.empty()) return failure;
         for (const auto& [id, state] : surfaces) {
@@ -1395,22 +1295,18 @@ struct SurfaceAudit final {
         }
         return {};
     }
-
     [[nodiscard]] std::string joined_surface_failure(const std::string& id, const SurfaceState& state) const {
-        if (!receipts_joined(id, state))
-            return "surface " + id + " lacks exact source, paired metadata, dispatch, or physical completion evidence";
+        if (!receipts_joined(id, state)) return "surface " + id + " lacks exact source, paired metadata, dispatch, or physical completion evidence";
         if (state.created == 0U && state.samples.empty()) {
             if (state.native_stage != 4U || state.firefox_stage != 5U || state.import_failed || state.firefox_import_failed ||
                 state.width != state.browser_width || state.height != state.browser_height)
                 return "unsampled arena " + id + " lacks matching native and Firefox admission";
             if (!state.native_retired || !state.firefox_retired || !state.firefox_withdrawn || !state.withdrawn)
                 return "unsampled arena " + id + " lacks withdrawal and physical retirement";
-            const bool released_without_sampling = !state.publications.empty() && state.publications.size() == state.receipts.size() &&
-                                                   std::ranges::all_of(state.receipts, [](const auto& receipt) {
-                                                       return receipt.second.release_only && receipt.second.stage == 3U;
-                                                   });
-            if ((!released_without_sampling &&
-                 (!state.publications.empty() || !state.reads.empty() || !state.transfers.empty() || !state.receipts.empty())) ||
+            const bool released_without_sampling =
+                !state.publications.empty() && state.publications.size() == state.receipts.size() &&
+                std::ranges::all_of(state.receipts, [](const auto& receipt) { return receipt.second.release_only && receipt.second.stage == 3U; });
+            if ((!released_without_sampling && (!state.publications.empty() || !state.reads.empty() || !state.transfers.empty() || !state.receipts.empty())) ||
                 !state.custody.empty() || !state.source_textures.empty())
                 return "unsampled arena " + id + " has image custody without a receiver texture";
             return {};
@@ -1427,11 +1323,10 @@ struct SurfaceAudit final {
         // An exact retained-read fact is emitted only after installing the
         // whole writer in its pre-reserved terminal owner. Its arena resources
         // remain physically retained too; this is not a successful GPU release.
-        const bool writer_retained = native_shutdown && browser_exited && std::ranges::any_of(surfaces, [](const auto& surface) {
-                                         return std::ranges::any_of(surface.second.transfers, [](const auto& transfer) {
-                                             return transfer.second.terminal == TerminalRead::Retained;
-                                         });
-                                     });
+        const bool writer_retained =
+            native_shutdown && browser_exited && std::ranges::any_of(surfaces, [](const auto& surface) {
+                return std::ranges::any_of(surface.second.transfers, [](const auto& transfer) { return transfer.second.terminal == TerminalRead::Retained; });
+            });
         if (state.native_stage != 4U || state.width != state.browser_width || state.height != state.browser_height ||
             (!state.native_retired && !writer_retained))
             return "surface " + id + " lacks matching native/browser import and retirement";
@@ -1439,19 +1334,16 @@ struct SurfaceAudit final {
             return "surface " + id + " lacks native or receiver withdrawal before physical retirement";
         if (state.import_failed && state.samples.empty()) return {};
         if (state.import_failed || state.firefox_stage != 5U) return "surface " + id + " sampled or withdrew an incomplete import";
-        if ((!state.firefox_retired || state.retired == 0U) && !(native_shutdown && browser_shutdown))
-            return "surface " + id + " lacks receiver retirement";
+        if ((!state.firefox_retired || state.retired == 0U) && !(native_shutdown && browser_shutdown)) return "surface " + id + " lacks receiver retirement";
         for (const auto& [publication, frame] : state.samples) {
             const auto native = state.publications.find(publication);
             const bool native_match = native != state.publications.end() && native->second == frame;
-            if (publication == 0U || frame == 0U || !native_match)
-                return "sampled surface " + id + " lacks matching native frame publication";
+            if (publication == 0U || frame == 0U || !native_match) return "sampled surface " + id + " lacks matching native frame publication";
         }
         if (state.discarded != 0U && (state.retired == 0U || (!state.withdrawn && !state.firefox_withdrawn)))
             return "discarded pending surface " + id + " lacks withdrawal and texture retirement";
         return {};
     }
-
     [[nodiscard]] bool evidence_settled(std::string* blocker = nullptr) const {
         const auto incomplete = [&](const std::string_view identity, const std::string_view reason) {
             if (blocker) *blocker = std::string{identity} + ": " + std::string{reason};
@@ -1460,8 +1352,7 @@ struct SurfaceAudit final {
         if (!failure.empty()) return incomplete("physical lifecycle", failure);
         for (const auto& [id, source] : sources) {
             if (!source_joined(source)) return incomplete(id, "source admission provenance");
-            if (source.native.retired() && !source.browser.retired() && !browser_shutdown)
-                return incomplete(id, "browser source retirement");
+            if (source.native.retired() && !source.browser.retired() && !browser_shutdown) return incomplete(id, "browser source retirement");
         }
         for (const auto& [id, state] : surfaces) {
             if (state.native_stage != 4U) return incomplete(id, "native arena admission");
@@ -1470,8 +1361,7 @@ struct SurfaceAudit final {
                 if (const auto reason = joined_surface_failure(id, state); !reason.empty()) return incomplete(id, reason);
             for (const auto& [publication, frame] : state.samples) {
                 const auto produced = state.publications.find(publication);
-                if (produced == state.publications.end() || produced->second != frame)
-                    return incomplete(id, "sample publication provenance");
+                if (produced == state.publications.end() || produced->second != frame) return incomplete(id, "sample publication provenance");
             }
             for (const auto& [operation, stage] : state.source_steps)
                 // A successfully borrowed source may be superseded before any
@@ -1482,12 +1372,10 @@ struct SurfaceAudit final {
         }
         return true;
     }
-
     void SettleScenario() {
         for (auto iterator = surfaces.begin(); iterator != surfaces.end();) {
             auto& [id, state] = *iterator;
-            if (state.native_retired && (state.firefox_retired || state.firefox_import_failed) &&
-                (state.retired != 0U || state.created == 0U)) {
+            if (state.native_retired && (state.firefox_retired || state.firefox_import_failed) && (state.retired != 0U || state.created == 0U)) {
                 if (const auto reason = joined_surface_failure(id, state); !reason.empty()) { return; }
                 iterator = surfaces.erase(iterator);
                 continue;
@@ -1505,22 +1393,18 @@ struct SurfaceAudit final {
         // draws selected in the new scenario can prove its renderer handoff.
         scenario_started = browser_ordinal;
         std::erase_if(draws, [&](const Draw& draw) { return draw.settled != 0U || !surfaces.contains(draw.selected); });
-        for (auto& [_, state] : surfaces)
-            state.draw_indices.clear();
+        for (auto& [_, state] : surfaces) state.draw_indices.clear();
         for (std::size_t index = 0U; index != draws.size(); ++index)
             if (draws[index].identity != 0U) surfaces.at(draws[index].selected).draw_indices.emplace(draws[index].identity, index);
     }
-
     [[nodiscard]] const SampleCustody* settled_draw(const Draw& draw) const {
         const auto& surface = surfaces.at(draw.selected);
         const auto custody = surface.custody.find(draw.publication);
-        if (draw.ordinal <= scenario_started || custody == surface.custody.end() || !custody->second.acquired ||
-            custody->second.acquired_at >= draw.ordinal || draw.submitted <= draw.encoded || draw.encoded <= draw.ordinal ||
-            draw.settled <= draw.submitted || draw.abandoned)
+        if (draw.ordinal <= scenario_started || custody == surface.custody.end() || !custody->second.acquired || custody->second.acquired_at >= draw.ordinal ||
+            draw.submitted <= draw.encoded || draw.encoded <= draw.ordinal || draw.settled <= draw.submitted || draw.abandoned)
             return nullptr;
         return &custody->second;
     }
-
     [[nodiscard]] const Draw* pending_fallback(const std::string& candidate) const {
         const auto found = surfaces.find(candidate);
         if (!failure.empty() || found == surfaces.end()) return nullptr;
@@ -1533,30 +1417,26 @@ struct SurfaceAudit final {
         std::size_t latest_prior_acquisition = 0U;
         for (const auto& [_, surface] : surfaces)
             for (const auto& [publication, custody] : surface.custody)
-                if (custody.acquired_at < pending.reconstruction->ordinal)
-                    latest_prior_acquisition = std::max(latest_prior_acquisition, custody.acquired_at);
+                if (custody.acquired_at < pending.reconstruction->ordinal) latest_prior_acquisition = std::max(latest_prior_acquisition, custody.acquired_at);
         const auto retained = active.custody.find(pending.reconstruction->publication);
         if (active.generation >= pending.generation || retained == active.custody.end() || retained->second.acquired_at == 0U ||
             retained->second.acquired_at != latest_prior_acquisition || !receipts_joined(active_identity, active, true))
             return nullptr;
         const auto fallback = std::ranges::find_if(draws, [&](const Draw& draw) {
             return draw.selected == active_identity && draw.requested == (pending.created == 0U ? active_identity : candidate) &&
-                   draw.publication == pending.reconstruction->publication && draw.ordinal > pending.reconstruction->ordinal &&
-                   settled_draw(draw) != nullptr;
+                   draw.publication == pending.reconstruction->publication && draw.ordinal > pending.reconstruction->ordinal && settled_draw(draw) != nullptr;
         });
         return fallback == draws.end() ? nullptr : &*fallback;
     }
-
     [[nodiscard]] bool pending_supersession_completed() const {
         if (!failure.empty()) return false;
         for (const auto& [b, pending] : surfaces) {
             const auto preparation = pending.admitted;
             const auto discarded = pending.created == 0U ? pending.firefox_withdrawn : pending.discarded;
             const bool retired = pending.created == 0U ? pending.firefox_retired > discarded : pending.retired > discarded;
-            if (!pending.candidate_withdrawn || preparation == 0U || pending.acquired != 0U || !pending.publications.empty() ||
-                discarded <= preparation || !retired || !pending.reconstruction || pending.reconstruction->requested != b ||
-                pending.reconstruction->ordinal <= preparation || (pending.created != 0U && pending.reconstruction->ordinal >= discarded) ||
-                !pending.firefox_retired || !pending.native_retired)
+            if (!pending.candidate_withdrawn || preparation == 0U || pending.acquired != 0U || !pending.publications.empty() || discarded <= preparation ||
+                !retired || !pending.reconstruction || pending.reconstruction->requested != b || pending.reconstruction->ordinal <= preparation ||
+                (pending.created != 0U && pending.reconstruction->ordinal >= discarded) || !pending.firefox_retired || !pending.native_retired)
                 continue;
             if (!joined_surface_failure(b, pending).empty()) continue;
             const auto* fallback = pending_fallback(b);
@@ -1565,16 +1445,14 @@ struct SurfaceAudit final {
                 const auto& latest = surfaces.at(draw.selected);
                 const auto custody = settled_draw(draw);
                 if (latest.generation > pending.generation && latest.created > preparation && latest.acquired > discarded &&
-                    latest.acquired > pending.reconstruction->ordinal && draw.ordinal > fallback->ordinal &&
-                    draw.requested == draw.selected && custody != nullptr && custody->acquired_at == latest.acquired &&
-                    receipts_joined(draw.selected, latest, true))
+                    latest.acquired > pending.reconstruction->ordinal && draw.ordinal > fallback->ordinal && draw.requested == draw.selected &&
+                    custody != nullptr && custody->acquired_at == latest.acquired && receipts_joined(draw.selected, latest, true))
                     return true;
             }
         }
         return false;
     }
 };
-
 struct PixelBoundaryAudit final {
     explicit PixelBoundaryAudit(const bool pixel_enabled = true) : enabled(pixel_enabled) {}
     bool enabled = true;
@@ -1609,13 +1487,11 @@ struct PixelBoundaryAudit final {
     std::map<Key, Publication> samples;
     std::vector<nlohmann::json> probe_failures;
     std::set<std::string> failed_probe_retirements;
-
     struct ProbeFailureEvidence final {
         bool forwarded = false;
         bool recovered = false;
         [[nodiscard]] bool complete() const noexcept { return forwarded && recovered; }
     };
-
     [[nodiscard]] ProbeFailureEvidence probe_failure_evidence(std::string_view expected) const {
         if (expected.empty() || !failure.empty() || probe_failures.size() != 1U) return {};
         const auto& failed = probe_failures.front();
@@ -1633,8 +1509,7 @@ struct PixelBoundaryAudit final {
             if (same_source) {
                 for (const auto receiver : {0U, 1U}) {
                     const auto& evidence = publication.receivers[receiver].identity;
-                    if (!evidence.empty() && (allocation || scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence")))
-                        return {};
+                    if (!evidence.empty() && (allocation || scalar(evidence, "transfer_sequence") == scalar(failed, "transfer_sequence"))) return {};
                 }
                 const bool same_attempt = key.second == scalar(failed, "presentation_revision") &&
                                           scalar(publication.forwarded, "transfer_sequence") == scalar(failed, "transfer_sequence");
@@ -1656,14 +1531,12 @@ struct PixelBoundaryAudit final {
                 scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
                 recovered = true;
-            if (allocation && !same_source && !receipt.empty() &&
-                scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
+            if (allocation && !same_source && !receipt.empty() && scalar(receipt, "presentation_revision") > scalar(failed, "presentation_revision") &&
                 std::ranges::all_of(publication.counted, [](bool value) { return value; }))
                 recovered = true;
         }
         return {.forwarded = forwarded || (allocation && failed_probe_retirements.contains(source)), .recovered = recovered};
     }
-
     [[nodiscard]] bool copy_probe_omission_proven() const {
         return failure.empty() && probe_failures.empty() && direct_joined != 0U && std::ranges::all_of(samples, [](const auto& item) {
                    const auto& publication = item.second;
@@ -1671,7 +1544,6 @@ struct PixelBoundaryAudit final {
                           (publication.direct() && publication.receivers[0].identity.empty() && publication.receivers[1].identity.empty());
                });
     }
-
     [[nodiscard]] bool probe_failure_complete(std::string_view expected) const {
         if (expected.empty()) return probe_failures.empty();
         // The injected Firefox probe boundary exists only on the capability
@@ -1689,8 +1561,7 @@ struct PixelBoundaryAudit final {
         bool summary = false;
         [[nodiscard]] bool complete() const {
             return summary && !expected.empty() && cards.size() == expected.size() && std::ranges::all_of(cards, [&](const auto& card) {
-                       return expected.contains(card.first) &&
-                              std::ranges::all_of(card.second, [](const auto& value) { return value.has_value(); });
+                       return expected.contains(card.first) && std::ranges::all_of(card.second, [](const auto& value) { return value.has_value(); });
                    });
         }
     };
@@ -1714,7 +1585,6 @@ struct PixelBoundaryAudit final {
     std::uint64_t route_revision = 0U;
     std::array<std::uint64_t, 3> reentry_product{};
     std::optional<std::pair<std::uint64_t, std::uint64_t>> successful_viewer;
-
     void consume_continuity(const nlohmann::json& record, std::string_view event) {
         if (!enabled) return;
         const auto control = textual(record, "control");
@@ -1732,8 +1602,7 @@ struct PixelBoundaryAudit final {
                 ++navigation_stage;
         } else if (event == "integration.navigation_outcome" && navigation_stage > 0U && navigation_stage < 8U) {
             const bool train = navigation_stage == 2U;
-            if ((!train && navigation_stage != 6U) || control != (train ? "navigation.train" : "navigation.explore") ||
-                detail != (train ? "Train" : "Explore"))
+            if ((!train && navigation_stage != 6U) || control != (train ? "navigation.train" : "navigation.explore") || detail != (train ? "Train" : "Explore"))
                 reject("navigation outcome lacks its mapped root/router message");
             else
                 ++navigation_stage;
@@ -1745,8 +1614,7 @@ struct PixelBoundaryAudit final {
             const bool train = navigation_stage == 3U;
             if ((!train && navigation_stage != 7U) || control != (train ? "navigation.train" : "navigation.explore") ||
                 (train ? detail != "None" : (detail != "Explore" && detail != "Upscale")) || scalar(record, "c") != 1U ||
-                (scalar(record, "b") != 0U) != route_persistence ||
-                (route_persistence && (!authoritative_route || scalar(record, "a") <= route_revision))) {
+                (scalar(record, "b") != 0U) != route_persistence || (route_persistence && (!authoritative_route || scalar(record, "a") <= route_revision))) {
                 reject("mapped route foreground or authoritative persistence is incomplete");
             } else {
                 ++navigation_stage;
@@ -1775,10 +1643,8 @@ struct PixelBoundaryAudit final {
         } else if (event == "integration.explore_reopened" && navigation_stage == 10U) {
             if (detail == "usable-after-reopen" && scalar(record, "c") > 0U && scalar(record, "d") > 0U) navigation_stage = 11U;
         }
-        if (event == "integration.viewer_complete" && detail != "copy")
-            successful_viewer = std::pair{scalar(record, "a"), scalar(record, "b")};
+        if (event == "integration.viewer_complete" && detail != "copy") successful_viewer = std::pair{scalar(record, "a"), scalar(record, "b")};
     }
-
     [[nodiscard]] bool raw_complete() const {
         return failure.empty() && std::ranges::any_of(samples, [](const auto& entry) { return entry.second.complete(); });
     }
@@ -1796,18 +1662,17 @@ struct PixelBoundaryAudit final {
             const auto& imported = publication.receivers[0];
             const auto& mailbox = publication.receivers[1];
             const auto& owned = publication.receivers[2];
-            const auto attempt = publication.native.find(
-                {publication.forwarded.value("workspace_source", ""), scalar(publication.forwarded, "transfer_sequence")});
+            const auto attempt =
+                publication.native.find({publication.forwarded.value("workspace_source", ""), scalar(publication.forwarded, "transfer_sequence")});
             const bool canvas_sampled = std::ranges::any_of(canvas.values, [](const auto& value) { return value.has_value(); });
-            if (attempt == publication.native.end() || (!publication.direct() && (!imported.complete() || !mailbox.complete())) ||
-                !owned.complete() || !canvas_sampled || canvas.identity != owned.identity)
+            if (attempt == publication.native.end() || (!publication.direct() && (!imported.complete() || !mailbox.complete())) || !owned.complete() ||
+                !canvas_sampled || canvas.identity != owned.identity)
                 return false;
             const auto& native = attempt->second;
             return native.complete() && !native.publication_fact.empty() && native.identity == native.publication_fact &&
                    scalar(native.identity, "source_revision") == successful_viewer->second && has_color(native) && has_color(canvas);
         });
     }
-
     static bool colored(std::uint32_t value) {
         return (value >> 24U) != 0U && ((value & 255U) > 8U || ((value >> 8U) & 255U) > 8U || ((value >> 16U) & 255U) > 8U);
     }
@@ -1819,27 +1684,22 @@ struct PixelBoundaryAudit final {
         nlohmann::json identity = nlohmann::json::object();
         identity["direct_sampling"] = record.value("direct_sampling", false);
         const auto copy = [&](const char* field) { identity[field] = scalar(record, field); };
-        for (const auto* field : {"presentation_revision"})
-            copy(field);
+        for (const auto* field : {"presentation_revision"}) copy(field);
         if (boundary == 0U) {
             identity["workspace_source"] = SurfaceAudit::native_identity(record, true);
             copy("workspace_allocation");
-            for (const auto* field :
-                 {"source_session", "source_instance", "source_revision", "clean_revision", "source_observation_revision", "source_width",
-                  "source_height", "content_x", "content_y", "content_width", "content_height", "allocation_generation", "capacity_width",
-                  "capacity_height", "transfer_sequence", "timeline_ready"})
+            for (const auto* field : {"source_session", "source_instance", "source_revision", "clean_revision", "source_observation_revision", "source_width",
+                                      "source_height", "content_x", "content_y", "content_width", "content_height", "allocation_generation", "capacity_width",
+                                      "capacity_height", "transfer_sequence", "timeline_ready"})
                 copy(field);
         } else {
-            for (const auto* field : {"content_session", "content_width", "content_height", "layer", "slot"})
-                copy(field);
+            for (const auto* field : {"content_session", "content_width", "content_height", "layer", "slot"}) copy(field);
             identity["content_sequence"] = scalar(record, boundary < 3U ? "content_sequence" : "frame_revision");
             if (boundary < 3U) {
-                for (const auto* field : {"transfer_sequence", "timeline_ready", "timeline_release"})
-                    copy(field);
+                for (const auto* field : {"transfer_sequence", "timeline_ready", "timeline_release"}) copy(field);
             } else {
                 identity["workspace_source"] = record.value("source", "");
-                for (const auto* field : {"width", "height"})
-                    copy(field);
+                for (const auto* field : {"width", "height"}) copy(field);
             }
         }
         return identity;
@@ -1852,14 +1712,12 @@ struct PixelBoundaryAudit final {
         if (direct && (!imported.identity.empty() || !publication.receivers[1].identity.empty()))
             reject("direct sampling produced a forbidden import or sample-arena pixel copy");
         const auto& acquired = direct ? publication.forwarded : imported.identity;
-        for (const auto* field : {"content_session", "content_sequence", "presentation_revision", "content_width", "content_height",
-                                  "layer", "slot", "transfer_sequence", "timeline_ready", "timeline_release"})
-            if (scalar(acquired, field) != scalar(publication.forwarded, field))
-                reject("Firefox pixel receipt differs from the forwarded physical mailbox");
+        for (const auto* field : {"content_session", "content_sequence", "presentation_revision", "content_width", "content_height", "layer", "slot",
+                                  "transfer_sequence", "timeline_ready", "timeline_release"})
+            if (scalar(acquired, field) != scalar(publication.forwarded, field)) reject("Firefox pixel receipt differs from the forwarded physical mailbox");
         if (scalar(acquired, "layer") != static_cast<std::uint64_t>(mmltk::controller::presentation::WorkspacePresentationLayer::Primary))
             reject("Firefox pixel receipt does not name the native Primary layer");
-        const auto native =
-            publication.native.find({publication.forwarded.value("workspace_source", ""), scalar(acquired, "transfer_sequence")});
+        const auto native = publication.native.find({publication.forwarded.value("workspace_source", ""), scalar(acquired, "transfer_sequence")});
         if (native == publication.native.end()) return;
         const auto& source = native->second;
         const auto& fact = source.identity;
@@ -1869,14 +1727,12 @@ struct PixelBoundaryAudit final {
         if (source.publication_fact.empty()) return;
         if (fact != source.publication_fact) reject("native pixels differ from the canonical publication fact");
         if (fact.value("direct_sampling", false) != direct) reject("native and acquired sampling modes differ");
-        if (fact.value("workspace_source", "") != publication.forwarded.value("workspace_source", ""))
-            reject("pixel bridge names a different producer source");
+        if (fact.value("workspace_source", "") != publication.forwarded.value("workspace_source", "")) reject("pixel bridge names a different producer source");
         const auto width = scalar(fact, "source_width"), height = scalar(fact, "source_height");
         if (width == 0U || height == 0U || width > scalar(fact, "capacity_width") || height > scalar(fact, "capacity_height") ||
             scalar(fact, "source_session") == 0U || scalar(fact, "source_instance") == 0U || scalar(fact, "source_revision") == 0U ||
-            scalar(fact, "clean_revision") == 0U || scalar(fact, "source_observation_revision") == 0U ||
-            scalar(fact, "allocation_generation") == 0U || scalar(fact, "content_x") + scalar(fact, "content_width") > width ||
-            scalar(fact, "content_y") + scalar(fact, "content_height") > height ||
+            scalar(fact, "clean_revision") == 0U || scalar(fact, "source_observation_revision") == 0U || scalar(fact, "allocation_generation") == 0U ||
+            scalar(fact, "content_x") + scalar(fact, "content_width") > width || scalar(fact, "content_y") + scalar(fact, "content_height") > height ||
             scalar(fact, "timeline_ready") != scalar(fact, "transfer_sequence") * 2U - 1U) {
             reject("invalid native product, content, allocation, or transfer fact");
             return;
@@ -1897,13 +1753,11 @@ struct PixelBoundaryAudit final {
                                scalar(identity, "timeline_release") != scalar(fact, "timeline_ready") + 1U))
                 reject("Firefox physical timeline receipt differs");
             if (owner == 3U && (identity.value("workspace_source", "") != fact.value("workspace_source", "") ||
-                                scalar(identity, "width") != scalar(fact, "capacity_width") ||
-                                scalar(identity, "height") != scalar(fact, "capacity_height")))
+                                scalar(identity, "width") != scalar(fact, "capacity_width") || scalar(identity, "height") != scalar(fact, "capacity_height")))
                 reject("Iced allocation differs from native publication");
         }
         const auto coordinate = [](std::size_t index, std::uint64_t size) {
-            return std::array<std::uint64_t, 5>{0U, std::min(191UL, size - 1U), std::min(383UL, size - 1U), (size - 1U) / 2U,
-                                                size - 1U}[index];
+            return std::array<std::uint64_t, 5>{0U, std::min(191UL, size - 1U), std::min(383UL, size - 1U), (size - 1U) / 2U, size - 1U}[index];
         };
         for (std::size_t owner = 0U; owner < raw.size(); ++owner) {
             if (direct && owner > 0U && owner < 3U) continue;
@@ -1913,8 +1767,7 @@ struct PixelBoundaryAudit final {
                 if (!sample) continue;
                 if (sample->x != coordinate(index % 5U, width) || sample->y != coordinate(index / 5U, height))
                     reject("raw probe coordinate differs from logical-content multiset");
-                if (owner != 0U && raw[previous]->values[index] && sample != raw[previous]->values[index])
-                    reject("ordered raw RGBA or alpha divergence");
+                if (owner != 0U && raw[previous]->values[index] && sample != raw[previous]->values[index]) reject("ordered raw RGBA or alpha divergence");
             }
             if (owner != 0U && !(direct ? publication.direct_counted : publication.counted[owner - 1U]) && raw[previous]->complete() &&
                 raw[owner]->complete() && failure.empty()) {
@@ -1935,8 +1788,7 @@ struct PixelBoundaryAudit final {
                 if (canvas.values[index] &&
                     (canvas.values[index]->x != coordinate(index % 5U, width) || canvas.values[index]->y != coordinate(index / 5U, height)))
                     reject("canvas probe does not name its logical source sample");
-                if (canvas.values[index] && raw[3]->values[index] && colored(raw[3]->values[index]->rgba) &&
-                    black(canvas.values[index]->rgba))
+                if (canvas.values[index] && raw[3]->values[index] && colored(raw[3]->values[index]->rgba) && black(canvas.values[index]->rgba))
                     reject("completed sample produced an unexplained black viewer canvas");
             }
         }
@@ -1947,7 +1799,6 @@ struct PixelBoundaryAudit final {
             if (width == 1536U && height == 1536U) upscale_growth = true;
         }
     }
-
     void consume(const nlohmann::json& record) {
         const std::string event = record.value("event", "");
         consume_continuity(record, event);
@@ -1960,8 +1811,7 @@ struct PixelBoundaryAudit final {
         }
         if (event == "firefox.workspace.source.retired") {
             const auto surface = record.value("surface", "");
-            if (!surface.empty() &&
-                std::ranges::any_of(probe_failures, [&](const auto& failed) { return failed.value("source", "") == surface; }))
+            if (!surface.empty() && std::ranges::any_of(probe_failures, [&](const auto& failed) { return failed.value("source", "") == surface; }))
                 failed_probe_retirements.insert(surface);
             return;
         }
@@ -2005,8 +1855,7 @@ struct PixelBoundaryAudit final {
                     return;
                 }
                 std::set<std::uint64_t> expected;
-                for (const auto& card : record["cards"])
-                    expected.insert(card.get<std::uint64_t>());
+                for (const auto& card : record["cards"]) expected.insert(card.get<std::uint64_t>());
                 if (expected.size() != record["cards"].size() || scalar(record, "emitted") != expected.size() * 4U ||
                     (composition.summary && composition.expected != expected))
                     reject("conflicting or incomplete composition summary");
@@ -2039,15 +1888,13 @@ struct PixelBoundaryAudit final {
                     const std::string canvas_field = std::string{"canvas_"} + axis;
                     const std::string origin_field = std::string{"image_"} + axis;
                     const auto dimension = std::string_view{axis} == "x" ? "width" : "height";
-                    const auto content =
-                        std::string_view{axis} == "y" && scalar(record, "rows") != 0U && scalar(record, "card_extent") != 0U
-                            ? scalar(record, "rows") * scalar(record, "card_extent")
-                            : scalar(record, (std::string{"content_"} + dimension).c_str());
+                    const auto content = std::string_view{axis} == "y" && scalar(record, "rows") != 0U && scalar(record, "card_extent") != 0U
+                                             ? scalar(record, "rows") * scalar(record, "card_extent")
+                                             : scalar(record, (std::string{"content_"} + dimension).c_str());
                     const auto extent = record.value(std::string{"image_"} + dimension, 0.0);
                     const auto sample = record.value(sample_field, -1.0);
                     const auto canvas = record.value(canvas_field, -1.0);
-                    if (content == 0U || extent <= 0.0 || !std::isfinite(canvas) || sample < 0.0 ||
-                        sample >= static_cast<double>(content) ||
+                    if (content == 0U || extent <= 0.0 || !std::isfinite(canvas) || sample < 0.0 || sample >= static_cast<double>(content) ||
                         std::abs(canvas - (record.value(origin_field, 0.0) + sample * extent / static_cast<double>(content))) > 0.01)
                         reject("composition transformed canvas coordinate differs");
                 }
@@ -2133,29 +1980,24 @@ struct PixelBoundaryAudit final {
             reject("pixel index exceeds fixed sample contract");
             return;
         }
-        const Sample value{scalar(record, "sample_x"), scalar(record, "sample_y"),
-                           static_cast<std::uint32_t>(scalar(record, "sample_rgba"))};
+        const Sample value{scalar(record, "sample_x"), scalar(record, "sample_y"), static_cast<std::uint32_t>(scalar(record, "sample_rgba"))};
         if (boundary != 4U && target.values[index] && target.values[index] != value) reject("immutable owner pixel changed");
         target.values[index] = value;
         publication.viewer = publication.viewer || boundary == 4U;
         if (publication.viewer && boundary == 4U) ++viewer_canvas_joins;
         reconcile(publication);
     }
-
     [[nodiscard]] bool composition_complete() const {
         return failure.empty() && std::ranges::all_of(std::array{4U, 10U}, [&](const auto columns) {
-                   return std::ranges::any_of(
-                       compositions, [&](const auto& value) { return std::get<0>(value.first) == columns && value.second.complete(); });
+                   return std::ranges::any_of(compositions, [&](const auto& value) { return std::get<0>(value.first) == columns && value.second.complete(); });
                });
     }
     [[nodiscard]] bool continuity_complete(bool require_gallery = true) const {
-        return failure.empty() && (!enabled || navigation_stage >= (require_gallery ? 11U : 10U)) && cached_methods.size() == 3U &&
-               settings_preserved && basic_reentry && reconnected && departure_begin != 0U && departure_end > departure_begin &&
-               std::ranges::count_if(stop_observations,
-                                     [&](const auto revision) { return revision >= departure_begin && revision < departure_end; }) == 1;
+        return failure.empty() && (!enabled || navigation_stage >= (require_gallery ? 11U : 10U)) && cached_methods.size() == 3U && settings_preserved &&
+               basic_reentry && reconnected && departure_begin != 0U && departure_end > departure_begin &&
+               std::ranges::count_if(stop_observations, [&](const auto revision) { return revision >= departure_begin && revision < departure_end; }) == 1;
     }
 };
-
 TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[workspace][audit][pixel]") {
     const nlohmann::json native{{"event", "presentation.pixel"}, {"surface_high", 1U},         {"surface_low", 2U},
                                 {"presentation_revision", 7U},   {"source_session", 1U},       {"source_instance", 3U},
@@ -2195,15 +2037,14 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     auto imported = pixel("firefox.workspace.pixel", "import");
     auto mailbox = pixel("firefox.workspace.pixel", "mailbox");
     auto owned = pixel("iced.surface.pixel", "");
-    const auto fill = [&](PixelBoundaryAudit& audit, nlohmann::json changed, bool missing = false, bool all_black = false,
-                          std::string_view missing_owner = {}, std::uint64_t publication = 7U, bool direct = false) {
+    const auto fill = [&](PixelBoundaryAudit& audit, nlohmann::json changed, bool missing = false, bool all_black = false, std::string_view missing_owner = {},
+                          std::uint64_t publication = 7U, bool direct = false) {
         constexpr std::array<unsigned, 5> coordinates{0U, 191U, 383U, 191U, 383U};
         for (std::size_t index = 0U; index < 25U; ++index) {
             for (auto record : {changed, mailbox, imported, native}) {
                 if (direct && record.value("event", "") == "firefox.workspace.pixel") continue;
                 record["direct_sampling"] = direct;
-                if (!missing_owner.empty() && (record.value("boundary", "") == missing_owner || record.value("event", "") == missing_owner))
-                    continue;
+                if (!missing_owner.empty() && (record.value("boundary", "") == missing_owner || record.value("event", "") == missing_owner)) continue;
                 if (missing && index == 24U && record.value("event", "") == "iced.surface.pixel") continue;
                 record["presentation_revision"] = publication;
                 record["sample_index"] = index;
@@ -2289,8 +2130,8 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     fill(partial, owned, true);
     CHECK(partial.joined.back() == 0U);
     CHECK_FALSE(partial.retained_logical_content);
-    for (const auto field : {"source_instance", "clean_revision", "source_observation_revision", "content_x", "allocation_generation",
-                             "capacity_width", "timeline_ready"}) {
+    for (const auto field :
+         {"source_instance", "clean_revision", "source_observation_revision", "content_x", "allocation_generation", "capacity_width", "timeline_ready"}) {
         PixelBoundaryAudit audit;
         fill(audit, owned);
         auto edge = native;
@@ -2373,8 +2214,7 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
         CHECK(reused_counter.probe_failure_evidence(target).complete());
         auto unrelated = audit.samples.at({surface, 7U});
         unrelated.forwarded["workspace_source"] = "00000000000000030000000000000006";
-        for (auto& receiver : unrelated.receivers)
-            receiver.identity["transfer_sequence"] = scalar(failed, "transfer_sequence");
+        for (auto& receiver : unrelated.receivers) receiver.identity["transfer_sequence"] = scalar(failed, "transfer_sequence");
         reused_counter.samples.emplace(PixelBoundaryAudit::Key{surface, 8U}, std::move(unrelated));
         CHECK(reused_counter.probe_failure_evidence(target).complete());
         auto before_viewer = audit;
@@ -2389,8 +2229,7 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
                 receipt_boundary.identity["content_sequence"] = other_sequence;
                 receipt_boundary.publication_fact["content_sequence"] = other_sequence;
             }
-            for (auto& receipt_boundary : publication.receivers)
-                receipt_boundary.identity["content_sequence"] = other_sequence;
+            for (auto& receipt_boundary : publication.receivers) receipt_boundary.identity["content_sequence"] = other_sequence;
             publication.forwarded["content_sequence"] = other_sequence;
             CHECK_FALSE(unrelated_content.probe_failure_complete(target));
             CHECK_FALSE(unrelated_content.probe_failure_evidence(target).complete());
@@ -2440,7 +2279,6 @@ TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[wo
     wrong_transfer.consume(selected);
     CHECK_FALSE(wrong_transfer.viewer_nonblack_complete());
 }
-
 TEST_CASE("composition evidence requires every card and kind in each column publication", "[workspace][audit][pixel]") {
     const auto fill = [](PixelBoundaryAudit& audit, std::string_view defect) {
         for (const auto columns : {4U, 10U}) {
@@ -2489,15 +2327,13 @@ TEST_CASE("composition evidence requires every card and kind in each column publ
         CHECK_FALSE(audit.composition_complete());
     }
 }
-
 TEST_CASE("viewer continuity requires mapped routes foreground persistence and the same restored product", "[workspace][audit][pixel]") {
     const auto fill = [](PixelBoundaryAudit& audit, std::string_view defect, bool persistence) {
-        const auto event = [&](const char* name, const char* control = "", const char* detail = "", unsigned a = 0U, unsigned b = 0U,
-                               unsigned c = 0U, unsigned d = 0U) {
+        const auto event = [&](const char* name, const char* control = "", const char* detail = "", unsigned a = 0U, unsigned b = 0U, unsigned c = 0U,
+                               unsigned d = 0U) {
             audit.consume({{"event", name}, {"control", control}, {"detail", detail}, {"a", a}, {"b", b}, {"c", c}, {"d", d}});
         };
-        for (unsigned kernel = 0U; kernel < 3U; ++kernel)
-            event("integration.upscale_cached", "", "", 0U, 0U, kernel);
+        for (unsigned kernel = 0U; kernel < 3U; ++kernel) event("integration.upscale_cached", "", "", 0U, 0U, kernel);
         event("integration.viewer_settings_preserved");
         event("integration.viewer_departure_started", "", "", 20U, persistence ? 1U : 0U, 30U);
         audit.consume({{"event", "upscale.stop.requested"}, {"observation_revision", 20U}});
@@ -2523,20 +2359,18 @@ TEST_CASE("viewer continuity requires mapped routes foreground persistence and t
         fill(valid, "", persistence);
         CHECK(valid.continuity_complete());
     }
-    for (const auto defect : {"direct", "missing-outcome", "foreground", "missing-persistence", "duplicate-stop", "missing-basic",
-                              "different-product", "missing-gallery"}) {
+    for (const auto defect :
+         {"direct", "missing-outcome", "foreground", "missing-persistence", "duplicate-stop", "missing-basic", "different-product", "missing-gallery"}) {
         PixelBoundaryAudit audit;
         fill(audit, defect, true);
         CHECK_FALSE(audit.continuity_complete());
     }
 }
-
 struct NativeAudit final {
     struct FinalCursorGenerations final {
         std::uint64_t material = 0U;
         std::uint64_t cursor = 0U;
     };
-
     struct ViewportAcceptance final {
         std::uint64_t endpoint = 0U;
         std::uint64_t generation = 0U;
@@ -2649,12 +2483,10 @@ struct NativeAudit final {
     ProbeOrdinals transition_probe_ordinals;
     ProbeFrames rendered_probe_frames;
     bool donor_descriptors = false;
-
     void reject_causal_evidence(const std::string_view reason) noexcept {
         causal_inconsistent = true;
         if (causal_failure.empty()) causal_failure = reason;
     }
-
     void reconcile_incremental_publication(const std::uint64_t generation) {
         const auto cardinality = placeholder_cardinalities.find(generation);
         const auto placeholder = placeholder_slots.find(generation);
@@ -2664,10 +2496,9 @@ struct NativeAudit final {
         const auto latest_count = published_tiles.find(generation);
         const auto first_slots = first_patched_slots.find(generation);
         const auto placeholder_ordinal = placeholder_ordinals.find(generation);
-        if (cardinality == placeholder_cardinalities.end() || placeholder == placeholder_slots.end() ||
-            placeholder->second.size() != cardinality->second || first_ordinal == first_publication_ordinals.end() ||
-            last_ordinal == last_publication_ordinals.end() || first_count == first_published_tiles.end() ||
-            latest_count == published_tiles.end() || first_slots == first_patched_slots.end() ||
+        if (cardinality == placeholder_cardinalities.end() || placeholder == placeholder_slots.end() || placeholder->second.size() != cardinality->second ||
+            first_ordinal == first_publication_ordinals.end() || last_ordinal == last_publication_ordinals.end() ||
+            first_count == first_published_tiles.end() || latest_count == published_tiles.end() || first_slots == first_patched_slots.end() ||
             placeholder_ordinal == placeholder_ordinals.end())
             return;
         const bool exact_observed_slots = !first_slots->second.empty() && first_slots->second.size() <= first_count->second &&
@@ -2680,11 +2511,9 @@ struct NativeAudit final {
             explore_partial_patch = true;
             acceptance_first_patch_exact = true;
         }
-        if (generation == partial_generation && last_ordinal->second > partial_first_patch_ordinal &&
-            latest_count->second > partial_first_tile_count)
+        if (generation == partial_generation && last_ordinal->second > partial_first_patch_ordinal && latest_count->second > partial_first_tile_count)
             explore_ready_batch = true;
     }
-
     void reconcile_rendered_probes(const std::uint64_t generation) {
         const auto frames = published_frames.find(generation);
         const auto placeholder = placeholder_slots.find(generation);
@@ -2733,7 +2562,6 @@ struct NativeAudit final {
             rendered_probe_frames.insert_or_assign(key, std::move(frame_revisions));
         }
     }
-
     void record_frame(const std::uint64_t generation, const std::uint64_t revision, const std::size_t publication_ordinal) {
         if (revision == 0U) {
             reject_causal_evidence("rendered probe frame revision");
@@ -2749,7 +2577,6 @@ struct NativeAudit final {
         frames.emplace(position, publication_ordinal, revision);
         reconcile_rendered_probes(generation);
     }
-
     void record_tile_publication(const std::uint64_t generation, const std::uint64_t count, const std::size_t publication_ordinal) {
         const auto previous = published_tiles.find(generation);
         explore_tile_regressed = explore_tile_regressed || (previous != published_tiles.end() && count < previous->second);
@@ -2763,10 +2590,9 @@ struct NativeAudit final {
         published_tiles.insert_or_assign(generation, count);
         reconcile_incremental_publication(generation);
     }
-
     void join_gallery_publication(const std::uint64_t generation, const std::map<std::uint64_t, std::uint64_t>& complete_slots) {
-        if (complete_slots.empty() || complete_slots.size() > kAcceptanceSlotLimit ||
-            complete_slots.rbegin()->first != complete_slots.size() - 1U || generation == 0U)
+        if (complete_slots.empty() || complete_slots.size() > kAcceptanceSlotLimit || complete_slots.rbegin()->first != complete_slots.size() - 1U ||
+            generation == 0U)
             return;
         const auto cardinality = placeholder_cardinalities.find(generation);
         if (cardinality == placeholder_cardinalities.end()) return;
@@ -2799,9 +2625,8 @@ struct NativeAudit final {
         reconcile_incremental_publication(generation);
         reconcile_rendered_probes(generation);
     }
-
-    void record_probe(ProbeSlots& probes, ProbeOrdinals& ordinals, const ProbeSlots::key_type& key,
-                      const ProbeSlots::mapped_type compiled_index, const bool valid, const std::string_view failure) {
+    void record_probe(ProbeSlots& probes, ProbeOrdinals& ordinals, const ProbeSlots::key_type& key, const ProbeSlots::mapped_type compiled_index,
+                      const bool valid, const std::string_view failure) {
         if (probes.contains(key) && probes.at(key) != compiled_index) {
             reject_causal_evidence("rendered probe identity changed");
             return;
@@ -2818,23 +2643,18 @@ struct NativeAudit final {
         ordinals.try_emplace(key, ordinal);
         reconcile_rendered_probes(key.first);
     }
-
-    void record_card_geometry(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index,
-                              const std::uint64_t card_width, const std::uint64_t card_height, const std::uint64_t content_x,
-                              const std::uint64_t content_y, const std::uint64_t content_width, const std::uint64_t content_height) {
-        const auto right_padding = card_width >= content_x && card_width - content_x >= content_width
-                                       ? card_width - content_x - content_width
-                                       : std::numeric_limits<std::uint64_t>::max();
-        const auto bottom_padding = card_height >= content_y && card_height - content_y >= content_height
-                                        ? card_height - content_y - content_height
-                                        : std::numeric_limits<std::uint64_t>::max();
+    void record_card_geometry(const std::uint64_t generation, const std::uint64_t slot, const std::uint64_t compiled_index, const std::uint64_t card_width,
+                              const std::uint64_t card_height, const std::uint64_t content_x, const std::uint64_t content_y, const std::uint64_t content_width,
+                              const std::uint64_t content_height) {
+        const auto right_padding = card_width >= content_x && card_width - content_x >= content_width ? card_width - content_x - content_width
+                                                                                                      : std::numeric_limits<std::uint64_t>::max();
+        const auto bottom_padding = card_height >= content_y && card_height - content_y >= content_height ? card_height - content_y - content_height
+                                                                                                          : std::numeric_limits<std::uint64_t>::max();
         const bool vertical_padding = content_x == 0U && content_width == card_width && content_y != 0U && bottom_padding != 0U &&
                                       std::max(content_y, bottom_padding) - std::min(content_y, bottom_padding) <= 1U;
         const bool horizontal_padding = content_y == 0U && content_height == card_height && content_x != 0U && right_padding != 0U &&
                                         std::max(content_x, right_padding) - std::min(content_x, right_padding) <= 1U;
-        if (card_width == 0U || card_width != card_height || content_width == 0U || content_height == 0U ||
-            vertical_padding == horizontal_padding)
-            return;
+        if (card_width == 0U || card_width != card_height || content_width == 0U || content_height == 0U || vertical_padding == horizontal_padding) return;
         const auto key = std::pair{generation, slot};
         const auto orientation = vertical_padding ? PaddingOrientation::Vertical : PaddingOrientation::Horizontal;
         if ((padded_card_slots.contains(key) && padded_card_slots.at(key) != compiled_index) ||
@@ -2847,9 +2667,7 @@ struct NativeAudit final {
             reject_causal_evidence("padded card evidence capacity");
         }
     }
-
-    void consume_explore_evidence(const char* const event, const std::uint64_t value, const std::uint64_t detail = 0U,
-                                  const std::uint64_t staging_bytes = 0U) {
+    void consume_explore_evidence(const char* const event, const std::uint64_t value, const std::uint64_t detail = 0U, const std::uint64_t staging_bytes = 0U) {
         consume({{"kind", "gui_runtime"},
                  {"owner", "explore"},
                  {"event", event},
@@ -2858,7 +2676,6 @@ struct NativeAudit final {
                  {"detail", detail},
                  {"staging_bytes", staging_bytes}});
     }
-
     void consume(const nlohmann::json& record) {
         if (record.value("kind", "") != "gui_runtime") return;
         ++ordinal;
@@ -2984,13 +2801,11 @@ struct NativeAudit final {
                 return;
             }
             auto& slots = patched_slots[sequence];
-            if (value >= kAcceptanceSlotLimit || (slots.contains(value) && slots.at(value) != compiled_index))
-                reject_causal_evidence("patched slot identity");
+            if (value >= kAcceptanceSlotLimit || (slots.contains(value) && slots.at(value) != compiled_index)) reject_causal_evidence("patched slot identity");
             if (value < kAcceptanceSlotLimit) slots.insert_or_assign(value, compiled_index);
             last_patch_ordinals.insert_or_assign(sequence, ordinal);
             const auto placeholder = placeholder_slots[sequence].find(value);
-            explore_stale_patch =
-                explore_stale_patch || (placeholder != placeholder_slots[sequence].end() && placeholder->second != compiled_index);
+            explore_stale_patch = explore_stale_patch || (placeholder != placeholder_slots[sequence].end() && placeholder->second != compiled_index);
             reconcile_rendered_probes(sequence);
         }
         if (owner == "explore" && event == "acceptance.completion.held") {
@@ -3016,11 +2831,9 @@ struct NativeAudit final {
             record_tile_publication(sequence, value, ordinal);
             explore_max_pinned = std::max(explore_max_pinned, static_cast<std::size_t>(scalar(record, "staging_bytes")));
         }
-        explore_stale_discard =
-            explore_stale_discard || (owner == "explore" && event == "thumbnail.stale.discarded" && sequence != 0U && value != 0U);
+        explore_stale_discard = explore_stale_discard || (owner == "explore" && event == "thumbnail.stale.discarded" && sequence != 0U && value != 0U);
         if (owner == "explore" && event == "acceptance.stale.read.discarded" && sequence == held_generation && value == held_slot &&
-            scalar(record, "detail") == held_compiled_index && scalar(record, "staging_bytes") == held_capacity &&
-            held_discard_ordinal == 0U) {
+            scalar(record, "detail") == held_compiled_index && scalar(record, "staging_bytes") == held_capacity && held_discard_ordinal == 0U) {
             held_discard_ordinal = ordinal;
             acceptance_held_stale = true;
         }
@@ -3041,16 +2854,16 @@ struct NativeAudit final {
                 augmentation_pixel_seeds.insert_or_assign(sequence, seed);
             }
         }
-        overlay_descriptors = overlay_descriptors || (owner == "explore" && event == "explore.overlay.descriptors.prepared" &&
-                                                      value != 0U && scalar(record, "detail") != 0U);
+        overlay_descriptors =
+            overlay_descriptors || (owner == "explore" && event == "explore.overlay.descriptors.prepared" && value != 0U && scalar(record, "detail") != 0U);
         if (owner == "explore" && event == "explore.overlay.transformed_bounds") {
             const auto detail = scalar(record, "detail");
             const auto minimum_x = scalar(record, "capacity_width");
             const auto minimum_y = scalar(record, "capacity_height");
             const auto maximum_x = scalar(record, "staging_bytes") >> 32U;
             const auto maximum_y = scalar(record, "staging_bytes") & 0xffffffffU;
-            if ((detail >> 32U) != 0U && (detail & 0xffffffffU) != 0U && maximum_x > minimum_x && maximum_y > minimum_y &&
-                maximum_x <= 65'535U && maximum_y <= 65'535U) {
+            if ((detail >> 32U) != 0U && (detail & 0xffffffffU) != 0U && maximum_x > minimum_x && maximum_y > minimum_y && maximum_x <= 65'535U &&
+                maximum_y <= 65'535U) {
                 const auto key = std::pair{sequence, value};
                 if (transformed_overlay_slots.contains(key) || transformed_overlay_slots.size() < kAcceptanceRecordLimit)
                     transformed_overlay_slots.insert(key);
@@ -3058,8 +2871,8 @@ struct NativeAudit final {
                     reject_causal_evidence("transformed overlay evidence capacity");
             }
         }
-        if (owner == "explore" && event == "explore.semantic.nonzero_pixels" && scalar(record, "detail") != 0U &&
-            scalar(record, "capacity_width") != 0U && scalar(record, "capacity_height") != 0U) {
+        if (owner == "explore" && event == "explore.semantic.nonzero_pixels" && scalar(record, "detail") != 0U && scalar(record, "capacity_width") != 0U &&
+            scalar(record, "capacity_height") != 0U) {
             const auto key = std::pair{sequence, value};
             if (semantic_overlay_slots.contains(key) || semantic_overlay_slots.size() < kAcceptanceRecordLimit)
                 semantic_overlay_slots.insert(key);
@@ -3068,9 +2881,8 @@ struct NativeAudit final {
         }
         if (owner == "explore" && event == "explore.card.geometry_probe") {
             const auto packed = scalar(record, "staging_bytes");
-            record_card_geometry(sequence, value, scalar(record, "detail"), scalar(record, "capacity_width"),
-                                 scalar(record, "capacity_height"), (packed >> 48U) & 0xffffU, (packed >> 32U) & 0xffffU,
-                                 (packed >> 16U) & 0xffffU, packed & 0xffffU);
+            record_card_geometry(sequence, value, scalar(record, "detail"), scalar(record, "capacity_width"), scalar(record, "capacity_height"),
+                                 (packed >> 48U) & 0xffffU, (packed >> 32U) & 0xffffU, (packed >> 16U) & 0xffffU, packed & 0xffffU);
         }
         if (owner == "explore" && event == "explore.overlay.selection_probe") {
             const auto packed = scalar(record, "staging_bytes");
@@ -3097,14 +2909,12 @@ struct NativeAudit final {
             const auto packed = scalar(record, "staging_bytes");
             const auto padding_pixels = packed >> 32U;
             const auto compiled_index = scalar(record, "detail");
-            record_card_geometry(sequence, value, compiled_index, scalar(record, "source_width"), scalar(record, "source_height"),
-                                 scalar(record, "content_x"), scalar(record, "content_y"), scalar(record, "content_width"),
-                                 scalar(record, "content_height"));
-            const bool complete_probe = scalar(record, "capacity_width") == 31U && scalar(record, "capacity_height") != 0U &&
-                                        padded_card_slots.contains(key) && padded_card_slots.at(key) == compiled_index &&
-                                        padding_pixels != 0U && ((packed >> 16U) & 0xffffU) != 0U && (packed & 0xffffU) != 0U;
-            record_probe(rendered_probe_slots, rendered_probe_ordinals, key, compiled_index, complete_probe,
-                         "rendered card probe incomplete");
+            record_card_geometry(sequence, value, compiled_index, scalar(record, "source_width"), scalar(record, "source_height"), scalar(record, "content_x"),
+                                 scalar(record, "content_y"), scalar(record, "content_width"), scalar(record, "content_height"));
+            const bool complete_probe = scalar(record, "capacity_width") == 31U && scalar(record, "capacity_height") != 0U && padded_card_slots.contains(key) &&
+                                        padded_card_slots.at(key) == compiled_index && padding_pixels != 0U && ((packed >> 16U) & 0xffffU) != 0U &&
+                                        (packed & 0xffffU) != 0U;
+            record_probe(rendered_probe_slots, rendered_probe_ordinals, key, compiled_index, complete_probe, "rendered card probe incomplete");
         }
         if (owner == "explore" && event == "explore.card.transition_probe") {
             const auto key = std::pair{sequence, value};
@@ -3112,13 +2922,12 @@ struct NativeAudit final {
             const auto expected = scalar(record, "staging_bytes");
             const bool complete_transition = expected != 0U && scalar(record, "capacity_width") >= expected / 2U &&
                                              scalar(record, "capacity_width") <= expected && scalar(record, "capacity_height") == expected;
-            record_probe(transition_probe_slots, transition_probe_ordinals, key, compiled_index, complete_transition,
-                         "rendered transition probe incomplete");
+            record_probe(transition_probe_slots, transition_probe_ordinals, key, compiled_index, complete_transition, "rendered transition probe incomplete");
         }
         if (owner == "explore" && event == "explore.frame.published") { record_frame(sequence, value, ordinal); }
-        donor_descriptors = donor_descriptors || (owner == "explore" && event == "explore.donor.descriptors.prepared" && value != 0U &&
-                                                  scalar(record, "detail") != 0U && scalar(record, "capacity_width") > value &&
-                                                  scalar(record, "capacity_height") > scalar(record, "detail"));
+        donor_descriptors =
+            donor_descriptors || (owner == "explore" && event == "explore.donor.descriptors.prepared" && value != 0U && scalar(record, "detail") != 0U &&
+                                  scalar(record, "capacity_width") > value && scalar(record, "capacity_height") > scalar(record, "detail"));
         const bool document_opened = owner == "annotation" && event == "document.opened";
         annotation_copied = annotation_copied || (owner == "annotation" && event == "copy.completed");
         annotation_opened = annotation_opened || document_opened;
@@ -3128,21 +2937,18 @@ struct NativeAudit final {
             presentation_timeline = std::max(presentation_timeline, value);
         }
         if (owner == "presentation" && event == "presentation.frame.edge" &&
-            scalar(record, "source_session") ==
-                mmltk::controller::presentation_source_session(mmltk::controller::PresentationSourceKind::Explore) &&
-            scalar(record, "source_instance") != 0U && scalar(record, "source_observation_revision") != 0U &&
-            scalar(record, "source_revision") != 0U && scalar(record, "frame_revision") == scalar(record, "source_revision")) {
+            scalar(record, "source_session") == mmltk::controller::presentation_source_session(mmltk::controller::PresentationSourceKind::Explore) &&
+            scalar(record, "source_instance") != 0U && scalar(record, "source_observation_revision") != 0U && scalar(record, "source_revision") != 0U &&
+            scalar(record, "frame_revision") == scalar(record, "source_revision")) {
             const auto frame = std::pair{scalar(record, "source_observation_revision"), scalar(record, "source_revision")};
             if (presented_explore_frames.contains(frame) || presented_explore_frames.size() < kAcceptanceRecordLimit)
                 presented_explore_frames.try_emplace(frame, ordinal);
             else
                 reject_causal_evidence("presented Explore frame evidence capacity");
         }
-        if (owner == "firefox_process" && event == "child.spawned" &&
-            sequence <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max()))
+        if (owner == "firefox_process" && event == "child.spawned" && sequence <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max()))
             firefox_pid = static_cast<pid_t>(sequence);
     }
-
     [[nodiscard]] std::optional<FinalCursorGenerations> final_generations_for(const std::map<std::uint64_t, std::uint64_t>& rendered_slots,
                                                                               const std::uint64_t generation,
                                                                               const std::uint64_t frame_revision) const noexcept {
@@ -3152,13 +2958,11 @@ struct NativeAudit final {
             placeholder_cardinalities.at(generation) != placeholder->second.size() || placeholder->second != rendered_slots)
             return std::nullopt;
         const auto native_frame = published_frames.find(generation);
-        if (native_frame == published_frames.end() || std::ranges::none_of(native_frame->second, [frame_revision](const auto& publication) {
-                return publication.second == frame_revision;
-            }))
+        if (native_frame == published_frames.end() ||
+            std::ranges::none_of(native_frame->second, [frame_revision](const auto& publication) { return publication.second == frame_revision; }))
             return std::nullopt;
         return FinalCursorGenerations{.material = generation, .cursor = generation};
     }
-
     [[nodiscard]] std::optional<std::uint64_t> generation_for(const std::map<std::uint64_t, std::uint64_t>& rendered_slots) const noexcept {
         for (auto accepted = accepted_viewports.rbegin(); accepted != accepted_viewports.rend(); ++accepted) {
             const auto placeholder = placeholder_slots.find(accepted->generation);
@@ -3168,24 +2972,19 @@ struct NativeAudit final {
         }
         return std::nullopt;
     }
-
     [[nodiscard]] bool held_stale_read_discarded() const noexcept { return acceptance_held_stale; }
-
     [[nodiscard]] bool stale_thumbnail_discarded() const noexcept { return explore_stale_discard || held_stale_read_discarded(); }
-
     [[nodiscard]] bool superseding_placeholder_observed() const noexcept {
         return acceptance_held_read && std::ranges::any_of(placeholder_slots, [this](const auto& placeholder) {
                    return placeholder.first > held_generation && placeholder_cardinalities.contains(placeholder.first) &&
                           placeholder_cardinalities.at(placeholder.first) == placeholder.second.size();
                });
     }
-
     void RecordHeldControlObservation(const ExploreAcceptanceGate::ControlObservation observation) noexcept {
         using Event = ExploreAcceptanceGate::ControlEvent;
         if (observation.event == Event::InitialWait) return;
         const bool valid_identity = observation.generation != 0U && observation.slot < kAcceptanceSlotLimit &&
-                                    observation.compiled_index <= std::numeric_limits<std::uint32_t>::max() &&
-                                    observation.staging_bytes != 0U;
+                                    observation.compiled_index <= std::numeric_limits<std::uint32_t>::max() && observation.staging_bytes != 0U;
         if (!valid_identity) {
             reject_causal_evidence("held control identity");
             return;
@@ -3208,22 +3007,18 @@ struct NativeAudit final {
         else if (observation.event != Event::HeldWait)
             reject_causal_evidence("held control event");
     }
-
     [[nodiscard]] std::string_view causal_stale_blocker(const FinalCursorGenerations final) const noexcept {
         if (!acceptance_held_read) return "held read";
         if (!acceptance_held_completed) return "held read completion";
         if (!held_stale_read_discarded()) return "released held read discard";
         if (final.material <= held_generation || final.cursor <= held_generation) return "final generation order";
         if (!placeholder_slots.contains(final.material)) return "final material placeholder";
-        if (!placeholder_cardinalities.contains(final.material) ||
-            placeholder_cardinalities.at(final.material) != placeholder_slots.at(final.material).size())
+        if (!placeholder_cardinalities.contains(final.material) || placeholder_cardinalities.at(final.material) != placeholder_slots.at(final.material).size())
             return "final material placeholder completeness";
         if (!superseding_placeholder_observed()) return "superseding placeholder";
         return {};
     }
-
     [[nodiscard]] bool causal_stale_chain(const FinalCursorGenerations final) const noexcept { return causal_stale_blocker(final).empty(); }
-
     [[nodiscard]] bool exact_partial_slot_identity() const noexcept {
         const auto placeholder = placeholder_slots.find(partial_generation);
         const auto patched = patched_slots.find(partial_generation);
@@ -3231,9 +3026,7 @@ struct NativeAudit final {
         return placeholder != placeholder_slots.end() && patched != patched_slots.end() && !patched->second.empty() &&
                std::ranges::includes(placeholder->second, patched->second);
     }
-
-    [[nodiscard]] std::optional<std::uint64_t> augmentation_generation_for(const std::uint64_t seed,
-                                                                           const std::uint64_t frame_revision) const noexcept {
+    [[nodiscard]] std::optional<std::uint64_t> augmentation_generation_for(const std::uint64_t seed, const std::uint64_t frame_revision) const noexcept {
         if (frame_revision == 0U) return std::nullopt;
         const auto generation = std::ranges::find_if(augmentation_seeds, [this, seed, frame_revision](const auto& candidate) {
             const auto frames = published_frames.find(candidate.first);
@@ -3242,30 +3035,25 @@ struct NativeAudit final {
         });
         return generation == augmentation_seeds.end() ? std::nullopt : std::optional{generation->first};
     }
-
     [[nodiscard]] bool augmentation_pixels_observed(const std::uint64_t seed) const noexcept {
         return std::ranges::any_of(augmentation_seeds, [this, seed](const auto& generation) {
             const auto pixels = augmentation_pixel_seeds.find(generation.first);
             const auto frames = published_frames.find(generation.first);
-            return generation.second == seed && pixels != augmentation_pixel_seeds.end() && pixels->second == seed &&
-                   frames != published_frames.end() && !frames->second.empty();
+            return generation.second == seed && pixels != augmentation_pixel_seeds.end() && pixels->second == seed && frames != published_frames.end() &&
+                   !frames->second.empty();
         });
     }
-
     [[nodiscard]] bool aligned_rendered_probe(const std::pair<std::uint64_t, std::uint64_t> key) const noexcept {
         const auto rendered = rendered_probe_slots.find(key);
         const auto selected = selected_overlay_slots.find(key);
         const auto placeholder = placeholder_slots.find(key.first);
         return rendered != rendered_probe_slots.end() && padded_card_slots.contains(key) && padding_orientations.contains(key) &&
-               padded_card_slots.at(key) == rendered->second && transition_probe_slots.contains(key) &&
-               transition_probe_slots.at(key) == rendered->second && rendered_probe_frames.contains(key) &&
-               std::ranges::any_of(rendered_probe_frames.at(key), [](const auto revision) { return revision != 0U; }) &&
-               placeholder != placeholder_slots.end() && placeholder->second.contains(key.second) &&
-               placeholder->second.at(key.second) == rendered->second && selected != selected_overlay_slots.end() &&
-               selected->second.second == rendered->second && transformed_overlay_slots.contains(key) &&
+               padded_card_slots.at(key) == rendered->second && transition_probe_slots.contains(key) && transition_probe_slots.at(key) == rendered->second &&
+               rendered_probe_frames.contains(key) && std::ranges::any_of(rendered_probe_frames.at(key), [](const auto revision) { return revision != 0U; }) &&
+               placeholder != placeholder_slots.end() && placeholder->second.contains(key.second) && placeholder->second.at(key.second) == rendered->second &&
+               selected != selected_overlay_slots.end() && selected->second.second == rendered->second && transformed_overlay_slots.contains(key) &&
                semantic_overlay_slots.contains(key);
     }
-
     [[nodiscard]] bool filtered_overlay_identity() const noexcept {
         return std::ranges::any_of(selected_overlay_slots, [this](const auto& selected) {
             return std::ranges::any_of(hidden_overlay_slots, [&selected](const auto& hidden) {
@@ -3273,19 +3061,15 @@ struct NativeAudit final {
             });
         });
     }
-
     [[nodiscard]] bool aligned_padding_orientation(const PaddingOrientation orientation) const noexcept {
         return std::ranges::any_of(rendered_probe_slots, [this, orientation](const auto& probe) {
-            return padding_orientations.contains(probe.first) && padding_orientations.at(probe.first) == orientation &&
-                   aligned_rendered_probe(probe.first);
+            return padding_orientations.contains(probe.first) && padding_orientations.at(probe.first) == orientation && aligned_rendered_probe(probe.first);
         });
     }
-
     [[nodiscard]] bool aligned_overlay_pixels() const noexcept {
         return filtered_overlay_identity() && aligned_padding_orientation(PaddingOrientation::Vertical) &&
                aligned_padding_orientation(PaddingOrientation::Horizontal);
     }
-
     [[nodiscard]] std::string_view overlay_readiness_blocker(const bool require_pixel_probes) const noexcept {
         if (!overlay_descriptors) return "overlay descriptors";
         if (!donor_descriptors) return "donor descriptors";
@@ -3295,7 +3079,6 @@ struct NativeAudit final {
         if (!aligned_padding_orientation(PaddingOrientation::Horizontal)) return "horizontal rendered overlay";
         return {};
     }
-
     [[nodiscard]] std::string_view readiness_blocker(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
                                                      const bool require_overlay_pixel_probes) const noexcept {
         const auto overlay_blocker = overlay_readiness_blocker(require_overlay_pixel_probes);
@@ -3304,8 +3087,7 @@ struct NativeAudit final {
             std::pair{explore_rendered && explore_placeholder, std::string_view{"Explore publication"}},
             std::pair{annotation_copied && annotation_opened && annotation_edited, std::string_view{"Annotation lifecycle"}},
             std::pair{presentation_ready, std::string_view{"Presentation timeline"}},
-            std::pair{explore_partial_patch && acceptance_first_patch_exact && explore_ready_batch,
-                      std::string_view{"incremental Explore publication"}},
+            std::pair{explore_partial_patch && acceptance_first_patch_exact && explore_ready_batch, std::string_view{"incremental Explore publication"}},
             std::pair{stale_thumbnail_discarded(), std::string_view{"stale thumbnail discard"}},
             std::pair{causal_stale_chain(final),
                       causal_stale_blocker(final).empty() ? std::string_view{"causal stale-read chain"} : causal_stale_blocker(final)},
@@ -3319,26 +3101,21 @@ struct NativeAudit final {
         const auto blocker = std::ranges::find_if(checks, [](const auto& check) { return !check.first; });
         return blocker == checks.end() ? std::string_view{} : blocker->second;
     }
-
     [[nodiscard]] bool product_completed(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
                                          const bool require_overlay_pixel_probes) const noexcept {
-        return server_started && peer_opened && firefox_pid > 0 && explore_rendered && annotation_copied && annotation_opened &&
-               annotation_edited && presentation_ready && explore_placeholder && explore_partial_patch && acceptance_first_patch_exact &&
-               explore_ready_batch && stale_thumbnail_discarded() && causal_stale_chain(final) && exact_partial_slot_identity() &&
-               overlay_descriptors && donor_descriptors && (!require_overlay_pixel_probes || aligned_overlay_pixels()) &&
-               seeded_augmentation_ready && !worker_failed && !explore_tile_regressed && !explore_nproc_changed && !explore_stale_patch &&
-               !invalid_message && !peer_replaced && !interaction_rejected && !causal_inconsistent;
+        return server_started && peer_opened && firefox_pid > 0 && explore_rendered && annotation_copied && annotation_opened && annotation_edited &&
+               presentation_ready && explore_placeholder && explore_partial_patch && acceptance_first_patch_exact && explore_ready_batch &&
+               stale_thumbnail_discarded() && causal_stale_chain(final) && exact_partial_slot_identity() && overlay_descriptors && donor_descriptors &&
+               (!require_overlay_pixel_probes || aligned_overlay_pixels()) && seeded_augmentation_ready && !worker_failed && !explore_tile_regressed &&
+               !explore_nproc_changed && !explore_stale_patch && !invalid_message && !peer_replaced && !interaction_rejected && !causal_inconsistent;
     }
-
     [[nodiscard]] bool product_ready(const FinalCursorGenerations final, const bool seeded_augmentation_ready,
                                      const bool require_overlay_pixel_probes) const noexcept {
         return product_completed(final, seeded_augmentation_ready, require_overlay_pixel_probes) && active_peer();
     }
-
     [[nodiscard]] bool failed_before_termination() const noexcept {
         return worker_failed || invalid_message || peer_replaced || interaction_rejected || causal_inconsistent;
     }
-
     [[nodiscard]] std::string_view failure_blocker() const noexcept {
         const std::array checks{
             std::pair{worker_failed, std::string_view{"worker failure"}},
@@ -3350,10 +3127,8 @@ struct NativeAudit final {
         const auto blocker = std::ranges::find_if(checks, [](const auto& check) { return check.first; });
         return blocker == checks.end() ? std::string_view{} : blocker->second;
     }
-
     [[nodiscard]] bool active_peer() const noexcept { return peer_open_count == peer_close_count + 1U; }
 };
-
 // Acceptance consumes bounded records only when lifecycle reporting is enabled.
 // Retain one offending record and its causal context, independently of verdicts.
 class FirstAuditFailure final {
@@ -3366,7 +3141,6 @@ class FirstAuditFailure final {
         record_["reason"] = reason;
         record_["audit_context"] = context();
     }
-
     void report(const std::filesystem::path& path, const std::string_view event, const std::filesystem::path& observed_file,
                 const std::optional<std::uint64_t> observed_line) {
         if (record_.is_null() || reported_) return;
@@ -3377,22 +3151,19 @@ class FirstAuditFailure final {
         append_acceptance_record(path, std::move(record));
         reported_ = true;
     }
-
     [[nodiscard]] const nlohmann::json& record() const noexcept { return record_; }
 
    private:
     nlohmann::json record_;
     bool reported_ = false;
 };
-
 struct AtlasDrawAudit final {
     using SourceKey = std::array<std::uint64_t, 4U>;
     using SampleKey = std::pair<std::string, std::uint64_t>;
     using AllocationKey = std::tuple<std::string, std::uint64_t, std::uint64_t>;
     static constexpr std::initializer_list<const char*> source_fields{
-        "content_session", "source_kind", "source_instance", "source_revision", "content_width",   "content_height", "dataset_identity",
-        "columns",         "rows",        "first_row",       "matching_count",  "visible_indices", "row_capacity",   "row_origin",
-        "card_extent"};
+        "content_session", "source_kind",    "source_instance", "source_revision", "content_width", "content_height", "dataset_identity", "columns", "rows",
+        "first_row",       "matching_count", "visible_indices", "row_capacity",    "row_origin",    "card_extent"};
     static constexpr std::initializer_list<const char*> image_fields{
         "surface",     "width",           "height",          "presentation_revision", "frame_revision", "content_session",
         "source_kind", "source_instance", "source_revision", "content_width",         "content_height", "columns",
@@ -3435,12 +3206,10 @@ struct AtlasDrawAudit final {
     bool empty_seen = false;
     bool valid = true;
     FirstAuditFailure failure;
-
     [[nodiscard]] const nlohmann::json* acquisition_for(const SampleKey& key) const {
         const auto found = acquisitions.find(key);
         return found != acquisitions.end() ? &found->second : nullptr;
     }
-
     [[nodiscard]] bool empty_draw_submitted(const SurfaceAudit& physical) const {
         if (!valid || !empty_seen) return false;
         return std::ranges::any_of(acquisitions, [&](const auto& entry) {
@@ -3449,17 +3218,14 @@ struct AtlasDrawAudit final {
             if (count == record.end() || !count->is_number_unsigned() || *count != 0U) return false;
             const auto& [identity, publication] = key;
             const auto surface = physical.surfaces.find(identity);
-            if (surface == physical.surfaces.end() || surface->second.width != scalar(record, "width") ||
-                surface->second.height != scalar(record, "height"))
+            if (surface == physical.surfaces.end() || surface->second.width != scalar(record, "width") || surface->second.height != scalar(record, "height"))
                 return false;
             const auto draw = surface->second.custody.find(publication);
             return draw != surface->second.custody.end() && draw->second.acquired && draw->second.settled != 0U;
         });
     }
-
-    [[nodiscard]] bool check(const bool passed, const std::string_view reason, const nlohmann::json& record,
-                             const nlohmann::json* prior = nullptr, const std::string_view field = {},
-                             const nlohmann::json* expected = nullptr) {
+    [[nodiscard]] bool check(const bool passed, const std::string_view reason, const nlohmann::json& record, const nlohmann::json* prior = nullptr,
+                             const std::string_view field = {}, const nlohmann::json* expected = nullptr) {
         if (!passed)
             failure.capture(reason, record, [&] {
                 nlohmann::json context{{"completed_scroll_stages", stages},
@@ -3484,26 +3250,18 @@ struct AtlasDrawAudit final {
             });
         return passed;
     }
-
-    [[nodiscard]] bool check_fields(const nlohmann::json& record, const nlohmann::json& prior,
-                                    const std::initializer_list<const char*> fields, const std::string_view reason) {
+    [[nodiscard]] bool check_fields(const nlohmann::json& record, const nlohmann::json& prior, const std::initializer_list<const char*> fields,
+                                    const std::string_view reason) {
         const auto* field = differing_field(record, prior, fields);
         return !field || check(false, reason, record, &prior, field, prior.contains(field) ? &prior[field] : nullptr);
     }
-
     [[nodiscard]] static SourceKey source_key(const nlohmann::json& record) {
-        return {scalar(record, "content_session"), scalar(record, "source_kind"), scalar(record, "source_instance"),
-                scalar(record, "source_revision")};
+        return {scalar(record, "content_session"), scalar(record, "source_kind"), scalar(record, "source_instance"), scalar(record, "source_revision")};
     }
-
-    [[nodiscard]] static SampleKey sample_key(const nlohmann::json& record) {
-        return {record.value("surface", ""), scalar(record, "presentation_revision")};
-    }
-
+    [[nodiscard]] static SampleKey sample_key(const nlohmann::json& record) { return {record.value("surface", ""), scalar(record, "presentation_revision")}; }
     [[nodiscard]] static AllocationKey allocation_key(const nlohmann::json& record) {
         return {record.value("surface", ""), scalar(record, "width"), scalar(record, "height")};
     }
-
     void observe_staged_rows(const AllocationKey& allocation, const std::uint64_t rows) {
         if (!staged_allocation) {
             staged_allocation = allocation;
@@ -3516,19 +3274,14 @@ struct AtlasDrawAudit final {
         grid_round_trip = staged_transitions == 3U;
         previous_staged_rows = rows;
     }
-
-    [[nodiscard]] static const char* differing_field(const nlohmann::json& left, const nlohmann::json& right,
-                                                     const std::initializer_list<const char*> fields) {
-        const auto found = std::ranges::find_if(
-            fields, [&](const auto* field) { return !left.contains(field) || !right.contains(field) || left[field] != right[field]; });
+    [[nodiscard]] static const char* differing_field(const nlohmann::json& left, const nlohmann::json& right, const std::initializer_list<const char*> fields) {
+        const auto found =
+            std::ranges::find_if(fields, [&](const auto* field) { return !left.contains(field) || !right.contains(field) || left[field] != right[field]; });
         return found != fields.end() ? *found : nullptr;
     }
-
-    [[nodiscard]] static bool same_fields(const nlohmann::json& left, const nlohmann::json& right,
-                                          const std::initializer_list<const char*> fields) {
+    [[nodiscard]] static bool same_fields(const nlohmann::json& left, const nlohmann::json& right, const std::initializer_list<const char*> fields) {
         return differing_field(left, right, fields) == nullptr;
     }
-
     [[nodiscard]] bool ready_pixels_complete(const nlohmann::json& record) {
         const auto samples = ready_cell_samples.find(sample_key(record));
         if (!check(samples != ready_cell_samples.end(), "stage_ready_pixel_samples_missing", record) ||
@@ -3544,39 +3297,33 @@ struct AtlasDrawAudit final {
             if (slot >= record["ready_slots"].size() || record["ready_slots"][slot] != true) continue;
             const double left = record["image"][0].get<double>() + (static_cast<double>(slot % columns) + .2) * side;
             const double top = record["image"][1].get<double>() + (static_cast<double>(slot / columns) + .2) * side;
-            const double width = std::min(left + .6 * side, record["clip"][0].get<double>() + record["clip"][2].get<double>()) -
-                                 std::max(left, record["clip"][0].get<double>());
-            const double height = std::min(top + .6 * side, record["clip"][1].get<double>() + record["clip"][3].get<double>()) -
-                                  std::max(top, record["clip"][1].get<double>());
+            const double width =
+                std::min(left + .6 * side, record["clip"][0].get<double>() + record["clip"][2].get<double>()) - std::max(left, record["clip"][0].get<double>());
+            const double height =
+                std::min(top + .6 * side, record["clip"][1].get<double>() + record["clip"][3].get<double>()) - std::max(top, record["clip"][1].get<double>());
             if (width >= 2.0 && height >= 2.0) {
                 const nlohmann::json& index = record["visible_indices"][slot];
-                if (!check(samples->second.contains(index.get<std::uint64_t>()), "stage_ready_cell_sample_missing", record, nullptr,
-                           "compiled_index", &index))
+                if (!check(samples->second.contains(index.get<std::uint64_t>()), "stage_ready_cell_sample_missing", record, nullptr, "compiled_index", &index))
                     return false;
             }
         }
         return true;
     }
-
     [[nodiscard]] bool source_stage_matches_draw(const nlohmann::json& record) {
         return check(last_draw.has_value(), "stage_last_draw_missing", record) &&
                check_fields(record, *last_draw, source_fields, "stage_source_differs_from_draw") &&
-               check(sample_key(record) == sample_key(*last_draw), "stage_sample_differs_from_draw", record, &*last_draw) &&
-               ready_pixels_complete(record);
+               check(sample_key(record) == sample_key(*last_draw), "stage_sample_differs_from_draw", record, &*last_draw) && ready_pixels_complete(record);
     }
-
     void clear_last_draw(const nlohmann::json& record) {
         if (last_draw) last_draw_reset = record;
         last_draw.reset();
     }
-
     void stage(const nlohmann::json& record) {
         const auto name = record.value("control", "");
         if (name.starts_with("resize-")) {
             static constexpr std::array names{"resize-landscape", "resize-portrait-return", "resize-landscape-return"};
-            bool matching =
-                check(resize_stages.size() < names.size() && name == names[resize_stages.size()], "resize_stage_out_of_order", record) &&
-                source_stage_matches_draw(record);
+            bool matching = check(resize_stages.size() < names.size() && name == names[resize_stages.size()], "resize_stage_out_of_order", record) &&
+                            source_stage_matches_draw(record);
             if (matching) {
                 const auto& clip = record.at("clip");
                 const auto& image = record.at("image");
@@ -3585,12 +3332,10 @@ struct AtlasDrawAudit final {
                 if (!resize_stages.empty()) {
                     const auto& previous = resize_stages.back();
                     const bool portrait = name == "resize-portrait-return";
-                    matching =
-                        matching &&
-                        check(portrait ? scalar(record, "rows") > scalar(previous, "rows")
-                                       : scalar(record, "rows") < scalar(previous, "rows"),
-                              "resize_row_direction_mismatch", record, &previous) &&
-                        check_fields(record, previous, {"dataset_identity", "columns", "first_row"}, "resize_changed_gallery_identity");
+                    matching = matching &&
+                               check(portrait ? scalar(record, "rows") > scalar(previous, "rows") : scalar(record, "rows") < scalar(previous, "rows"),
+                                     "resize_row_direction_mismatch", record, &previous) &&
+                               check_fields(record, previous, {"dataset_identity", "columns", "first_row"}, "resize_changed_gallery_identity");
                 }
             }
             valid = valid && matching;
@@ -3606,13 +3351,11 @@ struct AtlasDrawAudit final {
             return;
         }
         if (name.starts_with("held-")) {
-            bool matching = check(held_stages.size() < held_names.size() && name == held_names[held_stages.size()],
-                                  "held_stage_out_of_order", record) &&
+            bool matching = check(held_stages.size() < held_names.size() && name == held_names[held_stages.size()], "held_stage_out_of_order", record) &&
                             source_stage_matches_draw(record);
             if (matching && held_stages.contains("held-visible")) {
                 const auto& baseline = held_stages.at("held-visible");
-                matching = check_fields(record, baseline, {"columns", "card_extent", "dataset_identity", "first_row"},
-                                        "held_stage_differs_from_baseline") &&
+                matching = check_fields(record, baseline, {"columns", "card_extent", "dataset_identity", "first_row"}, "held_stage_differs_from_baseline") &&
                            check(record["clip"][3] == baseline["clip"][3], "held_stage_clip_height_changed", record, &baseline);
                 if (name == "held-aligned" || name == "held-extra" || name == "held-restored")
                     matching = matching && check(return_baseline.has_value(), "held_stage_return_baseline_missing", record) &&
@@ -3625,17 +3368,14 @@ struct AtlasDrawAudit final {
             return;
         }
         if (name.starts_with("return-")) {
-            bool matching =
-                check(return_stage < return_names.size() && name == return_names[return_stage], "return_stage_out_of_order", record) &&
-                source_stage_matches_draw(record);
+            bool matching = check(return_stage < return_names.size() && name == return_names[return_stage], "return_stage_out_of_order", record) &&
+                            source_stage_matches_draw(record);
             if (matching && return_baseline) {
-                matching = check_fields(record, *return_baseline, {"columns", "card_extent", "dataset_identity"},
-                                        "return_stage_differs_from_baseline") &&
-                           check(record["clip"][3] == (*return_baseline)["clip"][3], "return_stage_clip_height_changed", record,
-                                 &*return_baseline) &&
+                matching = check_fields(record, *return_baseline, {"columns", "card_extent", "dataset_identity"}, "return_stage_differs_from_baseline") &&
+                           check(record["clip"][3] == (*return_baseline)["clip"][3], "return_stage_clip_height_changed", record, &*return_baseline) &&
                            check(scalar(record, "first_row") == 0U, "return_stage_first_row_not_zero", record) &&
-                           check(scalar(record, "rows") == scalar(*return_baseline, "rows") + (return_stage == 2U ? 1U : 0U),
-                                 "return_stage_row_count_mismatch", record, &*return_baseline);
+                           check(scalar(record, "rows") == scalar(*return_baseline, "rows") + (return_stage == 2U ? 1U : 0U), "return_stage_row_count_mismatch",
+                                 record, &*return_baseline);
             }
             valid = valid && matching;
             if (matching) {
@@ -3646,11 +3386,10 @@ struct AtlasDrawAudit final {
             clear_last_draw(record);
             return;
         }
-        bool matching =
-            check(stages.size() < stage_names.size() && name == stage_names[stages.size()], "scroll_stage_out_of_order", record) &&
-            check(last_draw.has_value(), "stage_last_draw_missing", record) &&
-            check_fields(record, *last_draw, image_fields, "scroll_stage_image_differs_from_draw") &&
-            check_fields(record, *last_draw, {"bounds", "image", "clip"}, "scroll_stage_geometry_differs_from_draw");
+        bool matching = check(stages.size() < stage_names.size() && name == stage_names[stages.size()], "scroll_stage_out_of_order", record) &&
+                        check(last_draw.has_value(), "stage_last_draw_missing", record) &&
+                        check_fields(record, *last_draw, image_fields, "scroll_stage_image_differs_from_draw") &&
+                        check_fields(record, *last_draw, {"bounds", "image", "clip"}, "scroll_stage_geometry_differs_from_draw");
         const auto allocation = allocation_key(record);
         matching = matching && check(!staged_allocation || *staged_allocation == allocation, "scroll_stage_allocation_changed", record);
         if (matching) {
@@ -3662,13 +3401,11 @@ struct AtlasDrawAudit final {
             if (name == "row2") matching = check(row == 2U, "scroll_stage_expected_row2", record);
             if (name == "row10") matching = check(row == 10U, "scroll_stage_expected_row10", record);
             if (name == "row9") matching = check(row == 9U, "scroll_stage_expected_row9", record);
-            if (name == "restored")
-                matching = check(row == 0U && std::abs(image_top - clip_top) < 1.0, "restored_stage_row_or_clip_mismatch", record);
+            if (name == "restored") matching = check(row == 0U && std::abs(image_top - clip_top) < 1.0, "restored_stage_row_or_clip_mismatch", record);
             if (name == "end") {
                 const auto columns = scalar(record, "columns");
                 const auto total = scalar(record, "matching_count");
-                matching = check(columns != 0U && row + scalar(record, "rows") == (total + columns - 1U) / columns,
-                                 "end_stage_row_mismatch", record) &&
+                matching = check(columns != 0U && row + scalar(record, "rows") == (total + columns - 1U) / columns, "end_stage_row_mismatch", record) &&
                            check(std::abs(image_top + record["image"][3].get<double>() - clip_top - record["clip"][3].get<double>()) < 1.0,
                                  "end_stage_clip_mismatch", record);
             }
@@ -3680,11 +3417,9 @@ struct AtlasDrawAudit final {
         }
         clear_last_draw(record);
     }
-
     [[nodiscard]] static bool visible(const nlohmann::json& record) {
         const auto rectangle = [&](const char* field) {
-            if (!record.contains(field) || !record[field].is_array() || record[field].size() != 4U)
-                return std::optional<std::array<double, 4U>>{};
+            if (!record.contains(field) || !record[field].is_array() || record[field].size() != 4U) return std::optional<std::array<double, 4U>>{};
             std::array<double, 4U> result{};
             for (std::size_t i = 0U; i != result.size(); ++i) {
                 if (!record[field][i].is_number()) return std::optional<std::array<double, 4U>>{};
@@ -3699,7 +3434,6 @@ struct AtlasDrawAudit final {
         return std::max((*image)[0], (*clip)[0]) < std::min((*image)[0] + (*image)[2], (*clip)[0] + (*clip)[2]) &&
                std::max((*image)[1], (*clip)[1]) < std::min((*image)[1] + (*image)[3], (*clip)[1] + (*clip)[3]);
     }
-
     void consume(const nlohmann::json& record) {
         const std::string event = record.value("event", "");
         if (event == "integration.atlas_ready_cell") {
@@ -3713,18 +3447,16 @@ struct AtlasDrawAudit final {
                 const auto& indices = record["visible_indices"];
                 const auto found = std::ranges::find(indices, nlohmann::json(index));
                 const auto slot = static_cast<std::size_t>(found - indices.begin());
-                matching =
-                    check(found != indices.end(), "ready_cell_index_not_visible", record) &&
-                    check(record.contains("ready_slots") && slot < record["ready_slots"].size() && record["ready_slots"][slot] == true,
-                          "ready_cell_slot_not_ready", record);
+                matching = check(found != indices.end(), "ready_cell_index_not_visible", record) &&
+                           check(record.contains("ready_slots") && slot < record["ready_slots"].size() && record["ready_slots"][slot] == true,
+                                 "ready_cell_slot_not_ready", record);
             }
-            matching = matching &&
-                       check(record.contains("cell_sample_x") && record.contains("cell_sample_y") && record.contains("cell_sample_rgba"),
-                             "ready_cell_sample_point_missing", record);
+            matching = matching && check(record.contains("cell_sample_x") && record.contains("cell_sample_y") && record.contains("cell_sample_rgba"),
+                                         "ready_cell_sample_point_missing", record);
             if (matching) {
                 if (pixel_meaning && !same_fields(record, *pixel_meaning,
-                                                  {"dataset_identity", "card_extent", "augmentation_enabled", "augmentation_seed",
-                                                   "overlay_boxes", "overlay_masks", "overlay_labels"}))
+                                                  {"dataset_identity", "card_extent", "augmentation_enabled", "augmentation_seed", "overlay_boxes",
+                                                   "overlay_masks", "overlay_labels"}))
                     retained_cell_pixels.clear();
                 pixel_meaning = record;
                 const auto point = std::tuple{index, scalar(record, "cell_sample_x"), scalar(record, "cell_sample_y")};
@@ -3732,8 +3464,7 @@ struct AtlasDrawAudit final {
                 if (prior != retained_cell_pixels.end() && return_stage > 0U && stages.empty() && !away_return &&
                     prior->second.rgba != scalar(record, "cell_sample_rgba")) {
                     const nlohmann::json expected = prior->second.rgba;
-                    matching = check(false, "retained_ready_cell_pixel_changed", record, acquisition_for(prior->second.sample),
-                                     "cell_sample_rgba", &expected);
+                    matching = check(false, "retained_ready_cell_pixel_changed", record, acquisition_for(prior->second.sample), "cell_sample_rgba", &expected);
                 }
                 if (retained_cell_pixels.size() >= kAcceptanceRecordLimit && prior == retained_cell_pixels.end())
                     matching = check(false, "retained_cell_pixel_capacity_exhausted", record);
@@ -3765,9 +3496,7 @@ struct AtlasDrawAudit final {
                 valid = valid && check_fields(record, existing->second, source_fields, "gallery_source_facts_changed");
             } else if (sources.size() >= kAcceptanceRecordLimit || sessions.contains(session)) {
                 const auto conflicting = sessions.find(session);
-                valid = check(false,
-                              sources.size() >= kAcceptanceRecordLimit ? "gallery_source_capacity_exhausted"
-                                                                       : "gallery_source_session_revision_reused",
+                valid = check(false, sources.size() >= kAcceptanceRecordLimit ? "gallery_source_capacity_exhausted" : "gallery_source_session_revision_reused",
                               record, conflicting != sessions.end() ? &sources.at(conflicting->second) : nullptr);
             } else {
                 sources.emplace(key, record);
@@ -3779,10 +3508,8 @@ struct AtlasDrawAudit final {
             const auto key = sample_key(record);
             if (acquisitions.size() >= kAcceptanceRecordLimit || acquisitions.contains(key)) {
                 const auto prior = acquisitions.find(key);
-                valid = check(
-                    false,
-                    acquisitions.size() >= kAcceptanceRecordLimit ? "sample_acquisition_capacity_exhausted" : "sample_acquisition_repeated",
-                    record, prior != acquisitions.end() ? &prior->second : nullptr);
+                valid = check(false, acquisitions.size() >= kAcceptanceRecordLimit ? "sample_acquisition_capacity_exhausted" : "sample_acquisition_repeated",
+                              record, prior != acquisitions.end() ? &prior->second : nullptr);
                 return;
             }
             acquisitions.emplace(key, record);
@@ -3806,14 +3533,13 @@ struct AtlasDrawAudit final {
             check(source != sources.end(), "draw_gallery_source_missing", record) &&
             check(capture != acquisitions.end(), "draw_sample_acquisition_missing", record) &&
             check(visible(record), "draw_visible_geometry_invalid", record) &&
-            check(SurfaceAudit::valid_identity(record.value("surface", "")) && scalar(record, "presentation_revision") != 0U,
-                  "draw_sample_identity_invalid", record) &&
+            check(SurfaceAudit::valid_identity(record.value("surface", "")) && scalar(record, "presentation_revision") != 0U, "draw_sample_identity_invalid",
+                  record) &&
             check(width <= scalar(record, "width") && height <= scalar(record, "height"), "draw_content_exceeds_allocation", record) &&
             check(scalar(record, "source_revision") == scalar(record, "frame_revision"), "draw_source_frame_revision_mismatch", record) &&
-            check(columns != 0U && rows != 0U && width != 0U && height != 0U && scalar(record, "card_extent") != 0U,
-                  "draw_atlas_geometry_empty", record) &&
-            check(scalar(record, "row_capacity") >= rows && scalar(record, "row_origin") < scalar(record, "row_capacity"),
-                  "draw_atlas_row_capacity_invalid", record) &&
+            check(columns != 0U && rows != 0U && width != 0U && height != 0U && scalar(record, "card_extent") != 0U, "draw_atlas_geometry_empty", record) &&
+            check(scalar(record, "row_capacity") >= rows && scalar(record, "row_origin") < scalar(record, "row_capacity"), "draw_atlas_row_capacity_invalid",
+                  record) &&
             check(width / columns == scalar(record, "card_extent") && width % columns == 0U, "draw_atlas_column_extent_mismatch", record) &&
             check(height == scalar(record, "row_capacity") * scalar(record, "card_extent"), "draw_atlas_capacity_height_mismatch", record);
         if (matching) {
@@ -3823,8 +3549,7 @@ struct AtlasDrawAudit final {
             const auto& image = record["image"];
             const auto& bounds = record["bounds"];
             matching = matching &&
-                       check(std::abs(image[2].get<double>() / static_cast<double>(columns) -
-                                      image[3].get<double>() / static_cast<double>(rows)) < 0.01,
+                       check(std::abs(image[2].get<double>() / static_cast<double>(columns) - image[3].get<double>() / static_cast<double>(rows)) < 0.01,
                              "draw_card_aspect_mismatch", record) &&
                        check(image[0] == bounds[0] && image[1] == bounds[1] && image[2] == bounds[2], "draw_image_bounds_mismatch", record);
         }
@@ -3836,11 +3561,9 @@ struct AtlasDrawAudit final {
         if (matching) {
             const auto count = record.find("matching_count");
             matching = check(count != record.end() && count->is_number_unsigned(), "draw_matching_count_invalid", record) &&
-                       check(scalar(record, "matching_count") != 0U || record["visible_indices"].empty(),
-                             "draw_empty_gallery_has_visible_cells", record);
+                       check(scalar(record, "matching_count") != 0U || record["visible_indices"].empty(), "draw_empty_gallery_has_visible_cells", record);
         }
-        if (matching && overlap_draw &&
-            !same_fields(record, *overlap_draw, {"dataset_identity", "card_extent", "augmentation_enabled", "augmentation_seed"}))
+        if (matching && overlap_draw && !same_fields(record, *overlap_draw, {"dataset_identity", "card_extent", "augmentation_enabled", "augmentation_seed"}))
             retained_ready.clear();
         if (matching) {
             for (std::size_t slot = 0U; slot < record["visible_indices"].size(); ++slot) {
@@ -3854,11 +3577,10 @@ struct AtlasDrawAudit final {
                 const auto found = retained_ready.find(index);
                 // The return window is deliberately retained. Other distant
                 // scrolls can legitimately evict cells from the bounded cache.
-                if (return_stage > 0U && !away_return && stages.empty() && !held_stages.contains("held-complete") &&
-                    found != retained_ready.end() && found->second.ready && !ready) {
+                if (return_stage > 0U && !away_return && stages.empty() && !held_stages.contains("held-complete") && found != retained_ready.end() &&
+                    found->second.ready && !ready) {
                     const nlohmann::json expected{{"compiled_index", index}, {"ready", true}};
-                    matching = check(false, "retained_ready_cell_became_placeholder", record, acquisition_for(found->second.sample),
-                                     "ready_slots", &expected);
+                    matching = check(false, "retained_ready_cell_became_placeholder", record, acquisition_for(found->second.sample), "ready_slots", &expected);
                 }
                 if (retained_ready.size() >= kAcceptanceRecordLimit && found == retained_ready.end())
                     matching = check(false, "retained_readiness_capacity_exhausted", record);
@@ -3883,7 +3605,6 @@ struct AtlasDrawAudit final {
         }
     }
 };
-
 struct BrowserAudit final {
     AtlasDrawAudit atlas_draws;
     bool owned_atlas_seen = false;
@@ -3892,19 +3613,15 @@ struct BrowserAudit final {
     FirstAuditFailure owned_atlas_failure;
     std::optional<nlohmann::json> prior_scenario_atlas_draw;
     std::map<std::string, std::size_t, std::less<>> renderer_reconstructions;
-
     struct Bounds final {
         double x = 0.0;
         double y = 0.0;
         double width = 0.0;
         double height = 0.0;
-
         [[nodiscard]] bool valid() const noexcept { return width > 0.0 && height > 0.0; }
-
         [[nodiscard]] bool contains_horizontally(const Bounds& inner, const double tolerance = 1.0) const noexcept {
             return inner.x >= x - tolerance && inner.x + inner.width <= x + width + tolerance;
         }
-
         [[nodiscard]] bool contains(const Bounds& inner, const double tolerance = 1.0) const noexcept {
             return contains_horizontally(inner, tolerance) && inner.y >= y - tolerance && inner.y + inner.height <= y + height + tolerance;
         }
@@ -3922,7 +3639,6 @@ struct BrowserAudit final {
         double height = 0.0;
         std::string control;
     };
-
     std::set<std::string, std::less<>> controls;
     std::map<std::string, Bounds, std::less<>> page_bounds;
     Bounds train_setup;
@@ -4133,11 +3849,10 @@ struct BrowserAudit final {
     std::uint64_t compiled_width = 0U;
     std::uint64_t compiled_height = 0U;
     std::uint64_t presentation_receipt = 0U;
-
     [[nodiscard]] bool held_placeholder_motion(const std::uint64_t index, const std::uint64_t generation) const {
         const auto held = atlas_draws.held_stages.find("held-visible");
-        if (!atlas_draws.valid || held == atlas_draws.held_stages.end() || pending_hover_index != index ||
-            pending_read_generation != generation || held_visible_ordinal == 0U || pending_hover_ordinal <= held_visible_ordinal)
+        if (!atlas_draws.valid || held == atlas_draws.held_stages.end() || pending_hover_index != index || pending_read_generation != generation ||
+            held_visible_ordinal == 0U || pending_hover_ordinal <= held_visible_ordinal)
             return false;
         const auto& draw = held->second;
         const auto columns = scalar(draw, "columns"), side = scalar(draw, "card_extent");
@@ -4147,12 +3862,10 @@ struct BrowserAudit final {
         const auto slot = static_cast<std::size_t>(image - indices.begin());
         return std::ranges::any_of(shared_explore_motion, [&](const auto& motion) {
             return motion.ordinal > held_visible_ordinal && motion.ordinal < pending_hover_ordinal &&
-                   motion.x >= static_cast<double>((slot % columns) * side) &&
-                   motion.x < static_cast<double>((slot % columns + 1U) * side) &&
+                   motion.x >= static_cast<double>((slot % columns) * side) && motion.x < static_cast<double>((slot % columns + 1U) * side) &&
                    motion.y >= static_cast<double>((slot / columns) * side) && motion.y < static_cast<double>((slot / columns + 1U) * side);
         });
     }
-
     void consume_gallery_generation(const nlohmann::json& record) {
         const auto generation = scalar(record, "gallery_generation");
         const auto indices = record.find("visible_indices");
@@ -4203,7 +3916,6 @@ struct BrowserAudit final {
             gallery_generations.emplace(generation, evidence);
         }
     }
-
     void consume(const nlohmann::json& record) {
         atlas_draws.consume(record);
         const auto surface_event = record.value("event", "");
@@ -4225,8 +3937,7 @@ struct BrowserAudit final {
                     if (prior) context["prior"] = *prior;
                     return context;
                 });
-            owned_atlas_interrupted =
-                owned_atlas_interrupted || (owned_atlas_current && (control.empty() || control == kExploreGalleryControl));
+            owned_atlas_interrupted = owned_atlas_interrupted || (owned_atlas_current && (control.empty() || control == kExploreGalleryControl));
         }
         ++ordinal;
         const std::string event = record.value("event", "");
@@ -4391,30 +4102,28 @@ struct BrowserAudit final {
                     train_diagnostics = bounds;
             }
         } else if (event == "integration.fluent_shell") {
-            fluent = record.value("control", "") == "navigation" &&
-                     (record.value("detail", "") == "light" || record.value("detail", "") == "dark") && numeric(record, "a") > 0.0 &&
-                     numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 && numeric(record, "d") == 1.0;
+            fluent = record.value("control", "") == "navigation" && (record.value("detail", "") == "light" || record.value("detail", "") == "dark") &&
+                     numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 && numeric(record, "d") == 1.0;
         } else if (event == "integration.rendered_style") {
             if (record.value("detail", "") == "shared-primary" && numeric(record, "d") == 1.0 &&
                 (numeric(record, "a") > 0.0 || numeric(record, "b") > 0.0 || numeric(record, "c") > 0.0)) {
                 shared_primary.insert(record.value("control", ""));
-                shared_primary_colors.insert_or_assign(record.value("control", ""), std::array{numeric(record, "a"), numeric(record, "b"),
-                                                                                               numeric(record, "c"), numeric(record, "d")});
+                shared_primary_colors.insert_or_assign(record.value("control", ""),
+                                                       std::array{numeric(record, "a"), numeric(record, "b"), numeric(record, "c"), numeric(record, "d")});
                 rendered_style_keys.insert_or_assign(record.value("control", ""), scalar(record, "render_key"));
             }
             benchmark_purple =
-                benchmark_purple ||
-                (record.value("control", "") == BENCHMARK_OVERRIDE && record.value("detail", "") == "benchmark-purple" &&
-                 std::abs(numeric(record, "a") - 138.0 / 255.0) < 0.001 && std::abs(numeric(record, "b") - 43.0 / 255.0) < 0.001 &&
-                 std::abs(numeric(record, "c") - 226.0 / 255.0) < 0.001 && numeric(record, "d") == 1.0);
+                benchmark_purple || (record.value("control", "") == BENCHMARK_OVERRIDE && record.value("detail", "") == "benchmark-purple" &&
+                                     std::abs(numeric(record, "a") - 138.0 / 255.0) < 0.001 && std::abs(numeric(record, "b") - 43.0 / 255.0) < 0.001 &&
+                                     std::abs(numeric(record, "c") - 226.0 / 255.0) < 0.001 && numeric(record, "d") == 1.0);
             if (record.value("detail", "") == "benchmark-purple")
                 rendered_style_keys.insert_or_assign(record.value("control", ""), scalar(record, "render_key"));
         } else if (event == "integration.rendered_control") {
             const std::string control = record.value("control", "");
             const auto key = scalar(record, "a");
             const double scale = numeric(record, "d");
-            bounds_valid = bounds_valid && !control.empty() && key != 0U && numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 &&
-                           scale > 0.0 && rendered_style_keys.contains(control) && rendered_style_keys.at(control) == key &&
+            bounds_valid = bounds_valid && !control.empty() && key != 0U && numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 && scale > 0.0 &&
+                           rendered_style_keys.contains(control) && rendered_style_keys.at(control) == key &&
                            (!rendered_control_keys.contains(control) || rendered_control_keys.at(control) == key);
             if (!control.empty() && key != 0U) {
                 rendered_controls.insert(control);
@@ -4422,8 +4131,7 @@ struct BrowserAudit final {
                 rendered_control_scales.insert_or_assign(control, scale);
             }
         } else if (event == "integration.model_copy") {
-            model_copy = record.value("control", "") == TRAIN_MODEL_CARD && record.value("detail", "") == "RF-DETR Weights" &&
-                         numeric(record, "a") == 1.0;
+            model_copy = record.value("control", "") == TRAIN_MODEL_CARD && record.value("detail", "") == "RF-DETR Weights" && numeric(record, "a") == 1.0;
         } else if (event == "integration.explore_integer") {
             if (scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == 1U && scalar(record, "d") == 1U) {
                 const auto control = record.value("control", "");
@@ -4436,27 +4144,24 @@ struct BrowserAudit final {
                 }
             }
         } else if (event == "integration.explore_integer_paste_baseline") {
-            if (!explore_seed_control.empty() && record.value("control", "") == explore_seed_control &&
-                scalar(record, "detail") != explore_seed_target && scalar(record, "a") != 0U && scalar(record, "c") == 1U &&
-                scalar(record, "d") == 1U)
+            if (!explore_seed_control.empty() && record.value("control", "") == explore_seed_control && scalar(record, "detail") != explore_seed_target &&
+                scalar(record, "a") != 0U && scalar(record, "c") == 1U && scalar(record, "d") == 1U)
                 explore_paste_baseline = record;
         } else if (event == "integration.explore_integer_paste") {
-            if (explore_paste_baseline && record.value("control", "") == explore_seed_control &&
-                scalar(record, "detail") == explore_seed_target && scalar(record, "a") == scalar(*explore_paste_baseline, "a") &&
-                scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == 1U && scalar(record, "d") == 1U)
+            if (explore_paste_baseline && record.value("control", "") == explore_seed_control && scalar(record, "detail") == explore_seed_target &&
+                scalar(record, "a") == scalar(*explore_paste_baseline, "a") && scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == 1U &&
+                scalar(record, "d") == 1U)
                 explore_paste_value = record;
         } else if (event == "integration.explore_integer_paste_restored") {
             explore_paste_restored = explore_paste_baseline && explore_paste_value && record.value("control", "") == explore_seed_control &&
                                      scalar(record, "detail") == scalar(*explore_paste_baseline, "detail") &&
-                                     scalar(record, "a") == scalar(*explore_paste_value, "b") &&
-                                     scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == 1U && scalar(record, "d") == 1U;
+                                     scalar(record, "a") == scalar(*explore_paste_value, "b") && scalar(record, "b") > scalar(record, "a") &&
+                                     scalar(record, "c") == 1U && scalar(record, "d") == 1U;
         } else if (event == "integration.atlas_resize_measured") {
-            if (record.value("detail", "") == "detail-layout" && numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 &&
-                scalar(record, "d") == 1U)
+            if (record.value("detail", "") == "detail-layout" && numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 && scalar(record, "d") == 1U)
                 detail_resize_measurements.insert(scalar(record, "a"));
         } else if (event == "integration.atlas_resize") {
-            if (numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 && scalar(record, "c") > 0U &&
-                scalar(record, "d") >= scalar(record, "c"))
+            if (numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 && scalar(record, "c") > 0U && scalar(record, "d") >= scalar(record, "c"))
                 measured_resize_returns.insert(record.value("detail", ""));
         } else if (event == "integration.spinnerless") {
             const bool valid = numeric(record, "b") == 1.0 && numeric(record, "c") == 1.0 && numeric(record, "d") == 1.0;
@@ -4486,15 +4191,13 @@ struct BrowserAudit final {
                                   numeric(record, "b") >= 0.5 && std::abs(displayed - numeric(record, "a") / numeric(record, "b")) <= 0.5 &&
                                   std::abs(numeric(record, "c") - 6.0) < 0.01 && std::abs(numeric(record, "d") - 6.0) < 0.01;
         } else if (event == "integration.workspace_fps_pixels") {
-            workspace_fps_pixels |= record.value("control", "") == kExploreGalleryControl &&
-                                    record.value("detail", "") == "visible-counter" && numeric(record, "a") > 0.0 &&
-                                    numeric(record, "b") >= 0.5 && numeric(record, "c") >= 12.0 && numeric(record, "d") > 0.0;
+            workspace_fps_pixels |= record.value("control", "") == kExploreGalleryControl && record.value("detail", "") == "visible-counter" &&
+                                    numeric(record, "a") > 0.0 && numeric(record, "b") >= 0.5 && numeric(record, "c") >= 12.0 && numeric(record, "d") > 0.0;
         } else if (event == "integration.perceptual_controls") {
             perceptual_controls_round_trip = true;
         } else if (event == "integration.benchmark_override") {
             benchmark_round_trip = record.value("control", "") == BENCHMARK_OVERRIDE && record.value("detail", "") == "round-trip" &&
-                                   numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 &&
-                                   numeric(record, "d") > numeric(record, "c");
+                                   numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 && numeric(record, "d") > numeric(record, "c");
         } else if (event == "integration.bootstrap") {
             bootstrap = record.value("detail", "") == "typed-bootstrap";
         } else if (event == "integration.dataset_configured") {
@@ -4504,16 +4207,15 @@ struct BrowserAudit final {
             compile_completed = scalar(record, "b");
             compile_total = scalar(record, "c");
             compile_dropped = scalar(record, "d");
-            progress = record.value("control", "") == COMPILE_PROGRESS && scalar(record, "a") != 0U &&
-                       !record.value("detail", "").empty() && compile_total != 0U && compile_completed <= compile_total;
+            progress = record.value("control", "") == COMPILE_PROGRESS && scalar(record, "a") != 0U && !record.value("detail", "").empty() &&
+                       compile_total != 0U && compile_completed <= compile_total;
             if (progress && progress_ordinal == 0U) progress_ordinal = ordinal;
         } else if (event == "integration.compile_metrics") {
             const std::uint64_t elapsed = scalar(record, "a");
             const auto expected = mmltk::backend::data::estimate_progress(compile_completed, compile_total, elapsed);
-            compile_metrics = record.value("control", "") == COMPILE_PROGRESS &&
-                              record.value("detail", "") == "elapsed-eta-throughput-dropped" && compile_dropped != 0U &&
-                              scalar(record, "b") == expected.remaining_seconds && scalar(record, "c") == expected.throughput_per_second &&
-                              scalar(record, "d") == compile_dropped;
+            compile_metrics = record.value("control", "") == COMPILE_PROGRESS && record.value("detail", "") == "elapsed-eta-throughput-dropped" &&
+                              compile_dropped != 0U && scalar(record, "b") == expected.remaining_seconds &&
+                              scalar(record, "c") == expected.throughput_per_second && scalar(record, "d") == compile_dropped;
         } else if (event == "integration.dataset_complete") {
             dataset_complete = true;
             dataset_complete_ordinal = ordinal;
@@ -4521,11 +4223,10 @@ struct BrowserAudit final {
             compiled_width = scalar(record, "c");
             compiled_height = scalar(record, "d");
         } else if (event == "integration.explore_ready") {
-            explore_ready =
-                scalar(record, "a") != 0U && scalar(record, "b") != 0U && scalar(record, "c") != 0U && scalar(record, "d") != 0U;
+            explore_ready = scalar(record, "a") != 0U && scalar(record, "b") != 0U && scalar(record, "c") != 0U && scalar(record, "d") != 0U;
         } else if (event == "integration.explore_sweep_observed") {
-            sweep = record.value("detail", "") == "typed-viewport" && scalar(record, "b") > scalar(record, "a") &&
-                    scalar(record, "c") != 0U && scalar(record, "d") != 0U;
+            sweep = record.value("detail", "") == "typed-viewport" && scalar(record, "b") > scalar(record, "a") && scalar(record, "c") != 0U &&
+                    scalar(record, "d") != 0U;
         } else if (event == "integration.explore_scrolled") {
             scrolled = scalar(record, "b") > scalar(record, "a");
         } else if (event == "integration.explore_detail") {
@@ -4541,10 +4242,9 @@ struct BrowserAudit final {
                 if (valid) augmentation_frames.insert_or_assign(1U, frame_revision);
             }
         } else if (event == "integration.explore_reshuffle") {
-            reshuffle_order_only = record.value("detail", "") == "order-only" && scalar(record, "b") > scalar(record, "a") &&
-                                   scalar(record, "c") == scalar(record, "d");
-        } else if (event == "integration.annotation_pixel" || event == "integration.annotation_swatch" ||
-                   event == "integration.annotation_capability") {
+            reshuffle_order_only =
+                record.value("detail", "") == "order-only" && scalar(record, "b") > scalar(record, "a") && scalar(record, "c") == scalar(record, "d");
+        } else if (event == "integration.annotation_pixel" || event == "integration.annotation_swatch" || event == "integration.annotation_capability") {
             const auto expected = record.value("expected", std::vector<double>{});
             const auto observed = record.value("observed", std::vector<double>{});
             double tolerance = event == "integration.annotation_pixel" ? 24.0 : 3.0;
@@ -4569,8 +4269,7 @@ struct BrowserAudit final {
                     error = std::max(error, std::abs(expected[channel] - (observed[channel] - minimum) * gain));
                 }
                 bool blended = false;
-                if (matched && event == "integration.annotation_pixel" && scale < 1.0 &&
-                    std::ranges::max(expected) != std::ranges::min(expected)) {
+                if (matched && event == "integration.annotation_pixel" && scale < 1.0 && std::ranges::max(expected) != std::ranges::min(expected)) {
                     // Independently verify filtered coverage over the pixel-evidence PNG fixture.
                     constexpr std::array background{48.0, 80.0, 112.0};
                     double dot = 0.0, norm = 0.0;
@@ -4582,17 +4281,14 @@ struct BrowserAudit final {
                     const double coverage = norm > 0.0 ? dot / norm : 0.0;
                     blended = coverage >= scale / 2.0 && coverage <= 1.0;
                     for (std::size_t channel = 0U; channel < 3U; ++channel)
-                        blended = blended &&
-                                  std::abs(observed[channel] -
-                                           std::lerp(background[channel], expected[channel], coverage)) <= 3.0;
+                        blended = blended && std::abs(observed[channel] - std::lerp(background[channel], expected[channel], coverage)) <= 3.0;
                 }
                 matched = matched && (error <= tolerance || blended);
             }
             annotation_pixels_valid = annotation_pixels_valid && matched;
             if (event == "integration.annotation_pixel") {
                 annotation_pixels_valid = annotation_pixels_valid && scalar(record, "a") != 0U && scalar(record, "b") != 0U;
-                if (annotation_pixel_frames.size() < kAcceptanceRecordLimit)
-                    annotation_pixel_frames.emplace(scalar(record, "a"), scalar(record, "b"));
+                if (annotation_pixel_frames.size() < kAcceptanceRecordLimit) annotation_pixel_frames.emplace(scalar(record, "a"), scalar(record, "b"));
             } else if (event == "integration.annotation_swatch")
                 ++annotation_swatches;
             else
@@ -4605,16 +4301,14 @@ struct BrowserAudit final {
                 annotation_reachable[record.value("detail", "")].insert(record.value("control", ""));
         } else if (event == "integration.annotation_layout") {
             annotation_layouts.insert(record.value("detail", ""));
-            annotation_layout_valid =
-                annotation_layout_valid && numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 &&
-                std::abs(numeric(record, "a") / numeric(record, "c") - 0.62) < 0.002 &&
-                std::abs(numeric(record, "b") / numeric(record, "c") - 0.19) < 0.002 && numeric(record, "c") >= 1020.0 &&
-                numeric(record, "c") <= 1500.0 &&
-                (record.value("detail", "") == "narrow" ? numeric(record, "d") < 1020.0 : numeric(record, "d") >= 1020.0);
+            annotation_layout_valid = annotation_layout_valid && numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 &&
+                                      std::abs(numeric(record, "a") / numeric(record, "c") - 0.62) < 0.002 &&
+                                      std::abs(numeric(record, "b") / numeric(record, "c") - 0.19) < 0.002 && numeric(record, "c") >= 1020.0 &&
+                                      numeric(record, "c") <= 1500.0 &&
+                                      (record.value("detail", "") == "narrow" ? numeric(record, "d") < 1020.0 : numeric(record, "d") >= 1020.0);
         } else if (event == "integration.annotation_product") {
             ++annotation_product_operations[record.value("detail", "")];
-            annotation_pixels_valid =
-                annotation_pixels_valid && annotation_pixel_frames.contains({scalar(record, "a"), scalar(record, "b")});
+            annotation_pixels_valid = annotation_pixels_valid && annotation_pixel_frames.contains({scalar(record, "a"), scalar(record, "b")});
         } else if (event == "integration.annotation_preview") {
             if (scalar(record, "b") > scalar(record, "a") && scalar(record, "c") != 0U) ++annotation_previews;
         } else if (event == "integration.annotation_shape") {
@@ -4666,14 +4360,12 @@ struct BrowserAudit final {
         } else if (event == "integration.atlas_scroll") {
             atlas_scroll_stages.emplace(record.value("detail", ""));
         } else if (event == "integration.gallery_no_input_complete") {
-            gallery_no_input_complete =
-                scalar(record, "a") != 0U && scalar(record, "b") != 0U && scalar(record, "c") != 0U && scalar(record, "d") != 0U;
+            gallery_no_input_complete = scalar(record, "a") != 0U && scalar(record, "b") != 0U && scalar(record, "c") != 0U && scalar(record, "d") != 0U;
         } else if (event == "integration.atlas_canvas_pixels") {
-            if (scalar(record, "c") != 0U && scalar(record, "c") == scalar(record, "d"))
-                atlas_canvas_pixels.emplace(scalar(record, "a"), scalar(record, "b"));
+            if (scalar(record, "c") != 0U && scalar(record, "c") == scalar(record, "d")) atlas_canvas_pixels.emplace(scalar(record, "a"), scalar(record, "b"));
         } else if (event == "integration.initial_atlas_complete") {
-            initial_atlas_complete = record.value("detail", "") == "no-input-canvas-pixels" && scalar(record, "a") != 0U &&
-                                     scalar(record, "b") != 0U && atlas_canvas_pixels.contains({scalar(record, "c"), scalar(record, "d")});
+            initial_atlas_complete = record.value("detail", "") == "no-input-canvas-pixels" && scalar(record, "a") != 0U && scalar(record, "b") != 0U &&
+                                     atlas_canvas_pixels.contains({scalar(record, "c"), scalar(record, "d")});
         } else if (event == "integration.viewer_complete") {
             viewer_presentation = scalar(record, "a");
             viewer_complete = scalar(record, "a") != 0U && scalar(record, "b") != 0U && scalar(record, "c") == 1U;
@@ -4681,8 +4373,7 @@ struct BrowserAudit final {
             if (scalar(record, "c") != 0U && scalar(record, "d") != 0U) viewer_overlay_modes.insert(scalar(record, "b"));
         } else if (event == "integration.viewer_label_rgb") {
             if (viewer_label_colors.size() < 256U || viewer_label_colors.contains(scalar(record, "a")))
-                viewer_label_colors.insert_or_assign(scalar(record, "a"),
-                                                     std::array{numeric(record, "b"), numeric(record, "c"), numeric(record, "d")});
+                viewer_label_colors.insert_or_assign(scalar(record, "a"), std::array{numeric(record, "b"), numeric(record, "c"), numeric(record, "d")});
         } else if (event == "integration.viewer_label_frame") {
             if (record.value("detail", "") == "exact-scene-product" && scalar(record, "d") == 0U && scalar(record, "b") != 0U)
                 viewer_label_products.emplace(scalar(record, "c"), scalar(record, "a"));
@@ -4690,12 +4381,11 @@ struct BrowserAudit final {
             const auto found = viewer_label_colors.find(scalar(record, "a"));
             if (found != viewer_label_colors.end() && scalar(record, "b") != 0U) {
                 std::uint8_t red = 0U, green = 0U, blue = 0U;
-                mmltk::backend::imaging::raster::detail::color::class_color(static_cast<int>(scalar(record, "a")),
-                                                                            static_cast<int>(scalar(record, "b")), red, green, blue);
+                mmltk::backend::imaging::raster::detail::color::class_color(static_cast<int>(scalar(record, "a")), static_cast<int>(scalar(record, "b")), red,
+                                                                            green, blue);
                 const std::array expected{red, green, blue};
                 for (std::size_t channel = 0U; channel != expected.size(); ++channel)
-                    viewer_class_colors =
-                        viewer_class_colors && std::abs(found->second[channel] - expected[channel] / 255.0) <= 1.0 / 255.0;
+                    viewer_class_colors = viewer_class_colors && std::abs(found->second[channel] - expected[channel] / 255.0) <= 1.0 / 255.0;
                 viewer_labels_without_boxes = viewer_labels_without_boxes || scalar(record, "c") == 0U;
             }
         } else if (event == "integration.explore_detail_source") {
@@ -4704,8 +4394,7 @@ struct BrowserAudit final {
         } else if (event == "integration.explore_detail_fit") {
             detail_fit = record.value("detail", "") == "centered-contained" && numeric(record, "c") <= numeric(record, "a") + 1.0 &&
                          numeric(record, "d") <= numeric(record, "b") + 1.0 &&
-                         (std::abs(numeric(record, "c") - numeric(record, "a")) < 1.0 ||
-                          std::abs(numeric(record, "d") - numeric(record, "b")) < 1.0);
+                         (std::abs(numeric(record, "c") - numeric(record, "a")) < 1.0 || std::abs(numeric(record, "d") - numeric(record, "b")) < 1.0);
         } else if (event == "integration.viewer_sample" && numeric(record, "d") > 0.0) {
             original_detail_drawn = original_detail_drawn || (scalar(record, "a") == 512U && scalar(record, "b") == 256U &&
                                                               std::abs(numeric(record, "c") / numeric(record, "d") - 2.0) < 0.01);
@@ -4714,30 +4403,27 @@ struct BrowserAudit final {
                        scalar(record, "c") != 0U && scalar(record, "d") != 0U;
         } else if (event == "integration.ui_scale_drag") {
             if (record.value("detail", "") == "second-position")
-                ui_scale_drag = numeric(record, "a") == numeric(record, "c") && numeric(record, "b") > 0.85 &&
-                                numeric(record, "a") != numeric(record, "b") && numeric(record, "d") == 2.0;
+                ui_scale_drag = numeric(record, "a") == numeric(record, "c") && numeric(record, "b") > 0.85 && numeric(record, "a") != numeric(record, "b") &&
+                                numeric(record, "d") == 2.0;
             else if (record.value("detail", "") == "released-and-settled")
-                ui_scale_released =
-                    numeric(record, "b") > 0.85 && numeric(record, "b") == numeric(record, "c") && numeric(record, "d") != 0.0;
+                ui_scale_released = numeric(record, "b") > 0.85 && numeric(record, "b") == numeric(record, "c") && numeric(record, "d") != 0.0;
         } else if (event == "integration.ui_scale_pointer") {
             const std::string stage = record.value("detail", "");
             const bool pressed = stage != "released";
-            if (record.value("control", "") == "settings.ui_scale" && numeric(record, "b") == (pressed ? 1.0 : 0.0) &&
-                numeric(record, "c") > 0.0 && numeric(record, "d") > 0.0)
+            if (record.value("control", "") == "settings.ui_scale" && numeric(record, "b") == (pressed ? 1.0 : 0.0) && numeric(record, "c") > 0.0 &&
+                numeric(record, "d") > 0.0)
                 ui_scale_pointer_stages.insert(stage);
         } else if (event == "integration.ui_scale_restored") {
             ui_scale_restored = record.value("control", "") == "settings.ui_scale" && record.value("detail", "") == "baseline" &&
-                                numeric(record, "a") == numeric(record, "b") && numeric(record, "b") == numeric(record, "c") &&
-                                numeric(record, "d") != 0.0;
+                                numeric(record, "a") == numeric(record, "b") && numeric(record, "b") == numeric(record, "c") && numeric(record, "d") != 0.0;
         } else if (event == "integration.error_modal") {
-            error_modal_usable = record.value("detail", "") == "copy-and-dismiss" && numeric(record, "a") == 1.0 &&
-                                 numeric(record, "b") == 1.0 && numeric(record, "c") == 1.0;
+            error_modal_usable =
+                record.value("detail", "") == "copy-and-dismiss" && numeric(record, "a") == 1.0 && numeric(record, "b") == 1.0 && numeric(record, "c") == 1.0;
         } else if (event == "integration.explore_exact_grid") {
             const auto columns = scalar(record, "c");
             const auto rows = scalar(record, "d");
-            exact_grid = record.value("detail", "") == "oversized-logical-fill" && columns != 0U && rows != 0U &&
-                         scalar(record, "a") % columns == 0U && scalar(record, "b") % rows == 0U &&
-                         scalar(record, "a") / columns == scalar(record, "b") / rows;
+            exact_grid = record.value("detail", "") == "oversized-logical-fill" && columns != 0U && rows != 0U && scalar(record, "a") % columns == 0U &&
+                         scalar(record, "b") % rows == 0U && scalar(record, "a") / columns == scalar(record, "b") / rows;
             exact_grid_width = scalar(record, "a");
             exact_grid_height = scalar(record, "b");
         } else if (event == "integration.explore_exact_grid_capacity") {
@@ -4746,16 +4432,15 @@ struct BrowserAudit final {
             exact_grid_capacity_width = scalar(record, "c");
             exact_grid_capacity_height = scalar(record, "d");
         } else if (event == "integration.explore_scroll_placeholder") {
-            newest_placeholder = record.value("detail", "") == "newest-without-wait-all" && scalar(record, "a") != 0U &&
-                                 scalar(record, "b") != 0U && scalar(record, "c") != 0U && scalar(record, "d") != 0U;
+            newest_placeholder = record.value("detail", "") == "newest-without-wait-all" && scalar(record, "a") != 0U && scalar(record, "b") != 0U &&
+                                 scalar(record, "c") != 0U && scalar(record, "d") != 0U;
         } else if (event == "integration.explore_final_cursor") {
             final_cursor_revision = scalar(record, "a");
             final_cursor_frame_revision = scalar(record, "b");
             final_cursor_generation = scalar(record, "c");
             final_cursor_slot_count = scalar(record, "d");
         } else if (event == "integration.explore_pointer_inverse") {
-            pointer_inverse = record.value("detail", "") == "rendered-grid-slot" && scalar(record, "a") == scalar(record, "b") &&
-                              scalar(record, "d") != 0U;
+            pointer_inverse = record.value("detail", "") == "rendered-grid-slot" && scalar(record, "a") == scalar(record, "b") && scalar(record, "d") != 0U;
             pointer_slot = scalar(record, "a");
             pointer_compiled_index = scalar(record, "c");
             pointer_revision = scalar(record, "d");
@@ -4764,19 +4449,18 @@ struct BrowserAudit final {
         } else if (event == "integration.surface_click_dispatched" && record.value("control", "") == kExploreGalleryControl) {
             const auto dispatched_frame_revision = scalar(record, "a");
             const bool dispatched = record.value("detail", "") == "real-canvas-pointer" && pending_pointer_frame_revision != 0U &&
-                                    dispatched_frame_revision >= pending_pointer_frame_revision &&
-                                    surface_draws.contains(scalar(record, "b")) &&
-                                    surface_scales.contains(std::pair{scalar(record, "b"), dispatched_frame_revision}) &&
-                                    numeric(record, "c") > 0.0 && numeric(record, "d") > 0.0;
+                                    dispatched_frame_revision >= pending_pointer_frame_revision && surface_draws.contains(scalar(record, "b")) &&
+                                    surface_scales.contains(std::pair{scalar(record, "b"), dispatched_frame_revision}) && numeric(record, "c") > 0.0 &&
+                                    numeric(record, "d") > 0.0;
             if (dispatched) {
                 pointer_dispatched = true;
                 pending_pointer_frame_revision = dispatched_frame_revision;
             }
         } else if (event == "integration.explore_pointer_selected") {
-            const bool selected = record.value("detail", "") == "selected-from-dispatched-pointer" &&
-                                  scalar(record, "a") == pointer_revision && scalar(record, "b") == pointer_slot &&
-                                  scalar(record, "c") == pointer_compiled_index && scalar(record, "c") == scalar(record, "d") &&
-                                  explore_slots.contains(pointer_revision) && explore_slots.at(pointer_revision).contains(pointer_slot) &&
+            const bool selected = record.value("detail", "") == "selected-from-dispatched-pointer" && scalar(record, "a") == pointer_revision &&
+                                  scalar(record, "b") == pointer_slot && scalar(record, "c") == pointer_compiled_index &&
+                                  scalar(record, "c") == scalar(record, "d") && explore_slots.contains(pointer_revision) &&
+                                  explore_slots.at(pointer_revision).contains(pointer_slot) &&
                                   explore_slots.at(pointer_revision).at(pointer_slot) == pointer_compiled_index &&
                                   observed_frame_revision_for_slots(explore_slots.at(pointer_revision), pending_pointer_frame_revision);
             if (selected) {
@@ -4802,9 +4486,8 @@ struct BrowserAudit final {
                 atlas_identities = true;
             }
         } else if (event == "integration.upscale_growth") {
-            const bool complete_growth =
-                record.value("detail", "").ends_with("-four-times") && scalar(record, "c") == scalar(record, "a") * 4U &&
-                scalar(record, "d") == scalar(record, "b") * 4U && (scalar(record, "c") > 1500U || scalar(record, "d") > 1125U);
+            const bool complete_growth = record.value("detail", "").ends_with("-four-times") && scalar(record, "c") == scalar(record, "a") * 4U &&
+                                         scalar(record, "d") == scalar(record, "b") * 4U && (scalar(record, "c") > 1500U || scalar(record, "d") > 1125U);
             upscale_growth = upscale_growth || complete_growth;
             if (complete_growth) upscale_modes.insert(record.value("detail", ""));
         } else if (event == "integration.upscale_presentation") {
@@ -4814,12 +4497,12 @@ struct BrowserAudit final {
             upscale_presentation = upscale_presentation || complete_presentation;
             if (complete_presentation) upscale_presentations.insert(record.value("control", ""));
         } else if (event == "integration.upscale_completed_pixels") {
-            if (record.value("detail", "") == "exact-completed-blue" && scalar(record, "a") > 0U && scalar(record, "b") > 0U &&
-                scalar(record, "c") > 0U && scalar(record, "d") >= 32U)
+            if (record.value("detail", "") == "exact-completed-blue" && scalar(record, "a") > 0U && scalar(record, "b") > 0U && scalar(record, "c") > 0U &&
+                scalar(record, "d") >= 32U)
                 upscale_completed_pixels.insert(record.value("control", ""));
         } else if (event == "integration.upscale_same_method") {
-            if (record.value("detail", "") == "same-completed-result" && scalar(record, "a") > 0U && scalar(record, "b") > 0U &&
-                scalar(record, "c") > 0U && scalar(record, "d") == 1U)
+            if (record.value("detail", "") == "same-completed-result" && scalar(record, "a") > 0U && scalar(record, "b") > 0U && scalar(record, "c") > 0U &&
+                scalar(record, "d") == 1U)
                 upscale_same_method.insert(record.value("control", ""));
         } else if (event == "integration.upscale_later_frame") {
             upscale_later_frame = record.value("detail", "") == "distinct-imported-frame" && scalar(record, "b") > scalar(record, "a") &&
@@ -4830,8 +4513,7 @@ struct BrowserAudit final {
             annotation_tool = record.value("detail", "") == "typed-tool" && record.value("control", "").starts_with("annotation.tool.") &&
                               scalar(record, "b") > scalar(record, "a");
         } else if (event == "integration.annotation_pointer_observed") {
-            annotation_pointer =
-                record.value("detail", "") == "typed-interaction" && scalar(record, "b") > scalar(record, "a") && scalar(record, "c") != 0U;
+            annotation_pointer = record.value("detail", "") == "typed-interaction" && scalar(record, "b") > scalar(record, "a") && scalar(record, "c") != 0U;
         } else if (event == "integration.surface_draw") {
             const std::uint64_t revision = scalar(record, "a");
             if (revision != 0U && record.value("detail", "") == "draw") surface_draws.insert(revision);
@@ -4862,8 +4544,7 @@ struct BrowserAudit final {
                 bounds_valid = false;
         } else if (event == "integration.surface_content") {
             const auto key = std::pair{scalar(record, "a"), scalar(record, "b")};
-            if (record.value("detail", "") == "exported-native-frame" &&
-                (surface_contents.contains(key) || surface_contents.size() < kAcceptanceRecordLimit))
+            if (record.value("detail", "") == "exported-native-frame" && (surface_contents.contains(key) || surface_contents.size() < kAcceptanceRecordLimit))
                 surface_contents.insert_or_assign(key, std::pair{scalar(record, "c"), scalar(record, "d")});
             else if (record.value("detail", "") == "exported-native-frame")
                 bounds_valid = false;
@@ -4887,8 +4568,7 @@ struct BrowserAudit final {
             firefox_import = true;
         } else if (event == "firefox.workspace.claim_outcome") {
             firefox_claim = record.value("outcome", "") == "claimed";
-        } else if (event == "firefox.workspace.ready" || event == "firefox.workspace.import_ready_emitted" ||
-                   event == "firefox.workspace.registry_inserted") {
+        } else if (event == "firefox.workspace.ready" || event == "firefox.workspace.import_ready_emitted" || event == "firefox.workspace.registry_inserted") {
             firefox_ready = true;
         } else if (event == "firefox.workspace.channel_terminal" && record.value("terminal", "") == "protocol_failure") {
             workspace_protocol_failure = true;
@@ -4896,7 +4576,6 @@ struct BrowserAudit final {
             panic = true;
         }
     }
-
     [[nodiscard]] std::string_view readiness_blocker() const {
         static const std::array expected{
             "navigation.train",
@@ -4980,16 +4659,14 @@ struct BrowserAudit final {
             SETTINGS_CLOSE,
         };
         static const std::array pages{"Train", "Validate", "Predict", "Export", "Live", "Annotate"};
-        static const std::array regions{"workflow.setup", "workflow.workspace_and_advanced", "workflow.workspace", "workflow.advanced",
-                                        "workflow.diagnostics"};
+        static const std::array regions{"workflow.setup", "workflow.workspace_and_advanced", "workflow.workspace", "workflow.advanced", "workflow.diagnostics"};
         const auto page_bound = [this](const std::string_view page, const std::string_view control) -> const Bounds* {
             const auto found = page_bounds.find(std::string{page} + ":" + std::string{control});
             return found == page_bounds.end() ? nullptr : &found->second;
         };
         const auto immediately_above = [](const Bounds& progress_bounds, const Bounds& action_bounds) {
             const double progress_bottom = progress_bounds.y + progress_bounds.height;
-            return progress_bounds.valid() && action_bounds.valid() && progress_bottom <= action_bounds.y + 1.0 &&
-                   action_bounds.y - progress_bottom <= 5.0;
+            return progress_bounds.valid() && action_bounds.valid() && progress_bottom <= action_bounds.y + 1.0 && action_bounds.y - progress_bottom <= 5.0;
         };
         const auto page_prefix = [](const std::string_view page) {
             return page == "Train"      ? "train"
@@ -5004,20 +4681,16 @@ struct BrowserAudit final {
         };
         const bool every_region = std::ranges::all_of(pages, [this, &page_prefix, &primary_action](const std::string_view page) {
             const std::string_view prefix = page_prefix(page);
-            return std::ranges::all_of(regions,
-                                       [this, page](const std::string_view region) {
-                                           return page_bounds.contains(std::string{page} + ":" + std::string{region});
-                                       }) &&
-                   page_bounds.contains(std::string{page} + ":" + primary_action(page)) &&
-                   page_bounds.contains(std::string{page} + ":" + prefix + ".status");
+            return std::ranges::all_of(
+                       regions, [this, page](const std::string_view region) { return page_bounds.contains(std::string{page} + ":" + std::string{region}); }) &&
+                   page_bounds.contains(std::string{page} + ":" + primary_action(page)) && page_bounds.contains(std::string{page} + ":" + prefix + ".status");
         });
-        const bool primary_progress_placement =
-            std::ranges::all_of(pages, [&page_bound, &immediately_above, &primary_action](const std::string_view page) {
-                const std::string action = primary_action(page);
-                const Bounds* const progress_bounds = page_bound(page, action + ".progress");
-                const Bounds* const action_bounds = page_bound(page, action);
-                return progress_bounds != nullptr && action_bounds != nullptr && immediately_above(*progress_bounds, *action_bounds);
-            });
+        const bool primary_progress_placement = std::ranges::all_of(pages, [&page_bound, &immediately_above, &primary_action](const std::string_view page) {
+            const std::string action = primary_action(page);
+            const Bounds* const progress_bounds = page_bound(page, action + ".progress");
+            const Bounds* const action_bounds = page_bound(page, action);
+            return progress_bounds != nullptr && action_bounds != nullptr && immediately_above(*progress_bounds, *action_bounds);
+        });
         const bool primary_action_geometry = std::ranges::all_of(pages, [&page_bound, &primary_action](const std::string_view page) {
             const std::string action = primary_action(page);
             const Bounds* const action_bounds = page_bound(page, action);
@@ -5030,18 +4703,17 @@ struct BrowserAudit final {
         const bool model_composition = [&] {
             if (!std::ranges::all_of(model_parts, [](const Bounds& bounds) { return bounds.valid(); })) return false;
             const auto& [selector, presets, divider, custom, status, action] = model_parts;
-            return std::ranges::all_of(model_parts, [this](const Bounds& part) { return model_card.contains(part); }) &&
-                   model_card.contains(model_progress) && selector.contains(presets) && selector.contains(divider) &&
-                   selector.contains(custom) && std::abs(custom.x - (selector.x + 2.0)) < 1.0 &&
+            return std::ranges::all_of(model_parts, [this](const Bounds& part) { return model_card.contains(part); }) && model_card.contains(model_progress) &&
+                   selector.contains(presets) && selector.contains(divider) && selector.contains(custom) && std::abs(custom.x - (selector.x + 2.0)) < 1.0 &&
                    std::abs(custom.width - (selector.width - 4.0)) < 1.0 && divider.y >= presets.y + presets.height - 1.0 &&
                    custom.y >= divider.y + divider.height - 1.0 && status.y >= selector.y + selector.height - 1.0 &&
                    model_progress.y >= status.y + status.height - 1.0 && action.y >= model_progress.y + model_progress.height - 1.0;
         }();
         const double page_width = train_setup.width + train_center.width + train_diagnostics.width;
-        const bool reference_columns =
-            train_setup.valid() && train_center.valid() && train_diagnostics.valid() && train_setup.x < train_center.x &&
-            train_center.x < train_diagnostics.x && page_width > 0.0 && std::abs(train_setup.width / page_width - 0.19) < 0.002 &&
-            std::abs(train_center.width / page_width - 0.62) < 0.002 && std::abs(train_diagnostics.width / page_width - 0.19) < 0.002;
+        const bool reference_columns = train_setup.valid() && train_center.valid() && train_diagnostics.valid() && train_setup.x < train_center.x &&
+                                       train_center.x < train_diagnostics.x && page_width > 0.0 && std::abs(train_setup.width / page_width - 0.19) < 0.002 &&
+                                       std::abs(train_center.width / page_width - 0.62) < 0.002 &&
+                                       std::abs(train_diagnostics.width / page_width - 0.19) < 0.002;
         const bool vertical_composition =
             train_workspace.valid() && train_advanced.valid() && train_workspace.y + train_workspace.height <= train_advanced.y + 1.0;
         const bool explore_composition = explore_dataset.valid() && explore_gallery.valid() && explore_details.valid() &&
@@ -5054,30 +4726,25 @@ struct BrowserAudit final {
         const Bounds* const annotation_advanced = page_bound("Annotate", "workflow.advanced");
         const Bounds* const annotation_save = page_bound("Annotate", "annotation.save");
         const bool annotation_composition =
-            annotation_workspace != nullptr && annotation_diagnostics != nullptr && annotation_setup != nullptr &&
-            annotation_center != nullptr && annotation_advanced != nullptr && annotation_save != nullptr && annotation_sidebar.valid() &&
-            annotation_timeline.valid() && annotation_operation.valid() && annotation_stop.valid() && annotation_brush.valid() &&
-            annotation_tool_control.valid() && annotation_diagnostics->contains_horizontally(annotation_sidebar) &&
-            annotation_diagnostics->contains_horizontally(annotation_operation) &&
-            annotation_diagnostics->contains_horizontally(annotation_stop) &&
-            annotation_diagnostics->contains_horizontally(annotation_brush) &&
-            annotation_diagnostics->contains_horizontally(annotation_tool_control) &&
-            annotation_center->contains_horizontally(annotation_timeline) && annotation_setup->contains(*annotation_save) &&
-            annotation_advanced->y >= annotation_workspace->y + annotation_workspace->height - 1.0 &&
-            std::abs(annotation_setup->width / page_width - 0.19) < 0.002 &&
-            std::abs(annotation_center->width / page_width - 0.62) < 0.002 &&
+            annotation_workspace != nullptr && annotation_diagnostics != nullptr && annotation_setup != nullptr && annotation_center != nullptr &&
+            annotation_advanced != nullptr && annotation_save != nullptr && annotation_sidebar.valid() && annotation_timeline.valid() &&
+            annotation_operation.valid() && annotation_stop.valid() && annotation_brush.valid() && annotation_tool_control.valid() &&
+            annotation_diagnostics->contains_horizontally(annotation_sidebar) && annotation_diagnostics->contains_horizontally(annotation_operation) &&
+            annotation_diagnostics->contains_horizontally(annotation_stop) && annotation_diagnostics->contains_horizontally(annotation_brush) &&
+            annotation_diagnostics->contains_horizontally(annotation_tool_control) && annotation_center->contains_horizontally(annotation_timeline) &&
+            annotation_setup->contains(*annotation_save) && annotation_advanced->y >= annotation_workspace->y + annotation_workspace->height - 1.0 &&
+            std::abs(annotation_setup->width / page_width - 0.19) < 0.002 && std::abs(annotation_center->width / page_width - 0.62) < 0.002 &&
             std::abs(annotation_diagnostics->width / page_width - 0.19) < 0.002 &&
             std::abs(annotation_center->x - annotation_setup->x - annotation_setup->width) < 1.0 &&
             std::abs(annotation_diagnostics->x - annotation_center->x - annotation_center->width) < 1.0;
         const bool settings_composition =
-            settings_modal.valid() && std::abs(settings_modal.width - 520.0) < 0.01 && settings_footer.valid() &&
-            settings_appearance.valid() && settings_typography.valid() && settings_show_fps.valid() && settings_environment.valid() &&
-            settings_appearance.y < settings_typography.y && settings_show_fps.y >= settings_appearance.y - 1.0 &&
+            settings_modal.valid() && std::abs(settings_modal.width - 520.0) < 0.01 && settings_footer.valid() && settings_appearance.valid() &&
+            settings_typography.valid() && settings_show_fps.valid() && settings_environment.valid() && settings_appearance.y < settings_typography.y &&
+            settings_show_fps.y >= settings_appearance.y - 1.0 &&
             settings_show_fps.y + settings_show_fps.height <= settings_appearance.y + settings_appearance.height + 1.0 &&
-            settings_typography.y < settings_environment.y && settings_environment.y < settings_footer.y && settings_reset.valid() &&
-            settings_close.valid() && settings_reset.x < settings_close.x && settings_reset.y >= settings_footer.y - 1.0 &&
-            settings_close.y >= settings_footer.y - 1.0 && settings_footer.contains_horizontally(settings_reset) &&
-            settings_footer.contains_horizontally(settings_close);
+            settings_typography.y < settings_environment.y && settings_environment.y < settings_footer.y && settings_reset.valid() && settings_close.valid() &&
+            settings_reset.x < settings_close.x && settings_reset.y >= settings_footer.y - 1.0 && settings_close.y >= settings_footer.y - 1.0 &&
+            settings_footer.contains_horizontally(settings_reset) && settings_footer.contains_horizontally(settings_close);
         const bool settings_numeric_alignment = [&] {
             const Bounds& reference_label = settings_numeric_labels.front();
             const Bounds& reference_value = settings_numeric_values.front();
@@ -5099,9 +4766,9 @@ struct BrowserAudit final {
             const Bounds& reference = fields.front();
             for (std::size_t index = 0; index < fields.size(); ++index) {
                 const Bounds& bounds = fields[index];
-                if (std::abs(bounds.y - reference.y) >= 1.0 || std::abs(bounds.width - reference.width) >= 1.0 ||
-                    bounds.x < train_advanced.x - 1.0 || bounds.x + bounds.width > train_advanced.x + train_advanced.width + 1.0 ||
-                    bounds.y < train_advanced.y - 1.0 || bounds.y + bounds.height > train_advanced.y + train_advanced.height + 1.0 ||
+                if (std::abs(bounds.y - reference.y) >= 1.0 || std::abs(bounds.width - reference.width) >= 1.0 || bounds.x < train_advanced.x - 1.0 ||
+                    bounds.x + bounds.width > train_advanced.x + train_advanced.width + 1.0 || bounds.y < train_advanced.y - 1.0 ||
+                    bounds.y + bounds.height > train_advanced.y + train_advanced.height + 1.0 ||
                     (index != 0U && bounds.x < fields[index - 1U].x + fields[index - 1U].width - 1.0)) {
                     return false;
                 }
@@ -5110,45 +4777,41 @@ struct BrowserAudit final {
         };
         const std::array advanced_general{advanced_fixed[0], advanced_fixed[1], advanced_fixed[2], advanced_fixed[3]};
         const std::array advanced_optimizer{advanced_fixed[4], advanced_fixed[5], advanced_fixed[6], advanced_fixed[7]};
-        const bool advanced_composition =
-            aligned_grid(advanced_general) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) &&
-            aligned_grid(advanced_denoising) && std::abs(advanced_general.front().width - advanced_optimizer.front().width) < 1.0 &&
-            std::abs(advanced_general.front().width - advanced_match_free.front().width) < 1.0 &&
-            std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 &&
-            advanced_optimizer.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
-            advanced_assignment.valid() && advanced_denoising_toggle.valid() && advanced_assignment.x >= train_advanced.x - 1.0 &&
-            advanced_assignment.x + advanced_assignment.width <= train_advanced.x + train_advanced.width + 1.0 &&
-            advanced_assignment.y >= train_advanced.y - 1.0 &&
-            advanced_assignment.y + advanced_assignment.height <= train_advanced.y + train_advanced.height + 1.0 &&
-            advanced_assignment.y >= advanced_optimizer.front().y + advanced_optimizer.front().height - 1.0 &&
-            advanced_denoising_toggle.x >= train_advanced.x - 1.0 &&
-            advanced_denoising_toggle.x + advanced_denoising_toggle.width <= train_advanced.x + train_advanced.width + 1.0 &&
-            advanced_denoising_toggle.y >= train_advanced.y - 1.0 &&
-            advanced_denoising_toggle.y + advanced_denoising_toggle.height <= train_advanced.y + train_advanced.height + 1.0 &&
-            advanced_match_free.front().y >= advanced_denoising_toggle.y + advanced_denoising_toggle.height - 1.0;
+        const bool advanced_composition = aligned_grid(advanced_general) && aligned_grid(advanced_optimizer) && aligned_grid(advanced_match_free) &&
+                                          aligned_grid(advanced_denoising) &&
+                                          std::abs(advanced_general.front().width - advanced_optimizer.front().width) < 1.0 &&
+                                          std::abs(advanced_general.front().width - advanced_match_free.front().width) < 1.0 &&
+                                          std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 &&
+                                          advanced_optimizer.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
+                                          advanced_assignment.valid() && advanced_denoising_toggle.valid() && advanced_assignment.x >= train_advanced.x - 1.0 &&
+                                          advanced_assignment.x + advanced_assignment.width <= train_advanced.x + train_advanced.width + 1.0 &&
+                                          advanced_assignment.y >= train_advanced.y - 1.0 &&
+                                          advanced_assignment.y + advanced_assignment.height <= train_advanced.y + train_advanced.height + 1.0 &&
+                                          advanced_assignment.y >= advanced_optimizer.front().y + advanced_optimizer.front().height - 1.0 &&
+                                          advanced_denoising_toggle.x >= train_advanced.x - 1.0 &&
+                                          advanced_denoising_toggle.x + advanced_denoising_toggle.width <= train_advanced.x + train_advanced.width + 1.0 &&
+                                          advanced_denoising_toggle.y >= train_advanced.y - 1.0 &&
+                                          advanced_denoising_toggle.y + advanced_denoising_toggle.height <= train_advanced.y + train_advanced.height + 1.0 &&
+                                          advanced_match_free.front().y >= advanced_denoising_toggle.y + advanced_denoising_toggle.height - 1.0;
         const bool advanced_compact = [&] {
             const auto compact_row = [](const auto& fields) {
                 if (fields.size() < 2U) return false;
                 const double cell_pitch = fields[1].x - fields[0].x;
-                return cell_pitch > 0.0 &&
-                       std::ranges::all_of(fields, [cell_pitch](const Bounds& bounds) { return bounds.width < cell_pitch * 0.70; });
+                return cell_pitch > 0.0 && std::ranges::all_of(fields, [cell_pitch](const Bounds& bounds) { return bounds.width < cell_pitch * 0.70; });
             };
-            return compact_row(advanced_general) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) &&
-                   compact_row(advanced_denoising);
+            return compact_row(advanced_general) && compact_row(advanced_optimizer) && compact_row(advanced_match_free) && compact_row(advanced_denoising);
         }();
-        const bool error_composition = error_modal.valid() && error_copy.valid() && error_dismiss.valid() &&
-                                       error_copy.x < error_dismiss.x && error_copy.y >= error_modal.y - 1.0 &&
-                                       error_dismiss.y >= error_modal.y - 1.0 && error_modal.contains_horizontally(error_copy) &&
-                                       error_modal.contains_horizontally(error_dismiss);
+        const bool error_composition = error_modal.valid() && error_copy.valid() && error_dismiss.valid() && error_copy.x < error_dismiss.x &&
+                                       error_copy.y >= error_modal.y - 1.0 && error_dismiss.y >= error_modal.y - 1.0 &&
+                                       error_modal.contains_horizontally(error_copy) && error_modal.contains_horizontally(error_dismiss);
         const bool gallery_shader_fill =
             explore_gallery.valid() && std::ranges::any_of(surface_geometries, [this](const auto& geometry) {
-                const bool gallery_frame = std::ranges::any_of(
-                    explore_slot_frames, [&geometry](const auto& frame) { return frame.second == geometry.source_revision; });
+                const bool gallery_frame =
+                    std::ranges::any_of(explore_slot_frames, [&geometry](const auto& frame) { return frame.second == geometry.source_revision; });
                 const auto key = std::pair{geometry.presentation_revision, geometry.source_revision};
                 if (!gallery_frame || !surface_scales.contains(key)) return false;
                 const double scale = surface_scales.at(key);
-                return std::abs(geometry.width / scale - explore_gallery.width) < 1.0 && square_atlas_frames.contains(key) &&
-                       atlas_scaled_frames.contains(key);
+                return std::abs(geometry.width / scale - explore_gallery.width) < 1.0 && square_atlas_frames.contains(key) && atlas_scaled_frames.contains(key);
             });
         const bool detail_containers = detail_fit;
         // Automatic Basic may supersede the padded source before the browser's
@@ -5156,100 +4819,83 @@ struct BrowserAudit final {
         // require the original crop to have been physically drawn.
         const bool padded_and_original_detail = detail_source && original_detail_drawn;
         static const std::set<std::string, std::less<>> expected_upscale_modes{"basic-four-times", "fast-four-times", "neural-four-times"};
-        static const std::set<std::string, std::less<>> expected_upscale_presentations{EXPLORE_UPSCALE_BASIC, EXPLORE_UPSCALE_FAST,
-                                                                                       EXPLORE_UPSCALE_NEURAL};
+        static const std::set<std::string, std::less<>> expected_upscale_presentations{EXPLORE_UPSCALE_BASIC, EXPLORE_UPSCALE_FAST, EXPLORE_UPSCALE_NEURAL};
         const bool bounded_exact_grid = exact_grid && exact_grid_revision != 0U && exact_grid_frame_revision != 0U &&
                                         exact_grid_width <= exact_grid_capacity_width && exact_grid_height <= exact_grid_capacity_height &&
                                         explore_slot_frames.contains(exact_grid_revision) &&
                                         explore_slot_frames.at(exact_grid_revision) == exact_grid_frame_revision;
-        const bool repeated_same_revision =
-            std::ranges::any_of(surface_redraw_counts, [](const auto& draws) { return draws.second >= 3U; });
-        const bool pointer_render_chain =
-            pointer_frame_revision != 0U && std::ranges::any_of(surface_geometries, [this](const auto& geometry) {
-                const auto key = std::pair{geometry.presentation_revision, geometry.source_revision};
-                return geometry.source_revision == pointer_frame_revision && surface_scales.contains(key) &&
-                       surface_draws.contains(geometry.presentation_revision);
-            });
+        const bool repeated_same_revision = std::ranges::any_of(surface_redraw_counts, [](const auto& draws) { return draws.second >= 3U; });
+        const bool pointer_render_chain = pointer_frame_revision != 0U && std::ranges::any_of(surface_geometries, [this](const auto& geometry) {
+                                              const auto key = std::pair{geometry.presentation_revision, geometry.source_revision};
+                                              return geometry.source_revision == pointer_frame_revision && surface_scales.contains(key) &&
+                                                     surface_draws.contains(geometry.presentation_revision);
+                                          });
         static const std::array expected_drag_stages{"pressed", "moved-1", "moved-2", "released"};
-        const bool complete_pointer_drag = std::ranges::all_of(
-            expected_drag_stages, [this](const std::string_view stage) { return ui_scale_pointer_stages.contains(stage); });
+        const bool complete_pointer_drag =
+            std::ranges::all_of(expected_drag_stages, [this](const std::string_view stage) { return ui_scale_pointer_stages.contains(stage); });
         static const std::array expected_primary{
             DATASET_BROWSE, COMPILE_DATASET, TRAIN_MODEL_CUSTOM, TRAIN_MODEL_ACTION, EXPLORE_OPEN,
         };
-        const bool uniform_primary =
-            !shared_primary_colors.empty() && std::ranges::all_of(shared_primary_colors, [this](const auto& style) {
-                return style.second == shared_primary_colors.begin()->second;
-            });
+        const bool uniform_primary = !shared_primary_colors.empty() && std::ranges::all_of(shared_primary_colors, [this](const auto& style) {
+            return style.second == shared_primary_colors.begin()->second;
+        });
         return first_failed_check(
             bootstrap && fluent && uniform_primary && benchmark_purple && rendered_controls.contains(BENCHMARK_OVERRIDE) &&
-                std::ranges::all_of(
-                    expected_primary,
-                    [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
-            "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement",
-            primary_action_geometry, "primary action geometry", reference_columns, "workflow column geometry", vertical_composition,
-            "workflow vertical composition", advanced_composition, "Advanced composition", advanced_compact, "Advanced compact controls",
-            explore_integer_controls.size() == 5U && explore_integer_precision, "Explore integer editing and spinner suppression",
-            explore_paste_restored, "Explore clipboard paste persistence and restoration", spinnerless_integer,
-            "integer spinner suppression", spinnerless_floating, "floating spinner suppression", advanced_integer_persisted,
-            "Advanced integer persistence", advanced_floating_persisted, "Advanced floating persistence", compile_progress_placement,
-            "Dataset progress placement", model_progress_placement, "Model progress containment", model_composition && model_copy,
-            "Model card composition", benchmark_override.valid() && benchmark_round_trip, "benchmark override interaction",
-            perceptual_controls_round_trip, "independent perceptual controls round trip",
-            explore_composition, "Explore composition", annotation_composition, "annotation composition",
-            workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
-            settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released &&
-                ui_scale_restored && complete_pointer_drag && error_composition && error_modal_usable,
-            "Settings composition",
-            dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal,
-            "Dataset lifecycle", explore_ready, "ready snapshot", sweep, "viewport sweep", scrolled, "gallery scroll", detail,
-            "detail selection", bounded_exact_grid, "bounded exact grid", newest_placeholder, "newest placeholder", pointer_inverse,
-            "pointer inverse", pointer_dispatched, "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill,
-            "gallery shader fill", pointer_render_chain, "pointer render chain", atlas_identities, "atlas identities", augmentation_enabled,
-            "augmentation enabled", augmentation_rerolled, "augmentation rerolled", reshuffle_order_only, "reshuffle order only",
-            detail_source, "detail source", detail_fit, "detail fit", detail_containers, "detail containers", padded_and_original_detail,
-            "padded and original detail", upscale_growth, "upscale growth", upscale_presentation, "upscale presentation",
-            upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations,
-            "upscale presentations", upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels",
-            upscale_same_method == expected_upscale_presentations, "upscale exact re-click", upscale_later_frame, "upscale later frame",
-            reopened, "dataset reopen", repeated_same_revision, "same-revision redraw",
+                std::ranges::all_of(expected_primary,
+                                    [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
+            "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement", primary_action_geometry,
+            "primary action geometry", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition",
+            advanced_composition, "Advanced composition", advanced_compact, "Advanced compact controls",
+            explore_integer_controls.size() == 5U && explore_integer_precision, "Explore integer editing and spinner suppression", explore_paste_restored,
+            "Explore clipboard paste persistence and restoration", spinnerless_integer, "integer spinner suppression", spinnerless_floating,
+            "floating spinner suppression", advanced_integer_persisted, "Advanced integer persistence", advanced_floating_persisted,
+            "Advanced floating persistence", compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment",
+            model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip, "benchmark override interaction",
+            perceptual_controls_round_trip, "independent perceptual controls round trip", explore_composition, "Explore composition", annotation_composition,
+            "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
+            settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored &&
+                complete_pointer_drag && error_composition && error_modal_usable,
+            "Settings composition", dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal,
+            "Dataset lifecycle", explore_ready, "ready snapshot", sweep, "viewport sweep", scrolled, "gallery scroll", detail, "detail selection",
+            bounded_exact_grid, "bounded exact grid", newest_placeholder, "newest placeholder", pointer_inverse, "pointer inverse", pointer_dispatched,
+            "pointer dispatch", pointer_selected, "pointer selection", gallery_shader_fill, "gallery shader fill", pointer_render_chain, "pointer render chain",
+            atlas_identities, "atlas identities", augmentation_enabled, "augmentation enabled", augmentation_rerolled, "augmentation rerolled",
+            reshuffle_order_only, "reshuffle order only", detail_source, "detail source", detail_fit, "detail fit", detail_containers, "detail containers",
+            padded_and_original_detail, "padded and original detail", upscale_growth, "upscale growth", upscale_presentation, "upscale presentation",
+            upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations, "upscale presentations",
+            upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels", upscale_same_method == expected_upscale_presentations,
+            "upscale exact re-click", upscale_later_frame, "upscale later frame", reopened, "dataset reopen", repeated_same_revision, "same-revision redraw",
             annotation_ready && annotation_tool && annotation_pointer, "annotation lifecycle",
-            complete && surface_draws.contains(presentation_receipt) && surface_redraws.contains(presentation_receipt),
-            "presentation completion", bounds_valid && !failed_before_termination(), "browser validity",
-            firefox_import && firefox_claim && firefox_ready, "Firefox integration",
+            complete && surface_draws.contains(presentation_receipt) && surface_redraws.contains(presentation_receipt), "presentation completion",
+            bounds_valid && !failed_before_termination(), "browser validity", firefox_import && firefox_claim && firefox_ready, "Firefox integration",
             std::ranges::all_of(expected, [this](const std::string_view id) { return controls.contains(id); }), "expected controls");
     }
-
     [[nodiscard]] bool product_ready() const { return readiness_blocker().empty(); }
-
     [[nodiscard]] bool terminal_evidence_settled() const noexcept {
         return complete && presentation_receipt != 0U && surface_redraw_counts.contains(presentation_receipt) &&
                surface_redraw_counts.at(presentation_receipt) >= 3U;
     }
-
-    [[nodiscard]] bool rendered_frame_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots,
-                                                const std::uint64_t source_revision, const std::size_t minimum_redraws) const noexcept {
+    [[nodiscard]] bool rendered_frame_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots, const std::uint64_t source_revision,
+                                                const std::size_t minimum_redraws) const noexcept {
         for (const auto& [snapshot_revision, slots] : explore_slots) {
             if (slots != native_slots || !explore_slot_frames.contains(snapshot_revision)) continue;
             const auto source = explore_slot_frames.at(snapshot_revision);
             if (source_revision != 0U && source != source_revision) continue;
             for (const auto& geometry : surface_geometries) {
                 const auto key = std::pair{geometry.presentation_revision, geometry.source_revision};
-                if (geometry.source_revision != source || !surface_scales.contains(key) ||
-                    !surface_draws.contains(geometry.presentation_revision) ||
+                if (geometry.source_revision != source || !surface_scales.contains(key) || !surface_draws.contains(geometry.presentation_revision) ||
                     (minimum_redraws != 0U && (!surface_redraw_counts.contains(geometry.presentation_revision) ||
                                                surface_redraw_counts.at(geometry.presentation_revision) < minimum_redraws)))
                     continue;
                 const double scale = surface_scales.at(key);
-                const bool normalized =
-                    geometry.width > 0.0 && geometry.height > 0.0 && scale > 0.0 &&
-                    (!explore_gallery.valid() || (std::abs(geometry.width / scale - explore_gallery.width) < 1.0 &&
-                                                  square_atlas_frames.contains(key) && atlas_scaled_frames.contains(key)));
+                const bool normalized = geometry.width > 0.0 && geometry.height > 0.0 && scale > 0.0 &&
+                                        (!explore_gallery.valid() || (std::abs(geometry.width / scale - explore_gallery.width) < 1.0 &&
+                                                                      square_atlas_frames.contains(key) && atlas_scaled_frames.contains(key)));
                 if (normalized) return true;
             }
         }
         return false;
     }
-
     [[nodiscard]] bool observed_frame_revision_for_slots(const std::map<std::uint64_t, std::uint64_t>& native_slots,
                                                          const std::uint64_t source_revision) const noexcept {
         return source_revision != 0U && std::ranges::any_of(explore_slots, [this, &native_slots, source_revision](const auto& snapshot) {
@@ -5257,26 +4903,21 @@ struct BrowserAudit final {
                           explore_slot_frames.at(snapshot.first) == source_revision;
                });
     }
-
     [[nodiscard]] const std::map<std::uint64_t, std::uint64_t>* final_cursor_slots() const noexcept {
         const auto slots = explore_slots.find(final_cursor_revision);
-        if (final_cursor_revision == 0U || final_cursor_frame_revision == 0U || final_cursor_generation == 0U ||
-            final_cursor_slot_count == 0U || final_cursor_slot_count > kAcceptanceSlotLimit || slots == explore_slots.end() ||
-            slots->second.size() != final_cursor_slot_count || !explore_slot_frames.contains(final_cursor_revision) ||
-            explore_slot_frames.at(final_cursor_revision) != final_cursor_frame_revision)
+        if (final_cursor_revision == 0U || final_cursor_frame_revision == 0U || final_cursor_generation == 0U || final_cursor_slot_count == 0U ||
+            final_cursor_slot_count > kAcceptanceSlotLimit || slots == explore_slots.end() || slots->second.size() != final_cursor_slot_count ||
+            !explore_slot_frames.contains(final_cursor_revision) || explore_slot_frames.at(final_cursor_revision) != final_cursor_frame_revision)
             return nullptr;
         for (std::uint64_t slot = 0U; slot != final_cursor_slot_count; ++slot)
             if (!slots->second.contains(slot)) return nullptr;
         return &slots->second;
     }
-
     [[nodiscard]] const std::map<std::uint64_t, std::uint64_t>* pointer_slots() const noexcept {
         const auto slots = explore_slots.find(pointer_revision);
         return pointer_selected && slots != explore_slots.end() ? &slots->second : nullptr;
     }
-
     [[nodiscard]] bool failed_before_termination() const noexcept { return failed || panic || workspace_protocol_failure; }
-
     [[nodiscard]] std::string_view failure_blocker() const noexcept {
         const std::array checks{
             std::pair{failed, std::string_view{"integration failure"}},
@@ -5339,29 +4980,21 @@ struct BrowserAudit final {
     static constexpr const char* SETTINGS_RESET = "settings.reset";
     static constexpr const char* SETTINGS_CLOSE = "settings.close";
     static constexpr std::array<std::string_view, 5> SETTINGS_NUMERIC_CONTROLS{
-        "settings.ui_scale",
-        "settings.font_size",
-        "settings.secondary_font_size",
-        "settings.mono_font_size",
-        "settings.text_input_font_size",
+        "settings.ui_scale", "settings.font_size", "settings.secondary_font_size", "settings.mono_font_size", "settings.text_input_font_size",
     };
 };
-
 class JsonLineCursor final {
    public:
     enum class Format { NativeJson, FirefoxText };
     JsonLineCursor(std::filesystem::path path, const std::uintmax_t offset, Format format = Format::NativeJson)
         : path_(std::move(path)), offset_(offset), format_(format), line_(offset == 0U ? std::optional<std::uint64_t>{0U} : std::nullopt) {}
-
     [[nodiscard]] std::optional<std::uint64_t> line() const noexcept { return line_; }
-
     template <class Audit, class Observer>
     void consume(Audit& audit, Observer&& observer, const bool final = false) {
         std::ifstream input{path_, std::ios::binary | std::ios::ate};
         if (!input) throw std::runtime_error("evidence artifact unavailable: " + path_.string());
         const auto end = input.tellg();
-        if (end < 0 || static_cast<std::uintmax_t>(end) < offset_)
-            throw std::runtime_error("evidence artifact truncated: " + path_.string());
+        if (end < 0 || static_cast<std::uintmax_t>(end) < offset_) throw std::runtime_error("evidence artifact truncated: " + path_.string());
         input.seekg(static_cast<std::streamoff>(offset_));
         std::array<char, 16U * 1024U> chunk{};
         // Bound each allocation and consume one captured extent. Later appends
@@ -5369,8 +5002,7 @@ class JsonLineCursor final {
         const auto captured_end = static_cast<std::uintmax_t>(end);
         while (offset_ < captured_end) {
             const auto count = std::min<std::uintmax_t>(chunk.size(), captured_end - offset_);
-            if (!input.read(chunk.data(), static_cast<std::streamsize>(count)))
-                throw std::runtime_error("evidence transport read failed: " + path_.string());
+            if (!input.read(chunk.data(), static_cast<std::streamsize>(count))) throw std::runtime_error("evidence transport read failed: " + path_.string());
             offset_ += count;
             for (const char byte : std::string_view{chunk.data(), static_cast<std::size_t>(count)}) {
                 if (byte != '\n') {
@@ -5387,10 +5019,8 @@ class JsonLineCursor final {
             pending_.clear();
         }
     }
-
     void finish() const {
-        if (format_ == Format::NativeJson && !pending_.empty())
-            throw std::runtime_error("native evidence ended in an incomplete record: " + path_.string());
+        if (format_ == Format::NativeJson && !pending_.empty()) throw std::runtime_error("native evidence ended in an incomplete record: " + path_.string());
     }
 
    private:
@@ -5398,9 +5028,8 @@ class JsonLineCursor final {
     void consume_line(Audit& audit, Observer& observer) {
         if (line_) ++*line_;
         const std::string_view line{pending_};
-        if (format_ == Format::FirefoxText &&
-            ((line.contains("Uncaptured WebGPU error: Texture") && line.contains("is invalid")) || line.contains("XPCOMGlueLoad error") ||
-             line.contains("Couldn't load XPCOM") || line.contains("panicked at"))) {
+        if (format_ == Format::FirefoxText && ((line.contains("Uncaptured WebGPU error: Texture") && line.contains("is invalid")) ||
+                                               line.contains("XPCOMGlueLoad error") || line.contains("Couldn't load XPCOM") || line.contains("panicked at"))) {
             const nlohmann::json failure{{"event", "integration.failed"}, {"detail", std::string{line}}};
             audit.consume(failure);
             observer(failure);
@@ -5415,7 +5044,6 @@ class JsonLineCursor final {
         audit.consume(record);
         observer(record);
     }
-
     static constexpr std::size_t kLineLimit = 64U * 1024U;
     std::filesystem::path path_;
     std::uintmax_t offset_;
@@ -5423,7 +5051,6 @@ class JsonLineCursor final {
     std::optional<std::uint64_t> line_;
     std::string pending_;
 };
-
 TEST_CASE("acceptance artifacts have independent writers and one process-family archive identity", "[workspace][audit]") {
     ScopedTempDir temporary{"mmltk-evidence-ownership"};
     const auto native = temporary.path() / "capture.jsonl";
@@ -5451,8 +5078,7 @@ TEST_CASE("acceptance artifacts have independent writers and one process-family 
     prepare_latest_log(parent, "acceptance", "17-123");
     rotate_process_log_family(native, "17-123");
     for (const auto& path : {native, parent, application, mozilla, mozilla_parent}) {
-        const auto archive =
-            std::filesystem::path{path.string() + ".history"} / (path.extension() == ".jsonl" ? "17-123.jsonl" : "17-123.log");
+        const auto archive = std::filesystem::path{path.string() + ".history"} / (path.extension() == ".jsonl" ? "17-123.jsonl" : "17-123.log");
         CHECK(read_tail(archive) == "{\"event\":\"previous\"}\n");
     }
     CHECK_FALSE(std::filesystem::exists(application));
@@ -5463,7 +5089,6 @@ TEST_CASE("acceptance artifacts have independent writers and one process-family 
     CHECK(std::filesystem::file_size(native) == 0U);
     CHECK(read_tail(parent).contains("acceptance.complete"));
 }
-
 TEST_CASE("native evidence cursors reject malformed truncated oversized and incomplete records", "[workspace][audit]") {
     struct Count final {
         std::size_t records = 0U;
@@ -5472,8 +5097,7 @@ TEST_CASE("native evidence cursors reject malformed truncated oversized and inco
     ScopedTempDir temporary{"mmltk-evidence-cursor"};
     const auto path = temporary.path() / "native.jsonl";
     const auto observer = [](const auto&) {};
-    for (const std::string& content :
-         {std::string{"not JSON\n"}, std::string{"[]\n"}, std::string{"\n"}, std::string(64U * 1024U + 1U, 'x')}) {
+    for (const std::string& content : {std::string{"not JSON\n"}, std::string{"[]\n"}, std::string{"\n"}, std::string(64U * 1024U + 1U, 'x')}) {
         {
             std::ofstream output{path, std::ios::binary | std::ios::trunc};
             output << content;
@@ -5504,7 +5128,6 @@ TEST_CASE("native evidence cursors reject malformed truncated oversized and inco
     std::filesystem::remove(path);
     CHECK_THROWS_AS(cursor.consume(audit, observer), std::runtime_error);
 }
-
 TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual final bytes", "[workspace][audit]") {
     struct Count final {
         std::size_t records = 0U;
@@ -5515,8 +5138,7 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
     constexpr std::size_t count = 12000U;
     {
         std::ofstream output{path};
-        for (std::size_t index = 0U; index != count; ++index)
-            output << "{\"event\":\"chunk\"}\n";
+        for (std::size_t index = 0U; index != count; ++index) output << "{\"event\":\"chunk\"}\n";
     }
     Count audit;
     JsonLineCursor cursor{path, 0U};
@@ -5565,8 +5187,7 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
                     std::ofstream output{firefox, std::ios::trunc};
                     if (order == "failure-first" || order == "older-than-tail") output << failure << '\n';
                     if (order == "older-than-tail")
-                        for (std::size_t index = 0U; index != count; ++index)
-                            output << "Firefox ordinary text\n";
+                        for (std::size_t index = 0U; index != count; ++index) output << "Firefox ordinary text\n";
                     output << completion.dump() << '\n';
                     if (order == "completion-first") output << failure << '\n';
                 }
@@ -5597,12 +5218,10 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
         }
     }
 }
-
 void report_consumed_record(const nlohmann::json& record, const std::string_view source) {
     const std::string event = record.value("event", "");
-    const bool protocol_failure =
-        event.find("protocol") != std::string::npos ||
-        (record.contains("terminal") && record.at("terminal").is_string() && record.at("terminal") == "protocol_failure");
+    const bool protocol_failure = event.find("protocol") != std::string::npos ||
+                                  (record.contains("terminal") && record.at("terminal").is_string() && record.at("terminal") == "protocol_failure");
     const bool failure = event.find("failed") != std::string::npos || event.find("failure") != std::string::npos ||
                          event.find("invalid") != std::string::npos || event.find("incomplete") != std::string::npos || protocol_failure;
     if (failure) {
@@ -5624,11 +5243,8 @@ void report_consumed_record(const nlohmann::json& record, const std::string_view
         std::string_view{"shutdown.firefox_terminal"},
         std::string_view{"shutdown.complete"},
     };
-    if (std::ranges::contains(milestones, event)) {
-        std::cout << "workspace-wayland[" << source << "]: " << record.dump() << '\n' << std::flush;
-    }
+    if (std::ranges::contains(milestones, event)) { std::cout << "workspace-wayland[" << source << "]: " << record.dump() << '\n' << std::flush; }
 }
-
 class ArtifactNotifications final {
    public:
     ArtifactNotifications(const std::filesystem::path& first, const std::filesystem::path& second) {
@@ -5637,9 +5253,7 @@ class ArtifactNotifications final {
         add(first.parent_path());
         if (second.parent_path() != first.parent_path()) add(second.parent_path());
     }
-
     [[nodiscard]] int descriptor() const noexcept { return descriptor_.get(); }
-
     void consume() noexcept {
         std::array<char, 4096U> buffer{};
         while (::read(descriptor_.get(), buffer.data(), buffer.size()) > 0) {}
@@ -5651,10 +5265,8 @@ class ArtifactNotifications final {
         if (::inotify_add_watch(descriptor_.get(), directory.c_str(), IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE) < 0)
             throw std::runtime_error("failed to watch integration artifacts");
     }
-
     ScopedFd descriptor_;
 };
-
 [[nodiscard]] std::optional<int> await_shutdown(BrowserHostProcess& process, const int deadline) {
     for (;;) {
         std::array<pollfd, 2U> descriptors{{
@@ -5662,9 +5274,7 @@ class ArtifactNotifications final {
             {.fd = deadline, .events = POLLIN, .revents = 0},
         }};
         int ready = -1;
-        do {
-            ready = ::poll(descriptors.data(), descriptors.size(), -1);
-        } while (ready < 0 && errno == EINTR);
+        do { ready = ::poll(descriptors.data(), descriptors.size(), -1); } while (ready < 0 && errno == EINTR);
         if (ready < 0) throw std::runtime_error("failed to await packaged browser shutdown");
         if ((descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) return process.reap();
         if ((descriptors[1].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
@@ -5673,7 +5283,6 @@ class ArtifactNotifications final {
         }
     }
 }
-
 void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution) {
     using namespace mmltk::backend::data;
     const auto plan = DatasetCompiler::prepare({.source_dir = testsupport::dataset_dir(fixture),
@@ -5685,7 +5294,6 @@ void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpe
                                                {fixture.split});
     DatasetCompiler::compile(plan, 0U);
 }
-
 class PreparedWaylandInputs final {
    public:
     PreparedWaylandInputs()
@@ -5723,9 +5331,8 @@ class PreparedWaylandInputs final {
             std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
             std::ofstream dropped_instance{split / "000013.jsonl", std::ios::app};
             if (!dropped_instance) throw std::runtime_error("cannot prepare dropped-instance compiler evidence");
-            dropped_instance
-                << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
-                << fixture->width << ',' << fixture->height << "]}\n";
+            dropped_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
+                             << fixture->width << ',' << fixture->height << "]}\n";
         }
         replace_synthetic_image(square_, 1, 384, 384);
         // This small prerequisite is compiled once. The primary browser owns
@@ -5754,15 +5361,14 @@ class PreparedWaylandInputs final {
     mmltk::backend::data::testsupport::FixtureSpec mixed_;
     mmltk::backend::data::testsupport::FixtureSpec probe_;
 };
-
 // One owner retains the process, resources, physical evidence and byte cursors.
 // RunScenario contains domain assertions; Advance is acknowledged only after
 // typed UI settlement and those independent evidence streams have joined.
 class WaylandSession final {
    public:
-    WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, TerminationMode terminal, std::string profile,
-                   bool diagnostics_enabled = true, bool dpi = false, bool host_to_device = true, std::string fault = {},
-                   bool pixels_enabled = true, const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture = nullptr);
+    WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, TerminationMode terminal, std::string profile, bool diagnostics_enabled = true,
+                   bool dpi = false, bool host_to_device = true, std::string fault = {}, bool pixels_enabled = true,
+                   const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture = nullptr);
     void RunScenario(const std::string& viewer_scenario, bool last, bool dark = false, bool pending_reconstruction = false);
 
    private:
@@ -5798,10 +5404,9 @@ class WaylandSession final {
     bool pressure_entered_ = false;
     bool browser_failed_ = false;
 };
-
 WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile,
-                               const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault,
-                               const bool pixels_enabled, const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
+                               const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault, const bool pixels_enabled,
+                               const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
     : inputs_(std::move(inputs)),
       ordinary_fixture_(ordinary_fixture ? *ordinary_fixture : inputs_->mixed()),
       termination(terminal),
@@ -5812,21 +5417,19 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
       pixel_probes(logging && pixels_enabled),
       pixel_fixture(profile_ == "retained" || profile_ == "dpi"),
       probe_failure(std::move(fault)),
-      ordinary_compiled_(profile_ == "retained"
-                             ? working.path() / "compiled"
-                             : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
+      ordinary_compiled_(profile_ == "retained" ? working.path() / "compiled"
+                                                : std::filesystem::path{mmltk::backend::data::testsupport::compiled_dir(ordinary_fixture_)}),
       pixel_audit(pixel_probes) {
-    diagnostics = !logging ? quiet_artifacts.path() / "native.jsonl"
-                           : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
-    runtime_log = !logging ? quiet_artifacts.path() / "runtime.log"
-                           : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
+    diagnostics =
+        !logging ? quiet_artifacts.path() / "native.jsonl" : configured_path("MMLTK_GUI_TRACE_FILE", latest_wayland_artifact("latest-wayland-test.jsonl"));
+    runtime_log =
+        !logging ? quiet_artifacts.path() / "runtime.log" : configured_path("MMLTK_LOG_FILE", latest_wayland_artifact("latest-wayland-test-native.log"));
     firefox_log = !logging ? quiet_artifacts.path() / "firefox.log"
                            : configured_path("MMLTK_FIREFOX_LOG_FILE", latest_wayland_artifact("latest-wayland-test-firefox.log"));
     acceptance_log = artifact_sibling(diagnostics, "-acceptance.jsonl");
     const auto rotation_id = std::to_string(::getpid()) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     if (logging) {
-        const std::array owned_artifacts{diagnostics, acceptance_log, runtime_log, firefox_log,
-                                         artifact_sibling(diagnostics, "-application.log")};
+        const std::array owned_artifacts{diagnostics, acceptance_log, runtime_log, firefox_log, artifact_sibling(diagnostics, "-application.log")};
         require_independent_artifacts(owned_artifacts);
         prepare_latest_log(diagnostics, "workspace Wayland native trace", rotation_id);
         prepare_latest_log(acceptance_log, "workspace Wayland parent evidence", rotation_id);
@@ -5835,7 +5438,6 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
     }
     prepare_latest_log(runtime_log, "workspace Wayland native runtime log", rotation_id);
     if (logging) prepare_latest_log(firefox_log, "workspace Wayland Firefox log", rotation_id);
-
     auto initial_settings = mmltk::controller::contracts::default_gui_settings_state();
     initial_settings.ui.dark_mode = false;
     initial_settings.ui.ui_scale = 1.0F;
@@ -5847,17 +5449,14 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
     settings_file << mmltk::controller::contracts::snapshot_gui_settings(initial_settings).dump();
     settings_file.close();
     notifications_ = std::make_unique<ArtifactNotifications>(diagnostics, firefox_log);
-    process_ =
-        std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER, diagnostics, runtime_log, firefox_log, working.path(),
-                                             termination, ordinary_fixture_, ordinary_compiled_, profile_ == "blocked" ? "quiet" : profile_,
-                                             logging, high_dpi, h2d, pixel_probes, probe_failure, &inputs_->square());
+    process_ = std::make_unique<BrowserHostProcess>(MMLTK_TEST_MMLTK_GUI_LAUNCHER, diagnostics, runtime_log, firefox_log, working.path(), termination,
+                                                    ordinary_fixture_, ordinary_compiled_, profile_ == "blocked" ? "quiet" : profile_, logging, high_dpi, h2d,
+                                                    pixel_probes, probe_failure, &inputs_->square());
     deadline.reset(::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK));
-    if (deadline.get() < 0)
-        throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
+    if (deadline.get() < 0) throw std::runtime_error(std::string{"failed to create workspace Wayland acceptance deadline: "} + std::strerror(errno));
     native_cursor_ = std::make_unique<JsonLineCursor>(diagnostics, 0U);
     browser_cursor_ = std::make_unique<JsonLineCursor>(firefox_log, 0U, JsonLineCursor::Format::FirefoxText);
 }
-
 void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark, const bool pending_reconstruction) {
     const auto permitted_cpus = permitted_cpu_count();
     const auto& fixture = viewer_scenario == "square" ? inputs_->square() : ordinary_fixture_;
@@ -5878,7 +5477,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     std::cout << "workspace-wayland: " << kWaylandStartupDeadline.count() << "-second browser startup deadline armed"
               << "\nnative JSONL: " << diagnostics << "\nnative runtime log: " << runtime_log << "\nFirefox log: " << firefox_log << '\n'
               << std::flush;
-
     if (profile_ == "blocked" || profile_ == "quiet") {
         // The acceptance socket reports entry into the real I/O gate. This
         // shutdown case needs neither diagnostic records nor a startup delay.
@@ -5892,12 +5490,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 {.fd = deadline.get(), .events = POLLIN, .revents = 0},
             }};
             int ready;
-            do {
-                ready = ::poll(waits.data(), waits.size(), -1);
-            } while (ready < 0 && errno == EINTR);
+            do { ready = ::poll(waits.data(), waits.size(), -1); } while (ready < 0 && errno == EINTR);
             REQUIRE(ready > 0);
-            INFO("quiet profile " << profile_ << ", stage " << deadline_stage << ", progress " << progress << ", pressure entered "
-                                  << pressure_entered_);
+            INFO("quiet profile " << profile_ << ", stage " << deadline_stage << ", progress " << progress << ", pressure entered " << pressure_entered_);
             REQUIRE((waits[2].revents & POLLIN) == 0);
             REQUIRE((waits[1].revents & POLLIN) == 0);
             REQUIRE((waits[0].revents & POLLIN) != 0);
@@ -5913,10 +5508,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 using Kind = mmltk::controller::contracts::IntegrationControlKind;
                 const auto kind = static_cast<Kind>(entered->slot);
                 if (kind == Kind::Failed)
-                    FAIL("quiet integration failed after progress "
-                         << progress << ", failure receipt " << entered->compiled_index << ", frontend source line "
-                         << entered->staging_bytes << "\nfrontend error: " << process.frontend_failure() << "\nnative runtime output:\n"
-                         << read_tail(runtime_log));
+                    FAIL("quiet integration failed after progress " << progress << ", failure receipt " << entered->compiled_index << ", frontend source line "
+                                                                    << entered->staging_bytes << "\nfrontend error: " << process.frontend_failure()
+                                                                    << "\nnative runtime output:\n"
+                                                                    << read_tail(runtime_log));
                 if (kind == Kind::PressureEntered) {
                     REQUIRE_FALSE(pressure_entered_);
                     pressure_entered_ = true;
@@ -5927,8 +5522,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 } else if (kind == Kind::Progress) {
                     REQUIRE(entered->compiled_index > progress);
                     progress = entered->compiled_index;
-                    arm_acceptance_deadline((progress & 3U) == 2U ? kWaylandWorkDeadline : kWaylandInteractionDeadline,
-                                            "quiet typed workflow progress");
+                    arm_acceptance_deadline((progress & 3U) == 2U ? kWaylandWorkDeadline : kWaylandInteractionDeadline, "quiet typed workflow progress");
                 } else {
                     FAIL("invalid quiet integration control direction");
                 }
@@ -5948,7 +5542,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         }
         return;
     }
-
     const auto consume_records = [&](const bool final = false) {
         native_cursor.consume(native, [&](const auto& record) {
             surface_audit.native(record);
@@ -5989,8 +5582,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                                                                           : kWaylandInteractionDeadline;
         arm_acceptance_deadline(duration, "integration phase " + browser.phase_progress_name);
         if (observed_phase_progress == 1U || observed_phase_progress % 25U == 0U)
-            std::cout << "workspace-wayland: progress " << browser.phase_progress_name << " (phase " << observed_phase_progress << ")\n"
-                      << std::flush;
+            std::cout << "workspace-wayland: progress " << browser.phase_progress_name << " (phase " << observed_phase_progress << ")\n" << std::flush;
         return true;
     };
     const auto report_artifacts = [&] {
@@ -6030,11 +5622,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     const auto rendered_padding_exported = [&](const NativeAudit::PaddingOrientation orientation) {
         return std::ranges::any_of(native.rendered_probe_frames, [&](const auto& publication) {
             const auto slots = native.placeholder_slots.find(publication.first.first);
-            return native.padding_orientations.contains(publication.first) &&
-                   native.padding_orientations.at(publication.first) == orientation && native.aligned_rendered_probe(publication.first) &&
-                   slots != native.placeholder_slots.end() && std::ranges::any_of(publication.second, [&](const auto frame_revision) {
-                       return browser.rendered_frame_for_slots(slots->second, frame_revision, 0U);
-                   });
+            return native.padding_orientations.contains(publication.first) && native.padding_orientations.at(publication.first) == orientation &&
+                   native.aligned_rendered_probe(publication.first) && slots != native.placeholder_slots.end() &&
+                   std::ranges::any_of(publication.second,
+                                       [&](const auto frame_revision) { return browser.rendered_frame_for_slots(slots->second, frame_revision, 0U); });
         });
     };
     const auto seeded_augmentation_ready = [&] {
@@ -6048,10 +5639,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         });
     };
     const auto terminal_annotation_ready = [&] {
-        return viewer_scenario != "terminal" || (native.annotation_copied && native.annotation_opened && native.annotation_edited &&
-                                                 browser.annotation_ready && browser.annotation_tool && browser.annotation_pointer &&
-                                                 browser.complete && browser.surface_draws.contains(browser.presentation_receipt) &&
-                                                 browser.surface_redraws.contains(browser.presentation_receipt));
+        return viewer_scenario != "terminal" ||
+               (native.annotation_copied && native.annotation_opened && native.annotation_edited && browser.annotation_ready && browser.annotation_tool &&
+                browser.annotation_pointer && browser.complete && browser.surface_draws.contains(browser.presentation_receipt) &&
+                browser.surface_redraws.contains(browser.presentation_receipt));
     };
     const auto acceptance_blockers = [&] {
         std::vector<std::string> blockers;
@@ -6070,23 +5661,18 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             if (!terminal_annotation_ready()) blockers.emplace_back("native/browser: terminal Annotation lifecycle");
         }
         if (pixel_fixture) {
-            if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical))
-                blockers.emplace_back("rendered probe: vertical padding export");
-            if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal))
-                blockers.emplace_back("rendered probe: horizontal padding export");
+            if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical)) blockers.emplace_back("rendered probe: vertical padding export");
+            if (!rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal)) blockers.emplace_back("rendered probe: horizontal padding export");
         }
         if (pixel_probes && !pixel_audit.raw_complete()) blockers.emplace_back("pixel: physical 25-sample chain");
         if (pixel_probes && !pixel_audit.viewer_nonblack_complete()) blockers.emplace_back("pixel: nonblack viewer");
-        if (pixel_probes && viewer_scenario == "square" && !pixel_audit.retained_logical_content)
-            blockers.emplace_back("pixel: retained logical content");
-        if (pixel_probes && viewer_scenario == "square" && !pixel_audit.upscale_growth)
-            blockers.emplace_back("pixel: four-times allocation growth");
+        if (pixel_probes && viewer_scenario == "square" && !pixel_audit.retained_logical_content) blockers.emplace_back("pixel: retained logical content");
+        if (pixel_probes && viewer_scenario == "square" && !pixel_audit.upscale_growth) blockers.emplace_back("pixel: four-times allocation growth");
         if (!pixel_audit.probe_failure_complete(probe_failure)) blockers.emplace_back("pixel: injected probe-failure recovery");
         if (!frontend_settled_) blockers.emplace_back("frontend: typed scenario settlement");
         std::string surface_blocker;
         if (!surface_audit.evidence_settled(&surface_blocker)) add("surface", surface_blocker);
-        if (pending_reconstruction && !surface_audit.pending_supersession_completed())
-            blockers.emplace_back("surface: completed pending-candidate handoff");
+        if (pending_reconstruction && !surface_audit.pending_supersession_completed()) blockers.emplace_back("surface: completed pending-candidate handoff");
         if ((viewer_scenario.empty() || viewer_scenario == "copy" || viewer_scenario == "semantics") &&
             !pixel_audit.continuity_complete(viewer_scenario.empty()))
             blockers.emplace_back("pixel: copy and semantic continuity");
@@ -6128,9 +5714,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && !viewer_scenario.empty() && browser.viewer_complete &&
             browser.surface_draws.contains(browser.viewer_presentation) && native.presentation_ready && native.explore_rendered &&
             surface_audit.failure.empty() && pixel_audit.failure.empty() &&
-            (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
-            pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() && terminal_annotation_ready() &&
-            (!pixel_fixture || pixel_audit.composition_complete()) &&
+            (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) && pixel_audit.probe_failure_complete(probe_failure) &&
+            surface_audit.evidence_settled() && terminal_annotation_ready() && (!pixel_fixture || pixel_audit.composition_complete()) &&
             ((viewer_scenario != "copy" && viewer_scenario != "semantics") || pixel_audit.continuity_complete(false)) &&
             (!pending_reconstruction || surface_audit.pending_supersession_completed()) &&
             (viewer_scenario != "square" || !pixel_probes || (pixel_audit.retained_logical_content && pixel_audit.upscale_growth))) {
@@ -6138,8 +5723,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             break;
         }
         if (const auto* slots = browser.final_cursor_slots()) {
-            if (const auto identified =
-                    native.final_generations_for(*slots, browser.final_cursor_generation, browser.final_cursor_frame_revision))
+            if (const auto identified = native.final_generations_for(*slots, browser.final_cursor_generation, browser.final_cursor_frame_revision))
                 final_generations = *identified;
         }
         const auto recovery = pixel_audit.probe_failure_evidence(probe_failure);
@@ -6152,8 +5736,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             command_explore(16U, "requested exact-content probe recovery");
             recovery_redraw_requested = true;
         }
-        const bool reads_releasable =
-            !recover_before_reads || pixel_audit.copy_probe_omission_proven() || (recovery_redraw_requested && recovery.complete());
+        const bool reads_releasable = !recover_before_reads || pixel_audit.copy_probe_omission_proven() || (recovery_redraw_requested && recovery.complete());
         if (reads_releasable && !released_one_lane && browser.explore_ready) {
             const auto rendered_placeholder = std::ranges::find_if(native.placeholder_slots, [this](const auto& placeholder) {
                 const auto cardinality = native.placeholder_cardinalities.find(placeholder.first);
@@ -6175,8 +5758,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             released_remaining_lanes = true;
         }
         if (reads_releasable && released_one_lane && !released_remaining_lanes && !native.acceptance_first_patch_exact &&
-            native.explore_generation > released_placeholder_generation &&
-            native.placeholder_cardinalities.contains(native.explore_generation)) {
+            native.explore_generation > released_placeholder_generation && native.placeholder_cardinalities.contains(native.explore_generation)) {
             command_explore(1U, "reissued one Explore lane for superseding generation");
             released_placeholder_generation = native.explore_generation;
         }
@@ -6188,10 +5770,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         const bool rendered_probe_exported = !pixel_fixture || (rendered_padding_exported(NativeAudit::PaddingOrientation::Vertical) &&
                                                                 rendered_padding_exported(NativeAudit::PaddingOrientation::Horizontal));
         const bool expected_window_close = termination == TerminationMode::WindowClose &&
-                                           native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) &&
-                                           !native.active_peer();
-        const bool terminal_failure = (native.failed_before_termination() && !expected_window_close) ||
-                                      browser.failed_before_termination() || !surface_audit.failure.empty() || !pixel_audit.failure.empty();
+                                           native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) && !native.active_peer();
+        const bool terminal_failure = (native.failed_before_termination() && !expected_window_close) || browser.failed_before_termination() ||
+                                      !surface_audit.failure.empty() || !pixel_audit.failure.empty();
         if (terminal_failure && !terminal_failure_observed) {
             std::cerr << "workspace-wayland failed before readiness"
                       << "\nnative failure: " << native.failure_blocker() << "\nbrowser failure: " << browser.failure_blocker()
@@ -6209,12 +5790,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             arm_acceptance_deadline(kWaylandFailureSettlementDeadline, "terminal failure settlement");
         }
         if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ &&
-            (native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || expected_window_close) &&
-            browser.product_ready() && rendered_probe_exported &&
-            (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
-            pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() &&
-            (!pixel_fixture || pixel_audit.composition_complete()) && pixel_audit.continuity_complete(true) &&
-            (!pending_reconstruction || surface_audit.pending_supersession_completed())) {
+            (native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || expected_window_close) && browser.product_ready() &&
+            rendered_probe_exported && (!pixel_probes || (pixel_audit.raw_complete() && pixel_audit.viewer_nonblack_complete())) &&
+            pixel_audit.probe_failure_complete(probe_failure) && surface_audit.evidence_settled() && (!pixel_fixture || pixel_audit.composition_complete()) &&
+            pixel_audit.continuity_complete(true) && (!pending_reconstruction || surface_audit.pending_supersession_completed())) {
             readiness_reached = true;
             break;
         }
@@ -6236,9 +5815,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             {.fd = deadline.get(), .events = POLLIN, .revents = 0},
         }};
         int ready = -1;
-        do {
-            ready = ::poll(descriptors.data(), descriptors.size(), -1);
-        } while (ready < 0 && errno == EINTR);
+        do { ready = ::poll(descriptors.data(), descriptors.size(), -1); } while (ready < 0 && errno == EINTR);
         if (ready < 0) {
             std::cerr << "workspace-wayland failed to poll product evidence: " << std::strerror(errno);
             record_acceptance_state("acceptance.poll.failed", true);
@@ -6284,8 +5861,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 REQUIRE(pending_reconstruction);
                 REQUIRE_FALSE(supersession_held.has_value());
                 REQUIRE((event->source_high != 0U || event->source_low != 0U));
-                supersession_held =
-                    SurfaceAudit::native_identity({{"surface_high", event->source_high}, {"surface_low", event->source_low}});
+                supersession_held = SurfaceAudit::native_identity({{"surface_high", event->source_high}, {"surface_low", event->source_low}});
                 continue;
             }
             if (event->event == ExploreAcceptanceGate::ControlEvent::VisibleReadHeld) {
@@ -6293,9 +5869,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 REQUIRE_FALSE(visible_read_held.has_value());
                 visible_read_held = *event;
                 if (logging)
-                    append_acceptance_record(acceptance_log, {{"event", "acceptance.visible_read.held"},
-                                                              {"generation", event->generation},
-                                                              {"compiled_index", event->compiled_index}});
+                    append_acceptance_record(
+                        acceptance_log,
+                        {{"event", "acceptance.visible_read.held"}, {"generation", event->generation}, {"compiled_index", event->compiled_index}});
                 continue;
             }
             if (event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld ||
@@ -6305,14 +5881,13 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 REQUIRE(event->transfer != 0U);
                 REQUIRE(event->publication != 0U);
                 if (logging)
-                    append_acceptance_record(acceptance_log,
-                                             {{"event", event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld
-                                                            ? "acceptance.native_completion.held"
-                                                            : "acceptance.native_capacity.available"},
-                                              {"workspace_source_high", event->source_high},
-                                              {"workspace_source_low", event->source_low},
-                                              {"transfer_sequence", event->transfer},
-                                              {"presentation_revision", event->publication}});
+                    append_acceptance_record(acceptance_log, {{"event", event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld
+                                                                            ? "acceptance.native_completion.held"
+                                                                            : "acceptance.native_capacity.available"},
+                                                              {"workspace_source_high", event->source_high},
+                                                              {"workspace_source_low", event->source_low},
+                                                              {"transfer_sequence", event->transfer},
+                                                              {"presentation_revision", event->publication}});
                 if (event->event == ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld) {
                     REQUIRE_FALSE(capacity_held.has_value());
                     capacity_held = *event;
@@ -6363,11 +5938,10 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             if (event->event == ExploreAcceptanceGate::ControlEvent::HeldWait) held_read_waiting = true;
             native.RecordHeldControlObservation(*event);
             if (logging) {
-                const auto control_event =
-                    event->event == ExploreAcceptanceGate::ControlEvent::HeldWait      ? "acceptance.control.held_wait"
-                    : event->event == ExploreAcceptanceGate::ControlEvent::HeldProceed ? "acceptance.control.held_proceed"
-                    : event->event == ExploreAcceptanceGate::ControlEvent::HeldStale   ? "acceptance.control.held_stale"
-                                                                                       : "acceptance.control.initial_wait";
+                const auto control_event = event->event == ExploreAcceptanceGate::ControlEvent::HeldWait      ? "acceptance.control.held_wait"
+                                           : event->event == ExploreAcceptanceGate::ControlEvent::HeldProceed ? "acceptance.control.held_proceed"
+                                           : event->event == ExploreAcceptanceGate::ControlEvent::HeldStale   ? "acceptance.control.held_stale"
+                                                                                                              : "acceptance.control.initial_wait";
                 append_acceptance_record(acceptance_log, {{"event", control_event},
                                                           {"sequence", event->generation},
                                                           {"value", event->slot},
@@ -6392,11 +5966,9 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 FAIL("workspace Wayland product reported a terminal integration failure");
             }
             const bool terminal_window_close = termination == TerminationMode::WindowClose &&
-                                               native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) &&
-                                               !native.active_peer();
+                                               native.product_completed(final_generations, seeded_augmentation_ready(), pixel_fixture) && !native.active_peer();
             exited_early =
-                !((native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || terminal_window_close) &&
-                  browser.product_ready());
+                !((native.product_ready(final_generations, seeded_augmentation_ready(), pixel_fixture) || terminal_window_close) && browser.product_ready());
             if (exited_early) {
                 std::cerr << "workspace-wayland child exited before readiness";
                 record_acceptance_state("acceptance.readiness.blocked", true);
@@ -6408,7 +5980,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             break;
         }
     }
-
     bool peer_killed = false;
     if (readiness_reached) record_acceptance_state("acceptance.readiness.completed", false);
     REQUIRE(readiness_reached);
@@ -6445,7 +6016,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     }
     const std::string native_text = read_tail(diagnostics);
     const std::string browser_text = read_tail(firefox_log);
-
     INFO("termination: " << termination_label(termination));
     INFO("native diagnostics: " << native_text);
     INFO("native runtime log: " << read_tail(runtime_log));
@@ -6494,8 +6064,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         CHECK(pixel_audit.retained_logical_content);
         CHECK(pixel_audit.upscale_growth);
     }
-    if (viewer_scenario == "copy" || viewer_scenario == "semantics" || viewer_scenario.empty())
-        CHECK(pixel_audit.continuity_complete(viewer_scenario.empty()));
+    if (viewer_scenario == "copy" || viewer_scenario == "semantics" || viewer_scenario.empty()) CHECK(pixel_audit.continuity_complete(viewer_scenario.empty()));
     CHECK_FALSE(browser.owned_atlas_interrupted);
     CHECK(browser.initial_atlas_complete);
     if (viewer_scenario == "terminal") {
@@ -6571,13 +6140,11 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     const auto slot = static_cast<std::size_t>(held - indices.begin());
                     REQUIRE(slot < draw["ready_slots"].size());
                     CHECK(draw["ready_slots"][slot] == (stage == "held-complete"));
-                    if (stage == "held-visible")
-                        CHECK(browser.held_placeholder_motion(visible_read_held->compiled_index, visible_read_held->generation));
+                    if (stage == "held-visible") CHECK(browser.held_placeholder_motion(visible_read_held->compiled_index, visible_read_held->generation));
                 }
                 REQUIRE(capacity_held.has_value());
                 REQUIRE(capacity_available);
-                const auto source = SurfaceAudit::native_identity(
-                    {{"surface_high", capacity_held->source_high}, {"surface_low", capacity_held->source_low}});
+                const auto source = SurfaceAudit::native_identity({{"surface_high", capacity_held->source_high}, {"surface_low", capacity_held->source_low}});
                 bool exact_retry = false;
                 for (const auto& [arena, state] : surface_audit.surfaces) {
                     const auto copied = state.receipts.find(browser.capacity_retry_publication);
@@ -6585,9 +6152,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                     const auto first = state.transfers.find({capacity_held->publication, capacity_held->transfer});
                     const auto retry = state.transfers.find({browser.capacity_retry_publication, copied->second.transfer});
                     exact_retry = copied->second.stage == 3U && !copied->second.release_only && first != state.transfers.end() &&
-                                  retry != state.transfers.end() && first->second.read.source == source && first->second.releasing &&
-                                  first->second.released && retry->second.releasing && retry->second.released &&
-                                  browser.capacity_retry_publication >= capacity_held->publication &&
+                                  retry != state.transfers.end() && first->second.read.source == source && first->second.releasing && first->second.released &&
+                                  retry->second.releasing && retry->second.released && browser.capacity_retry_publication >= capacity_held->publication &&
                                   browser.capacity_retry_frame == copied->second.frame;
                     if (exact_retry) break;
                 }
@@ -6613,8 +6179,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                             else
                                 ++copies;
                         }
-                        offers +=
-                            std::ranges::count_if(allocation.transfers, [](const auto& transfer) { return !transfer.second.releasing; });
+                        offers += std::ranges::count_if(allocation.transfers, [](const auto& transfer) { return !transfer.second.releasing; });
                         for (const auto& [publication, custody] : allocation.custody) {
                             encodings += custody.encoded;
                             settlements += custody.settled;
@@ -6658,9 +6223,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK(browser.viewer_class_colors);
             CHECK(browser.viewer_labels_without_boxes);
             for (const auto kind : {1U, 5U}) {
-                CHECK(std::ranges::any_of(browser.viewer_label_products, [&](const auto& product) {
-                    return product.first == kind && browser.surface_draws.contains(product.second);
-                }));
+                CHECK(std::ranges::any_of(browser.viewer_label_products,
+                                          [&](const auto& product) { return product.first == kind && browser.surface_draws.contains(product.second); }));
             }
         }
         if (viewer_scenario == "copy") {
@@ -6674,8 +6238,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 const auto found = browser.annotation_reachable.find(layout);
                 REQUIRE(found != browser.annotation_reachable.end());
                 const auto& controls = found->second;
-                for (const auto control : {"annotation.save", "annotation.timeline", "annotation.stop"})
-                    CHECK(controls.contains(control));
+                for (const auto control : {"annotation.save", "annotation.timeline", "annotation.stop"}) CHECK(controls.contains(control));
                 // The source imports one object and six classes. Setup creates
                 // three shapes and 32 disabled duplicates/classes. Each full
                 // product pass adds four further objects.
@@ -6701,24 +6264,22 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                 CHECK(source != 0U);
                 CHECK(browser.surface_draws.contains(presentation));
             }
-            for (const auto operation : {"color-sample", "mask-fill", "move-Mask", "resize-mask", "paint-mask", "erase-mask", "move-Point",
-                                         "move-Spline", "move-Skeleton", "spline-handle", "singleton-spline", "reclassify", "undo-class",
-                                         "redo-class", "cancel-preview", "create-Box", "create-Point", "create-Skeleton"})
+            for (const auto operation : {"color-sample", "mask-fill", "move-Mask", "resize-mask", "paint-mask", "erase-mask", "move-Point", "move-Spline",
+                                         "move-Skeleton", "spline-handle", "singleton-spline", "reclassify", "undo-class", "redo-class", "cancel-preview",
+                                         "create-Box", "create-Point", "create-Skeleton"})
                 CHECK(browser.annotation_product_operations[operation] >= 2U);
             for (const auto tool : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationTool>())
                 CHECK(browser.annotation_product_operations["tool-" + std::string{tool.name}] >= 2U);
             for (const auto operation : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationMaskCleanup>())
                 CHECK(browser.annotation_product_operations["cleanup-" + std::string{operation.name}] >= 2U);
-            CHECK(
-                (browser.viewer_import_edits == std::set<std::string>{"box-move-undo-redo", "box-resize-undo-redo", "mask-paint-undo-redo",
-                                                                      "mask-erase-undo-redo", "class-undo-redo"}));
+            CHECK((browser.viewer_import_edits ==
+                   std::set<std::string>{"box-move-undo-redo", "box-resize-undo-redo", "mask-paint-undo-redo", "mask-erase-undo-redo", "class-undo-redo"}));
             const auto saved_path = compiled_directory / "viewer-annotations.cbor";
             REQUIRE(std::filesystem::is_regular_file(saved_path));
             const auto saved_bytes = read_from(saved_path, 0U);
             const auto saved = mmltk::frameworks::serialization::decode<mmltk::controller::contracts::AnnotationUiState>(
-                {.first = std::as_bytes(std::span{saved_bytes})},
-                {.max_bytes = mmltk::controller::contracts::kAnnotationUiStateByteBudget,
-                 .max_items = mmltk::controller::contracts::kAnnotationUiStateByteBudget});
+                {.first = std::as_bytes(std::span{saved_bytes})}, {.max_bytes = mmltk::controller::contracts::kAnnotationUiStateByteBudget,
+                                                                   .max_items = mmltk::controller::contracts::kAnnotationUiStateByteBudget});
             REQUIRE(saved.has_value());
             CHECK(saved->valid());
             CHECK(saved->scene.objects.size() == 44U);
@@ -6726,8 +6287,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK(std::ranges::count_if(saved->scene.objects, [](const auto& object) { return !object.enabled; }) == 32);
             CHECK(saved->scene.palette == mmltk::controller::contracts::annotation_class_palette(saved->scene.categories.size()));
             for (const auto shape : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationShape>())
-                CHECK(std::ranges::any_of(saved->scene.objects,
-                                          [&](const auto& object) { return object.enabled && object.shape == shape.value; }));
+                CHECK(std::ranges::any_of(saved->scene.objects, [&](const auto& object) { return object.enabled && object.shape == shape.value; }));
             CHECK(std::ranges::any_of(saved->scene.objects, [](const auto& object) {
                 return object.shape == mmltk::controller::contracts::AnnotationShape::Spline && object.spline_knots.size() == 1U;
             }));
@@ -6790,9 +6350,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     REQUIRE(native.placeholder_slots.contains(native.partial_generation));
     REQUIRE(native.patched_slots.contains(native.partial_generation));
     CHECK_FALSE(native.patched_slots.at(native.partial_generation).empty());
-    CHECK(std::ranges::any_of(browser.explore_slots, [this](const auto& rendered) {
-        return rendered.second == native.placeholder_slots.at(native.partial_generation);
-    }));
+    CHECK(std::ranges::any_of(browser.explore_slots,
+                              [this](const auto& rendered) { return rendered.second == native.placeholder_slots.at(native.partial_generation); }));
     CHECK(native.exact_partial_slot_identity());
     CHECK(native.stale_thumbnail_discarded());
     CHECK_FALSE(native.explore_tile_regressed);
@@ -6806,7 +6365,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     constexpr std::size_t fixture_descriptor_allowance = 64U * 1024U;
     constexpr std::size_t maximum_fixture_lane_bytes = source_and_donor_bytes + donor_mask_bytes + fixture_descriptor_allowance;
     CHECK(native.explore_max_pinned <= native.explore_nproc * maximum_fixture_lane_bytes);
-
     const auto compiled_path = compiled_directory / (fixture.split + ".bin");
     REQUIRE(std::filesystem::is_regular_file(compiled_path));
     // CLEANUP-IGNORE: Runtime audit facts and persisted dataset metadata are independent Wayland acceptance evidence.
@@ -6816,10 +6374,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     CHECK(compiled.height == static_cast<std::uint32_t>(kCompiledResolution));
     CHECK(compiled.channels != 0U);
     CHECK_FALSE(compiled.class_names().empty());
-
     if (!last) AdvanceScenario();
 }
-
 void WaylandSession::AdvanceScenario() {
     REQUIRE(frontend_settled_);
     REQUIRE_FALSE(browser_failed_);
@@ -6830,7 +6386,6 @@ void WaylandSession::AdvanceScenario() {
     surface_audit.SettleScenario();
     REQUIRE(surface_audit.failure.empty());
     REQUIRE(surface_audit.surfaces.size() <= kAcceptanceGenerationLimit);
-
     const auto live_publication = [&](const auto& identity, const auto revision) {
         const auto surface = surface_audit.surfaces.find(identity);
         return surface != surface_audit.surfaces.end() && surface->second.publications.contains(revision);
@@ -6850,34 +6405,28 @@ void WaylandSession::AdvanceScenario() {
         publication.direct_counted = false;
     }
     pixel_audit = std::move(next_pixels);
-
     AtlasDrawAudit retained_atlas;
     retained_atlas.acquisitions = std::move(browser.atlas_draws.acquisitions);
-    std::erase_if(retained_atlas.acquisitions,
-                  [&](const auto& entry) { return !surface_audit.surfaces.contains(std::get<0>(entry.first)); });
+    std::erase_if(retained_atlas.acquisitions, [&](const auto& entry) { return !surface_audit.surfaces.contains(std::get<0>(entry.first)); });
     std::set<AtlasDrawAudit::SourceKey> retained_sources;
-    for (const auto& [_, capture] : retained_atlas.acquisitions)
-        retained_sources.insert(AtlasDrawAudit::source_key(capture));
+    for (const auto& [_, capture] : retained_atlas.acquisitions) retained_sources.insert(AtlasDrawAudit::source_key(capture));
     std::map<std::array<std::uint64_t, 3U>, AtlasDrawAudit::SourceKey> latest_sources;
     for (const auto& [key, _] : browser.atlas_draws.sources) {
         const std::array owner{key[0], key[1], key[2]};
         auto [found, inserted] = latest_sources.try_emplace(owner, key);
         if (!inserted && key[3] > found->second[3]) found->second = key;
     }
-    for (const auto& [_, key] : latest_sources)
-        retained_sources.insert(key);
+    for (const auto& [_, key] : latest_sources) retained_sources.insert(key);
     retained_atlas.sources = std::move(browser.atlas_draws.sources);
     retained_atlas.sessions = std::move(browser.atlas_draws.sessions);
     std::erase_if(retained_atlas.sources, [&](const auto& entry) { return !retained_sources.contains(entry.first); });
     std::erase_if(retained_atlas.sessions, [&](const auto& entry) { return !retained_sources.contains(entry.second); });
     const bool current_atlas = browser.owned_atlas_current;
-    auto prior_atlas_draw =
-        browser.atlas_draws.overlap_draw ? std::move(browser.atlas_draws.overlap_draw) : std::move(browser.prior_scenario_atlas_draw);
+    auto prior_atlas_draw = browser.atlas_draws.overlap_draw ? std::move(browser.atlas_draws.overlap_draw) : std::move(browser.prior_scenario_atlas_draw);
     browser = {};
     browser.atlas_draws = std::move(retained_atlas);
     browser.owned_atlas_current = current_atlas;
     browser.prior_scenario_atlas_draw = std::move(prior_atlas_draw);
-
     NativeAudit next_native;
     next_native.server_started = native.server_started;
     next_native.peer_opened = native.peer_opened;
@@ -6892,7 +6441,6 @@ void WaylandSession::AdvanceScenario() {
     frontend_settled_ = false;
     REQUIRE(process_->command_explore(8U));
 }
-
 [[nodiscard]] std::shared_ptr<PreparedWaylandInputs> wayland_inputs(const bool require_compiled) {
     if (!execution_requested()) SKIP("workspace Wayland integration requires the packaged hardware runner");
     if (permitted_cpu_count() < 2U) SKIP("workspace Wayland streaming acceptance requires at least two permitted CPUs");
@@ -6905,7 +6453,6 @@ void WaylandSession::AdvanceScenario() {
     }
     return inputs;
 }
-
 void workspace_wayland_retained() {
     WaylandSession session{wayland_inputs(false), TerminationMode::SignalInterrupt, "retained"};
     session.RunScenario("square", false, false, true);
@@ -6917,34 +6464,29 @@ void workspace_wayland_retained() {
     session.RunScenario("copy", false, true);
     session.RunScenario("rapid", true);
 }
-
 void workspace_wayland_dpi() {
     WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, "dpi", true, true};
     session.RunScenario("copy", false, false, true);
     session.RunScenario("copy", false, true);
     session.RunScenario("rapid", true, true);
 }
-
 void workspace_wayland_terminal() {
     const auto terminal = GENERATE(TerminationMode::WindowClose, TerminationMode::AbruptPeerLoss);
     WaylandSession session{wayland_inputs(true), terminal, "terminal", true, false, true, {}, terminal != TerminationMode::WindowClose};
     session.RunScenario("terminal", true);
 }
-
 void workspace_wayland_probe_recovery() {
     const std::string boundary = GENERATE("allocation", "reset", "begin", "end");
     const auto inputs = wayland_inputs(false);
     WaylandSession session{inputs, TerminationMode::SignalInterrupt, "semantics", true, false, true, boundary, true, &inputs->probe()};
     session.RunScenario("semantics", true);
 }
-
 void workspace_wayland_gdr() {
     if (!execution_requested()) SKIP("workspace Wayland integration requires the packaged hardware runner");
     if (!gdr_transport_available()) SKIP("GDR hardware unavailable; focused packaged GDR coverage remains unverified");
     WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, "wide", true, false, false};
     session.RunScenario("wide", true);
 }
-
 void workspace_wayland_quiet() {
     const std::string profile = GENERATE("blocked", "quiet");
     const char* const diagnostics = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_QUIET_DIAGNOSTICS");
@@ -6952,7 +6494,6 @@ void workspace_wayland_quiet() {
     WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, profile, logging, false, true, {}, false};
     session.RunScenario("quiet", true);
 }
-
 void add_rendered_probe_audit_fixture(NativeAudit& audit, const NativeAudit::PaddingOrientation orientation, const std::uint64_t generation,
                                       const std::uint64_t slot, const std::uint64_t compiled_index, const std::uint64_t frame_revision) {
     const auto key = std::pair{generation, slot};
@@ -6962,21 +6503,18 @@ void add_rendered_probe_audit_fixture(NativeAudit& audit, const NativeAudit::Pad
     audit.transition_probe_slots.emplace(key, compiled_index);
     audit.rendered_probe_frames.emplace(key, std::vector{frame_revision});
     audit.selected_overlay_slots.emplace(key, NativeAudit::OverlayDescriptorIdentity{1U, compiled_index});
-    audit.hidden_overlay_slots.emplace(std::pair{generation - 1U, slot + 1U},
-                                       NativeAudit::OverlayDescriptorIdentity{1U, compiled_index + 100U});
+    audit.hidden_overlay_slots.emplace(std::pair{generation - 1U, slot + 1U}, NativeAudit::OverlayDescriptorIdentity{1U, compiled_index + 100U});
     audit.transformed_overlay_slots.emplace(key);
     audit.semantic_overlay_slots.emplace(key);
     audit.placeholder_slots[generation].emplace(slot, compiled_index);
     audit.patched_slots[generation].emplace(slot, compiled_index);
 }
-
 [[nodiscard]] NativeAudit rendered_probe_audit_fixture(const bool vertical = true, const bool horizontal = true) {
     NativeAudit audit;
     if (vertical) add_rendered_probe_audit_fixture(audit, NativeAudit::PaddingOrientation::Vertical, 7U, 2U, 11U, 50U);
     if (horizontal) add_rendered_probe_audit_fixture(audit, NativeAudit::PaddingOrientation::Horizontal, 8U, 3U, 12U, 51U);
     return audit;
 }
-
 void rendered_probe_audit_rejects_mismatched_identity() {
     NativeAudit self_contained;
     self_contained.consume({{"kind", "gui_runtime"},
@@ -6997,13 +6535,8 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     CHECK_FALSE(self_contained.causal_inconsistent);
     CHECK(self_contained.rendered_probe_slots.at({7U, 2U}) == 11U);
     CHECK(self_contained.padding_orientations.at({7U, 2U}) == NativeAudit::PaddingOrientation::Vertical);
-
     const auto publish_frame = [](NativeAudit& audit, const std::uint64_t generation, const std::uint64_t revision) {
-        audit.consume({{"kind", "gui_runtime"},
-                       {"owner", "explore"},
-                       {"event", "explore.frame.published"},
-                       {"sequence", generation},
-                       {"value", revision}});
+        audit.consume({{"kind", "gui_runtime"}, {"owner", "explore"}, {"event", "explore.frame.published"}, {"sequence", generation}, {"value", revision}});
     };
     NativeAudit incomplete_pair;
     incomplete_pair.placeholder_slots[7U].emplace(2U, 11U);
@@ -7015,7 +6548,6 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     incomplete_pair.reconcile_rendered_probes(7U);
     CHECK_FALSE(incomplete_pair.causal_inconsistent);
     CHECK(incomplete_pair.rendered_probe_frames.at({7U, 2U}) == std::vector{std::uint64_t{50U}});
-
     NativeAudit missing_patch;
     missing_patch.placeholder_slots[7U].emplace(2U, 11U);
     missing_patch.rendered_probe_slots.emplace(std::pair{7U, 2U}, 11U);
@@ -7023,7 +6555,6 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     publish_frame(missing_patch, 7U, 50U);
     CHECK_FALSE(missing_patch.causal_inconsistent);
     CHECK(missing_patch.rendered_probe_frames.at({7U, 2U}) == std::vector{std::uint64_t{50U}});
-
     NativeAudit coalesced_publications;
     const auto coalesced_key = std::pair{7U, 2U};
     coalesced_publications.placeholder_slots[7U].emplace(2U, 11U);
@@ -7034,7 +6565,6 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     coalesced_publications.published_frames[7U] = {{1U, 49U}, {4U, 50U}, {5U, 51U}};
     coalesced_publications.reconcile_rendered_probes(7U);
     CHECK(coalesced_publications.rendered_probe_frames.at(coalesced_key) == std::vector{std::uint64_t{50U}, std::uint64_t{51U}});
-
     NativeAudit conflicting_pair;
     conflicting_pair.placeholder_slots[7U].emplace(2U, 11U);
     conflicting_pair.patched_slots[7U].emplace(2U, 12U);
@@ -7043,7 +6573,6 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     publish_frame(conflicting_pair, 7U, 50U);
     CHECK(conflicting_pair.causal_inconsistent);
     CHECK(conflicting_pair.causal_failure == "rendered probe patch identity");
-
     CHECK(rendered_probe_audit_fixture().aligned_overlay_pixels());
     const auto vertical_only = rendered_probe_audit_fixture(true, false);
     CHECK(vertical_only.aligned_padding_orientation(NativeAudit::PaddingOrientation::Vertical));
@@ -7053,29 +6582,23 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     CHECK(horizontal_only.aligned_padding_orientation(NativeAudit::PaddingOrientation::Horizontal));
     CHECK_FALSE(horizontal_only.aligned_padding_orientation(NativeAudit::PaddingOrientation::Vertical));
     CHECK_FALSE(horizontal_only.aligned_overlay_pixels());
-
     auto stale_generation = rendered_probe_audit_fixture();
     stale_generation.transition_probe_slots.erase({7U, 2U});
     stale_generation.transition_probe_slots.emplace(std::pair{8U, 2U}, 11U);
     CHECK_FALSE(stale_generation.aligned_overlay_pixels());
-
     auto mismatched_slot = rendered_probe_audit_fixture();
     mismatched_slot.placeholder_slots.at(7U).clear();
     mismatched_slot.placeholder_slots.at(7U).emplace(3U, 11U);
     CHECK_FALSE(mismatched_slot.aligned_overlay_pixels());
-
     auto mismatched_compiled_index = rendered_probe_audit_fixture();
     mismatched_compiled_index.rendered_probe_slots.at({7U, 2U}) = 12U;
     CHECK_FALSE(mismatched_compiled_index.aligned_overlay_pixels());
-
     auto mismatched_orientation = rendered_probe_audit_fixture();
     mismatched_orientation.padding_orientations.at({7U, 2U}) = NativeAudit::PaddingOrientation::Horizontal;
     CHECK_FALSE(mismatched_orientation.aligned_overlay_pixels());
-
     auto mismatched_frame = rendered_probe_audit_fixture();
     mismatched_frame.rendered_probe_frames.at({7U, 2U}) = {0U};
     CHECK_FALSE(mismatched_frame.aligned_overlay_pixels());
-
     BrowserAudit browser;
     browser.surface_geometries.push_back({.presentation_revision = 70U, .source_revision = 50U, .width = 640.0, .height = 320.0});
     browser.surface_geometries.push_back({.presentation_revision = 71U, .source_revision = 51U, .width = 640.0, .height = 320.0});
@@ -7097,22 +6620,18 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     CHECK_FALSE(browser.rendered_frame_for_slots({{2U, 11U}}, 0U, 0U));
     CHECK(browser.rendered_frame_for_slots({{3U, 12U}}, 0U, 0U));
 }
-
 TEST_CASE("browser audit exposes distinct integration phases for progress deadlines", "[workspace][audit]") {
     BrowserAudit audit;
     audit.consume({{"event", "integration.phase_progress"}, {"control", "startup"}, {"detail", "AwaitBootstrap"}});
     CHECK(audit.phase_progress_revision == 1U);
     CHECK(audit.phase_progress_class == "startup");
     CHECK(audit.phase_progress_name == "AwaitBootstrap");
-
     audit.consume({{"event", "integration.phase_progress"}, {"control", "startup"}, {"detail", "AwaitBootstrap"}});
     CHECK(audit.phase_progress_revision == 1U);
-
     audit.consume({{"event", "integration.phase_progress"}, {"control", "work"}, {"detail", "AwaitCompileCompletion"}});
     CHECK(audit.phase_progress_revision == 2U);
     CHECK(audit.phase_progress_class == "work");
     CHECK(audit.phase_progress_name == "AwaitCompileCompletion");
-
     audit.consume({{"event", "integration.explore_reopen_wait"}, {"a", 41U}});
     CHECK(audit.work_progress_revision == 1U);
     audit.consume({{"event", "integration.explore_reopen_wait"}, {"a", 41U}});
@@ -7123,11 +6642,9 @@ TEST_CASE("browser audit exposes distinct integration phases for progress deadli
     CHECK(audit.work_progress_revision == 3U);
     audit.consume({{"event", "integration.explore_reopen_draw"}, {"d", 9U}});
     CHECK(audit.work_progress_revision == 3U);
-
     audit.consume({{"event", "integration.phase_progress"}, {"control", "unbounded"}, {"detail", "Unknown"}});
     CHECK_FALSE(audit.bounds_valid);
 }
-
 // Configured inventory: primary + DPI + two destructive terminals + four
 // startup-latched faults + two quiet paths = 10 H2D lifetimes. Optional GDR
 // adds one focused lifetime. The former matrix used 23 per transport (46
@@ -7139,10 +6656,8 @@ MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][pr
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][gdr]", workspace_wayland_gdr);
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][quiet]", workspace_wayland_quiet);
 MMLTK_REGISTER_TEST_CASE("[workspace_wayland_integration][rendered_probe_audit]", rendered_probe_audit_rejects_mismatched_identity);
-
 }  // namespace
 namespace {
-
 [[nodiscard]] nlohmann::json native_surface_record(const char* event, const std::uint64_t low = 12U) {
     const std::string_view name{event};
     const bool copying = name.starts_with("presentation.source_borrow.") || name == "presentation.source.read_submitted";
@@ -7179,11 +6694,10 @@ namespace {
             {"timeline_ready", copying ? 0U : 1U},
             {"trace_id", 31U},
             {"span_id", 31U},
-            {"span_outcome", static_cast<std::uint64_t>(std::string_view{event}.ends_with(".completed")
-                                                            ? mmltk::controller::contracts::DiagnosticSpanOutcome::Success
-                                                            : mmltk::controller::contracts::DiagnosticSpanOutcome::Unspecified)}};
+            {"span_outcome",
+             static_cast<std::uint64_t>(std::string_view{event}.ends_with(".completed") ? mmltk::controller::contracts::DiagnosticSpanOutcome::Success
+                                                                                        : mmltk::controller::contracts::DiagnosticSpanOutcome::Unspecified)}};
 }
-
 [[nodiscard]] nlohmann::json browser_surface_record(const char* event, const std::uint64_t low = 12U) {
     const std::string_view name{event};
     static std::uint64_t next_draw = 0U;
@@ -7191,8 +6705,7 @@ namespace {
     if (name == "iced.surface.sample_draw_selected") current_draw[low] = ++next_draw;
     return {{"event", event},
             {"draw_identity", current_draw[low]},
-            {"surface",
-             SurfaceAudit::native_identity(native_surface_record("", name.starts_with("firefox.workspace.source.") ? low + 1000U : low))},
+            {"surface", SurfaceAudit::native_identity(native_surface_record("", name.starts_with("firefox.workspace.source.") ? low + 1000U : low))},
             {"source", SurfaceAudit::native_identity(native_surface_record("", low + 1000U))},
             {"arena", SurfaceAudit::native_identity(native_surface_record("", low))},
             {"workspace_allocation", low + 2000U},
@@ -7215,14 +6728,12 @@ namespace {
             {"presentation_revision", 1U},
             {"outcome", "claimed"}};
 }
-
 [[nodiscard]] nlohmann::json release_only_record(const char* event) {
     auto record = browser_surface_record(event);
     record.erase("layer");
     record.erase("slot");
     return record;
 }
-
 constexpr std::array native_surface_events{"presentation.arena.advertised",
                                            "presentation.admission.enqueued",
                                            "presentation.admission.written",
@@ -7262,14 +6773,10 @@ constexpr std::array browser_surface_events{"firefox.workspace.admitted",
                                             "iced.surface.texture_destroyed",
                                             "firefox.workspace.retired"};
 constexpr std::size_t browser_live_stages = 17U;
-
 void record_source_transfer(SurfaceAudit& audit, const bool acquired = true) {
-    for (std::size_t stage = 0U; stage < (acquired ? 15U : 13U); ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
-    for (std::size_t stage = 0U; stage < 9U; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < (acquired ? 15U : 13U); ++stage) audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < 9U; ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
 }
-
 void record_unsettled_source_read(SurfaceAudit& audit, const bool direct, const bool dispatched) {
     for (std::size_t stage = 0U; stage < 13U; ++stage) {
         auto record = native_surface_record(native_surface_events[stage]);
@@ -7284,20 +6791,17 @@ void record_unsettled_source_read(SurfaceAudit& audit, const bool direct, const 
         audit.browser(record);
     }
 }
-
 void record_receiver_withdrawal(SurfaceAudit& audit) {
-    for (std::size_t index = 0U; index < 6U; ++index)
-        audit.browser(browser_surface_record(browser_surface_events[index]));
+    for (std::size_t index = 0U; index < 6U; ++index) audit.browser(browser_surface_record(browser_surface_events[index]));
     audit.browser(browser_surface_record("iced.surface.pending_discarded"));
     audit.browser(browser_surface_record("firefox.workspace.withdrawal"));
     audit.browser(browser_surface_record("iced.surface.import_dropped"));
     audit.browser(browser_surface_record("iced.surface.texture_destroyed"));
     audit.browser(browser_surface_record("firefox.workspace.retired"));
 }
-
 TEST_CASE("unsampled arena retirement joins native and Firefox physical ownership", "[workspace][audit]") {
-    const std::string fault = GENERATE("complete", "native-admission", "browser-admission", "dimensions", "native-withdrawal",
-                                       "browser-withdrawal", "native-retirement", "browser-retirement", "failed-retirement");
+    const std::string fault = GENERATE("complete", "native-admission", "browser-admission", "dimensions", "native-withdrawal", "browser-withdrawal",
+                                       "native-retirement", "browser-retirement", "failed-retirement");
     CAPTURE(fault);
     SurfaceAudit audit;
     for (std::size_t stage = 0U; stage < 4U; ++stage)
@@ -7325,16 +6829,13 @@ TEST_CASE("unsampled arena retirement joins native and Firefox physical ownershi
         CHECK_FALSE(audit.joined_failure().empty());
     }
 }
-
 TEST_CASE("Image metadata stays paired with its acquired pixels through retained draws", "[workspace][audit]") {
     SurfaceAudit audit;
     record_source_transfer(audit);
-    for (std::size_t stage = 9U; stage < browser_live_stages; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    for (std::size_t stage = 9U; stage < browser_live_stages; ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
     REQUIRE(audit.evidence_settled());
     audit.SettleScenario();
-    for (const auto* event :
-         {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.surface.draw_submitted", "iced.frame.draw_settled"})
+    for (const auto* event : {"iced.surface.sample_draw_selected", "iced.surface.draw_encoded", "iced.surface.draw_submitted", "iced.frame.draw_settled"})
         audit.browser(browser_surface_record(event));
     REQUIRE(audit.evidence_settled());
     const auto& surface = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
@@ -7342,13 +6843,10 @@ TEST_CASE("Image metadata stays paired with its acquired pixels through retained
     CHECK(surface.custody.at(1U).metadata == surface.transfers.at({1U, 1U}).metadata);
     CHECK(surface.custody.at(1U).settled == 2U);
 }
-
 TEST_CASE("exact draw submission survives non-FIFO encoder settlement", "[workspace][audit]") {
     SurfaceAudit audit;
-    for (const auto* event : native_surface_events)
-        audit.native(native_surface_record(event));
-    for (std::size_t stage = 0U; stage < browser_live_stages - 1U; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    for (const auto* event : native_surface_events) audit.native(native_surface_record(event));
+    for (std::size_t stage = 0U; stage < browser_live_stages - 1U; ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
     const auto submitted_identity = audit.draws.front().identity;
     audit.SettleScenario();
     REQUIRE(audit.draws.size() == 1U);
@@ -7369,10 +6867,9 @@ TEST_CASE("exact draw submission survives non-FIFO encoder settlement", "[worksp
     CHECK(audit.draws[1].submitted == 0U);
     CHECK(audit.draws[1].abandoned);
 }
-
 TEST_CASE("draw submission requires exact encoded identity and live custody", "[workspace][audit]") {
-    const std::string fault = GENERATE("complete", "width", "height", "requested", "publication", "before-encoding", "after-settlement",
-                                       "duplicate", "draw-identity");
+    const std::string fault =
+        GENERATE("complete", "width", "height", "requested", "publication", "before-encoding", "after-settlement", "duplicate", "draw-identity");
     CAPTURE(fault);
     SurfaceAudit audit;
     record_source_transfer(audit);
@@ -7389,7 +6886,6 @@ TEST_CASE("draw submission requires exact encoded identity and live custody", "[
     if (fault == "duplicate") audit.browser(submitted);
     CHECK(audit.failure.empty() == (fault == "complete"));
 }
-
 TEST_CASE("Image metadata acceptance validates payload and physical transfer identity", "[workspace][audit]") {
     const std::string fault = GENERATE("bytes", "fingerprint", "empty", "malformed", "source", "transfer");
     CAPTURE(fault);
@@ -7409,17 +6905,13 @@ TEST_CASE("Image metadata acceptance validates payload and physical transfer ide
     }
     CHECK_FALSE(audit.evidence_settled());
 }
-
 TEST_CASE("scenario settlement retains physical reuse and waits for independent native delivery", "[workspace][audit]") {
     SurfaceAudit audit;
-    for (std::size_t stage = 0U; stage < 12U; ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
-    for (std::size_t stage = 0U; stage < browser_live_stages; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < 12U; ++stage) audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < browser_live_stages; ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
     REQUIRE(audit.failure.empty());
     CHECK_FALSE(audit.evidence_settled());
-    for (std::size_t stage = 12U; stage < 15U; ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 12U; stage < 15U; ++stage) audit.native(native_surface_record(native_surface_events[stage]));
     REQUIRE(audit.evidence_settled());
     const auto id = SurfaceAudit::native_identity(native_surface_record(""));
     const auto publications = audit.surfaces.at(id).publications;
@@ -7433,8 +6925,7 @@ TEST_CASE("scenario settlement retains physical reuse and waits for independent 
     audit.browser(browser_surface_record("iced.frame.draw_settled"));
     CHECK(audit.evidence_settled());
     CHECK(audit.draws.size() == 1U);
-    for (std::size_t stage = 15U; stage < native_surface_events.size(); ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 15U; stage < native_surface_events.size(); ++stage) audit.native(native_surface_record(native_surface_events[stage]));
     CHECK_FALSE(audit.evidence_settled());
     for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage)
         audit.browser(browser_surface_record(browser_surface_events[stage]));
@@ -7443,13 +6934,11 @@ TEST_CASE("scenario settlement retains physical reuse and waits for independent 
     CHECK(audit.surfaces.empty());
     CHECK(audit.failure.empty());
 }
-
 TEST_CASE("terminal reads require exact positive completion or installed custody evidence", "[workspace][audit]") {
     const bool retained = GENERATE(false, true);
     const bool direct = GENERATE(false, true);
     const std::string fault = GENERATE("none", "missing", "duplicate", "before_terminal", "allocation", "outcome", "dispatch");
-    const std::string contradiction =
-        retained ? GENERATE("none", "release_before", "release_after", "retirement_before", "retirement_after") : "none";
+    const std::string contradiction = retained ? GENERATE("none", "release_before", "release_after", "retirement_before", "retirement_after") : "none";
     CAPTURE(retained, direct, fault, contradiction);
     SurfaceAudit audit;
     const auto native = [&](const char* event) {
@@ -7485,11 +6974,9 @@ TEST_CASE("terminal reads require exact positive completion or installed custody
     INFO(audit.joined_failure());
     CHECK(audit.joined_failure().empty() == (fault == "none" && contradiction == "none"));
 }
-
 TEST_CASE("terminal source retirement proves native completion whose receiver notification was lost", "[workspace][audit]") {
     const bool direct = GENERATE(false, true);
-    const std::string fault =
-        GENERATE("none", "release", "retirement", "shutdown", "browser_exit", "allocation", "mode", "dispatch", "transfer");
+    const std::string fault = GENERATE("none", "release", "retirement", "shutdown", "browser_exit", "allocation", "mode", "dispatch", "transfer");
     CAPTURE(direct, fault);
     SurfaceAudit audit;
     const auto native = [&](const char* event) {
@@ -7513,15 +7000,12 @@ TEST_CASE("terminal source retirement proves native completion whose receiver no
     INFO(audit.joined_failure());
     CHECK(audit.joined_failure().empty() == (fault == "none"));
 }
-
 TEST_CASE("source release settlement outlives the sample arena but not its physical source", "[workspace][audit]") {
     const bool release_started = GENERATE(false, true);
     const bool source_retired = GENERATE(false, true);
     SurfaceAudit audit;
-    for (std::size_t stage = 0U; stage < 13U; ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
-    for (const char* event : browser_surface_events)
-        audit.browser(browser_surface_record(event));
+    for (std::size_t stage = 0U; stage < 13U; ++stage) audit.native(native_surface_record(native_surface_events[stage]));
+    for (const char* event : browser_surface_events) audit.browser(browser_surface_record(event));
     if (release_started) audit.native(native_surface_record("presentation.release_wait.started"));
     audit.native(native_surface_record("presentation.active.withdrawal"));
     audit.native(native_surface_record("presentation.retirement"));
@@ -7536,14 +7020,11 @@ TEST_CASE("source release settlement outlives the sample arena but not its physi
     CHECK(audit.failure.empty() == !source_retired);
     CHECK(audit.evidence_settled() == !source_retired);
 }
-
 TEST_CASE("receiver process exit terminates page readers without fabricating draw completion", "[workspace][audit]") {
     const std::string boundary = GENERATE("shutdown", "bridge", "exit", "premature-texture-destruction");
     SurfaceAudit audit;
-    for (const char* event : native_surface_events)
-        audit.native(native_surface_record(event));
-    for (std::size_t stage = 0U; stage < browser_live_stages - 1U; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
+    for (const char* event : native_surface_events) audit.native(native_surface_record(event));
+    for (std::size_t stage = 0U; stage < browser_live_stages - 1U; ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
     REQUIRE(audit.failure.empty());
     REQUIRE_FALSE(audit.evidence_settled());
     audit.native({{"event", "shutdown.requested"}});
@@ -7555,7 +7036,6 @@ TEST_CASE("receiver process exit terminates page readers without fabricating dra
     CHECK(custody.settled == 0U);
     CHECK(custody.abandoned == 0U);
 }
-
 TEST_CASE("physical lifecycle custody rejects capacity overflow instead of dropping provenance", "[workspace][audit]") {
     SurfaceAudit audit;
     for (std::size_t identity = 1U; identity <= kAcceptanceGenerationLimit; ++identity)
@@ -7565,10 +7045,8 @@ TEST_CASE("physical lifecycle custody rejects capacity overflow instead of dropp
     CHECK_FALSE(audit.failure.empty());
     CHECK(audit.surfaces.size() == kAcceptanceGenerationLimit);
 }
-
 TEST_CASE("surface join rejects missing native provenance", "[workspace][audit]") {
-    for (const char* field :
-         {"sequence", "selection_generation", "frame_revision", "capacity_width", "capacity_height", "condition", "outcome"}) {
+    for (const char* field : {"sequence", "selection_generation", "frame_revision", "capacity_width", "capacity_height", "condition", "outcome"}) {
         SurfaceAudit audit;
         auto record = native_surface_record("presentation.arena.advertised");
         record.erase(field);
@@ -7579,14 +7057,12 @@ TEST_CASE("surface join rejects missing native provenance", "[workspace][audit]"
     audit.browser(nlohmann::json{{"event", "iced.surface.texture_create"}, {"surface", "not-a-capability"}});
     CHECK_FALSE(audit.joined_failure().empty());
 }
-
 TEST_CASE("surface join records failed span endings without accepting a completed physical transition", "[workspace][audit]") {
     using mmltk::controller::contracts::DiagnosticSpanOutcome;
-    for (const auto outcome : {DiagnosticSpanOutcome::Unspecified, DiagnosticSpanOutcome::ScopeExit, DiagnosticSpanOutcome::Cancelled,
-                               DiagnosticSpanOutcome::Exception}) {
+    for (const auto outcome :
+         {DiagnosticSpanOutcome::Unspecified, DiagnosticSpanOutcome::ScopeExit, DiagnosticSpanOutcome::Cancelled, DiagnosticSpanOutcome::Exception}) {
         SurfaceAudit audit;
-        for (std::size_t index = 0U; index < 8U; ++index)
-            audit.native(native_surface_record(native_surface_events[index]));
+        for (std::size_t index = 0U; index < 8U; ++index) audit.native(native_surface_record(native_surface_events[index]));
         auto ended = native_surface_record("presentation.source_borrow.completed");
         ended["span_outcome"] = static_cast<std::uint64_t>(outcome);
         audit.native(ended);
@@ -7597,7 +7073,6 @@ TEST_CASE("surface join records failed span endings without accepting a complete
         CHECK_FALSE(audit.joined_failure().empty());
     }
 }
-
 TEST_CASE("surface join rejects omitted admission and reordered observed copy stages", "[workspace][audit]") {
     for (std::size_t omitted = 0U; omitted < native_surface_events.size(); ++omitted) {
         if (std::string_view{native_surface_events[omitted]} == "presentation.active.withdrawal")
@@ -7605,14 +7080,12 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
         SurfaceAudit audit;
         for (std::size_t index = 0U; index < native_surface_events.size(); ++index)
             if (index != omitted) audit.native(native_surface_record(native_surface_events[index]));
-        for (const char* event : browser_surface_events)
-            audit.browser(browser_surface_record(event));
+        for (const char* event : browser_surface_events) audit.browser(browser_surface_record(event));
         CHECK_FALSE(audit.joined_failure().empty());
     }
     for (std::size_t omitted = 0U; omitted < browser_surface_events.size(); ++omitted) {
         SurfaceAudit audit;
-        for (const char* event : native_surface_events)
-            audit.native(native_surface_record(event));
+        for (const char* event : native_surface_events) audit.native(native_surface_record(event));
         for (std::size_t index = 0U; index < browser_surface_events.size(); ++index)
             if (index != omitted) audit.browser(browser_surface_record(browser_surface_events[index]));
         if (std::string_view{browser_surface_events[omitted]} == "iced.surface.draw_submitted") {
@@ -7630,36 +7103,29 @@ TEST_CASE("surface join rejects omitted admission and reordered observed copy st
     reordered.native(native_surface_record("presentation.arena.advertised"));
     CHECK_FALSE(reordered.joined_failure().empty());
     SurfaceAudit reordered_copy;
-    for (std::size_t index = 0U; index < 4U; ++index)
-        reordered_copy.native(native_surface_record(native_surface_events[index]));
+    for (std::size_t index = 0U; index < 4U; ++index) reordered_copy.native(native_surface_record(native_surface_events[index]));
     reordered_copy.native(native_surface_record("presentation.source.read_submitted"));
     reordered_copy.native(native_surface_record("presentation.source_borrow.started"));
     CHECK_FALSE(reordered_copy.joined_failure().empty());
     SurfaceAudit dropped_ready_start;
     for (std::size_t index = 0U; index < native_surface_events.size(); ++index)
         if (index != 10U) dropped_ready_start.native(native_surface_record(native_surface_events[index]));
-    for (const char* event : browser_surface_events)
-        dropped_ready_start.browser(browser_surface_record(event));
+    for (const char* event : browser_surface_events) dropped_ready_start.browser(browser_surface_record(event));
     CHECK_FALSE(dropped_ready_start.joined_failure().empty());
     SurfaceAudit reordered_ready;
-    for (std::size_t index = 0U; index < 10U; ++index)
-        reordered_ready.native(native_surface_record(native_surface_events[index]));
+    for (std::size_t index = 0U; index < 10U; ++index) reordered_ready.native(native_surface_record(native_surface_events[index]));
     reordered_ready.native(native_surface_record("presentation.ready_sync.completed"));
     reordered_ready.native(native_surface_record("presentation.ready_sync.started"));
     CHECK_FALSE(reordered_ready.joined_failure().empty());
 }
-
 TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejected-import retirement", "[workspace][audit]") {
     SurfaceAudit audit;
-    for (std::size_t index = 0U; index < 4U; ++index)
-        audit.native(native_surface_record(native_surface_events[index]));
+    for (std::size_t index = 0U; index < 4U; ++index) audit.native(native_surface_record(native_surface_events[index]));
     audit.native(native_surface_record("presentation.retirement"));
     record_receiver_withdrawal(audit);
     CHECK(audit.joined_failure().empty());
-
     SurfaceAudit dropped_candidate_retirement;
-    for (std::size_t index = 0U; index < 4U; ++index)
-        dropped_candidate_retirement.native(native_surface_record(native_surface_events[index]));
+    for (std::size_t index = 0U; index < 4U; ++index) dropped_candidate_retirement.native(native_surface_record(native_surface_events[index]));
     dropped_candidate_retirement.native(native_surface_record("presentation.candidate.withdrawal"));
     auto replacement = native_surface_record("presentation.replacement", 13U);
     replacement["sequence"] = 8U;
@@ -7667,12 +7133,10 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
     dropped_candidate_retirement.native(replacement);
     record_receiver_withdrawal(dropped_candidate_retirement);
     CHECK_FALSE(dropped_candidate_retirement.joined_failure().empty());
-
     for (const bool released : {false, true}) {
         CAPTURE(released);
         SurfaceAudit used_pending;
-        for (const char* event : native_surface_events)
-            used_pending.native(native_surface_record(event));
+        for (const char* event : native_surface_events) used_pending.native(native_surface_record(event));
         for (const char* event : browser_surface_events) {
             used_pending.browser(browser_surface_record(event));
             if (std::string_view{event} == "iced.surface.sample_acquired") break;
@@ -7684,11 +7148,9 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
         used_pending.browser(browser_surface_record("firefox.workspace.retired"));
         CHECK(used_pending.joined_failure().empty() == released);
     }
-
     for (const bool observed_native_outcome : {false, true}) {
         SurfaceAudit rejected;
-        for (std::size_t index = 0U; index < 3U; ++index)
-            rejected.native(native_surface_record(native_surface_events[index]));
+        for (std::size_t index = 0U; index < 3U; ++index) rejected.native(native_surface_record(native_surface_events[index]));
         if (observed_native_outcome) {
             auto outcome = native_surface_record("presentation.import.outcome");
             outcome["value"] = 0U;
@@ -7705,7 +7167,6 @@ TEST_CASE("surface join accepts receiver-confirmed withdrawal and explicit rejec
         CHECK(rejected.joined_failure().empty() == observed_native_outcome);
     }
 }
-
 TEST_CASE("incremental Explore audit requires independent lifecycle and exact inventory evidence", "[workspace][audit]") {
     NativeAudit annotation;
     annotation.consume({{"kind", "gui_runtime"}, {"owner", "annotation"}, {"event", "document.opened"}});
@@ -7720,7 +7181,6 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
     CHECK(closure.peer_close_count == 0U);
     closure.consume({{"kind", "gui_runtime"}, {"event", "browser.server.peer_closed"}});
     CHECK(closure.peer_close_count == closure.peer_open_count);
-
     NativeAudit audit;
     audit.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U, 4096U);
     audit.consume_explore_evidence("acceptance.placeholder.slot", 1U, 11U, 4096U);
@@ -7730,7 +7190,6 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
     CHECK(audit.explore_placeholder);
     CHECK(audit.partial_generation == 2U);
     CHECK(audit.acceptance_first_patch_exact);
-
     NativeAudit joined_after_publication;
     joined_after_publication.consume_explore_evidence("acceptance.placeholder.complete", 2U, 19U, 4096U);
     joined_after_publication.consume_explore_evidence("acceptance.slot.patched", 0U, 10U, 4096U);
@@ -7743,7 +7202,6 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
     joined_after_publication.join_gallery_publication(2U, {{0U, 10U}, {1U, 11U}});
     CHECK(joined_after_publication.partial_generation == 2U);
     CHECK(joined_after_publication.acceptance_first_patch_exact);
-
     const std::map<std::uint64_t, std::uint64_t> rendered_slots{{0U, 10U}, {1U, 11U}};
     for (const auto missing : {"none", "summary", "slot", "patch", "count", "frame", "identity", "conflict"}) {
         INFO("missing native inventory evidence: " << missing);
@@ -7764,9 +7222,8 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
         material.join_gallery_publication(2U, rendered_slots);
         const auto final = material.final_generations_for(rendered_slots, 2U, 7U);
         CHECK(final.has_value() == (omitted != "summary" && omitted != "slot" && omitted != "frame" && omitted != "conflict"));
-        const bool complete_material = final && material.patched_slots.at(2U) == rendered_slots &&
-                                       material.published_tiles.at(2U) == rendered_slots.size() && !material.explore_stale_patch &&
-                                       !material.causal_inconsistent;
+        const bool complete_material = final && material.patched_slots.at(2U) == rendered_slots && material.published_tiles.at(2U) == rendered_slots.size() &&
+                                       !material.explore_stale_patch && !material.causal_inconsistent;
         CHECK(complete_material == (omitted == "none"));
         if (final) {
             CHECK(final->material == 2U);
@@ -7776,7 +7233,6 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
         }
         if (omitted == "conflict") CHECK(material.causal_inconsistent);
     }
-
     NativeAudit initial;
     initial.consume_explore_evidence("placeholder.published", 0U);
     initial.consume_explore_evidence("acceptance.placeholder.slot", 0U, 10U);
@@ -7815,17 +7271,14 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
     initial.augmentation_seeds.emplace(2U, 0U);
     CHECK(initial.augmentation_generation_for(0U, 8U) == 2U);
     CHECK_FALSE(initial.augmentation_generation_for(1U, 8U).has_value());
-
     for (const std::string_view missing :
          {"none", "bitmap", "wrong-ready", "extra-ready", "patch", "identity", "frame", "observation", "physical", "late-patch"}) {
         INFO("missing partial publication evidence: " << missing);
         NativeAudit partial;
         partial.consume_explore_evidence("placeholder.published", 0U);
-        for (std::uint64_t slot = 0U; slot < 3U; ++slot)
-            partial.consume_explore_evidence("acceptance.placeholder.slot", slot, slot + 10U);
+        for (std::uint64_t slot = 0U; slot < 3U; ++slot) partial.consume_explore_evidence("acceptance.placeholder.slot", slot, slot + 10U);
         partial.consume_explore_evidence("acceptance.placeholder.complete", 3U);
-        if (missing != "patch" && missing != "late-patch")
-            partial.consume_explore_evidence("acceptance.slot.patched", 1U, missing == "identity" ? 12U : 11U);
+        if (missing != "patch" && missing != "late-patch") partial.consume_explore_evidence("acceptance.slot.patched", 1U, missing == "identity" ? 12U : 11U);
         partial.consume_explore_evidence("explore.frame.published", 8U);
         if (missing != "physical")
             partial.consume({{"kind", "gui_runtime"},
@@ -7837,14 +7290,12 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
                              {"source_revision", 8U},
                              {"frame_revision", 8U}});
         if (missing == "late-patch") partial.consume_explore_evidence("acceptance.slot.patched", 1U, 11U);
-
         BrowserAudit browser;
         nlohmann::json snapshot{{"gallery_generation", 2U},
                                 {"visible_indices", {10U, 11U, 12U}},
                                 {"source_revision", missing == "frame" ? 9U : 8U},
                                 {"source_observation_revision", missing == "observation" ? 12U : 11U}};
-        if (missing != "bitmap")
-            snapshot["ready_slots"] = std::vector<bool>{missing == "wrong-ready", missing != "wrong-ready", missing == "extra-ready"};
+        if (missing != "bitmap") snapshot["ready_slots"] = std::vector<bool>{missing == "wrong-ready", missing != "wrong-ready", missing == "extra-ready"};
         browser.consume_gallery_generation(snapshot);
         REQUIRE(browser.bounds_valid);
         const auto& evidence = browser.gallery_generations.at(2U);
@@ -7873,7 +7324,6 @@ TEST_CASE("incremental Explore audit requires independent lifecycle and exact in
         CHECK(malformed.gallery_generations.empty());
     }
 }
-
 TEST_CASE("surface join rejects duplicate claims and texture construction", "[workspace][audit]") {
     for (const char* repeated : {"firefox.workspace.claim_outcome", "iced.surface.texture_create"}) {
         SurfaceAudit audit;
@@ -7884,21 +7334,15 @@ TEST_CASE("surface join rejects duplicate claims and texture construction", "[wo
         CHECK_FALSE(audit.failure.empty());
     }
 }
-
 TEST_CASE("surface join rejects otherwise complete traces for different physical identities", "[workspace][audit]") {
     SurfaceAudit audit;
-    for (const char* event : native_surface_events)
-        audit.native(native_surface_record(event, 12U));
-    for (const char* event : browser_surface_events)
-        audit.browser(browser_surface_record(event, 13U));
+    for (const char* event : native_surface_events) audit.native(native_surface_record(event, 12U));
+    for (const char* event : browser_surface_events) audit.browser(browser_surface_record(event, 13U));
     CHECK_FALSE(audit.joined_failure().empty());
     CHECK_FALSE(audit.pending_supersession_completed());
 }
-
 }  // namespace
-
 namespace {
-
 enum class MissingHandoffEvidence {
     PendingDiscard,
     Reconstruction,
@@ -7919,10 +7363,8 @@ enum class MissingHandoffEvidence {
     DuplicateReplacementSubmission
 };
 enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
-
-[[nodiscard]] SurfaceAudit pending_handoff(const std::optional<MissingHandoffEvidence> missing = std::nullopt,
-                                           const bool pending_texture = true, const bool incumbent_after_admission = false,
-                                           const bool retain_latest = false) {
+[[nodiscard]] SurfaceAudit pending_handoff(const std::optional<MissingHandoffEvidence> missing = std::nullopt, const bool pending_texture = true,
+                                           const bool incumbent_after_admission = false, const bool retain_latest = false) {
     SurfaceAudit audit;
     const auto native = [&](const char* event, const std::uint64_t surface, const std::uint64_t publication = 1U) {
         auto record = native_surface_record(event, surface);
@@ -7940,8 +7382,8 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
         }
         audit.native(record);
     };
-    const auto browser = [&](const char* event, const std::uint64_t surface, const std::uint64_t requested = 0U,
-                             const std::uint64_t publication = 1U, const HandoffSubmission submission = HandoffSubmission::Submit) {
+    const auto browser = [&](const char* event, const std::uint64_t surface, const std::uint64_t requested = 0U, const std::uint64_t publication = 1U,
+                             const HandoffSubmission submission = HandoffSubmission::Submit) {
         auto record = browser_surface_record(event, surface);
         if (requested != 0U) record["requested_surface"] = SurfaceAudit::native_identity(native_surface_record("", requested));
         record["presentation_revision"] = publication;
@@ -7953,8 +7395,7 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
         if (std::string_view{event} == "iced.surface.sample_draw_selected") {
             record["event"] = "iced.surface.draw_encoded";
             audit.browser(record);
-            if (submission == HandoffSubmission::Submit || submission == HandoffSubmission::Duplicate ||
-                submission == HandoffSubmission::Pending) {
+            if (submission == HandoffSubmission::Submit || submission == HandoffSubmission::Duplicate || submission == HandoffSubmission::Pending) {
                 record["event"] = "iced.surface.draw_submitted";
                 audit.browser(record);
                 if (submission == HandoffSubmission::Duplicate) audit.browser(record);
@@ -7967,43 +7408,33 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
     };
     constexpr std::uint64_t d = 11U, a = 12U, b = 13U, c = 14U;
     const bool newer_incumbent = incumbent_after_admission || missing == MissingHandoffEvidence::FallbackPublication ||
-                                 missing == MissingHandoffEvidence::AcquisitionAfterReconstruction ||
-                                 missing == MissingHandoffEvidence::OlderCompleted;
+                                 missing == MissingHandoffEvidence::AcquisitionAfterReconstruction || missing == MissingHandoffEvidence::OlderCompleted;
     const std::uint64_t retained_publication = newer_incumbent ? 2U : 1U;
     if (missing == MissingHandoffEvidence::DifferentCompleted)
-        for (const char* event : native_surface_events)
-            native(event, d);
-    for (std::size_t stage = 0U; stage < 15U; ++stage)
-        native(native_surface_events[stage], a);
+        for (const char* event : native_surface_events) native(event, d);
+    for (std::size_t stage = 0U; stage < 15U; ++stage) native(native_surface_events[stage], a);
     for (const auto surface : {b, c})
-        for (std::size_t stage = 0U; stage < 4U; ++stage)
-            native(native_surface_events[stage], surface);
+        for (std::size_t stage = 0U; stage < 4U; ++stage) native(native_surface_events[stage], surface);
     native("presentation.candidate.withdrawal", b);
     native("presentation.retirement", b);
-    for (std::size_t stage = 4U; stage < 15U; ++stage)
-        native(native_surface_events[stage], c);
+    for (std::size_t stage = 4U; stage < 15U; ++stage) native(native_surface_events[stage], c);
     if (newer_incumbent)
-        for (std::size_t stage = 7U; stage < 15U; ++stage)
-            native(native_surface_events[stage], a, 2U);
+        for (std::size_t stage = 7U; stage < 15U; ++stage) native(native_surface_events[stage], a, 2U);
     if (missing == MissingHandoffEvidence::ReplacementPublication)
-        for (std::size_t stage = 7U; stage < 15U; ++stage)
-            native(native_surface_events[stage], c, 2U);
+        for (std::size_t stage = 7U; stage < 15U; ++stage) native(native_surface_events[stage], c, 2U);
     for (const auto surface : {a, c}) {
         if (retain_latest && surface == c) continue;
         native("presentation.active.withdrawal", surface);
         native("presentation.retirement", surface);
     }
     if (missing == MissingHandoffEvidence::DifferentCompleted)
-        for (std::size_t stage = 0U; stage < 14U; ++stage)
-            browser(browser_surface_events[stage], d);
-    for (std::size_t stage = 0U; stage < 14U; ++stage)
-        browser(browser_surface_events[stage], a);
+        for (std::size_t stage = 0U; stage < 14U; ++stage) browser(browser_surface_events[stage], d);
+    for (std::size_t stage = 0U; stage < 14U; ++stage) browser(browser_surface_events[stage], a);
     for (std::size_t stage = 0U; stage < 6U; ++stage)
         if (pending_texture || stage != 1U) browser(browser_surface_events[stage], b);
     if (newer_incumbent)
         for (std::size_t stage = 9U; stage < 13U; ++stage)
-            if (stage != 12U || missing != MissingHandoffEvidence::AcquisitionAfterReconstruction)
-                browser(browser_surface_events[stage], a, 0U, 2U);
+            if (stage != 12U || missing != MissingHandoffEvidence::AcquisitionAfterReconstruction) browser(browser_surface_events[stage], a, 0U, 2U);
     if (missing != MissingHandoffEvidence::Reconstruction)
         browser("iced.surface.renderer_reconstructed", missing == MissingHandoffEvidence::DifferentCompleted ? d : a, b,
                 missing == MissingHandoffEvidence::OlderCompleted ? 1U : retained_publication);
@@ -8016,11 +7447,9 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
                 : missing == MissingHandoffEvidence::FallbackSubmission          ? HandoffSubmission::Omit
                 : missing == MissingHandoffEvidence::DuplicateFallbackSubmission ? HandoffSubmission::Duplicate
                                                                                  : HandoffSubmission::Submit);
-    if (missing == MissingHandoffEvidence::AbandonedFallback && pending_texture)
-        browser("iced.surface.sample_draw_selected", a, a, retained_publication);
+    if (missing == MissingHandoffEvidence::AbandonedFallback && pending_texture) browser("iced.surface.sample_draw_selected", a, a, retained_publication);
     if (pending_texture || missing != MissingHandoffEvidence::PendingDiscard) browser("firefox.workspace.drop_received", b);
-    for (std::size_t stage = 0U; stage < 2U; ++stage)
-        browser(browser_surface_events[stage], c);
+    for (std::size_t stage = 0U; stage < 2U; ++stage) browser(browser_surface_events[stage], c);
     if (pending_texture) {
         if (missing != MissingHandoffEvidence::PendingDiscard) browser("iced.surface.pending_discarded", b);
         browser("iced.surface.import_dropped", b);
@@ -8028,10 +7457,8 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
     }
     browser("firefox.workspace.retired", b);
     browser("iced.surface.sample_draw_selected", a, c, retained_publication);
-    for (std::size_t stage = 2U; stage < 6U; ++stage)
-        browser(browser_surface_events[stage], c);
-    for (std::size_t stage = 6U; stage < 12U; ++stage)
-        browser(browser_surface_events[stage], c);
+    for (std::size_t stage = 2U; stage < 6U; ++stage) browser(browser_surface_events[stage], c);
+    for (std::size_t stage = 6U; stage < 12U; ++stage) browser(browser_surface_events[stage], c);
     if (missing == MissingHandoffEvidence::CaptureBeforeDraw) {
         browser("iced.surface.sample_draw_selected", c);
         browser("iced.surface.sample_acquired", c);
@@ -8039,8 +7466,7 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
         browser("iced.surface.sample_acquired", c);
         browser("iced.surface.sample_draw_selected", a, c, retained_publication);
         if (missing == MissingHandoffEvidence::ReplacementPublication)
-            for (std::size_t stage = 9U; stage < 13U; ++stage)
-                browser(browser_surface_events[stage], c, 0U, 2U);
+            for (std::size_t stage = 9U; stage < 13U; ++stage) browser(browser_surface_events[stage], c, 0U, 2U);
         browser("iced.surface.sample_draw_selected", c, 0U, 1U,
                 missing == MissingHandoffEvidence::AbandonedReplacement             ? HandoffSubmission::Abandon
                 : missing == MissingHandoffEvidence::ReplacementSubmission          ? HandoffSubmission::Omit
@@ -8055,15 +7481,12 @@ enum class HandoffSubmission { Submit, Omit, Duplicate, Abandon, Pending };
             browser("iced.surface.sample_draw_selected", c, c, 1U, HandoffSubmission::Pending);
             continue;
         }
-        for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage)
-            browser(browser_surface_events[stage], surface);
+        for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage) browser(browser_surface_events[stage], surface);
     }
     if (missing == MissingHandoffEvidence::DifferentCompleted)
-        for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage)
-            browser(browser_surface_events[stage], d);
+        for (std::size_t stage = browser_live_stages; stage < browser_surface_events.size(); ++stage) browser(browser_surface_events[stage], d);
     return audit;
 }
-
 TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[workspace][audit]") {
     const bool pending_texture = GENERATE(false, true);
     CAPTURE(pending_texture);
@@ -8080,28 +7503,23 @@ TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[
     for (const auto missing :
          {MissingHandoffEvidence::PendingDiscard, MissingHandoffEvidence::Reconstruction, MissingHandoffEvidence::CaptureBeforeDraw,
           MissingHandoffEvidence::DuplicateReconstruction, MissingHandoffEvidence::DifferentCompleted, MissingHandoffEvidence::Fallback,
-          MissingHandoffEvidence::FallbackPublication, MissingHandoffEvidence::FallbackRequest,
-          MissingHandoffEvidence::ReplacementPublication, MissingHandoffEvidence::AcquisitionAfterReconstruction,
-          MissingHandoffEvidence::OlderCompleted, MissingHandoffEvidence::AbandonedFallback, MissingHandoffEvidence::AbandonedReplacement,
-          MissingHandoffEvidence::FallbackSubmission, MissingHandoffEvidence::ReplacementSubmission,
+          MissingHandoffEvidence::FallbackPublication, MissingHandoffEvidence::FallbackRequest, MissingHandoffEvidence::ReplacementPublication,
+          MissingHandoffEvidence::AcquisitionAfterReconstruction, MissingHandoffEvidence::OlderCompleted, MissingHandoffEvidence::AbandonedFallback,
+          MissingHandoffEvidence::AbandonedReplacement, MissingHandoffEvidence::FallbackSubmission, MissingHandoffEvidence::ReplacementSubmission,
           MissingHandoffEvidence::DuplicateFallbackSubmission, MissingHandoffEvidence::DuplicateReplacementSubmission}) {
         if (pending_texture && missing == MissingHandoffEvidence::FallbackRequest) continue;
         const auto audit = pending_handoff(missing, pending_texture);
         INFO("surface join: " << audit.joined_failure());
         if (missing != MissingHandoffEvidence::CaptureBeforeDraw && missing != MissingHandoffEvidence::DuplicateReconstruction &&
-            missing != MissingHandoffEvidence::AcquisitionAfterReconstruction &&
-            missing != MissingHandoffEvidence::DuplicateFallbackSubmission &&
-            missing != MissingHandoffEvidence::DuplicateReplacementSubmission &&
-            (pending_texture || missing != MissingHandoffEvidence::PendingDiscard))
+            missing != MissingHandoffEvidence::AcquisitionAfterReconstruction && missing != MissingHandoffEvidence::DuplicateFallbackSubmission &&
+            missing != MissingHandoffEvidence::DuplicateReplacementSubmission && (pending_texture || missing != MissingHandoffEvidence::PendingDiscard))
             CHECK(audit.joined_failure().empty());
         else
             CHECK_FALSE(audit.joined_failure().empty());
         CHECK_FALSE(audit.pending_supersession_completed());
     }
 }
-
-[[nodiscard]] nlohmann::json atlas_draw_record(const std::uint64_t revision, const std::uint64_t first_row, const std::uint64_t rows,
-                                               const double top) {
+[[nodiscard]] nlohmann::json atlas_draw_record(const std::uint64_t revision, const std::uint64_t first_row, const std::uint64_t rows, const double top) {
     nlohmann::json record{
         {"event", "iced.surface.draw_encoded"},
         {"control", kExploreGalleryControl},
@@ -8137,15 +7555,13 @@ TEST_CASE("rapid surface join requires a complete pending-candidate handoff", "[
     record["image"] = record["bounds"];
     return record;
 }
-
 TEST_CASE("Explore clipboard evidence requires an exact seed and authoritative restoration", "[workspace][audit]") {
-    for (const std::string_view defect : {"none", "alternate", "target-mismatch", "baseline-collision", "typed-only", "rounded", "control",
-                                          "persistence", "baseline", "revision"}) {
+    for (const std::string_view defect :
+         {"none", "alternate", "target-mismatch", "baseline-collision", "typed-only", "rounded", "control", "persistence", "baseline", "revision"}) {
         INFO(defect);
         BrowserAudit audit;
         const auto entry = [](const char* event, const char* value, const std::uint64_t before, const std::uint64_t after) {
-            return nlohmann::json{{"event", event}, {"control", "seed-field"}, {"detail", value}, {"a", before}, {"b", after}, {"c", 1U},
-                                  {"d", 1U}};
+            return nlohmann::json{{"event", event}, {"control", "seed-field"}, {"detail", value}, {"a", before}, {"b", after}, {"c", 1U}, {"d", 1U}};
         };
         const auto* target = defect == "alternate" ? "9007199254740995" : "9007199254740993";
         const auto* baseline = defect == "alternate" || defect == "baseline-collision" ? "9007199254740993" : "73";
@@ -8165,14 +7581,9 @@ TEST_CASE("Explore clipboard evidence requires an exact seed and authoritative r
         CHECK(audit.explore_paste_restored == (defect == "none" || defect == "alternate"));
     }
 }
-
 TEST_CASE("initial atlas completion requires nonblack canvas pixels for the exact publication", "[workspace][audit]") {
-    const nlohmann::json completed{{"event", "integration.initial_atlas_complete"},
-                                   {"detail", "no-input-canvas-pixels"},
-                                   {"a", 17U},
-                                   {"b", 3U},
-                                   {"c", 23U},
-                                   {"d", 29U}};
+    const nlohmann::json completed{
+        {"event", "integration.initial_atlas_complete"}, {"detail", "no-input-canvas-pixels"}, {"a", 17U}, {"b", 3U}, {"c", 23U}, {"d", 29U}};
     for (const auto* defect : {"missing", "black", "empty", "source", "publication", "none"}) {
         INFO(defect);
         BrowserAudit audit;
@@ -8190,7 +7601,6 @@ TEST_CASE("initial atlas completion requires nonblack canvas pixels for the exac
         CHECK(audit.initial_atlas_complete == (kind == "none"));
     }
 }
-
 TEST_CASE("annotation canvas palette evidence preserves class hue contrast and solid control colors", "[workspace][audit]") {
     struct Sample final {
         std::array<double, 3U> expected;
@@ -8236,7 +7646,6 @@ TEST_CASE("annotation canvas palette evidence preserves class hue contrast and s
         CHECK(audit.annotation_pixels_valid == sample.valid);
     }
 }
-
 TEST_CASE("Paired empty atlases replace displayed content through an actual acquired draw", "[workspace][audit]") {
     const std::string fault = GENERATE("none", "source", "acquisition", "unsubmitted", "visible_cells", "negative_count");
     CAPTURE(fault);
@@ -8261,8 +7670,7 @@ TEST_CASE("Paired empty atlases replace displayed content through an actual acqu
     if (fault == "negative_count") empty["matching_count"] = -1;
     for (const auto* event : {"iced.gallery.source", "iced.surface.sample_acquired", "iced.surface.draw_encoded"}) {
         const std::string_view name{event};
-        if ((fault == "source" && name == "iced.gallery.source") || (fault == "acquisition" && name == "iced.surface.sample_acquired"))
-            continue;
+        if ((fault == "source" && name == "iced.gallery.source") || (fault == "acquisition" && name == "iced.surface.sample_acquired")) continue;
         auto record = empty;
         record["event"] = fault == "unsubmitted" && name == "iced.surface.draw_encoded" ? "iced.surface.sample_draw_selected" : event;
         audit.consume(record);
@@ -8277,7 +7685,6 @@ TEST_CASE("Paired empty atlases replace displayed content through an actual acqu
         CHECK(scalar(*audit.atlas_draws.last_draw, "matching_count") == 0U);
     }
 }
-
 TEST_CASE("atlas visibility requires an encoded intersecting draw with exact source rows", "[workspace][audit]") {
     const auto draw = atlas_draw_record(23U, 2U, 5U, -37.25);
     auto source = draw;
@@ -8323,8 +7730,8 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
         browser.consume(replacement);
         CHECK(browser.owned_atlas_interrupted);
     }
-    for (const auto* event : {"iced.gallery.source", "iced.surface.renderer_reconstructed", "iced.surface.sample_acquired",
-                              "iced.surface.sample_draw_selected"}) {
+    for (const auto* event :
+         {"iced.gallery.source", "iced.surface.renderer_reconstructed", "iced.surface.sample_acquired", "iced.surface.sample_draw_selected"}) {
         auto browser = observed;
         auto pending = atlas_draw_record(24U, 3U, 5U, -37.25);
         pending["event"] = event;
@@ -8335,8 +7742,7 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
         browser.consume(missing);
         CHECK(browser.owned_atlas_interrupted);
     }
-    for (const auto* defect :
-         {"offscreen", "grid", "row", "indices", "source", "source-instance", "session", "pending", "capture", "selection"}) {
+    for (const auto* defect : {"offscreen", "grid", "row", "indices", "source", "source-instance", "session", "pending", "capture", "selection"}) {
         INFO(defect);
         AtlasDrawAudit audit;
         audit.consume(source);
@@ -8357,7 +7763,6 @@ TEST_CASE("atlas visibility requires an encoded intersecting draw with exact sou
         if (kind != "selection") CHECK_FALSE(audit.valid);
     }
 }
-
 TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguous sources", "[workspace][audit]") {
     AtlasDrawAudit complete;
     constexpr std::array names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
@@ -8426,7 +7831,6 @@ TEST_CASE("atlas stages require fresh complete draw identity and reject ambiguou
     CHECK(complete.grid_round_trip);
     CHECK(complete.stages.size() == names.size());
 }
-
 TEST_CASE("atlas grid transitions belong only to consecutive stages on one allocation", "[workspace][audit]") {
     constexpr std::array names{"fractional", "row1", "row2", "row10", "row9", "end", "restored"};
     const auto publish = [](AtlasDrawAudit& audit, nlohmann::json draw) {
@@ -8448,15 +7852,13 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
     }
     CHECK(between_stages.valid);
     CHECK(between_stages.grid_round_trip);
-
     for (const auto* scenario : {"constant", "only-grow", "only-shrink", "surface-high", "surface-low", "width", "height"}) {
         INFO(scenario);
         const std::string_view kind{scenario};
         const bool replacement = kind == "surface-high" || kind == "surface-low" || kind == "width" || kind == "height";
         AtlasDrawAudit audit;
         // These valid draws contain a complete round trip but belong to no stage.
-        for (std::uint64_t index = 0U; index != 3U; ++index)
-            publish(audit, atlas_draw_record(10U + index, 0U, index == 1U ? 5U : 4U, 0.0));
+        for (std::uint64_t index = 0U; index != 3U; ++index) publish(audit, atlas_draw_record(10U + index, 0U, index == 1U ? 5U : 4U, 0.0));
         CHECK(audit.valid);
         CHECK_FALSE(audit.grid_round_trip);
         for (std::size_t index = 0U; index != names.size(); ++index) {
@@ -8492,19 +7894,13 @@ TEST_CASE("atlas grid transitions belong only to consecutive stages on one alloc
         }
     }
 }
-
 }  // namespace
-
 TEST_CASE("Source retirement remains independent of a retained sample arena", "[workspace][audit]") {
     SurfaceAudit audit;
-    for (std::size_t stage = 0U; stage < 15U; ++stage)
-        audit.native(native_surface_record(native_surface_events[stage]));
-    for (std::size_t stage = 0U; stage < browser_live_stages; ++stage)
-        audit.browser(browser_surface_record(browser_surface_events[stage]));
-    for (const auto* event : {"presentation.source.withdrawal", "presentation.source.retirement"})
-        audit.native(native_surface_record(event));
-    for (const auto* event : {"firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"})
-        audit.browser(browser_surface_record(event));
+    for (std::size_t stage = 0U; stage < 15U; ++stage) audit.native(native_surface_record(native_surface_events[stage]));
+    for (std::size_t stage = 0U; stage < browser_live_stages; ++stage) audit.browser(browser_surface_record(browser_surface_events[stage]));
+    for (const auto* event : {"presentation.source.withdrawal", "presentation.source.retirement"}) audit.native(native_surface_record(event));
+    for (const auto* event : {"firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}) audit.browser(browser_surface_record(event));
     REQUIRE(audit.failure.empty());
     CHECK(audit.surfaces.size() == 1U);
     CHECK(audit.sources.size() == 1U);
@@ -8518,19 +7914,17 @@ TEST_CASE("Source retirement remains independent of a retained sample arena", "[
     audit.browser(browser_surface_record("firefox.workspace.source.retired"));
     CHECK_FALSE(audit.failure.empty());
 }
-
 TEST_CASE("Source withdrawal permits claimed initialization to finish before retirement", "[workspace][audit]") {
     const auto native_early = GENERATE(false, true);
     const auto browser_early = GENERATE(false, true);
     const auto install_native_timeline = GENERATE(false, true);
     SurfaceAudit audit;
     for (const bool browser : {false, true}) {
-        const std::array events =
-            browser
-                ? std::array{"firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome",
-                             "firefox.workspace.source.ready", "firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}
-                : std::array{"presentation.source.admission.enqueued", "presentation.source.admission.written", "presentation.source.ready",
-                             "presentation.source.withdrawal", "presentation.source.retirement"};
+        const std::array events = browser
+                                      ? std::array{"firefox.workspace.source.admitted", "firefox.workspace.source.claim_outcome",
+                                                   "firefox.workspace.source.ready", "firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}
+                                      : std::array{"presentation.source.admission.enqueued", "presentation.source.admission.written",
+                                                   "presentation.source.ready", "presentation.source.withdrawal", "presentation.source.retirement"};
         const auto observe = [&](SurfaceAudit& target, const std::size_t stage) {
             if (browser)
                 target.browser(browser_surface_record(events[stage]));
@@ -8563,12 +7957,11 @@ TEST_CASE("Source withdrawal permits claimed initialization to finish before ret
     }
     CHECK(audit.evidence_settled());
 }
-
 TEST_CASE("Source cancellation settles the exact unclaimed admission without a ready product", "[workspace][audit]") {
     const auto omitted = GENERATE("", "failure", "withdrawal", "retirement");
     SurfaceAudit audit;
-    for (const auto* event : {"presentation.source.admission.enqueued", "presentation.source.admission.written",
-                              "presentation.source.withdrawal", "presentation.source.retirement"})
+    for (const auto* event : {"presentation.source.admission.enqueued", "presentation.source.admission.written", "presentation.source.withdrawal",
+                              "presentation.source.retirement"})
         audit.native(native_surface_record(event));
     audit.browser(browser_surface_record("firefox.workspace.source.admitted"));
     if (std::string_view{omitted} != "withdrawal") audit.browser(browser_surface_record("firefox.workspace.source.withdrawal"));
@@ -8582,10 +7975,9 @@ TEST_CASE("Source cancellation settles the exact unclaimed admission without a r
         CHECK_FALSE(audit.failure.empty());
     }
 }
-
 TEST_CASE("Source publication audit requires exact physical receiver receipts", "[workspace][audit]") {
-    for (const std::string_view fault : {"none", "missing", "duplicate", "reordered", "arena", "content", "presentation", "transfer",
-                                         "source", "allocation", "source-generation", "source-width"}) {
+    for (const std::string_view fault : {"none", "missing", "duplicate", "reordered", "arena", "content", "presentation", "transfer", "source", "allocation",
+                                         "source-generation", "source-width"}) {
         INFO("physical receipt fault: " << fault);
         SurfaceAudit audit;
         for (const auto* event : native_surface_events) {
@@ -8614,8 +8006,7 @@ TEST_CASE("Source publication audit requires exact physical receiver receipts", 
                 if (fault == "content") record["content_sequence"] = 24U;
                 if (fault == "presentation") record["presentation_revision"] = 2U;
             }
-            if (name == "firefox.workspace.frame_dispatched" && fault == "reordered")
-                audit.browser(browser_surface_record("firefox.workspace.copy_completed"));
+            if (name == "firefox.workspace.frame_dispatched" && fault == "reordered") audit.browser(browser_surface_record("firefox.workspace.copy_completed"));
             audit.browser(record);
             if (name == "firefox.workspace.copy_completed" && fault == "duplicate") audit.browser(record);
         }
@@ -8623,17 +8014,13 @@ TEST_CASE("Source publication audit requires exact physical receiver receipts", 
         CHECK(audit.joined_failure().empty() == (fault == "none"));
     }
 }
-
 TEST_CASE("Source publication joins survive independent drains and retirement before copy evidence", "[workspace][audit]") {
     SurfaceAudit audit;
     for (const auto* event : browser_surface_events)
         if (std::string_view{event} != "firefox.workspace.copy_completed") audit.browser(browser_surface_record(event));
-    for (const auto* event : native_surface_events)
-        audit.native(native_surface_record(event));
-    for (const auto* event : {"presentation.source.withdrawal", "presentation.source.retirement"})
-        audit.native(native_surface_record(event));
-    for (const auto* event : {"firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"})
-        audit.browser(browser_surface_record(event));
+    for (const auto* event : native_surface_events) audit.native(native_surface_record(event));
+    for (const auto* event : {"presentation.source.withdrawal", "presentation.source.retirement"}) audit.native(native_surface_record(event));
+    for (const auto* event : {"firefox.workspace.source.withdrawal", "firefox.workspace.source.retired"}) audit.browser(browser_surface_record(event));
     REQUIRE(audit.failure.empty());
     CHECK_FALSE(audit.evidence_settled());
     audit.SettleScenario();
@@ -8645,7 +8032,6 @@ TEST_CASE("Source publication joins survive independent drains and retirement be
     CHECK(audit.surfaces.empty());
     CHECK(audit.sources.empty());
 }
-
 TEST_CASE("Direct fallback custody requires positive source read settlement without copy evidence", "[workspace][audit]") {
     for (const std::string_view fault : {"none", "missing", "mode", "copy", "early-destruction", "pending-release"}) {
         INFO("direct receipt fault: " << fault);
@@ -8660,13 +8046,11 @@ TEST_CASE("Direct fallback custody requires positive source read settlement with
             record["direct_sampling"] = true;
             audit.browser(record);
         };
-        for (std::size_t stage = 0U; stage < 13U; ++stage)
-            native(native_surface_events[stage]);
+        for (std::size_t stage = 0U; stage < 13U; ++stage) native(native_surface_events[stage]);
         for (std::size_t stage = 0U; stage < browser_live_stages; ++stage) {
             if (std::string_view{browser_surface_events[stage]} == "firefox.workspace.copy_completed") continue;
             browser(browser_surface_events[stage]);
-            if (std::string_view{browser_surface_events[stage]} == "iced.surface.texture_create")
-                browser("iced.surface.source_texture_create");
+            if (std::string_view{browser_surface_events[stage]} == "iced.surface.texture_create") browser("iced.surface.source_texture_create");
         }
         REQUIRE(audit.failure.empty());
         CHECK(audit.evidence_settled());
@@ -8699,7 +8083,6 @@ TEST_CASE("Direct fallback custody requires positive source read settlement with
         CHECK(audit.joined_failure().empty() == (fault == "none"));
     }
 }
-
 TEST_CASE("Release-only custody settles exact GPU work without creating a page sample", "[workspace][audit]") {
     const bool direct = GENERATE(false, true);
     const bool receiver_first = GENERATE(false, true);
@@ -8709,8 +8092,7 @@ TEST_CASE("Release-only custody settles exact GPU work without creating a page s
         record["direct_sampling"] = direct;
         audit.native(record);
     };
-    for (std::size_t stage = 0U; stage < 13U; ++stage)
-        native(native_surface_events[stage]);
+    for (std::size_t stage = 0U; stage < 13U; ++stage) native(native_surface_events[stage]);
     for (std::size_t stage = 0U; stage < 9U; ++stage) {
         auto record = browser_surface_record(browser_surface_events[stage]);
         record["direct_sampling"] = direct;
@@ -8739,7 +8121,6 @@ TEST_CASE("Release-only custody settles exact GPU work without creating a page s
     CHECK(state.custody.empty());
     CHECK(audit.draws.empty());
 }
-
 TEST_CASE("Two completed outputs join independent presentation and release-only custody", "[workspace][audit]") {
     SurfaceAudit audit;
     record_source_transfer(audit);
@@ -8784,10 +8165,9 @@ TEST_CASE("Two completed outputs join independent presentation and release-only 
     REQUIRE(audit.draws.size() == 1U);
     CHECK(state.custody.at(2U).selected == 1U);
 }
-
 TEST_CASE("Release-only receipts require unique physical identity and completion", "[workspace][audit]") {
-    const std::string fault = GENERATE("missing_submission", "missing_completion", "duplicate_submission", "duplicate_completion", "source",
-                                       "publication", "transfer", "session", "frame", "ready", "release", "slot", "layer");
+    const std::string fault = GENERATE("missing_submission", "missing_completion", "duplicate_submission", "duplicate_completion", "source", "publication",
+                                       "transfer", "session", "frame", "ready", "release", "slot", "layer");
     CAPTURE(fault);
     SurfaceAudit audit;
     record_source_transfer(audit);
@@ -8807,7 +8187,6 @@ TEST_CASE("Release-only receipts require unique physical identity and completion
     if (fault == "duplicate_completion") audit.browser(completed);
     CHECK_FALSE(audit.evidence_settled());
 }
-
 TEST_CASE("Release-only terminal custody requires positive native completion or retained ownership", "[workspace][audit]") {
     const bool retained = GENERATE(false, true);
     SurfaceAudit audit;
@@ -8823,10 +8202,8 @@ TEST_CASE("Release-only terminal custody requires positive native completion or 
     CHECK(audit.joined_failure().empty());
     const auto& state = audit.surfaces.at(SurfaceAudit::native_identity(native_surface_record("")));
     CHECK(state.receipts.at(1U).stage == 2U);
-    CHECK(state.transfers.at({1U, 1U}).terminal ==
-          (retained ? SurfaceAudit::TerminalRead::Retained : SurfaceAudit::TerminalRead::Completed));
+    CHECK(state.transfers.at({1U, 1U}).terminal == (retained ? SurfaceAudit::TerminalRead::Retained : SurfaceAudit::TerminalRead::Completed));
 }
-
 TEST_CASE("Capacity retry preserves logical publication with a new physical source transfer", "[workspace][audit]") {
     SurfaceAudit audit;
     record_source_transfer(audit, false);
@@ -8856,7 +8233,6 @@ TEST_CASE("Capacity retry preserves logical publication with a new physical sour
     audit.browser(browser_surface_record("firefox.workspace.copy_completed"));
     CHECK_FALSE(audit.failure.empty());
 }
-
 TEST_CASE("Unacquired offers reject invented physical settlement receipts", "[workspace][audit]") {
     for (const auto* event : {"firefox.workspace.frame_released", "firefox.workspace.copy_completed", "firefox.workspace.read_settled"}) {
         SurfaceAudit audit;
@@ -8866,7 +8242,6 @@ TEST_CASE("Unacquired offers reject invented physical settlement receipts", "[wo
         CHECK_FALSE(audit.failure.empty());
     }
 }
-
 TEST_CASE("Detached unacquired offers retire without inventing physical read custody", "[workspace][audit]") {
     SurfaceAudit audit;
     record_source_transfer(audit, false);
@@ -8878,10 +8253,9 @@ TEST_CASE("Detached unacquired offers retire without inventing physical read cus
     CHECK_FALSE(state.transfers.begin()->second.releasing);
     CHECK(state.samples.empty());
 }
-
 TEST_CASE("Source admission audit requires canonical allocation provenance", "[workspace][audit]") {
-    for (const auto* field : {"sequence", "capacity_width", "capacity_height", "workspace_source_high", "workspace_source_low",
-                              "workspace_allocation", "workspace_bytes", "workspace_pitch", "workspace_width", "workspace_height"}) {
+    for (const auto* field : {"sequence", "capacity_width", "capacity_height", "workspace_source_high", "workspace_source_low", "workspace_allocation",
+                              "workspace_bytes", "workspace_pitch", "workspace_width", "workspace_height"}) {
         SurfaceAudit audit;
         auto record = native_surface_record("presentation.source.admission.enqueued");
         record.erase(field);
@@ -8896,7 +8270,6 @@ TEST_CASE("Source admission audit requires canonical allocation provenance", "[w
         CHECK_FALSE(audit.failure.empty());
     }
 }
-
 TEST_CASE("held placeholder motion evidence uses only the target hover interval", "[workspace][audit]") {
     for (const std::string_view timing : {"earlier", "during", "later"}) {
         BrowserAudit audit;
@@ -8934,10 +8307,8 @@ TEST_CASE("held placeholder motion evidence uses only the target hover interval"
         CHECK_FALSE(audit.held_placeholder_motion(41U, 78U));
     }
 }
-
 TEST_CASE("fixed gallery return rejects any intermediate readiness or ready-pixel loss", "[workspace][audit]") {
-    for (const std::string_view defect :
-         {"none", "placeholder", "missing-cell", "black-cell", "wrong-cell", "origin", "capacity", "clip"}) {
+    for (const std::string_view defect : {"none", "placeholder", "missing-cell", "black-cell", "wrong-cell", "origin", "capacity", "clip"}) {
         INFO(defect);
         AtlasDrawAudit audit;
         constexpr std::array names{"return-cached", "return-aligned", "return-extra", "return-restored"};
@@ -8982,12 +8353,10 @@ TEST_CASE("fixed gallery return rejects any intermediate readiness or ready-pixe
         CHECK((audit.valid && audit.return_round_trip) == (defect == "none"));
     }
 }
-
 TEST_CASE("physical ledger distinguishes abandonment and rejects obsolete image copies", "[workspace][audit]") {
     for (const std::string_view defect : {"none", "settlement", "early-release", "native-copy", "capture"}) {
         SurfaceAudit audit;
-        for (const auto* event : native_surface_events)
-            audit.native(native_surface_record(event));
+        for (const auto* event : native_surface_events) audit.native(native_surface_record(event));
         for (const auto* event : browser_surface_events) {
             if (std::string_view{event} == "iced.surface.draw_submitted") continue;
             if (std::string_view{event} == "iced.frame.draw_settled") {
@@ -9002,7 +8371,6 @@ TEST_CASE("physical ledger distinguishes abandonment and rejects obsolete image 
         CHECK(audit.joined_failure().empty() == (defect == "none"));
     }
 }
-
 TEST_CASE("read admission checks actual eligible demand and independently clipped neighbor windows", "[workspace][audit]") {
     for (const std::string_view defect : {"none", "immediate", "preferred", "outside"}) {
         NativeAudit audit;
@@ -9027,7 +8395,6 @@ TEST_CASE("read admission checks actual eligible demand and independently clippe
         CHECK(audit.admission_priority_valid == (defect == "none"));
     }
 }
-
 TEST_CASE("cached viewport evidence joins initial readiness before new read admission", "[workspace][audit]") {
     for (const bool forward : {false, true}) {
         for (const bool restored_first : {false, true}) {

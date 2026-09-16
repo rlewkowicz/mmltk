@@ -26,7 +26,10 @@ pub enum StartInputs {
 }
 
 impl StartInputs {
-    pub fn capture(settings: &crate::generated::GuiSettingsState, feature: FeatureId) -> Option<Self> {
+    pub fn capture(
+        settings: &crate::generated::GuiSettingsState,
+        feature: FeatureId,
+    ) -> Option<Self> {
         match feature {
             FeatureId::Train => Some(Self::Train(settings.workflows.train.clone())),
             FeatureId::Validate => Some(Self::Validate(settings.workflows.validate.clone())),
@@ -62,8 +65,16 @@ pub enum StartPreparation {
 
 impl StartPreparation {
     pub fn cancelled(self) -> bool {
-        matches!(self, Self::Selecting { cancelled: true, .. }
-            | Self::Active { cancelled: true, .. } | Self::Stopping { .. })
+        matches!(
+            self,
+            Self::Selecting {
+                cancelled: true,
+                ..
+            } | Self::Active {
+                cancelled: true,
+                ..
+            } | Self::Stopping { .. }
+        )
     }
 }
 
@@ -94,7 +105,9 @@ impl Default for WorkflowModel {
 
 impl WorkflowModel {
     pub fn cancel_start(&mut self, detail: &str) {
-        let Some(pending) = self.pending_start.as_mut() else { return; };
+        let Some(pending) = self.pending_start.as_mut() else {
+            return;
+        };
         self.start_status = Some((pending.feature, detail.to_owned()));
         match &mut pending.preparation {
             StartPreparation::Waiting => self.pending_start = None,
@@ -109,24 +122,35 @@ impl WorkflowModel {
         correlation: u64,
         reply: &Result<crate::generated::ApplicationReply, crate::protocol::ApplicationError>,
     ) {
-        let Some(pending) = self.pending_start.as_mut() else { return; };
+        let Some(pending) = self.pending_start.as_mut() else {
+            return;
+        };
         match pending.preparation {
-            StartPreparation::Selecting { correlation: owned, cancelled } if correlation == owned => {
-                match reply {
-                    Ok(crate::generated::ApplicationReply::ModelSelect(snapshot)) => {
-                        pending.preparation = StartPreparation::Active { generation: snapshot.generation, cancelled };
-                    }
-                    Err(error) => {
-                        self.start_status = Some((pending.feature, error.detail.clone()));
-                        self.pending_start = None;
-                    }
-                    _ => {
-                        self.start_status = Some((pending.feature, "Model selection reply did not match its request.".to_owned()));
-                        self.pending_start = None;
-                    }
+            StartPreparation::Selecting {
+                correlation: owned,
+                cancelled,
+            } if correlation == owned => match reply {
+                Ok(crate::generated::ApplicationReply::ModelSelect(snapshot)) => {
+                    pending.preparation = StartPreparation::Active {
+                        generation: snapshot.generation,
+                        cancelled,
+                    };
                 }
-            }
-            StartPreparation::Stopping { correlation: owned, .. } if correlation == owned => {
+                Err(error) => {
+                    self.start_status = Some((pending.feature, error.detail.clone()));
+                    self.pending_start = None;
+                }
+                _ => {
+                    self.start_status = Some((
+                        pending.feature,
+                        "Model selection reply did not match its request.".to_owned(),
+                    ));
+                    self.pending_start = None;
+                }
+            },
+            StartPreparation::Stopping {
+                correlation: owned, ..
+            } if correlation == owned => {
                 if let Err(error) = reply {
                     self.start_status = Some((pending.feature, error.detail.clone()));
                     self.pending_start = None;
@@ -137,7 +161,9 @@ impl WorkflowModel {
     }
 
     pub fn start_detail(&self, feature: FeatureId) -> &str {
-        self.start_status.as_ref().filter(|(owner, _)| *owner == feature)
+        self.start_status
+            .as_ref()
+            .filter(|(owner, _)| *owner == feature)
             .map_or("", |(_, detail)| detail.as_str())
     }
 
@@ -239,14 +265,24 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
     fn project_training_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         let snapshot = match reply {
             ApplicationReply::TrainingOpenRun(value) => {
-                if self.workflow.training_run.as_ref().is_none_or(|current| value.generation >= current.generation) {
+                if self
+                    .workflow
+                    .training_run
+                    .as_ref()
+                    .is_none_or(|current| value.generation >= current.generation)
+                {
                     self.workflow.training_run = Some(value);
                     self.workflow.training_history = None;
                 }
                 return;
             }
             ApplicationReply::TrainingHistory(value) => {
-                if self.workflow.training_run.as_ref().is_some_and(|run| run.generation == value.generation) {
+                if self
+                    .workflow
+                    .training_run
+                    .as_ref()
+                    .is_some_and(|run| run.generation == value.generation)
+                {
                     self.workflow.training_history = Some(value);
                 }
                 return;
@@ -285,8 +321,12 @@ impl ApplicationModel {
 }
 
 impl ApplicationModel {
-    fn install_validation_snapshot(&mut self, mut value: crate::generated::ValidationSnapshot) -> Result<(), UiError> {
-        let failed = value.operation.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed;
+    fn install_validation_snapshot(
+        &mut self,
+        mut value: crate::generated::ValidationSnapshot,
+    ) -> Result<(), UiError> {
+        let failed =
+            value.operation.terminal.outcome == crate::generated::ComputeOperationOutcome::Failed;
         let detail = value.operation.terminal.detail.clone();
         let mut installed = true;
         if let Some(current) = self.workflow.validation.as_ref() {
@@ -303,7 +343,8 @@ impl ApplicationModel {
                 }
             }
             let mut operation = current.operation.clone();
-            let outcome = super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
+            let outcome =
+                super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
             installed = outcome == Observation::Installed;
             if outcome == Observation::Stale {
                 value.metrics = current.metrics.clone();
@@ -318,41 +359,61 @@ impl ApplicationModel {
             }
             value.operation = operation;
         }
-        if self.workflow.validation_details.as_ref().is_some_and(|page| page.generation != value.operation.generationfrontier) {
+        if self
+            .workflow
+            .validation_details
+            .as_ref()
+            .is_some_and(|page| page.generation != value.operation.generationfrontier)
+        {
             self.workflow.validation_details = None;
         }
         self.workflow.validation = Some(value);
-        if installed && failed { self.failed(detail); }
+        if installed && failed {
+            self.failed(detail);
+        }
         Ok(())
     }
 }
 impl crate::generated::ValidationApplicationProjection<UiError> for ApplicationModel {
-    fn project_validation_snapshot(&mut self, value: crate::generated::ValidationSnapshot) -> Result<(), UiError> {
+    fn project_validation_snapshot(
+        &mut self,
+        value: crate::generated::ValidationSnapshot,
+    ) -> Result<(), UiError> {
         self.install_validation_snapshot(value)
     }
     fn project_validation_event(&mut self, event: ApplicationEvent) {
         match event {
-            ApplicationEvent::ValidationValidationProgress(value) => self.install_compute_snapshot(FeatureId::Validate, value.operation),
+            ApplicationEvent::ValidationValidationProgress(value) => {
+                self.install_compute_snapshot(FeatureId::Validate, value.operation)
+            }
             ApplicationEvent::ValidationValidationChanged(value) => {
-                if let Err(error) = self.install_validation_snapshot(value.snapshot) { self.error = Some(error); }
+                if let Err(error) = self.install_validation_snapshot(value.snapshot) {
+                    self.error = Some(error);
+                }
             }
             _ => unreachable!("generated Validation dispatch supplied another system event"),
         }
     }
     fn project_validation_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         let snapshot = match reply {
-            ApplicationReply::ValidationStart(snapshot) | ApplicationReply::ValidationStop(snapshot)
-            | ApplicationReply::ValidationSelectSample(snapshot) | ApplicationReply::ValidationCloseDetail(snapshot)
+            ApplicationReply::ValidationStart(snapshot)
+            | ApplicationReply::ValidationStop(snapshot)
+            | ApplicationReply::ValidationSelectSample(snapshot)
+            | ApplicationReply::ValidationCloseDetail(snapshot)
             | ApplicationReply::ValidationSetOverlays(snapshot) => snapshot,
             ApplicationReply::ValidationDetails(page) => {
-                if self.workflow.validation.as_ref().is_some_and(|snapshot| snapshot.operation.generationfrontier == page.generation) {
+                if self.workflow.validation.as_ref().is_some_and(|snapshot| {
+                    snapshot.operation.generationfrontier == page.generation
+                }) {
                     self.workflow.validation_details = Some(page);
                 }
                 return;
             }
             _ => unreachable!("generated Validation dispatch supplied another system reply"),
         };
-        if let Err(error) = self.install_validation_snapshot(snapshot) { self.error = Some(error); }
+        if let Err(error) = self.install_validation_snapshot(snapshot) {
+            self.error = Some(error);
+        }
     }
 }
 
@@ -394,7 +455,10 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
     fn project_predict_event(&mut self, event: ApplicationEvent) {
         match event {
             ApplicationEvent::PredictPredictProgress(value) => {
-                if let Err(error) = super::reduction::merge_predict_progress(&mut self.predict_snapshot, value.snapshot) {
+                if let Err(error) = super::reduction::merge_predict_progress(
+                    &mut self.predict_snapshot,
+                    value.snapshot,
+                ) {
                     self.error = Some(error);
                 }
             }
@@ -422,9 +486,9 @@ impl crate::generated::PredictApplicationProjection<UiError> for ApplicationMode
 
     fn project_predict_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         let snapshot = match reply {
-            ApplicationReply::PredictStart(snapshot) | ApplicationReply::PredictStop(snapshot) | ApplicationReply::PredictPause(snapshot) => {
-                snapshot
-            }
+            ApplicationReply::PredictStart(snapshot)
+            | ApplicationReply::PredictStop(snapshot)
+            | ApplicationReply::PredictPause(snapshot) => snapshot,
             _ => unreachable!("generated Predict dispatch supplied another system reply"),
         };
         if let Err(error) = self.install_predict_snapshot(snapshot) {
@@ -536,57 +600,107 @@ mod tests {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
-    use crate::generated::{ValidationApplicationProjection, ValidationChanged, ValidationProgress};
+    use crate::generated::{
+        ValidationApplicationProjection, ValidationChanged, ValidationProgress,
+    };
     #[test]
     fn validation_keeps_physical_generation_independent_and_rejects_old_detail_pages() {
         let mut model = crate::view_model::test_support::bootstrapped();
         let mut current = model.workflow.validation.clone().unwrap();
         current.operation.generationfrontier = 2;
         current.operation.progress.sequence = 1;
-        current.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 7);
+        current.frame =
+            crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 7);
         current.contentidentity = 11;
         current.sampleidentities[0].generation = 2;
         current.sampleavailable[0] = true;
-        model.project_validation_event(ApplicationEvent::ValidationValidationChanged(ValidationChanged { snapshot: current.clone() }));
+        model.project_validation_event(ApplicationEvent::ValidationValidationChanged(
+            ValidationChanged {
+                snapshot: current.clone(),
+            },
+        ));
         let mut old = current.clone();
         old.operation.generationfrontier = 1;
         old.frame.revision = 8;
-        model.project_validation_event(ApplicationEvent::ValidationValidationChanged(ValidationChanged { snapshot: old }));
+        model.project_validation_event(ApplicationEvent::ValidationValidationChanged(
+            ValidationChanged { snapshot: old },
+        ));
         let installed = model.workflow.validation.as_ref().unwrap();
         assert_eq!(installed.operation.generationfrontier, 2);
         assert_eq!(installed.frame.revision, 8);
         let mut progress = current.operation.clone();
         progress.progress.sequence = 2;
-        model.project_validation_event(ApplicationEvent::ValidationValidationProgress(ValidationProgress { operation: progress }));
-        assert_eq!(model.workflow.validation.as_ref().unwrap().contentidentity, 11);
-        model.project_validation_reply(1, ApplicationReply::ValidationDetails(crate::generated::EvaluationDetailPage {
-            generation: 1, total: 0, offset: 0, rows: vec![],
-        }));
+        model.project_validation_event(ApplicationEvent::ValidationValidationProgress(
+            ValidationProgress {
+                operation: progress,
+            },
+        ));
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().contentidentity,
+            11
+        );
+        model.project_validation_reply(
+            1,
+            ApplicationReply::ValidationDetails(crate::generated::EvaluationDetailPage {
+                generation: 1,
+                total: 0,
+                offset: 0,
+                rows: vec![],
+            }),
+        );
         assert!(model.workflow.validation_details.is_none());
-        model.project_validation_reply(2, ApplicationReply::ValidationDetails(crate::generated::EvaluationDetailPage {
-            generation: 2, total: 0, offset: 0, rows: vec![],
-        }));
+        model.project_validation_reply(
+            2,
+            ApplicationReply::ValidationDetails(crate::generated::EvaluationDetailPage {
+                generation: 2,
+                total: 0,
+                offset: 0,
+                rows: vec![],
+            }),
+        );
         assert!(model.workflow.validation_details.is_some());
         let retained = model.workflow.validation_details.clone();
-        let mut settings = crate::generated::application_snapshot_defaults().unwrap().into_iter()
-            .find_map(|fact| match fact.value { crate::generated::ApplicationSnapshot::Settings(value) => Some(value), _ => None }).unwrap();
+        let mut settings = crate::generated::application_snapshot_defaults()
+            .unwrap()
+            .into_iter()
+            .find_map(|fact| match fact.value {
+                crate::generated::ApplicationSnapshot::Settings(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
         settings.revision += 1;
-        settings.settingsstate.workflows.validate.request.compiledpath = "/later/input.bin".into();
-        model.install_settings(&settings);
+        settings
+            .settingsstate
+            .workflows
+            .validate
+            .request
+            .compiledpath = "/later/input.bin".into();
+        model.install_settings_snapshot(settings).unwrap();
         assert_eq!(model.workflow.validation_details, retained);
     }
     #[test]
     fn validation_equal_physical_revisions_require_identical_product_facts() {
         let mut model = crate::view_model::test_support::bootstrapped();
         let mut baseline = model.workflow.validation.clone().unwrap();
-        baseline.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 9);
+        baseline.frame =
+            crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 9);
         baseline.operation.generationfrontier = 3;
         baseline.contentidentity = 17;
         model.install_validation_snapshot(baseline.clone()).unwrap();
         let mut progress = baseline.clone();
         progress.operation.progress.sequence = 1;
         model.install_validation_snapshot(progress.clone()).unwrap();
-        assert_eq!(model.workflow.validation.as_ref().unwrap().operation.progress.sequence, 1);
+        assert_eq!(
+            model
+                .workflow
+                .validation
+                .as_ref()
+                .unwrap()
+                .operation
+                .progress
+                .sequence,
+            1
+        );
         for mutation in 0..6 {
             let mut conflict = progress.clone();
             match mutation {
@@ -616,10 +730,21 @@ mod validation_tests {
         newer.operation.generationfrontier -= 1;
         newer.overlays.predictionboxes = !newer.overlays.predictionboxes;
         model.install_validation_snapshot(newer.clone()).unwrap();
-        assert_eq!(model.workflow.validation.as_ref().unwrap().overlays, newer.overlays);
-        assert_eq!(model.workflow.validation.as_ref().unwrap().operation.generationfrontier, 3);
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().overlays,
+            newer.overlays
+        );
+        assert_eq!(
+            model
+                .workflow
+                .validation
+                .as_ref()
+                .unwrap()
+                .operation
+                .generationfrontier,
+            3
+        );
     }
-
 }
 
 #[cfg(test)]
@@ -632,20 +757,37 @@ mod training_history_tests {
         let mut model = crate::view_model::test_support::bootstrapped();
         let before = model.workflow.training.clone();
         let checkpoint = crate::generated::TrainingCheckpoint {
-            path: "/run/checkpoint.pt".into(), attemptid: "saved-attempt".into(),
-            originalweights: "/original/weights.pt".into(), originalclassdescriptor: String::new(),
-            resumable: true, epoch: 4, configuration: None, classlayout: None,
+            path: "/run/checkpoint.pt".into(),
+            attemptid: "saved-attempt".into(),
+            originalweights: "/original/weights.pt".into(),
+            originalclassdescriptor: String::new(),
+            resumable: true,
+            epoch: 4,
+            configuration: None,
+            classlayout: None,
             evaluatedweights: crate::generated::EvaluatedWeights::Ema,
         };
-        model.project_training_reply(1, ApplicationReply::TrainingInspectCheckpoint(checkpoint.clone()));
+        model.project_training_reply(
+            1,
+            ApplicationReply::TrainingInspectCheckpoint(checkpoint.clone()),
+        );
         assert_eq!(model.workflow.training, before);
         assert_eq!(model.workflow.training_checkpoint, Some(checkpoint.clone()));
         assert!(model.workflow.resume_ready.is_none());
-        model.project_training_reply(2, ApplicationReply::TrainingHistory(crate::generated::TrainingHistoryPage {
-            generation: 7, nextcursor: 4096, more: true, records: vec![],
-        }));
+        model.project_training_reply(
+            2,
+            ApplicationReply::TrainingHistory(crate::generated::TrainingHistoryPage {
+                generation: 7,
+                nextcursor: 4096,
+                more: true,
+                records: vec![],
+            }),
+        );
         assert!(model.workflow.training_history.is_none());
-        model.project_training_reply(3, ApplicationReply::TrainingPrepareResume(checkpoint.clone()));
+        model.project_training_reply(
+            3,
+            ApplicationReply::TrainingPrepareResume(checkpoint.clone()),
+        );
         assert_eq!(model.workflow.resume_ready, Some(checkpoint));
         assert_eq!(model.workflow.training, before);
     }

@@ -3,7 +3,6 @@
 module;
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -16,11 +15,8 @@ module;
 #include <memory>
 #include <stdexcept>
 #include <utility>
-
 #include "detail/live_module_dependencies.h"  // IWYU pragma: keep
-
 module mmltk.backend.media.live.live_session_controller;
-
 import mmltk.backend.media.live.live_capture_region;
 import mmltk.backend.media.live.live_frame_id; // CLEANUP-IGNORE: The overlay worker directly imports its typed Live schema dependencies.
 import mmltk.backend.media.live.live_types;
@@ -30,33 +26,25 @@ import mmltk.backend.imaging.annotation.core;
 import mmltk.backend.imaging.annotation.renderer;
 import mmltk.backend.imaging.annotation.semantic_scene_descriptor;
 import mmltk.backend.imaging.raster;
-
 #include "detail/live_manual_overlay_worker.h"
 namespace mmltk::backend::media::live {
 namespace annotation = mmltk::backend::imaging::annotation;
 namespace raster = mmltk::backend::imaging::raster;
 namespace {
 constexpr double kTwoPi = 6.28318530717958647692;
-
 [[nodiscard]] bool box_has_area(const ManualOverlayBox& box) noexcept { return box.x2 > box.x1 && box.y2 > box.y1; }
-
 [[nodiscard]] const ManualOverlayInstance& instance_at(const ManualOverlayDocumentSnapshot& snapshot, const std::size_t index) {
-    return index < snapshot.instances.size() ? snapshot.instances[index]
-                                             : snapshot.interaction_instances[index - snapshot.instances.size()];
+    return index < snapshot.instances.size() ? snapshot.instances[index] : snapshot.interaction_instances[index - snapshot.instances.size()];
 }
-
 [[nodiscard]] bool add_bounded(const std::size_t count, const std::size_t limit, std::size_t* total) noexcept {
     if (total == nullptr || *total > limit || count > limit - *total) return false;
     *total += count;
     return true;
 }
-
 [[nodiscard]] std::uint8_t* offset_rgba(const CUdeviceptr rgba, const std::size_t pitch, const ManualOverlayMaskRegion region) noexcept {
-    return reinterpret_cast<std::uint8_t*>(rgba) + static_cast<std::size_t>(region.capture_y) * pitch +
-           static_cast<std::size_t>(region.capture_x) * 4U;
+    return reinterpret_cast<std::uint8_t*>(rgba) + static_cast<std::size_t>(region.capture_y) * pitch + static_cast<std::size_t>(region.capture_x) * 4U;
 }
 }  // namespace
-
 LiveManualOverlayWorker::LiveManualOverlayWorker(ManualOverlayDocument& document, const std::uint32_t count, const std::uint32_t width,
                                                  const std::uint32_t height, const std::uint32_t maximum_instances,
                                                  const LiveManualOverlayUploadLimits upload_limits, LivePhysicalCudaContext cuda)
@@ -82,8 +70,7 @@ LiveManualOverlayWorker::LiveManualOverlayWorker(ManualOverlayDocument& document
                 throw std::runtime_error("create Live manual-overlay stream");
             if (scope.Record(cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming)) != cudaSuccess)
                 throw std::runtime_error("create Live manual-overlay event");
-            if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.rgba), &slot.pitch, static_cast<std::size_t>(width) * 4U,
-                                             height)) != cudaSuccess)
+            if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.rgba), &slot.pitch, static_cast<std::size_t>(width) * 4U, height)) != cudaSuccess)
                 throw std::runtime_error("allocate Live manual-overlay slot");
             allocate_upload(slot.masks, upload_limits.mask_bytes, scope);
             allocate_upload(slot.runs, upload_limits.run_values * sizeof(std::uint32_t), scope);
@@ -96,36 +83,25 @@ LiveManualOverlayWorker::LiveManualOverlayWorker(ManualOverlayDocument& document
         throw;
     }
 }
-
 LiveManualOverlayWorker::~LiveManualOverlayWorker() { destroy(); }
-
 void LiveManualOverlayWorker::start() noexcept { running_.store(true, std::memory_order_release); }
-
 void LiveManualOverlayWorker::close_admission() noexcept { running_.store(false, std::memory_order_release); }
-
 void LiveManualOverlayWorker::ScrubProduct(Slot& slot) noexcept {
     slot.generation = 0U;
     slot.has_content = false;
 }
-
 void LiveManualOverlayWorker::publish_slot(Slot& slot, const SlotState published) noexcept {
     publish_latest_live_owner_slot(latest_, slot.index, slot.state, published, [&slot] noexcept { ScrubProduct(slot); });
 }
-
 void LiveManualOverlayWorker::stop() noexcept {
     close_admission();
     if (slots_ == nullptr) return;
     latest_.store(-1, std::memory_order_release);
     published_generation_.store(0U, std::memory_order_release);
     auto scope = cuda_.scope();
-    retire_live_slots(scope, slots_.get(), slot_count_,
-                      [this](Slot& slot, const SlotState published) noexcept { publish_slot(slot, published); });
+    retire_live_slots(scope, slots_.get(), slot_count_, [this](Slot& slot, const SlotState published) noexcept { publish_slot(slot, published); });
 }
-
-LiveManualOverlayWorker::SlotReservation LiveManualOverlayWorker::reserve() noexcept {
-    return {reserve_live_slot(slots_.get(), slot_count_).slot};
-}
-
+LiveManualOverlayWorker::SlotReservation LiveManualOverlayWorker::reserve() noexcept { return {reserve_live_slot(slots_.get(), slot_count_).slot}; }
 void LiveManualOverlayWorker::allocate_upload(UploadStorage& storage, const std::size_t bytes, LiveCudaCommandScope& scope) {
     if (bytes == 0U) throw std::invalid_argument("Live manual-overlay upload storage cannot be empty");
     auto host = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
@@ -134,31 +110,26 @@ void LiveManualOverlayWorker::allocate_upload(UploadStorage& storage, const std:
     cudaError_t status = scope.Record(cudaMalloc(&device, bytes));
     if (status != cudaSuccess) {
         if (device != nullptr) static_cast<void>(scope.Record(cudaFree(device)));
-
         throw std::runtime_error("allocate Live manual-overlay upload storage");
     }
     storage.host = host->data();
     storage.storage = std::move(host);
     storage.device = reinterpret_cast<CUdeviceptr>(device);
 }
-
 LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(const ManualOverlayDocumentSnapshot& snapshot, Slot& slot,
                                                                                 std::size_t* instance_count_out) {
-    if (instance_count_out == nullptr ||
-        snapshot.interaction_instances.size() > std::numeric_limits<std::size_t>::max() - snapshot.instances.size())
+    if (instance_count_out == nullptr || snapshot.interaction_instances.size() > std::numeric_limits<std::size_t>::max() - snapshot.instances.size())
         return PrepareResult::Refused;
     const std::size_t instance_count = snapshot.instances.size() + snapshot.interaction_instances.size();
     if (instance_count > maximum_instances_) return PrepareResult::Refused;
     *instance_count_out = instance_count;
-
     std::size_t mask_bytes_total = 0U;
     std::size_t run_values_total = 0U;
     std::size_t point_values_total = 0U;
     std::size_t edge_values_total = 0U;
-    const bool dimensions_valid = snapshot.capture_width != 0U && snapshot.capture_height != 0U && snapshot.capture_width <= width_ &&
-                                  snapshot.capture_height <= height_;
+    const bool dimensions_valid =
+        snapshot.capture_width != 0U && snapshot.capture_height != 0U && snapshot.capture_width <= width_ && snapshot.capture_height <= height_;
     if (!dimensions_valid) return PrepareResult::Refused;
-
     for (std::size_t index = 0U; index < instance_count; ++index) {
         const ManualOverlayInstance& instance = instance_at(snapshot, index);
         PackedInstance& packed = slot.packed[index];
@@ -169,43 +140,32 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
         packed.point_value_offset = point_values_total;
         packed.edge_value_offset = edge_values_total;
         if (!instance.enabled) continue;
-
         if ((!instance.mask.empty() && (!instance.mask_runs.empty() || instance.deferred_mask_mapping.has_value())) ||
             instance.mask_runs.size() > upload_limits_.run_values / 2U)
             return PrepareResult::Refused;
         if (instance.deferred_mask_mapping.has_value()) {
-            packed.deferred_mask_projection = validate_manual_overlay_deferred_mask(
-                *instance.deferred_mask_mapping, instance.mask_region, instance.mask_runs, snapshot.capture_width, snapshot.capture_height);
+            packed.deferred_mask_projection = validate_manual_overlay_deferred_mask(*instance.deferred_mask_mapping, instance.mask_region, instance.mask_runs,
+                                                                                    snapshot.capture_width, snapshot.capture_height);
             if (!packed.deferred_mask_projection.has_value()) return PrepareResult::Refused;
         }
         const std::size_t mask_bytes = static_cast<std::size_t>(instance.mask_region.width) * instance.mask_region.height;
         const bool has_mask_payload = !instance.mask.empty() || !instance.mask_runs.empty();
-        if (has_mask_payload &&
-            !manual_overlay_mask_region_contained(instance.mask_region, snapshot.capture_width, snapshot.capture_height))
+        if (has_mask_payload && !manual_overlay_mask_region_contained(instance.mask_region, snapshot.capture_width, snapshot.capture_height))
             return PrepareResult::Refused;
         if (!instance.mask.empty()) {
-            if (mask_bytes == 0U || instance.mask.size() != mask_bytes ||
-                !add_bounded(mask_bytes, upload_limits_.mask_bytes, &mask_bytes_total))
+            if (mask_bytes == 0U || instance.mask.size() != mask_bytes || !add_bounded(mask_bytes, upload_limits_.mask_bytes, &mask_bytes_total))
                 return PrepareResult::Refused;
         } else if (!instance.mask_runs.empty()) {
             if (!packed.deferred_mask_projection.has_value()) {
-                const ManualOverlayDeferredMaskMapping local{instance.mask_region.width,
-                                                             instance.mask_region.height,
-                                                             0U,
-                                                             0U,
-                                                             instance.mask_region.width,
-                                                             instance.mask_region.height,
-                                                             snapshot.capture_width,
-                                                             snapshot.capture_height,
-                                                             0U,
-                                                             0U};
-                if (!validate_manual_overlay_deferred_mask(local, instance.mask_region, instance.mask_runs, snapshot.capture_width,
-                                                           snapshot.capture_height)
+                const ManualOverlayDeferredMaskMapping local{
+                    instance.mask_region.width, instance.mask_region.height, 0U, 0U, instance.mask_region.width, instance.mask_region.height,
+                    snapshot.capture_width,     snapshot.capture_height,     0U, 0U};
+                if (!validate_manual_overlay_deferred_mask(local, instance.mask_region, instance.mask_runs, snapshot.capture_width, snapshot.capture_height)
                          .has_value())
                     return PrepareResult::Refused;
             }
-            const std::size_t values = packed.deferred_mask_projection.has_value() ? packed.deferred_mask_projection->run_value_count
-                                                                                   : instance.mask_runs.size() * 2U;
+            const std::size_t values =
+                packed.deferred_mask_projection.has_value() ? packed.deferred_mask_projection->run_value_count : instance.mask_runs.size() * 2U;
             if (!add_bounded(values, upload_limits_.run_values, &run_values_total)) return PrepareResult::Refused;
         }
         if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced) {
@@ -226,12 +186,10 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
                 !add_bounded(instance.skeleton_edges.size() * 2U, upload_limits_.edge_values, &edge_values_total))
                 return PrepareResult::Refused;
             for (const ManualOverlayEdge edge : instance.skeleton_edges)
-                if (edge.source_index >= instance.points.size() || edge.target_index >= instance.points.size())
-                    return PrepareResult::Refused;
+                if (edge.source_index >= instance.points.size() || edge.target_index >= instance.points.size()) return PrepareResult::Refused;
         }
     }
     if (snapshot.selected_instance.has_value() && *snapshot.selected_instance >= snapshot.instances.size()) return PrepareResult::Refused;
-
     auto* masks = static_cast<std::uint8_t*>(slot.masks.host);
     auto* runs = static_cast<std::uint32_t*>(slot.runs.host);
     auto* points = static_cast<int*>(slot.points.host);
@@ -268,14 +226,12 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
             }
         }
     }
-
     auto scope = cuda_.scope();
     if (!scope) return PrepareResult::CudaFailure;
     cudaError_t status = cudaSuccess;
     const auto upload = [&](const UploadStorage& storage, const std::size_t bytes) {
         if (status != cudaSuccess || bytes == 0U) return;
-        status = scope.Record(
-            cudaMemcpyAsync(reinterpret_cast<void*>(storage.device), storage.host, bytes, cudaMemcpyHostToDevice, slot.stream));
+        status = scope.Record(cudaMemcpyAsync(reinterpret_cast<void*>(storage.device), storage.host, bytes, cudaMemcpyHostToDevice, slot.stream));
     };
     upload(slot.masks, mask_bytes_total);
     upload(slot.runs, run_values_total * sizeof(std::uint32_t));
@@ -283,16 +239,13 @@ LiveManualOverlayWorker::PrepareResult LiveManualOverlayWorker::prepare_uploads(
     upload(slot.edges, edge_values_total * sizeof(std::uint32_t));
     return status == cudaSuccess ? PrepareResult::Ready : PrepareResult::CudaFailure;
 }
-
 bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapshot& snapshot, Slot& slot, const std::size_t instance_count) {
     auto scope = cuda_.scope();
     if (!scope) return false;
-    cudaError_t status = scope.Record(
-        cudaMemset2DAsync(reinterpret_cast<void*>(slot.rgba), slot.pitch, 0, static_cast<std::size_t>(width_) * 4U, height_, slot.stream));
+    cudaError_t status =
+        scope.Record(cudaMemset2DAsync(reinterpret_cast<void*>(slot.rgba), slot.pitch, 0, static_cast<std::size_t>(width_) * 4U, height_, slot.stream));
     bool has_content = false;
-    const raster::MutableBytes target{reinterpret_cast<std::uint8_t*>(slot.rgba), slot.pitch, static_cast<int>(width_),
-                                      static_cast<int>(height_)};
-
+    const raster::MutableBytes target{reinterpret_cast<std::uint8_t*>(slot.rgba), slot.pitch, static_cast<int>(width_), static_cast<int>(height_)};
     for (std::size_t index = 0U; index < instance_count && status == cudaSuccess; ++index) {
         const ManualOverlayInstance& instance = instance_at(snapshot, index);
         const PackedInstance& packed = slot.packed[index];
@@ -305,44 +258,41 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
         const int radius = std::max(1, instance.style.has_value() ? instance.style->point_radius : 3);
         const std::size_t mask_bytes = static_cast<std::size_t>(instance.mask_region.width) * instance.mask_region.height;
         if (mask_bytes != 0U && instance.mask.size() == mask_bytes) {
-            status = scope.Record(raster::raster_mask_rgba(
-                {.overlay = {offset_rgba(slot.rgba, slot.pitch, instance.mask_region), slot.pitch,
-                             static_cast<int>(instance.mask_region.width), static_cast<int>(instance.mask_region.height)},
-                 .mask = reinterpret_cast<const std::uint8_t*>(slot.masks.device + packed.mask_offset),
-                 .color = {color[0], color[1], color[2], alpha},
-                 .stream = slot.stream}));
+            status =
+                scope.Record(raster::raster_mask_rgba({.overlay = {offset_rgba(slot.rgba, slot.pitch, instance.mask_region), slot.pitch,
+                                                                   static_cast<int>(instance.mask_region.width), static_cast<int>(instance.mask_region.height)},
+                                                       .mask = reinterpret_cast<const std::uint8_t*>(slot.masks.device + packed.mask_offset),
+                                                       .color = {color[0], color[1], color[2], alpha},
+                                                       .stream = slot.stream}));
             has_content = true;
         } else if (mask_bytes != 0U && !instance.mask_runs.empty()) {
-            const auto* run_pairs =
-                reinterpret_cast<const std::uint32_t*>(slot.runs.device + packed.run_value_offset * sizeof(std::uint32_t));
+            const auto* run_pairs = reinterpret_cast<const std::uint32_t*>(slot.runs.device + packed.run_value_offset * sizeof(std::uint32_t));
             if (packed.deferred_mask_projection.has_value()) {
                 const auto& projection = *packed.deferred_mask_projection;
                 status = scope.Record(static_cast<cudaError_t>(annotation::draw_deferred_manual_mask_runs_rgba_pitched(
-                    projection.mapping, offset_rgba(slot.rgba, slot.pitch, instance.mask_region), slot.pitch,
-                    static_cast<int>(instance.mask_region.width), static_cast<int>(instance.mask_region.height), run_pairs,
-                    projection.run_count, projection.region.capture_x, projection.region.capture_y, color[0], color[1], color[2], alpha,
-                    reinterpret_cast<std::uintptr_t>(slot.stream))));
+                    projection.mapping, offset_rgba(slot.rgba, slot.pitch, instance.mask_region), slot.pitch, static_cast<int>(instance.mask_region.width),
+                    static_cast<int>(instance.mask_region.height), run_pairs, projection.run_count, projection.region.capture_x, projection.region.capture_y,
+                    color[0], color[1], color[2], alpha, reinterpret_cast<std::uintptr_t>(slot.stream))));
             } else {
-                status = scope.Record(raster::raster_mask_runs_rgba(
-                    {.overlay = {offset_rgba(slot.rgba, slot.pitch, instance.mask_region), slot.pitch,
-                                 static_cast<int>(instance.mask_region.width), static_cast<int>(instance.mask_region.height)},
-                     .run_pairs = run_pairs,
-                     .run_count = static_cast<std::uint32_t>(instance.mask_runs.size()),
-                     .color = {color[0], color[1], color[2], alpha},
-                     .stream = slot.stream}));
+                status = scope.Record(
+                    raster::raster_mask_runs_rgba({.overlay = {offset_rgba(slot.rgba, slot.pitch, instance.mask_region), slot.pitch,
+                                                               static_cast<int>(instance.mask_region.width), static_cast<int>(instance.mask_region.height)},
+                                                   .run_pairs = run_pairs,
+                                                   .run_count = static_cast<std::uint32_t>(instance.mask_runs.size()),
+                                                   .color = {color[0], color[1], color[2], alpha},
+                                                   .stream = slot.stream}));
             }
             has_content = true;
         }
-        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && instance.polyline_points.size() >= 2U &&
-            status == cudaSuccess) {
-            status = scope.Record(raster::raster_polyline_rgba(
-                {.overlay = target,
-                 .points = {reinterpret_cast<const int*>(slot.points.device + packed.polyline_value_offset * sizeof(int)),
-                            static_cast<int>(instance.polyline_points.size())},
-                 .closed = instance.polyline_closed,
-                 .color = {color[0], color[1], color[2]},
-                 .thickness = thickness,
-                 .stream = slot.stream}));
+        if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && instance.polyline_points.size() >= 2U && status == cudaSuccess) {
+            status = scope.Record(
+                raster::raster_polyline_rgba({.overlay = target,
+                                              .points = {reinterpret_cast<const int*>(slot.points.device + packed.polyline_value_offset * sizeof(int)),
+                                                         static_cast<int>(instance.polyline_points.size())},
+                                              .closed = instance.polyline_closed,
+                                              .color = {color[0], color[1], color[2]},
+                                              .thickness = thickness,
+                                              .stream = slot.stream}));
             has_content = true;
         }
         if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && !instance.skeleton_edges.empty() && !instance.points.empty() &&
@@ -361,43 +311,39 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
         // CLEANUP-IGNORE: Skeleton edges and standalone point glyphs are distinct raster primitives with separate
         // buffers.
         if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && !instance.points.empty() && status == cudaSuccess) {
-            status = scope.Record(raster::raster_points_rgba(
-                {.overlay = target,
-                 .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)),
-                            static_cast<int>(instance.points.size())},
-                 .radius = radius,
-                 .color = {color[0], color[1], color[2], instance.style.has_value() ? instance.style->alpha : std::uint8_t{240U}},
-                 .stream = slot.stream}));
+            status = scope.Record(
+                raster::raster_points_rgba({.overlay = target,
+                                            .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)),
+                                                       static_cast<int>(instance.points.size())},
+                                            .radius = radius,
+                                            .color = {color[0], color[1], color[2], instance.style.has_value() ? instance.style->alpha : std::uint8_t{240U}},
+                                            .stream = slot.stream}));
             has_content = true;
         }
         if (snapshot.renderer_mode != annotation::SemanticRenderer::Iced && box_has_area(instance.box) && status == cudaSuccess) {
-            status =
-                scope.Record(raster::raster_box_outline_rgba({.overlay = target,
-                                                              .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2},
-                                                              .color = {color[0], color[1], color[2]},
-                                                              .thickness = thickness,
-                                                              .stream = slot.stream}));
+            status = scope.Record(raster::raster_box_outline_rgba({.overlay = target,
+                                                                   .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2},
+                                                                   .color = {color[0], color[1], color[2]},
+                                                                   .thickness = thickness,
+                                                                   .stream = slot.stream}));
             has_content = true;
             if (status == cudaSuccess && instance.style.has_value() && instance.style->draw_handles)
-                status = scope.Record(
-                    raster::raster_selection_handles_rgba({.overlay = target,
-                                                           .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2},
-                                                           .handle_radius = std::max(1, instance.style->handle_radius),
-                                                           .color = {color[0], color[1], color[2], instance.style->alpha},
-                                                           .stream = slot.stream}));
+                status = scope.Record(raster::raster_selection_handles_rgba({.overlay = target,
+                                                                             .box = {instance.box.x1, instance.box.y1, instance.box.x2, instance.box.y2},
+                                                                             .handle_radius = std::max(1, instance.style->handle_radius),
+                                                                             .color = {color[0], color[1], color[2], instance.style->alpha},
+                                                                             .stream = slot.stream}));
         }
     }
-
     if (status == cudaSuccess && snapshot.renderer_mode != annotation::SemanticRenderer::Iced && snapshot.selected_instance.has_value() &&
         *snapshot.selected_instance < snapshot.instances.size()) {
         const ManualOverlayInstance& selected = snapshot.instances[*snapshot.selected_instance];
         if (box_has_area(selected.box)) {
-            status = scope.Record(
-                raster::raster_selection_handles_rgba({.overlay = target,
-                                                       .box = {selected.box.x1, selected.box.y1, selected.box.x2, selected.box.y2},
-                                                       .handle_radius = 4,
-                                                       .color = {255U, 220U, 96U, 240U},
-                                                       .stream = slot.stream}));
+            status = scope.Record(raster::raster_selection_handles_rgba({.overlay = target,
+                                                                         .box = {selected.box.x1, selected.box.y1, selected.box.x2, selected.box.y2},
+                                                                         .handle_radius = 4,
+                                                                         .color = {255U, 220U, 96U, 240U},
+                                                                         .stream = slot.stream}));
             has_content = true;
         }
     }
@@ -410,8 +356,8 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
             host[index * 2] = static_cast<int>(std::lround(static_cast<double>(brush.capture_x) + std::cos(theta) * brush_radius));
             host[index * 2 + 1] = static_cast<int>(std::lround(static_cast<double>(brush.capture_y) + std::sin(theta) * brush_radius));
         }
-        status = scope.Record(cudaMemcpyAsync(reinterpret_cast<void*>(slot.brush.device), slot.brush.host,
-                                              kManualOverlayBrushValueCount * sizeof(int), cudaMemcpyHostToDevice, slot.stream));
+        status = scope.Record(cudaMemcpyAsync(reinterpret_cast<void*>(slot.brush.device), slot.brush.host, kManualOverlayBrushValueCount * sizeof(int),
+                                              cudaMemcpyHostToDevice, slot.stream));
         if (status == cudaSuccess)
             status = scope.Record(raster::raster_polyline_rgba(
                 {.overlay = target,
@@ -426,7 +372,6 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
     slot.has_content = has_content;
     return status == cudaSuccess;
 }
-
 bool LiveManualOverlayWorker::render_pending() {
     if (!running_.load(std::memory_order_acquire)) return false;
     const auto snapshot = document_.snapshot_if_changed(consumed_generation_);
@@ -473,14 +418,13 @@ bool LiveManualOverlayWorker::render_pending() {
     consumed_generation_ = snapshot->generation;
     return true;
 }
-
 void CUDART_CB LiveManualOverlayWorker::RenderComplete(void* context) noexcept {
     auto& slot = *static_cast<Slot*>(context);
     if (slot.owner->running_.load(std::memory_order_acquire)) {
         publish_live_slot_state(slot.state, SlotState::Published);
         std::uint64_t current = slot.owner->published_generation_.load(std::memory_order_acquire);
-        while (slot.generation > current && !slot.owner->published_generation_.compare_exchange_weak(
-                                                current, slot.generation, std::memory_order_acq_rel, std::memory_order_acquire)) {}
+        while (slot.generation > current &&
+               !slot.owner->published_generation_.compare_exchange_weak(current, slot.generation, std::memory_order_acq_rel, std::memory_order_acquire)) {}
         if (slot.generation > current) slot.owner->latest_.store(static_cast<int>(slot.index), std::memory_order_release);
     } else {
         slot.owner->publish_slot(slot, SlotState::Free);
@@ -488,7 +432,6 @@ void CUDART_CB LiveManualOverlayWorker::RenderComplete(void* context) noexcept {
     // CLEANUP-IGNORE: This overlay acquisition transfers custody of an overlay-specific slot and view.
     slot.owner->ready_.notify();
 }
-
 bool LiveManualOverlayWorker::try_acquire_latest(OverlayView* output) {
     if (output == nullptr) return false;
     const int index = latest_.load(std::memory_order_acquire);
@@ -506,7 +449,6 @@ bool LiveManualOverlayWorker::try_acquire_latest(OverlayView* output) {
                .has_content = slot.has_content};
     return true;
 }
-
 void LiveManualOverlayWorker::release(const std::uint32_t index) noexcept {
     if (index >= slot_count_) {
         cuda_.Record(cudaErrorUnknown);
@@ -524,16 +466,13 @@ void LiveManualOverlayWorker::release(const std::uint32_t index) noexcept {
     publish_slot(slot, SlotState::Free);
     ready_.notify();
 }
-
 void LiveManualOverlayWorker::terminalize(const std::uint32_t index) noexcept {
     Slot* const slot = index < slot_count_ ? &slots_[index] : nullptr;
     if (!claim_acquired_live_slot(slot == nullptr ? nullptr : &slot->state, cuda_)) return;
     publish_slot(*slot, SlotState::Terminal);
     ready_.notify();
 }
-
 void LiveManualOverlayWorker::set_ready_listener(std::function<void()> listener) { ready_.set_listener(std::move(listener)); }
-
 void LiveManualOverlayWorker::release_upload(UploadStorage& storage) noexcept {
     auto scope = cuda_.scope();
     if (storage.host != nullptr) {
@@ -545,7 +484,6 @@ void LiveManualOverlayWorker::release_upload(UploadStorage& storage) noexcept {
         storage.device = 0U;
     }
 }
-
 void LiveManualOverlayWorker::destroy() noexcept {
     if (slots_ == nullptr) return;
     stop();

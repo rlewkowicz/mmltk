@@ -1,9 +1,6 @@
 #pragma once
-
 #include <ATen/autocast_mode.h>
-
 namespace mmltk::backend::ml::cuda {
-
 class TorchAutocastScope final {
    public:
     TorchAutocastScope(const bool enabled, const at::ScalarType precision)
@@ -15,7 +12,6 @@ class TorchAutocastScope final {
         at::autocast::set_autocast_cache_enabled(enabled);
         at::autocast::increment_nesting();
     }
-
     ~TorchAutocastScope() {
         at::autocast::decrement_nesting();
         at::autocast::set_autocast_enabled(at::kCUDA, previous_enabled_);
@@ -23,7 +19,6 @@ class TorchAutocastScope final {
         at::autocast::set_autocast_cache_enabled(previous_cache_enabled_);
         if (!previous_enabled_) at::autocast::clear_cache();
     }
-
     TorchAutocastScope(const TorchAutocastScope&) = delete;
     TorchAutocastScope& operator=(const TorchAutocastScope&) = delete;
 
@@ -32,5 +27,4 @@ class TorchAutocastScope final {
     at::ScalarType previous_precision_;
     bool previous_cache_enabled_;
 };
-
 }  // namespace mmltk::backend::ml::cuda

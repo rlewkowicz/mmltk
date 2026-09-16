@@ -5,7 +5,6 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-
 namespace mmltk::controller::subsystems::annotation {
 namespace c = contracts;
 namespace {
@@ -29,12 +28,10 @@ Runs complement(const Runs& runs, std::uint16_t width, std::uint16_t height) {
         unsigned x = 0;
         while (next < runs.size() && runs[next].row == y) {
             auto run = runs[next++];
-            if (run.first > x)
-                result.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(x), static_cast<std::uint16_t>(run.first - 1)});
+            if (run.first > x) result.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(x), static_cast<std::uint16_t>(run.first - 1)});
             x = static_cast<unsigned>(run.last) + 1;
         }
-        if (x < width)
-            result.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(x), static_cast<std::uint16_t>(width - 1)});
+        if (x < width) result.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(x), static_cast<std::uint16_t>(width - 1)});
     }
     return result;
 }
@@ -46,15 +43,12 @@ struct Components {
         std::size_t previous_begin = 0, previous_end = 0, begin = 0;
         while (begin < runs.size()) {
             auto end = begin + 1;
-            while (end < runs.size() && runs[end].row == runs[begin].row)
-                ++end;
+            while (end < runs.size() && runs[end].row == runs[begin].row) ++end;
             if (previous_end && static_cast<unsigned>(runs[previous_begin].row) + 1 == runs[begin].row) {
                 auto left = previous_begin;
                 for (auto index = begin; index < end; ++index) {
-                    while (left < previous_end && runs[left].last < runs[index].first)
-                        ++left;
-                    for (auto other = left; other < previous_end && runs[other].first <= runs[index].last; ++other)
-                        parent[root(index)] = root(other);
+                    while (left < previous_end && runs[left].last < runs[index].first) ++left;
+                    for (auto other = left; other < previous_end && runs[other].first <= runs[index].last; ++other) parent[root(index)] = root(other);
                 }
             }
             previous_begin = begin;
@@ -143,8 +137,8 @@ void MaskRows::Materialize(c::AnnotationObject& object) const {
     }
     update_mask_bounds(object);
 }
-void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width, std::uint16_t height,
-                      bool erase, MaskScratch& scratch) {
+void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint16_t radius, std::uint16_t width, std::uint16_t height, bool erase,
+                      MaskScratch& scratch) {
     auto& stroke = scratch.stroke;
     stroke.clear();
     const float dx = to.x - from.x, dy = to.y - from.y;
@@ -160,8 +154,7 @@ void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint1
             const float reach = std::sqrt(static_cast<float>(radius) * radius - distance * distance);
             const int first = std::max(0, static_cast<int>(std::ceil(x - reach - 0.5F)));
             const int last = std::min(static_cast<int>(width) - 1, static_cast<int>(std::floor(x + reach - 0.5F)));
-            if (first <= last)
-                stroke.push_back({static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)});
+            if (first <= last) stroke.push_back({static_cast<std::uint16_t>(row), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)});
         }
         if (stroke.size() > c::kAnnotationMaskRunCapacity * 2) normalize(stroke);
     }
@@ -173,8 +166,7 @@ void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint1
         index_ = std::make_shared<Index>(*index_);
     for (std::size_t begin = 0U; begin < stroke.size();) {
         auto end = begin + 1U;
-        while (end < stroke.size() && stroke[end].row == stroke[begin].row)
-            ++end;
+        while (end < stroke.size() && stroke[end].row == stroke[begin].row) ++end;
         const auto block_index = stroke[begin].row / kRowsPerBlock;
         if (index_->blocks.size() <= block_index) index_->blocks.resize(block_index + 1U);
         auto& block = index_->blocks[block_index];
@@ -194,12 +186,10 @@ void MaskRows::Stroke(c::AnnotationPoint from, c::AnnotationPoint to, std::uint1
             auto cut = begin;
             for (const auto run : *row) {
                 unsigned first = run.first;
-                while (cut < end && stroke[cut].last < first)
-                    ++cut;
+                while (cut < end && stroke[cut].last < first) ++cut;
                 for (auto index = cut; index < end && stroke[index].first <= run.last; ++index) {
                     if (stroke[index].first > first)
-                        result.push_back(
-                            {run.row, static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(stroke[index].first - 1U)});
+                        result.push_back({run.row, static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(stroke[index].first - 1U)});
                     first = std::max(first, static_cast<unsigned>(stroke[index].last) + 1U);
                     if (first > run.last) break;
                 }
@@ -262,23 +252,20 @@ void fill_mask(c::AnnotationObject& object, c::AnnotationPoint point, std::uint1
     Components components(empty);
     std::size_t selected = empty.size();
     for (std::size_t index = 0; index < empty.size(); ++index)
-        if (empty[index].row == static_cast<unsigned>(point.y) && point.x >= empty[index].first &&
-            point.x < static_cast<unsigned>(empty[index].last) + 1)
+        if (empty[index].row == static_cast<unsigned>(point.y) && point.x >= empty[index].first && point.x < static_cast<unsigned>(empty[index].last) + 1)
             selected = components.root(index);
     if (selected == empty.size()) return;
     for (std::size_t index = 0; index < empty.size(); ++index)
         if (components.root(index) == selected) object.mask.runs.push_back(empty[index]);
     normalize_mask(object);
 }
-void cleanup_mask(c::AnnotationObject& object, c::AnnotationMaskCleanup operation, std::uint16_t radius, std::uint16_t width,
-                  std::uint16_t height) {
+void cleanup_mask(c::AnnotationObject& object, c::AnnotationMaskCleanup operation, std::uint16_t radius, std::uint16_t width, std::uint16_t height) {
     normalize(object.mask.runs);
     auto& runs = object.mask.runs;
     if (operation == c::AnnotationMaskCleanup::LargestComponent) {
         Components components(runs);
         std::vector<std::size_t> area(runs.size());
-        for (std::size_t index = 0; index < runs.size(); ++index)
-            area[components.root(index)] += runs[index].last - runs[index].first + 1;
+        for (std::size_t index = 0; index < runs.size(); ++index) area[components.root(index)] += runs[index].last - runs[index].first + 1;
         if (!runs.empty()) {
             const auto largest = static_cast<std::size_t>(std::ranges::max_element(area) - area.begin());
             Runs kept;
@@ -310,12 +297,8 @@ void cleanup_mask(c::AnnotationObject& object, c::AnnotationMaskCleanup operatio
             runs = std::move(interior);
         };
         switch (operation) {
-            case c::AnnotationMaskCleanup::Dilate:
-                grow();
-                break;
-            case c::AnnotationMaskCleanup::Erode:
-                shrink();
-                break;
+            case c::AnnotationMaskCleanup::Dilate: grow(); break;
+            case c::AnnotationMaskCleanup::Erode: shrink(); break;
             case c::AnnotationMaskCleanup::Open:
                 shrink();
                 grow();
@@ -324,8 +307,7 @@ void cleanup_mask(c::AnnotationObject& object, c::AnnotationMaskCleanup operatio
                 grow();
                 shrink();
                 break;
-            default:
-                break;
+            default: break;
         }
     }
     object.mask.cleanup = operation;

@@ -128,12 +128,24 @@ pub fn view<'a>(
                 crate::generated::constraint_workflowstraincompileddatasetdir().stable_field_id,
             )))
             .style(crate::fluent_theme::button_primary),
-        model.workflow.dialogs(crate::generated::FeatureId::Train)
-            .filter(|fact| [crate::generated::constraint_workflowstrainrequesttraincompiledpath().stable_field_id,
+        model
+            .workflow
+            .dialogs(crate::generated::FeatureId::Train)
+            .filter(|fact| [
+                crate::generated::constraint_workflowstrainrequesttraincompiledpath()
+                    .stable_field_id,
                 crate::generated::constraint_workflowstrainrequestvalcompiledpath().stable_field_id,
-                crate::generated::constraint_workflowstrainrequesttestcompiledpath().stable_field_id].contains(&fact.stable_field_id))
-            .fold(column![], |column, fact| column.push(button(fact.title).on_press_maybe(
-                model.file_dialog_open_available(fact, crate::generated::FeatureId::Train).then_some(Message::Browse(fact.stable_field_id))))),
+                crate::generated::constraint_workflowstrainrequesttestcompiledpath()
+                    .stable_field_id
+            ]
+            .contains(&fact.stable_field_id))
+            .fold(column![], |column, fact| column.push(
+                button(fact.title).on_press_maybe(
+                    model
+                        .file_dialog_open_available(fact, crate::generated::FeatureId::Train)
+                        .then_some(Message::Browse(fact.stable_field_id))
+                )
+            )),
         crate::view::workflow::fields::toggle(
             "Infer splits",
             train.usecompileddirectorydefaults,
@@ -186,9 +198,19 @@ pub fn view<'a>(
             ))
             .id(super::COMPILE_DIMENSIONS_ID),
         );
-    let fields = fields.push(container(crate::view::workflow::fields::toggle(
-        "Perceptual downscaling", train.compileperceptualdownscale, enabled, Message::PerceptualDownscaleChanged,
-    )).id(crate::generated::constraint_workflowstraincompileperceptualdownscale().stable_field_id.to_string()));
+    let fields = fields.push(
+        container(crate::view::workflow::fields::toggle(
+            "Perceptual downscaling",
+            train.compileperceptualdownscale,
+            enabled,
+            Message::PerceptualDownscaleChanged,
+        ))
+        .id(
+            crate::generated::constraint_workflowstraincompileperceptualdownscale()
+                .stable_field_id
+                .to_string(),
+        ),
+    );
     let fields = if train.compiledimensions {
         fields.push(
             container(crate::view::workflow::fields::number_i32(

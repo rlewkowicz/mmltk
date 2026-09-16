@@ -1,16 +1,12 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "checkpoint_fixture_support/parity_fixture_support.h"
-
 #include <stdexcept>
-
 #include "model_state_access.h"
 #include "model_state_technical.h"
 #include "model_technical.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
-
 namespace mmltk::backend::models::rfdetr::testsupport {
 namespace torch_api = mmltk::backend::ml::torch_api;
-
 const std::array<ParityFixtureCase, 2>& parity_fixture_cases() noexcept {
     static const std::array<ParityFixtureCase, 2> cases{{
         {"rf-detr-nano", "rf-detr-nano.pth", std::int64_t{300} * 13, 32, 0.0F},
@@ -30,8 +26,7 @@ at::Tensor make_fixture_query_feat(const ParityFixtureCase& fixture) {
         .add(fixture.offset);
 }
 at::Tensor make_fixture_refpoint_embed(const ParityFixtureCase& fixture) {
-    return torch_api::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, fixture.query_rows * 4,
-                               torch_api::TensorOptions().dtype(torch_api::kFloat32))
+    return torch_api::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, fixture.query_rows * 4, torch_api::TensorOptions().dtype(torch_api::kFloat32))
         .reshape({fixture.query_rows, 4});
 }
 at::Tensor make_fixture_class_weight(const ParityFixtureCase& fixture) {
@@ -41,8 +36,7 @@ at::Tensor make_fixture_class_weight(const ParityFixtureCase& fixture) {
         .add(0.5F + fixture.offset);
 }
 at::Tensor make_fixture_class_bias(const ParityFixtureCase& fixture) {
-    return torch_api::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, kParityFixtureNumClasses,
-                               torch_api::TensorOptions().dtype(torch_api::kFloat32));
+    return torch_api::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, kParityFixtureNumClasses, torch_api::TensorOptions().dtype(torch_api::kFloat32));
 }
 DecodedNativeModelState make_native_parity_fixture(const ParityFixtureCase& fixture) {
     DecodedNativeModelState checkpoint;

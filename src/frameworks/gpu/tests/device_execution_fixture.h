@@ -3,7 +3,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <stdexcept>
-
 namespace mmltk::frameworks::gpu::test_support {
 // Hardware may legitimately have no reported locality on a multi-node host.
 // Verify rejection before deliberately choosing an eligible node for the test.

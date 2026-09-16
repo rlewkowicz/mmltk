@@ -1,9 +1,6 @@
 #pragma once
-
 #include "src/controller/contracts/workspace_input.h"
-
 #include "src/controller/presentation/visual_source_projection.h"
-
 #include <cstdint>
 #include <functional>
 #include <array>
@@ -11,7 +8,6 @@
 #include <optional>
 #include <string>
 #include <variant>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/presentation/visual_runtime.h"
@@ -20,13 +16,9 @@
 #include "src/frameworks/gpu/system_image_model.h"
 #include "src/controller/presentation/visual_document.h"
 #include "src/backend/imaging/upscale/upscale_execution.h"
-
 namespace mmltk::controller {
-
 inline constexpr std::uint32_t kUpscaleOutputScale = 4U;
-
 [[nodiscard]] VisualExtent checked_upscale_output_extent(VisualExtent);
-
 enum class UpscaleKernel : std::uint8_t {
     Default,
     ShiftLut,
@@ -46,8 +38,8 @@ class UpscaleAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     ~UpscaleAlgorithm() override = default;
     virtual void Warm() = 0;
     [[nodiscard]] virtual bool GraphReplay(UpscaleKernel) const { return false; }
-    virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target,
-                     std::uintptr_t stream, const std::function<bool()>& current = {}) = 0;
+    virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
+                     const std::function<bool()>& current = {}) = 0;
     virtual void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
 };
 struct UpscaleMethodSnapshot final {
@@ -65,7 +57,6 @@ struct UpscaleImageMetadata final {
     VisualFrame input{};
     contracts::AnnotationSceneContent scene{};
 };
-
 struct UpscaleSnapshot final {
     std::uint64_t revision = 0U;
     bool busy = false;
@@ -92,19 +83,15 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     UpscaleFailureKind kind = UpscaleFailureKind::Failed;
     // CLEANUP-IGNORE: Upscale registers its own direct input endpoint and canonical source projection.
 };
-
 class UpscaleSystem final {
    public:
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
     void SetInputPeer(std::uint64_t);
-
     using visual_source =
-        VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale,
-                               mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
+        VisualSourceProjection<UpscaleSnapshot, PresentationSourceKind::Upscale, mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::frame>,
                                mmltk::frameworks::reflection::member_path<&UpscaleSnapshot::revision>, UpscaleImageMetadata>;
     using event_type = std::variant<UpscaleChanged, UpscaleFailed>;
-    UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
-                  VisualDiagnosticSink = {});
+    UpscaleSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
     ~UpscaleSystem();
     void Warm(VisualExtent) noexcept;
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] UpscaleSnapshot Start(UpscaleRequest);
@@ -128,10 +115,8 @@ class UpscaleSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
-[[nodiscard]] VisualRuntimeFactory make_native_upscale_runtime_factory(
-    VisualDeviceSettings, mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint = {});
-
+[[nodiscard]] VisualRuntimeFactory make_native_upscale_runtime_factory(VisualDeviceSettings,
+                                                                       mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint = {});
 MMLTK_REFLECT_ENUM(UpscaleKernel)
 MMLTK_REFLECT_ENUM(UpscaleFailureKind)
 MMLTK_REFLECT_FIELDS(UpscaleRequest)
@@ -140,5 +125,4 @@ MMLTK_REFLECT_FIELDS(UpscaleImageMetadata)
 MMLTK_REFLECT_FIELDS(UpscaleSnapshot)
 MMLTK_REFLECT_FIELDS(UpscaleChanged)
 MMLTK_REFLECT_FIELDS(UpscaleFailed)
-
 }  // namespace mmltk::controller

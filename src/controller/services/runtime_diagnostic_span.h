@@ -1,5 +1,4 @@
 #pragma once
-
 #include <chrono>
 #include <atomic>
 #include <cstdint>
@@ -9,9 +8,7 @@
 #include <type_traits>
 #include <utility>
 #include "src/controller/contracts/diagnostic_context.h"
-
 namespace mmltk::controller::services {
-
 // Process-local diagnostic identities, never resource or scheduling state.
 class DiagnosticSpanIds final {
    public:
@@ -30,7 +27,6 @@ class DiagnosticSpanIds final {
    private:
     static inline std::atomic<std::uint64_t> sequence_{0U};
 };
-
 // A synchronous effect only. The lazy factory runs after sink admission and
 // supplies the existing begin/end vocabulary. No work or GPU lifetime is owned.
 template <class Sink, class Fact, class Clock = std::chrono::steady_clock>
@@ -59,15 +55,13 @@ class RuntimeDiagnosticSpan final {
     RuntimeDiagnosticSpan& operator=(const RuntimeDiagnosticSpan&) = delete;
     ~RuntimeDiagnosticSpan() noexcept {
         if (!ended_) return;
-        Finish(std::uncaught_exceptions() > exceptions_ ? contracts::DiagnosticSpanOutcome::Exception
-                                                        : contracts::DiagnosticSpanOutcome::ScopeExit);
+        Finish(std::uncaught_exceptions() > exceptions_ ? contracts::DiagnosticSpanOutcome::Exception : contracts::DiagnosticSpanOutcome::ScopeExit);
     }
     void Finish(contracts::DiagnosticSpanOutcome outcome = contracts::DiagnosticSpanOutcome::Success) noexcept {
         if (!ended_) return;
         if (sink_.valid()) {
             ended_->context.span = {
-                .duration_ns =
-                    static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started_).count()),
+                .duration_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - started_).count()),
                 .span_outcome = outcome,
             };
             sink_(*ended_);
@@ -103,7 +97,5 @@ class RuntimeDiagnosticSpan final {
 template <class Sink, class Factory>
 RuntimeDiagnosticSpan(Sink, Factory) -> RuntimeDiagnosticSpan<Sink, typename std::invoke_result_t<Factory>::second_type>;
 template <class Sink, class Factory>
-RuntimeDiagnosticSpan(Sink, Factory, contracts::DiagnosticLink)
-    -> RuntimeDiagnosticSpan<Sink, typename std::invoke_result_t<Factory>::second_type>;
-
+RuntimeDiagnosticSpan(Sink, Factory, contracts::DiagnosticLink) -> RuntimeDiagnosticSpan<Sink, typename std::invoke_result_t<Factory>::second_type>;
 }  // namespace mmltk::controller::services

@@ -10,7 +10,6 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-
 #include "catch2_compat.hpp"
 #include "filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
@@ -28,37 +27,29 @@
 #include "mmltk/frameworks/reflection/member_path.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/serialization/serialization.h"
-
 namespace {
-
 using namespace mmltk::controller::contracts;
 using namespace mmltk::controller::services;
 using mmltk::controller::ExploreOrder;
-
 using SettingsViewStates = GuiSettingsState;
-
 GuiSettingsState& make_snapshot(SettingsViewStates& states) {
     states.workflows.annotate.preset_name = "rf-detr-seg-medium";
     states.current_view = mmltk::controller::contracts::FeatureId::Annotate;
     return states;
 }
-
 bool load_settings(const std::filesystem::path& path, GuiSettingsState& snapshot, nlohmann::json* const normalized_document = nullptr,
                    bool* const repair_required = nullptr) {
     return load_gui_settings_file(path.string(), snapshot, normalized_document, repair_required);
 }
-
 [[nodiscard]] auto mutable_settings_views(SettingsViewStates& states) noexcept {
     return std::tie(states.ui, states.workflows.train, states.workflows.validate, states.workflows.predict, states.workflows.annotate,
                     states.workflows.export_state, states.workflows.explore);
 }
-
 using TrainOptimizerKind = mmltk::backend::models::rfdetr::TrainOptimizerKind;
 using TrainLrSchedulerKind = mmltk::backend::models::rfdetr::TrainLrSchedulerKind;
 using TrainAssignmentKind = mmltk::backend::models::rfdetr::TrainAssignmentKind;
 using TrainRequest = mmltk::backend::models::rfdetr::TrainRequest;
 using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
-
 template <class Member, class Visitor>
 [[nodiscard]] bool visit_recipe_member(Member TrainRequest::* member, Visitor&& visitor) {
     bool matched = false;
@@ -73,10 +64,8 @@ template <class Member, class Visitor>
     });
     return matched;
 }
-
 template <class Member>
-void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRequest::* member,
-                         const bool overridden) {
+void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRequest::* member, const bool overridden) {
     const bool matched = visit_recipe_member(member, [&]<class Entry>() {
         if (overridden)
             TrainRecipeRelation::template set_override<Entry::destination>(state);
@@ -85,76 +74,62 @@ void set_recipe_override(mmltk::backend::models::rfdetr::TrainRecipeOverrideStat
     });
     REQUIRE(matched);
 }
-
 template <class Member>
 [[nodiscard]] bool recipe_overridden(const mmltk::backend::models::rfdetr::TrainRecipeOverrideState& state, Member TrainRequest::* member) {
     bool result = false;
-    const bool matched =
-        visit_recipe_member(member, [&]<class Entry>() { result = TrainRecipeRelation::template overridden<Entry::destination>(state); });
+    const bool matched = visit_recipe_member(member, [&]<class Entry>() { result = TrainRecipeRelation::template overridden<Entry::destination>(state); });
     REQUIRE(matched);
     return result;
 }
-
 template <auto Access>
 [[nodiscard]] consteval bool settings_path_is(const std::string_view expected) {
     return mmltk::frameworks::reflection::reflected_member_path<GuiSettingsState, Access>().view() == expected;
 }
-
 using WorkflowSettingsState = mmltk::controller::contracts::WorkflowSettingsState;
 using ModelArtifactRequest = mmltk::backend::models::rfdetr::ModelArtifactRequest;
-
 static_assert(!mmltk::frameworks::reflection::accessor_is_applicable<
               GuiSettingsState, mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &ExploreViewState::show_boxes>>());
 static_assert(mmltk::frameworks::reflection::accessor_is_applicable<ExploreViewState, &ExploreViewState::show_boxes>());
 static_assert(mmltk::frameworks::reflection::accessor_is_applicable<
-              const GuiSettingsState, mmltk::frameworks::reflection::member_path<
-                                          &GuiSettingsState::workflows, &WorkflowSettingsState::explore, &ExploreViewState::show_boxes>>());
+              const GuiSettingsState,
+              mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::explore, &ExploreViewState::show_boxes>>());
 static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train,
-                                                                          &TrainExecutionPaneState::execution_target>>(
-    "workflows.train.execution_target"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::explore,
-                                                                          &ExploreViewState::show_boxes>>("workflows.explore.show_boxes"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train,
-                                                                          &TrainViewState::request, &TrainRequest::weights_path>>(
-    "workflows.train.request.weights_path"));
+                                                                          &TrainExecutionPaneState::execution_target>>("workflows.train.execution_target"));
 static_assert(
-    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate,
-                                                                &ValidateViewState::request, &ModelArtifactRequest::weights_path>>(
-        "workflows.validate.request.weights_path"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate,
-                                                                          &ValidateViewState::request, &ModelArtifactRequest::onnx_path>>(
-    "workflows.validate.request.onnx_path"));
+    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::explore, &ExploreViewState::show_boxes>>(
+        "workflows.explore.show_boxes"));
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::train, &TrainViewState::request,
+                                                                          &TrainRequest::weights_path>>("workflows.train.request.weights_path"));
 static_assert(
-    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate,
-                                                                &ValidateViewState::request, &ModelArtifactRequest::tensorrt_path>>(
-        "workflows.validate.request.tensorrt_path"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict,
-                                                                          &PredictViewState::request, &ModelArtifactRequest::weights_path>>(
-    "workflows.predict.request.weights_path"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict,
-                                                                          &PredictViewState::request, &ModelArtifactRequest::onnx_path>>(
-    "workflows.predict.request.onnx_path"));
+    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
+                                                                &ModelArtifactRequest::weights_path>>("workflows.validate.request.weights_path"));
 static_assert(
-    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict,
-                                                                &PredictViewState::request, &ModelArtifactRequest::tensorrt_path>>(
-        "workflows.predict.request.tensorrt_path"));
+    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
+                                                                &ModelArtifactRequest::onnx_path>>("workflows.validate.request.onnx_path"));
 static_assert(
-    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state,
-                                                                &ExportViewState::weights_path>>("workflows.export_state.weights_path"));
-static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<
-                  &GuiSettingsState::workflows, &WorkflowSettingsState::export_state, &ExportViewState::onnx_input_path>>(
-    "workflows.export_state.onnx_input_path"));
-
+    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::validate, &ValidateViewState::request,
+                                                                &ModelArtifactRequest::tensorrt_path>>("workflows.validate.request.tensorrt_path"));
+static_assert(
+    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
+                                                                &ModelArtifactRequest::weights_path>>("workflows.predict.request.weights_path"));
+static_assert(
+    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
+                                                                &ModelArtifactRequest::onnx_path>>("workflows.predict.request.onnx_path"));
+static_assert(
+    settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::predict, &PredictViewState::request,
+                                                                &ModelArtifactRequest::tensorrt_path>>("workflows.predict.request.tensorrt_path"));
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state,
+                                                                          &ExportViewState::weights_path>>("workflows.export_state.weights_path"));
+static_assert(settings_path_is<mmltk::frameworks::reflection::member_path<&GuiSettingsState::workflows, &WorkflowSettingsState::export_state,
+                                                                          &ExportViewState::onnx_input_path>>("workflows.export_state.onnx_input_path"));
 struct OptimizerFixture final {
     int persisted_id;
     TrainOptimizerKind native_value;
 };
-
 constexpr std::array kOptimizerFixtures{
     OptimizerFixture{.persisted_id = 0, .native_value = TrainOptimizerKind::AdamW},
     OptimizerFixture{.persisted_id = 1, .native_value = TrainOptimizerKind::Muon},
 };
-
 struct DoubleRecipeFixture final {
     std::string_view key;
     double TrainRequest::* value_member;
@@ -165,7 +140,6 @@ struct DoubleRecipeFixture final {
     double invalid_value;
     bool corpus_override;
 };
-
 // These literal keys, persisted values, and member bindings are the independent schema-v8 oracle.
 // They intentionally do not consume or reproduce the production persistence visitor.
 constexpr std::array kDoubleRecipeFixtures{
@@ -179,32 +153,24 @@ constexpr std::array kDoubleRecipeFixtures{
     DoubleRecipeFixture{"warmup_momentum", &TrainRequest::warmup_momentum, 0.0, 0.8, 0.71, 0.82, 1.01, false},
     DoubleRecipeFixture{"lr_min_factor", &TrainRequest::lr_min_factor, 0.0, 0.01, 0.93, 0.84, 1.01, true},
 };
-
 constexpr auto kGoldenRecipeKeys = [] {
     std::array<std::string_view, 11U> keys{};
-    for (std::size_t index = 0U; index < kDoubleRecipeFixtures.size(); ++index) {
-        keys[index] = kDoubleRecipeFixtures[index].key;
-    }
+    for (std::size_t index = 0U; index < kDoubleRecipeFixtures.size(); ++index) { keys[index] = kDoubleRecipeFixtures[index].key; }
     keys[9U] = "lr_drop";
     keys[10U] = "lr_scheduler";
     return keys;
 }();
-
 constexpr int kCorpusLrDrop = 53;
 constexpr int kPriorLrDrop = 137;
 constexpr bool kCorpusLrDropOverride = false;
 constexpr TrainLrSchedulerKind kCorpusScheduler = TrainLrSchedulerKind::Cosine;
 constexpr TrainLrSchedulerKind kPriorScheduler = TrainLrSchedulerKind::Step;
 constexpr bool kCorpusSchedulerOverride = true;
-
 [[nodiscard]] nlohmann::json uniform_recipe_overrides(const bool value) {
     nlohmann::json overrides = nlohmann::json::object();
-    for (const std::string_view key : kGoldenRecipeKeys) {
-        overrides[std::string{key}] = value;
-    }
+    for (const std::string_view key : kGoldenRecipeKeys) { overrides[std::string{key}] = value; }
     return overrides;
 }
-
 [[nodiscard]] nlohmann::json golden_recipe_values(const int persisted_optimizer_id) {
     nlohmann::json values = nlohmann::json::object();
     for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
@@ -214,29 +180,21 @@ constexpr bool kCorpusSchedulerOverride = true;
     values["lr_scheduler"] = persisted_optimizer_id == 0 ? "step" : "cosine";
     return values;
 }
-
 [[nodiscard]] nlohmann::json nonuniform_recipe_values() {
     nlohmann::json values = nlohmann::json::object();
-    for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-        values[std::string{field.key}] = field.corpus_value;
-    }
+    for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { values[std::string{field.key}] = field.corpus_value; }
     values["lr_drop"] = kCorpusLrDrop;
     values["lr_scheduler"] = "cosine";
     return values;
 }
-
 [[nodiscard]] nlohmann::json nonuniform_recipe_overrides() {
     nlohmann::json overrides = nlohmann::json::object();
-    for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-        overrides[std::string{field.key}] = field.corpus_override;
-    }
+    for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { overrides[std::string{field.key}] = field.corpus_override; }
     overrides["lr_drop"] = kCorpusLrDropOverride;
     overrides["lr_scheduler"] = kCorpusSchedulerOverride;
     return overrides;
 }
-
-[[nodiscard]] nlohmann::json recipe_document(const int persisted_optimizer_id, const nlohmann::json& values,
-                                             const nlohmann::json& overrides) {
+[[nodiscard]] nlohmann::json recipe_document(const int persisted_optimizer_id, const nlohmann::json& values, const nlohmann::json& overrides) {
     nlohmann::json document = default_gui_settings_document();
     nlohmann::json& training = document["workflows"]["train"]["training"];
     training.update(values);
@@ -244,7 +202,6 @@ constexpr bool kCorpusSchedulerOverride = true;
     training["recipe_overrides"] = overrides;
     return document;
 }
-
 [[nodiscard]] std::size_t count_object_key(const nlohmann::json& value, const std::string_view key) {
     std::size_t count = 0U;
     if (value.is_object()) {
@@ -253,19 +210,15 @@ constexpr bool kCorpusSchedulerOverride = true;
             count += count_object_key(child, key);
         }
     } else if (value.is_array()) {
-        for (const nlohmann::json& child : value) {
-            count += count_object_key(child, key);
-        }
+        for (const nlohmann::json& child : value) { count += count_object_key(child, key); }
     }
     return count;
 }
-
 void check_recipe_schema_v8_shape(const nlohmann::json& document, const int persisted_optimizer_id, const nlohmann::json& expected_values,
                                   const nlohmann::json& expected_overrides) {
     REQUIRE(document.is_object());
     REQUIRE(document.at("schema_version").type() == nlohmann::json::value_t::number_unsigned);
     CHECK(document.at("schema_version") == 8U);
-
     const nlohmann::json& workflows = document.at("workflows");
     const nlohmann::json& train = workflows.at("train");
     const nlohmann::json& training = train.at("training");
@@ -276,7 +229,6 @@ void check_recipe_schema_v8_shape(const nlohmann::json& document, const int pers
     REQUIRE_FALSE(document.contains("recipe_overrides"));
     REQUIRE_FALSE(workflows.contains("recipe_overrides"));
     REQUIRE_FALSE(train.contains("recipe_overrides"));
-
     for (const std::string_view key : kGoldenRecipeKeys) {
         const std::string persisted_key{key};
         REQUIRE(training.contains(persisted_key));
@@ -285,16 +237,14 @@ void check_recipe_schema_v8_shape(const nlohmann::json& document, const int pers
         REQUIRE_FALSE(train.contains(persisted_key));
         CHECK(count_object_key(document, key) == 2U);
     }
-    for (const std::string_view key :
-         std::array<std::string_view, 9U>{"lr", "lr_encoder", "lr_component_decay", "encoder_layer_decay", "momentum", "weight_decay",
-                                          "warmup_epochs", "warmup_momentum", "lr_min_factor"}) {
+    for (const std::string_view key : std::array<std::string_view, 9U>{"lr", "lr_encoder", "lr_component_decay", "encoder_layer_decay", "momentum",
+                                                                       "weight_decay", "warmup_epochs", "warmup_momentum", "lr_min_factor"}) {
         CHECK(training.at(std::string{key}).type() == nlohmann::json::value_t::number_float);
     }
     CHECK(training.at("lr_drop").type() == nlohmann::json::value_t::number_integer);
     CHECK(training.at("lr_scheduler").type() == nlohmann::json::value_t::string);
     CHECK(training.at("optimizer").type() == nlohmann::json::value_t::number_integer);
     CHECK(training.at("optimizer") == persisted_optimizer_id);
-
     const nlohmann::json& overrides = training.at("recipe_overrides");
     REQUIRE(overrides.is_object());
     REQUIRE(overrides.size() == kGoldenRecipeKeys.size());
@@ -305,14 +255,12 @@ void check_recipe_schema_v8_shape(const nlohmann::json& document, const int pers
         CHECK(value == expected_overrides.at(std::string{key}));
     }
 }
-
 [[nodiscard]] std::filesystem::path write_recipe_case(const mmltk::testsupport::ScopedTempDir& temporary, const std::string_view name,
                                                       const nlohmann::json& document) {
     const std::filesystem::path path = temporary.path() / std::string{name};
     mmltk::testsupport::write_text_file(path, document.dump(2) + "\n");
     return path;
 }
-
 void seed_distinct_prior_recipe(GuiSettingsState& state) {
     TrainRequest& request = state.workflows.train.request;
     for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
@@ -325,7 +273,6 @@ void seed_distinct_prior_recipe(GuiSettingsState& state) {
     set_recipe_override(request.recipe_overrides, &TrainRequest::lr_scheduler, !kCorpusSchedulerOverride);
     request.optimizer = TrainOptimizerKind::Muon;
 }
-
 void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const std::string_view missing_value = {},
                                           const std::string_view missing_override = {}) {
     const TrainRequest& request = state.workflows.train.request;
@@ -343,7 +290,6 @@ void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const s
           (missing_override == "lr_scheduler" ? !kCorpusSchedulerOverride : kCorpusSchedulerOverride));
     CHECK(request.optimizer == TrainOptimizerKind::Muon);
 }
-
 [[nodiscard]] nlohmann::json expected_nonuniform_values(const std::string_view missing_value = {}) {
     nlohmann::json values = nonuniform_recipe_values();
     for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
@@ -356,7 +302,6 @@ void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const s
     }
     return values;
 }
-
 [[nodiscard]] nlohmann::json expected_nonuniform_overrides(const std::string_view missing_override = {}) {
     nlohmann::json overrides = nonuniform_recipe_overrides();
     for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
@@ -369,27 +314,21 @@ void check_materialized_nonuniform_recipe(const GuiSettingsState& state, const s
     }
     return overrides;
 }
-
 [[nodiscard]] nlohmann::json prior_recipe_overrides() {
     nlohmann::json overrides = nlohmann::json::object();
-    for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
-        overrides[std::string{field.key}] = !field.corpus_override;
-    }
+    for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) { overrides[std::string{field.key}] = !field.corpus_override; }
     overrides["lr_drop"] = !kCorpusLrDropOverride;
     overrides["lr_scheduler"] = !kCorpusSchedulerOverride;
     return overrides;
 }
-
 void test_schema_v8_recipe_golden_shape_and_round_trip() {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-golden"};
-
     for (const OptimizerFixture optimizer : kOptimizerFixtures) {
         for (const bool explicit_overrides : {false, true}) {
             const nlohmann::json expected_values = golden_recipe_values(optimizer.persisted_id);
             const nlohmann::json expected_overrides = uniform_recipe_overrides(explicit_overrides);
             const nlohmann::json input = recipe_document(optimizer.persisted_id, expected_values, expected_overrides);
             check_recipe_schema_v8_shape(input, optimizer.persisted_id, expected_values, expected_overrides);
-
             const std::string stem = std::to_string(optimizer.persisted_id) + (explicit_overrides ? "-explicit" : "-default");
             const std::filesystem::path input_path = write_recipe_case(temporary, stem + "-input.json", input);
             GuiSettingsState loaded = default_gui_settings_state();
@@ -397,7 +336,6 @@ void test_schema_v8_recipe_golden_shape_and_round_trip() {
             REQUIRE(load_settings(input_path, loaded, nullptr, &repaired));
             CHECK_FALSE(repaired);
             CHECK(loaded.workflows.train.request.optimizer == optimizer.native_value);
-
             const nlohmann::json saved = snapshot_gui_settings(loaded);
             check_recipe_schema_v8_shape(saved, optimizer.persisted_id, expected_values, expected_overrides);
             const std::filesystem::path saved_path = write_recipe_case(temporary, stem + "-saved.json", saved);
@@ -408,7 +346,6 @@ void test_schema_v8_recipe_golden_shape_and_round_trip() {
         }
     }
 }
-
 void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-members"};
     const nlohmann::json corpus_values = nonuniform_recipe_values();
@@ -418,7 +355,6 @@ void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
     REQUIRE(load_settings(write_recipe_case(temporary, "nonuniform.json", corpus), materialized));
     check_materialized_nonuniform_recipe(materialized);
     check_recipe_schema_v8_shape(snapshot_gui_settings(materialized), 1, corpus_values, corpus_overrides);
-
     nlohmann::json absent_overrides_document = corpus;
     absent_overrides_document["workflows"]["train"]["training"].erase("recipe_overrides");
     GuiSettingsState absent_overrides_state = default_gui_settings_state();
@@ -435,7 +371,6 @@ void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
     CHECK(recipe_overridden(absent_request.recipe_overrides, &TrainRequest::lr_drop) == !kCorpusLrDropOverride);
     CHECK(recipe_overridden(absent_request.recipe_overrides, &TrainRequest::lr_scheduler) == !kCorpusSchedulerOverride);
     check_recipe_schema_v8_shape(snapshot_gui_settings(absent_overrides_state), 1, corpus_values, prior_recipe_overrides());
-
     for (const std::string_view key : kGoldenRecipeKeys) {
         CAPTURE(key);
         nlohmann::json missing_value_document = corpus;
@@ -443,27 +378,23 @@ void test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved() {
         GuiSettingsState missing_value_state = default_gui_settings_state();
         seed_distinct_prior_recipe(missing_value_state);
         bool repaired = false;
-        REQUIRE(
-            load_settings(write_recipe_case(temporary, std::string{"missing-value-"} + std::string{key} + ".json", missing_value_document),
-                          missing_value_state, nullptr, &repaired));
+        REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-value-"} + std::string{key} + ".json", missing_value_document),
+                              missing_value_state, nullptr, &repaired));
         CHECK(repaired);
         check_materialized_nonuniform_recipe(missing_value_state, key);
         check_recipe_schema_v8_shape(snapshot_gui_settings(missing_value_state), 1, expected_nonuniform_values(key), corpus_overrides);
-
         nlohmann::json missing_override_document = corpus;
         missing_override_document["workflows"]["train"]["training"]["recipe_overrides"].erase(std::string{key});
         GuiSettingsState missing_override_state = default_gui_settings_state();
         seed_distinct_prior_recipe(missing_override_state);
         repaired = false;
-        REQUIRE(load_settings(
-            write_recipe_case(temporary, std::string{"missing-override-"} + std::string{key} + ".json", missing_override_document),
-            missing_override_state, nullptr, &repaired));
+        REQUIRE(load_settings(write_recipe_case(temporary, std::string{"missing-override-"} + std::string{key} + ".json", missing_override_document),
+                              missing_override_state, nullptr, &repaired));
         CHECK(repaired);
         check_materialized_nonuniform_recipe(missing_override_state, {}, key);
         check_recipe_schema_v8_shape(snapshot_gui_settings(missing_override_state), 1, corpus_values, expected_nonuniform_overrides(key));
     }
 }
-
 void test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically() {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-placement"};
     const nlohmann::json corpus_values = nonuniform_recipe_values();
@@ -482,7 +413,6 @@ void test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically() {
     misplaced["workflows"]["validate"]["validation"]["recipe_overrides"] = nlohmann::json::object({{"lr", true}});
     misplaced["workflows"]["train"]["training"]["unknown_recipe_value"] = 123;
     misplaced["workflows"]["train"]["training"]["recipe_overrides"]["unknown_override"] = true;
-
     GuiSettingsState loaded = default_gui_settings_state();
     bool repaired = false;
     REQUIRE(load_settings(write_recipe_case(temporary, "misplaced.json", misplaced), loaded, nullptr, &repaired));
@@ -490,7 +420,6 @@ void test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically() {
     check_materialized_nonuniform_recipe(loaded);
     check_recipe_schema_v8_shape(snapshot_gui_settings(loaded), 1, corpus_values, corpus_overrides);
 }
-
 void test_schema_v8_recipe_scheduler_compatibility() {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-scheduler"};
     struct SchedulerCase final {
@@ -516,7 +445,6 @@ void test_schema_v8_recipe_scheduler_compatibility() {
         SchedulerCase{"wrong-case", "Cosine", kPriorScheduler, "step", true},
         SchedulerCase{"unknown-spelling", "future-scheduler", kPriorScheduler, "step", true},
     };
-
     for (const SchedulerCase& test : cases) {
         CAPTURE(test.name);
         nlohmann::json document = recipe_document(1, nonuniform_recipe_values(), nonuniform_recipe_overrides());
@@ -532,7 +460,6 @@ void test_schema_v8_recipe_scheduler_compatibility() {
         CHECK(saved.at("workflows").at("train").at("training").at("lr_scheduler").is_string());
     }
 }
-
 void test_schema_v8_recipe_optimizer_compatibility() {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-optimizer"};
     for (const OptimizerFixture optimizer : kOptimizerFixtures) {
@@ -541,15 +468,13 @@ void test_schema_v8_recipe_optimizer_compatibility() {
             nlohmann::json(nlohmann::json::number_unsigned_t{static_cast<unsigned int>(optimizer.persisted_id)}),
         };
         for (std::size_t index = 0U; index < raw_ids.size(); ++index) {
-            nlohmann::json document =
-                recipe_document(optimizer.persisted_id, golden_recipe_values(optimizer.persisted_id), uniform_recipe_overrides(false));
+            nlohmann::json document = recipe_document(optimizer.persisted_id, golden_recipe_values(optimizer.persisted_id), uniform_recipe_overrides(false));
             document["workflows"]["train"]["training"]["optimizer"] = raw_ids[index];
             GuiSettingsState loaded = default_gui_settings_state();
             bool repaired = true;
-            REQUIRE(load_settings(
-                write_recipe_case(temporary, "valid-" + std::to_string(optimizer.persisted_id) + "-" + std::to_string(index) + ".json",
-                                  document),
-                loaded, nullptr, &repaired));
+            REQUIRE(
+                load_settings(write_recipe_case(temporary, "valid-" + std::to_string(optimizer.persisted_id) + "-" + std::to_string(index) + ".json", document),
+                              loaded, nullptr, &repaired));
             CHECK_FALSE(repaired);
             CHECK(loaded.workflows.train.request.optimizer == optimizer.native_value);
             const nlohmann::json saved = snapshot_gui_settings(loaded);
@@ -557,7 +482,6 @@ void test_schema_v8_recipe_optimizer_compatibility() {
             CHECK(saved.at("workflows").at("train").at("training").at("optimizer") == optimizer.persisted_id);
         }
     }
-
     nlohmann::json missing = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
     missing["workflows"]["train"]["training"].erase("optimizer");
     GuiSettingsState retained = default_gui_settings_state();
@@ -568,7 +492,6 @@ void test_schema_v8_recipe_optimizer_compatibility() {
     CHECK(retained.workflows.train.request.optimizer == TrainOptimizerKind::Muon);
     CHECK(snapshot_gui_settings(retained).at("workflows").at("train").at("training").at("optimizer") == 1);
 }
-
 void test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic() {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-schema-v8-recipe-rejection"};
     const GuiSettingsState prior = [] {
@@ -576,45 +499,37 @@ void test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic() {
         seed_distinct_prior_recipe(state);
         return state;
     }();
-
     const auto check_rejected = [&](const std::string_view name, nlohmann::json document) {
         GuiSettingsState candidate = prior;
         CHECK_FALSE(load_settings(write_recipe_case(temporary, name, document), candidate));
         CHECK(candidate == prior);
     };
-
     nlohmann::json missing_schema = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
     missing_schema.erase("schema_version");
     check_rejected("missing-schema.json", std::move(missing_schema));
-
     nlohmann::json unsupported_schema = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
     unsupported_schema["schema_version"] = 9U;
     check_rejected("unsupported-schema.json", std::move(unsupported_schema));
-
     for (const DoubleRecipeFixture& field : kDoubleRecipeFixtures) {
         CAPTURE(field.key);
         nlohmann::json malformed = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
         malformed["workflows"]["train"]["training"][std::string{field.key}] = "not-a-number";
         check_rejected(std::string{"malformed-"} + std::string{field.key} + ".json", std::move(malformed));
-
         nlohmann::json invalid = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
         invalid["workflows"]["train"]["training"][std::string{field.key}] = field.invalid_value;
         check_rejected(std::string{"invalid-"} + std::string{field.key} + ".json", std::move(invalid));
     }
-
     nlohmann::json malformed_lr_drop = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
     malformed_lr_drop["workflows"]["train"]["training"]["lr_drop"] = "not-an-integer";
     check_rejected("malformed-lr-drop.json", std::move(malformed_lr_drop));
     nlohmann::json invalid_lr_drop = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
     invalid_lr_drop["workflows"]["train"]["training"]["lr_drop"] = -1;
     check_rejected("invalid-lr-drop.json", std::move(invalid_lr_drop));
-
     for (const std::string_view key : kGoldenRecipeKeys) {
         nlohmann::json malformed_override = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
         malformed_override["workflows"]["train"]["training"]["recipe_overrides"][std::string{key}] = 1;
         check_rejected(std::string{"malformed-override-"} + std::string{key} + ".json", std::move(malformed_override));
     }
-
     const std::array invalid_optimizers{
         std::pair<std::string_view, nlohmann::json>{"malformed-optimizer", "adamw"},
         std::pair<std::string_view, nlohmann::json>{"floating-optimizer", 1.0},
@@ -622,8 +537,8 @@ void test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic() {
         std::pair<std::string_view, nlohmann::json>{"negative-optimizer", -1},
         std::pair<std::string_view, nlohmann::json>{"outside-optimizer", 2},
         std::pair<std::string_view, nlohmann::json>{"unsigned-outside-optimizer", nlohmann::json::number_unsigned_t{2}},
-        std::pair<std::string_view, nlohmann::json>{
-            "overflowing-optimizer", nlohmann::json::number_unsigned_t{static_cast<unsigned int>(std::numeric_limits<int>::max()) + 1U}},
+        std::pair<std::string_view, nlohmann::json>{"overflowing-optimizer",
+                                                    nlohmann::json::number_unsigned_t{static_cast<unsigned int>(std::numeric_limits<int>::max()) + 1U}},
     };
     for (const auto& [name, invalid_optimizer] : invalid_optimizers) {
         nlohmann::json document = recipe_document(0, golden_recipe_values(0), uniform_recipe_overrides(false));
@@ -631,7 +546,6 @@ void test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic() {
         check_rejected(std::string{name} + ".json", std::move(document));
     }
 }
-
 void test_ui_settings_round_trip() {
     SettingsViewStates states;
     auto [ui, train, validate, predict, annotate, export_state, explore] = mutable_settings_views(states);
@@ -657,7 +571,6 @@ void test_ui_settings_round_trip() {
     ui.annotation_brush_radius = 27;
     ui.mask_cleanup_radius = 6;
     ui.show_workspace_performance = true;
-
     train.dataset_source_dir = "/tmp/dataset";
     train.compiled_dataset_dir = "/tmp/compiled";
     train.request.train_compiled_path = "/tmp/train.bin";
@@ -709,7 +622,6 @@ void test_ui_settings_round_trip() {
     export_state.onnx_output_path = "/tmp/export-output.onnx";
     export_state.output_path = "/tmp/export.engine";
     export_state.allow_fp16 = false;
-
     train.visualize_augmentation_in_explore = true;
     explore.dataset_source = ExploreDatasetSource::Custom;
     explore.custom_compiled_path = "/tmp/explore.bin";
@@ -731,7 +643,6 @@ void test_ui_settings_round_trip() {
     explore.show_original_dimensions = true;
     explore.detail_scale_mode = ExploreDetailScaleMode::Neural;
     GuiSettingsState& snapshot = make_snapshot(states);
-
     const nlohmann::json saved = snapshot_gui_settings(snapshot);
     MMLTK_ASSERT(saved.at("schema_version") == kGuiSettingsSchemaVersion);
     MMLTK_ASSERT(saved.at("ui").at("workspace_aspect_ratio") == 3);
@@ -775,7 +686,6 @@ void test_ui_settings_round_trip() {
     MMLTK_ASSERT(!saved_explore.at("show_masks").get<bool>());
     MMLTK_ASSERT(saved_explore.at("show_original_dimensions").get<bool>());
     MMLTK_ASSERT(saved_explore.at("detail_scale_mode") == static_cast<int>(ExploreDetailScaleMode::Neural));
-
     SettingsViewStates loaded_states;
     auto& loaded_ui = loaded_states.ui;
     auto& loaded_train = loaded_states.workflows.train;
@@ -785,9 +695,7 @@ void test_ui_settings_round_trip() {
     auto& loaded_export = loaded_states.workflows.export_state;
     auto& loaded_explore = loaded_states.workflows.explore;
     GuiSettingsState& loaded = loaded_states;
-
     apply_gui_settings(saved, loaded);
-
     MMLTK_ASSERT(loaded.current_view == mmltk::controller::contracts::FeatureId::Annotate);
     MMLTK_ASSERT(loaded_annotate.preset_name == "rf-detr-seg-medium");
     CHECK(loaded_train.request.h2d_dataloader);
@@ -869,15 +777,12 @@ void test_ui_settings_round_trip() {
     MMLTK_ASSERT(loaded_ui.mask_cleanup_radius == 6);
     MMLTK_ASSERT(loaded_ui.show_workspace_performance);
 }
-
 void test_fresh_defaults_use_capture_only_annotate() {
     SettingsViewStates states;
     MMLTK_ASSERT(states == default_gui_settings_state());
     auto [ui, train, validate, predict, annotate, export_state, explore] = mutable_settings_views(states);
-
     apply_default_gui_state(train, validate, predict, annotate, export_state, explore);
     MMLTK_ASSERT(ui.workspace_aspect_ratio == WorkspaceAspectRatio::Widescreen);
-
     MMLTK_ASSERT(ui.font_size == 14.0F);
     MMLTK_ASSERT(ui.secondary_font_size == 12.0F);
     MMLTK_ASSERT(ui.mono_font_size == 12.0F);
@@ -905,11 +810,11 @@ void test_fresh_defaults_use_capture_only_annotate() {
     MMLTK_ASSERT(annotate.tensorrt_path.empty());
     MMLTK_ASSERT(export_state.model_input == ModelArtifactInputKind::None);
 }
-
 TEST_CASE("explicit compiled selections override inferred directories and keep test input optional", "[gui][settings]") {
     auto state = default_gui_settings_state();
     const std::array updates{
-        SettingsValueUpdate{.path = "workflows.train.request.train_compiled_path",
+        SettingsValueUpdate{
+            .path = "workflows.train.request.train_compiled_path",
             .value = *mmltk::frameworks::serialization::wire::FlatValue::text("/selected/compiled.mmltk", mmltk::frameworks::reflection::kMaximumPathBytes)},
     };
     REQUIRE(apply_gui_settings_values(state, updates));
@@ -917,12 +822,10 @@ TEST_CASE("explicit compiled selections override inferred directories and keep t
     CHECK(state.workflows.train.request.train_compiled_path == "/selected/compiled.mmltk");
     CHECK(state.workflows.train.request.test_compiled_path.empty());
     auto inferred = default_gui_settings_state();
-    const std::array unrelated{SettingsValueUpdate{.path = "ui.dark_mode",
-        .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
+    const std::array unrelated{SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
     REQUIRE(apply_gui_settings_values(inferred, unrelated));
     CHECK(inferred.workflows.train.request.test_compiled_path.empty());
 }
-
 TEST_CASE("GUI prediction loads batch one while backend requests retain batching", "[gui][settings]") {
     auto state = default_gui_settings_state();
     REQUIRE(state.workflows.predict.request.batch_size == 1U);
@@ -936,41 +839,33 @@ TEST_CASE("GUI prediction loads batch one while backend requests retain batching
     cli.batch_size = 32U;
     CHECK(cli.batch_size == 32U);
 }
-
 void test_model_input_load_normalizes_invalid_values_by_workflow() {
     SettingsViewStates states;
     GuiSettingsState& snapshot = make_snapshot(states);
-
     nlohmann::json saved = snapshot_gui_settings(snapshot);
     saved["workflows"]["predict"]["model_artifacts"]["input"] = 99;
     saved["workflows"]["annotate"]["model_artifacts"]["input"] = 99;
     saved["workflows"]["annotate"]["model_artifacts"]["weights_path"] = "/explicit/annotate.pt";
-
     apply_gui_settings(saved, snapshot);
-
     MMLTK_ASSERT(states.workflows.predict.model_input == ModelArtifactInputKind::Weights);
     MMLTK_ASSERT(states.workflows.annotate.model_input == ModelArtifactInputKind::None);
     MMLTK_ASSERT(states.workflows.annotate.weights_path.empty());
 }
-
 // Seeds view states with sentinel values, then requires that loading `path` fails and leaves them
 // untouched.
-void assert_load_rejected_and_state_preserved(const std::filesystem::path& path, const mmltk::controller::contracts::FeatureId view,
-                                              const float ui_scale, const char* output_dir) {
+void assert_load_rejected_and_state_preserved(const std::filesystem::path& path, const mmltk::controller::contracts::FeatureId view, const float ui_scale,
+                                              const char* output_dir) {
     SettingsViewStates states;
     states.ui.ui_scale = ui_scale;
     states.workflows.train.request.output_dir = output_dir;
     states.current_view = view;
-
     MMLTK_ASSERT(!load_settings(path, states));
     MMLTK_ASSERT(states.current_view == view);
     MMLTK_ASSERT(states.ui.ui_scale == ui_scale);
     MMLTK_ASSERT(states.workflows.train.request.output_dir == output_dir);
 }
-
 void test_persistence_rejects_unsupported_schema_and_malformed_files() {
     const std::filesystem::path temp_root = mmltk::testsupport::make_temp_root("mmltk-gui-settings-schema-test");
-
     const std::filesystem::path unsupported_path = temp_root / "unsupported-gui.json";
     {
         nlohmann::json unsupported;
@@ -979,36 +874,28 @@ void test_persistence_rejects_unsupported_schema_and_malformed_files() {
         mmltk::testsupport::write_text_file(unsupported_path, unsupported.dump(2) + "\n");
     }
     assert_load_rejected_and_state_preserved(unsupported_path, mmltk::controller::contracts::FeatureId::Train, 3.0f, "/keep");
-
     const std::filesystem::path overflowing_schema_path = temp_root / "overflowing-schema-gui.json";
     {
         nlohmann::json overflowing_schema = default_gui_settings_document();
         overflowing_schema["schema_version"] = static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()) + 1U;
         mmltk::testsupport::write_text_file(overflowing_schema_path, overflowing_schema.dump(2) + "\n");
     }
-    assert_load_rejected_and_state_preserved(overflowing_schema_path, mmltk::controller::contracts::FeatureId::Validate, 2.5F,
-                                             "/keep-overflowing-schema");
-
+    assert_load_rejected_and_state_preserved(overflowing_schema_path, mmltk::controller::contracts::FeatureId::Validate, 2.5F, "/keep-overflowing-schema");
     const std::filesystem::path overflowing_view_path = temp_root / "overflowing-view-gui.json";
     {
         nlohmann::json overflowing_view = default_gui_settings_document();
         overflowing_view["current_view"] = static_cast<std::uint64_t>(std::numeric_limits<int>::max()) + 1U;
         mmltk::testsupport::write_text_file(overflowing_view_path, overflowing_view.dump(2) + "\n");
     }
-    assert_load_rejected_and_state_preserved(overflowing_view_path, mmltk::controller::contracts::FeatureId::Predict, 2.25F,
-                                             "/keep-overflowing-view");
-
+    assert_load_rejected_and_state_preserved(overflowing_view_path, mmltk::controller::contracts::FeatureId::Predict, 2.25F, "/keep-overflowing-view");
     const std::filesystem::path malformed_path = temp_root / "malformed-gui.json";
     mmltk::testsupport::write_text_file(malformed_path, "{ this is not valid json");
     assert_load_rejected_and_state_preserved(malformed_path, mmltk::controller::contracts::FeatureId::Export, 4.0f, "/keep-malformed");
-
     const std::filesystem::path invalid_typed_path = temp_root / "invalid-typed-gui.json";
     nlohmann::json invalid_typed = default_gui_settings_document();
     invalid_typed["workflows"]["train"]["training"]["batch_size"] = 0;
     mmltk::testsupport::write_text_file(invalid_typed_path, invalid_typed.dump(2));
-    assert_load_rejected_and_state_preserved(invalid_typed_path, mmltk::controller::contracts::FeatureId::Explore, 1.25F,
-                                             "/keep-invalid-typed");
-
+    assert_load_rejected_and_state_preserved(invalid_typed_path, mmltk::controller::contracts::FeatureId::Explore, 1.25F, "/keep-invalid-typed");
     std::error_code cleanup_error;
     std::filesystem::remove(unsupported_path, cleanup_error);
     std::filesystem::remove(overflowing_schema_path, cleanup_error);
@@ -1017,7 +904,6 @@ void test_persistence_rejects_unsupported_schema_and_malformed_files() {
     std::filesystem::remove(invalid_typed_path, cleanup_error);
     std::filesystem::remove(temp_root, cleanup_error);
 }
-
 void test_persistence_repairs_catalog_and_compiled_directory_defaults() {
     const std::filesystem::path temp_root = mmltk::testsupport::make_temp_root("mmltk-gui-settings-default-repair-test");
     const std::filesystem::path settings_path = temp_root / "gui.json";
@@ -1028,7 +914,6 @@ void test_persistence_repairs_catalog_and_compiled_directory_defaults() {
     document["workflows"]["train"]["dataset_paths"]["use_compiled_directory_defaults"] = true;
     document["workflows"]["train"]["dataset_paths"]["train_compiled_path"] = "/custom/train.bin";
     mmltk::testsupport::write_text_file(settings_path, document.dump(2));
-
     GuiSettingsState state = default_gui_settings_state();
     bool repair_required = false;
     REQUIRE(load_settings(settings_path, state, nullptr, &repair_required));
@@ -1038,25 +923,21 @@ void test_persistence_repairs_catalog_and_compiled_directory_defaults() {
     CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
     CHECK(state.workflows.predict.request.tensorrt_path.empty());
     CHECK_FALSE(state.workflows.train.use_compiled_directory_defaults);
-
     std::error_code cleanup_error;
     std::filesystem::remove(settings_path, cleanup_error);
     std::filesystem::remove(temp_root, cleanup_error);
 }
-
 void test_bounded_flat_settings_mutation_is_atomic() {
     GuiSettingsState state = default_gui_settings_state();
     state.workflows.predict.model_source = ModelSelectionSource::Custom;
     state.workflows.predict.model_input = ModelArtifactInputKind::TensorRt;
     state.workflows.predict.request.tensorrt_path = "/tmp/custom.engine";
     const auto& preset = mmltk::backend::models::rfdetr::kPresetCatalog.front();
-    const auto preset_name =
-        mmltk::frameworks::serialization::wire::FlatValue::text(preset.preset_name, mmltk::frameworks::reflection::kMaximumNameBytes);
+    const auto preset_name = mmltk::frameworks::serialization::wire::FlatValue::text(preset.preset_name, mmltk::frameworks::reflection::kMaximumNameBytes);
     REQUIRE(preset_name.has_value());
     const std::vector<SettingsValueUpdate> canonical_selection{
         {.path = "workflows.predict.request.preset_name", .value = *preset_name},
-        {.path = "workflows.predict.request.resolution",
-         .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{preset.resolution}}},
+        {.path = "workflows.predict.request.resolution", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{preset.resolution}}},
         {.path = "workflows.predict.model_source", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{0}}},
         {.path = "workflows.predict.model_input", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{0}}},
     };
@@ -1065,11 +946,10 @@ void test_bounded_flat_settings_mutation_is_atomic() {
     CHECK(state.workflows.predict.request.resolution == preset.resolution);
     CHECK(state.workflows.predict.model_source == ModelSelectionSource::Canonical);
     CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
-
     const std::array device_id_values{mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{2}},
                                       mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{4}}};
-    const auto device_ids = mmltk::frameworks::serialization::wire::FlatValue::array(
-        device_id_values, {.max_bytes = 16U, .max_items = device_id_values.size(), .max_depth = 1U});
+    const auto device_ids =
+        mmltk::frameworks::serialization::wire::FlatValue::array(device_id_values, {.max_bytes = 16U, .max_items = device_id_values.size(), .max_depth = 1U});
     REQUIRE(device_ids.has_value());
     const std::array direct_flat_updates{
         SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{true}},
@@ -1078,15 +958,12 @@ void test_bounded_flat_settings_mutation_is_atomic() {
     REQUIRE(apply_gui_settings_values(state, direct_flat_updates));
     CHECK(state.ui.dark_mode);
     CHECK(state.workflows.train.request.device_ids == std::vector<int>({2, 4}));
-
     constexpr double browser_threshold = 0.42;
     const std::array browser_float_update{
-        SettingsValueUpdate{.path = "workflows.annotate.threshold",
-                            .value = mmltk::frameworks::serialization::wire::FlatValue{browser_threshold}},
+        SettingsValueUpdate{.path = "workflows.annotate.threshold", .value = mmltk::frameworks::serialization::wire::FlatValue{browser_threshold}},
     };
     REQUIRE(apply_gui_settings_values(state, browser_float_update));
     CHECK(state.workflows.annotate.threshold == static_cast<float>(browser_threshold));
-
     const auto square_aspect = mmltk::frameworks::serialization::wire::FlatValue::text("Square", sizeof("Square") - 1U);
     REQUIRE(square_aspect.has_value());
     const std::array workspace_aspect_update{
@@ -1094,26 +971,21 @@ void test_bounded_flat_settings_mutation_is_atomic() {
     };
     REQUIRE(apply_gui_settings_values(state, workspace_aspect_update));
     CHECK(state.ui.workspace_aspect_ratio == WorkspaceAspectRatio::Square);
-
     const GuiSettingsState before_invalid_aspect = state;
     const std::array invalid_workspace_aspect{
-        SettingsValueUpdate{.path = "ui.workspace_aspect_ratio",
-                            .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{-1}}},
+        SettingsValueUpdate{.path = "ui.workspace_aspect_ratio", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{-1}}},
     };
     CHECK_FALSE(apply_gui_settings_values(state, invalid_workspace_aspect));
     CHECK(state == before_invalid_aspect);
-
     const GuiSettingsState before_invalid_flat_array = state;
     const std::array<mmltk::frameworks::serialization::wire::FlatValue, 0U> no_device_ids{};
-    const auto empty_device_ids =
-        mmltk::frameworks::serialization::wire::FlatValue::array(no_device_ids, {.max_bytes = 1U, .max_items = 1U, .max_depth = 0U});
+    const auto empty_device_ids = mmltk::frameworks::serialization::wire::FlatValue::array(no_device_ids, {.max_bytes = 1U, .max_items = 1U, .max_depth = 0U});
     REQUIRE(empty_device_ids.has_value());
     const std::array invalid_flat_array{
         SettingsValueUpdate{.path = "workflows.train.request.device_ids", .value = *empty_device_ids},
     };
     CHECK_FALSE(apply_gui_settings_values(state, invalid_flat_array));
     CHECK(state == before_invalid_flat_array);
-
     const GuiSettingsState before_invalid_batch = state;
     const std::array invalid_batch{
         SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
@@ -1127,13 +999,11 @@ void test_bounded_flat_settings_mutation_is_atomic() {
     };
     CHECK_FALSE(apply_gui_settings_values(state, duplicate_batch));
     CHECK(state == before_invalid_batch);
-
     GuiSettingsState copy = state;
     CHECK(state == copy);
     copy.ui.dark_mode = !copy.ui.dark_mode;
     CHECK(state != copy);
 }
-
 void test_catalog_source_transition_normalizes_model_input_at_the_native_boundary() {
     GuiSettingsState state = default_gui_settings_state();
     state.workflows.validate.model_source = ModelSelectionSource::Custom;
@@ -1143,7 +1013,6 @@ void test_catalog_source_transition_normalizes_model_input_at_the_native_boundar
     state.workflows.predict.model_input = ModelArtifactInputKind::TensorRt;
     state.workflows.predict.request.tensorrt_path = "/tmp/predict.engine";
     REQUIRE(gui_settings_valid(state));
-
     const auto select_catalog_source = [&state](std::string path) {
         const std::array update{
             SettingsValueUpdate{.path = std::move(path), .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{0}}},
@@ -1154,12 +1023,10 @@ void test_catalog_source_transition_normalizes_model_input_at_the_native_boundar
     CHECK(state.workflows.validate.model_source == ModelSelectionSource::Canonical);
     CHECK(state.workflows.validate.model_input == ModelArtifactInputKind::Weights);
     CHECK(state.workflows.validate.request.onnx_path == "/tmp/validate.onnx");
-
     select_catalog_source("workflows.predict.model_source");
     CHECK(state.workflows.predict.model_source == ModelSelectionSource::Canonical);
     CHECK(state.workflows.predict.model_input == ModelArtifactInputKind::Weights);
     CHECK(state.workflows.predict.request.tensorrt_path == "/tmp/predict.engine");
-
     GuiSettingsState defaults = default_gui_settings_state();
     REQUIRE(defaults.workflows.validate.model_source == ModelSelectionSource::Canonical);
     REQUIRE(defaults.workflows.validate.model_input == ModelArtifactInputKind::Weights);
@@ -1168,21 +1035,16 @@ void test_catalog_source_transition_normalizes_model_input_at_the_native_boundar
     };
     REQUIRE(apply_gui_settings_values(defaults, unrelated));
     CHECK(defaults.workflows.validate.model_input == ModelArtifactInputKind::Weights);
-
     const GuiSettingsState before_invalid = defaults;
     const std::array invalid_custom_onnx{
-        SettingsValueUpdate{.path = "workflows.validate.model_source",
-                            .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{1}}},
-        SettingsValueUpdate{.path = "workflows.validate.model_input",
-                            .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{1}}},
+        SettingsValueUpdate{.path = "workflows.validate.model_source", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{1}}},
+        SettingsValueUpdate{.path = "workflows.validate.model_input", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{1}}},
     };
     CHECK_FALSE(apply_gui_settings_values(defaults, invalid_custom_onnx));
     CHECK(defaults == before_invalid);
 }
-
 void test_model_selection_settings_validation_exhausts_canonical_compatibility() {
-    const auto validate_case = [](const FeatureId workflow, const ModelSelectionSource source, const ModelArtifactInputKind input,
-                                  const bool build_tensorrt) {
+    const auto validate_case = [](const FeatureId workflow, const ModelSelectionSource source, const ModelArtifactInputKind input, const bool build_tensorrt) {
         GuiSettingsState state = default_gui_settings_state();
         const ModelArtifactSelectionState artifacts{
             .weights_path = "/tmp/model.pt",
@@ -1194,47 +1056,38 @@ void test_model_selection_settings_validation_exhausts_canonical_compatibility()
             .input = input,
         };
         switch (workflow) {
-            case FeatureId::Train:
-                apply_model_artifacts(state.workflows.train, artifacts);
-                break;
-            case FeatureId::Validate:
-                apply_model_artifacts(state.workflows.validate, artifacts);
-                break;
-            case FeatureId::Predict:
-                apply_model_artifacts(state.workflows.predict, artifacts);
-                break;
+            case FeatureId::Train: apply_model_artifacts(state.workflows.train, artifacts); break;
+            case FeatureId::Validate: apply_model_artifacts(state.workflows.validate, artifacts); break;
+            case FeatureId::Predict: apply_model_artifacts(state.workflows.predict, artifacts); break;
             case FeatureId::Export:
                 state.workflows.export_state.build_tensorrt = build_tensorrt;
                 apply_model_artifacts(state.workflows.export_state, artifacts);
                 break;
             case FeatureId::Annotate:
             case FeatureId::Live:
-            case FeatureId::Explore:
-                FAIL("test case requires a ModelSystem workflow");
+            case FeatureId::Explore: FAIL("test case requires a ModelSystem workflow");
         }
-        const bool expected = input == ModelArtifactInputKind::None ||
-                              (workflow == FeatureId::Export ? model_selection_compatible(workflow, source, input, build_tensorrt)
-                                                             : model_selection_compatible(workflow, source, input));
+        const bool expected =
+            input == ModelArtifactInputKind::None || (workflow == FeatureId::Export ? model_selection_compatible(workflow, source, input, build_tensorrt)
+                                                                                    : model_selection_compatible(workflow, source, input));
         CHECK(gui_settings_valid(state) == expected);
     };
-
     for (const auto workflow : {FeatureId::Train, FeatureId::Validate, FeatureId::Predict}) {
         for (const auto source : {ModelSelectionSource::Canonical, ModelSelectionSource::Custom}) {
-            for (const auto input : {ModelArtifactInputKind::Weights, ModelArtifactInputKind::Onnx, ModelArtifactInputKind::TensorRt,
-                                     ModelArtifactInputKind::None}) {
+            for (const auto input :
+                 {ModelArtifactInputKind::Weights, ModelArtifactInputKind::Onnx, ModelArtifactInputKind::TensorRt, ModelArtifactInputKind::None}) {
                 validate_case(workflow, source, input, false);
             }
         }
     }
     for (const bool build_tensorrt : {false, true}) {
         for (const auto source : {ModelSelectionSource::Canonical, ModelSelectionSource::Custom}) {
-            for (const auto input : {ModelArtifactInputKind::Weights, ModelArtifactInputKind::Onnx, ModelArtifactInputKind::TensorRt,
-                                     ModelArtifactInputKind::None}) {
+            for (const auto input :
+                 {ModelArtifactInputKind::Weights, ModelArtifactInputKind::Onnx, ModelArtifactInputKind::TensorRt, ModelArtifactInputKind::None}) {
                 validate_case(FeatureId::Export, source, input, build_tensorrt);
             }
         }
     }
-
     GuiSettingsState annotation = default_gui_settings_state();
     annotation.workflows.annotate.model_source = ModelSelectionSource::Custom;
     annotation.workflows.annotate.model_input = ModelArtifactInputKind::TensorRt;
@@ -1246,21 +1099,17 @@ void test_model_selection_settings_validation_exhausts_canonical_compatibility()
     annotation.workflows.annotate.model_input = ModelArtifactInputKind::None;
     CHECK(gui_settings_valid(annotation));
 }
-
 void test_gui_json_persistence_enforces_reflected_field_policies() {
     const GuiSettingsState defaults = default_gui_settings_state();
     REQUIRE(gui_settings_valid(defaults));
-
     auto train = defaults.workflows.train.request;
     REQUIRE_FALSE(mmltk::frameworks::reflection::validate_reflected_fields(train).has_value());
     train.lr = std::numeric_limits<double>::quiet_NaN();
     CHECK(mmltk::frameworks::reflection::validate_reflected_fields(train).has_value());
-
     auto predict = defaults.workflows.predict.request;
     REQUIRE_FALSE(mmltk::frameworks::reflection::validate_reflected_fields(predict).has_value());
     predict.threshold = -0.01F;
     CHECK(mmltk::frameworks::reflection::validate_reflected_fields(predict).has_value());
-
     struct PersistenceCase {
         std::string_view name;
         void (*mutate)(nlohmann::json&);
@@ -1268,52 +1117,40 @@ void test_gui_json_persistence_enforces_reflected_field_policies() {
         bool repaired;
     };
     const std::array persistence_cases{
-        PersistenceCase{"signed endpoint",
-                        [](nlohmann::json& document) { document["ui"]["annotation_brush_radius"] = kMaxAnnotationBrushRadius; }, true,
+        PersistenceCase{"signed endpoint", [](nlohmann::json& document) { document["ui"]["annotation_brush_radius"] = kMaxAnnotationBrushRadius; }, true,
                         false},
-        PersistenceCase{"signed outside",
-                        [](nlohmann::json& document) { document["ui"]["annotation_brush_radius"] = kMaxAnnotationBrushRadius + 1; }, true,
+        PersistenceCase{"signed outside", [](nlohmann::json& document) { document["ui"]["annotation_brush_radius"] = kMaxAnnotationBrushRadius + 1; }, true,
                         true},
-        PersistenceCase{"unsigned endpoint", [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = 10'000U; },
-                        true, false},
-        PersistenceCase{"unsigned outside", [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = 10'001U; },
-                        true, true},
-        PersistenceCase{
-            "unsigned conversion overflow",
-            [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = std::numeric_limits<std::uint64_t>::max(); },
-            false, false},
+        PersistenceCase{"unsigned endpoint", [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = 10'000U; }, true, false},
+        PersistenceCase{"unsigned outside", [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = 10'001U; }, true, true},
+        PersistenceCase{"unsigned conversion overflow",
+                        [](nlohmann::json& document) { document["workflows"]["explore"]["min_instances"] = std::numeric_limits<std::uint64_t>::max(); }, false,
+                        false},
         PersistenceCase{"float endpoint", [](nlohmann::json& document) { document["ui"]["ui_scale"] = 1.75F; }, true, false},
         PersistenceCase{"float outside", [](nlohmann::json& document) { document["ui"]["ui_scale"] = 1.7501F; }, true, true},
-        PersistenceCase{"nonfinite JSON representation", [](nlohmann::json& document) { document["ui"]["ui_scale"] = nullptr; }, false,
-                        false},
+        PersistenceCase{"nonfinite JSON representation", [](nlohmann::json& document) { document["ui"]["ui_scale"] = nullptr; }, false, false},
         PersistenceCase{"path endpoint",
                         [](nlohmann::json& document) {
-                            document["workflows"]["train"]["training"]["output_dir"] =
-                                std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x');
+                            document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x');
                         },
                         true, false},
         PersistenceCase{"path outside",
                         [](nlohmann::json& document) {
-                            document["workflows"]["train"]["training"]["output_dir"] =
-                                std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x');
+                            document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x');
                         },
                         false, false},
         PersistenceCase{"container endpoint",
                         [](nlohmann::json& document) {
                             auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
                             ids = nlohmann::json::array();
-                            for (std::size_t index = 0U; index < mmltk::frameworks::reflection::kMaximumTrainingDevices; ++index) {
-                                ids.push_back(index);
-                            }
+                            for (std::size_t index = 0U; index < mmltk::frameworks::reflection::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
                         },
                         true, false},
         PersistenceCase{"container outside",
                         [](nlohmann::json& document) {
                             auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
                             ids = nlohmann::json::array();
-                            for (std::size_t index = 0U; index <= mmltk::frameworks::reflection::kMaximumTrainingDevices; ++index) {
-                                ids.push_back(index);
-                            }
+                            for (std::size_t index = 0U; index <= mmltk::frameworks::reflection::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
                         },
                         false, false},
         PersistenceCase{"container element conversion overflow",
@@ -1341,7 +1178,6 @@ void test_gui_json_persistence_enforces_reflected_field_policies() {
             CHECK(materialized == defaults);
     }
 }
-
 void test_explore_class_capacity_is_canonical_across_persistence_and_reflection() {
     constexpr auto filter_policy = mmltk::frameworks::reflection::policy_of_member<&mmltk::controller::ExploreClassSelection::classes>();
     constexpr std::size_t sample_capacity = std::tuple_size_v<decltype(std::declval<ExploreViewState>().sample_classes)>;
@@ -1350,7 +1186,6 @@ void test_explore_class_capacity_is_canonical_across_persistence_and_reflection(
     CHECK(sample_capacity == filter_policy.maximum_items);
     CHECK(overlay_capacity == filter_policy.maximum_items);
 }
-
 void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
     for (std::size_t selected = 0U; selected < 4U; ++selected) {
         ExploreViewState one_hot;
@@ -1364,7 +1199,6 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
         CHECK(projected.filter.require_masks == (selected == 1U));
         CHECK(projected.overlay.show_boxes == (selected == 2U));
         CHECK(projected.overlay.show_masks == (selected == 3U));
-
         ExploreViewState restored;
         ExploreSettingsProjection::Visit([&]<auto Setting, auto Filter>() {
             mmltk::frameworks::reflection::access<ExploreViewState, Setting>(restored) =
@@ -1375,7 +1209,6 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
         CHECK(restored.show_boxes == (selected == 2U));
         CHECK(restored.show_masks == (selected == 3U));
     }
-
     ExploreViewState settings;
     settings.require_boxes = true;
     settings.require_masks = false;
@@ -1387,7 +1220,6 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
     settings.shuffle_seed = 0x1234'5678U;
     settings.show_boxes = false;
     settings.show_masks = true;
-
     mmltk::controller::ExploreFilterUpdate filter;
     ExploreSettingsProjection::Visit([&]<auto Setting, auto Filter>() {
         mmltk::frameworks::reflection::access<mmltk::controller::ExploreFilterUpdate, Filter>(filter) =
@@ -1403,7 +1235,6 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
     CHECK(filter.filter.shuffle_seed == 0x1234'5678U);
     CHECK_FALSE(filter.overlay.show_boxes);
     CHECK(filter.overlay.show_masks);
-
     filter.filter.require_boxes = false;
     filter.filter.require_masks = true;
     filter.filter.minimum_instances = 5U;
@@ -1429,7 +1260,6 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
     CHECK(settings.show_boxes);
     CHECK_FALSE(settings.show_masks);
 }
-
 void test_explore_class_catalog_identity_is_ordered_and_deterministic() {
     const std::array first{
         mmltk::backend::data::catalog::ClassName{.value = "person"},
@@ -1447,7 +1277,6 @@ void test_explore_class_catalog_identity_is_ordered_and_deterministic() {
     CHECK(mmltk::controller::explore_class_catalog_identity(first) != mmltk::controller::explore_class_catalog_identity(reordered));
     CHECK(mmltk::controller::explore_class_catalog_identity(first) != mmltk::controller::explore_class_catalog_identity(repartitioned));
 }
-
 void test_explore_class_catalog_identity_rejects_generic_settings_mutation() {
     GuiSettingsState state = default_gui_settings_state();
     state.workflows.explore.class_catalog_identity = 0x1234U;
@@ -1460,7 +1289,6 @@ void test_explore_class_catalog_identity_rejects_generic_settings_mutation() {
     CHECK_FALSE(apply_gui_settings_values(state, update));
     CHECK(state.workflows.explore.class_catalog_identity == 0x1234U);
 }
-
 void test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically() {
     GuiSettingsState state = default_gui_settings_state();
     const GuiSettingsState before = state;
@@ -1473,13 +1301,11 @@ void test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically() {
     CHECK_FALSE(apply_gui_settings_values(state, update));
     CHECK(state == before);
 }
-
 void test_training_supervision_relation_is_enforced_by_generic_settings_validity() {
     const auto match_free = mmltk::frameworks::serialization::wire::FlatValue::text("MatchFree", sizeof("MatchFree") - 1U);
     REQUIRE(match_free.has_value());
     const auto zero = mmltk::frameworks::serialization::wire::FlatValue{0.0};
     const auto one = mmltk::frameworks::serialization::wire::FlatValue{1.0};
-
     GuiSettingsState valid_ablation = default_gui_settings_state();
     const std::array one_zero_updates{
         SettingsValueUpdate{.path = "workflows.train.request.training_supervision.assignment", .value = *match_free},
@@ -1489,14 +1315,12 @@ void test_training_supervision_relation_is_enforced_by_generic_settings_validity
     REQUIRE(apply_gui_settings_values(valid_ablation, one_zero_updates));
     CHECK(gui_settings_valid(valid_ablation));
     CHECK(valid_ablation.workflows.train.request.training_supervision.match_free.correspondence_weight == 0.0F);
-
     const GuiSettingsState before_rejected_edit = valid_ablation;
     const std::array second_zero{
         SettingsValueUpdate{.path = "workflows.train.request.training_supervision.match_free.query_weight", .value = zero},
     };
     CHECK_FALSE(apply_gui_settings_values(valid_ablation, second_zero));
     CHECK(valid_ablation == before_rejected_edit);
-
     GuiSettingsState rejected_batch = default_gui_settings_state();
     const GuiSettingsState before_rejected_batch = rejected_batch;
     const std::array both_zero_updates{
@@ -1506,37 +1330,30 @@ void test_training_supervision_relation_is_enforced_by_generic_settings_validity
     };
     CHECK_FALSE(apply_gui_settings_values(rejected_batch, both_zero_updates));
     CHECK(rejected_batch == before_rejected_batch);
-
     GuiSettingsState invalid_persistence_candidate = default_gui_settings_state();
     invalid_persistence_candidate.workflows.train.request.training_supervision.assignment = TrainAssignmentKind::MatchFree;
     invalid_persistence_candidate.workflows.train.request.training_supervision.match_free.correspondence_weight = 0.0F;
     invalid_persistence_candidate.workflows.train.request.training_supervision.match_free.query_weight = 0.0F;
     CHECK_FALSE(gui_settings_valid(invalid_persistence_candidate));
-
     mmltk::testsupport::ScopedTempDir persistence_root{"mmltk-training-supervision-settings"};
     const SettingsLocation location{(persistence_root.path() / "gui.json").string()};
     mmltk::controller::SettingsSystem settings;
     REQUIRE(settings.Load(location).applied());
-
     SettingsUpdateRequest persisted_ablation;
     persisted_ablation.updates.assign(one_zero_updates.begin(), one_zero_updates.end());
     const auto persisted = settings.Update(std::move(persisted_ablation));
     CHECK(persisted.settings_state == valid_ablation);
-
     mmltk::controller::SettingsSystem reloaded;
     REQUIRE(reloaded.Load(location).applied());
     CHECK(reloaded.snapshot().settings_state == valid_ablation);
-
     SettingsUpdateRequest rejected_persistence;
     rejected_persistence.updates.assign(second_zero.begin(), second_zero.end());
     CHECK_THROWS_AS(settings.Update(std::move(rejected_persistence)), mmltk::controller::contracts::InvalidIntentError);
     CHECK(settings.snapshot() == persisted);
-
     mmltk::controller::SettingsSystem reloaded_after_rejection;
     REQUIRE(reloaded_after_rejection.Load(location).applied());
     CHECK(reloaded_after_rejection.snapshot() == persisted);
 }
-
 void test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection() {
     GuiSettingsState state = default_gui_settings_state();
     auto& supervision = state.workflows.train.request.training_supervision;
@@ -1549,35 +1366,29 @@ void test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejectio
         .center_noise_scale = 0.45F,
         .size_noise_scale = 0.35F,
     };
-
     const nlohmann::json saved = snapshot_gui_settings(state);
     const auto& persisted = saved.at("workflows").at("train").at("training").at("training_supervision");
     CHECK(persisted.at("assignment") == "match-free");
     CHECK(persisted.at("match_free").at("rho") == 0.625F);
     CHECK(persisted.at("denoising").at("enabled") == true);
     CHECK(persisted.at("denoising").at("groups") == 10U);
-
     GuiSettingsState round_trip = default_gui_settings_state();
     apply_gui_settings(saved, round_trip);
     CHECK(round_trip.workflows.train.request.training_supervision == supervision);
-
     nlohmann::json missing = saved;
     missing["workflows"]["train"]["training"].erase("training_supervision");
     apply_gui_settings(missing, round_trip);
     CHECK(round_trip.workflows.train.request.training_supervision == mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
-
     for (const nlohmann::json& malformed :
          {nlohmann::json{"not-an-object"},
           nlohmann::json{
               {"assignment", "match-free"},
               {"match_free", {{"rho", 0.0}, {"correspondence_weight", 1.0}, {"query_weight", 1.0}}},
-              {"denoising",
-               {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}},
+              {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}},
           nlohmann::json{
               {"assignment", "match-free"},
               {"match_free", {{"rho", 0.5}, {"correspondence_weight", 0.0}, {"query_weight", 0.0}}},
-              {"denoising",
-               {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}}}) {
+              {"denoising", {{"enabled", false}, {"groups", 5}, {"label_noise_ratio", 0.2}, {"center_noise_scale", 0.4}, {"size_noise_scale", 0.4}}}}}) {
         nlohmann::json invalid = saved;
         invalid["workflows"]["train"]["training"]["training_supervision"] = malformed;
         const GuiSettingsState before = round_trip;
@@ -1585,7 +1396,6 @@ void test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejectio
         CHECK(round_trip == before);
     }
 }
-
 void test_startup_transport_override_is_session_local_in_both_directions() {
     for (const bool h2d : {false, true}) {
         mmltk::testsupport::ScopedTempDir persistence_root{"mmltk-startup-transport-settings"};
@@ -1621,24 +1431,20 @@ void test_startup_transport_override_is_session_local_in_both_directions() {
         CHECK(overridden.snapshot().settings_state.workflows.explore.h2d_dataloader == h2d);
     }
 }
-
 void test_explore_preview_candidate_is_atomic_and_persists_native_modes() {
     mmltk::testsupport::ScopedTempDir persistence_root{"mmltk-explore-preview-settings"};
     const SettingsLocation location{(persistence_root.path() / "gui.json").string()};
     mmltk::controller::SettingsSystem settings;
     REQUIRE(settings.Load(location).applied());
-
     const auto initial = settings.explore_settings_candidate();
     CHECK_FALSE(initial.augmentation_preview_enabled);
     CHECK_FALSE(initial.show_original_dimensions);
     CHECK(mmltk::backend::models::rfdetr::gpu_augmentation_config_valid(initial.augmentation));
-
     const auto preview = settings.persist_explore_augmentation(initial, true);
     CHECK(preview.version > initial.version);
     CHECK(preview.augmentation_preview_enabled);
     CHECK(preview.augmentation.enabled == initial.augmentation.enabled);
     CHECK_THROWS_AS(settings.persist_explore_detail(initial, true), mmltk::controller::contracts::BusyError);
-
     const auto detail = settings.persist_explore_detail(preview, true);
     CHECK(detail.version > preview.version);
     CHECK(detail.augmentation_preview_enabled);
@@ -1648,14 +1454,12 @@ void test_explore_preview_candidate_is_atomic_and_persists_native_modes() {
     CHECK(filtered.version > detail.version);
     CHECK(filtered.preferences.policy.filter.minimum_instances == 1U);
     CHECK_FALSE(filtered.preferences.policy.overlay.show_boxes);
-
     mmltk::controller::SettingsSystem reloaded;
     REQUIRE(reloaded.Load(location).applied());
     const auto restored = reloaded.explore_settings_candidate();
     CHECK(restored.augmentation_preview_enabled);
     CHECK(restored.show_original_dimensions);
 }
-
 void test_copy_paste_default_and_persisted_overrides() {
     mmltk::testsupport::ScopedTempDir root{"mmltk-copy-paste-settings"};
     const SettingsLocation location{(root.path() / "gui.json").string()};
@@ -1677,7 +1481,6 @@ void test_copy_paste_default_and_persisted_overrides() {
     REQUIRE(reset_reloaded.Load(location).applied());
     CHECK(reset_reloaded.explore_settings_candidate().augmentation.copy_paste_probability == .80F);
 }
-
 void test_apply_current_copy_paste_preference() {
     const auto* gate = std::getenv("MMLTK_ACCEPT_APPLY_COPY_PASTE_DEFAULT");
     if (gate == nullptr || std::string_view{gate} != "1") SKIP("current saved preferences require explicit acceptance authorization");
@@ -1698,9 +1501,7 @@ void test_apply_current_copy_paste_preference() {
     const bool persisted_only_requested_preference = reloaded.snapshot().settings_state == expected;
     CHECK(persisted_only_requested_preference);
 }
-
 }  // namespace
-
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_ui_settings_round_trip);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_recipe_golden_shape_and_round_trip);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved);
@@ -1722,13 +1523,9 @@ MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_explore_settings_projection_cov
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_explore_class_catalog_identity_is_ordered_and_deterministic);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_explore_class_catalog_identity_rejects_generic_settings_mutation);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically);
-MMLTK_REGISTER_TEST_CASE("[gui][settings][training_supervision]",
-                         test_training_supervision_relation_is_enforced_by_generic_settings_validity);
-MMLTK_REGISTER_TEST_CASE("[gui][settings][training_supervision]",
-                         test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection);
+MMLTK_REGISTER_TEST_CASE("[gui][settings][training_supervision]", test_training_supervision_relation_is_enforced_by_generic_settings_validity);
+MMLTK_REGISTER_TEST_CASE("[gui][settings][training_supervision]", test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_startup_transport_override_is_session_local_in_both_directions);
 MMLTK_REGISTER_TEST_CASE("[gui][settings][explore]", test_explore_preview_candidate_is_atomic_and_persists_native_modes);
-
 MMLTK_REGISTER_TEST_CASE("[gui][settings][copy_paste]", test_copy_paste_default_and_persisted_overrides);
-
 MMLTK_REGISTER_TEST_CASE("[.][acceptance][settings]", test_apply_current_copy_paste_preference);

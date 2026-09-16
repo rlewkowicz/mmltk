@@ -42,10 +42,23 @@ pub(super) fn view(
             super::GALLERY_BOXES_ID,
         ]
     };
-    crate::view::workflow::overlay_controls::view(overlay.showlabels, overlay.showmasks, overlay.showboxes,
-        available, available, ids).map(|message| match message {
-            crate::view::workflow::overlay_controls::Message::Labels(value) => Message::LabelsToggled(value),
-            crate::view::workflow::overlay_controls::Message::Masks(value) => Message::MasksToggled(value),
-            crate::view::workflow::overlay_controls::Message::Boxes(value) => Message::BoxesToggled(value),
-        })
+    crate::view::workflow::overlay_controls::view(
+        overlay.showlabels,
+        overlay.showmasks,
+        overlay.showboxes,
+        available,
+        available,
+        ids,
+    )
+    .map(|message| match message {
+        crate::view::workflow::overlay_controls::Message::Labels(value) => {
+            Message::LabelsToggled(value)
+        }
+        crate::view::workflow::overlay_controls::Message::Masks(value) => {
+            Message::MasksToggled(value)
+        }
+        crate::view::workflow::overlay_controls::Message::Boxes(value) => {
+            Message::BoxesToggled(value)
+        }
+    })
 }

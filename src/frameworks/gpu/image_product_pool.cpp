@@ -1,12 +1,9 @@
 #include "src/frameworks/gpu/image_product_pool.h"
-
 #include <atomic>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
-
 namespace mmltk::frameworks::gpu {
-
 struct ImageProductPool::Admission final {
     void Available() noexcept {
         Notify();
@@ -26,8 +23,7 @@ struct ImageProductPool::Admission final {
     std::atomic<std::shared_ptr<const std::function<void()>>> sink;
 };
 struct ImageProductPool::Slot final {
-    Slot(std::shared_ptr<Admission> gate, DeviceContext context, ImageProductLayout layout,
-         std::shared_ptr<ImageProductRetirement> retirement)
+    Slot(std::shared_ptr<Admission> gate, DeviceContext context, ImageProductLayout layout, std::shared_ptr<ImageProductRetirement> retirement)
         : admission(std::move(gate)), buffer(std::move(context), layout, std::move(retirement)) {}
     [[nodiscard]] bool Readable() const noexcept { return facts.revision != 0U && !buffer.terminal(); }
     [[nodiscard]] bool SelectedReadable() const noexcept { return selected && !reserved && Readable(); }
@@ -38,7 +34,6 @@ struct ImageProductPool::Slot final {
     bool reserved = false;
     bool selected = false;
 };
-
 ImageProductPool::Availability::Availability(std::shared_ptr<Admission> admission) noexcept
     : admission_(std::move(admission)), epoch_(admission_->epoch.load(std::memory_order_acquire)) {}
 bool ImageProductPool::Availability::Wait(std::stop_token stop) const {
@@ -60,9 +55,7 @@ ImageStorageFootprint ImageProductPool::StorageFootprint() const noexcept {
     }
     return result;
 }
-
-ImageProductPool::Product::Product(std::shared_ptr<Slot> slot, std::uint64_t revision) noexcept
-    : slot_(std::move(slot)), revision_(revision) {}
+ImageProductPool::Product::Product(std::shared_ptr<Slot> slot, std::uint64_t revision) noexcept : slot_(std::move(slot)), revision_(revision) {}
 ImageProductPool::Product::Product() noexcept = default;
 ImageProductPool::Product::~Product() { Release(); }
 ImageProductPool::Product::Product(const Product& other) : slot_(other.slot_), revision_(other.revision_) { Retain(); }
@@ -72,8 +65,7 @@ ImageProductPool::Product& ImageProductPool::Product::operator=(const Product& o
     *this = std::move(copy);
     return *this;
 }
-ImageProductPool::Product::Product(Product&& other) noexcept
-    : slot_(std::move(other.slot_)), revision_(std::exchange(other.revision_, 0U)) {}
+ImageProductPool::Product::Product(Product&& other) noexcept : slot_(std::move(other.slot_)), revision_(std::exchange(other.revision_, 0U)) {}
 ImageProductPool::Product& ImageProductPool::Product::operator=(Product&& other) noexcept {
     if (this == &other) return *this;
     Release();
@@ -170,8 +162,7 @@ void ImageProductPool::Candidate::Release() noexcept {
     revision_ = 0U;
     slot->admission->Available();
 }
-ImageProductPool::ImageProductPool(DeviceContext context, ImageProductLayout layout, std::size_t count,
-                                   std::shared_ptr<ImageProductRetirement> retirement)
+ImageProductPool::ImageProductPool(DeviceContext context, ImageProductLayout layout, std::size_t count, std::shared_ptr<ImageProductRetirement> retirement)
     : admission_(std::make_shared<Admission>()) {
     if (count == 0U) throw std::invalid_argument("image product pool is empty");
     slots_.reserve(count);
@@ -227,7 +218,6 @@ ImageProductPool::Candidate ImageProductPool::TryAcquire(Product& baseline, Imag
     }
     return {};
 }
-
 void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::uint32_t width, std::uint32_t height, std::uint64_t revision,
                                ImageProductBuffer::ProductSubmit submit) {
     if (!candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U || revision == 0U)
@@ -241,10 +231,9 @@ void ImageProductPool::Publish(ImageStream& stream, Candidate& candidate, std::u
         auto baseline = candidate.baseline_.Borrow();
         if (!baseline.valid()) throw std::invalid_argument("image product baseline is unavailable");
         const auto descriptor = baseline.plane(0U).plane().descriptor;
-        initialized = descriptor.width == width && descriptor.height == height &&
-                      baseline.plane_count() == (slot.buffer.layout() == ImageProductLayout::Clean ? 1U : 2U);
-        if (initialized && !same_slot)
-            static_cast<void>(slot.buffer.CopyFromAs(stream, std::move(baseline), {}, 0U, false, candidate.preservation_));
+        initialized =
+            descriptor.width == width && descriptor.height == height && baseline.plane_count() == (slot.buffer.layout() == ImageProductLayout::Clean ? 1U : 2U);
+        if (initialized && !same_slot) static_cast<void>(slot.buffer.CopyFromAs(stream, std::move(baseline), {}, 0U, false, candidate.preservation_));
     }
     {
         std::scoped_lock lock(admission_->mutex);
@@ -290,8 +279,8 @@ std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Bo
     static_cast<void>(Commit(std::move(candidate)));
     return paths;
 }
-std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Candidate& candidate,
-                                                      BorrowedImageProductReadView source, std::uint64_t revision) {
+std::array<ImageCopyPath, 2U> ImageProductPool::CopyFrom(ImageStream& stream, Candidate& candidate, BorrowedImageProductReadView source,
+                                                         std::uint64_t revision) {
     if (revision == 0U || !candidate.slot_ || candidate.slot_->admission != admission_ || candidate.revision_ != 0U)
         throw std::invalid_argument("image copy candidate is invalid");
     ValidateCopySource(source, revision);
@@ -322,8 +311,7 @@ bool ImageProductPool::PrepareDisplay(ImageStream& stream, std::uint64_t revisio
         if (!product.slot_->buffer.DetachWorkspace(stream, prior)) return false;
     return PrepareWorkspace(product, workspace, std::move(finalize));
 }
-bool ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<ImageWorkspace> workspace,
-                                        ImageWorkspaceFinalize finalize) {
+bool ImageProductPool::PrepareWorkspace(const Product& product, std::shared_ptr<ImageWorkspace> workspace, ImageWorkspaceFinalize finalize) {
     ValidateBaseline(product);
     if (!product.valid()) throw std::invalid_argument("workspace product is unavailable");
     product.slot_->buffer.CompleteWorkspace();
@@ -368,8 +356,7 @@ ImageStreamSettlement ImageProductPool::SettleWorkspaces() noexcept {
     return result;
 }
 void ImageProductPool::ReleaseForRetirement() noexcept {
-    for (const auto& slot : slots_)
-        slot->buffer.DeferReleaseToReaders();
+    for (const auto& slot : slots_) slot->buffer.DeferReleaseToReaders();
     slots_.clear();
 }
 ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
@@ -382,8 +369,7 @@ ImageProductPool::Product ImageProductPool::Commit(Candidate&& candidate) {
     {
         std::scoped_lock lock(admission_->mutex);
         candidate.slot_->facts = facts;
-        for (const auto& slot : slots_)
-            slot->selected = slot == candidate.slot_;
+        for (const auto& slot : slots_) slot->selected = slot == candidate.slot_;
         candidate.slot_->reserved = false;
         candidate.slot_->buffer.CancelWorkspaceWrite();
         ++candidate.slot_->products;
@@ -402,8 +388,7 @@ void ImageProductPool::Select(const Product& product) {
         std::scoped_lock lock(admission_->mutex);
         if (!product.slot_->Readable() || product.slot_->facts.revision != product.revision_)
             throw std::invalid_argument("completed image product is unavailable");
-        for (const auto& slot : slots_)
-            slot->selected = slot == product.slot_;
+        for (const auto& slot : slots_) slot->selected = slot == product.slot_;
     }
     admission_->Available();
 }
@@ -428,5 +413,4 @@ void ImageProductPool::SetAvailabilitySink(std::function<void()> sink) {
     admission_->sink.store(std::move(retained), std::memory_order_release);
 }
 std::size_t ImageProductPool::size() const noexcept { return slots_.size(); }
-
 }  // namespace mmltk::frameworks::gpu

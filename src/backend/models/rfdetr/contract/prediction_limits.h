@@ -15,12 +15,10 @@ inline constexpr std::size_t kMaximumPredictionEncodedBytes = 1ULL << 30U;
 inline constexpr std::size_t kMaximumPredictionMaskRuns = kMaximumPredictionEncodedBytes / 22U;
 inline constexpr std::size_t kMaximumEncodedMaskPixels = std::numeric_limits<std::uint32_t>::max();
 inline void validate_prediction_candidates(std::size_t requested) {
-    if (requested == 0U || requested > kMaximumPredictionCandidates)
-        throw std::invalid_argument("RF-DETR candidate limit exceeds supported signed indexing");
+    if (requested == 0U || requested > kMaximumPredictionCandidates) throw std::invalid_argument("RF-DETR candidate limit exceeds supported signed indexing");
 }
 [[nodiscard]] inline std::size_t checked_prediction_extent(std::size_t count, std::size_t stride, std::size_t maximum) {
-    if (count == 0U || stride == 0U || count > maximum / stride)
-        throw std::invalid_argument("RF-DETR prediction extent exceeds supported storage");
+    if (count == 0U || stride == 0U || count > maximum / stride) throw std::invalid_argument("RF-DETR prediction extent exceeds supported storage");
     return count * stride;
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

@@ -6,7 +6,6 @@
 #include <cuda.h>
 #include <limits>
 #include "src/common/system/numa_memory.h"
-
 namespace {
 TEST_CASE("Registered local storage preserves portable high-water registration", "[frameworks][gpu][pinned][hardware]") {
     if (cuInit(0) != CUDA_SUCCESS) SKIP("CUDA unavailable; pinned host placement remains unverified");

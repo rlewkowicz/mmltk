@@ -1,12 +1,9 @@
 #include "src/backend/models/rfdetr/training/distributed_train_launcher.h"
-
 #include <algorithm>
 #include <cstddef>
 #include <set>
 #include <stdexcept>
-
 namespace mmltk::backend::models::rfdetr {
-
 void apply_training_partition(TrainRequest& request, const DistributedTrainingPartition& partition) {
     request.device_id = partition.device_id;
     request.workers = partition.worker_budget;
@@ -14,7 +11,6 @@ void apply_training_partition(TrainRequest& request, const DistributedTrainingPa
     request.device_ids.clear();
     request.numa_nodes.clear();
 }
-
 std::vector<DistributedTrainingPartition> select_distributed_training_partitions(const TrainRequest& request) {
     validate_train_placement(request);
     if (request.device_ids.empty()) { return {{0, 1, request.device_id, request.workers, request.numa_node}}; }
@@ -38,5 +34,4 @@ std::vector<DistributedTrainingPartition> select_distributed_training_partitions
     }
     return partitions;
 }
-
 }  // namespace mmltk::backend::models::rfdetr

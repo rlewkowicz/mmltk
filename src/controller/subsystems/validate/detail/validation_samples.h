@@ -11,9 +11,9 @@ namespace mmltk::controller::detail {
 // Domain storage and rendering only. The validation session remains with its
 // existing CudaSessionRuntimeState execution owner.
 class ValidationSamples final {
- public:
+   public:
     ValidationSamples(VisualDeviceSettings, std::function<void()> changed,
-        PredictionPreviewPool::TransferOperations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister});
+                      PredictionPreviewPool::TransferOperations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister});
     ~ValidationSamples();
     void Begin(std::uint64_t generation, std::span<const std::uint32_t> indices);
     void Capture(mmltk::backend::models::rfdetr::ValidationSampleView);
@@ -27,8 +27,9 @@ class ValidationSamples final {
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
     void RequestWorkspace(VisualWorkspaceRequest);
     void Shutdown() noexcept;
- private:
+
+   private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-}
+}  // namespace mmltk::controller::detail

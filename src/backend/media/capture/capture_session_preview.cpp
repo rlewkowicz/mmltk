@@ -7,7 +7,6 @@ module;
 #include <linux/videodev2.h>
 #include <poll.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -22,22 +21,16 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
-
 module mmltk.backend.media.capture.capture_session;
-
 #include "detail/capture_session_impl.hpp"
-
 namespace mmltk::backend::media::capture {
-
 using capture_internal::CaptureSlotPhase;
 using capture_internal::CaptureSlotPhaseValue;
 using capture_internal::kBgr3V4l2PixelFormat;
 using capture_internal::MakeErrnoStatus;
 using capture_internal::MakeStatus;
 using capture_internal::NowNs;
-
 namespace {
-
 void drain_event(const int fd) noexcept {
     std::uint64_t value = 0;
     while (fd >= 0) {
@@ -47,7 +40,6 @@ void drain_event(const int fd) noexcept {
         return;
     }
 }
-
 [[nodiscard]] bool signal_event(const int fd) noexcept {
     const std::uint64_t value = 1U;
     while (fd >= 0) {
@@ -58,9 +50,7 @@ void drain_event(const int fd) noexcept {
     }
     return false;
 }
-
 }  // namespace
-
 CaptureSession::Impl::CaptureReadyResult CaptureSession::Impl::WaitForCaptureReady() {
     if (camera_fault_.load(std::memory_order_acquire)) return CaptureReadyResult::kCameraError;
     pollfd descriptors[3]{
@@ -69,9 +59,7 @@ CaptureSession::Impl::CaptureReadyResult CaptureSession::Impl::WaitForCaptureRea
         {.fd = completion_event_fd_, .events = POLLIN, .revents = 0},
     };
     int result = 0;
-    do {
-        result = ::poll(descriptors, 3, -1);
-    } while (result < 0 && errno == EINTR);
+    do { result = ::poll(descriptors, 3, -1); } while (result < 0 && errno == EINTR);
     if (result < 0) {
         ReportCameraFault(MakeErrnoStatus(StatusCode::kInternalError, "poll capture descriptors").message);
         return CaptureReadyResult::kCameraError;
@@ -95,7 +83,6 @@ CaptureSession::Impl::CaptureReadyResult CaptureSession::Impl::WaitForCaptureRea
     }
     return (camera & (POLLIN | POLLPRI)) != 0 ? CaptureReadyResult::kFrameReady : CaptureReadyResult::kCameraError;
 }
-
 CaptureSession::Impl::DequeueResult CaptureSession::Impl::TryDequeueBuffer(v4l2_buffer* const output, Status* const error) {
     if (output == nullptr) {
         if (error != nullptr) *error = MakeStatus(StatusCode::kInvalidArgument, "capture dequeue output is null");
@@ -117,27 +104,21 @@ CaptureSession::Impl::DequeueResult CaptureSession::Impl::TryDequeueBuffer(v4l2_
     UpdateSequenceStats(output->sequence);
     return DequeueResult::kDequeued;
 }
-
 void CaptureSession::Impl::UpdateSequenceStats(const std::uint32_t sequence) {
-    if (last_sequence_.has_value() && sequence > *last_sequence_ + 1U)
-        sequence_gaps_.fetch_add(sequence - *last_sequence_ - 1U, std::memory_order_relaxed);
+    if (last_sequence_.has_value() && sequence > *last_sequence_ + 1U) sequence_gaps_.fetch_add(sequence - *last_sequence_ - 1U, std::memory_order_relaxed);
     last_sequence_ = sequence;
 }
-
 std::optional<std::uint32_t> CaptureSession::Impl::ResolveHostSlotIndex(const v4l2_buffer& buffer) const {
     if (buffer.index < host_slots_.size()) {
         const auto& slot = *host_slots_[buffer.index];
-        if (reinterpret_cast<unsigned long>(slot.capture_buffer.data) == buffer.m.userptr && slot.capture_buffer.bytes == buffer.length)
-            return buffer.index;
+        if (reinterpret_cast<unsigned long>(slot.capture_buffer.data) == buffer.m.userptr && slot.capture_buffer.bytes == buffer.length) return buffer.index;
     }
     for (std::uint32_t index = 0; index < host_slots_.size(); ++index) {
         const auto& slot = *host_slots_[index];
-        if (reinterpret_cast<unsigned long>(slot.capture_buffer.data) == buffer.m.userptr && slot.capture_buffer.bytes == buffer.length)
-            return index;
+        if (reinterpret_cast<unsigned long>(slot.capture_buffer.data) == buffer.m.userptr && slot.capture_buffer.bytes == buffer.length) return index;
     }
     return std::nullopt;
 }
-
 CaptureSession::Impl::CaptureLoopResult CaptureSession::Impl::CaptureLoop() {
     for (;;) {
         const CaptureReadyResult ready = WaitForCaptureReady();
@@ -161,9 +142,7 @@ CaptureSession::Impl::CaptureLoopResult CaptureSession::Impl::CaptureLoop() {
         const DequeueResult dequeued = TryDequeueBuffer(&buffer, &error);
         if (dequeued == DequeueResult::kNotReady) continue;
         if (dequeued == DequeueResult::kCameraError)
-            return {.kind = CaptureStopKind::kCameraError,
-                    .status = std::move(error),
-                    .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
+            return {.kind = CaptureStopKind::kCameraError, .status = std::move(error), .teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost};
         const Status handled = HandleDequeuedBuffer(buffer);
         if (!handled.ok())
             return {.kind = camera_fault_.load(std::memory_order_acquire) ? CaptureStopKind::kCameraError : CaptureStopKind::kOwnerFailure,
@@ -172,7 +151,6 @@ CaptureSession::Impl::CaptureLoopResult CaptureSession::Impl::CaptureLoop() {
                                                                               : CaptureTeardownDisposition::kOwnerRetainThenStreamOff};
     }
 }
-
 Status CaptureSession::Impl::HandleDequeuedBuffer(const v4l2_buffer& buffer) {
     const auto index = ResolveHostSlotIndex(buffer);
     if (!index.has_value()) {
@@ -200,13 +178,11 @@ Status CaptureSession::Impl::HandleDequeuedBuffer(const v4l2_buffer& buffer) {
         short_frames_.fetch_add(1U, std::memory_order_relaxed);
         ZeroFillShortFrame(slot, valid);
     }
-
     std::unique_lock lock(filled_mutex_);
     std::size_t active_slots = 0U;
     for (const auto& candidate : host_slots_) {
         const std::uint32_t phase = candidate->phase.load(std::memory_order_acquire);
-        if (phase == CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive) ||
-            phase == CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending))
+        if (phase == CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive) || phase == CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending))
             ++active_slots;
     }
     if (replaceable_filled_index_ < 0 && active_slots != 0U && active_slots + 1U == host_slots_.size()) {
@@ -232,8 +208,7 @@ Status CaptureSession::Impl::HandleDequeuedBuffer(const v4l2_buffer& buffer) {
     slot.sequence = next_frame_id_++;
     slot.capture_ns = NowNs();
     slot.short_frame = short_frame;
-    slot.region = CaptureRegion{.width = published_width_.load(std::memory_order_acquire),
-                                .height = published_height_.load(std::memory_order_acquire)};
+    slot.region = CaptureRegion{.width = published_width_.load(std::memory_order_acquire), .height = published_height_.load(std::memory_order_acquire)};
     slot.phase.store(CaptureSlotPhaseValue(CaptureSlotPhase::kReplaceableFilled), std::memory_order_release);
     replaceable_filled_index_ = static_cast<int>(*index);
     filled_frames_published_.fetch_add(1U, std::memory_order_relaxed);
@@ -241,12 +216,10 @@ Status CaptureSession::Impl::HandleDequeuedBuffer(const v4l2_buffer& buffer) {
     NotifyFilledFramePublished();
     return Status::Ok();
 }
-
 void CaptureSession::Impl::ZeroFillShortFrame(HostSlotRuntime& slot, const std::size_t valid) const {
     auto* bytes = static_cast<std::uint8_t*>(slot.capture_buffer.data);
     std::memset(bytes + valid, 0, size_image_ - valid);
 }
-
 Status CaptureSession::Impl::RequeueCompletedSlots(CaptureTeardownDisposition* const teardown) {
     if (teardown == nullptr) return MakeStatus(StatusCode::kInvalidArgument, "capture teardown disposition is null");
     Status first_failure = Status::Ok();
@@ -264,7 +237,6 @@ Status CaptureSession::Impl::RequeueCompletedSlots(CaptureTeardownDisposition* c
     }
     return first_failure;
 }
-
 Status CaptureSession::Impl::SettleSlotsBeforeTeardown(CaptureTeardownDisposition* const teardown) {
     if (teardown == nullptr) return MakeStatus(StatusCode::kInvalidArgument, "capture teardown disposition is null");
     Status first_failure = Status::Ok();
@@ -282,8 +254,7 @@ Status CaptureSession::Impl::SettleSlotsBeforeTeardown(CaptureTeardownDispositio
         bool settled = true;
         for (const auto& slot : host_slots_) {
             const std::uint32_t phase = slot->phase.load(std::memory_order_acquire);
-            if (phase != CaptureSlotPhaseValue(CaptureSlotPhase::kHardwareQueued) &&
-                phase != CaptureSlotPhaseValue(CaptureSlotPhase::kOwnerRetained)) {
+            if (phase != CaptureSlotPhaseValue(CaptureSlotPhase::kHardwareQueued) && phase != CaptureSlotPhaseValue(CaptureSlotPhase::kOwnerRetained)) {
                 settled = false;
                 break;
             }
@@ -291,14 +262,11 @@ Status CaptureSession::Impl::SettleSlotsBeforeTeardown(CaptureTeardownDispositio
         if (settled) return first_failure;
         pollfd completion{.fd = completion_event_fd_, .events = POLLIN, .revents = 0};
         int result = 0;
-        do {
-            result = ::poll(&completion, 1, -1);
-        } while (result < 0 && errno == EINTR);
+        do { result = ::poll(&completion, 1, -1); } while (result < 0 && errno == EINTR);
         if (result < 0) return MakeErrnoStatus(StatusCode::kInternalError, "poll capture completion");
         drain_event(completion_event_fd_);
     }
 }
-
 Status CaptureSession::Impl::try_take_filled(FilledCaptureSlotLease* const output) {
     if (output == nullptr) return MakeStatus(StatusCode::kInvalidArgument, "output lease is null");
     if (output->valid()) return MakeStatus(StatusCode::kInvalidArgument, "output lease still owns a capture slot");
@@ -310,25 +278,21 @@ Status CaptureSession::Impl::try_take_filled(FilledCaptureSlotLease* const outpu
                                             std::memory_order_acquire))
         return MakeStatus(StatusCode::kNotReady, "filled capture slot was replaced");
     replaceable_filled_index_ = -1;
-    *output = CaptureSession::MakeFilledSlotLease(active_identity(), slot.slot_index, slot.sequence,
-                                                  static_cast<const std::uint8_t*>(slot.capture_buffer.data), size_image_, bytes_per_line_,
-                                                  kBgr3V4l2PixelFormat, slot.region, slot.capture_ns, slot.short_frame);
+    *output = CaptureSession::MakeFilledSlotLease(active_identity(), slot.slot_index, slot.sequence, static_cast<const std::uint8_t*>(slot.capture_buffer.data),
+                                                  size_image_, bytes_per_line_, kBgr3V4l2PixelFormat, slot.region, slot.capture_ns, slot.short_frame);
     h2d_frames_admitted_.fetch_add(1U, std::memory_order_relaxed);
     return Status::Ok();
 }
-
 Status CaptureSession::Impl::mark_h2d_completion_pending(const FilledCaptureSlotLease& lease) {
-    if (!lease.valid() || lease.identity() != active_identity() || lease.slot() >= host_slots_.size())
-        return {StatusCode::kInvalidArgument, {}};
+    if (!lease.valid() || lease.identity() != active_identity() || lease.slot() >= host_slots_.size()) return {StatusCode::kInvalidArgument, {}};
     HostSlotRuntime& slot = *host_slots_[lease.slot()];
     if (slot.sequence != lease.sequence()) return {StatusCode::kInvalidArgument, {}};
     std::uint32_t expected = CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive);
-    if (!slot.phase.compare_exchange_strong(expected, CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending),
-                                            std::memory_order_acq_rel, std::memory_order_acquire))
+    if (!slot.phase.compare_exchange_strong(expected, CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending), std::memory_order_acq_rel,
+                                            std::memory_order_acquire))
         return MakeStatus(StatusCode::kNotReady, "capture slot is not H2D active");
     return Status::Ok();
 }
-
 Status CaptureSession::Impl::return_after_h2d(FilledCaptureSlotLease&& lease) noexcept {
     if (!lease.valid() || lease.identity() != active_identity() || lease.slot() >= host_slots_.size())
         return MakeStatus(StatusCode::kInvalidArgument, "capture lease does not name the active slot");
@@ -338,8 +302,7 @@ Status CaptureSession::Impl::return_after_h2d(FilledCaptureSlotLease&& lease) no
     bool newly_completed = false;
     for (;;) {
         if (phase == CaptureSlotPhaseValue(CaptureSlotPhase::kRequeuePending)) break;
-        if (phase != CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive) &&
-            phase != CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending))
+        if (phase != CaptureSlotPhaseValue(CaptureSlotPhase::kH2dActive) && phase != CaptureSlotPhaseValue(CaptureSlotPhase::kCompletionPending))
             return {StatusCode::kNotReady, {}};
         if (slot.phase.compare_exchange_weak(phase, CaptureSlotPhaseValue(CaptureSlotPhase::kRequeuePending), std::memory_order_acq_rel,
                                              std::memory_order_acquire)) {
@@ -356,23 +319,19 @@ Status CaptureSession::Impl::return_after_h2d(FilledCaptureSlotLease&& lease) no
     }
     return Status::Ok();
 }
-
 void CaptureSession::Impl::RetainFirstFailure(const CaptureSessionIdentity identity, Status failure) noexcept {
     if (failure.ok()) return;
     std::lock_guard lock(failure_mutex_);
     if (!first_failure_.has_value()) first_failure_.emplace(PhysicalFailure{.identity = identity, .status = std::move(failure)});
 }
-
 Status CaptureSession::Impl::FirstFailure() const {
     std::lock_guard lock(failure_mutex_);
     return first_failure_.has_value() ? first_failure_->status : Status::Ok();
 }
-
 Status CaptureSession::Impl::report_failure(const CaptureSessionIdentity identity, Status failure) noexcept {
     if (!identity.valid() || identity != active_identity() || finalized_.load(std::memory_order_acquire))
         return MakeStatus(StatusCode::kInvalidArgument, "physical failure does not name the active capture owner");
-    if (terminal_published_.load(std::memory_order_acquire))
-        return MakeStatus(StatusCode::kNotReady, "capture terminal is already immutable");
+    if (terminal_published_.load(std::memory_order_acquire)) return MakeStatus(StatusCode::kNotReady, "capture terminal is already immutable");
     if (failure.ok()) failure = MakeStatus(StatusCode::kInternalError, "empty physical capture failure");
     RetainFirstFailure(identity, std::move(failure));
     stop_requested_.store(true, std::memory_order_release);
@@ -386,17 +345,14 @@ Status CaptureSession::Impl::report_failure(const CaptureSessionIdentity identit
     }
     return Status::Ok();
 }
-
 CaptureSession::Impl::CaptureLoopResult CaptureSession::Impl::StopRequestedResult() const {
     Status failure = FirstFailure();
-    return !failure.ok() ? CaptureLoopResult{.kind = CaptureStopKind::kOwnerFailure,
-                                             .status = std::move(failure),
-                                             .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff}
-                         : CaptureLoopResult{.kind = CaptureStopKind::kRequested,
-                                             .status = Status::Ok(),
-                                             .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff};
+    return !failure.ok()
+               ? CaptureLoopResult{.kind = CaptureStopKind::kOwnerFailure,
+                                   .status = std::move(failure),
+                                   .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff}
+               : CaptureLoopResult{.kind = CaptureStopKind::kRequested, .status = Status::Ok(), .teardown = CaptureTeardownDisposition::kRequeueThenStreamOff};
 }
-
 void CaptureSession::Impl::NotifyFilledFramePublished() {
     const auto listener = filled_frame_listener_.load(std::memory_order_acquire);
     if (listener != nullptr && *listener) {
@@ -405,5 +361,4 @@ void CaptureSession::Impl::NotifyFilledFramePublished() {
         } catch (...) {}
     }
 }
-
 }  // namespace mmltk::backend::media::capture

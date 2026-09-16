@@ -8,7 +8,6 @@
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-
 namespace mmltk::backend::models::rfdetr {
 class DatasetBatchLease final {
    public:
@@ -27,25 +26,35 @@ class DatasetBatchLease final {
         batch_ = batch;
         active_ = true;
     }
-    void StopWorkers() { if (loader_) loader_->stop_workers(); }
+    void StopWorkers() {
+        if (loader_) loader_->stop_workers();
+    }
     ~DatasetBatchLease() noexcept {
-        if (active_) { try { Release(); } catch (...) {} }
+        if (active_) {
+            try {
+                Release();
+            } catch (...) {}
+        }
     }
     DatasetBatchLease(const DatasetBatchLease&) = delete;
     DatasetBatchLease& operator=(const DatasetBatchLease&) = delete;
     void Release() {
         if (!active_) return;
-        try { loader_->release_batch(batch_, stream_); }
-        catch (...) {
+        try {
+            loader_->release_batch(batch_, stream_);
+        } catch (...) {
             // A failed release must never destroy a loader with a checked-out
             // lease or leave its CPU workers alive with quarantined storage.
-            try { StopWorkers(); } catch (...) {}
+            try {
+                StopWorkers();
+            } catch (...) {}
             active_ = false;
             std::move(retirement_lease_).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(loader_)), cudaErrorUnknown);
             throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction dataset source release"};
         }
         active_ = false;
     }
+
    private:
     std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement_;
     mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_lease_;
@@ -54,5 +63,4 @@ class DatasetBatchLease final {
     void* stream_ = nullptr;
     bool active_ = false;
 };
-
-}
+}  // namespace mmltk::backend::models::rfdetr

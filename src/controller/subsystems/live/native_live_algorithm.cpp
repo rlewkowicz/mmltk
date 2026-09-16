@@ -1,38 +1,26 @@
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
-
 #include <cuda_runtime_api.h>
-
 #include <optional>
 #include <atomic>
 #include <stdexcept>
 #include <thread>
 #include <utility>
-
 #include "src/controller/subsystems/live/live_receiver_copy.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
-
 import mmltk.backend.media.capture.capture_session;
 import mmltk.backend.media.live.live_session_controller;
 import mmltk.backend.media.live.live_types;
-
 namespace mmltk::controller {
 namespace {
-
 namespace capture = mmltk::backend::media::capture;
 namespace media = mmltk::backend::media::live;
 namespace gpu = mmltk::frameworks::gpu;
-
 class NativeLiveAlgorithm final : public LiveAlgorithm {
    public:
     NativeLiveAlgorithm(const VisualDeviceSettings settings, LiveNativeConfiguration configuration, gpu::DeviceExecution execution)
-        : settings_(settings),
-          execution_(std::move(execution)),
-          configuration_(std::move(configuration)),
-          owner_thread_(std::this_thread::get_id()) {}
-
+        : settings_(settings), execution_(std::move(execution)), configuration_(std::move(configuration)), owner_thread_(std::this_thread::get_id()) {}
     ~NativeLiveAlgorithm() override { Stop(); }
-
     void Start(const LiveStart& request) override {
         if (plane_) throw std::logic_error("Live data plane is already active");
         media::LiveDataPlaneConfig config{};
@@ -43,8 +31,7 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
         config.capture.height = request.extent.height;
         config.capture.fps = request.frames_per_second;
         config.capture.v4l2_buffer_count = configuration_.capture_buffers;
-        config.resource_worker =
-            gpu::ResourceOwnerWorkerCapability{this, 1U, &NativeLiveAlgorithm::IsCurrent, &NativeLiveAlgorithm::FailCurrent};
+        config.resource_worker = gpu::ResourceOwnerWorkerCapability{this, 1U, &NativeLiveAlgorithm::IsCurrent, &NativeLiveAlgorithm::FailCurrent};
         config.ingress_slots = configuration_.ingress_slots;
         config.fanout_slots = configuration_.fanout_slots;
         config.analysis_slots = configuration_.analysis_slots;
@@ -67,9 +54,7 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
             throw std::runtime_error("Live capture session failed to start");
         }
     }
-
     void SetOutputAvailableSink(std::function<void()> sink) override { ready_ = std::move(sink); }
-
     bool AcquireOutput() override {
         if (failed_.load(std::memory_order_acquire) || !plane_) throw std::runtime_error("Live media data plane failed");
         if (lease_) return true;
@@ -82,9 +67,7 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
         last_revision_ = observed->revision;
         return true;
     }
-
-    bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream_value,
-                 const std::stop_token stop) override {
+    bool Capture(const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream_value, const std::stop_token stop) override {
         if (stop.stop_requested()) {
             lease_ = {};
             return false;
@@ -93,13 +76,12 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
         const auto source = lease_.view();
         if (source.width != target.descriptor.width || source.height != target.descriptor.height)
             throw std::runtime_error("Live composite extent changed unexpectedly");
-        const cudaError_t status = detail::copy_live_receiver_frame(target, source.pixels, source.pitch_bytes, source.ready_event,
-                                                                    stream_value, detail::native_live_receiver_copy_operations());
+        const cudaError_t status = detail::copy_live_receiver_frame(target, source.pixels, source.pitch_bytes, source.ready_event, stream_value,
+                                                                    detail::native_live_receiver_copy_operations());
         if (status != cudaSuccess) throw std::runtime_error("Live composite receiver copy failed");
         std::move(lease_).Complete();
         return true;
     }
-
     void Stop() noexcept override {
         if (!plane_) return;
         lease_ = {};
@@ -129,9 +111,7 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
         Notify();
     }
     static void RevisionReady(void* context) noexcept { static_cast<NativeLiveAlgorithm*>(context)->Notify(); }
-    static void TerminalReady(void* context, const media::LivePhysicalTerminal&) noexcept {
-        static_cast<NativeLiveAlgorithm*>(context)->Fail();
-    }
+    static void TerminalReady(void* context, const media::LivePhysicalTerminal&) noexcept { static_cast<NativeLiveAlgorithm*>(context)->Fail(); }
     static bool AcquireMediaOutput(void* context, const media::PhysicalFrameRevision revision, media::LiveCompositeOutputLease* output) {
         return context != nullptr && static_cast<media::LiveMediaDataPlane*>(context)->try_acquire_output(revision, output);
     }
@@ -145,9 +125,7 @@ class NativeLiveAlgorithm final : public LiveAlgorithm {
     std::atomic_bool failed_{false};
     std::function<void()> ready_;
 };
-
 }  // namespace
-
 VisualRuntimeFactory make_native_live_runtime_factory(const VisualDeviceSettings settings, LiveNativeConfiguration configuration) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Live device settings are invalid");
     return [settings, execution = resolve_visual_device_execution(settings), configuration = std::move(configuration)](auto revisions) {
@@ -163,5 +141,4 @@ VisualRuntimeFactory make_native_live_runtime_factory(const VisualDeviceSettings
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
     };
 }
-
 }  // namespace mmltk::controller

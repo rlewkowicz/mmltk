@@ -1,17 +1,12 @@
 #pragma once
-
 #include <cstdint>
-
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/controller/contracts/visual_source.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
-
 namespace mmltk::frameworks::gpu {
 class BorrowedImageProductReadView;
 }
-
 namespace mmltk::controller {
-
 struct VisualExtent final {
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
@@ -19,7 +14,6 @@ struct VisualExtent final {
     // CLEANUP-IGNORE: Visual geometry has controller sampling semantics, independent of model-analysis regions.
     bool operator==(const VisualExtent&) const = default;
 };
-
 struct VisualRegion final {
     std::uint32_t x = 0U;
     std::uint32_t y = 0U;
@@ -51,24 +45,20 @@ struct VisualCleanContentIdentity final {
     bool operator==(const VisualCleanContentIdentity&) const = default;
 };
 [[nodiscard]] bool visual_product_matches_frame(const VisualFrame&, const mmltk::frameworks::gpu::BorrowedImageProductReadView&) noexcept;
-[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(
-    const VisualFrame&, mmltk::frameworks::gpu::BorrowedImageProductReadView);
-
-[[nodiscard]] constexpr VisualFrame visual_frame(const PresentationSourceIdentity source, const VisualExtent extent,
-                                                 const std::uint64_t revision) noexcept {
+[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame&,
+                                                                                                  mmltk::frameworks::gpu::BorrowedImageProductReadView);
+[[nodiscard]] constexpr VisualFrame visual_frame(const PresentationSourceIdentity source, const VisualExtent extent, const std::uint64_t revision) noexcept {
     return {
         .source = source,
         .extent = extent,
         .revision = revision,
     };
 }
-
 MMLTK_REFLECT_FIELDS(VisualExtent)
 MMLTK_REFLECT_FIELDS(VisualRegion)
 MMLTK_REFLECT_FIELDS(VisualFrame)
 MMLTK_REFLECT_FIELDS(VisualSourceObservation)
 MMLTK_REFLECT_FIELDS(VisualCleanContentIdentity)
-
 struct VisualCleanContentRelation final
     : mmltk::frameworks::reflection::StaticMemberRelation<
           VisualFrame, VisualCleanContentIdentity, 4U,
@@ -80,7 +70,6 @@ struct VisualCleanContentRelation final
     static constexpr auto zero_fallback_destination = &VisualCleanContentIdentity::revision;
 };
 static_assert(VisualCleanContentRelation::valid());
-
 [[nodiscard]] constexpr VisualCleanContentIdentity visual_clean_content_identity(const VisualFrame& frame) {
     VisualCleanContentIdentity identity;
     VisualCleanContentRelation::Project(frame, identity);
@@ -88,5 +77,4 @@ static_assert(VisualCleanContentRelation::valid());
         identity.*VisualCleanContentRelation::zero_fallback_destination = frame.*VisualCleanContentRelation::zero_fallback_source;
     return identity;
 }
-
 }  // namespace mmltk::controller

@@ -13,7 +13,9 @@ impl App {
                     self.settings.settle_success(&authoritative);
                     if let Some(pending) = self.model.workflow.pending_start.as_mut()
                         && pending.preparation == crate::view_model::StartPreparation::Waiting
-                        && let Some(inputs) = self.settings.draft().and_then(|draft| crate::view_model::StartInputs::capture(draft, pending.feature))
+                        && let Some(inputs) = self.settings.draft().and_then(|draft| {
+                            crate::view_model::StartInputs::capture(draft, pending.feature)
+                        })
                     {
                         pending.inputs = inputs;
                     }
@@ -205,9 +207,21 @@ impl App {
     }
 
     pub(super) fn handle_settings_schedule(&mut self, schedule: EditSchedule) -> Task<Message> {
-        if self.model.workflow.pending_start.as_ref().is_some_and(|pending| {
-            self.settings.draft().is_none_or(|draft| !pending.inputs.matches(draft))
-        }) { self.model.workflow.cancel_start("Start cancelled because its inputs changed."); }
+        if self
+            .model
+            .workflow
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| {
+                self.settings
+                    .draft()
+                    .is_none_or(|draft| !pending.inputs.matches(draft))
+            })
+        {
+            self.model
+                .workflow
+                .cancel_start("Start cancelled because its inputs changed.");
+        }
         match schedule {
             EditSchedule::Debounce(generation) => settings_persist_task(generation),
             EditSchedule::FlushNow => {

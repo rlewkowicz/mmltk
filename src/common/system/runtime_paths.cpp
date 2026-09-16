@@ -1,7 +1,5 @@
 #include "src/common/system/runtime_paths.h"
-
 #include <unistd.h>
-
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -10,16 +8,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 #include "src/common/system/time_utils.h"
-
 namespace mmltk::common::system {
-
 std::uint64_t steady_clock_now_ns() noexcept {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
 }
-
 namespace runtime_paths {
 std::filesystem::path repository_root() {
     if (const char* root = std::getenv("MMLTK_REPO_ROOT"); root != nullptr && root[0] != '\0') return root;

@@ -2,11 +2,9 @@
 #include "detail/shiftlut_model_format.h"
 #include <cuda_runtime_api.h>
 #include <onnxruntime_cxx_api.h>
-
 #define ONNX_NAMESPACE mmltk_onnx
 #include <onnx/checker.h>
 #include <onnx/onnx_pb.h>
-
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -20,32 +18,26 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
-
 namespace {
-
 namespace onnx = mmltk_onnx;
 namespace lut = mmltk::backend::imaging::upscale::shiftlut;
-
 void describe_layout() {
     std::cout << "{\"domain\":\"" << lut::kDomain << "\",\"operator\":\"" << lut::kOperator << "\",\"version\":" << lut::kVersion
-              << ",\"dtype\":\"<f4\",\"element_bytes\":" << sizeof(float) << ",\"elements\":" << lut::kTableElements
-              << ",\"bytes\":" << lut::kTableBytes << ",\"channels\":" << lut::kChannels << ",\"rgb_channels\":" << lut::kRgbChannels
-              << ",\"rotations\":" << lut::kRotations << ",\"stages\":" << lut::kStages << ",\"shift_axes\":" << lut::kShiftAxes
-              << ",\"scale\":" << lut::kScale << ",\"maximum_tile_extent\":" << lut::kMaximumTileExtent
-              << ",\"scratch_elements\":" << lut::kScratchElements << ",\"decision_checkpoints\":" << lut::kDecisionCheckpoints
-              << ",\"blocks\":[";
+              << ",\"dtype\":\"<f4\",\"element_bytes\":" << sizeof(float) << ",\"elements\":" << lut::kTableElements << ",\"bytes\":" << lut::kTableBytes
+              << ",\"channels\":" << lut::kChannels << ",\"rgb_channels\":" << lut::kRgbChannels << ",\"rotations\":" << lut::kRotations
+              << ",\"stages\":" << lut::kStages << ",\"shift_axes\":" << lut::kShiftAxes << ",\"scale\":" << lut::kScale
+              << ",\"maximum_tile_extent\":" << lut::kMaximumTileExtent << ",\"scratch_elements\":" << lut::kScratchElements
+              << ",\"decision_checkpoints\":" << lut::kDecisionCheckpoints << ",\"blocks\":[";
     for (std::size_t index = 0; index < lut::kTableBlocks; ++index) {
         const auto block = lut::table_block(index);
         if (index != 0) std::cout << ',';
-        std::cout << "{\"name\":\"" << block.name.data() << "\",\"kind\":\""
-                  << (block.family == lut::TableFamily::Shifts ? "shifts" : "lut") << "\",\"dimensions\":[" << block.shape.outer << ','
-                  << block.shape.inner << ',' << block.shape.domain << "],\"offset\":" << block.offset
+        std::cout << "{\"name\":\"" << block.name.data() << "\",\"kind\":\"" << (block.family == lut::TableFamily::Shifts ? "shifts" : "lut")
+                  << "\",\"dimensions\":[" << block.shape.outer << ',' << block.shape.inner << ',' << block.shape.domain << "],\"offset\":" << block.offset
                   << ",\"elements\":" << block.shape.elements() << '}';
     }
     std::cout << "]}\n";
     if (!std::cout) throw std::runtime_error("write ShiftLUT layout description");
 }
-
 void image_type(onnx::ValueInfoProto& value, const char* name, bool output) {
     value.set_name(name);
     auto* tensor = value.mutable_type()->mutable_tensor_type();
@@ -56,15 +48,12 @@ void image_type(onnx::ValueInfoProto& value, const char* name, bool output) {
     shape->add_dim()->set_dim_param(output ? "height4" : "height");
     shape->add_dim()->set_dim_param(output ? "width4" : "width");
 }
-
 void metadata(onnx::ModelProto& model, const char* name, std::string_view value) {
     auto* item = model.add_metadata_props();
     item->set_key(name);
     item->set_value(std::string(value));
 }
-
-void generate(const std::filesystem::path& tables, const std::filesystem::path& output, std::string_view lut_digest,
-              std::string_view source_digest) {
+void generate(const std::filesystem::path& tables, const std::filesystem::path& output, std::string_view lut_digest, std::string_view source_digest) {
     static_assert(std::endian::native == std::endian::little);
     const std::size_t bytes = lut::kTableBytes;
     if (std::filesystem::file_size(tables) != bytes) throw std::invalid_argument("invalid checked ShiftLUT interchange length");
@@ -111,16 +100,13 @@ void generate(const std::filesystem::path& tables, const std::filesystem::path& 
     stream.close();
     if (!stream) throw std::runtime_error("close ShiftLUT model");
 }
-
 void cuda_checked(cudaError_t status, const char* context) {
     if (status != cudaSuccess) throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
 }
-
 class VerificationStorage final {
    public:
     void Allocate() {
-        cuda_checked(cudaMalloc(reinterpret_cast<void**>(&data_), (kInputElements + kOutputElements) * sizeof(float)),
-                     "allocate fixed verification tensors");
+        cuda_checked(cudaMalloc(reinterpret_cast<void**>(&data_), (kInputElements + kOutputElements) * sizeof(float)), "allocate fixed verification tensors");
         cuda_checked(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "create verification stream");
     }
     ~VerificationStorage() {
@@ -141,7 +127,6 @@ class VerificationStorage final {
     float* data_ = nullptr;
     cudaStream_t stream_ = nullptr;
 };
-
 std::vector<float> read_vector(const std::filesystem::path& path, std::size_t count) {
     if (std::filesystem::file_size(path) != count * sizeof(float)) throw std::invalid_argument("invalid upstream oracle size");
     std::vector<float> values(count);
@@ -150,9 +135,7 @@ std::vector<float> read_vector(const std::filesystem::path& path, std::size_t co
         throw std::runtime_error("read independent upstream oracle");
     return values;
 }
-
-void verify(const std::filesystem::path& path, const std::filesystem::path& directory, std::string_view lut_digest,
-            std::string_view source_digest) {
+void verify(const std::filesystem::path& path, const std::filesystem::path& directory, std::string_view lut_digest, std::string_view source_digest) {
     onnx::ModelProto graph;
     std::ifstream model_file(path, std::ios::binary);
     if (!graph.ParseFromIstream(&model_file)) throw std::invalid_argument("invalid production ONNX");
@@ -188,15 +171,13 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
                 const auto input_count = static_cast<std::size_t>(height * width * lut::kRgbChannels);
                 const auto input = read_vector(directory / (label + ".input.f32"), input_count);
                 const auto expected = read_vector(directory / (label + ".expected.f32"), input_count * lut::kOutputPhases);
-                cuda_checked(
-                    cudaMemcpyAsync(storage.Input(), input.data(), input_count * sizeof(float), cudaMemcpyHostToDevice, storage.Stream()),
-                    "copy changed verification pixels");
+                cuda_checked(cudaMemcpyAsync(storage.Input(), input.data(), input_count * sizeof(float), cudaMemcpyHostToDevice, storage.Stream()),
+                             "copy changed verification pixels");
                 const std::array<std::int64_t, 4> input_shape{1, lut::kRgbChannels, height, width},
                     output_shape{1, lut::kRgbChannels, height * lut::kScale, width * lut::kScale};
-                auto input_value =
-                    Ort::Value::CreateTensor<float>(memory, storage.Input(), input_count, input_shape.data(), input_shape.size());
-                auto output_value = Ort::Value::CreateTensor<float>(memory, storage.Output(), input_count * lut::kOutputPhases,
-                                                                    output_shape.data(), output_shape.size());
+                auto input_value = Ort::Value::CreateTensor<float>(memory, storage.Input(), input_count, input_shape.data(), input_shape.size());
+                auto output_value =
+                    Ort::Value::CreateTensor<float>(memory, storage.Output(), input_count * lut::kOutputPhases, output_shape.data(), output_shape.size());
                 Ort::IoBinding binding{session};
                 binding.BindInput("image", input_value);
                 binding.BindOutput("upscaled", output_value);
@@ -204,19 +185,15 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
                 const auto graph_id = std::to_string(height * 257 + width);
                 run.AddConfigEntry("gpu_graph_id", graph_id.c_str());
                 const auto before = allocation_count;
-                for (int replay = 0; replay < 3; ++replay)
-                    session.Run(run, binding);
+                for (int replay = 0; replay < 3; ++replay) session.Run(run, binding);
                 cuda_checked(cudaStreamSynchronize(storage.Stream()), "settle verification replay");
                 const auto after = allocation_count;
                 if (before != after) throw std::runtime_error("ShiftLUT operator allocated during execution");
                 std::vector<float> actual(expected.size());
-                cuda_checked(cudaMemcpy(actual.data(), storage.Output(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost),
-                             "read verification output");
+                cuda_checked(cudaMemcpy(actual.data(), storage.Output(), actual.size() * sizeof(float), cudaMemcpyDeviceToHost), "read verification output");
                 if (actual != expected) {
-                    std::ofstream mismatch(directory / (label + (capture ? ".graph.actual.f32" : ".fallback.actual.f32")),
-                                           std::ios::binary);
-                    mismatch.write(reinterpret_cast<const char*>(actual.data()),
-                                   static_cast<std::streamsize>(actual.size() * sizeof(float)));
+                    std::ofstream mismatch(directory / (label + (capture ? ".graph.actual.f32" : ".fallback.actual.f32")), std::ios::binary);
+                    mismatch.write(reinterpret_cast<const char*>(actual.data()), static_cast<std::streamsize>(actual.size() * sizeof(float)));
                     throw std::runtime_error("independent upstream ShiftLUT mismatch: " + label);
                 }
                 const bool probe_decisions = height * width <= 1024;
@@ -224,15 +201,13 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
                     const auto count = lut::decision_elements(static_cast<std::size_t>(height * width));
                     std::vector<std::int8_t> decisions(count), expected_decisions(count);
                     const auto decision_path = directory / (label + ".decisions.i8");
-                    if (std::filesystem::file_size(decision_path) != count)
-                        throw std::invalid_argument("invalid upstream decision oracle size");
+                    if (std::filesystem::file_size(decision_path) != count) throw std::invalid_argument("invalid upstream decision oracle size");
                     std::ifstream decision_file(decision_path, std::ios::binary);
                     if (!decision_file.read(reinterpret_cast<char*>(expected_decisions.data()), static_cast<std::streamsize>(count)))
                         throw std::runtime_error("read upstream lookup decisions");
                     cuda_checked(operators.ReadDecisions(decisions), "read captured ShiftLUT lookup inputs");
                     if (decisions != expected_decisions) {
-                        std::ofstream mismatch(directory / (label + (capture ? ".graph.decisions.i8" : ".fallback.decisions.i8")),
-                                               std::ios::binary);
+                        std::ofstream mismatch(directory / (label + (capture ? ".graph.decisions.i8" : ".fallback.decisions.i8")), std::ios::binary);
                         mismatch.write(reinterpret_cast<const char*>(decisions.data()), static_cast<std::streamsize>(decisions.size()));
                         throw std::runtime_error("independent upstream lookup decision mismatch: " + label);
                     }
@@ -252,9 +227,7 @@ void verify(const std::filesystem::path& path, const std::filesystem::path& dire
     evidence.close();
     if (!evidence) throw std::runtime_error("write ShiftLUT verification evidence");
 }
-
 }  // namespace
-
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--describe-layout") {

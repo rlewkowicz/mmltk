@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <compare>
 #include <concepts>
@@ -7,17 +6,13 @@
 #include <cstdint>
 #include <meta>
 #include <type_traits>
-
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
-
 namespace mmltk::controller {
-
 struct BrowserContentSession final {
     std::uint64_t value;
 };
-
 enum class PresentationSourceKind : std::uint8_t {
     None[[= BrowserContentSession{0U}]],
     Explore[[= BrowserContentSession{1U}]],
@@ -27,12 +22,10 @@ enum class PresentationSourceKind : std::uint8_t {
     Upscale[[= BrowserContentSession{5U}]],
     Validation[[= BrowserContentSession{6U}]],
 };
-
 struct PresentationSourceMetadata final {
     PresentationSourceKind kind;
     std::uint64_t session;
 };
-
 struct PresentationSourceMaterializer final {
     template <class Owner, class Input>
     [[nodiscard]] consteval auto operator()() const {
@@ -58,24 +51,17 @@ struct PresentationSourceMaterializer final {
         return result;
     }
 };
-
-inline constexpr auto presentation_source_metadata =
-    mmltk::frameworks::reflection::materialize<PresentationSourceKind>(PresentationSourceMaterializer{});
-
+inline constexpr auto presentation_source_metadata = mmltk::frameworks::reflection::materialize<PresentationSourceKind>(PresentationSourceMaterializer{});
 [[nodiscard]] constexpr std::uint64_t presentation_source_session(const PresentationSourceKind kind) noexcept {
     const auto index = static_cast<std::size_t>(kind);
     return index < presentation_source_metadata.size() ? presentation_source_metadata[index].session : 0U;
 }
-
 struct PresentationSourceIdentity final {
     PresentationSourceKind kind = PresentationSourceKind::None;
     std::uint32_t instance = 0U;
-
     [[nodiscard]] constexpr bool valid() const noexcept { return presentation_source_session(kind) != 0U && instance != 0U; }
     constexpr auto operator<=>(const PresentationSourceIdentity&) const = default;
 };
-
 MMLTK_REFLECT_ENUM(PresentationSourceKind)
 MMLTK_REFLECT_FIELDS(PresentationSourceIdentity)
-
 }  // namespace mmltk::controller

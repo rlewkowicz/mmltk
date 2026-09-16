@@ -2,11 +2,8 @@ module;
 #include <atomic>
 #include <cstdint>
 #include <limits>
-
 module mmltk.backend.ml.cuda.gpu_quiescence;
-
 namespace mmltk::backend::ml::cuda {
-
 GpuBackendGeneration next_gpu_backend_generation() noexcept {
     static std::atomic<std::uint64_t> next_generation{1U};
     std::uint64_t candidate = next_generation.load(std::memory_order_relaxed);
@@ -16,5 +13,4 @@ GpuBackendGeneration next_gpu_backend_generation() noexcept {
     }
     return {};
 }
-
 }  // namespace mmltk::backend::ml::cuda

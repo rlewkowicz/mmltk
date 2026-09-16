@@ -1,22 +1,17 @@
 #include <filesystem>
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstddef>
 #include <span>
 #include <vector>
-
 #include "src/controller/subsystems/annotation/detail/annotation_atomic_save.h"
-
 namespace mmltk::controller::subsystems::annotation {
 namespace {
-
 class PosixAtomicSaveBackend final {
    public:
     [[nodiscard]] bool open_exclusive(const std::string_view path) noexcept {
@@ -45,8 +40,7 @@ class PosixAtomicSaveBackend final {
         return closed;
     }
     [[nodiscard]] bool rename_file(const std::string_view from, const std::string_view to) noexcept {
-        return with_two_paths(from, to,
-                              [](const char* source, const char* destination) noexcept { return ::rename(source, destination) == 0; });
+        return with_two_paths(from, to, [](const char* source, const char* destination) noexcept { return ::rename(source, destination) == 0; });
     }
     void remove_file(const std::string_view path) noexcept {
         static_cast<void>(with_path(path, [](const char* value) noexcept { return ::unlink(value) == 0; }));
@@ -83,9 +77,7 @@ class PosixAtomicSaveBackend final {
     }
     int descriptor_ = -1;
 };
-
 }  // namespace
-
 DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& state, const std::string_view destination,
                                             const std::uint64_t generation) noexcept {
     if (!state.valid() || destination.empty() || generation == 0U) return DocumentSaveEffect::NotApplied;
@@ -110,5 +102,4 @@ DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& sta
         return annotation_persistence::AtomicSave(backend, bytes, path.string(), state.document_revision, generation);
     } catch (...) { return DocumentSaveEffect::NotApplied; }
 }
-
 }  // namespace mmltk::controller::subsystems::annotation

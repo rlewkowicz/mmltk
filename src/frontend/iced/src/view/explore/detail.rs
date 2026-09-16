@@ -77,7 +77,8 @@ pub(super) fn view<'a>(
         content.configure_surface(surface, original, state.fit_revision),
         crate::presentation_surface::labels::Source::Detail(content.clone(), overlay.showlabels),
         Some(input.for_source(content.frame().source.kind, 0, None)),
-        crate::workspace_fps::enabled(settings), super::DETAIL_WORKSPACE_ID,
+        crate::workspace_fps::enabled(settings),
+        super::DETAIL_WORKSPACE_ID,
     );
     let active = model.displayed_upscale_kernel();
     let pending = model

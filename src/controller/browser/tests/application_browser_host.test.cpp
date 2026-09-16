@@ -4,15 +4,12 @@
 #include "src/controller/browser/application_browser_host.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
-
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
-
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -37,7 +34,6 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/presentation/presentation_system.h"
@@ -57,12 +53,9 @@
 #include "src/controller/subsystems/train/training_system.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
-
 namespace mmltk::controller::browser {
 namespace {
-
 namespace transport = mmltk::frameworks::transport;
-
 template <class Composition, class SystemCell>
 [[nodiscard]] consteval bool append_reflected_event_ids(std::vector<std::uint64_t>& identities) {
     bool matched = true;
@@ -74,7 +67,6 @@ template <class Composition, class SystemCell>
     });
     return matched;
 }
-
 template <class Composition>
 [[nodiscard]] consteval bool reflected_application_ids_match_members() {
     std::size_t count = 0U;
@@ -87,7 +79,6 @@ template <class Composition>
     }
     return matched && count == 13U;
 }
-
 template <class Composition>
 [[nodiscard]] consteval bool reflected_event_ids_are_exhaustive() {
     std::vector<std::uint64_t> identities;
@@ -100,16 +91,13 @@ template <class Composition>
         ++system_count;
     }
     for (std::size_t left = 0U; left < identities.size(); ++left)
-        for (std::size_t right = left + 1U; right < identities.size(); ++right)
-            matched = matched && identities[left] != identities[right];
+        for (std::size_t right = left + 1U; right < identities.size(); ++right) matched = matched && identities[left] != identities[right];
     return matched && system_count == 13U && identities.size() >= system_count;
 }
-
 TEST_CASE("host event identities derive from every application member") {
     STATIC_REQUIRE(reflected_application_ids_match_members<ApplicationSystems>());
     STATIC_REQUIRE(reflected_event_ids_are_exhaustive<ApplicationSystems>());
 }
-
 enum class OpenPressure : std::uint8_t {
     None,
     Transient,
@@ -117,7 +105,6 @@ enum class OpenPressure : std::uint8_t {
     LatestState,
     Activation,
 };
-
 struct HostCallbackContext final {
     transport::BrowserServer::Callbacks host;
     ApplicationBrowserHost* owner = nullptr;
@@ -127,7 +114,6 @@ struct HostCallbackContext final {
     std::mutex mutex;
     std::condition_variable changed;
     std::array<std::size_t, 12U> diagnostics{};
-
     static void Opened(void* opaque) noexcept {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
         ++self.epoch;
@@ -146,32 +132,28 @@ struct HostCallbackContext final {
             });
         }
     }
-
     static void Activated(void* opaque) noexcept {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
         if (self.host.activated) self.host.activated(self.host.context.get());
         if (self.pressure != OpenPressure::Activation) return;
         wire::ByteBuffer bytes;
-        if (!encode_server_record(ServerRecord{InteractionRejected{
-                                      .endpoint_id = self.epoch,
-                                      .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "activation"}}},
-                                  bytes)) {
+        if (!encode_server_record(
+                ServerRecord{InteractionRejected{.endpoint_id = self.epoch,
+                                                 .error = {.category = contracts::ApplicationErrorCategory::Unavailable, .detail = "activation"}}},
+                bytes)) {
             self.server->close_peer();
             return;
         }
         static_cast<void>(self.server->publish({.bytes = std::move(bytes), .priority = transport::BrowserRecordPriority::Critical}));
     }
-
     static bool Record(void* opaque, const std::span<const std::byte> bytes) noexcept {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
         return self.host.record(self.host.context.get(), bytes);
     }
-
     static void Closed(void* opaque) noexcept {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
         self.host.closed(self.host.context.get());
     }
-
     static void Diagnostic(void* opaque, const transport::BrowserServerEvent event, const std::size_t value) noexcept {
         auto& self = *static_cast<HostCallbackContext*>(opaque);
         {
@@ -181,13 +163,11 @@ struct HostCallbackContext final {
         self.changed.notify_all();
         if (self.host.diagnostic != nullptr) self.host.diagnostic(self.host.context.get(), event, value);
     }
-
     [[nodiscard]] bool await(const transport::BrowserServerEvent event) {
         std::unique_lock lock(mutex);
         return changed.wait_for(lock, std::chrono::seconds{2}, [&] { return diagnostics[static_cast<std::size_t>(event)] != 0U; });
     }
 };
-
 class RunningHost final {
    public:
     explicit RunningHost(const OpenPressure pressure)
@@ -228,7 +208,6 @@ class RunningHost final {
         std::unique_lock lock(mutex_);
         changed_.wait(lock, [&] { return ready_; });
     }
-
     ~RunningHost() {
         {
             std::scoped_lock lock(mutex_);
@@ -236,7 +215,6 @@ class RunningHost final {
         }
         owner_.join();
     }
-
     [[nodiscard]] const std::string& websocket() const noexcept { return websocket_; }
     [[nodiscard]] std::shared_ptr<HostCallbackContext> context() const {
         std::scoped_lock lock(mutex_);
@@ -253,25 +231,22 @@ class RunningHost final {
     bool ready_ = false;
     std::thread owner_;
 };
-
 class HostAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
     void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion) override {}
     contracts::AnnotationColor Sample(contracts::AnnotationPoint) override { return {}; }
-    void Render(const AnnotationRenderState&, const mmltk::frameworks::gpu::ImagePlaneView source,
-                const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                std::uintptr_t) const override {
+    void Render(const AnnotationRenderState&, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
+                const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {
         if (source.valid()) mmltk::frameworks::gpu::test_support::CopyImagePlane(clean, source);
         std::memset(reinterpret_cast<void*>(semantic.data), 0, semantic.descriptor.pitch_bytes * semantic.descriptor.height);
     }
 };
-
 class ReadyHostAnnotation final {
    public:
     ReadyHostAnnotation()
         : backend_(std::make_shared<mmltk::frameworks::gpu::test_support::FakeImageBackend>()),
-          source_(std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(
-              mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
+          source_(
+              std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(mmltk::frameworks::gpu::SystemImageRuntimeConfig{.device = 0, .backend = backend_})),
           annotation_(
               {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
               [backend = backend_](auto revisions) {
@@ -302,13 +277,11 @@ class ReadyHostAnnotation final {
               mmltk::testsupport::annotation_render_evidence()) {
         source_->Publish(16U, 16U, [](auto, auto, auto) {});
         static_cast<void>(annotation_.Open({.source = visual_frame(identity_, {16U, 16U}, source_->OutputFacts().revision)}));
-        const bool ready =
-            Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });
+        const bool ready = Wait([this] { return (annotation_.snapshot().ready && annotation_.snapshot().frame.valid()) || !failure_.empty(); });
         INFO("Annotation startup failure: " << failure_);
         REQUIRE(ready);
         REQUIRE(failure_.empty());
     }
-
     [[nodiscard]] AnnotationSystem& system() noexcept { return annotation_; }
     void Flush() {
         const auto before = annotation_.snapshot();
@@ -322,7 +295,6 @@ class ReadyHostAnnotation final {
             return !state.busy && state.revision > revision;
         }));
     }
-
     template <class Predicate>
     [[nodiscard]] bool Wait(Predicate predicate) {
         std::unique_lock lock(mutex_);
@@ -339,17 +311,14 @@ class ReadyHostAnnotation final {
     std::string failure_;
     AnnotationSystem annotation_;
 };
-
 struct WebSocketFrame final {
     std::uint8_t opcode = 0U;
     std::vector<std::byte> payload;
 };
-
 enum class HandshakePolicy : std::uint8_t {
     RequireUpgrade,
     AllowPeerClose,
 };
-
 class LoopbackWebSocket final {
    public:
     explicit LoopbackWebSocket(const std::string& url, const HandshakePolicy handshake = HandshakePolicy::RequireUpgrade) {
@@ -371,8 +340,7 @@ class LoopbackWebSocket final {
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         REQUIRE(::connect(descriptor_.get(), reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
         const std::string origin = "http://127.0.0.1:" + std::to_string(port);
-        const std::string request = "GET " + url.substr(slash) + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port) +
-                                    "\r\nOrigin: " + origin +
+        const std::string request = "GET " + url.substr(slash) + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(port) + "\r\nOrigin: " + origin +
                                     "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                                     "Sec-WebSocket-Version: 13\r\n\r\n";
@@ -381,9 +349,7 @@ class LoopbackWebSocket final {
         while (response.find("\r\n\r\n") == std::string::npos) {
             char byte = '\0';
             ssize_t received;
-            do {
-                received = ::recv(descriptor_.get(), &byte, sizeof(byte), 0);
-            } while (received < 0 && errno == EINTR);
+            do { received = ::recv(descriptor_.get(), &byte, sizeof(byte), 0); } while (received < 0 && errno == EINTR);
             if (received == 0) {
                 REQUIRE(response.empty());
                 REQUIRE(handshake == HandshakePolicy::AllowPeerClose);
@@ -394,7 +360,6 @@ class LoopbackWebSocket final {
         }
         REQUIRE(response.starts_with("HTTP/1.1 101"));
     }
-
     [[nodiscard]] std::optional<WebSocketFrame> receive() {
         std::array<std::byte, 2U> header{};
         if (!read_exact(header, true)) return std::nullopt;
@@ -411,15 +376,13 @@ class LoopbackWebSocket final {
             std::array<std::byte, 8U> extended{};
             REQUIRE(read_exact(extended));
             size = 0U;
-            for (const auto byte : extended)
-                size = (size << 8U) | std::to_integer<std::uint64_t>(byte);
+            for (const auto byte : extended) size = (size << 8U) | std::to_integer<std::uint64_t>(byte);
         }
         REQUIRE(size <= kMaxRecordWireBytes);
         frame.payload.resize(static_cast<std::size_t>(size));
         REQUIRE(read_exact(frame.payload));
         return frame;
     }
-
     void send_binary(const std::span<const std::byte> payload) { write_exact(mmltk::testsupport::masked_websocket_frame(2U, payload)); }
 
    private:
@@ -450,10 +413,8 @@ class LoopbackWebSocket final {
         }
         return true;
     }
-
     mmltk::common::io::ScopedFd descriptor_;
 };
-
 [[nodiscard]] ServerRecord decode(const WebSocketFrame& frame) {
     REQUIRE(frame.opcode == 2U);
     const auto bytes = std::span<const std::byte>{frame.payload};
@@ -461,16 +422,13 @@ class LoopbackWebSocket final {
     REQUIRE(decoded);
     return std::move(*decoded);
 }
-
 [[nodiscard]] std::uint64_t settings_reset_endpoint() {
     std::uint64_t result = 0U;
     ApplicationIntentSurface<ApplicationSystems>::Visit([&]<class Endpoint>() {
-        if constexpr (std::same_as<typename Endpoint::signature::owner_type, SettingsSystem> && Endpoint::name == "Reset")
-            result = Endpoint::stable_id;
+        if constexpr (std::same_as<typename Endpoint::signature::owner_type, SettingsSystem> && Endpoint::name == "Reset") result = Endpoint::stable_id;
     });
     return result;
 }
-
 [[nodiscard]] Interaction explore_viewport_interaction() {
     wire::ByteBuffer bytes(mmltk::frameworks::serialization::compact_maximum_cbor_bytes<ExploreViewportUpdate>());
     mmltk::frameworks::serialization::FixedCborEncoder writer(bytes);
@@ -478,7 +436,6 @@ class LoopbackWebSocket final {
     bytes.resize(writer.size());
     return {.endpoint_id = application_stable_id("explore", "UpdateViewport"), .value = std::move(bytes)};
 }
-
 TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     RunningHost server{OpenPressure::Activation};
     REQUIRE_FALSE(server.websocket().empty());
@@ -487,13 +444,11 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     REQUIRE(first);
     REQUIRE(std::holds_alternative<Bootstrap>(decode(*first)));
     CHECK(std::get<Bootstrap>(decode(*first)).input_epoch != 0U);
-
     const auto progress_frame = peer.receive();
     REQUIRE(progress_frame);
     const auto progress = decode(*progress_frame);
     REQUIRE(std::holds_alternative<InteractionRejected>(progress));
     CHECK(std::get<InteractionRejected>(progress).endpoint_id == std::get<Bootstrap>(decode(*first)).input_epoch);
-
     const auto endpoint = settings_reset_endpoint();
     REQUIRE(endpoint != 0U);
     wire::ByteBuffer intent;
@@ -521,7 +476,6 @@ TEST_CASE("direct host emits Bootstrap and dispatches intent on a real peer") {
     REQUIRE(std::holds_alternative<InteractionRejected>(decode(*replacement_progress)));
     CHECK(std::get<InteractionRejected>(decode(*replacement_progress)).endpoint_id == std::get<Bootstrap>(bootstrap).input_epoch);
 }
-
 TEST_CASE("direct host closes a real peer on malformed Protocol-17 input") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
@@ -531,7 +485,6 @@ TEST_CASE("direct host closes a real peer on malformed Protocol-17 input") {
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));
 }
-
 TEST_CASE("ordinary browser host rejects explicit integration control", "[controller][browser][protocol]") {
     using Kind = mmltk::controller::contracts::IntegrationControlKind;
     const auto kind = GENERATE(Kind::Settled, Kind::CapacityArmRequested, Kind::VisibleReadArmRequested);
@@ -544,12 +497,10 @@ TEST_CASE("ordinary browser host rejects explicit integration control", "[contro
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));
 }
-
 TEST_CASE("direct host keeps a real peer after decoded application interaction rejection") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
-
     wire::ByteBuffer interaction;
     REQUIRE(encode_client_record(ClientRecord{explore_viewport_interaction()}, interaction));
     peer.send_binary(interaction);
@@ -559,7 +510,6 @@ TEST_CASE("direct host keeps a real peer after decoded application interaction r
     REQUIRE(std::holds_alternative<InteractionRejected>(rejected));
     CHECK(std::get<InteractionRejected>(rejected).endpoint_id == application_stable_id("explore", "UpdateViewport"));
     CHECK(std::get<InteractionRejected>(rejected).error.category == contracts::ApplicationErrorCategory::Unavailable);
-
     wire::ByteBuffer later_intent;
     REQUIRE(encode_client_record(ClientRecord{Intent{
                                      .correlation = 29U,
@@ -574,26 +524,22 @@ TEST_CASE("direct host keeps a real peer after decoded application interaction r
     REQUIRE(std::holds_alternative<IntentReply>(reply));
     CHECK(std::get<IntentReply>(reply).correlation == 29U);
 }
-
 TEST_CASE("application interaction rejection emits bounded endpoint and error diagnostics") {
     int descriptors[2]{-1, -1};
     REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
     mmltk::common::io::ScopedFd reader{descriptors[0]};
-    services::DiagnosticsClient diagnostics{mmltk::common::io::ScopedFd{descriptors[1]},
-                                            services::DiagnosticsExecutionPolicy::CallerDriven};
+    services::DiagnosticsClient diagnostics{mmltk::common::io::ScopedFd{descriptors[1]}, services::DiagnosticsExecutionPolicy::CallerDriven};
     services::RuntimeDiagnostics runtime{diagnostics.producer()};
     transport::BrowserServer server;
     ApplicationBrowserHost host{server, runtime.target()};
     SettingsSystem settings;
     ApplicationSystems systems{.settings = &settings};
     REQUIRE(host.install(systems));
-
     wire::ByteBuffer interaction;
     REQUIRE(encode_client_record(ClientRecord{explore_viewport_interaction()}, interaction));
     const auto callbacks = host.callbacks();
     CHECK(callbacks.record(callbacks.context.get(), interaction));
     diagnostics.flush();
-
     // CLEANUP-IGNORE: Interaction diagnostics and benchmark diagnostics own separate pipe records.
     std::array<char, services::DiagnosticsClient::kRecordCapacity> record{};
     const ssize_t size = ::read(reader.get(), record.data(), record.size());
@@ -606,7 +552,6 @@ TEST_CASE("application interaction rejection emits bounded endpoint and error di
     CHECK(jsonl.contains(R"("message":"application system is unavailable")"));
     diagnostics.close(services::DiagnosticsCloseMode::Discard);
 }
-
 TEST_CASE("direct host closes a real peer when an interaction endpoint is unknown") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
@@ -620,7 +565,6 @@ TEST_CASE("direct host closes a real peer when an interaction endpoint is unknow
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));
 }
-
 TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     transport::BrowserServer server;
     ApplicationBrowserHost host{server};
@@ -628,7 +572,6 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     ApplicationSystems systems{.annotation = &ready.system()};
     REQUIRE(host.install(systems));
     const auto callbacks = host.callbacks();
-
     auto& annotation = ready.system();
     const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
     mmltk::testsupport::await_annotation_command(annotation, ready, edit.revision);
@@ -645,7 +588,6 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     callbacks.closed(callbacks.context.get());
     REQUIRE(ready.Wait([&] { return annotation.snapshot().frame.revision > rendered; }));
     CHECK(annotation.snapshot().ui.scene.objects.empty());
-
     annotation.SetInputPeer(1U);
     rendered = annotation.snapshot().frame.revision;
     gesture(1U, contracts::AnnotationPointerPhase::Begin, 1U, 1U);
@@ -655,7 +597,6 @@ TEST_CASE("browser admission gates Annotation peer-terminal notification") {
     gesture(1U, contracts::AnnotationPointerPhase::End, 2U, 2U);
     REQUIRE(ready.Wait([&] { return annotation.snapshot().ui.scene.objects.size() == 1U; }));
 }
-
 TEST_CASE("browser admission settles acceptance redraw callbacks before releasing systems") {
     std::array<int, 2U> sockets{};
     REQUIRE(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets.data()) == 0);
@@ -692,14 +633,12 @@ TEST_CASE("browser admission settles acceptance redraw callbacks before releasin
     CHECK(gate->AwaitInitialRelease(0U) == ExploreAcceptanceGate::WaitResult::Stale);
     CHECK_FALSE(host.accepting());
 }
-
 TEST_CASE("direct host drops transient pressure in the real open epoch") {
     RunningHost server{OpenPressure::Transient};
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());
     REQUIRE(server.context()->await(transport::BrowserServerEvent::TransientDropped));
 }
-
 TEST_CASE("direct host closes critical pressure in the real open epoch") {
     RunningHost server{OpenPressure::Critical};
     LoopbackWebSocket peer{server.websocket(), HandshakePolicy::AllowPeerClose};
@@ -707,7 +646,6 @@ TEST_CASE("direct host closes critical pressure in the real open epoch") {
     CHECK((!terminal || terminal->opcode == 8U));
     REQUIRE(server.context()->await(transport::BrowserServerEvent::CriticalCapacityClosed));
 }
-
 TEST_CASE("direct host closes the peer when essential state continuity is lost") {
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket(), HandshakePolicy::AllowPeerClose};
@@ -716,7 +654,6 @@ TEST_CASE("direct host closes the peer when essential state continuity is lost")
     const auto terminal = peer.receive();
     CHECK((!terminal || terminal->opcode == 8U));
 }
-
 TEST_CASE("essential typed encoding failure closes once and reconnect restores bootstrap") {
     RunningHost server{OpenPressure::None};
     std::size_t failures = 0U;
@@ -744,7 +681,6 @@ TEST_CASE("essential typed encoding failure closes once and reconnect restores b
     REQUIRE(std::get<Bootstrap>(record).snapshots.size() == 1U);
     CHECK(std::get<Bootstrap>(record).snapshots.front().system_id == application_system_stable_id<&ApplicationSystems::settings>());
 }
-
 TEST_CASE("direct host preserves the final complete state across a snapshot burst") {
     RunningHost server{OpenPressure::LatestState};
     LoopbackWebSocket peer{server.websocket()};
@@ -760,6 +696,5 @@ TEST_CASE("direct host preserves the final complete state across a snapshot burs
     CHECK(event.event_id == 1U);
     CHECK(event.value == wire::Value(wire::Value::Object{{"revision", wire::Value(std::uint64_t{64U})}}));
 }
-
 }  // namespace
 }  // namespace mmltk::controller::browser

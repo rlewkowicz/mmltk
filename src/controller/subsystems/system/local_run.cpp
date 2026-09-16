@@ -1,24 +1,18 @@
 #include "src/controller/subsystems/system/local_run.h"
-
 #include <stdexcept>
 #include <utility>
-
 namespace mmltk::controller::direct {
-
 LocalRun::~LocalRun() noexcept { StopAndJoin(); }
-
 void LocalRun::Start(Job job) {
     if (!job.work) throw std::invalid_argument("local run work is unavailable");
     std::jthread retired;
     {
         std::unique_lock lock(mutex_);
         if (active_) throw contracts::BusyError("operation is already active");
-        if (worker_.joinable() && worker_.get_id() == std::this_thread::get_id())
-            throw contracts::BusyError("operation observer is still active");
+        if (worker_.joinable() && worker_.get_id() == std::this_thread::get_id()) throw contracts::BusyError("operation observer is still active");
         retired = std::move(worker_);
     }
     if (retired.joinable()) retired.join();
-
     std::unique_lock lock(mutex_);
     if (active_) throw contracts::BusyError("operation is already active");
     auto control = std::make_shared<RunControl>();
@@ -65,8 +59,7 @@ void LocalRun::Start(Job job) {
         if (job.prepare) job.prepare();
     } catch (...) {
         auto expected = control;
-        static_cast<void>(current_.compare_exchange_strong(expected, std::shared_ptr<RunControl>{}, std::memory_order_acq_rel,
-                                                           std::memory_order_acquire));
+        static_cast<void>(current_.compare_exchange_strong(expected, std::shared_ptr<RunControl>{}, std::memory_order_acq_rel, std::memory_order_acquire));
         control->ready.release();
         lock.unlock();
         candidate.join();
@@ -77,26 +70,20 @@ void LocalRun::Start(Job job) {
     control->launch.store(true, std::memory_order_release);
     control->ready.release();
 }
-
 bool LocalRun::Stop() noexcept { return CurrentStopSource().request_stop(); }
-
 std::stop_source LocalRun::CurrentStopSource() const noexcept {
     const auto control = current_.load(std::memory_order_acquire);
     return control ? control->stop : std::stop_source{std::nostopstate};
 }
-
 bool LocalRun::active() const noexcept {
     std::scoped_lock lock(mutex_);
     return active_;
 }
-
 void LocalRun::Finish(const std::shared_ptr<RunControl>& control) noexcept {
     std::scoped_lock lock(mutex_);
     auto expected = control;
-    if (current_.compare_exchange_strong(expected, std::shared_ptr<RunControl>{}, std::memory_order_acq_rel, std::memory_order_acquire))
-        active_ = false;
+    if (current_.compare_exchange_strong(expected, std::shared_ptr<RunControl>{}, std::memory_order_acq_rel, std::memory_order_acquire)) active_ = false;
 }
-
 void LocalRun::StopAndJoin() noexcept {
     static_cast<void>(Stop());
     std::jthread worker;
@@ -108,5 +95,4 @@ void LocalRun::StopAndJoin() noexcept {
     if (worker.joinable()) worker.join();
     current_.store({}, std::memory_order_release);
 }
-
 }  // namespace mmltk::controller::direct

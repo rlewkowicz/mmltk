@@ -4,7 +4,6 @@
 #include "catch2_compat.hpp"
 #include <fstream>
 using mmltk::controller::services::TrainRunStore;
-
 namespace {
 void test_current_training_history_pages_and_attempt_configuration() {
     namespace r = mmltk::backend::models::rfdetr;
@@ -65,5 +64,5 @@ void test_current_training_history_pages_and_attempt_configuration() {
     REQUIRE(fresh != temp.path());
     REQUIRE(std::filesystem::is_empty(fresh));
 }
-}
+}  // namespace
 MMLTK_REGISTER_TEST_CASE("[gui][train][history]", test_current_training_history_pages_and_attempt_configuration);

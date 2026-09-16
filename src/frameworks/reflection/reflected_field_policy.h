@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -15,33 +14,24 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
-
 namespace mmltk::frameworks::serialization::implementation::detail {
 struct OpaqueCborFacade;
 }
-
 namespace mmltk::frameworks::reflection {
-
 template <class T>
 using RemoveCvRef = std::remove_cvref_t<T>;
-
 template <class T>
 inline constexpr bool kReflectedIntegerScalar =
     std::same_as<RemoveCvRef<T>, bool> || std::same_as<RemoveCvRef<T>, std::uint8_t> || std::same_as<RemoveCvRef<T>, std::uint16_t> ||
-    std::same_as<RemoveCvRef<T>, std::uint32_t> || std::same_as<RemoveCvRef<T>, std::uint64_t> ||
-    std::same_as<RemoveCvRef<T>, std::int8_t> || std::same_as<RemoveCvRef<T>, std::int16_t> || std::same_as<RemoveCvRef<T>, std::int32_t> ||
-    std::same_as<RemoveCvRef<T>, std::int64_t> ||
-    (std::same_as<RemoveCvRef<T>, char> && std::is_signed_v<char> &&
-     std::numeric_limits<char>::digits == std::numeric_limits<std::int8_t>::digits);
-
+    std::same_as<RemoveCvRef<T>, std::uint32_t> || std::same_as<RemoveCvRef<T>, std::uint64_t> || std::same_as<RemoveCvRef<T>, std::int8_t> ||
+    std::same_as<RemoveCvRef<T>, std::int16_t> || std::same_as<RemoveCvRef<T>, std::int32_t> || std::same_as<RemoveCvRef<T>, std::int64_t> ||
+    (std::same_as<RemoveCvRef<T>, char> && std::is_signed_v<char> && std::numeric_limits<char>::digits == std::numeric_limits<std::int8_t>::digits);
 struct OpaqueRelationStorage : Annotation {
     static constexpr bool is_opaque_relation_storage = true;
 };
-
 template <class Type>
 inline constexpr bool kOpaqueRelationStorage = [] consteval {
     std::size_t markers = 0U;
@@ -52,19 +42,15 @@ inline constexpr bool kOpaqueRelationStorage = [] consteval {
     if (markers > 1U) throw "a reflected type has duplicate opaque-relation-storage annotations";
     return markers == 1U;
 }();
-
 MMLTK_REFLECT_ENUM(PresentationKind)
 MMLTK_REFLECT_ENUM(Violation)
 MMLTK_REFLECT_ENUM(FixedTextCharacterPolicy)
-
 template <class Annotation>
 inline constexpr bool kFixedTextAnnotation = std::same_as<RemoveCvRef<Annotation>, FixedText>;
-
 template <class Type>
 [[nodiscard]] consteval std::size_t fixed_text_annotation_count() {
     return reflected_annotation_count<^^Type>([]<class Annotation> { return kFixedTextAnnotation<Annotation>; });
 }
-
 template <class Type>
 [[nodiscard]] consteval FixedText fixed_text_policy_of() {
     FixedText result{{}, 0U, FixedTextCharacterPolicy::PrintableAscii};
@@ -74,7 +60,6 @@ template <class Type>
     }
     return result;
 }
-
 template <class T>
 struct IsByteSequence : std::false_type {};
 template <class Allocator>
@@ -95,7 +80,6 @@ template <class Byte, std::size_t Count>
 struct IsByteSequence<std::span<Byte, Count>> : std::true_type {};
 template <class T>
 inline constexpr bool kByteSequence = IsByteSequence<RemoveCvRef<T>>::value;
-
 // Boundary owners specialize this semantics-free policy for types that are
 // opaque leaves to reflected field traversal and require both byte and item
 // budgets. Reflection owns the policy shape; it knows no wire vocabulary.
@@ -103,66 +87,50 @@ template <class T>
 struct LeafPolicy {
     static constexpr bool bounded_dynamic = false;
 };
-
 template <class T>
 inline constexpr bool kBoundedDynamicLeaf = LeafPolicy<RemoveCvRef<T>>::bounded_dynamic;
-
 template <class>
 struct InplaceVectorCapacity;
-
 template <class Value, std::size_t Capacity>
 struct InplaceVectorCapacity<std::inplace_vector<Value, Capacity>> : std::integral_constant<std::size_t, Capacity> {};
-
 template <class T>
 inline constexpr bool kInplaceVector = false;
-
 template <class Value, std::size_t Capacity>
 inline constexpr bool kInplaceVector<std::inplace_vector<Value, Capacity>> = true;
-
 template <class T>
 [[nodiscard]] consteval bool fixed_sequence_capacity_is_valid(const std::size_t maximum_items) {
     if constexpr (kInplaceVector<T>) { return maximum_items == 0U || maximum_items <= InplaceVectorCapacity<T>::value; }
     return true;
 }
-
 template <class T>
 struct OptionalValue {
     static constexpr bool value = false;
     using type = RemoveCvRef<T>;
 };
-
 template <class T>
 struct OptionalValue<std::optional<T>> {
     static constexpr bool value = true;
     using type = RemoveCvRef<T>;
 };
-
 template <class T>
 using OptionalValueT = typename OptionalValue<RemoveCvRef<T>>::type;
-
 template <class T>
 struct MemberPointerOwner;
-
 template <class Owner, class Value>
 struct MemberPointerOwner<Value Owner::*> {
     using type = Owner;
 };
-
 template <auto Member>
 struct MemberTag {};
-
 template <auto Member, class Owner>
 [[nodiscard]] consteval FieldConstraint external_field_constraint(MemberTag<Member>, std::type_identity<Owner>) {
     return {};
 }
-
 template <auto Member, class Owner>
 [[nodiscard]] consteval PresentationKind external_presentation_kind(MemberTag<Member>, std::type_identity<Owner>) {
     return PresentationKind::Default;
 }
-
 [[nodiscard]] constexpr FieldConstraint merge(FieldConstraint left, FieldConstraint right) noexcept;
-
 template <std::meta::info Target, class Visitor>
 constexpr void visit_annotations(Visitor&& visitor) {
     // GCC does not support annotation-value splice expressions. Keep the
@@ -173,80 +141,59 @@ constexpr void visit_annotations(Visitor&& visitor) {
         visitor(std::meta::extract<AnnotationType>(annotation));
     }
 }
-
 // Annotation traits are a compile-time declaration vocabulary, not runtime knobs.
 // CLEANUP-IGNORE: Minimum is one entry in the canonical compile-time policy-annotation trait vocabulary.
 template <class Annotation, class = void>
 struct MinimumAnnotation : std::false_type {};
-
 template <class Annotation>
 struct MinimumAnnotation<Annotation, std::void_t<decltype(Annotation::is_minimum), decltype(std::declval<const Annotation&>().value)>>
     // CLEANUP-IGNORE: Trait specializations deliberately share the standard bool-constant detection shape.
-    : std::bool_constant<Annotation::is_minimum && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), long double>> {
-};
-
+    : std::bool_constant<Annotation::is_minimum && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), long double>> {};
 // CLEANUP-IGNORE: Maximum is an independent entry in the canonical compile-time annotation vocabulary.
 template <class Annotation, class = void>
 struct MaximumAnnotation : std::false_type {};
-
 template <class Annotation>
 struct MaximumAnnotation<Annotation, std::void_t<decltype(Annotation::is_maximum), decltype(std::declval<const Annotation&>().value)>>
-    : std::bool_constant<Annotation::is_maximum && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), long double>> {
-};
-
+    : std::bool_constant<Annotation::is_maximum && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), long double>> {};
 // CLEANUP-IGNORE
 template <class Annotation, class = void>
 struct FiniteAnnotation : std::false_type {};
-
 template <class Annotation>
 struct FiniteAnnotation<Annotation, std::void_t<decltype(Annotation::is_finite)>>
     // CLEANUP-IGNORE: Finite uses the same trait result form while detecting a semantically distinct annotation.
     : std::bool_constant<Annotation::is_finite> {};
-
 // CLEANUP-IGNORE: MinBytes is an independent entry in the canonical compile-time annotation vocabulary.
 template <class Annotation, class = void>
 struct MinBytesAnnotation : std::false_type {};
-
 template <class Annotation>
 struct MinBytesAnnotation<Annotation, std::void_t<decltype(Annotation::is_min_bytes), decltype(std::declval<const Annotation&>().value)>>
     : std::bool_constant<Annotation::is_min_bytes &&
                          // CLEANUP-IGNORE: Byte limits and numeric bounds intentionally use parallel trait detection
                          // with different value domains.
                          std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
-
 // CLEANUP-IGNORE: MaxBytes is an independent entry in the canonical compile-time annotation vocabulary.
 template <class Annotation, class = void>
 struct MaxBytesAnnotation : std::false_type {};
-
 template <class Annotation>
 struct MaxBytesAnnotation<Annotation, std::void_t<decltype(Annotation::is_max_bytes), decltype(std::declval<const Annotation&>().value)>>
-    : std::bool_constant<Annotation::is_max_bytes &&
-                         std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
-
+    : std::bool_constant<Annotation::is_max_bytes && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
 // CLEANUP-IGNORE: MaxItems is an independent entry in the canonical compile-time annotation vocabulary.
 template <class Annotation, class = void>
 struct MaxItemsAnnotation : std::false_type {};
-
 template <class Annotation>
 struct MaxItemsAnnotation<Annotation, std::void_t<decltype(Annotation::is_max_items), decltype(std::declval<const Annotation&>().value)>>
-    : std::bool_constant<Annotation::is_max_items &&
-                         std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
-
+    : std::bool_constant<Annotation::is_max_items && std::is_convertible_v<decltype(std::declval<const Annotation&>().value), std::size_t>> {};
 // CLEANUP-IGNORE: Presentation is an independent entry in the canonical compile-time annotation vocabulary.
 template <class Annotation, class = void>
 struct PresentationAnnotation : std::false_type {};
-
 template <class Annotation>
 struct PresentationAnnotation<Annotation, std::void_t<decltype(Annotation::kind)>>
     : std::bool_constant<std::is_convertible_v<decltype(Annotation::kind), PresentationKind>> {};
-
 template <class Annotation>
-inline constexpr bool kPolicyAnnotation =
-    MinimumAnnotation<RemoveCvRef<Annotation>>::value || MaximumAnnotation<RemoveCvRef<Annotation>>::value ||
-    FiniteAnnotation<RemoveCvRef<Annotation>>::value || MinBytesAnnotation<RemoveCvRef<Annotation>>::value ||
-    MaxBytesAnnotation<RemoveCvRef<Annotation>>::value || MaxItemsAnnotation<RemoveCvRef<Annotation>>::value ||
-    PresentationAnnotation<RemoveCvRef<Annotation>>::value || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
-
+inline constexpr bool kPolicyAnnotation = MinimumAnnotation<RemoveCvRef<Annotation>>::value || MaximumAnnotation<RemoveCvRef<Annotation>>::value ||
+                                          FiniteAnnotation<RemoveCvRef<Annotation>>::value || MinBytesAnnotation<RemoveCvRef<Annotation>>::value ||
+                                          MaxBytesAnnotation<RemoveCvRef<Annotation>>::value || MaxItemsAnnotation<RemoveCvRef<Annotation>>::value ||
+                                          PresentationAnnotation<RemoveCvRef<Annotation>>::value || is_catalog_provider_annotation<RemoveCvRef<Annotation>>;
 template <class Annotation>
 constexpr void apply_field_constraint(FieldConstraint& result, const Annotation& annotation) {
     using A = RemoveCvRef<Annotation>;
@@ -266,13 +213,11 @@ constexpr void apply_field_constraint(FieldConstraint& result, const Annotation&
         result.maximum_items = static_cast<std::size_t>(annotation.value);
     }
 }
-
 template <class Annotation>
 constexpr void apply_presentation_kind(PresentationKind& result, const Annotation&) {
     using A = RemoveCvRef<Annotation>;
     if constexpr (PresentationAnnotation<A>::value) result = static_cast<PresentationKind>(A::kind);
 }
-
 template <std::meta::info Member>
 [[nodiscard]] consteval FieldConstraint policy_of() {
     FieldConstraint result{};
@@ -284,7 +229,6 @@ template <std::meta::info Member>
     }
     return result;
 }
-
 template <std::meta::info Member>
 [[nodiscard]] consteval PresentationKind presentation_of() {
     PresentationKind result = PresentationKind::Default;
@@ -297,7 +241,6 @@ template <std::meta::info Member>
     }
     return result;
 }
-
 template <std::meta::info Member>
 [[nodiscard]] consteval bool valid_policy_annotations() {
     using MemberType = OptionalValueT<typename[:std::meta::type_of(Member):]>;
@@ -331,14 +274,13 @@ template <std::meta::info Member>
                                   } && (!byte_bounded || kByteSequence<MemberType>)) || dynamic_value;
     const FieldConstraint policy = policy_of<Member>();
     const bool fixed_sequence_capacity = fixed_sequence_capacity_is_valid<MemberType>(policy.maximum_items);
-    return minima <= 1U && maxima <= 1U && finite_markers <= 1U && byte_minima <= 1U && byte_limits <= 1U && item_limits <= 1U &&
-           presentation_markers <= 1U && catalog_markers <= 1U && (!policy.has_minimum || numeric) && (!policy.has_maximum || numeric) &&
+    return minima <= 1U && maxima <= 1U && finite_markers <= 1U && byte_minima <= 1U && byte_limits <= 1U && item_limits <= 1U && presentation_markers <= 1U &&
+           catalog_markers <= 1U && (!policy.has_minimum || numeric) && (!policy.has_maximum || numeric) &&
            (!policy.finite || std::is_floating_point_v<MemberType>) && (policy.minimum_bytes == 0U || minimum_byte_bounded) &&
            (policy.maximum_bytes == 0U || byte_bounded) && (policy.maximum_items == 0U || item_bounded) &&
            (policy.minimum_bytes == 0U || policy.maximum_bytes == 0U || policy.minimum_bytes <= policy.maximum_bytes) &&
            (!policy.has_minimum || !policy.has_maximum || policy.minimum <= policy.maximum) && fixed_sequence_capacity;
 }
-
 struct MaterializedFieldPolicy final {
     std::string_view member_name{};
     FieldConstraint constraint{};
@@ -348,34 +290,28 @@ struct MaterializedFieldPolicy final {
     bool private_member = false;
     bool default_zero = false;
 };
-
 template <class... Bases>
 struct MaterializedBaseList final {
     static constexpr std::size_t count = sizeof...(Bases);
-
     template <class Visitor>
     static constexpr void Visit(Visitor&& visitor) {
         (visitor.template operator()<Bases>(), ...);
     }
 };
-
 template <auto Member, auto... Annotations>
 struct MaterializedMemberDeclaration final {
     using member_type = RemoveCvRef<decltype(std::declval<typename MemberPointerOwner<RemoveCvRef<decltype(Member)>>::type&>().*Member)>;
     static constexpr auto pointer = Member;
     static constexpr std::size_t annotation_count = sizeof...(Annotations);
-
     template <class Visitor>
     static constexpr void VisitAnnotations(Visitor&& visitor) {
         (visitor(Annotations), ...);
     }
-
     template <class Visitor>
     static constexpr void VisitAnnotationValues(Visitor&& visitor) {
         (visitor.template operator()<Annotations>(), ...);
     }
 };
-
 template <class Member, auto... Annotations>
 struct MaterializedOpaqueMemberDeclaration final {
     using member_type = Member;
@@ -399,27 +335,23 @@ struct MaterializedOpaqueMemberDeclaration final {
           finite += FiniteAnnotation<RemoveCvRef<decltype(Annotations)>>::value ? 1U : 0U),
          ...);
         constexpr bool numeric = std::is_arithmetic_v<Member> && !std::is_same_v<Member, bool>;
-        return minima <= 1U && maxima <= 1U && finite <= 1U && (!constraint.has_minimum || numeric) &&
-               (!constraint.has_maximum || numeric) && (!constraint.finite || std::is_floating_point_v<Member>) &&
+        return minima <= 1U && maxima <= 1U && finite <= 1U && (!constraint.has_minimum || numeric) && (!constraint.has_maximum || numeric) &&
+               (!constraint.finite || std::is_floating_point_v<Member>) &&
                (!constraint.has_minimum || !constraint.has_maximum || constraint.minimum <= constraint.maximum);
     }();
-
     template <class Visitor>
     static constexpr void VisitAnnotations(Visitor&& visitor) {
         (visitor(Annotations), ...);
     }
-
     template <class Visitor>
     static constexpr void VisitAnnotationValues(Visitor&& visitor) {
         (visitor.template operator()<Annotations>(), ...);
     }
 };
-
 template <class BaseList, class... Members>
 struct MaterializedFieldPolicyProduct final {
     using base_types = BaseList;
     std::array<MaterializedFieldPolicy, sizeof...(Members)> values{};
-
     [[nodiscard]] static consteval std::size_t size() noexcept { return sizeof...(Members); }
     [[nodiscard]] static consteval bool empty() noexcept { return sizeof...(Members) == 0U; }
     [[nodiscard]] constexpr const MaterializedFieldPolicy& operator[](const std::size_t index) const noexcept { return values[index]; }
@@ -432,7 +364,6 @@ struct MaterializedFieldPolicyProduct final {
         }(std::index_sequence_for<Members...>{});
     }
 };
-
 struct FieldPolicyMaterializer final {
     template <class Owner, class Reflection>
     [[nodiscard]] consteval auto operator()() const {
@@ -455,8 +386,7 @@ struct FieldPolicyMaterializer final {
                     declaration_arguments.push_back(std::meta::reflect_constant(std::meta::extract<AnnotationType>(annotation)));
                 }
                 product_arguments.push_back(std::meta::substitute(
-                    kOpaqueRelationStorage<Owner> ? ^^MaterializedOpaqueMemberDeclaration : ^^MaterializedMemberDeclaration,
-                    declaration_arguments));
+                    kOpaqueRelationStorage<Owner> ? ^^MaterializedOpaqueMemberDeclaration : ^^MaterializedMemberDeclaration, declaration_arguments));
             }
             return std::meta::substitute(^^MaterializedFieldPolicyProduct, product_arguments);
         }();
@@ -488,7 +418,6 @@ struct FieldPolicyMaterializer final {
         return result;
     }
 };
-
 template <class Owner>
 inline constexpr auto kReflectedFieldPolicies = [] consteval {
     if constexpr (kOpaqueRelationStorage<Owner>)
@@ -496,33 +425,27 @@ inline constexpr auto kReflectedFieldPolicies = [] consteval {
     else
         return materialize<Owner>(FieldPolicyMaterializer{});
 }();
-
 #define MMLTK_REFLECT_FIELDS(Type)                                                              \
     [[nodiscard]] consteval const auto& materialized_field_policies(std::type_identity<Type>) { \
         return ::mmltk::frameworks::reflection::kReflectedFieldPolicies<Type>;                  \
     }
-
 template <class Owner>
 consteval void materialized_field_policies(std::type_identity<Owner>) = delete;
-
 template <class Owner>
 [[nodiscard]] consteval decltype(auto) field_declarations() {
     return materialized_field_policies(std::type_identity<RemoveCvRef<Owner>>{});
 }
-
 template <class Owner, class Visitor>
 constexpr void visit_materialized_bases(Visitor&& visitor) {
     using Product = RemoveCvRef<decltype(field_declarations<Owner>())>;
     Product::base_types::Visit(std::forward<Visitor>(visitor));
 }
-
 template <class Owner, class Visitor>
 constexpr void visit_materialized_members(Visitor&& visitor) {
     constexpr const auto& product = field_declarations<Owner>();
     using Product = RemoveCvRef<decltype(product)>;
     Product::Visit([&]<class Declaration, std::size_t Index>() { visitor.template operator()<Declaration>(product[Index]); });
 }
-
 template <auto MemberPointer, class Product>
 [[nodiscard]] consteval std::size_t member_index(const Product& product) {
     std::size_t result = product.size();
@@ -534,7 +457,6 @@ template <auto MemberPointer, class Product>
     if (result != product.size()) return result;
     throw "member pointer does not identify a reflected data member";
 }
-
 template <auto MemberPointer>
 [[nodiscard]] consteval decltype(auto) materialized_member_declaration() {
     using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(MemberPointer)>>::type;
@@ -543,29 +465,24 @@ template <auto MemberPointer>
     static_assert(index < materialized.size());
     return (materialized[index]);
 }
-
 template <auto MemberPointer>
 [[nodiscard]] consteval std::string_view materialized_member_name() {
     return materialized_member_declaration<MemberPointer>().member_name;
 }
-
 template <auto MemberPointer>
 [[nodiscard]] consteval FieldConstraint policy_of_member() {
     using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(MemberPointer)>>::type;
     return merge(materialized_member_declaration<MemberPointer>().constraint,
                  external_field_constraint(MemberTag<MemberPointer>{}, std::type_identity<Owner>{}));
 }
-
 template <auto MemberPointer>
 [[nodiscard]] consteval bool has_materialized_policy_only_annotations() {
     return materialized_member_declaration<MemberPointer>().only_policy_annotations;
 }
-
 template <auto MemberPointer>
 [[nodiscard]] consteval bool materialized_policy_annotations_are_valid() {
     return materialized_member_declaration<MemberPointer>().annotations_valid;
 }
-
 template <auto MemberPointer>
 [[nodiscard]] consteval PresentationKind presentation_of_member() {
     using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(MemberPointer)>>::type;
@@ -573,13 +490,10 @@ template <auto MemberPointer>
     const PresentationKind external = external_presentation_kind(MemberTag<MemberPointer>{}, std::type_identity<Owner>{});
     return external == PresentationKind::Default ? result : external;
 }
-
 template <class Value>
 [[nodiscard]] constexpr bool field_value_satisfies(const Value& value, const FieldConstraint& constraint) noexcept;
-
 template <class Value>
 [[nodiscard]] constexpr std::optional<Violation> field_value_violation(const Value& value, const FieldConstraint& constraint) noexcept;
-
 template <auto MemberPointer>
 [[nodiscard]] consteval bool member_default_satisfies() {
     using Owner = typename MemberPointerOwner<RemoveCvRef<decltype(MemberPointer)>>::type;
@@ -589,7 +503,6 @@ template <auto MemberPointer>
     }
     return true;
 }
-
 [[nodiscard]] constexpr FieldConstraint merge(const FieldConstraint left, const FieldConstraint right) noexcept {
     FieldConstraint result = left;
     result.finite = left.finite || right.finite;
@@ -606,12 +519,10 @@ template <auto MemberPointer>
     if (right.maximum_items != 0U) result.maximum_items = right.maximum_items;
     return result;
 }
-
 template <class Value>
 [[nodiscard]] constexpr bool field_value_satisfies(const Value& value, const FieldConstraint& constraint) noexcept {
     return !field_value_violation(value, constraint).has_value();
 }
-
 template <class Value>
 [[nodiscard]] constexpr std::optional<Violation> field_value_violation(const Value& value, const FieldConstraint& constraint) noexcept {
     using V = RemoveCvRef<Value>;
@@ -641,31 +552,24 @@ template <class Value>
         return std::nullopt;
     }
 }
-
 template <class T>
 [[nodiscard]] constexpr std::optional<ValidationError> validate_reflected_fields(const T& value) noexcept;
-
 template <class T>
 [[nodiscard]] consteval bool opaque_relation_storage_shape_is_valid(std::uint64_t valid_bits) noexcept;
-
 namespace detail {
-
 class OpaqueRelationStorageAccess final {
     friend struct OpaqueRelationStorageValidation;
     friend struct ::mmltk::frameworks::serialization::implementation::detail::OpaqueCborFacade;
-
     template <class Owner, class Visitor>
     static constexpr void VisitMember(Owner&& owner, Visitor&& visitor) {
         using U = RemoveCvRef<Owner>;
         static_assert(kOpaqueRelationStorage<U>);
-        template for (constexpr auto member :
-                      std::define_static_array(std::meta::nonstatic_data_members_of(^^U, std::meta::access_context::unchecked()))) {
+        template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^U, std::meta::access_context::unchecked()))) {
             constexpr auto pointer = &[:member:];
             visitor.template operator()<member>(std::forward<Owner>(owner).*pointer);
         }
     }
 };
-
 struct OpaqueRelationStorageValidation final {
     template <class T>
     [[nodiscard]] static constexpr std::optional<ValidationError> Validate(const T& value) noexcept {
@@ -680,9 +584,7 @@ struct OpaqueRelationStorageValidation final {
         return result;
     }
 };
-
 }  // namespace detail
-
 template <class T>
 [[nodiscard]] consteval bool opaque_relation_storage_shape_is_valid(const std::uint64_t valid_bits) noexcept {
     using U = RemoveCvRef<T>;
@@ -703,7 +605,6 @@ template <class T>
         return valid;
     }
 }
-
 template <class Value>
 [[nodiscard]] constexpr std::optional<ValidationError> validate_reflected_value(const Value& value) noexcept {
     using V = RemoveCvRef<Value>;
@@ -724,7 +625,6 @@ template <class Value>
         return std::nullopt;
     }
 }
-
 template <class T>
 [[nodiscard]] constexpr std::optional<ValidationError> validate_reflected_fields(const T& value) noexcept {
     using U = RemoveCvRef<T>;
@@ -755,7 +655,6 @@ template <class T>
     });
     return result;
 }
-
 template <class Number>
 constexpr void normalize_reflected_number(Number& value, const Number default_value, const FieldConstraint& constraint) noexcept {
     if constexpr (std::is_floating_point_v<Number>) {
@@ -764,7 +663,6 @@ constexpr void normalize_reflected_number(Number& value, const Number default_va
     if (constraint.has_minimum && static_cast<long double>(value) < constraint.minimum) { value = static_cast<Number>(constraint.minimum); }
     if (constraint.has_maximum && static_cast<long double>(value) > constraint.maximum) { value = static_cast<Number>(constraint.maximum); }
 }
-
 // Persistence repairs numeric values from the same reflected policy consumed by
 // CLI, IPC, and system-boundary validation. Text and container violations remain terminal
 // because truncating a path or silently dropping user entries changes meaning.
@@ -772,8 +670,7 @@ template <class T>
 constexpr void normalize_reflected_intrinsics(T& value, const T& defaults) noexcept {
     using U = RemoveCvRef<T>;
     if constexpr (kOpaqueRelationStorage<U>) { return; }
-    visit_materialized_bases<U>(
-        [&]<class Base>() { normalize_reflected_intrinsics(static_cast<Base&>(value), static_cast<const Base&>(defaults)); });
+    visit_materialized_bases<U>([&]<class Base>() { normalize_reflected_intrinsics(static_cast<Base&>(value), static_cast<const Base&>(defaults)); });
     visit_materialized_members<U>([&]<class Declaration>(const auto&) {
         if constexpr (requires { Declaration::pointer; }) {
             auto& field = value.*Declaration::pointer;
@@ -788,8 +685,8 @@ constexpr void normalize_reflected_intrinsics(T& value, const T& defaults) noexc
                         normalize_reflected_number(*field, fallback, member_policy);
                     } else if constexpr (std::is_enum_v<Item>) {
                         if (field_value_violation(*field, member_policy)) *field = fallback;
-                    } else if constexpr (std::is_class_v<Item> && !std::is_same_v<Item, std::string> &&
-                                         !std::is_same_v<Item, std::filesystem::path> && !kBoundedDynamicLeaf<Item>) {
+                    } else if constexpr (std::is_class_v<Item> && !std::is_same_v<Item, std::string> && !std::is_same_v<Item, std::filesystem::path> &&
+                                         !kBoundedDynamicLeaf<Item>) {
                         normalize_reflected_intrinsics(*field, fallback);
                     }
                 }
@@ -797,23 +694,19 @@ constexpr void normalize_reflected_intrinsics(T& value, const T& defaults) noexc
                 normalize_reflected_number(field, default_field, member_policy);
             } else if constexpr (std::is_enum_v<Field>) {
                 if (field_value_violation(field, member_policy)) field = default_field;
-            } else if constexpr (std::is_class_v<Field> && !std::is_same_v<Field, std::string> &&
-                                 !std::is_same_v<Field, std::filesystem::path> && !kBoundedDynamicLeaf<Field> &&
-                                 !requires { typename Field::value_type; }) {
+            } else if constexpr (std::is_class_v<Field> && !std::is_same_v<Field, std::string> && !std::is_same_v<Field, std::filesystem::path> &&
+                                 !kBoundedDynamicLeaf<Field> && !requires { typename Field::value_type; }) {
                 normalize_reflected_intrinsics(field, default_field);
             }
         }
     });
 }
-
 template <class Declaration, class Owner>
 [[nodiscard]] consteval bool member_policy_is_complete();
-
 enum class ReflectedPolicyAudit : unsigned char {
     AnnotationValidity,
     Completeness,
 };
-
 template <ReflectedPolicyAudit Audit, class Declaration, class Owner>
 [[nodiscard]] consteval bool reflected_member_policy_satisfies() {
     if constexpr (Audit == ReflectedPolicyAudit::AnnotationValidity) {
@@ -831,7 +724,6 @@ template <ReflectedPolicyAudit Audit, class Declaration, class Owner>
                policy.maximum_bytes != 0U;
     }
 }
-
 template <ReflectedPolicyAudit Audit, class T>
 [[nodiscard]] consteval bool reflected_policies_satisfy() {
     using U = RemoveCvRef<T>;
@@ -853,12 +745,10 @@ template <ReflectedPolicyAudit Audit, class T>
     });
     return valid;
 }
-
 template <class T>  // CLEANUP-IGNORE Named canonical-walker validation.
 [[nodiscard]] consteval bool reflected_policies_are_valid() {
     return reflected_policies_satisfy<ReflectedPolicyAudit::AnnotationValidity, T>();
 }
-
 template <class Declaration, class Owner>
 [[nodiscard]] consteval bool member_policy_is_complete() {
     using MemberType = OptionalValueT<decltype(std::declval<Owner&>().*Declaration::pointer)>;
@@ -876,20 +766,16 @@ template <class Declaration, class Owner>
     }
     return true;
 }
-
 template <class T>
 [[nodiscard]] consteval bool reflected_policies_are_complete() {
     return reflected_policies_satisfy<ReflectedPolicyAudit::Completeness, T>();
 }
-
 template <class T>
 [[nodiscard]] consteval bool reflected_defaults_are_valid() {
     return !validate_reflected_fields(T{}).has_value();
 }
-
 template <class... Roots>
 [[nodiscard]] consteval bool ingress_policies_are_valid() {
     return (reflected_policies_are_valid<Roots>() && ...) && (reflected_policies_are_complete<Roots>() && ...);
 }
-
 }  // namespace mmltk::frameworks::reflection

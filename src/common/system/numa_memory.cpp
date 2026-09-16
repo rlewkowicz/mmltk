@@ -1,5 +1,4 @@
 #include "src/common/system/numa_memory.h"
-
 #include <numa.h>
 #include <numaif.h>
 #include <sys/mman.h>
@@ -13,7 +12,6 @@
 #include <stdexcept>
 #include <system_error>
 #include <utility>
-
 namespace mmltk::common::system {
 namespace {
 constexpr std::size_t word_bits = sizeof(unsigned long) * 8U;
@@ -36,8 +34,7 @@ void verify_pages(void* data, std::size_t bytes, int node) {
     const auto page = host_page_size();
     for (std::size_t offset = 0; offset < bytes;) {
         const auto count = std::min(pages.size(), (bytes - offset) / page);
-        for (std::size_t i = 0; i < count; ++i)
-            pages[i] = static_cast<std::byte*>(data) + offset + i * page;
+        for (std::size_t i = 0; i < count; ++i) pages[i] = static_cast<std::byte*>(data) + offset + i * page;
         checked(::move_pages(0, count, pages.data(), nullptr, status.data(), 0), "verify host page NUMA placement");
         for (std::size_t i = 0; i < count; ++i)
             if (status[i] != node) throw std::runtime_error("host page is not resident on required NUMA node");
@@ -64,8 +61,7 @@ void* allocate_pages(std::size_t bytes, std::size_t alignment, int node) {
         mapping = reinterpret_cast<void*>(aligned);
     }
     try {
-        checked(::mbind(mapping, bytes, MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(), mask.size() * word_bits, 0),
-                "bind owned host storage");
+        checked(::mbind(mapping, bytes, MPOL_BIND | MPOL_F_STATIC_NODES, mask.data(), mask.size() * word_bits, 0), "bind owned host storage");
         // Unlike user-space first-touch stores, this reports allocation failure
         // to the owner instead of relying on a fault handler to survive OOM.
         checked(::madvise(mapping, bytes, MADV_POPULATE_WRITE), "prefault owned local host storage");
@@ -98,8 +94,7 @@ MemoryPolicy capture_memory_policy() {
 }
 void restore_memory_policy(const MemoryPolicy& policy) {
     const bool empty = std::ranges::all_of(policy.mask, [](auto word) { return word == 0; });
-    checked(::set_mempolicy(policy.mode, empty ? nullptr : policy.mask.data(), empty ? 0 : policy.mask.size() * word_bits),
-            "restore thread memory policy");
+    checked(::set_mempolicy(policy.mode, empty ? nullptr : policy.mask.data(), empty ? 0 : policy.mask.size() * word_bits), "restore thread memory policy");
 }
 void bind_memory_node(int node) {
     const auto mask = node_mask(node);
@@ -119,8 +114,7 @@ int bound_memory_node(const MemoryPolicy& policy) {
 }
 NumaMemory::NumaMemory(int node) : node_(node) { (void)node_mask(node); }
 NumaMemory::~NumaMemory() { reset(); }
-NumaMemory::NumaMemory(NumaMemory&& other) noexcept
-    : node_(other.node_), data_(std::exchange(other.data_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
+NumaMemory::NumaMemory(NumaMemory&& other) noexcept : node_(other.node_), data_(std::exchange(other.data_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
 NumaMemory& NumaMemory::operator=(NumaMemory&& other) noexcept {
     if (this != &other) {
         reset();
@@ -150,8 +144,6 @@ NumaMemoryResource::NumaMemoryResource(int node) : node_(node) { (void)node_mask
 void* NumaMemoryResource::do_allocate(std::size_t bytes, std::size_t alignment) {
     return allocate_pages(page_rounded_bytes(std::max(bytes, std::size_t{1})), alignment, node_);
 }
-void NumaMemoryResource::do_deallocate(void* data, std::size_t bytes, std::size_t) {
-    ::munmap(data, page_rounded_bytes(std::max(bytes, std::size_t{1})));
-}
+void NumaMemoryResource::do_deallocate(void* data, std::size_t bytes, std::size_t) { ::munmap(data, page_rounded_bytes(std::max(bytes, std::size_t{1}))); }
 bool NumaMemoryResource::do_is_equal(const std::pmr::memory_resource& other) const noexcept { return this == &other; }
 }  // namespace mmltk::common::system

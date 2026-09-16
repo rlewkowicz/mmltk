@@ -9,7 +9,7 @@ bool same_path(const std::filesystem::path& first, const std::filesystem::path& 
     if (std::filesystem::weakly_canonical(first) == std::filesystem::weakly_canonical(second)) return true;
     return std::filesystem::exists(first) && std::filesystem::exists(second) && std::filesystem::equivalent(first, second);
 }
-}
+}  // namespace
 ClassArtifactPublication::ClassArtifactPublication(const std::filesystem::path& destination, const std::filesystem::path& explicit_descriptor)
     : destination_(std::filesystem::absolute(destination).lexically_normal()), companion_(destination_.string() + ".classes.json") {
     if (!explicit_descriptor.empty() && (same_path(explicit_descriptor, companion_) || same_path(explicit_descriptor, destination_)))
@@ -36,14 +36,20 @@ io::UniqueFd ClassArtifactPublication::LockPreviousArtifact() const {
     return lease;
 }
 void ClassArtifactPublication::RequirePreviousUnchanged() const {
-    if (previous_artifact_) previous_artifact_->RequireUnchanged(destination_);
-    else if (std::filesystem::exists(destination_)) throw std::runtime_error("artifact appeared during publication");
-    if (previous_companion_) previous_companion_->RequireUnchanged(companion_);
-    else if (std::filesystem::exists(companion_)) throw std::runtime_error("companion appeared during publication");
+    if (previous_artifact_)
+        previous_artifact_->RequireUnchanged(destination_);
+    else if (std::filesystem::exists(destination_))
+        throw std::runtime_error("artifact appeared during publication");
+    if (previous_companion_)
+        previous_companion_->RequireUnchanged(companion_);
+    else if (std::filesystem::exists(companion_))
+        throw std::runtime_error("companion appeared during publication");
 }
 void ClassArtifactPublication::Publish(std::optional<ModelClassDescriptor> descriptor, std::function_ref<bool()> cancelled) {
     if (published_) throw std::logic_error("RF-DETR artifact already published");
-    const auto checkpoint = [&] { if (cancelled()) throw ArtifactPublicationCancelled{}; };
+    const auto checkpoint = [&] {
+        if (cancelled()) throw ArtifactPublicationCancelled{};
+    };
     checkpoint();
     io::FileHandle::open_readonly(staged_.string()).sync_data();
     const auto staged_descriptor = staging_->path() / "classes.json";
@@ -61,13 +67,23 @@ void ClassArtifactPublication::Publish(std::optional<ModelClassDescriptor> descr
     const auto old_descriptor = staging_->path() / "previous-classes";
     bool backed_artifact = false, backed_descriptor = false, installed_artifact = false, installed_descriptor = false;
     try {
-        if (previous_artifact_) { std::filesystem::rename(destination_, old_artifact); backed_artifact = true; }
+        if (previous_artifact_) {
+            std::filesystem::rename(destination_, old_artifact);
+            backed_artifact = true;
+        }
         checkpoint();
-        if (previous_companion_) { std::filesystem::rename(companion_, old_descriptor); backed_descriptor = true; }
+        if (previous_companion_) {
+            std::filesystem::rename(companion_, old_descriptor);
+            backed_descriptor = true;
+        }
         checkpoint();
-        std::filesystem::rename(staged_, destination_); installed_artifact = true;
+        std::filesystem::rename(staged_, destination_);
+        installed_artifact = true;
         checkpoint();
-        if (descriptor) { std::filesystem::rename(staged_descriptor, companion_); installed_descriptor = true; }
+        if (descriptor) {
+            std::filesystem::rename(staged_descriptor, companion_);
+            installed_descriptor = true;
+        }
         checkpoint();
         io::sync_parent_directory(destination_);
         checkpoint();
@@ -86,4 +102,4 @@ void ClassArtifactPublication::Publish(std::optional<ModelClassDescriptor> descr
         throw;
     }
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

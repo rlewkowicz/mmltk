@@ -2,12 +2,10 @@
 #include <stdexcept>
 #include "src/backend/models/rfdetr/training/distributed_train_launcher.h"
 #include "src/common/system/numa_topology.h"
-
 TEST_CASE("Distributed ranks resolve independent known and unknown GPU locality", "[rfdetr][placement][topology]") {
     using namespace mmltk::backend::models::rfdetr;
     using namespace mmltk::common::system;
-    const NumaTopology topology{
-        .permitted_cpus = {2, 8}, .permitted_nodes = {0, 3}, .cpus = {{2, 0, 0, 0}, {8, 3, 1, 0}}, .nodes = {{0, 4096}, {3, 4096}}};
+    const NumaTopology topology{.permitted_cpus = {2, 8}, .permitted_nodes = {0, 3}, .cpus = {{2, 0, 0, 0}, {8, 3, 1, 0}}, .nodes = {{0, 4096}, {3, 4096}}};
     TrainRequest request;
     request.device_ids = {5, 1};
     request.workers = 7;
@@ -19,8 +17,7 @@ TEST_CASE("Distributed ranks resolve independent known and unknown GPU locality"
     CHECK(ranks[1].worker_budget == 3);
     CHECK(resolve_placement(topology, 0, ranks[0].numa_node).cpus == std::vector<int>{2});
     CHECK(resolve_placement(topology, 3, ranks[1].numa_node).cpus == std::vector<int>{8});
-    for (const auto& rank : ranks)
-        CHECK_THROWS_AS(resolve_placement(topology, -1, rank.numa_node), std::invalid_argument);
+    for (const auto& rank : ranks) CHECK_THROWS_AS(resolve_placement(topology, -1, rank.numa_node), std::invalid_argument);
     request.numa_node = 0;
     CHECK_THROWS_AS(select_distributed_training_partitions(request), std::invalid_argument);
     request.numa_node = -1;

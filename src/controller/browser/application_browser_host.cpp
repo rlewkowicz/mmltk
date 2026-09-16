@@ -1,5 +1,4 @@
 #include "src/controller/browser/application_browser_host.h"
-
 #include <atomic>
 #include <mutex>
 #include <limits>
@@ -8,63 +7,42 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
-
 namespace mmltk::controller::browser {
 namespace {
-
 namespace transport = mmltk::frameworks::transport;
 [[nodiscard]] constexpr transport::BrowserRecordPriority priority(const contracts::reflection::EventDelivery delivery) noexcept {
     return delivery != contracts::reflection::EventDelivery::Transient ? transport::BrowserRecordPriority::Critical
                                                                        : transport::BrowserRecordPriority::Transient;
 }
-
 [[nodiscard]] constexpr std::string_view diagnostic_name(const transport::BrowserServerEvent event) noexcept {
     switch (event) {
-        case transport::BrowserServerEvent::Started:
-            return "browser.server.started";
-        case transport::BrowserServerEvent::PeerOpened:
-            return "browser.server.peer_opened";
-        case transport::BrowserServerEvent::PeerReplaced:
-            return "browser.server.peer_replaced";
-        case transport::BrowserServerEvent::PeerClosed:
-            return "browser.server.peer_closed";
-        case transport::BrowserServerEvent::BinaryReceived:
-            return "browser.server.binary_received";
-        case transport::BrowserServerEvent::InvalidMessage:
-            return "browser.server.invalid_message";
-        case transport::BrowserServerEvent::RecordEnqueued:
-            return "browser.server.record_enqueued";
-        case transport::BrowserServerEvent::TransientDropped:
-            return "browser.server.transient_dropped";
-        case transport::BrowserServerEvent::CriticalCapacityClosed:
-            return "browser.server.critical_capacity_closed";
-        case transport::BrowserServerEvent::WriteAccepted:
-            return "browser.server.write_accepted";
-        case transport::BrowserServerEvent::WriteBackpressured:
-            return "browser.server.write_backpressured";
-        case transport::BrowserServerEvent::WriteDrained:
-            return "browser.server.write_drained";
+        case transport::BrowserServerEvent::Started: return "browser.server.started";
+        case transport::BrowserServerEvent::PeerOpened: return "browser.server.peer_opened";
+        case transport::BrowserServerEvent::PeerReplaced: return "browser.server.peer_replaced";
+        case transport::BrowserServerEvent::PeerClosed: return "browser.server.peer_closed";
+        case transport::BrowserServerEvent::BinaryReceived: return "browser.server.binary_received";
+        case transport::BrowserServerEvent::InvalidMessage: return "browser.server.invalid_message";
+        case transport::BrowserServerEvent::RecordEnqueued: return "browser.server.record_enqueued";
+        case transport::BrowserServerEvent::TransientDropped: return "browser.server.transient_dropped";
+        case transport::BrowserServerEvent::CriticalCapacityClosed: return "browser.server.critical_capacity_closed";
+        case transport::BrowserServerEvent::WriteAccepted: return "browser.server.write_accepted";
+        case transport::BrowserServerEvent::WriteBackpressured: return "browser.server.write_backpressured";
+        case transport::BrowserServerEvent::WriteDrained: return "browser.server.write_drained";
     }
     return {};
 }
-
 }  // namespace
-
 struct ApplicationBrowserHost::Impl final {
     Impl(transport::BrowserServer& server_value, const services::RuntimeDiagnosticTarget diagnostics_value)
         : server(&server_value), diagnostics(diagnostics_value) {}
-
     [[nodiscard]] bool install(ApplicationSystems& value) noexcept {
         ApplicationSystems* expected = nullptr;
-        return systems.compare_exchange_strong(expected, &value, std::memory_order_release, std::memory_order_acquire) ||
-               expected == &value;
+        return systems.compare_exchange_strong(expected, &value, std::memory_order_release, std::memory_order_acquire) || expected == &value;
     }
-
     [[nodiscard]] bool publish_record(const ServerRecord& record, const transport::BrowserRecordPriority record_priority) noexcept {
         try {
             wire::ByteBuffer encoded;
@@ -91,8 +69,7 @@ struct ApplicationBrowserHost::Impl final {
                 .state_event = state != nullptr ? state->event_id : 0U,
                 .state_revision = state != nullptr ? state->state_revision : 0U,
             });
-            const bool accepted =
-                record_priority == transport::BrowserRecordPriority::Transient || result == transport::BrowserRecordPush::Enqueued;
+            const bool accepted = record_priority == transport::BrowserRecordPriority::Transient || result == transport::BrowserRecordPush::Enqueued;
             if (!accepted) {
                 diagnostics.Emit([&] {
                     return services::RuntimeDiagnosticFact{
@@ -122,7 +99,6 @@ struct ApplicationBrowserHost::Impl final {
             return false;
         }
     }
-
     void opened() noexcept {
         try {
             auto* installed = systems.load(std::memory_order_acquire);
@@ -131,8 +107,7 @@ struct ApplicationBrowserHost::Impl final {
                 std::uint64_t epoch;
                 {
                     std::scoped_lock lock(input_mutex);
-                    if (input_epoch == std::numeric_limits<std::uint64_t>::max())
-                        throw contracts::UnavailableError("input epoch exhausted");
+                    if (input_epoch == std::numeric_limits<std::uint64_t>::max()) throw contracts::UnavailableError("input epoch exhausted");
                     epoch = ++input_epoch;
                     auto bootstrap = materialize_bootstrap(*installed);
                     bootstrap.input_epoch = epoch;
@@ -143,7 +118,6 @@ struct ApplicationBrowserHost::Impl final {
         } catch (...) {}
         continuity_lost();
     }
-
     void activated() noexcept {
         auto* installed = systems.load(std::memory_order_acquire);
         if (!admission.load(std::memory_order_acquire) || !installed) return;
@@ -158,7 +132,6 @@ struct ApplicationBrowserHost::Impl final {
             });
         } catch (...) { continuity_lost(); }
     }
-
     [[nodiscard]] bool record(const std::span<const std::byte> bytes) noexcept {
         auto* installed = systems.load(std::memory_order_acquire);
         if (!admission.load(std::memory_order_acquire) || installed == nullptr) {
@@ -275,7 +248,6 @@ struct ApplicationBrowserHost::Impl final {
             return false;
         }
     }
-
     bool interaction(ApplicationSystems& installed, InteractionView value) noexcept {
         const auto result = dispatch_interaction(installed, value);
         if (result.disposition == InteractionDispatchDisposition::ProtocolInvalid) {
@@ -290,8 +262,7 @@ struct ApplicationBrowserHost::Impl final {
         }
         if (result.disposition == InteractionDispatchDisposition::ApplicationRejected && result.error.has_value()) {
             const auto& error = result.error.value();
-            (void)publish_record(InteractionRejected{.endpoint_id = result.endpoint_id, .error = error},
-                                 transport::BrowserRecordPriority::Critical);
+            (void)publish_record(InteractionRejected{.endpoint_id = result.endpoint_id, .error = error}, transport::BrowserRecordPriority::Critical);
             if (result.essential_input) {
                 continuity_lost();
                 return false;
@@ -319,7 +290,6 @@ struct ApplicationBrowserHost::Impl final {
         }
         return true;
     }
-
     void publish(SystemEvent event) noexcept {
         if (!admission.load(std::memory_order_acquire)) return;
         const auto record_priority = priority(event.delivery);
@@ -334,12 +304,9 @@ struct ApplicationBrowserHost::Impl final {
         });
         if (server) server->close_peer();
     }
-
     static void Opened(void* context) noexcept { static_cast<Impl*>(context)->opened(); }
     static void Activated(void* context) noexcept { static_cast<Impl*>(context)->activated(); }
-    static bool Record(void* context, const std::span<const std::byte> bytes) noexcept {
-        return static_cast<Impl*>(context)->record(bytes);
-    }
+    static bool Record(void* context, const std::span<const std::byte> bytes) noexcept { return static_cast<Impl*>(context)->record(bytes); }
     void closed() noexcept {
         if (!admission.load(std::memory_order_acquire)) return;
         auto* installed = systems.load(std::memory_order_acquire);
@@ -366,7 +333,6 @@ struct ApplicationBrowserHost::Impl final {
             };
         });
     }
-
     std::mutex input_mutex;
     std::uint64_t input_epoch = 0U;
     std::shared_ptr<ExploreAcceptanceGate> integration;
@@ -376,14 +342,10 @@ struct ApplicationBrowserHost::Impl final {
     std::atomic<ApplicationSystems*> systems = nullptr;
     std::atomic_bool admission = true;
 };
-
 ApplicationBrowserHost::ApplicationBrowserHost(transport::BrowserServer& server, const services::RuntimeDiagnosticTarget diagnostics)
     : impl_(std::make_shared<Impl>(server, diagnostics)) {}
-
 bool ApplicationBrowserHost::install(ApplicationSystems& systems) noexcept { return impl_->install(systems); }
-
-void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptanceGate> gate,
-                                                 std::shared_ptr<PresentationAcceptanceGate> completion) {
+void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptanceGate> gate, std::shared_ptr<PresentationAcceptanceGate> completion) {
     if (!gate || impl_->integration) throw std::invalid_argument("integration gate installation is unique");
     gate->SetDiagnostics(impl_->diagnostics);
     std::weak_ptr<Impl> weak = impl_;
@@ -408,12 +370,9 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
             if (const auto target = receiver.lock()) {
                 const auto event = [&] {
                     switch (receipt.boundary) {
-                        case PresentationAcceptanceGate::Boundary::Completion:
-                            return ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld;
-                        case PresentationAcceptanceGate::Boundary::Capacity:
-                            return ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable;
-                        case PresentationAcceptanceGate::Boundary::Supersession:
-                            return ExploreAcceptanceGate::ControlEvent::PendingSupersessionHeld;
+                        case PresentationAcceptanceGate::Boundary::Completion: return ExploreAcceptanceGate::ControlEvent::NativeCompletionHeld;
+                        case PresentationAcceptanceGate::Boundary::Capacity: return ExploreAcceptanceGate::ControlEvent::NativeCapacityAvailable;
+                        case PresentationAcceptanceGate::Boundary::Supersession: return ExploreAcceptanceGate::ControlEvent::PendingSupersessionHeld;
                     }
                     std::unreachable();
                 }();
@@ -447,7 +406,6 @@ void ApplicationBrowserHost::install_integration(std::shared_ptr<ExploreAcceptan
     }
     impl_->integration = std::move(gate);
 }
-
 transport::BrowserServer::Callbacks ApplicationBrowserHost::callbacks() const noexcept {
     return {
         .context = impl_,
@@ -458,10 +416,8 @@ transport::BrowserServer::Callbacks ApplicationBrowserHost::callbacks() const no
         .diagnostic = impl_->diagnostics.valid() ? &Impl::Diagnostic : nullptr,
     };
 }
-
 void ApplicationBrowserHost::publish(SystemEvent event) noexcept { impl_->publish(std::move(event)); }
 void ApplicationBrowserHost::continuity_lost() noexcept { impl_->continuity_lost(); }
-
 void ApplicationBrowserHost::close_admission() noexcept {
     impl_->admission.store(false, std::memory_order_release);
     if (impl_->integration) {
@@ -472,7 +428,5 @@ void ApplicationBrowserHost::close_admission() noexcept {
         impl_->integration->StopAndJoin();
     }
 }
-
 bool ApplicationBrowserHost::accepting() const noexcept { return impl_->admission.load(std::memory_order_acquire); }
-
 }  // namespace mmltk::controller::browser

@@ -1,9 +1,7 @@
 #pragma once
-
 #include <expected>
 #include <string>
 #include "src/frameworks/reflection/field_policy.h"
-
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/contracts/artifact.h"
 #include "src/backend/data/catalog/class_catalog.h"
@@ -42,5 +40,4 @@ struct ComputeIntentMaterializer final {
                                                            const mmltk::controller::contracts::ArtifactInspection& artifact,
                                                            const mmltk::controller::contracts::ModelSelection& model) noexcept;
 };
-
 }  // namespace mmltk::controller::subsystems::system

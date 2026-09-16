@@ -4,7 +4,6 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
 #include <torch/torch.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -26,7 +25,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
 #include "detection_types.h"
 #include "postprocess.h"
 #include "src/backend/data/dataset_loader.h"
@@ -37,13 +35,9 @@
 #include "src/frameworks/gpu/cuda_priority.h"
 #include "torch_api.h"
 #include "torch_cuda_utils.h"
-
 import mmltk.backend.ml.cuda.gpu_quiescence;
-
 #include "detail/evaluation_runtime.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 struct TrainingEvaluationRunOwner::Impl final {
     explicit Impl(EvaluationRunConfig value) : config(std::move(value)) {
         if (config.batch_capacity == 0U || config.prediction_capacity == 0U || config.lane_count == 0U || config.slots_per_lane == 0U ||
@@ -53,16 +47,13 @@ struct TrainingEvaluationRunOwner::Impl final {
         const PredictionBufferConfig buffers{
             static_cast<std::int64_t>(config.batch_capacity),
             static_cast<std::int64_t>(config.prediction_capacity),
-            config.metric_set == EvaluationMetricSet::BBoxAndMask
-                ? std::make_optional(std::make_pair(config.image_height, config.image_width))
-                : std::nullopt,
+            config.metric_set == EvaluationMetricSet::BBoxAndMask ? std::make_optional(std::make_pair(config.image_height, config.image_width)) : std::nullopt,
             config.device_id,
         };
         lanes_.reserve(config.lane_count);
         for (std::size_t lane = 0; lane < config.lane_count; ++lane) {
             lanes_.push_back(EvaluationPredictionLane{
-                mmltk::backend::ml::cuda::get_priority_cuda_stream(config.device_id,
-                                                                   mmltk::frameworks::gpu::current_cuda_highest_stream_priority()),
+                mmltk::backend::ml::cuda::get_priority_cuda_stream(config.device_id, mmltk::frameworks::gpu::current_cuda_highest_stream_priority()),
                 std::make_shared<PredictionBufferSlotPool>(config.slots_per_lane, buffers),
             });
         }
@@ -71,12 +62,9 @@ struct TrainingEvaluationRunOwner::Impl final {
             timing_pool_ = std::make_unique<EvaluationCudaTimingPool>(config.lane_count + config.encoding_capacity);
         }
     }
-
     ~Impl() { cancel_and_drain(); }
-
     void begin() {
-        if (!lane_futures_.empty() || !encoding_queue_.empty() || !unsubmitted_timing_.empty() || !lane_timing_.empty() ||
-            !encoding_timing_.empty())
+        if (!lane_futures_.empty() || !encoding_queue_.empty() || !unsubmitted_timing_.empty() || !lane_timing_.empty() || !encoding_timing_.empty())
             throw std::logic_error("evaluation run cannot restart with outstanding work");
         if (!dataset_) throw std::logic_error("evaluation run requires a loaded dataset");
         dataset_->clear_predictions();
@@ -102,7 +90,6 @@ struct TrainingEvaluationRunOwner::Impl final {
             profile_->mask_task_count.store(0U, std::memory_order_relaxed);
         }
     }
-
     void cancel_and_drain() noexcept {
         if (progress_.terminal) return;
         progress_.cancelled = true;
@@ -121,32 +108,24 @@ struct TrainingEvaluationRunOwner::Impl final {
             } catch (...) {}
         }
         if (timing_pool_) {
-            for (auto& lease : unsubmitted_timing_)
-                timing_pool_->release(lease);
-            for (auto& lease : lane_timing_)
-                timing_pool_->release(lease);
-            for (auto& lease : encoding_timing_)
-                timing_pool_->release(lease);
+            for (auto& lease : unsubmitted_timing_) timing_pool_->release(lease);
+            for (auto& lease : lane_timing_) timing_pool_->release(lease);
+            for (auto& lease : encoding_timing_) timing_pool_->release(lease);
         }
         unsubmitted_timing_.clear();
         lane_timing_.clear();
         encoding_timing_.clear();
         progress_.in_flight_batches = 0U;
-        if (!terminal_) {
-            terminal_ = EvaluationRunTerminal{{}, progress_.completed_images, dataset_ ? dataset_->category_count() : 0U, true};
-        }
+        if (!terminal_) { terminal_ = EvaluationRunTerminal{{}, progress_.completed_images, dataset_ ? dataset_->category_count() : 0U, true}; }
         progress_.terminal = true;
     }
-
     void update_profile_peaks() noexcept {
         if (!profile_) return;
         std::size_t task_count = lane_futures_.size();
-        for (const PendingPredictionBatchEncoding& pending : encoding_queue_)
-            task_count += pending.images.size();
+        for (const PendingPredictionBatchEncoding& pending : encoding_queue_) task_count += pending.images.size();
         profile_->peak_in_flight_tasks = std::max(profile_->peak_in_flight_tasks, task_count);
         profile_->peak_in_flight_slots = std::max(profile_->peak_in_flight_slots, lane_futures_.size() + encoding_queue_.size());
     }
-
     void write_profile() const {
         const EvaluationDatasetOwner::Facts facts = dataset_->facts();
         const auto seconds = [](const std::uint64_t nanoseconds) { return static_cast<double>(nanoseconds) / 1.0e9; };
@@ -203,7 +182,6 @@ struct TrainingEvaluationRunOwner::Impl final {
         if (!stream.is_open()) throw std::runtime_error("failed to append RF-DETR validation profile: " + profile_->jsonl_path.string());
         stream << payload.dump() << '\n';
     }
-
     EvaluationRunConfig config;
     std::unique_ptr<EvaluationDatasetOwner> dataset_;
     std::vector<EvaluationPredictionLane> lanes_;
@@ -217,26 +195,21 @@ struct TrainingEvaluationRunOwner::Impl final {
     EvaluationRunProgress progress_{};
     std::optional<EvaluationRunTerminal> terminal_;
 };
-
 TrainingEvaluationRunOwner::TrainingEvaluationRunOwner(EvaluationRunConfig config) : impl_(std::make_unique<Impl>(std::move(config))) {}
 TrainingEvaluationRunOwner::~TrainingEvaluationRunOwner() = default;
 TrainingEvaluationRunOwner::TrainingEvaluationRunOwner(TrainingEvaluationRunOwner&&) noexcept = default;
 TrainingEvaluationRunOwner& TrainingEvaluationRunOwner::operator=(TrainingEvaluationRunOwner&&) noexcept = default;
-
 void TrainingEvaluationRunOwner::begin() { impl_->begin(); }
 void TrainingEvaluationRunOwner::cancel() noexcept { impl_->cancel_and_drain(); }
 EvaluationRunProgress TrainingEvaluationRunOwner::progress() const noexcept { return impl_->progress_; }
 std::optional<EvaluationRunTerminal> TrainingEvaluationRunOwner::terminal() const { return impl_->terminal_; }
-std::vector<int> TrainingEvaluationRunOwner::image_ids() const {
-    return impl_->dataset_ ? impl_->dataset_->image_ids() : std::vector<int>{};
-}
+std::vector<int> TrainingEvaluationRunOwner::image_ids() const { return impl_->dataset_ ? impl_->dataset_->image_ids() : std::vector<int>{}; }
 void TrainingEvaluationRunOwner::load_dataset(mmltk::backend::data::DatasetLoader& loader) {
     if (!impl_->lane_futures_.empty() || !impl_->encoding_queue_.empty()) {
         throw std::logic_error("evaluation dataset cannot change while work is in flight");
     }
     impl_->dataset_ = std::make_unique<EvaluationDatasetOwner>(loader, impl_->config.metric_set);
 }
-
 EvaluationDatasetOwner& TrainingEvaluationRunOwner::dataset() noexcept { return *impl_->dataset_; }
 const EvaluationDatasetOwner& TrainingEvaluationRunOwner::dataset() const noexcept { return *impl_->dataset_; }
 std::size_t TrainingEvaluationRunOwner::pending_lane_count() const noexcept { return impl_->lane_futures_.size(); }
@@ -261,7 +234,7 @@ void TrainingEvaluationRunOwner::record_timing_stop(const EvaluationCudaTimingLe
     if (lease) lease.timing->record_stop(phase, static_cast<cudaStream_t>(stream));
 }
 void TrainingEvaluationRunOwner::record_model_output(std::string precision, std::string box_precision, const std::size_t query_count,
-                         const std::size_t class_count) {
+                                                     const std::size_t class_count) {
     if (!impl_->profile_) return;
     impl_->profile_->precision = std::move(precision);
     impl_->profile_->box_precision = std::move(box_precision);
@@ -369,9 +342,8 @@ void TrainingEvaluationRunOwner::settle(EvalSummary summary) {
         !impl_->encoding_timing_.empty())
         throw std::logic_error("evaluation run cannot settle with outstanding work");
     if (impl_->terminal_) throw std::logic_error("evaluation run already reached a terminal outcome");
-    impl_->terminal_ = EvaluationRunTerminal{std::move(summary), impl_->progress_.completed_images, impl_->dataset_->category_count(), impl_->progress_.cancelled};
+    impl_->terminal_ =
+        EvaluationRunTerminal{std::move(summary), impl_->progress_.completed_images, impl_->dataset_->category_count(), impl_->progress_.cancelled};
     impl_->progress_.terminal = true;
 }
-
-
 }  // namespace mmltk::backend::models::rfdetr

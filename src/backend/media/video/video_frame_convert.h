@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <cuda_runtime_api.h>
 namespace mmltk::backend::media::video {
 struct VideoPlane final {
     const std::uint8_t* data = nullptr;
@@ -20,6 +21,5 @@ struct VideoColorConversion final {
     float kr = 0.299F;
     float kb = 0.114F;
 };
-[[nodiscard]] int convert_video_chw(VideoColorConversion, std::uint32_t width, std::uint32_t height,
-                                    float* target, std::uintptr_t stream) noexcept;
-}
+[[nodiscard]] int convert_video_chw(VideoColorConversion, std::uint32_t width, std::uint32_t height, float* target, cudaStream_t stream) noexcept;
+}  // namespace mmltk::backend::media::video

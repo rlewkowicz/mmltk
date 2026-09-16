@@ -6,27 +6,21 @@ module;
 #include <optional>
 #include "src/frameworks/gpu/device_execution.h"
 #include <string>
-
 export module mmltk.backend.media.capture.capture_session;
-
 import mmltk.backend.media.capture.capture_types;
 import mmltk.backend.media.capture.live_video_source;
 import mmltk.backend.media.capture.status;
-
 export namespace mmltk::backend::media::capture {
-
 struct CaptureDeviceApi final {
     void* context = nullptr;
     int (*ioctl)(void*, int, unsigned long, void*) noexcept = nullptr;
     void (*host_storage_released)(void*, std::uint32_t) noexcept = nullptr;
 };
-
 struct CaptureConfig final : LiveVideoSourceOptions {
     int cuda_device_index = 0;
     CaptureDeviceApi device_api{};
     std::optional<mmltk::frameworks::gpu::DeviceExecution> execution;
 };
-
 enum class CaptureStopKind : std::uint8_t {
     kRequested = 0,
     kStartupFailed,
@@ -35,7 +29,6 @@ enum class CaptureStopKind : std::uint8_t {
     kOwnerFailure,
     kCount,
 };
-
 struct CaptureStopTerminal {
     CaptureSessionIdentity identity{};
     CaptureStopKind kind = CaptureStopKind::kOwnerFailure;
@@ -43,55 +36,44 @@ struct CaptureStopTerminal {
     CaptureStats final_stats{};
     bool streamoff_skipped = false;
 };
-
 enum class CaptureSessionStartPhase : std::uint8_t {
     NoCustody,
     Running,
     Closing,
 };
-
 struct CaptureSessionStartResult final {
     CaptureSessionStartPhase phase = CaptureSessionStartPhase::NoCustody;
     Status status{StatusCode::kInternalError, "capture admission was not produced"};
     CaptureSessionIdentity identity{};
-
     [[nodiscard]] bool valid() const noexcept {
         switch (phase) {
-            case CaptureSessionStartPhase::NoCustody:
-                return !identity.valid() && !status.ok();
-            case CaptureSessionStartPhase::Running:
-                return identity.valid() && status.ok();
-            case CaptureSessionStartPhase::Closing:
-                return identity.valid() && !status.ok();
+            case CaptureSessionStartPhase::NoCustody: return !identity.valid() && !status.ok();
+            case CaptureSessionStartPhase::Running: return identity.valid() && status.ok();
+            case CaptureSessionStartPhase::Closing: return identity.valid() && !status.ok();
         }
         return false;
     }
     [[nodiscard]] bool has_custody() const noexcept {
         switch (phase) {
-            case CaptureSessionStartPhase::NoCustody:
-                return false;
+            case CaptureSessionStartPhase::NoCustody: return false;
             case CaptureSessionStartPhase::Running:
-            case CaptureSessionStartPhase::Closing:
-                return true;
+            case CaptureSessionStartPhase::Closing: return true;
         }
         return false;
     }
     [[nodiscard]] bool running() const noexcept { return phase == CaptureSessionStartPhase::Running; }
     [[nodiscard]] bool closing() const noexcept { return phase == CaptureSessionStartPhase::Closing; }
 };
-
 class CaptureSession {
    public:
     explicit CaptureSession(CaptureConfig config = {});
     // An admitted run must be requested to stop or reach its own terminal
     // before destruction. Destruction never initiates or waits for teardown.
     ~CaptureSession();
-
     CaptureSession(const CaptureSession&) = delete;
     CaptureSession& operator=(const CaptureSession&) = delete;
     CaptureSession(CaptureSession&&) noexcept;
     CaptureSession& operator=(CaptureSession&&) noexcept;
-
     // start() admits one owner-thread run. Device setup, capture, and every
     // teardown path execute on that owner thread.
     [[nodiscard]] CaptureSessionStartResult start();
@@ -120,16 +102,13 @@ class CaptureSession {
     void set_filled_frame_listener(std::function<void()> listener);
 
    private:
-    [[nodiscard]] static FilledCaptureSlotLease MakeFilledSlotLease(CaptureSessionIdentity identity, std::uint32_t slot,
-                                                                    std::uint64_t sequence, const std::uint8_t* data, std::size_t bytes,
-                                                                    std::size_t stride_bytes, std::uint32_t pixel_format,
-                                                                    CaptureRegion region, std::uint64_t capture_ns,
+    [[nodiscard]] static FilledCaptureSlotLease MakeFilledSlotLease(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence,
+                                                                    const std::uint8_t* data, std::size_t bytes, std::size_t stride_bytes,
+                                                                    std::uint32_t pixel_format, CaptureRegion region, std::uint64_t capture_ns,
                                                                     bool short_frame) noexcept;
     static void ConsumeFilledSlotLease(FilledCaptureSlotLease& lease) noexcept;
-
     struct Impl;
     struct OwnerHandle;
     std::unique_ptr<OwnerHandle> owner_;
 };
-
 }  // namespace mmltk::backend::media::capture

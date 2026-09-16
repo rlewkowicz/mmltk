@@ -3,43 +3,31 @@
 //
 // Retained from NVIDIA Image Scaling as the coefficient data required by the
 // repository-owned, device-only immediate fallback. See NOTICE for attribution.
-
 #pragma once
-
 #include <cstddef>
-
 namespace mmltk::backend::imaging::upscale::image_upscaler_nis::coefficients {
-
 inline constexpr std::size_t kPhaseCount = 64U;
 inline constexpr std::size_t kFilterTaps = 6U;
-
 // The same plain aggregate is used for the canonical host declaration and the
 // module-scope CUDA constant symbols. This keeps the coefficient vocabulary in
 // one owner and makes the device initialization a compile-time aggregate copy.
 struct CoefficientTable final {
     float values[kPhaseCount][kFilterTaps]{};
 };
-
 struct HalfCoefficientTable final {
     float values[(kPhaseCount / 2U) + 1U][kFilterTaps]{};
 };
-
 consteval CoefficientTable mirror_coefficients(const HalfCoefficientTable& leading) noexcept {
     CoefficientTable result{};
     constexpr std::size_t leading_phase_count = (kPhaseCount / 2U) + 1U;
     for (std::size_t phase = 0U; phase < leading_phase_count; ++phase) {
-        for (std::size_t tap = 0U; tap < kFilterTaps; ++tap) {
-            result.values[phase][tap] = leading.values[phase][tap];
-        }
+        for (std::size_t tap = 0U; tap < kFilterTaps; ++tap) { result.values[phase][tap] = leading.values[phase][tap]; }
     }
     for (std::size_t phase = (kPhaseCount / 2U) + 1U; phase < kPhaseCount; ++phase) {
-        for (std::size_t tap = 0U; tap < kFilterTaps; ++tap) {
-            result.values[phase][tap] = result.values[kPhaseCount - phase][kFilterTaps - tap - 1U];
-        }
+        for (std::size_t tap = 0U; tap < kFilterTaps; ++tap) { result.values[phase][tap] = result.values[kPhaseCount - phase][kFilterTaps - tap - 1U]; }
     }
     return result;
 }
-
 consteval CoefficientTable make_scale() noexcept {
     return mirror_coefficients({{
         {0.0f, 0.0f, 1.0000f, 0.0f, 0.0f, 0.0f},
@@ -77,9 +65,7 @@ consteval CoefficientTable make_scale() noexcept {
         {0.0244f, -0.1357f, 0.6113f, 0.6113f, -0.1357f, 0.0244f},
     }});
 }
-
 inline constexpr CoefficientTable kScale = make_scale();
-
 consteval CoefficientTable make_usm() noexcept {
     return mirror_coefficients({{
         {0.0f, -0.6001f, 1.2002f, -0.6001f, 0.0f, 0.0f},           {0.0029f, -0.6084f, 1.1987f, -0.5903f, -0.0029f, 0.0f},
@@ -101,7 +87,5 @@ consteval CoefficientTable make_usm() noexcept {
         {0.0132f, -0.3394f, 0.3262f, 0.3262f, -0.3394f, 0.0132f},
     }});
 }
-
 inline constexpr CoefficientTable kUsm = make_usm();
-
 }  // namespace mmltk::backend::imaging::upscale::image_upscaler_nis::coefficients

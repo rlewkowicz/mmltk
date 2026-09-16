@@ -42,7 +42,8 @@ pub struct Component {
 impl Default for Component {
     fn default() -> Self {
         Self {
-            results: Default::default(), samples: Default::default(),
+            results: Default::default(),
+            samples: Default::default(),
             model_card: crate::view::workflow::model_card::Component::new(
                 // CLEANUP-IGNORE: Validate binds the child owner to its generated feature.
                 crate::generated::FeatureId::Validate,
@@ -87,7 +88,13 @@ impl Component {
                     .id(format!("dialog.{}", fact.stable_field_id)),
                 )
             });
-        let progress = crate::view::workflow::progress::compute(model.workflow.validation.as_ref().map(|snapshot| &snapshot.operation));
+        let progress = crate::view::workflow::progress::compute(
+            model
+                .workflow
+                .validation
+                .as_ref()
+                .map(|snapshot| &snapshot.operation),
+        );
         let setup = column![
             self.model_card
                 .view(crate::view::workflow::model_card::State::from_settings(
@@ -125,7 +132,11 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
-            text(model.workflow.start_detail(crate::generated::FeatureId::Validate)),
+            text(
+                model
+                    .workflow
+                    .start_detail(crate::generated::FeatureId::Validate)
+            ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Validate,
                 "Run validation",
@@ -133,10 +144,7 @@ impl Component {
                     .draft
                     .as_ref()
                     .is_some_and(|draft| {
-                        model.compute_start_available(
-                                draft,
-                                crate::generated::FeatureId::Validate,
-                            )
+                        model.compute_start_available(draft, crate::generated::FeatureId::Validate)
                     })
                     .then_some(Message::StartRequested),
                 progress,
@@ -144,13 +152,22 @@ impl Component {
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
         .into();
-        let center = crate::view::workflow::Composition::new(crate::generated::FeatureId::Validate, width).center_width()
-            - 2.0 * crate::view::workflow::CARD_PADDING;
+        let center =
+            crate::view::workflow::Composition::new(crate::generated::FeatureId::Validate, width)
+                .center_width()
+                - 2.0 * crate::view::workflow::CARD_PADDING;
         let half = (center - 10.0) / 2.0;
         let workspace = iced::widget::row![
             container(self.results.view(model).map(Message::Results)).width(half),
-            container(self.samples.view(surface, model, settings, half).map(Message::Samples)).width(half),
-        ].spacing(10).into();
+            container(
+                self.samples
+                    .view(surface, model, settings, half)
+                    .map(Message::Samples)
+            )
+            .width(half),
+        ]
+        .spacing(10)
+        .into();
         let advanced = crate::view::shared::card(
             "Advanced",
             "Validation execution and generated constraints.",
@@ -180,7 +197,11 @@ impl Component {
             "Validation status",
             "Canonical native operation outcome.",
             text(crate::view::shared::compute_status(
-                model.workflow.validation.as_ref().map(|snapshot| &snapshot.operation),
+                model
+                    .workflow
+                    .validation
+                    .as_ref()
+                    .map(|snapshot| &snapshot.operation),
             )),
         );
         crate::view::workflow::Regions::new(
@@ -231,12 +252,18 @@ impl Component {
                 // CLEANUP-IGNORE: Validate closes its local settings outcome before workspace routing.
             ),
             Message::Results(message) => {
-                if self.results.update(&message) { return Ok(None); }
-                let results::Message::Page(query) = message else { return Ok(None); };
+                if self.results.update(&message) {
+                    return Ok(None);
+                }
+                let results::Message::Page(query) = message else {
+                    return Ok(None);
+                };
                 Outcome::Details(query)
             }
             Message::Samples(message) => {
-                if self.samples.update(&message) { return Ok(None); }
+                if self.samples.update(&message) {
+                    return Ok(None);
+                }
                 Outcome::Sample(message)
             }
         };
@@ -252,12 +279,26 @@ mod tests {
     fn labels_and_fit_are_local_while_sample_selection_keeps_displayed_identity() {
         let mut component = Component::default();
         let mut settings = crate::view::settings::SettingsModel::default();
-        for message in [samples::Message::Labels(true, false), samples::Message::Labels(false, true), samples::Message::Fit] {
-            assert!(component.update(&mut settings, Message::Samples(message)).unwrap().is_none());
+        for message in [
+            samples::Message::Labels(true, false),
+            samples::Message::Labels(false, true),
+            samples::Message::Fit,
+        ] {
+            assert!(
+                component
+                    .update(&mut settings, Message::Samples(message))
+                    .unwrap()
+                    .is_none()
+            );
         }
-        let identity = crate::generated::ValidationSampleIdentity { generation: 7, datasetindex: 42 };
-        assert!(matches!(component.update(&mut settings, Message::Samples(samples::Message::Select(identity.clone()))).unwrap(),
-            Some(Outcome::Sample(samples::Message::Select(actual))) if actual == identity));
+        let identity = crate::generated::ValidationSampleIdentity {
+            generation: 7,
+            datasetindex: 42,
+        };
+        assert!(
+            matches!(component.update(&mut settings, Message::Samples(samples::Message::Select(identity.clone()))).unwrap(),
+            Some(Outcome::Sample(samples::Message::Select(actual))) if actual == identity)
+        );
     }
 
     #[test]

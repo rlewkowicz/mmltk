@@ -1,13 +1,12 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <atomic>
 #include <exception>
 #include <future>
 #include <memory>
 #include <stdexcept>
 #include "src/backend/models/rfdetr/training/detail/evaluation_runtime.h"
-
 using namespace mmltk::backend::models::rfdetr;
-
 TEST_CASE("Evaluation encoding collection preserves image order", "[rfdetr][evaluation][settlement]") {
     PendingPredictionBatchEncoding pending;
     for (int image_id : {7, 3, 11}) {
@@ -24,7 +23,6 @@ TEST_CASE("Evaluation encoding collection preserves image order", "[rfdetr][eval
     CHECK(results[2].image_id == 11);
     for (const auto& future : pending.images) CHECK_FALSE(future.valid());
 }
-
 TEST_CASE("Evaluation encoding failure settles every sibling before propagating", "[rfdetr][evaluation][settlement]") {
     for (int failure_index : {0, 1, 2}) {
         PendingPredictionBatchEncoding pending;
@@ -48,7 +46,6 @@ TEST_CASE("Evaluation encoding failure settles every sibling before propagating"
         CHECK(collect_prediction_batch_encoding(std::move(pending)).empty());
     }
 }
-
 TEST_CASE("Evaluation encoding collection joins a running sibling after a consumed failure", "[rfdetr][evaluation][settlement]") {
     PendingPredictionBatchEncoding pending;
     std::promise<PredictionBatchItem> failed;

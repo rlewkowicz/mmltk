@@ -17,7 +17,10 @@ namespace io = mmltk::common::io;
 TEST_CASE("Digest-bound class bundles survive renaming and reject stale companions", "[model][rfdetr][layout][artifact]") {
     const auto root = mmltk::testsupport::make_temp_root("class-layout-bundle");
     const auto artifact = root / "model.engine";
-    { std::ofstream output(artifact); output << "engine bytes for descriptor admission"; }
+    {
+        std::ofstream output(artifact);
+        output << "engine bytes for descriptor admission";
+    }
     const auto digest = *io::try_file_digests(artifact, false);
     const auto layout = r::native_training_class_layout(c::ClassCatalog({"background", "cat"}));
     const auto write = [&](const std::filesystem::path& path, const r::ModelClassDescriptor& descriptor) {
@@ -43,7 +46,10 @@ TEST_CASE("Digest-bound class bundles survive renaming and reject stale companio
     const r::ResolvedClassLayout raw(r::ClassArtifactAdmission(artifact, {}, std::make_shared<const io::FileDigests>(digest)).Resolve(3, {}));
     CHECK(raw.domain() == c::ClassReferenceDomain::RawOutputSlot);
     write(artifact.string() + ".classes.json", descriptor);
-    { std::ofstream output(artifact, std::ios::trunc); output << "replacement engine"; }
+    {
+        std::ofstream output(artifact, std::ios::trunc);
+        output << "replacement engine";
+    }
     CHECK_THROWS(r::ClassArtifactAdmission(artifact, {}, std::make_shared<const io::FileDigests>(digest)).Resolve(3, {}));
     CHECK_THROWS(r::ClassArtifactAdmission(artifact).Resolve(3, {}));
     std::filesystem::remove_all(root);
@@ -55,27 +61,34 @@ TEST_CASE("Zero foreground preserves physical logits bounds without detection al
     CHECK(r::PredictionCapacity::Resolve(0, 2, 300, 1, 64, 64, true, 0).candidates == 0);
     CHECK_THROWS(r::PredictionCapacity::Resolve(500, 2, 300, 1, 64, 64, false, 2));
 }
-
 TEST_CASE("RF-DETR publication restores the complete bundle at every cancellation boundary", "[model][rfdetr][layout][publication]") {
     const mmltk::testsupport::ScopedTempDir root("class-bundle-publication");
     const auto artifact = root.path() / "model.engine";
     const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
     const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));
     for (int stop_at = 1; stop_at <= 7; ++stop_at) {
-        { std::ofstream output(artifact); output << "previous complete artifact"; }
+        {
+            std::ofstream output(artifact);
+            output << "previous complete artifact";
+        }
         const auto old_digest = io::sha256_file(artifact);
         const auto descriptor = r::encode_class_descriptor({1, io::sha256_hex(old_digest), layout});
-        { std::ofstream output(companion); output << descriptor; }
+        {
+            std::ofstream output(companion);
+            output << descriptor;
+        }
         {
             r::ClassArtifactPublication publication(artifact);
-            { std::ofstream output(publication.staged_artifact()); output << "replacement artifact"; }
+            {
+                std::ofstream output(publication.staged_artifact());
+                output << "replacement artifact";
+            }
             int boundary = 0;
             CHECK_THROWS(publication.Publish(r::ModelClassDescriptor{1, {}, layout}, [&] { return ++boundary == stop_at; }));
         }
         CHECK(io::sha256_file(artifact) == old_digest);
         CHECK(r::detail::read_class_descriptor(companion).artifact_sha256 == io::sha256_hex(old_digest));
-        for (const auto& entry : std::filesystem::directory_iterator(root.path()))
-            CHECK_FALSE(entry.is_directory());
+        for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
     }
     CHECK_THROWS(r::ClassArtifactPublication(artifact, companion));
     {
@@ -85,17 +98,20 @@ TEST_CASE("RF-DETR publication restores the complete bundle at every cancellatio
     CHECK(r::detail::read_class_descriptor(companion).artifact_sha256 == io::sha256_hex(io::sha256_file(artifact)));
     {
         r::ClassArtifactPublication unfinished(artifact);
-        std::ofstream output(unfinished.staged_artifact()); output << "partial serialization";
+        std::ofstream output(unfinished.staged_artifact());
+        output << "partial serialization";
     }
     CHECK(r::detail::read_class_descriptor(companion).artifact_sha256 == io::sha256_hex(io::sha256_file(artifact)));
     {
         r::ClassArtifactPublication embedded(artifact);
-        { std::ofstream output(embedded.staged_artifact()); output << "new embedded layout artifact"; }
+        {
+            std::ofstream output(embedded.staged_artifact());
+            output << "new embedded layout artifact";
+        }
         embedded.Publish();
     }
     CHECK_FALSE(std::filesystem::exists(companion));
 }
-
 TEST_CASE("Class artifact admission waits for a complete published companion", "[model][rfdetr][layout][publication]") {
     const mmltk::testsupport::ScopedTempDir root("class-bundle-read");
     const auto artifact = root.path() / "model.engine";
@@ -105,7 +121,10 @@ TEST_CASE("Class artifact admission waits for a complete published companion", "
     std::future<r::ModelClassLayout> admitted;
     {
         r::ClassArtifactPublication publication(artifact);
-        { std::ofstream output(publication.staged_artifact()); output << "new engine"; }
+        {
+            std::ofstream output(publication.staged_artifact());
+            output << "new engine";
+        }
         int boundary = 0;
         publication.Publish(r::ModelClassDescriptor{1, {}, layout}, [&] {
             if (++boundary == 5) {
@@ -122,21 +141,33 @@ TEST_CASE("Class artifact admission waits for a complete published companion", "
     }
     CHECK(admitted.get() == layout);
 }
-
 TEST_CASE("Staged class publication permits old readers and rejects a competing commit", "[model][rfdetr][layout][publication]") {
     const mmltk::testsupport::ScopedTempDir root("class-bundle-staged-read");
     const auto artifact = root.path() / "model.engine";
     const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
     const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));
-    { std::ofstream output(artifact); output << "old complete engine"; }
+    {
+        std::ofstream output(artifact);
+        output << "old complete engine";
+    }
     const auto original = *io::try_file_digests(artifact, false);
-    { std::ofstream output(companion); output << r::encode_class_descriptor({1, io::sha256_hex(original.sha256), layout}); }
+    {
+        std::ofstream output(companion);
+        output << r::encode_class_descriptor({1, io::sha256_hex(original.sha256), layout});
+    }
     std::future<r::ModelClassLayout> reader;
     {
         r::ClassArtifactPublication first(artifact), competing(artifact);
-        { std::ofstream output(first.staged_artifact()); output << "first replacement"; }
-        { std::ofstream output(competing.staged_artifact()); output << "competing replacement"; }
-        reader = std::async(std::launch::async, [&] { return r::ClassArtifactAdmission(artifact, {}, std::make_shared<const io::FileDigests>(original)).Resolve(2, {}); });
+        {
+            std::ofstream output(first.staged_artifact());
+            output << "first replacement";
+        }
+        {
+            std::ofstream output(competing.staged_artifact());
+            output << "competing replacement";
+        }
+        reader = std::async(std::launch::async,
+                            [&] { return r::ClassArtifactAdmission(artifact, {}, std::make_shared<const io::FileDigests>(original)).Resolve(2, {}); });
         // Both producers still own staging here. The reader must finish before
         // either producer enters the named replacement window.
         REQUIRE(reader.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
@@ -151,21 +182,29 @@ TEST_CASE("Staged class publication permits old readers and rejects a competing 
     }
     CHECK(r::ClassArtifactAdmission(artifact).Resolve(2, {}) == layout);
 }
-
 TEST_CASE("A live stop after staging preserves the prior complete class bundle", "[model][rfdetr][layout][publication]") {
     const mmltk::testsupport::ScopedTempDir root("class-bundle-staged-stop");
     const auto artifact = root.path() / "model.engine";
     const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
     const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));
-    { std::ofstream output(artifact); output << "previous engine"; }
+    {
+        std::ofstream output(artifact);
+        output << "previous engine";
+    }
     const auto original = io::sha256_file(artifact);
-    { std::ofstream output(companion); output << r::encode_class_descriptor({1, io::sha256_hex(original), layout}); }
+    {
+        std::ofstream output(companion);
+        output << r::encode_class_descriptor({1, io::sha256_hex(original), layout});
+    }
     const auto original_companion = io::sha256_file(companion);
     std::stop_source source;
     const auto stop = source.get_token();
     {
         r::ClassArtifactPublication publication(artifact);
-        { std::ofstream output(publication.staged_artifact()); output << "finished candidate"; }
+        {
+            std::ofstream output(publication.staged_artifact());
+            output << "finished candidate";
+        }
         source.request_stop();
         CHECK_THROWS_AS(publication.Publish(r::ModelClassDescriptor{1, {}, layout}, [&] { return stop.stop_requested(); }), r::ArtifactPublicationCancelled);
     }
@@ -173,17 +212,22 @@ TEST_CASE("A live stop after staging preserves the prior complete class bundle",
     CHECK(io::sha256_file(companion) == original_companion);
     for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
 }
-
 TEST_CASE("Retained class admission rejects changes across model construction", "[model][rfdetr][layout][artifact]") {
     const mmltk::testsupport::ScopedTempDir root("retained-class-admission");
     const auto artifact = root.path() / "model.engine";
     const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
     const auto selected = root.path() / "selected.json";
-    { std::ofstream output(artifact); output << "admitted model bytes"; }
+    {
+        std::ofstream output(artifact);
+        output << "admitted model bytes";
+    }
     const auto proof = std::make_shared<const io::FileDigests>(*io::try_file_digests(artifact, false));
     const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));
     const auto encoded = r::encode_class_descriptor({1, io::sha256_hex(proof->sha256), layout});
-    const auto write_descriptor = [&](const std::filesystem::path& path) { std::ofstream output(path); output << encoded; };
+    const auto write_descriptor = [&](const std::filesystem::path& path) {
+        std::ofstream output(path);
+        output << encoded;
+    };
     write_descriptor(companion);
     write_descriptor(selected);
     const r::ClassArtifactAdmission admission(artifact, selected, proof);
@@ -219,43 +263,58 @@ TEST_CASE("Retained class admission rejects changes across model construction", 
         }
         DYNAMIC_SECTION("descriptor removal " << path.filename()) {
             std::filesystem::remove(path);
-            if (path == selected) CHECK_THROWS(admission.Matches(artifact, selected));
-            else CHECK_FALSE(admission.Matches(artifact, selected));
+            if (path == selected)
+                CHECK_THROWS(admission.Matches(artifact, selected));
+            else
+                CHECK_FALSE(admission.Matches(artifact, selected));
             CHECK_THROWS(admission.Resolve(2, layout));
         }
     }
 }
-
 TEST_CASE("Class admission records absent descriptors and rejects conflicting facts", "[model][rfdetr][layout][artifact]") {
     const mmltk::testsupport::ScopedTempDir root("class-admission-absence");
     const auto artifact = root.path() / "model.engine";
     const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
     const auto selected = root.path() / "selected.json";
-    { std::ofstream output(artifact); output << "external model"; }
+    {
+        std::ofstream output(artifact);
+        output << "external model";
+    }
     const r::ClassArtifactAdmission absent(artifact);
     CHECK_FALSE(r::ResolvedClassLayout(absent.Resolve(2, {})).semantic());
     CHECK_THROWS(r::ClassArtifactAdmission(artifact, selected, absent.file()));
     const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));
     const r::ModelClassDescriptor descriptor{1, io::sha256_hex(absent.file()->sha256), layout};
-    { std::ofstream output(companion); output << r::encode_class_descriptor(descriptor); }
+    {
+        std::ofstream output(companion);
+        output << r::encode_class_descriptor(descriptor);
+    }
     CHECK_FALSE(absent.Matches(artifact));
     CHECK_THROWS(absent.Resolve(2, {}));
-    { std::ofstream output(selected); output << r::encode_class_descriptor(descriptor); }
+    {
+        std::ofstream output(selected);
+        output << r::encode_class_descriptor(descriptor);
+    }
     const r::ClassArtifactAdmission matching(artifact, selected, absent.file());
     CHECK(matching.file() == absent.file());
     CHECK(matching.Resolve(2, layout) == layout);
     CHECK_THROWS(matching.Resolve(2, r::native_training_class_layout(c::ClassCatalog({"dog"}))));
     auto conflicting = descriptor;
     conflicting.layout = r::native_training_class_layout(c::ClassCatalog({"dog"}));
-    { std::ofstream output(selected); output << r::encode_class_descriptor(conflicting); }
+    {
+        std::ofstream output(selected);
+        output << r::encode_class_descriptor(conflicting);
+    }
     CHECK_THROWS(r::ClassArtifactAdmission(artifact, selected, absent.file()).Resolve(2, {}));
     CHECK_THROWS(matching.Resolve(2, layout));
 }
-
 TEST_CASE("Class admission observes live cancellation at digest and completion boundaries", "[model][rfdetr][layout][cancellation]") {
     const mmltk::testsupport::ScopedTempDir root("class-admission-stop");
     const auto artifact = root.path() / "model.engine";
-    { std::ofstream output(artifact); output << "external model"; }
+    {
+        std::ofstream output(artifact);
+        output << "external model";
+    }
     std::stop_source source;
     const auto stop = source.get_token();
     SECTION("before hashing") {

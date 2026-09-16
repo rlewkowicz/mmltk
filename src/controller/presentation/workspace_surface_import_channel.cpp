@@ -3,7 +3,6 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/random.h>
@@ -12,7 +11,6 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -37,20 +35,14 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
 #include "src/common/io/noexcept_io.h"
 #include "src/common/io/scoped_fd.h"
-
 import mmltk.common.logging.mmltk_logging;
-
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/controller/presentation/presentation_system.h"
-
 namespace mmltk::controller::presentation {
-
 using mmltk::common::io::ScopedFd;
-
 contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surface_import::Record& record) noexcept {
     // CLEANUP-IGNORE: Workspace diagnostic projection has no shared fields or behavior with RF-DETR model preset construction.
     return {.workspace_source_high = record.id_high,
@@ -64,18 +56,14 @@ contracts::DiagnosticWorkspace workspace_source_diagnostic(const workspace_surfa
             .workspace_height = record.height,
             .direct_sampling = record.direct_sampling != 0U};
 }
-
 namespace {
-
 using workspace_surface_import::FailureCode;
 using workspace_surface_import::Opcode;
 using workspace_surface_import::Record;
-
 // Allocation request eventfd, frame, and access descriptors fit the shell's
 // frozen control-message budget.
 constexpr std::size_t kControlBytes = 32U;
 static_assert(CMSG_SPACE(sizeof(int) * workspace_surface_import::kAllocateDescriptorCount) <= kControlBytes);
-
 // These records use the existing native stderr capture, as do the CUDA import
 // records. Observe descriptors only while their existing owners retain them.
 // No diagnostic descriptor, protocol field, or lifetime extension is needed.
@@ -97,32 +85,29 @@ void trace_memory_descriptor(const char* event, const Record& record, int peer, 
         uuid[index * 2 + 1] = hex[record.device_uuid[index] & 15];
     }
     char output[2048];
-    const int bytes = std::snprintf(output, sizeof(output),
-                                    "{\"event\":\"presentation.workspace.%s\",\"source\":\"%016llx%016llx\",\"surface\":\"%016llx%016llx\","
-                                    "\"workspace_allocation\":%llu,\"native_process_id\":%ld,\"browser_process_id\":%ld,"
-                                    "\"peer_credentials_known\":%s,\"channel_descriptor\":%d,\"workspace_descriptor\":%d,"
-                                    "\"descriptor_count\":%u,\"memory_descriptor_index\":%zu,\"descriptor_transport\":\"SCM_RIGHTS\","
-                                    "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"memory_size\":%llu,\"row_pitch\":%llu,"
-                                    "\"image_offset\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,\"dedicated\":%u,"
-                                    "\"record_bytes\":%zu,\"fd_stat_status\":%d,\"fd_stat_errno\":%d,"
-                                    "\"fd_dev\":%llu,\"fd_ino\":%llu,\"fd_rdev\":%llu,\"fd_mode\":%u,\"fd_size\":%lld,"
-                                    "\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"}\n",
-                                    event, static_cast<unsigned long long>(record.id_high), static_cast<unsigned long long>(record.id_low),
-                                    static_cast<unsigned long long>(record.arena_high), static_cast<unsigned long long>(record.arena_low),
-                                    static_cast<unsigned long long>(record.allocation_identity), static_cast<long>(::getpid()),
-                                    peer_known ? static_cast<long>(credentials.pid) : 0L, peer_known ? "true" : "false", peer, descriptor,
-                                    record.descriptors, workspace_surface_import::kReadyMemoryDescriptor, uuid,
-                                    static_cast<unsigned long long>(record.device_incarnation),
-                                    static_cast<unsigned long long>(record.size), static_cast<unsigned long long>(record.stride),
-                                    static_cast<unsigned long long>(record.offset), record.width, record.height, record.dedicated,
-                                    sizeof(record), stat_status, stat_errno, static_cast<unsigned long long>(metadata.st_dev),
-                                    static_cast<unsigned long long>(metadata.st_ino), static_cast<unsigned long long>(metadata.st_rdev),
-                                    static_cast<unsigned int>(metadata.st_mode), static_cast<long long>(metadata.st_size));
+    const int bytes = std::snprintf(
+        output, sizeof(output),
+        "{\"event\":\"presentation.workspace.%s\",\"source\":\"%016llx%016llx\",\"surface\":\"%016llx%016llx\","
+        "\"workspace_allocation\":%llu,\"native_process_id\":%ld,\"browser_process_id\":%ld,"
+        "\"peer_credentials_known\":%s,\"channel_descriptor\":%d,\"workspace_descriptor\":%d,"
+        "\"descriptor_count\":%u,\"memory_descriptor_index\":%zu,\"descriptor_transport\":\"SCM_RIGHTS\","
+        "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"memory_size\":%llu,\"row_pitch\":%llu,"
+        "\"image_offset\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,\"dedicated\":%u,"
+        "\"record_bytes\":%zu,\"fd_stat_status\":%d,\"fd_stat_errno\":%d,"
+        "\"fd_dev\":%llu,\"fd_ino\":%llu,\"fd_rdev\":%llu,\"fd_mode\":%u,\"fd_size\":%lld,"
+        "\"fd_identity_scope\":\"metadata_only_not_gpu_allocation_identity\"}\n",
+        event, static_cast<unsigned long long>(record.id_high), static_cast<unsigned long long>(record.id_low),
+        static_cast<unsigned long long>(record.arena_high), static_cast<unsigned long long>(record.arena_low),
+        static_cast<unsigned long long>(record.allocation_identity), static_cast<long>(::getpid()), peer_known ? static_cast<long>(credentials.pid) : 0L,
+        peer_known ? "true" : "false", peer, descriptor, record.descriptors, workspace_surface_import::kReadyMemoryDescriptor, uuid,
+        static_cast<unsigned long long>(record.device_incarnation), static_cast<unsigned long long>(record.size),
+        static_cast<unsigned long long>(record.stride), static_cast<unsigned long long>(record.offset), record.width, record.height, record.dedicated,
+        sizeof(record), stat_status, stat_errno, static_cast<unsigned long long>(metadata.st_dev), static_cast<unsigned long long>(metadata.st_ino),
+        static_cast<unsigned long long>(metadata.st_rdev), static_cast<unsigned int>(metadata.st_mode), static_cast<long long>(metadata.st_size));
     if (bytes > 0 && static_cast<std::size_t>(bytes) < sizeof(output))
         mmltk::common::io::write_all_noexcept(STDERR_FILENO, {output, static_cast<std::size_t>(bytes)});
     errno = saved_errno;
 }
-
 [[nodiscard]] bool bind_listener(const int fd, const std::filesystem::path& path, std::string& error) {
     sockaddr_un address{};
     const std::string native = path.string();
@@ -148,9 +133,7 @@ void trace_memory_descriptor(const char* event, const Record& record, int peer, 
     }
     return true;
 }
-
 }  // namespace
-
 WorkspaceSurfaceImportId WorkspaceSurfaceImportId::generate() {
     WorkspaceSurfaceImportId id;
     do {
@@ -166,12 +149,9 @@ WorkspaceSurfaceImportId WorkspaceSurfaceImportId::generate() {
     } while (!id);
     return id;
 }
-
 WorkspaceSurfaceFrameSignal::~WorkspaceSurfaceFrameSignal() { reset(); }
-
 WorkspaceSurfaceFrameSignal::WorkspaceSurfaceFrameSignal(WorkspaceSurfaceFrameSignal&& other) noexcept
     : descriptor_(std::move(other.descriptor_)), mapping_(std::exchange(other.mapping_, nullptr)) {}
-
 WorkspaceSurfaceFrameSignal& WorkspaceSurfaceFrameSignal::operator=(WorkspaceSurfaceFrameSignal&& other) noexcept {
     if (this != &other) {
         reset();
@@ -180,7 +160,6 @@ WorkspaceSurfaceFrameSignal& WorkspaceSurfaceFrameSignal::operator=(WorkspaceSur
     }
     return *this;
 }
-
 WorkspaceSurfaceFrameSignal WorkspaceSurfaceFrameSignal::create() {
     WorkspaceSurfaceFrameSignal result;
     const int descriptor = ::memfd_create("mmltk-workspace-frame", MFD_CLOEXEC | MFD_ALLOW_SEALING);
@@ -199,11 +178,8 @@ WorkspaceSurfaceFrameSignal WorkspaceSurfaceFrameSignal::create() {
     }
     return result;
 }
-
 int WorkspaceSurfaceFrameSignal::descriptor() const noexcept { return descriptor_.get(); }
-
 detail::WorkspaceFrameSignal* WorkspaceSurfaceFrameSignal::mapping() const noexcept { return mapping_; }
-
 void WorkspaceSurfaceFrameSignal::reset() noexcept {
     if (mapping_ != nullptr) {
         static_cast<void>(::munmap(mapping_, detail::kWorkspaceFrameMappingBytes));
@@ -211,14 +187,12 @@ void WorkspaceSurfaceFrameSignal::reset() noexcept {
     }
     descriptor_.reset();
 }
-
 std::string WorkspaceSurfaceImportId::to_string() const {
     if (!*this) { return {}; }
     std::ostringstream stream;
     stream << std::hex << std::setfill('0') << std::setw(16) << high << std::setw(16) << low;
     return stream.str();
 }
-
 struct WorkspaceSurfaceImportChannel::Impl {
     static constexpr std::size_t kLedgerCapacity = 256U;
     static constexpr std::size_t kPendingRecordCapacity = 32U;
@@ -241,18 +215,14 @@ struct WorkspaceSurfaceImportChannel::Impl {
         bool release_submitted = false;
         std::uint64_t last_transfer = 0U;
     };
-
     struct PendingRecord {
         Record record{};
         std::array<ScopedFd, workspace_surface_import::kAllocateDescriptorCount> descriptors{};
         std::size_t descriptor_count = 0U;
     };
-
     VisualDiagnosticSink diagnostics{};
-
     using AdmissionRecord = std::pair<WorkspaceSurfaceImportId, Admission>;
     using RetirementRecord = std::pair<WorkspaceSurfaceImportId, std::uint64_t>;
-
     // CLEANUP-IGNORE: This import-channel owner preallocates its own fixed ledgers and queues.
     explicit Impl(const VisualDiagnosticSink sink) : diagnostics(sink) {
         // CLEANUP-IGNORE: This channel reserves each owner-specific fixed-capacity record collection once.
@@ -268,28 +238,20 @@ struct WorkspaceSurfaceImportChannel::Impl {
         pending_withdrawals.reserve(kLedgerCapacity);
         replied.reserve(kLedgerCapacity);
     }
-
     [[nodiscard]] static bool contains(const std::vector<WorkspaceSurfaceImportId>& values, const WorkspaceSurfaceImportId id) noexcept {
         return std::ranges::find(values, id) != values.end();
     }
-
-    [[nodiscard]] auto find_admission(const WorkspaceSurfaceImportId id) noexcept {
-        return std::ranges::find(admitted, id, &AdmissionRecord::first);
-    }
-
+    [[nodiscard]] auto find_admission(const WorkspaceSurfaceImportId id) noexcept { return std::ranges::find(admitted, id, &AdmissionRecord::first); }
     [[nodiscard]] std::uint64_t generation(const WorkspaceSurfaceImportId id) const noexcept {
         const auto admission = std::ranges::find(admitted, id, &AdmissionRecord::first);
         if (admission != admitted.end()) return admission->second.generation;
         const auto retirement = std::ranges::find(retired, id, &RetirementRecord::first);
         return retirement != retired.end() ? retirement->second : 0U;
     }
-
     void erase_id(std::vector<WorkspaceSurfaceImportId>& values, const WorkspaceSurfaceImportId id) { std::erase(values, id); }
-
     void erase_admission(const WorkspaceSurfaceImportId id) {
         std::erase_if(admitted, [id](const AdmissionRecord& record) { return record.first == id; });
     }
-
     std::filesystem::path path;
     ScopedFd listener;
     ScopedFd peer;
@@ -298,7 +260,6 @@ struct WorkspaceSurfaceImportChannel::Impl {
     std::array<Record, 2U * kLedgerCapacity> source_transitions{};
     std::size_t next_source_transition = 0U;
     std::size_t source_transition_count = 0U;
-
     void push_source_transition(const Record& record) {
         source_transitions[(next_source_transition + source_transition_count) % source_transitions.size()] = record;
         ++source_transition_count;
@@ -317,7 +278,6 @@ struct WorkspaceSurfaceImportChannel::Impl {
     std::vector<WorkspaceSurfaceImportId> replied;
     std::optional<std::string> terminal;
     PeerEpochState peer_epoch = PeerEpochState::Accepting;
-
     void fail(std::string reason) {
         if (!terminal.has_value()) { terminal = std::move(reason); }
         // Transport failure closes this peer and discards queued socket work.
@@ -326,12 +286,10 @@ struct WorkspaceSurfaceImportChannel::Impl {
         pending.clear();
         peer_epoch = PeerEpochState::ClosedObserved;
     }
-
     void lose_peer() noexcept {
         peer.reset();
         peer_epoch = PeerEpochState::ClosedPendingObservation;
     }
-
     // Rejects a peer outside the expected process group, so a browser restart
     // cannot have its predecessor claim the channel.
     [[nodiscard]] bool peer_is_expected(const int fd) const {
@@ -341,7 +299,6 @@ struct WorkspaceSurfaceImportChannel::Impl {
         if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &length) != 0) { return false; }
         return ::getpgid(credentials.pid) == expected_process_group;
     }
-
     // Sends one record together with exactly the descriptors its opcode
     // declares, in one SCM_RIGHTS array. The record's own count is what the
     // shell checks the ancillary data against.
@@ -368,7 +325,6 @@ struct WorkspaceSurfaceImportChannel::Impl {
         erase_admission(id);
         return false;
     }
-
     [[nodiscard]] bool send(const Record& record, const std::span<const int> descriptors) {
         if (peer.get() < 0 || descriptors.size() != workspace_surface_import::descriptor_count(record.opcode)) { return false; }
         if (pending.size() >= kPendingRecordCapacity) { return false; }
@@ -376,9 +332,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
         outbound.record.descriptors = static_cast<std::uint32_t>(descriptors.size());
         for (std::size_t index = 0U; index < descriptors.size(); ++index) {
             int duplicate = -1;
-            do {
-                duplicate = ::fcntl(descriptors[index], F_DUPFD_CLOEXEC, 0);
-            } while (duplicate < 0 && errno == EINTR);
+            do { duplicate = ::fcntl(descriptors[index], F_DUPFD_CLOEXEC, 0); } while (duplicate < 0 && errno == EINTR);
             if (duplicate < 0) {
                 fail("workspace import descriptor duplication failed");
                 return false;
@@ -389,40 +343,35 @@ struct WorkspaceSurfaceImportChannel::Impl {
         flush();
         return !terminal.has_value();
     }
-
     void EmitAdmission(const Record& record, const VisualDiagnosticOperation operation) {
         diagnostics.Emit([&] {
             const WorkspaceSurfaceImportId id{record.id_high, record.id_low};
             const auto found = find_admission(id);
             const auto& admission = found->second;
-            return VisualDiagnosticFact{
-                .system = contracts::DiagnosticOwner::Presentation,
-                .operation = admission.arena ? operation
-                                             : (operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued
-                                                    ? VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued
-                                                    : VisualDiagnosticOperation::PresentationSourceAdmissionWritten),
-                .generation = admission.generation,
-                .context = {.capacity_width = admission.width,
-                            .capacity_height = admission.height,
-                            .surface_high = id.high,
-                            .surface_low = id.low,
-                            .selection_generation = admission.selection_generation,
-                            .frame_revision = admission.frame_revision,
-                            .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
-                            .outcome = 1U,
-                            .allocation = {.allocation_generation = admission.generation},
-                            .workspace = admission.arena ? contracts::DiagnosticWorkspace{} : workspace_source_diagnostic(record)}};
+            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
+                                        .operation = admission.arena ? operation
+                                                                     : (operation == VisualDiagnosticOperation::PresentationAdmissionEnqueued
+                                                                            ? VisualDiagnosticOperation::PresentationSourceAdmissionEnqueued
+                                                                            : VisualDiagnosticOperation::PresentationSourceAdmissionWritten),
+                                        .generation = admission.generation,
+                                        .context = {.capacity_width = admission.width,
+                                                    .capacity_height = admission.height,
+                                                    .surface_high = id.high,
+                                                    .surface_low = id.low,
+                                                    .selection_generation = admission.selection_generation,
+                                                    .frame_revision = admission.frame_revision,
+                                                    .condition = static_cast<std::uint64_t>(PresentationCapabilityCondition::Admitted),
+                                                    .outcome = 1U,
+                                                    .allocation = {.allocation_generation = admission.generation},
+                                                    .workspace = admission.arena ? contracts::DiagnosticWorkspace{} : workspace_source_diagnostic(record)}};
         });
     }
-
     void flush() {
         while (peer.get() >= 0 && !pending.empty()) {
             PendingRecord& outbound = pending.front();
             iovec buffer{.iov_base = &outbound.record, .iov_len = sizeof(outbound.record)};
             std::array<int, workspace_surface_import::kAllocateDescriptorCount> descriptor_values{};
-            for (std::size_t index = 0U; index < outbound.descriptor_count; ++index) {
-                descriptor_values[index] = outbound.descriptors[index].get();
-            }
+            for (std::size_t index = 0U; index < outbound.descriptor_count; ++index) { descriptor_values[index] = outbound.descriptors[index].get(); }
             std::array<std::byte, kControlBytes> control{};
             msghdr message{};
             message.msg_iov = &buffer;
@@ -463,14 +412,12 @@ struct WorkspaceSurfaceImportChannel::Impl {
             pending.erase(pending.begin());
         }
     }
-
     void begin_withdrawal(const WorkspaceSurfaceImportId id, const std::uint64_t generation) {
         std::erase_if(outcomes, [id](const WorkspaceSurfaceImportOutcome& outcome) { return outcome.id == id; });
         if (capacity_wake == id) capacity_wake.reset();
         retired.emplace_back(id, generation);
         withdrawn.push_back(id);
     }
-
     void promote_withdrawals() {
         while (!pending_withdrawals.empty() && pending.size() < kPendingRecordCapacity && !terminal.has_value()) {
             const auto [id, generation] = pending_withdrawals.front();
@@ -479,7 +426,6 @@ struct WorkspaceSurfaceImportChannel::Impl {
             begin_withdrawal(id, generation);
         }
     }
-
     void drain() {
         while (peer.get() >= 0) {
             Record record{};
@@ -547,9 +493,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 continue;
             }
             if (record.opcode == Opcode::Acquired) {
-                if (admission == admitted.end() || admission->second.arena || !contains(replied, id) ||
-                    source_transition_count == source_transitions.size() || admission->second.acquired ||
-                    record.offset <= admission->second.last_transfer) {
+                if (admission == admitted.end() || admission->second.arena || !contains(replied, id) || source_transition_count == source_transitions.size() ||
+                    admission->second.acquired || record.offset <= admission->second.last_transfer) {
                     fail("workspace acquisition is unknown, duplicate, or exceeds capacity");
                     return;
                 }
@@ -565,8 +510,8 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     return;
                 }
                 const auto& acquired = *admission->second.acquired;
-                if (record.stride != acquired.stride || record.size != acquired.size ||
-                    record.presentation_revision != acquired.presentation_revision || record.offset != acquired.offset) {
+                if (record.stride != acquired.stride || record.size != acquired.size || record.presentation_revision != acquired.presentation_revision ||
+                    record.offset != acquired.offset) {
                     fail("workspace release submission does not match the exact acquisition");
                     return;
                 }
@@ -580,8 +525,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     std::ranges::any_of(renderer_presentations, [id](const auto& presentation) { return presentation.resource == id; });
                 if (admission == admitted.end() || retirement == retired.end() || !contains(withdrawn, id) || !contains(replied, id) ||
                     (admission != admitted.end() && admission->second.acquired) ||
-                    (admission != admitted.end() && admission->second.arena && presentation_outstanding) ||
-                    retirements.size() >= kLedgerCapacity) {
+                    (admission != admitted.end() && admission->second.arena && presentation_outstanding) || retirements.size() >= kLedgerCapacity) {
                     fail("workspace import channel received an invalid retirement terminal");
                     return;
                 }
@@ -638,8 +582,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 fail("workspace import channel received an unknown or duplicate outcome");
                 return;
             }
-            if ((record.opcode == Opcode::Ready && admission->second.arena) ||
-                (record.opcode == Opcode::ArenaReady && !admission->second.arena)) {
+            if ((record.opcode == Opcode::Ready && admission->second.arena) || (record.opcode == Opcode::ArenaReady && !admission->second.arena)) {
                 fail("workspace import channel received an outcome for the wrong capability role");
                 return;
             }
@@ -697,8 +640,7 @@ struct WorkspaceSurfaceImportChannel::Impl {
                     outcomes.back().imported = true;
                     outcomes.back().layout = record;
                     if (record.opcode == Opcode::Ready)
-                        trace_memory_descriptor("descriptor_received", record, peer.get(),
-                                                descriptors[workspace_surface_import::kReadyMemoryDescriptor].get());
+                        trace_memory_descriptor("descriptor_received", record, peer.get(), descriptors[workspace_surface_import::kReadyMemoryDescriptor].get());
                     outcomes.back().memory_descriptor = std::move(descriptors[workspace_surface_import::kReadyMemoryDescriptor]);
                     outcomes.back().timeline_descriptor = std::move(descriptors[workspace_surface_import::kReadyTimelineDescriptor]);
                     break;
@@ -723,59 +665,42 @@ struct WorkspaceSurfaceImportChannel::Impl {
                 case Opcode::Available:
                 case Opcode::Presented:
                 case Opcode::Completed:
-                case Opcode::Retired:
-                    fail("workspace import channel received an opcode outside the import outcome boundary");
-                    return;
+                case Opcode::Retired: fail("workspace import channel received an opcode outside the import outcome boundary"); return;
             }
         }
     }
 };
-
-WorkspaceSurfaceImportChannel::WorkspaceSurfaceImportChannel(const std::filesystem::path& socket_path,
-                                                             const VisualDiagnosticSink diagnostics)
+WorkspaceSurfaceImportChannel::WorkspaceSurfaceImportChannel(const std::filesystem::path& socket_path, const VisualDiagnosticSink diagnostics)
     : impl_(std::make_unique<Impl>(diagnostics)) {
     impl_->path = socket_path;
     impl_->listener = ScopedFd{::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)};
-    if (impl_->listener.get() < 0) {
-        throw std::system_error(errno, std::generic_category(), "workspace import socket could not be created");
-    }
+    if (impl_->listener.get() < 0) { throw std::system_error(errno, std::generic_category(), "workspace import socket could not be created"); }
     std::string error;
     if (!bind_listener(impl_->listener.get(), socket_path, error)) { throw std::system_error(errno, std::generic_category(), error); }
 }
-
 WorkspaceSurfaceImportChannel::~WorkspaceSurfaceImportChannel() {
     if (impl_ != nullptr && !impl_->path.empty()) { ::unlink(impl_->path.c_str()); }
 }
-
 const std::filesystem::path& WorkspaceSurfaceImportChannel::socket_path() const noexcept { return impl_->path; }
-
 int WorkspaceSurfaceImportChannel::poll_fd() const noexcept { return impl_->peer.get() >= 0 ? impl_->peer.get() : impl_->listener.get(); }
-
 bool WorkspaceSurfaceImportChannel::connected() const noexcept {
     return impl_->peer_epoch == Impl::PeerEpochState::Connected && impl_->peer.get() >= 0 && !impl_->terminal.has_value();
 }
-
-bool WorkspaceSurfaceImportChannel::wants_write() const noexcept {
-    return connected() && (!impl_->pending.empty() || !impl_->pending_withdrawals.empty());
-}
-
+bool WorkspaceSurfaceImportChannel::wants_write() const noexcept { return connected() && (!impl_->pending.empty() || !impl_->pending_withdrawals.empty()); }
 bool WorkspaceSurfaceImportChannel::claimable(const WorkspaceSurfaceImportId id) const noexcept {
     return connected() && Impl::contains(impl_->committed, id) && !Impl::contains(impl_->withdrawn, id) &&
            std::ranges::find(impl_->pending_withdrawals, id, &Impl::RetirementRecord::first) == impl_->pending_withdrawals.end();
 }
-
 bool WorkspaceSurfaceImportChannel::consume_peer_loss() noexcept {
     if (impl_->peer_epoch != Impl::PeerEpochState::ClosedPendingObservation) return false;
     impl_->peer_epoch = Impl::PeerEpochState::ClosedObserved;
     return true;
 }
-
 void WorkspaceSurfaceImportChannel::set_expected_process_group(const pid_t process_group) {
     // Naming a new process group is the host saying a replacement browser is
     // coming. Protocol terminals remain irreversible.
     impl_->expected_process_group = process_group;
 }
-
 void WorkspaceSurfaceImportChannel::reset_peer() noexcept {
     impl_->peer.reset();
     impl_->peer_epoch = Impl::PeerEpochState::Accepting;
@@ -794,28 +719,24 @@ void WorkspaceSurfaceImportChannel::reset_peer() noexcept {
     impl_->pending_withdrawals.clear();
     impl_->replied.clear();
 }
-
-bool WorkspaceSurfaceImportChannel::admit_arena(const WorkspaceSurfaceImportId id, const std::uint64_t generation,
-                                                const std::uint32_t width, const std::uint32_t height,
-                                                const std::uint64_t selection_generation, const std::uint64_t frame_revision) {
-    return connected() &&
-           impl_->admit(Record{.opcode = Opcode::Arena, .id_high = id.high, .id_low = id.low, .width = width, .height = height}, generation,
-                        {}, selection_generation, frame_revision);
+bool WorkspaceSurfaceImportChannel::admit_arena(const WorkspaceSurfaceImportId id, const std::uint64_t generation, const std::uint32_t width,
+                                                const std::uint32_t height, const std::uint64_t selection_generation, const std::uint64_t frame_revision) {
+    return connected() && impl_->admit(Record{.opcode = Opcode::Arena, .id_high = id.high, .id_low = id.low, .width = width, .height = height}, generation, {},
+                                       selection_generation, frame_revision);
 }
-bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, const int frame_edge,
-                                                 const int frame_signal, const int access_signal, const std::uint64_t selection_generation,
-                                                 const std::uint64_t frame_revision) {
+bool WorkspaceSurfaceImportChannel::admit_source(Record record, const std::uint64_t generation, const int frame_edge, const int frame_signal,
+                                                 const int access_signal, const std::uint64_t selection_generation, const std::uint64_t frame_revision) {
     if (!connected() || frame_edge < 0 || frame_signal < 0 || access_signal < 0) return false;
     record.opcode = Opcode::Allocate;
     const std::array descriptors{frame_edge, frame_signal, access_signal};
     return impl_->admit(record, generation, descriptors, selection_generation, frame_revision);
 }
-bool WorkspaceSurfaceImportChannel::read_settled(const WorkspaceSurfaceImportId id, const WorkspaceContentIdentity content,
-                                                 const std::uint64_t revision, const std::uint64_t transfer_sequence) {
+bool WorkspaceSurfaceImportChannel::read_settled(const WorkspaceSurfaceImportId id, const WorkspaceContentIdentity content, const std::uint64_t revision,
+                                                 const std::uint64_t transfer_sequence) {
     if (!connected() || !content.valid() || revision == 0U || transfer_sequence == 0U) return false;
     const auto admission = impl_->find_admission(id);
-    if (admission == impl_->admitted.end() || admission->second.arena || !Impl::contains(impl_->replied, id) ||
-        !admission->second.acquired || !admission->second.release_submitted)
+    if (admission == impl_->admitted.end() || admission->second.arena || !Impl::contains(impl_->replied, id) || !admission->second.acquired ||
+        !admission->second.release_submitted)
         return false;
     const auto& acquired = *admission->second.acquired;
     if (acquired.stride != content.session || acquired.size != content.sequence || acquired.presentation_revision != revision ||
@@ -838,13 +759,11 @@ bool WorkspaceSurfaceImportChannel::read_settled(const WorkspaceSurfaceImportId 
     admission->second.release_submitted = false;
     return true;
 }
-
 WorkspaceSurfaceWithdrawal WorkspaceSurfaceImportChannel::withdraw(const WorkspaceSurfaceImportId id) {
     if (!connected() || !id) { return {.progress = WorkspaceSurfaceWithdrawalProgress::Invalid, .id = id}; }
     const auto admission = impl_->find_admission(id);
     if (admission == impl_->admitted.end()) {
-        return {.progress = Impl::contains(impl_->seen, id) ? WorkspaceSurfaceWithdrawalProgress::Retired
-                                                            : WorkspaceSurfaceWithdrawalProgress::Invalid,
+        return {.progress = Impl::contains(impl_->seen, id) ? WorkspaceSurfaceWithdrawalProgress::Retired : WorkspaceSurfaceWithdrawalProgress::Invalid,
                 .id = id};
     }
     if (Impl::contains(impl_->withdrawn, id)) {
@@ -867,24 +786,19 @@ WorkspaceSurfaceWithdrawal WorkspaceSurfaceImportChannel::withdraw(const Workspa
     impl_->begin_withdrawal(id, admission->second.generation);
     return {.progress = WorkspaceSurfaceWithdrawalProgress::Submitted, .id = id, .generation = admission->second.generation};
 }
-
 void WorkspaceSurfaceImportChannel::pump() {
     if (impl_->terminal.has_value()) { return; }
-    if (impl_->peer_epoch == Impl::PeerEpochState::ClosedPendingObservation || impl_->peer_epoch == Impl::PeerEpochState::ClosedObserved)
-        return;
+    if (impl_->peer_epoch == Impl::PeerEpochState::ClosedPendingObservation || impl_->peer_epoch == Impl::PeerEpochState::ClosedObserved) return;
     if (impl_->peer_epoch == Impl::PeerEpochState::Accepting) {
         int accepted = -1;
-        do {
-            accepted = ::accept4(impl_->listener.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
-        } while (accepted < 0 && errno == EINTR);
+        do { accepted = ::accept4(impl_->listener.get(), nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK); } while (accepted < 0 && errno == EINTR);
         if (accepted < 0) {
             if (errno != EAGAIN && errno != EWOULDBLOCK) { impl_->fail("workspace import channel accept failed"); }
             return;
         }
         ScopedFd candidate{accepted};
         if (!impl_->peer_is_expected(candidate.get())) {
-            mmltk::common::logging::warn(
-                [](auto& logger) { logger.warn("workspace import connection refused: unexpected peer process group"); });
+            mmltk::common::logging::warn([](auto& logger) { logger.warn("workspace import connection refused: unexpected peer process group"); });
             return;
         }
         impl_->peer = std::move(candidate);
@@ -899,7 +813,6 @@ void WorkspaceSurfaceImportChannel::pump() {
     if (impl_->peer_epoch != Impl::PeerEpochState::Connected) return;
     impl_->drain();
 }
-
 std::optional<WorkspaceSurfaceImportOutcome> WorkspaceSurfaceImportChannel::take_outcome() {
     if (impl_->outcomes.empty()) { return std::nullopt; }
     WorkspaceSurfaceImportOutcome outcome = std::move(impl_->outcomes.front());
@@ -913,11 +826,7 @@ std::optional<Record> WorkspaceSurfaceImportChannel::take_source_transition() {
     --impl_->source_transition_count;
     return record;
 }
-
-std::optional<WorkspaceSurfaceImportId> WorkspaceSurfaceImportChannel::take_capacity_wake() {
-    return std::exchange(impl_->capacity_wake, std::nullopt);
-}
-
+std::optional<WorkspaceSurfaceImportId> WorkspaceSurfaceImportChannel::take_capacity_wake() { return std::exchange(impl_->capacity_wake, std::nullopt); }
 std::optional<WorkspaceSurfaceRetired> WorkspaceSurfaceImportChannel::take_retirement() {
     if (impl_->retirements.empty()) return std::nullopt;
     WorkspaceSurfaceRetired retired = impl_->retirements.front();
@@ -925,7 +834,5 @@ std::optional<WorkspaceSurfaceRetired> WorkspaceSurfaceImportChannel::take_retir
     impl_->erase_id(impl_->seen, retired.id);
     return retired;
 }
-
 std::optional<std::string> WorkspaceSurfaceImportChannel::terminal_error() const { return impl_->terminal; }
-
 }  // namespace mmltk::controller::presentation

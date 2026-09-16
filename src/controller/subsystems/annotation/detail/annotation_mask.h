@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
-
 namespace mmltk::controller::subsystems::annotation {
 struct MaskScratch final {
     std::vector<contracts::AnnotationMaskRun> stroke;
@@ -26,8 +25,8 @@ class MaskRows final {
 
    public:
     void Assign(const contracts::AnnotationObject&);
-    void Stroke(contracts::AnnotationPoint, contracts::AnnotationPoint, std::uint16_t radius, std::uint16_t width, std::uint16_t height,
-                bool erase, MaskScratch&);
+    void Stroke(contracts::AnnotationPoint, contracts::AnnotationPoint, std::uint16_t radius, std::uint16_t width, std::uint16_t height, bool erase,
+                MaskScratch&);
     void Materialize(contracts::AnnotationObject&) const;
 
    private:
@@ -35,8 +34,7 @@ class MaskRows final {
 };
 // Run storage stays normalized: sorted rows, disjoint inclusive intervals.
 void normalize_mask(contracts::AnnotationObject&);
-void cleanup_mask(contracts::AnnotationObject&, contracts::AnnotationMaskCleanup, std::uint16_t radius, std::uint16_t width,
-                  std::uint16_t height);
+void cleanup_mask(contracts::AnnotationObject&, contracts::AnnotationMaskCleanup, std::uint16_t radius, std::uint16_t width, std::uint16_t height);
 void transform_mask(contracts::AnnotationObject&, contracts::AnnotationBox, contracts::AnnotationBox, MaskScratch&);
 void fill_mask(contracts::AnnotationObject&, contracts::AnnotationPoint, std::uint16_t width, std::uint16_t height);
 }  // namespace mmltk::controller::subsystems::annotation

@@ -1,25 +1,19 @@
 #pragma once
-
 #include <functional>
 #include <type_traits>
 #include <utility>
 #include <variant>
-
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/presentation/visual_system_types.h"
-
 namespace mmltk::controller::browser {
-
 template <auto Member, class Composition = ApplicationSystems>
 class ApplicationEventPublisher final {
    public:
     using Sink = std::function<void(SystemEvent)>;
     using ContinuitySink = std::function<void()>;
     using SourceSink = std::function<void(PresentationSourceIdentity)>;
-
     ApplicationEventPublisher(Sink& sink, ContinuitySink continuity, SourceSink source = {})
         : sink_(sink), continuity_(std::move(continuity)), source_(std::move(source)) {}
-
     template <class Variant>
     void operator()(const Variant& event) const noexcept {
         std::visit(
@@ -50,5 +44,4 @@ class ApplicationEventPublisher final {
     ContinuitySink continuity_;
     SourceSink source_;
 };
-
 }  // namespace mmltk::controller::browser

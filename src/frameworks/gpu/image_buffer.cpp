@@ -1,7 +1,6 @@
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-
 #include <algorithm>
 #include <atomic>
 #include <limits>
@@ -17,7 +16,6 @@
 #include "src/common/io/noexcept_io.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/system/execution_policy.h"
-
 namespace mmltk::frameworks::gpu {
 [[nodiscard]] std::uint64_t next_image_allocation_identity() {
     static std::atomic<std::uint64_t> next{1U};
@@ -48,14 +46,12 @@ void LogStaging(const DeviceContext& receiver, int source_device, std::size_t by
     if (!trace.enabled()) return;
     const auto* execution = receiver.execution();
     char record[256];
-    const int size =
-        std::snprintf(record, sizeof(record),
-                      "{\"event\":\"image_host_staging\",\"source_device\":%d,\"receiver_device\":%d,\"node\":%d,\"bytes\":%zu,"
-                      "\"completion\":\"source-event,synchronous-d2h,receiver-stream\"}\n",
-                      source_device, receiver.device(), execution ? execution->placement.numa_node : -1, bytes);
+    const int size = std::snprintf(record, sizeof(record),
+                                   "{\"event\":\"image_host_staging\",\"source_device\":%d,\"receiver_device\":%d,\"node\":%d,\"bytes\":%zu,"
+                                   "\"completion\":\"source-event,synchronous-d2h,receiver-stream\"}\n",
+                                   source_device, receiver.device(), execution ? execution->placement.numa_node : -1, bytes);
     trace.Write(record, size, sizeof(record));
 }
-
 void CheckCuda(const char* operation, const CUresult result) {
     if (result == CUDA_SUCCESS) return;
     const char* detail = nullptr;
@@ -76,12 +72,11 @@ void LogCopyFailure(const DeviceContext& receiver, const char* boundary, const b
     const TransferTrace trace;
     if (!trace.enabled()) return;
     char record[256];
-    const int size = std::snprintf(
-        record, sizeof(record), "{\"event\":\"image_copy_failure\",\"boundary\":\"%s\",\"receiver_device\":%d,\"completion_reached\":%s}\n",
-        boundary, receiver.device(), completion_reached ? "true" : "false");
+    const int size =
+        std::snprintf(record, sizeof(record), "{\"event\":\"image_copy_failure\",\"boundary\":\"%s\",\"receiver_device\":%d,\"completion_reached\":%s}\n",
+                      boundary, receiver.device(), completion_reached ? "true" : "false");
     trace.Write(record, size, sizeof(record));
 }
-
 template <typename ReadView>
 ImageCopyBackend::StreamSettlement RetainUnsettledRead(ImageStream& stream, ReadView& source, std::optional<ReadView>& retained) noexcept {
     const auto settled = stream.Settle();
@@ -96,13 +91,10 @@ ImageCopyBackend::StreamSettlement RetainUnsettledRead(ImageStream& stream, Read
         case CUDA_ERROR_DEINITIALIZED:
         case CUDA_ERROR_NOT_INITIALIZED:
         case CUDA_ERROR_INVALID_CONTEXT:
-        case CUDA_ERROR_INVALID_HANDLE:
-            return false;
-        default:
-            return true;
+        case CUDA_ERROR_INVALID_HANDLE: return false;
+        default: return true;
     }
 }
-
 class NativeImageCopyBackend final : public ImageCopyBackend {
    public:
     [[nodiscard]] std::uintptr_t CreateContext(const int device, const DeviceContextMode mode) override {
@@ -123,14 +115,11 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
             return;
         }
         CUcontext current = nullptr;
-        if (cuCtxGetCurrent(&current) == CUDA_SUCCESS && current == reinterpret_cast<CUcontext>(context))
-            static_cast<void>(cuCtxSetCurrent(nullptr));
+        if (cuCtxGetCurrent(&current) == CUDA_SUCCESS && current == reinterpret_cast<CUcontext>(context)) static_cast<void>(cuCtxSetCurrent(nullptr));
         CUdevice selected = 0;
         if (cuDeviceGet(&selected, device) == CUDA_SUCCESS) static_cast<void>(cuDevicePrimaryCtxRelease(selected));
     }
-    void BindContext(const std::uintptr_t context) override {
-        CheckCuda("bind CUDA context", cuCtxSetCurrent(reinterpret_cast<CUcontext>(context)));
-    }
+    void BindContext(const std::uintptr_t context) override { CheckCuda("bind CUDA context", cuCtxSetCurrent(reinterpret_cast<CUcontext>(context))); }
     [[nodiscard]] std::uintptr_t CreateStream(const std::uintptr_t context) override {
         BindContext(context);
         CUstream stream = nullptr;
@@ -182,8 +171,7 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         CheckCuda("clear CUDA image plane", cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, 0U, plane.descriptor.row_bytes(),
                                                               plane.descriptor.height, reinterpret_cast<CUstream>(stream)));
     }
-    [[nodiscard]] std::shared_ptr<void> AllocatePinned(const std::uintptr_t receiver_context,
-                                                       const mmltk::common::system::ExecutionPlacement* placement,
+    [[nodiscard]] std::shared_ptr<void> AllocatePinned(const std::uintptr_t receiver_context, const mmltk::common::system::ExecutionPlacement* placement,
                                                        const std::size_t bytes) override {
         if (!placement) throw std::invalid_argument("image staging requires receiver placement");
         auto storage = std::make_shared<PinnedHostBuffer>(reinterpret_cast<CUcontext>(receiver_context), *placement, true);
@@ -199,14 +187,12 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         CheckCuda("query CUDA peer access", cuDeviceCanAccessPeer(&accessible, receiver_device, source_device));
         return accessible != 0;
     }
-    void WaitEvent(const std::uintptr_t receiver_context, const std::uintptr_t receiver_stream,
-                   const std::uintptr_t source_event) override {
+    void WaitEvent(const std::uintptr_t receiver_context, const std::uintptr_t receiver_stream, const std::uintptr_t source_event) override {
         BindContext(receiver_context);
-        CheckCuda("wait for source image",
-                  cuStreamWaitEvent(reinterpret_cast<CUstream>(receiver_stream), reinterpret_cast<CUevent>(source_event), 0U));
+        CheckCuda("wait for source image", cuStreamWaitEvent(reinterpret_cast<CUstream>(receiver_stream), reinterpret_cast<CUevent>(source_event), 0U));
     }
-    void CopySameDevice(const std::uintptr_t context, const std::uintptr_t stream, const ImagePlaneView& destination,
-                        const std::uintptr_t source_context, const ImagePlaneView& source) override {
+    void CopySameDevice(const std::uintptr_t context, const std::uintptr_t stream, const ImagePlaneView& destination, const std::uintptr_t source_context,
+                        const ImagePlaneView& source) override {
         CopyDevice(context, stream, destination, source_context, source, "copy same-device image");
     }
     void CopyPeer(const std::uintptr_t receiver_context, const std::uintptr_t receiver_stream, const int, const ImagePlaneView& destination,
@@ -227,8 +213,8 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         copy.Height = source.descriptor.height;
         CheckCuda("stage source image", cuMemcpy2D(&copy));
     }
-    void CopyHostToDevice(const std::uintptr_t receiver_context, const std::uintptr_t receiver_stream, const void* const source,
-                          const std::size_t source_pitch, const ImagePlaneView& destination) override {
+    void CopyHostToDevice(const std::uintptr_t receiver_context, const std::uintptr_t receiver_stream, const void* const source, const std::size_t source_pitch,
+                          const ImagePlaneView& destination) override {
         BindContext(receiver_context);
         CUDA_MEMCPY2D copy{};
         copy.srcMemoryType = CU_MEMORYTYPE_HOST;
@@ -254,8 +240,7 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         CheckCuda("enqueue image completion notification",
                   cuStreamAddCallback(
                       reinterpret_cast<CUstream>(stream),
-                      [](CUstream, CUresult status, void* value) { static_cast<StreamNotification*>(value)->Notify(status); },
-                      &notification, 0U));
+                      [](CUstream, CUresult status, void* value) { static_cast<StreamNotification*>(value)->Notify(status); }, &notification, 0U));
     }
     StreamSettlement SettleStream(const std::uintptr_t context, const std::uintptr_t stream) noexcept override {
         const auto bound = cuCtxSetCurrent(reinterpret_cast<CUcontext>(context));
@@ -286,14 +271,11 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         CheckCuda(operation, cuMemcpy3DPeerAsync(&copy, reinterpret_cast<CUstream>(receiver_stream)));
     }
 };
-
 }  // namespace
-
 std::shared_ptr<ImageCopyBackend> cuda_image_copy_backend() {
     static std::shared_ptr<ImageCopyBackend> backend = std::make_shared<NativeImageCopyBackend>();
     return backend;
 }
-
 std::optional<DeviceExecution> ImageCopyBackend::ResolveExecution(int device, int numa_node) {
     return resolve_device_execution(device, mmltk::common::system::NumaTopology::Capture(), numa_node);
 }
@@ -306,8 +288,7 @@ struct DeviceContext::State final {
         std::optional<mmltk::common::system::ScopedExecutionPolicy> policy;
         if (execution) {
             if (execution->device != device) throw std::invalid_argument("image context placement device mismatch");
-            policy.emplace(mmltk::common::system::ExecutionPolicyRequest{
-                execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
+            policy.emplace(mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
         }
         context = backend->CreateContext(device, mode);
         if (context == 0U) throw std::runtime_error("image device context creation returned no context");
@@ -319,7 +300,6 @@ struct DeviceContext::State final {
     std::uintptr_t context = 0U;
     std::optional<DeviceExecution> execution;
 };
-
 DeviceContext::DeviceContext(const int device, std::shared_ptr<ImageCopyBackend> backend, const DeviceContextMode mode, int numa_node,
                              std::optional<DeviceExecution> execution)
     : state_(std::make_shared<State>(device, std::move(backend), mode, numa_node, std::move(execution))) {}
@@ -332,8 +312,8 @@ std::uintptr_t DeviceContext::CreateEvent() const {
     if (event == 0U) throw std::runtime_error("image completion event creation returned no event");
     return event;
 }
-void DeviceContext::ValidateSelection(int device, const std::shared_ptr<ImageCopyBackend>& backend, DeviceContextMode mode,
-                                      int numa_node, const std::optional<DeviceExecution>& execution) const {
+void DeviceContext::ValidateSelection(int device, const std::shared_ptr<ImageCopyBackend>& backend, DeviceContextMode mode, int numa_node,
+                                      const std::optional<DeviceExecution>& execution) const {
     if (state_->device != device || state_->mode != mode || (backend && backend != state_->backend) ||
         (execution && (!state_->execution || *execution != *state_->execution)) ||
         (numa_node >= 0 && (!state_->execution || state_->execution->placement.numa_node != numa_node)))
@@ -383,7 +363,6 @@ void ImageStream::Notify(std::function<void()> wake) {
     }
 }
 void ImageStream::AwaitEvent(std::uintptr_t event) { context_.state_->backend->WaitEvent(context_.state_->context, stream_, event); }
-
 ImageStream::ImageStream(DeviceContext context) : context_(std::move(context)) {
     stream_ = context_.state_->backend->CreateStream(context_.state_->context);
     if (stream_ == 0U) throw std::runtime_error("image stream creation returned no stream");
@@ -451,7 +430,6 @@ void ImageStream::RethrowAfterSettlement(std::exception_ptr submission) {
     if (!settled.completion_reached || settled.failure) ThrowExecutionFailure(settled, submission);
     std::rethrow_exception(submission);
 }
-
 struct ImageBuffer::State final {
     explicit State(DeviceContext selected) : context(std::move(selected)) {
         completion = context.state_->backend->CreateEvent(context.state_->context);
@@ -496,8 +474,7 @@ struct ImageBuffer::State final {
     void EnsureStaging(const std::size_t bytes) {
         if (staging_bytes >= bytes) return;
         const auto* execution = context.execution();
-        auto candidate =
-            context.state_->backend->AllocatePinned(context.state_->context, execution ? &execution->placement : nullptr, bytes);
+        auto candidate = context.state_->backend->AllocatePinned(context.state_->context, execution ? &execution->placement : nullptr, bytes);
         if (candidate == nullptr) throw std::runtime_error("pinned staging allocation returned no memory");
         staging_owner.reset();
         staging_owner = std::move(candidate);
@@ -522,11 +499,9 @@ struct ImageBuffer::State final {
     std::uint64_t revision = 0U;
     std::optional<BorrowedImageReadView> unsettled_source;
 };
-
 struct BorrowedImageReadView::Lease final {
-    explicit Lease(std::shared_ptr<ImageBuffer::State> owner, const std::uintptr_t product_completion = 0U,
-                   std::shared_ptr<void> shared_product_lease = {}, const std::uint64_t product_generation = 0U,
-                   std::shared_lock<std::shared_mutex>* shared_product_lock = nullptr,
+    explicit Lease(std::shared_ptr<ImageBuffer::State> owner, const std::uintptr_t product_completion = 0U, std::shared_ptr<void> shared_product_lease = {},
+                   const std::uint64_t product_generation = 0U, std::shared_lock<std::shared_mutex>* shared_product_lock = nullptr,
                    std::shared_ptr<const std::function<void()>> availability_callback = {}, bool nonblocking = false)
         : state(std::move(owner)),
           completion(product_completion == 0U ? state->completion : product_completion),
@@ -554,7 +529,6 @@ struct BorrowedImageReadView::Lease final {
     std::uint64_t revision = 0U;
     std::shared_ptr<const std::function<void()>> availability;
 };
-
 BorrowedImageReadView::BorrowedImageReadView() noexcept = default;
 BorrowedImageReadView::~BorrowedImageReadView() = default;
 BorrowedImageReadView::BorrowedImageReadView(std::unique_ptr<Lease> lease) noexcept : lease_(std::move(lease)) {}
@@ -564,16 +538,13 @@ bool BorrowedImageReadView::valid() const noexcept {
     return lease_ && !lease_->state->unavailable.load(std::memory_order_acquire) && lease_->state->plane.valid() && lease_->revision != 0U;
 }
 int BorrowedImageReadView::device() const noexcept { return valid() ? lease_->state->context.device() : -1; }
-bool BorrowedImageReadView::UsesContext(const DeviceContext& context) const noexcept {
-    return valid() && lease_->state->context == context;
-}
+bool BorrowedImageReadView::UsesContext(const DeviceContext& context) const noexcept { return valid() && lease_->state->context == context; }
 DeviceContext BorrowedImageReadView::context() const {
     if (!valid()) throw std::invalid_argument("image read context is unavailable");
     return lease_->state->context;
 }
 std::uint64_t BorrowedImageReadView::revision() const noexcept { return valid() ? lease_->revision : 0U; }
 ImagePlaneView BorrowedImageReadView::plane() const noexcept { return valid() ? lease_->state->plane : ImagePlaneView{}; }
-
 void BorrowedImageReadView::Quarantine() noexcept {
     if (!lease_) return;
     lease_->state->unavailable.store(true, std::memory_order_release);
@@ -585,7 +556,6 @@ void BorrowedImageReadView::Quarantine() noexcept {
         } catch (...) {}
     }
 }
-
 ImageBuffer::ImageBuffer(DeviceContext context) : state_(std::make_shared<State>(std::move(context))) {}
 ImageBuffer::~ImageBuffer() {
     if (!state_) return;
@@ -600,7 +570,6 @@ ImageBuffer& ImageBuffer::operator=(ImageBuffer&& other) noexcept {
     }
     return *this;
 }
-
 void ImageBuffer::Write(ImageStream& stream, const ImagePlaneKind kind, const std::uint32_t width, const std::uint32_t height,
                         const std::function<void(ImagePlaneView, std::uintptr_t)>& submit) {
     if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image write request is invalid");
@@ -612,12 +581,10 @@ void ImageBuffer::Write(ImageStream& stream, const ImagePlaneKind kind, const st
     state_->context.state_->backend->RecordEvent(state_->context.state_->context, stream.stream_, state_->completion);
     state_->revision = next_revision;
 }
-
 ImageCopyPath ImageBuffer::CopyFrom(ImageStream& stream, BorrowedImageReadView source) {
     if (!source.valid()) throw std::invalid_argument("borrowed source image is unavailable");
     if (source.lease_->state == state_) throw std::invalid_argument("an image buffer cannot copy from itself");
-    if (stream.context_.state_ != state_->context.state_)
-        throw std::invalid_argument("image stream does not belong to the receiver context");
+    if (stream.context_.state_ != state_->context.state_) throw std::invalid_argument("image stream does not belong to the receiver context");
     if (state_->context.state_->backend != source.lease_->state->context.state_->backend)
         throw std::invalid_argument("source and receiver use different image backends");
     std::unique_lock lock(state_->access);
@@ -634,13 +601,12 @@ ImageCopyPath ImageBuffer::CopyFrom(ImageStream& stream, BorrowedImageReadView s
         if (receiver_device == source_device) {
             backend.WaitEvent(state_->context.state_->context, stream.stream_, source.lease_->completion);
             reads_submitted = true;
-            backend.CopySameDevice(state_->context.state_->context, stream.stream_, state_->plane,
-                                   source.lease_->state->context.state_->context, source_plane);
+            backend.CopySameDevice(state_->context.state_->context, stream.stream_, state_->plane, source.lease_->state->context.state_->context, source_plane);
         } else if (backend.CanAccessPeer(receiver_device, source_device)) {
             backend.WaitEvent(state_->context.state_->context, stream.stream_, source.lease_->completion);
             reads_submitted = true;
-            backend.CopyPeer(state_->context.state_->context, stream.stream_, receiver_device, state_->plane,
-                             source.lease_->state->context.state_->context, source_device, source_plane);
+            backend.CopyPeer(state_->context.state_->context, stream.stream_, receiver_device, state_->plane, source.lease_->state->context.state_->context,
+                             source_device, source_plane);
             path = ImageCopyPath::Peer;
         } else {
             const std::size_t row_bytes = source_plane.descriptor.row_bytes();
@@ -648,8 +614,7 @@ ImageCopyPath ImageBuffer::CopyFrom(ImageStream& stream, BorrowedImageReadView s
                 throw std::overflow_error("staged image byte size exceeds addressable memory");
             state_->EnsureStaging(row_bytes * source_plane.descriptor.height);
             LogStaging(state_->context, source_device, row_bytes * source_plane.descriptor.height);
-            source.lease_->state->context.state_->backend->SynchronizeEvent(source.lease_->state->context.state_->context,
-                                                                            source.lease_->completion);
+            source.lease_->state->context.state_->backend->SynchronizeEvent(source.lease_->state->context.state_->context, source.lease_->completion);
             reads_submitted = true;
             backend.CopyDeviceToHost(source.lease_->state->context.state_->context, source_plane, state_->staging, row_bytes);
             backend.CopyHostToDevice(state_->context.state_->context, stream.stream_, state_->staging, row_bytes, state_->plane);
@@ -674,11 +639,9 @@ ImageCopyPath ImageBuffer::CopyFrom(ImageStream& stream, BorrowedImageReadView s
         throw;
     }
 }
-
 BorrowedImageReadView ImageBuffer::Borrow() const {
     auto lease = std::make_unique<BorrowedImageReadView::Lease>(state_);
-    if (lease->state->unavailable.load(std::memory_order_acquire) || !lease->state->plane.valid() || lease->state->revision == 0U)
-        return {};
+    if (lease->state->unavailable.load(std::memory_order_acquire) || !lease->state->plane.valid() || lease->state->revision == 0U) return {};
     return BorrowedImageReadView{std::move(lease)};
 }
 std::uint32_t ImageBuffer::capacity_width() const noexcept {
@@ -697,7 +660,6 @@ std::uint64_t ImageBuffer::revision() const noexcept {
     std::shared_lock lock(state_->access);
     return state_->revision;
 }
-
 void ImageProductRetirement::Acquire() noexcept {
     std::scoped_lock lock(mutex_);
     ++live_;
@@ -743,7 +705,6 @@ void ImageProductRetirement::Notify() const noexcept {
         } catch (...) {}
     }
 }
-
 struct ImageProductBuffer::State final {
     State(DeviceContext selected, const ImageProductLayout selected_layout, std::shared_ptr<ImageProductRetirement> retirement)
         : context_(std::move(selected)),
@@ -772,11 +733,9 @@ struct ImageProductBuffer::State final {
             settled.failure = combine_image_failures(settled.failure, result.failure);
             workspace->Detach(owner);
         }
-        for (auto& plane : planes_)
-            plane.reset();
+        for (auto& plane : planes_) plane.reset();
         context_.state_->backend->DestroyEvent(context_.state_->context, completion_);
-        for (auto& workspace : workspaces)
-            workspace.reset();
+        for (auto& workspace : workspaces) workspace.reset();
         for (const auto& observation : observations) {
             const auto result = observation.TakeResult();
             if (!result.complete || !result.claimed) continue;
@@ -787,8 +746,7 @@ struct ImageProductBuffer::State final {
     }
     void ReplaceWorkspace(std::shared_ptr<ImageWorkspace>& slot, std::shared_ptr<ImageWorkspace> replacement = {}) {
         auto prior = std::exchange(slot, std::move(replacement));
-        if (prior && prior != workspace_ && prior != raw_workspace_ && prior != workspace_reserved_)
-            prior->Detach(planes_[0U]->state_->allocation_owner);
+        if (prior && prior != workspace_ && prior != raw_workspace_ && prior != workspace_reserved_) prior->Detach(planes_[0U]->state_->allocation_owner);
     }
     void DetachDisplay(ImageStream& stream, const std::shared_ptr<ImageWorkspace>& workspace) {
         const auto locks = LockPlanes();
@@ -796,19 +754,15 @@ struct ImageProductBuffer::State final {
         if (raw.external_storage == workspace) {
             const auto prior = raw.plane;
             auto next = raw.reusable_plane;
-            const bool reused =
-                next.valid() && next.allocation.width >= raw.capacity_width && next.allocation.height >= raw.capacity_height;
+            const bool reused = next.valid() && next.allocation.width >= raw.capacity_width && next.allocation.height >= raw.capacity_height;
             if (!reused)
-                next = context_.state_->backend->AllocatePlane(context_.state_->context, prior.descriptor.kind, raw.capacity_width,
-                                                               raw.capacity_height);
+                next = context_.state_->backend->AllocatePlane(context_.state_->context, prior.descriptor.kind, raw.capacity_width, raw.capacity_height);
             if (!next.valid()) throw std::runtime_error("detached raw product allocation is invalid");
             next.descriptor.width = prior.descriptor.width;
             next.descriptor.height = prior.descriptor.height;
-            if (!reused)
-                next.allocation = {next_image_allocation_identity(), raw.capacity_width, raw.capacity_height, raw.allocation_owner};
+            if (!reused) next.allocation = {next_image_allocation_identity(), raw.capacity_width, raw.capacity_height, raw.allocation_owner};
             try {
-                context_.state_->backend->CopySameDevice(context_.state_->context, stream.native_handle(), next, context_.state_->context,
-                                                         prior);
+                context_.state_->backend->CopySameDevice(context_.state_->context, stream.native_handle(), next, context_.state_->context, prior);
                 stream.Synchronize();
             } catch (...) {
                 const auto failure = std::current_exception();
@@ -825,8 +779,7 @@ struct ImageProductBuffer::State final {
                 stream.RethrowAfterSettlement(failure);
             }
             raw.plane = next;
-            if (!reused && raw.reusable_plane.data != 0U)
-                context_.state_->backend->FreePlane(context_.state_->context, raw.reusable_plane.data);
+            if (!reused && raw.reusable_plane.data != 0U) context_.state_->backend->FreePlane(context_.state_->context, raw.reusable_plane.data);
             raw.reusable_plane = {};
             raw.capacity_width = next.allocation.width;
             raw.capacity_height = next.allocation.height;
@@ -851,8 +804,7 @@ struct ImageProductBuffer::State final {
             DetachDisplay(stream, workspace);
         }
         if (unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
-        if (generation_sequence_ == std::numeric_limits<std::uint64_t>::max())
-            throw std::overflow_error("image product generation exhausted");
+        if (generation_sequence_ == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("image product generation exhausted");
         if (!ReservePhysicalWork()) throw std::runtime_error("image product workspace is acquired");
         if (workspace_) {
             workspace_->InvalidateWrite();
@@ -885,8 +837,7 @@ struct ImageProductBuffer::State final {
         std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
         for (std::size_t index = 0U; index != plane_count_; ++index) {
             locks[index] = std::unique_lock{planes_[index]->state_->access};
-            if (planes_[index]->state_->unavailable.load(std::memory_order_acquire))
-                throw std::runtime_error("image product storage is quarantined");
+            if (planes_[index]->state_->unavailable.load(std::memory_order_acquire)) throw std::runtime_error("image product storage is quarantined");
         }
         return locks;
     }
@@ -908,7 +859,6 @@ struct ImageProductBuffer::State final {
     std::optional<BorrowedImageProductReadView> unsettled_source_;
     std::shared_ptr<const std::function<void()>> availability_sink_;
 };
-
 struct BorrowedImageProductReadView::Lease final {
     explicit Lease(std::shared_ptr<ImageProductBuffer::State> owner)
         : product(std::move(owner)), lock(product->transaction_), generation(product->generation_) {}
@@ -932,15 +882,12 @@ struct BorrowedImageProductReadView::Lease final {
     std::uint64_t generation = 0U;
     bool completion_access = false;
 };
-
 void ImageStream::Await(const BorrowedImageProductReadView& source) {
     if (!source.valid()) throw std::invalid_argument("cannot await an invalid image product");
     const auto& product = *source.lease_->product;
-    if (context_.state_->backend != product.context_.state_->backend)
-        throw std::invalid_argument("source and receiver use different image backends");
+    if (context_.state_->backend != product.context_.state_->backend) throw std::invalid_argument("source and receiver use different image backends");
     context_.state_->backend->WaitEvent(context_.state_->context, stream_, product.completion_);
 }
-
 // CLEANUP-IGNORE: Product read special members retain a shared transaction lease; scalar reads own one plane lease.
 BorrowedImageProductReadView::BorrowedImageProductReadView() noexcept = default;
 BorrowedImageProductReadView::~BorrowedImageProductReadView() = default;
@@ -962,12 +909,9 @@ BorrowedImageReadView BorrowedImageProductReadView::TakePlane(const std::size_t 
     if (index >= count_) throw std::out_of_range("image product plane index is invalid");
     return std::move(planes_[index]);
 }
-
 void BorrowedImageProductReadView::Quarantine() noexcept {
-    for (std::size_t index = 0U; index != count_; ++index)
-        planes_[index].Quarantine();
+    for (std::size_t index = 0U; index != count_; ++index) planes_[index].Quarantine();
 }
-
 ImageProductReadCompletion::ImageProductReadCompletion(BorrowedImageProductReadView&& source) : source_(std::move(source)) {
     if (!source_.valid()) throw std::invalid_argument("receiver completion requires an intact product borrow");
     auto& lease = *source_.lease_;
@@ -977,8 +921,7 @@ ImageProductReadCompletion::ImageProductReadCompletion(BorrowedImageProductReadV
     pending_.store(true, std::memory_order_release);
     // These shared_mutex locks belong to this thread. The callback releases
     // only the counted access established before unlocking them.
-    for (std::size_t index = 0U; index != source_.count_; ++index)
-        source_.planes_[index].lease_->lock.unlock();
+    for (std::size_t index = 0U; index != source_.count_; ++index) source_.planes_[index].lease_->lock.unlock();
     lease.lock.unlock();
 }
 ImageProductReadCompletion::~ImageProductReadCompletion() {
@@ -1006,9 +949,7 @@ void ImageProductReadCompletion::Quarantine() noexcept {
     source_.Quarantine();
     ReleaseAccess();
 }
-
-ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout,
-                                       std::shared_ptr<ImageProductRetirement> retirement)
+ImageProductBuffer::ImageProductBuffer(DeviceContext context, const ImageProductLayout layout, std::shared_ptr<ImageProductRetirement> retirement)
     : state_(std::make_shared<State>(std::move(context), layout, std::move(retirement))) {}
 ImageProductBuffer::~ImageProductBuffer() {
     if (deferred_release_) return;
@@ -1028,8 +969,7 @@ void ImageProductBuffer::Publish(ImageStream& stream, const std::uint32_t width,
     std::uint64_t next_generation = 0U;
     {
         std::shared_lock transaction(state_->transaction_);
-        if (state_->generation_sequence_ == std::numeric_limits<std::uint64_t>::max())
-            throw std::overflow_error("image product generation exhausted");
+        if (state_->generation_sequence_ == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("image product generation exhausted");
         next_generation = state_->generation_sequence_ + 1U;
     }
     PublishAs(stream, width, height, next_generation, false, std::move(submit));
@@ -1038,8 +978,7 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
                                    const bool initialize, ProductSubmit submit) {
     if (width == 0U || height == 0U || !submit) throw std::invalid_argument("image product submit is empty");
     if (revision == 0U) throw std::invalid_argument("image product revision is invalid");
-    if (stream.context_.state_ != state_->context_.state_)
-        throw std::invalid_argument("image stream does not belong to the product context");
+    if (stream.context_.state_ != state_->context_.state_) throw std::invalid_argument("image stream does not belong to the product context");
     std::unique_lock transaction(state_->transaction_);
     static_cast<void>(state_->BeginWrite(stream));
     const auto plane_locks = state_->LockPlanes();
@@ -1057,8 +996,7 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
                 stream.Synchronize();
             }
             if (raw.plane.data != 0U && !raw.external_storage) {
-                if (raw.reusable_plane.data != 0U)
-                    state_->context_.state_->backend->FreePlane(state_->context_.state_->context, raw.reusable_plane.data);
+                if (raw.reusable_plane.data != 0U) state_->context_.state_->backend->FreePlane(state_->context_.state_->context, raw.reusable_plane.data);
                 raw.reusable_plane = raw.plane;
             }
             raw.external_storage = state_->workspace_;
@@ -1078,26 +1016,24 @@ void ImageProductBuffer::PublishAs(ImageStream& stream, const std::uint32_t widt
     }
     if (initialize) {
         for (std::size_t index = 0U; index != state_->plane_count_; ++index)
-            state_->context_.state_->backend->ClearPlane(state_->context_.state_->context, stream.native_handle(),
-                                                         state_->planes_[index]->state_->plane);
+            state_->context_.state_->backend->ClearPlane(state_->context_.state_->context, stream.native_handle(), state_->planes_[index]->state_->plane);
     }
     submit(state_->planes_[0U]->state_->plane, semantic, stream.native_handle());
     state_->context_.state_->backend->RecordEvent(state_->context_.state_->context, stream.native_handle(), state_->completion_);
     state_->generation_sequence_ = std::max(state_->generation_sequence_, revision);
     state_->generation_ = revision;
 }
-std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source,
-                                                           MissingPlaneSubmit initialize_missing, const bool preserve_clean) {
+std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFrom(ImageStream& stream, BorrowedImageProductReadView source, MissingPlaneSubmit initialize_missing,
+                                                           const bool preserve_clean) {
     return CopyFromAs(stream, std::move(source), std::move(initialize_missing), 0U, preserve_clean);
 }
-std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream, BorrowedImageProductReadView source,
-                                                             MissingPlaneSubmit initialize_missing, const std::uint64_t revision,
-                                                             const bool preserve_clean, const ImagePlanePreservation preservation) {
+std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream, BorrowedImageProductReadView source, MissingPlaneSubmit initialize_missing,
+                                                             const std::uint64_t revision, const bool preserve_clean,
+                                                             const ImagePlanePreservation preservation) {
     if (!source.valid() || (source.plane_count() < state_->plane_count_ && !initialize_missing))
         throw std::invalid_argument("source image product lacks a receiver plane");
     if (source.lease_->product == state_) throw std::invalid_argument("an image product cannot copy from itself");
-    if (stream.context_.state_ != state_->context_.state_)
-        throw std::invalid_argument("image stream does not belong to the product context");
+    if (stream.context_.state_ != state_->context_.state_) throw std::invalid_argument("image stream does not belong to the product context");
     if (state_->context_.state_->backend != source.lease_->product->context_.state_->backend)
         throw std::invalid_argument("source and receiver use different image backends");
     std::unique_lock transaction(state_->transaction_);
@@ -1135,16 +1071,15 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
     bool reads_submitted = false;
     bool receiver_completed = false;
     try {
-        const auto copied_planes =
-            preservation == ImagePlanePreservation::Clean ? 1U : std::min(state_->plane_count_, source.plane_count());
+        const auto copied_planes = preservation == ImagePlanePreservation::Clean ? 1U : std::min(state_->plane_count_, source.plane_count());
         for (std::size_t index = preserve_clean ? 1U : 0U; index < copied_planes; ++index) {
             auto& receiver = *state_->planes_[index]->state_;
             const ImagePlaneView source_plane = source.planes_[index].plane();
             receiver.EnsurePlane(source_plane.descriptor.kind, source_plane.descriptor.width, source_plane.descriptor.height);
             if (receiver_device == source_device) {
                 reads_submitted = true;
-                backend.CopySameDevice(state_->context_.state_->context, stream.native_handle(), receiver.plane,
-                                       source_product.context_.state_->context, source_plane);
+                backend.CopySameDevice(state_->context_.state_->context, stream.native_handle(), receiver.plane, source_product.context_.state_->context,
+                                       source_plane);
                 paths[index] = ImageCopyPath::SameDevice;
             } else if (!staged) {
                 reads_submitted = true;
@@ -1159,8 +1094,7 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
                 LogStaging(state_->context_, source_device, row_bytes * source_plane.descriptor.height);
                 reads_submitted = true;
                 backend.CopyDeviceToHost(source_product.context_.state_->context, source_plane, receiver.staging, row_bytes);
-                backend.CopyHostToDevice(state_->context_.state_->context, stream.native_handle(), receiver.staging, row_bytes,
-                                         receiver.plane);
+                backend.CopyHostToDevice(state_->context_.state_->context, stream.native_handle(), receiver.staging, row_bytes, receiver.plane);
                 paths[index] = ImageCopyPath::PinnedStaging;
             }
         }
@@ -1188,9 +1122,8 @@ BorrowedImageProductReadView ImageProductBuffer::Borrow() const {
     BorrowedImageProductReadView result{std::make_shared<BorrowedImageProductReadView::Lease>(state_)};
     result.count_ = state_->plane_count_;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index)
-        result.planes_[index] = BorrowedImageReadView{
-            std::make_unique<BorrowedImageReadView::Lease>(state_->planes_[index]->state_, state_->completion_, result.lease_,
-                                                           result.lease_->generation, &result.lease_->lock, state_->availability_sink_)};
+        result.planes_[index] = BorrowedImageReadView{std::make_unique<BorrowedImageReadView::Lease>(
+            state_->planes_[index]->state_, state_->completion_, result.lease_, result.lease_->generation, &result.lease_->lock, state_->availability_sink_)};
     if (!result.valid()) return {};
     return result;
 }
@@ -1245,18 +1178,15 @@ void ImageProductBuffer::FinalizeWorkspace(ImageWorkspaceCoverage coverage) {
     {
         std::shared_lock transaction(state_->transaction_);
         state_->damage_.Record({state_->planes_[0U]->state_->allocation_owner, state_->generation_}, coverage);
-        if (!state_->workspace_ || state_->workspace_->Contains({state_->planes_[0U]->state_->allocation_owner, state_->generation_}))
-            return;
+        if (!state_->workspace_ || state_->workspace_->Contains({state_->planes_[0U]->state_->allocation_owner, state_->generation_})) return;
     }
     auto source = Borrow();
-    if (!source.valid() || !state_->workspace_ ||
-        state_->workspace_->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()}))
+    if (!source.valid() || !state_->workspace_ || state_->workspace_->Contains({source.plane(0U).plane().allocation.owner, source.plane(0U).revision()}))
         return;
     const auto extent = source.plane(0U).plane().descriptor;
     if (extent.width > state_->workspace_->layout().width || extent.height > state_->workspace_->layout().height) return;
-    coverage =
-        state_->damage_.Since(state_->workspace_->Content(), {source.plane(0U).plane().allocation.owner, source.plane(0U).revision()},
-                              state_->workspace_->identity());
+    coverage = state_->damage_.Since(state_->workspace_->Content(), {source.plane(0U).plane().allocation.owner, source.plane(0U).revision()},
+                                     state_->workspace_->identity());
     state_->workspace_->Finalize(std::move(source), coverage, state_->finalize_);
     CancelWorkspaceWrite();
 }
@@ -1271,9 +1201,9 @@ BorrowedImageWorkspace ImageProductBuffer::BorrowWorkspace() const {
     BorrowedImageProductReadView source{std::make_shared<BorrowedImageProductReadView::Lease>(state_, std::move(transaction))};
     source.count_ = state_->plane_count_;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
-        source.planes_[index] = BorrowedImageReadView{std::make_unique<BorrowedImageReadView::Lease>(
-            state_->planes_[index]->state_, state_->completion_, source.lease_, source.lease_->generation, &source.lease_->lock,
-            state_->availability_sink_, true)};
+        source.planes_[index] = BorrowedImageReadView{std::make_unique<BorrowedImageReadView::Lease>(state_->planes_[index]->state_, state_->completion_,
+                                                                                                     source.lease_, source.lease_->generation,
+                                                                                                     &source.lease_->lock, state_->availability_sink_, true)};
         if (!source.planes_[index].lease_->lock.owns_lock()) return {};
     }
     if (!source.valid()) return {};
@@ -1292,8 +1222,7 @@ std::uint32_t ImageProductBuffer::capacity_width() const noexcept { return state
 std::uint32_t ImageProductBuffer::capacity_height() const noexcept { return state_->planes_[0U]->capacity_height(); }
 std::size_t ImageProductBuffer::staging_capacity_bytes() const noexcept {
     std::size_t result = 0U;
-    for (std::size_t index = 0U; index != state_->plane_count_; ++index)
-        result = std::max(result, state_->planes_[index]->staging_capacity_bytes());
+    for (std::size_t index = 0U; index != state_->plane_count_; ++index) result = std::max(result, state_->planes_[index]->staging_capacity_bytes());
     return result;
 }
 ImageStorageFootprint ImageProductBuffer::StorageFootprint() const noexcept {
@@ -1306,8 +1235,7 @@ ImageStorageFootprint ImageProductBuffer::StorageFootprint() const noexcept {
         } else if (plane.plane.data != 0U)
             result.device_bytes += plane.plane.descriptor.pitch_bytes * plane.capacity_height;
         result.pinned_bytes += plane.staging_bytes;
-        if (plane.reusable_plane.data != 0U)
-            result.device_bytes += plane.reusable_plane.descriptor.pitch_bytes * plane.reusable_plane.allocation.height;
+        if (plane.reusable_plane.data != 0U) result.device_bytes += plane.reusable_plane.descriptor.pitch_bytes * plane.reusable_plane.allocation.height;
     }
     if (state_->workspace_) {
         const auto workspace = state_->workspace_->StorageFootprint();
@@ -1330,8 +1258,7 @@ bool ImageProductBuffer::writable() const {
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {
         locks[index] = std::unique_lock{state_->planes_[index]->state_->access, std::try_to_lock};
         if (!locks[index].owns_lock()) return false;
-        if (state_->planes_[index]->state_->unavailable.load(std::memory_order_acquire))
-            throw std::runtime_error("image product storage is quarantined");
+        if (state_->planes_[index]->state_->unavailable.load(std::memory_order_acquire)) throw std::runtime_error("image product storage is quarantined");
     }
     return true;
 }
@@ -1355,14 +1282,11 @@ bool ImageProductBuffer::terminal() const noexcept {
         if (state_->planes_[index]->state_->unavailable.load(std::memory_order_acquire)) return true;
     return false;
 }
-bool ImageProductBuffer::Owns(const BorrowedImageProductReadView& source) const noexcept {
-    return source.lease_ && source.lease_->product == state_;
-}
+bool ImageProductBuffer::Owns(const BorrowedImageProductReadView& source) const noexcept { return source.lease_ && source.lease_->product == state_; }
 void ImageProductBuffer::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) {
     std::unique_lock transaction(state_->transaction_);
     state_->availability_sink_ = std::move(sink);
     if (state_->workspace_) state_->workspace_->SetAvailabilitySink(state_->availability_sink_);
-    if (state_->raw_workspace_ && state_->raw_workspace_ != state_->workspace_)
-        state_->raw_workspace_->SetAvailabilitySink(state_->availability_sink_);
+    if (state_->raw_workspace_ && state_->raw_workspace_ != state_->workspace_) state_->raw_workspace_->SetAvailabilitySink(state_->availability_sink_);
 }
 }  // namespace mmltk::frameworks::gpu

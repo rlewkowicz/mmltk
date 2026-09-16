@@ -210,17 +210,44 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
     let snapshot = bootstrapped().workflow.validation.unwrap();
     ValidationImageMetadata {
         frame: visual_frame(PresentationSourceKind::Validation, 1),
-        contentidentity: 9, detail: false, overlays: snapshot.overlays,
+        contentidentity: 9,
+        detail: false,
+        overlays: snapshot.overlays,
         samples: std::array::from_fn(|index| ValidationSampleMetadata {
-            identity: ValidationSampleIdentity { generation: 7, datasetindex: index as u32 },
+            identity: ValidationSampleIdentity {
+                generation: 7,
+                datasetindex: index as u32,
+            },
             available: index < 2,
-            crop: VisualRegion { x: index as u32 * 100, y: 0, width: 100, height: 100 },
-            originalextent: VisualExtent { width: 200, height: 200 },
-            labels: if index < 2 { vec![ValidationLabel {
-                box_: AnnotationBox { first: AnnotationPoint { x: 20.0, y: 40.0 }, second: AnnotationPoint { x: 80.0, y: 90.0 } },
-                color: AnnotationColor { hue: 120.0, saturation: 1.0, value: 0.8 },
-                category: index as u32, groundtruth: index == 0, confidence: 0.75, name: "paired name".into(),
-            }] } else { Vec::new() },
+            crop: VisualRegion {
+                x: index as u32 * 100,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            originalextent: VisualExtent {
+                width: 200,
+                height: 200,
+            },
+            labels: if index < 2 {
+                vec![ValidationLabel {
+                    box_: AnnotationBox {
+                        first: AnnotationPoint { x: 20.0, y: 40.0 },
+                        second: AnnotationPoint { x: 80.0, y: 90.0 },
+                    },
+                    color: AnnotationColor {
+                        hue: 120.0,
+                        saturation: 1.0,
+                        value: 0.8,
+                    },
+                    category: index as u32,
+                    groundtruth: index == 0,
+                    confidence: 0.75,
+                    name: "paired name".into(),
+                }]
+            } else {
+                Vec::new()
+            },
         }),
     }
 }

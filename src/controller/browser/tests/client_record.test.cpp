@@ -9,10 +9,8 @@
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"
-
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -24,15 +22,12 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 namespace mmltk::controller::browser {
 namespace {
-
 struct ClientFixture final {
     std::string kind;
     wire::ByteBuffer bytes;
 };
-
 class FixtureFileDialogSystem final {
    public:
     using event_type = std::variant<mmltk::controller::FileDialogFailed>;
@@ -47,46 +42,39 @@ class FixtureFileDialogSystem final {
             .target = request.target,
         };
     }
-    [[= mmltk::controller::contracts::reflection::Snapshot{8192U}]] [[nodiscard]] mmltk::controller::FileDialogSnapshot snapshot() const {
-        return {};
-    }
+    [[= mmltk::controller::contracts::reflection::Snapshot{8192U}]] [[nodiscard]] mmltk::controller::FileDialogSnapshot snapshot() const { return {}; }
     mmltk::controller::services::FileDialogOpen opened{};
 };
-
 class FixtureSettingsSystem final {
    public:
     using event_type = std::variant<mmltk::controller::SettingsChanged>;
-    [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState
-        Update(mmltk::controller::contracts::SettingsUpdateRequest request) {
+    [[= mmltk::controller::contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState Update(
+        mmltk::controller::contracts::SettingsUpdateRequest request) {
         state = mmltk::controller::contracts::default_gui_settings_state();
-        const auto applied = mmltk::controller::contracts::apply_gui_settings_values(
-            state, std::span<const mmltk::controller::contracts::SettingsValueUpdate>{request.updates});
+        const auto applied =
+            mmltk::controller::contracts::apply_gui_settings_values(state, std::span<const mmltk::controller::contracts::SettingsValueUpdate>{request.updates});
         if (!applied) throw mmltk::controller::contracts::InvalidIntentError("invalid fixture settings update");
         latest = std::move(request);
         return snapshot();
     }
-    [[= mmltk::controller::contracts::reflection::Snapshot{mmltk::controller::contracts::kSettingsUiStateByteBudget}]]
-        [[nodiscard]] mmltk::controller::contracts::SettingsUiState snapshot() const {
+    [[= mmltk::controller::contracts::reflection::Snapshot{
+        mmltk::controller::contracts::kSettingsUiStateByteBudget}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState snapshot() const {
         return {.revision = 1U, .settings_state = state};
     }
     mmltk::controller::contracts::GuiSettingsState state{};
     mmltk::controller::contracts::SettingsUpdateRequest latest{};
 };
-
 class FixtureExploreSystem final {
    public:
     using event_type = std::variant<mmltk::controller::ExploreChanged>;
-    [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void UpdateViewport(
-        mmltk::controller::ExploreViewportUpdate request) {
+    [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void UpdateViewport(mmltk::controller::ExploreViewportUpdate request) {
         latest = request.viewport;
     }
-    [[= mmltk::controller::contracts::reflection::Snapshot{64U *
-                                                           1024U}]] [[nodiscard]] mmltk::controller::ExploreSnapshot snapshot() const {
+    [[= mmltk::controller::contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] mmltk::controller::ExploreSnapshot snapshot() const {
         return {.viewport = latest};
     }
     mmltk::controller::ExploreViewport latest{};
 };
-
 class FixtureAnnotationSystem final {
    public:
     using event_type = std::variant<mmltk::controller::AnnotationChanged>;
@@ -98,24 +86,19 @@ class FixtureAnnotationSystem final {
         alternatives.push_back(request.edit.value.index());
         return {};
     }
-    [[= mmltk::controller::contracts::reflection::Snapshot{256U *
-                                                           1024U}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot snapshot() const {
-        return {};
-    }
+    [[= mmltk::controller::contracts::reflection::Snapshot{256U * 1024U}]] [[nodiscard]] mmltk::controller::AnnotationSnapshot snapshot() const { return {}; }
     [[= mmltk::controller::contracts::reflection::direct::InteractionEndpoint{}]] void Input(mmltk::controller::WorkspaceMouse batch) {
         input = std::move(batch);
     }
     mmltk::controller::WorkspaceMouse input;
     std::vector<std::size_t> alternatives;
 };
-
 struct FixtureApplicationSystems final {
     FixtureSettingsSystem* settings = nullptr;
     FixtureFileDialogSystem* file_dialog = nullptr;
     FixtureExploreSystem* explore = nullptr;
     FixtureAnnotationSystem* annotation = nullptr;
 };
-
 [[nodiscard]] std::vector<ClientFixture> protocol_client_fixtures() {
     std::ifstream input(MMLTK_PROTOCOL_V17_CLIENT_FIXTURE_PATH);
     REQUIRE(input.good());
@@ -135,13 +118,11 @@ struct FixtureApplicationSystems final {
     }
     return fixtures;
 }
-
 [[nodiscard]] const ClientFixture& fixture_named(const std::vector<ClientFixture>& fixtures, const std::string_view name) {
     const auto found = std::ranges::find(fixtures, name, &ClientFixture::kind);
     REQUIRE(found != fixtures.end());
     return *found;
 }
-
 [[nodiscard]] Intent decode_intent_fixture(const ClientFixture& fixture) {
     const auto record = decode_client_record(wire::ByteSegments{.first = fixture.bytes, .second = {}});
     REQUIRE(record);
@@ -150,7 +131,6 @@ struct FixtureApplicationSystems final {
     CHECK(intent.protocol_version == kBrowserProtocolVersion);
     return intent;
 }
-
 void check_integration_round_trip(const IntegrationControl& source, const bool expected_server, wire::ByteBuffer& encoded) {
     REQUIRE((expected_server ? encode_server_record(source, encoded) : encode_client_record(source, encoded)));
     const wire::ByteSegments bytes{.first = encoded, .second = {}};
@@ -162,14 +142,12 @@ void check_integration_round_trip(const IntegrationControl& source, const bool e
     if (server_record) CHECK(std::get<IntegrationControl>(*server_record) == source);
     CHECK_FALSE((expected_server ? encode_client_record(source, encoded) : encode_server_record(source, encoded)));
 }
-
 template <class Exception>
 [[nodiscard]] ApplicationErrorRecord map_exception(Exception exception) {
     try {
         throw std::move(exception);
     } catch (...) { return map_current_exception(); }
 }
-
 TEST_CASE("browser client records are one complete canonical CBOR item", "[controller][browser][protocol]") {
     const ClientRecord source = Intent{
         .correlation = 7U,
@@ -181,11 +159,9 @@ TEST_CASE("browser client records are one complete canonical CBOR item", "[contr
     const auto decoded = decode_client_record(wire::ByteSegments{.first = encoded, .second = {}});
     REQUIRE(decoded);
     CHECK(*decoded == source);
-
     encoded.push_back(std::byte{0xf6});
     CHECK_FALSE(decode_client_record(wire::ByteSegments{.first = encoded, .second = {}}));
 }
-
 TEST_CASE("integration control retains typed direction and sequence validation", "[controller][browser][protocol]") {
     using Kind = mmltk::controller::contracts::IntegrationControlKind;
     wire::ByteBuffer encoded;
@@ -207,15 +183,11 @@ TEST_CASE("integration control retains typed direction and sequence validation",
     CHECK_FALSE(encode_client_record(ClientRecord{IntegrationControl{.receipt = {.kind = Kind::Settled}}}, encoded));
     CHECK_FALSE(encode_server_record(ServerRecord{IntegrationControl{.receipt = {.kind = Kind::Advance}}}, encoded));
 }
-
 TEST_CASE("integration failure text has a bounded failed-only canonical payload", "[controller][browser][protocol]") {
     using namespace mmltk::controller::contracts;
     for (const auto size : {0U, 1U, static_cast<unsigned>(kIntegrationFailureMaxBytes)}) {
-        IntegrationControl source{.receipt = {.kind = IntegrationControlKind::Failed,
-                                              .sequence = 3U,
-                                              .progress = 7U,
-                                              .failureline = 123U,
-                                              .failure = std::string(size, 'x')}};
+        IntegrationControl source{
+            .receipt = {.kind = IntegrationControlKind::Failed, .sequence = 3U, .progress = 7U, .failureline = 123U, .failure = std::string(size, 'x')}};
         wire::ByteBuffer encoded;
         check_integration_round_trip(source, false, encoded);
         source.receipt.failure.assign(kIntegrationFailureMaxBytes + 1U, 'x');
@@ -223,15 +195,12 @@ TEST_CASE("integration failure text has a bounded failed-only canonical payload"
     }
     visit_integration_commands([&]<auto kind, auto policy>(auto) {
         if constexpr (kind != IntegrationControlKind::Failed) {
-            const IntegrationControl source{.receipt = {.kind = kind,
-                                                        .sequence = 3U,
-                                                        .read_generation = policy.read_generation ? 1U : 0U,
-                                                        .failure = "Protocol: invalid frame"}};
+            const IntegrationControl source{
+                .receipt = {.kind = kind, .sequence = 3U, .read_generation = policy.read_generation ? 1U : 0U, .failure = "Protocol: invalid frame"}};
             CHECK_FALSE(integration_receipt_valid(source.receipt));
         }
     });
 }
-
 TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[controller][browser][protocol][interop]") {
     STATIC_REQUIRE(kBrowserProtocolVersion == 17U);
     const auto fixtures = protocol_client_fixtures();
@@ -258,7 +227,6 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     const auto& settings_fixture = fixture_named(fixtures, "Intent:settings.Update");
     const auto& interaction_fixture = fixture_named(fixtures, "Interaction:explore.UpdateViewport");
     const auto& batch_fixture = fixture_named(fixtures, "Interaction:annotation.Input");
-
     const Intent intent = decode_intent_fixture(dialog_fixture);
     CHECK(intent.correlation == 17U);
     CHECK(intent.endpoint_id == application_stable_id("file_dialog", "Open"));
@@ -279,7 +247,6 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     REQUIRE(mmltk::controller::services::file_dialog_stable_id(file_dialog.opened.target) != 0U);
     CHECK(std::holds_alternative<mmltk::controller::services::SettingsFieldTarget>(file_dialog.opened.target.value));
     REQUIRE(mmltk::controller::services::file_dialog_catalog().resolve(file_dialog.opened));
-
     const Intent model_intent = decode_intent_fixture(model_dialog_fixture);
     CHECK(model_intent.correlation == 23U);
     CHECK(model_intent.endpoint_id == application_stable_id("file_dialog", "Open"));
@@ -294,7 +261,6 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     CHECK(model_target.workflow == expected_model.workflow);
     CHECK(model_target.input == expected_model.input);
     REQUIRE(mmltk::controller::services::file_dialog_catalog().resolve(file_dialog.opened));
-
     const Intent settings_intent = decode_intent_fixture(settings_fixture);
     CHECK(settings_intent.correlation == 19U);
     CHECK(settings_intent.endpoint_id == application_stable_id("settings", "Update"));
@@ -304,7 +270,6 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     REQUIRE(settings.latest.updates.size() == 1U);
     // CLEANUP-IGNORE: Settings and file-dialog fixtures prove separate generated endpoints and native dispatch paths.
     CHECK(mmltk::controller::contracts::gui_settings_valid(settings.state));
-
     const auto interaction_record = decode_client_record(wire::ByteSegments{.first = interaction_fixture.bytes, .second = {}});
     REQUIRE(interaction_record);
     REQUIRE(std::holds_alternative<Interaction>(*interaction_record));
@@ -340,8 +305,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
         const auto bytes = std::span<const std::byte>(projected);
         REQUIRE(decode_client_record({.first = bytes.first(split), .second = bytes.subspan(split)}));
     }
-    for (std::size_t size = 0U; size < projected.size(); ++size)
-        CHECK_FALSE(decode_interaction_view(std::span<const std::byte>(projected).first(size)));
+    for (std::size_t size = 0U; size < projected.size(); ++size) CHECK_FALSE(decode_interaction_view(std::span<const std::byte>(projected).first(size)));
     auto trailing = projected;
     trailing.push_back(std::byte{0xf6});
     CHECK_FALSE(decode_interaction_view(trailing));
@@ -350,9 +314,8 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     unknown[1] = std::byte{0x17};
     CHECK_FALSE(decode_interaction_view(unknown));
     CHECK_FALSE(decode_client_record({.first = unknown}));
-    REQUIRE(mmltk::frameworks::serialization::encode(
-        ClientRecord{interaction}, projected,
-        {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
+    REQUIRE(mmltk::frameworks::serialization::encode(ClientRecord{interaction}, projected,
+                                                     {.max_bytes = kMaxRecordWireBytes, .max_items = kMaxIntentValueItems, .max_depth = kMaxIntentValueDepth}));
     CHECK_FALSE(decode_interaction_view(projected));
     CHECK_FALSE(decode_client_record({.first = projected}));
     const auto accepted_interaction = dispatch_interaction(systems, interaction);
@@ -360,18 +323,14 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     CHECK_FALSE(accepted_interaction.error.has_value());
     CHECK(explore.latest.extent.width == 64U);
     CHECK(explore.latest.extent.height == 64U);
-
-    const auto malformed_interaction =
-        dispatch_interaction(systems, Interaction{.endpoint_id = interaction.endpoint_id, .value = {std::byte{0xf6}}});
+    const auto malformed_interaction = dispatch_interaction(systems, Interaction{.endpoint_id = interaction.endpoint_id, .value = {std::byte{0xf6}}});
     CHECK(malformed_interaction.disposition == InteractionDispatchDisposition::ProtocolInvalid);
-
     systems.explore = nullptr;
     const auto unavailable_interaction = dispatch_interaction(systems, interaction);
     CHECK(unavailable_interaction.disposition == InteractionDispatchDisposition::ApplicationRejected);
     REQUIRE(unavailable_interaction.error.has_value());
     CHECK(unavailable_interaction.error->category == mmltk::controller::contracts::ApplicationErrorCategory::Unavailable);
     systems.explore = &explore;
-
     for (std::size_t alternative = 0U; alternative != annotation_alternatives; ++alternative) {
         const std::string name = "Intent:annotation.Edit." + std::to_string(alternative);
         const auto& fixture = fixture_named(fixtures, name);
@@ -391,7 +350,6 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
         // evidence.
         CHECK(annotation.alternatives[alternative] == alternative);
 }
-
 TEST_CASE("browser server records preserve reply and event error vocabulary", "[controller][browser][protocol]") {
     const ServerRecord failed = IntentReply{
         .correlation = 23U,
@@ -407,10 +365,9 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
     const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
     REQUIRE(decoded);
     CHECK(*decoded == failed);
-
-    for (const auto delivery : {mmltk::controller::contracts::reflection::EventDelivery::Transient,
-                                mmltk::controller::contracts::reflection::EventDelivery::Critical,
-                                mmltk::controller::contracts::reflection::EventDelivery::LatestState}) {
+    for (const auto delivery :
+         {mmltk::controller::contracts::reflection::EventDelivery::Transient, mmltk::controller::contracts::reflection::EventDelivery::Critical,
+          mmltk::controller::contracts::reflection::EventDelivery::LatestState}) {
         const ServerRecord event = SystemEvent{
             .system_id = 29U,
             .event_id = 31U,
@@ -424,7 +381,6 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
         CHECK(*roundtrip == event);
     }
 }
-
 TEST_CASE("output records admit bounded scene collections and complete bootstrap payloads", "[controller][browser][protocol][limits]") {
     namespace cbor = mmltk::frameworks::serialization;
     wire::ByteBuffer encoded;
@@ -435,18 +391,16 @@ TEST_CASE("output records admit bounded scene collections and complete bootstrap
                                            .state_revision = 1U,
                                            .value = wire::Value(std::move(objects))};
     REQUIRE(encode_server_record(event, encoded));
-    const auto event_payload_bytes =
-        cbor::measure(std::get<SystemEvent>(event).value,
-                      {.max_bytes = kMaxOutputValueBytes, .max_items = kMaxOutputValueItems, .max_depth = kMaxIntentValueDepth});
+    const auto event_payload_bytes = cbor::measure(std::get<SystemEvent>(event).value,
+                                                   {.max_bytes = kMaxOutputValueBytes, .max_items = kMaxOutputValueItems, .max_depth = kMaxIntentValueDepth});
     REQUIRE(event_payload_bytes);
     CHECK(encoded.size() <= cbor::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(*event_payload_bytes));
     const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
     REQUIRE(decoded);
     CHECK(*decoded == event);
     const wire::Value payload(std::string(kMaxOutputValueBytes, 'x'));
-    const ServerRecord bootstrap = Bootstrap{.schema_fingerprint = {11U, 13U},
-                                             .input_epoch = 1U,
-                                             .snapshots = {{.system_id = 1U, .value = payload}, {.system_id = 2U, .value = payload}}};
+    const ServerRecord bootstrap =
+        Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}, {.system_id = 2U, .value = payload}}};
     REQUIRE(encode_server_record(bootstrap, encoded));
     CHECK(encoded.size() > kMaxOutputValueBytes * 2U);
     CHECK(encoded.size() <= kMaxRecordWireBytes);
@@ -455,13 +409,11 @@ TEST_CASE("output records admit bounded scene collections and complete bootstrap
     REQUIRE(snapshot_bytes);
     CHECK(encoded.size() <= cbor::reflected_structural_cbor_bytes<std::variant<Bootstrap>>(2U * *snapshot_bytes));
     REQUIRE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
-    const ServerRecord oversized =
-        SystemEvent{.system_id = 1U, .event_id = 2U, .value = wire::Value(std::string(kMaxOutputValueBytes + 1U, 'x'))};
+    const ServerRecord oversized = SystemEvent{.system_id = 1U, .event_id = 2U, .value = wire::Value(std::string(kMaxOutputValueBytes + 1U, 'x'))};
     CHECK_FALSE(encode_server_record(oversized, encoded));
     const ClientRecord oversized_input = Interaction{.endpoint_id = 2U, .value = wire::ByteBuffer(kMaxIntentValueBytes + 1U)};
     CHECK_FALSE(encode_client_record(oversized_input, encoded));
 }
-
 TEST_CASE("materialized Annotation categories retain native fixed text validation") {
     FixtureAnnotationSystem annotation;
     FixtureApplicationSystems systems{.annotation = &annotation};
@@ -487,7 +439,6 @@ TEST_CASE("materialized Annotation categories retain native fixed text validatio
         REQUIRE(reply.error);
         CHECK(reply.error->category == mmltk::controller::contracts::ApplicationErrorCategory::InvalidIntent);
     };
-
     rejected({});
     auto over_capacity = mmltk::controller::contracts::AnnotationText::From("x");
     over_capacity.size = static_cast<std::uint8_t>(over_capacity.bytes.size() + 1U);
@@ -499,15 +450,12 @@ TEST_CASE("materialized Annotation categories retain native fixed text validatio
     auto nonzero_tail = mmltk::controller::contracts::AnnotationText::From("x");
     nonzero_tail.bytes[1] = 'y';
     rejected(nonzero_tail);
-
     const auto accepted = dispatch_intent(systems, intent(mmltk::controller::contracts::AnnotationText::From("category")));
     CHECK_FALSE(accepted.error);
     REQUIRE(accepted.result);
 }
-
 TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapshots", "[controller][browser][protocol][limits]") {
-    STATIC_REQUIRE(kMaxRecordWireBytes >=
-                   mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(kMaxOutputValueBytes));
+    STATIC_REQUIRE(kMaxRecordWireBytes >= mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<SystemEvent>>(kMaxOutputValueBytes));
     STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_cbor_member_count<SystemEvent>() == 6U);
     STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_structural_cbor_bytes<std::variant<Bootstrap>>() == 954U);
     STATIC_REQUIRE(kMaxOutputValueBytes == 8388608U);
@@ -518,7 +466,6 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
     STATIC_REQUIRE(kMaxSnapshotCount == 32U);
     STATIC_REQUIRE(kMaxIntentFields == 64U);
     STATIC_REQUIRE(kMaxErrorDetailBytes == 512U);
-
     const ServerRecord bootstrap = Bootstrap{
         .schema_fingerprint = {11U, 13U},
         .input_epoch = 1U,
@@ -527,15 +474,13 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
     wire::ByteBuffer encoded;
     REQUIRE(encode_server_record(bootstrap, encoded));
     REQUIRE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
-
     auto zero_epoch = std::get<Bootstrap>(bootstrap);
     zero_epoch.input_epoch = 0U;
     CHECK_FALSE(encode_server_record(ServerRecord{zero_epoch}, encoded));
     for (const ServerRecord& record : std::array<ServerRecord, 2U>{
              InteractionRejected{.endpoint_id = 7U, .error = {.detail = "input unavailable"}},
-             InteractionRejected{
-                 .endpoint_id = 1U,
-                 .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
+             InteractionRejected{.endpoint_id = 1U,
+                                 .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
         REQUIRE(encode_server_record(record, encoded));
         const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
         REQUIRE(decoded);
@@ -543,11 +488,9 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
     }
     std::vector<SystemSnapshot> too_many_snapshots;
     too_many_snapshots.reserve(kMaxSnapshotCount + 1U);
-    for (std::size_t index = 0U; index <= kMaxSnapshotCount; ++index)
-        too_many_snapshots.push_back({.system_id = index + 1U, .value = wire::Value{}});
-    CHECK_FALSE(encode_server_record(
-        ServerRecord{Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = std::move(too_many_snapshots)}}, encoded));
-
+    for (std::size_t index = 0U; index <= kMaxSnapshotCount; ++index) too_many_snapshots.push_back({.system_id = index + 1U, .value = wire::Value{}});
+    CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = std::move(too_many_snapshots)}},
+                                     encoded));
     CHECK_FALSE(encode_server_record(ServerRecord{Bootstrap{
                                          .schema_fingerprint = {11U, 13U},
                                          .input_epoch = 1U,
@@ -557,14 +500,12 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
                                          }},
                                      }},
                                      encoded));
-
     REQUIRE(encode_server_record(bootstrap, encoded));
     encoded.push_back(std::byte{0xf6});
     CHECK_FALSE(decode_server_record(wire::ByteSegments{.first = encoded, .second = {}}));
     const wire::ByteBuffer malformed{std::byte{0xbf}};
     CHECK_FALSE(decode_server_record(wire::ByteSegments{.first = malformed, .second = {}}));
 }
-
 TEST_CASE("browser records reject duplicate identities and invalid renderer observations", "[controller][browser][protocol]") {
     wire::ByteBuffer encoded;
     CHECK_FALSE(encode_client_record(ClientRecord{Intent{
@@ -578,7 +519,6 @@ TEST_CASE("browser records reject duplicate identities and invalid renderer obse
                                      }},
                                      encoded));
 }
-
 TEST_CASE("settings leaf traversal retains every reflected constraint dimension", "[controller][browser][schema][settings]") {
     std::size_t leaves = 0U;
     bool observed_byte_bound = false;
@@ -595,7 +535,6 @@ TEST_CASE("settings leaf traversal retains every reflected constraint dimension"
     CHECK(observed_byte_bound);
     CHECK(observed_item_bound);
 }
-
 TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[controller][browser][protocol]") {
     using mmltk::controller::contracts::ApplicationErrorCategory;
     const auto invalid = map_exception(mmltk::controller::contracts::InvalidIntentError("invalid"));
@@ -606,7 +545,6 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
     CHECK(busy.category == ApplicationErrorCategory::Busy);
     CHECK(unavailable.category == ApplicationErrorCategory::Unavailable);
     CHECK(failed.category == ApplicationErrorCategory::Failed);
-
     std::string oversized(kMaxErrorDetailBytes * 2U, 'x');
     oversized[1U] = '\n';
     oversized[2U] = static_cast<char>(0xff);
@@ -615,7 +553,6 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
     CHECK(bounded.detail.size() == kMaxErrorDetailBytes);
     CHECK(bounded.detail[1U] == '?');
     CHECK(bounded.detail[2U] == '?');
-
     wire::ByteBuffer encoded;
     InteractionRejected rejected{.endpoint_id = 1U, .error = {.detail = std::string(kMaxErrorDetailBytes, 'r')}};
     REQUIRE(encode_server_record(ServerRecord{rejected}, encoded));
@@ -634,10 +571,8 @@ TEST_CASE("exception mapping preserves the common bounded error vocabulary", "[c
                                      }},
                                      encoded));
 }
-
 }  // namespace
 }  // namespace mmltk::controller::browser
-
 TEST_CASE("Native graphics records reject unknown raw opcodes and malformed descriptor counts", "[browser][workspace][protocol]") {
     namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
     abi::Record record{.id_high = 1U,
@@ -666,7 +601,6 @@ TEST_CASE("Native graphics records reject unknown raw opcodes and malformed desc
     ++packet.presentation_revision_offset;
     CHECK_FALSE(abi::valid(packet));
 }
-
 TEST_CASE("Graphics arena negotiation and source completion use independent record shapes", "[browser][workspace][protocol]") {
     namespace abi = mmltk::controller::presentation::detail::workspace_surface_import;
     abi::Record arena{.opcode = abi::Opcode::Arena, .id_high = 1U, .width = 4U, .height = 3U};
@@ -703,8 +637,7 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
         layout.alignment = 3U;
         CHECK_FALSE(abi::valid(layout));
     }
-    abi::Record completed{
-        .opcode = abi::Opcode::ReadSettled, .id_high = 3U, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
+    abi::Record completed{.opcode = abi::Opcode::ReadSettled, .id_high = 3U, .stride = 7U, .size = 8U, .presentation_revision = 9U, .offset = 1U};
     REQUIRE(abi::valid(completed));
     SECTION("exact acquisition and submitted release use the same physical identity") {
         completed.opcode = GENERATE(abi::Opcode::Acquired, abi::Opcode::ReleaseSubmitted);
@@ -734,7 +667,6 @@ TEST_CASE("Graphics arena negotiation and source completion use independent reco
         CHECK_FALSE(abi::valid(completed));
     }
 }
-
 TEST_CASE("compact workspace mouse records preserve fractional coordinates and wheel units", "[controller][browser][protocol]") {
     using namespace mmltk::controller;
     using namespace mmltk::controller::browser;

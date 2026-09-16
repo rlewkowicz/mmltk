@@ -1,7 +1,7 @@
 use super::{PlacementGeometry, Program, Surface, WorkspaceViewport, placement_geometry};
 use crate::fluent_theme::{Element, Theme};
 use iced::advanced::Renderer as _;
-use iced::advanced::text::{Renderer as _, Paragraph as _};
+use iced::advanced::text::{Paragraph as _, Renderer as _};
 use iced::advanced::{Layout, Shell, Widget, layout, mouse, renderer, text, widget};
 use iced::{Color, Event, Fill, Point, Rectangle, Size};
 
@@ -32,25 +32,45 @@ impl CachedLabel {
     fn new(text: String) -> Self {
         let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
         let paragraph = iced::advanced::graphics::text::Paragraph::with_text(text::Text {
-            content: &text, bounds: Size::new(width - 6.0, 19.0), size: iced::Pixels(12.0),
-            line_height: text::LineHeight::default(), font: iced::Font::DEFAULT,
-            align_x: text::Alignment::Left, align_y: iced::alignment::Vertical::Center,
-            shaping: text::Shaping::Advanced, wrapping: text::Wrapping::None,
-            ellipsis: text::Ellipsis::default(), hint_factor: None,
+            content: &text,
+            bounds: Size::new(width - 6.0, 19.0),
+            size: iced::Pixels(12.0),
+            line_height: text::LineHeight::default(),
+            font: iced::Font::DEFAULT,
+            align_x: text::Alignment::Left,
+            align_y: iced::alignment::Vertical::Center,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::None,
+            ellipsis: text::Ellipsis::default(),
+            hint_factor: None,
         });
-        Self { text, width, paragraph }
+        Self {
+            text,
+            width,
+            paragraph,
+        }
     }
 }
 impl PredictionContent {
-    pub(crate) fn new(metadata: impl Into<std::sync::Arc<crate::generated::PredictImageMetadata>>) -> Self {
+    pub(crate) fn new(
+        metadata: impl Into<std::sync::Arc<crate::generated::PredictImageMetadata>>,
+    ) -> Self {
         let metadata = metadata.into();
-        let labels = metadata.labels.iter().map(|item| {
-            let text = match item.classdomain {
-                crate::generated::ClassReferenceDomain::Foreground => format!("{} {}", item.name, item.confidence),
-                crate::generated::ClassReferenceDomain::RawOutputSlot => format!("Raw slot {} {}", item.classreference, item.confidence),
-            };
-            CachedLabel::new(text)
-        }).collect();
+        let labels = metadata
+            .labels
+            .iter()
+            .map(|item| {
+                let text = match item.classdomain {
+                    crate::generated::ClassReferenceDomain::Foreground => {
+                        format!("{} {}", item.name, item.confidence)
+                    }
+                    crate::generated::ClassReferenceDomain::RawOutputSlot => {
+                        format!("Raw slot {} {}", item.classreference, item.confidence)
+                    }
+                };
+                CachedLabel::new(text)
+            })
+            .collect();
         Self { metadata, labels }
     }
 }
@@ -60,22 +80,35 @@ pub(crate) struct ValidationContent {
     labels: Vec<(usize, usize, crate::generated::AnnotationBox, CachedLabel)>,
 }
 impl ValidationContent {
-    pub(crate) fn new(metadata: impl Into<std::sync::Arc<crate::generated::ValidationImageMetadata>>) -> Self {
+    pub(crate) fn new(
+        metadata: impl Into<std::sync::Arc<crate::generated::ValidationImageMetadata>>,
+    ) -> Self {
         let metadata = metadata.into();
         let mut labels = Vec::new();
-        for (sample_index, sample) in metadata.samples.iter().enumerate().filter(|(_, sample)| sample.available) {
+        for (sample_index, sample) in metadata
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, sample)| sample.available)
+        {
             for (label_index, label) in sample.labels.iter().enumerate() {
                 let mut bounds = label.box_.clone();
                 for point in [&mut bounds.first, &mut bounds.second] {
-                    point.x = sample.crop.x as f32 + point.x * sample.crop.width as f32 / sample.originalextent.width as f32;
-                    point.y = sample.crop.y as f32 + point.y * sample.crop.height as f32 / sample.originalextent.height as f32;
+                    point.x = sample.crop.x as f32
+                        + point.x * sample.crop.width as f32 / sample.originalextent.width as f32;
+                    point.y = sample.crop.y as f32
+                        + point.y * sample.crop.height as f32 / sample.originalextent.height as f32;
                 }
-                labels.push((sample_index, label_index, bounds, CachedLabel::new(label.name.clone())));
+                labels.push((
+                    sample_index,
+                    label_index,
+                    bounds,
+                    CachedLabel::new(label.name.clone()),
+                ));
             }
         }
         Self { metadata, labels }
     }
-
 }
 
 #[derive(Clone)]
@@ -150,13 +183,31 @@ impl Source {
             Self::Validation(content, ground_truth, predictions) => {
                 for (sample, index, bounds, cached) in &content.labels {
                     let item = &content.metadata.samples[*sample].labels[*index];
-                    if (item.groundtruth && !ground_truth) || (!item.groundtruth && !predictions) { continue; }
-                    label(item.category as u16, bounds, &cached.text, &item.color, 0, None, Some(cached));
+                    if (item.groundtruth && !ground_truth) || (!item.groundtruth && !predictions) {
+                        continue;
+                    }
+                    label(
+                        item.category as u16,
+                        bounds,
+                        &cached.text,
+                        &item.color,
+                        0,
+                        None,
+                        Some(cached),
+                    );
                 }
             }
             Self::Prediction(snapshot) => {
                 for (item, cached) in snapshot.metadata.labels.iter().zip(&snapshot.labels) {
-                    label(item.classreference as u16, &item.box_, &cached.text, &item.color, 0, None, Some(cached));
+                    label(
+                        item.classreference as u16,
+                        &item.box_,
+                        &cached.text,
+                        &item.color,
+                        0,
+                        None,
+                        Some(cached),
+                    );
                 }
             }
             _ => {}
@@ -345,10 +396,17 @@ impl<Message> Labelled<'_, Message> {
             region = [0, 0, extent.0, extent.1];
         }
         renderer.with_layer(clip, |renderer| {
-            self.source
-                .visit(|category, bounds, name, color, catalog_count, overlay, cached| {
-                    let mut rect = label_bounds(geometry, region, bounds, if cached.is_some() { "" } else { name });
-                    if let Some(cached) = cached { rect.width = cached.width; }
+            self.source.visit(
+                |category, bounds, name, color, catalog_count, overlay, cached| {
+                    let mut rect = label_bounds(
+                        geometry,
+                        region,
+                        bounds,
+                        if cached.is_some() { "" } else { name },
+                    );
+                    if let Some(cached) = cached {
+                        rect.width = cached.width;
+                    }
                     if rect.intersection(&clip).is_none() {
                         return;
                     }
@@ -361,28 +419,33 @@ impl<Message> Labelled<'_, Message> {
                         color,
                     );
                     let position = Point::new(rect.x + 3.0, rect.y + 9.5);
-                    let foreground = if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.55 { Color::BLACK } else { Color::WHITE };
+                    let foreground =
+                        if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.55 {
+                            Color::BLACK
+                        } else {
+                            Color::WHITE
+                        };
                     if let Some(cached) = cached {
                         renderer.fill_paragraph(&cached.paragraph, position, foreground, clip);
                     } else {
-                    renderer.fill_text(
-                        text::Text {
-                            content: name.to_owned(),
-                            bounds: Size::new(rect.width - 6.0, 19.0),
-                            size: iced::Pixels(12.0),
-                            line_height: text::LineHeight::default(),
-                            font: iced::Font::DEFAULT,
-                            align_x: text::Alignment::Left,
-                            align_y: iced::alignment::Vertical::Center,
-                            shaping: text::Shaping::Advanced,
-                            wrapping: text::Wrapping::None,
-                            ellipsis: text::Ellipsis::default(),
-                            hint_factor: None,
-                        },
-                        position,
-                        foreground,
-                        clip,
-                    );
+                        renderer.fill_text(
+                            text::Text {
+                                content: name.to_owned(),
+                                bounds: Size::new(rect.width - 6.0, 19.0),
+                                size: iced::Pixels(12.0),
+                                line_height: text::LineHeight::default(),
+                                font: iced::Font::DEFAULT,
+                                align_x: text::Alignment::Left,
+                                align_y: iced::alignment::Vertical::Center,
+                                shaping: text::Shaping::Advanced,
+                                wrapping: text::Wrapping::None,
+                                ellipsis: text::Ellipsis::default(),
+                                hint_factor: None,
+                            },
+                            position,
+                            foreground,
+                            clip,
+                        );
                     }
                     if crate::integration_control::reporting_enabled()
                         && let Some(frame) = self.surface.frame
@@ -397,7 +460,8 @@ impl<Message> Labelled<'_, Message> {
                             matches!(self.source, Source::Detail(..)),
                         );
                     }
-                });
+                },
+            );
         });
     }
 }
@@ -424,19 +488,30 @@ mod tests {
 
     #[test]
     fn validation_labels_cache_paragraphs_and_toggle_each_domain_independently() {
-        let content = std::sync::Arc::new(ValidationContent::new(crate::view_model::test_support::validation_image_metadata()));
+        let content = std::sync::Arc::new(ValidationContent::new(
+            crate::view_model::test_support::validation_image_metadata(),
+        ));
         assert_eq!(content.labels.len(), 2);
         assert_eq!(content.labels[0].2.first.x, 10.0);
         assert_eq!(content.labels[0].2.first.y, 20.0);
         let pointer = content.labels[0].3.text.as_ptr();
-        for (gt, predictions, expected) in [(true, true, 2), (true, false, 1), (false, true, 1), (false, false, 0)] {
+        for (gt, predictions, expected) in [
+            (true, true, 2),
+            (true, false, 1),
+            (false, true, 1),
+            (false, false, 0),
+        ] {
             let mut count = 0;
-            Source::Validation(content.clone(), gt, predictions).visit(|_, _, name, _, _, _, cached| {
-                assert!(cached.is_some());
-                assert_eq!(name, "paired name");
-                if gt && count == 0 { assert_eq!(name.as_ptr(), pointer); }
-                count += 1;
-            });
+            Source::Validation(content.clone(), gt, predictions).visit(
+                |_, _, name, _, _, _, cached| {
+                    assert!(cached.is_some());
+                    assert_eq!(name, "paired name");
+                    if gt && count == 0 {
+                        assert_eq!(name.as_ptr(), pointer);
+                    }
+                    count += 1;
+                },
+            );
             assert_eq!(count, expected);
         }
         assert_eq!(content.metadata.samples[0].identity.generation, 7);
@@ -447,18 +522,40 @@ mod tests {
     fn prediction_labels_cache_exact_text_and_keep_source_products_distinct() {
         let model = crate::view_model::test_support::bootstrapped();
         let mut snapshot = model.predict_snapshot.unwrap();
-        snapshot.labels = (0..4096).map(|index| crate::generated::PredictLabel {
-            box_: crate::generated::AnnotationBox {
-                first: crate::generated::AnnotationPoint { x: index as f32, y: 2.0 },
-                second: crate::generated::AnnotationPoint { x: index as f32 + 10.0, y: 12.0 },
-            },
-            classreference: if index == 0 { 0 } else { 79 },
-            classdomain: if index == 0 { crate::generated::ClassReferenceDomain::Foreground } else { crate::generated::ClassReferenceDomain::RawOutputSlot },
-            confidence: 0.75,
-            color: crate::generated::AnnotationColor { hue: 120.0, saturation: 1.0, value: 0.8 },
-            name: if index == 0 { "person".into() } else { String::new() },
-        }).collect();
-        let retained = std::sync::Arc::new(PredictionContent::new(crate::generated::PredictImageMetadata::from(&snapshot)));
+        snapshot.labels = (0..4096)
+            .map(|index| crate::generated::PredictLabel {
+                box_: crate::generated::AnnotationBox {
+                    first: crate::generated::AnnotationPoint {
+                        x: index as f32,
+                        y: 2.0,
+                    },
+                    second: crate::generated::AnnotationPoint {
+                        x: index as f32 + 10.0,
+                        y: 12.0,
+                    },
+                },
+                classreference: if index == 0 { 0 } else { 79 },
+                classdomain: if index == 0 {
+                    crate::generated::ClassReferenceDomain::Foreground
+                } else {
+                    crate::generated::ClassReferenceDomain::RawOutputSlot
+                },
+                confidence: 0.75,
+                color: crate::generated::AnnotationColor {
+                    hue: 120.0,
+                    saturation: 1.0,
+                    value: 0.8,
+                },
+                name: if index == 0 {
+                    "person".into()
+                } else {
+                    String::new()
+                },
+            })
+            .collect();
+        let retained = std::sync::Arc::new(PredictionContent::new(
+            crate::generated::PredictImageMetadata::from(&snapshot),
+        ));
         assert_eq!(retained.labels.len(), 4096);
         assert_eq!(retained.labels[0].text, "person 0.75");
         assert_eq!(retained.labels[4095].text, "Raw slot 79 0.75");
@@ -467,16 +564,25 @@ mod tests {
         for _ in 0..3 {
             source.visit(|_, _, text, _, _, _, cached| {
                 assert!(cached.is_some());
-                if text == "person 0.75" { assert_eq!(text.as_ptr(), pointer); }
+                if text == "person 0.75" {
+                    assert_eq!(text.as_ptr(), pointer);
+                }
             });
         }
         snapshot.contentidentity += 1;
         snapshot.labels[0].name = "changed".into();
-        let replacement = PredictionContent::new(crate::generated::PredictImageMetadata::from(&snapshot));
+        let replacement =
+            PredictionContent::new(crate::generated::PredictImageMetadata::from(&snapshot));
         assert_eq!(replacement.labels[0].text, "changed 0.75");
         assert_eq!(retained.labels[0].text, "person 0.75");
-        assert_eq!(replacement.metadata.frame.source, retained.metadata.frame.source);
-        assert_ne!(replacement.metadata.contentidentity, retained.metadata.contentidentity);
+        assert_eq!(
+            replacement.metadata.frame.source,
+            retained.metadata.frame.source
+        );
+        assert_ne!(
+            replacement.metadata.contentidentity,
+            retained.metadata.contentidentity
+        );
     }
 
     #[test]
@@ -720,7 +826,7 @@ mod tests {
     fn detail_uses_its_own_catalog_geometry_and_visibility_without_gallery_labels() {
         let mut snapshot = crate::view_model::test_support::explore_snapshot();
         snapshot.scene.categories = vec![crate::generated::ClassName {
-            value: "人".into(),
+            value: "人".into()
         }];
         snapshot.scene.palette = vec![crate::generated::AnnotationColor {
             hue: 120.0,

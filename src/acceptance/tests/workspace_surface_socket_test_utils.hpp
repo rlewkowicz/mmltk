@@ -1,10 +1,8 @@
 #pragma once
-
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
-
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -13,21 +11,16 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/presentation/detail/workspace_surface_import_abi.h"
-
 namespace mmltk::testsupport {
-
 // Upper bound on the descriptors a single workspace surface protocol message carries, which also
 // sizes the ancillary control buffer.
 inline constexpr std::size_t kMaxWorkspaceSurfaceDescriptors = 8U;
-
 struct WorkspaceSurfaceDescriptors final {
     std::array<mmltk::common::io::ScopedFd, kMaxWorkspaceSurfaceDescriptors> descriptors{};
     std::size_t descriptor_count = 0U;
 };
-
 [[nodiscard]] inline mmltk::common::io::ScopedFd connect_workspace_surface_shell(const std::filesystem::path& path) {
     mmltk::common::io::ScopedFd socket{::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0)};
     if (socket.get() < 0) { throw std::runtime_error("workspace test shell socket creation failed"); }
@@ -41,13 +34,11 @@ struct WorkspaceSurfaceDescriptors final {
     }
     return socket;
 }
-
 [[nodiscard]] inline mmltk::common::io::ScopedFd workspace_surface_event_descriptor() {
     const int descriptor = ::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
     if (descriptor < 0) { throw std::runtime_error("workspace test eventfd creation failed"); }
     return mmltk::common::io::ScopedFd{descriptor};
 }
-
 [[nodiscard]] inline WorkspaceSurfaceDescriptors receive_message_with_descriptors(const int socket, const std::span<std::byte> record,
                                                                                   const char* const failure_message) {
     WorkspaceSurfaceDescriptors received;
@@ -64,23 +55,18 @@ struct WorkspaceSurfaceDescriptors final {
         const std::size_t count = (ancillary->cmsg_len - CMSG_LEN(0U)) / sizeof(int);
         const auto* const descriptors = reinterpret_cast<const int*>(CMSG_DATA(ancillary));
         for (std::size_t index = 0U; index < count; ++index) {
-            if (received.descriptor_count == received.descriptors.size()) {
-                throw std::runtime_error("workspace protocol message carries excess descriptors");
-            }
+            if (received.descriptor_count == received.descriptors.size()) { throw std::runtime_error("workspace protocol message carries excess descriptors"); }
             received.descriptors[received.descriptor_count++] = mmltk::common::io::ScopedFd{descriptors[index]};
         }
     }
     return received;
 }
-
 // Sends one fixed-size protocol message over a SOCK_SEQPACKET socket, attaching `descriptors` as
 // SCM_RIGHTS ancillary data. Returns false when the socket would block; any other failure throws
 // with `failure_message`.
-[[nodiscard]] inline bool send_message_with_descriptors(const int socket, const std::span<const std::byte> message,
-                                                        const std::span<const int> descriptors, const char* const failure_message) {
-    if (descriptors.size() > kMaxWorkspaceSurfaceDescriptors) {
-        throw std::runtime_error("workspace protocol message carries too many descriptors");
-    }
+[[nodiscard]] inline bool send_message_with_descriptors(const int socket, const std::span<const std::byte> message, const std::span<const int> descriptors,
+                                                        const char* const failure_message) {
+    if (descriptors.size() > kMaxWorkspaceSurfaceDescriptors) { throw std::runtime_error("workspace protocol message carries too many descriptors"); }
     iovec payload{const_cast<std::byte*>(message.data()), message.size()};
     std::array<std::byte, CMSG_SPACE(sizeof(int) * kMaxWorkspaceSurfaceDescriptors)> control{};
     msghdr header{};
@@ -101,17 +87,12 @@ struct WorkspaceSurfaceDescriptors final {
     if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) { return false; }
     throw std::runtime_error(failure_message);
 }
-
-[[nodiscard]] inline bool send_workspace_record(const int socket,
-                                                const mmltk::controller::presentation::detail::workspace_surface_import::Record& record,
+[[nodiscard]] inline bool send_workspace_record(const int socket, const mmltk::controller::presentation::detail::workspace_surface_import::Record& record,
                                                 const std::span<const int> descriptors = {}) {
     return send_message_with_descriptors(socket, std::as_bytes(std::span{&record, 1U}), descriptors, "workspace protocol test send failed");
 }
-
-[[nodiscard]] inline WorkspaceSurfaceDescriptors receive_workspace_record(
-    const int socket, mmltk::controller::presentation::detail::workspace_surface_import::Record& record) {
-    return receive_message_with_descriptors(socket, std::as_writable_bytes(std::span{&record, 1U}),
-                                            "workspace protocol test receive failed");
+[[nodiscard]] inline WorkspaceSurfaceDescriptors receive_workspace_record(const int socket,
+                                                                          mmltk::controller::presentation::detail::workspace_surface_import::Record& record) {
+    return receive_message_with_descriptors(socket, std::as_writable_bytes(std::span{&record, 1U}), "workspace protocol test receive failed");
 }
-
 }  // namespace mmltk::testsupport

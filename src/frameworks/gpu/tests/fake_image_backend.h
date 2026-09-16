@@ -1,7 +1,5 @@
 #pragma once
-
 #include "src/acceptance/tests/async_test_utils.hpp"
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -20,14 +18,11 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
-
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
-
 namespace mmltk::frameworks::gpu::test_support {
-
 // The fixture records the physical mapped-base release before external-memory
 // destruction. A failed mapping release must retain backing and context.
 struct ImportedImageBufferTestAccess final {
@@ -97,12 +92,10 @@ struct ImportedImageBufferTestAccess final {
         return allocation_result;
     }
 };
-
 struct ImageWorkspaceTestAccess final {
     static inline std::exception_ptr initialize_failure;
     static inline std::exception_ptr alias_failure;
     static inline std::size_t initialized = 0U;
-
     static std::shared_ptr<ImageWorkspace> Create(DeviceContext display, ImageWorkspaceLayout layout) {
         return ImageWorkspace::Create(std::move(display), std::move(layout), {}, &operations);
     }
@@ -136,15 +129,13 @@ struct ImageWorkspaceTestAccess final {
         if (alias_failure) std::rethrow_exception(alias_failure);
         return ImportedImageBufferTestAccess::AliasWorkspace(buffer, std::move(context));
     }
-    static void Initialize(ImportedImageBuffer& buffer, DeviceContext context, const ImageWorkspaceLayout& layout,
-                           mmltk::common::io::ScopedFd, std::uint64_t) {
+    static void Initialize(ImportedImageBuffer& buffer, DeviceContext context, const ImageWorkspaceLayout& layout, mmltk::common::io::ScopedFd, std::uint64_t) {
         ++initialized;
         ImportedImageBufferTestAccess::AdoptWorkspace(buffer, std::move(context), layout);
         if (initialize_failure) std::rethrow_exception(initialize_failure);
     }
     static inline const ImageWorkspace::Operations operations{&Initialize, &ImportedImageBufferTestAccess::ReleaseWorkspace, &Alias};
 };
-
 inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::exception_ptr& expected) {
     if (failure == expected) return true;
     try {
@@ -154,32 +145,26 @@ inline bool ContainsImageFailure(const std::exception_ptr& failure, const std::e
     } catch (...) {}
     return false;
 }
-
 inline void CopyImagePlane(const ImagePlaneView destination, const ImagePlaneView source) {
     for (std::uint32_t row = 0U; row != source.descriptor.height; ++row) {
         std::memcpy(reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes,
                     reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes, source.descriptor.row_bytes());
     }
 }
-
 [[nodiscard]] inline SystemImageRuntimeConfig WorkspaceRuntimeConfig(
-    std::shared_ptr<ImageCopyBackend> backend,
-    std::shared_ptr<ImageProductRevisionSequence> revisions = std::make_shared<ImageProductRevisionSequence>()) {
+    std::shared_ptr<ImageCopyBackend> backend, std::shared_ptr<ImageProductRevisionSequence> revisions = std::make_shared<ImageProductRevisionSequence>()) {
     return {.device = 0,
             .backend = std::move(backend),
             .workspace_finalize = [](auto clean, auto, auto destination, auto, auto) { CopyImagePlane(destination, clean); },
             .product_revisions = std::move(revisions)};
 }
-
 [[nodiscard]] inline std::pair<std::shared_ptr<ImageWorkspace>, bool> PublishTestWorkspace(SystemImageRuntime& runtime,
-                                                                                           std::shared_ptr<ImageCopyBackend> backend,
-                                                                                           const int device = 1) {
+                                                                                           std::shared_ptr<ImageCopyBackend> backend, const int device = 1) {
     auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(std::move(backend), ImageWorkspaceTestAccess::Layout(device));
     runtime.Publish(4U, 3U, [](auto, auto, auto) {});
     const bool prepared = runtime.PrepareDisplay(runtime.Completed().revision(), workspace);
     return {std::move(workspace), prepared};
 }
-
 class FakeImageBackend final : public ImageCopyBackend {
    public:
     [[nodiscard]] std::optional<DeviceExecution> ResolveExecution(int, int) override { return {}; }
@@ -198,7 +183,6 @@ class FakeImageBackend final : public ImageCopyBackend {
         NotifyStream,
         // CLEANUP-IGNORE: The fake backend's failure inventory is independent from its deliberately granular counters.
     };
-
     std::atomic<std::size_t> contexts_created{0U};
     // CLEANUP-IGNORE: Physical backend counters are independent from the controller worker lifecycle and publication gate.
     std::atomic<std::size_t> contexts_destroyed{0U};
@@ -258,14 +242,12 @@ class FakeImageBackend final : public ImageCopyBackend {
                 entry = notifications_.erase(entry);
             }
         }
-        for (auto* notification : completed)
-            notification->Notify(status);
+        for (auto* notification : completed) notification->Notify(status);
     }
     void SetStreamSettlement(std::uintptr_t stream, StreamSettlement result) {
         std::scoped_lock lock(mutex_);
         stream_settlements_.insert_or_assign(stream, std::move(result));
     }
-
     void FailAfter(const FailurePoint point, const std::size_t successful_calls = 0U, std::exception_ptr failure = {}) noexcept {
         failure_point_ = point;
         successful_calls_before_failure_ = successful_calls;
@@ -283,12 +265,10 @@ class FakeImageBackend final : public ImageCopyBackend {
         failed_binding_device_ = device;
         device_binding_failure_ = std::move(failure);
     }
-
     void CompleteEvents() noexcept {
         {
             std::scoped_lock lock(mutex_);
-            for (auto& event : events_)
-                event.second = true;
+            for (auto& event : events_) event.second = true;
         }
         event_ready_.notify_all();
     }
@@ -304,7 +284,6 @@ class FakeImageBackend final : public ImageCopyBackend {
         event_gate_ = gate->receipt();
         return gate;
     }
-
     [[nodiscard]] std::uintptr_t CreateContext(const int device, DeviceContextMode) override {
         MaybeFail(FailurePoint::CreateContext);
         const std::uintptr_t context = next_.fetch_add(1U);
@@ -344,8 +323,7 @@ class FakeImageBackend final : public ImageCopyBackend {
         events_.erase(event);
         ++events_destroyed;
     }
-    [[nodiscard]] ImagePlaneView AllocatePlane(std::uintptr_t, const ImagePlaneKind kind, const std::uint32_t width,
-                                               const std::uint32_t height) override {
+    [[nodiscard]] ImagePlaneView AllocatePlane(std::uintptr_t, const ImagePlaneKind kind, const std::uint32_t width, const std::uint32_t height) override {
         MaybeFail(FailurePoint::AllocatePlane);
         const std::size_t pitch = static_cast<std::size_t>(width) * 4U + pitch_padding_bytes;
         auto* storage = new std::byte[pitch * height];
@@ -383,8 +361,7 @@ class FakeImageBackend final : public ImageCopyBackend {
     }
     [[nodiscard]] bool CanAccessPeer(int, int) override { return peer_access; }
     void WaitEvent(std::uintptr_t, std::uintptr_t, const std::uintptr_t event) override { Wait(event); }
-    void CopySameDevice(std::uintptr_t, std::uintptr_t, const ImagePlaneView& destination, std::uintptr_t,
-                        const ImagePlaneView& source) override {
+    void CopySameDevice(std::uintptr_t, std::uintptr_t, const ImagePlaneView& destination, std::uintptr_t, const ImagePlaneView& source) override {
         MaybeFail(FailurePoint::Copy);
         std::optional<mmltk::testsupport::TestGate::Receipt> gate;
         {
@@ -396,19 +373,16 @@ class FakeImageBackend final : public ImageCopyBackend {
         if (source.data == watched_copy_source.load()) ++watched_source_copies;
         ++same_copies;
     }
-    void CopyPeer(std::uintptr_t, std::uintptr_t, int, const ImagePlaneView& destination, std::uintptr_t, int,
-                  const ImagePlaneView& source) override {
+    void CopyPeer(std::uintptr_t, std::uintptr_t, int, const ImagePlaneView& destination, std::uintptr_t, int, const ImagePlaneView& source) override {
         MaybeFail(FailurePoint::Copy);
         CopyImagePlane(destination, source);
         ++peer_copies;
     }
-    void CopyDeviceToHost(std::uintptr_t, const ImagePlaneView& source, void* const destination,
-                          const std::size_t destination_pitch) override {
+    void CopyDeviceToHost(std::uintptr_t, const ImagePlaneView& source, void* const destination, const std::size_t destination_pitch) override {
         MaybeFail(FailurePoint::Copy);
         for (std::uint32_t row = 0U; row != source.descriptor.height; ++row) {
             std::memcpy(static_cast<std::byte*>(destination) + row * destination_pitch,
-                        reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes,
-                        source.descriptor.row_bytes());
+                        reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes, source.descriptor.row_bytes());
         }
         ++staged_downloads;
     }
@@ -440,8 +414,7 @@ class FakeImageBackend final : public ImageCopyBackend {
             observed = std::exchange(notification_observer_, {});
             stream_observed = std::exchange(notification_stream_observer_, {});
             deferred = defer_notifications.load();
-            if (deferred && !notifications_.emplace(stream, &notification).second)
-                throw std::logic_error("fake stream notification is already pending");
+            if (deferred && !notifications_.emplace(stream, &notification).second) throw std::logic_error("fake stream notification is already pending");
         }
         if (!deferred) notification.Notify(CUDA_SUCCESS);
         if (observed) observed->set_value();
@@ -484,8 +457,7 @@ class FakeImageBackend final : public ImageCopyBackend {
     void CheckDeviceBinding(const std::uintptr_t context) {
         std::scoped_lock lock(mutex_);
         const auto found = devices_.find(context);
-        if (device_binding_failure_ && found != devices_.end() && found->second == failed_binding_device_)
-            std::rethrow_exception(device_binding_failure_);
+        if (device_binding_failure_ && found != devices_.end() && found->second == failed_binding_device_) std::rethrow_exception(device_binding_failure_);
     }
     void MaybeFail(const FailurePoint point) {
         if (failure_point_ != point) return;
@@ -497,7 +469,6 @@ class FakeImageBackend final : public ImageCopyBackend {
         if (injected_failure_) std::rethrow_exception(injected_failure_);
         throw std::runtime_error("injected image backend failure");
     }
-
     void Wait(const std::uintptr_t event) {
         std::unique_lock lock(mutex_);
         const auto gate = event_gate_;
@@ -511,7 +482,6 @@ class FakeImageBackend final : public ImageCopyBackend {
             return found == events_.end() || found->second;
         });
     }
-
     std::atomic<std::uintptr_t> next_{1U};
     std::mutex mutex_;
     std::unordered_map<std::uintptr_t, StreamNotification*> notifications_;
@@ -532,13 +502,11 @@ class FakeImageBackend final : public ImageCopyBackend {
     int failed_binding_device_ = -1;
     std::exception_ptr device_binding_failure_;
 };
-
 struct WorkspaceTestFixture final {
     std::shared_ptr<FakeImageBackend> backend;
     std::unique_ptr<SystemImageRuntime> runtime;
     std::shared_ptr<ImageWorkspace> workspace;
     bool prepared = false;
-
     explicit WorkspaceTestFixture(const bool publish_product = false) {
         ImageWorkspaceTestAccess::Reset();
         backend = std::make_shared<FakeImageBackend>();
@@ -552,10 +520,9 @@ struct WorkspaceTestFixture final {
         }
     }
 };
-
 [[nodiscard]] inline ImageWorkspaceFinalize FakeWorkspaceFinalizer(std::shared_ptr<FakeImageBackend> backend) {
-    return [backend = std::move(backend)](ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination,
-                                          ImageWorkspaceCoverage coverage, std::uintptr_t) {
+    return [backend = std::move(backend)](ImagePlaneView clean, ImagePlaneView semantic, ImagePlaneView destination, ImageWorkspaceCoverage coverage,
+                                          std::uintptr_t) {
         ++backend->workspace_finalizations;
         const auto draw = [&](ImageWorkspaceRegion region) {
             for (auto y = std::max(0, region.y1); y < std::min(static_cast<int>(clean.descriptor.height), region.y2); ++y) {
@@ -564,8 +531,7 @@ struct WorkspaceTestFixture final {
                     auto* pixel = reinterpret_cast<std::uint8_t*>(destination.data) + y * destination.descriptor.pitch_bytes + x * 4U;
                     std::memcpy(pixel, base, 4U);
                     if (!semantic.valid()) continue;
-                    const auto* overlay =
-                        reinterpret_cast<const std::uint8_t*>(semantic.data) + y * semantic.descriptor.pitch_bytes + x * 4U;
+                    const auto* overlay = reinterpret_cast<const std::uint8_t*>(semantic.data) + y * semantic.descriptor.pitch_bytes + x * 4U;
                     if (overlay[3] == 0U) continue;
                     const float alpha = static_cast<float>(overlay[3]) / 255.0F;
                     for (unsigned channel = 0U; channel != 3U; ++channel)
@@ -577,15 +543,12 @@ struct WorkspaceTestFixture final {
         if (coverage.full_image)
             draw({0, 0, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)});
         else
-            for (auto region : coverage.regions)
-                draw(region);
+            for (auto region : coverage.regions) draw(region);
     };
 }
-
 [[nodiscard]] inline std::function<std::unique_ptr<SystemImageRuntime>(std::shared_ptr<ImageProductRevisionSequence>)> RuntimeFactory(
     const int device, const std::shared_ptr<FakeImageBackend>& backend, const ImageProductLayout layout = ImageProductLayout::Clean,
-    std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U,
-    ImageWorkspaceFinalize finalize = {}) {
+    std::function<std::unique_ptr<SystemImageModel>()> model = {}, const std::size_t output_buffer_count = 1U, ImageWorkspaceFinalize finalize = {}) {
     return [device, backend, layout, model = std::move(model), output_buffer_count,
             finalize = std::move(finalize)](std::shared_ptr<ImageProductRevisionSequence> revisions) {
         return std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
@@ -600,5 +563,4 @@ struct WorkspaceTestFixture final {
         });
     };
 }
-
 }  // namespace mmltk::frameworks::gpu::test_support

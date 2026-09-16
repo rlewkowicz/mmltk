@@ -15,12 +15,9 @@
 #include <torch/serialize.h>
 #include <torch/torch.h>
 #include <torch/version.h>
-
 #include <cstdint>
 #include <string_view>
-
 namespace mmltk::backend::ml::torch_api {
-
 using ::at::_fused_adamw_;
 using ::at::IntArrayRef;
 using ::at::kBFloat16;
@@ -94,12 +91,10 @@ using ::torch::zeros_like;
 using ::torch::nn::functional::interpolate;
 using ::torch::nn::functional::InterpolateFuncOptions;
 using CudaStream = ::cudaStream_t;
-
 namespace autograd {
 using ::torch::autograd::grad;
 using ::torch::autograd::Variable;
 }  // namespace autograd
-
 namespace cuda {
 using ::c10::cuda::CUDAGuard;
 using ::c10::cuda::CUDAStreamGuard;
@@ -107,11 +102,9 @@ using ::c10::cuda::getStreamFromPool;
 using ::torch::cuda::device_count;
 using ::torch::cuda::is_available;
 }  // namespace cuda
-
 namespace indexing {
 using ::torch::indexing::Slice;
 }
-
 namespace nn {
 using ::torch::nn::Module;
 namespace functional {
@@ -122,20 +115,15 @@ namespace utils {
 using ::torch::nn::utils::clip_grad_norm_;
 }
 }  // namespace nn
-
 namespace serialize {
 using ::torch::serialize::InputArchive;
 using ::torch::serialize::OutputArchive;
 }  // namespace serialize
-
 using autograd::grad;
 using nn::Module;
 using nn::utils::clip_grad_norm_;
 using serialize::InputArchive;
 using serialize::OutputArchive;
-
 [[nodiscard]] inline auto create_cpu_generator(const std::uint64_t seed) { return ::at::detail::createCPUGenerator(seed); }
-
 inline constexpr std::string_view kVersion{TORCH_VERSION};
-
 }  // namespace mmltk::backend::ml::torch_api

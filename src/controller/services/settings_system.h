@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -7,7 +6,6 @@
 #include <string>
 #include <string_view>
 #include <variant>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/compute.h"
 #include "src/controller/contracts/explore_filter.h"
@@ -19,9 +17,7 @@
 #include "src/controller/services/settings_location.h"
 #include "src/controller/services/settings_types.h"
 #include "src/controller/subsystems/system/system_events.h"
-
 namespace mmltk::controller {
-
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] SettingsChanged final {
     contracts::SettingsUiState snapshot{};
 };
@@ -39,8 +35,7 @@ class SettingsSystem final {
     using event_type = std::variant<SettingsChanged>;
     using settings_surface = SettingsSurface<&contracts::SettingsUiState::settings_state, &contracts::default_gui_settings_state>;
     explicit SettingsSystem(SystemEventSink<event_type> events = {});
-    [[nodiscard]] services::SettingsMutationResult Load(services::SettingsLocation,
-                                                        std::optional<bool> h2d_dataloader_override = std::nullopt);
+    [[nodiscard]] services::SettingsMutationResult Load(services::SettingsLocation, std::optional<bool> h2d_dataloader_override = std::nullopt);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::SettingsUiState Update(contracts::SettingsUpdateRequest);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] contracts::SettingsUiState Reset(contracts::SettingsResetRequest);
     [[nodiscard]] services::SettingsMutationResult Retry();
@@ -52,8 +47,7 @@ class SettingsSystem final {
     [[nodiscard]] ExploreSettingsCandidate explore_settings_candidate() const;
     [[nodiscard]] ExploreSettingsCandidate persist_explore_filter(const ExploreSettingsCandidate&, const ExploreFilterUpdate&);
     [[nodiscard]] ExploreSettingsCandidate persist_explore_augmentation(const ExploreSettingsCandidate&, bool);
-    [[nodiscard]] ExploreSettingsCandidate persist_explore_product(const ExploreSettingsCandidate&, const ExploreFilterUpdate&,
-                                                                   bool augmentation_enabled);
+    [[nodiscard]] ExploreSettingsCandidate persist_explore_product(const ExploreSettingsCandidate&, const ExploreFilterUpdate&, bool augmentation_enabled);
     [[nodiscard]] ExploreSettingsCandidate persist_explore_detail(const ExploreSettingsCandidate&, bool);
     void persist_explore_class_catalog(const ExploreSettingsCandidate&, ExploreClassCatalogIdentity, const ExploreFilterUpdate&);
 
@@ -75,6 +69,5 @@ class SettingsSystem final {
     bool retryable_ = false;
     services::SettingsMutationResult terminal_{};
 };
-
 MMLTK_REFLECT_FIELDS(SettingsChanged)
 }  // namespace mmltk::controller

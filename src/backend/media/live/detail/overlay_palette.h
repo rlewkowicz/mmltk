@@ -1,11 +1,8 @@
 #pragma once
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
-
 namespace mmltk::backend::media::live {
-
 inline constexpr std::array<std::array<std::uint8_t, 3>, 8> kManualOverlayCategoryPalette{{
     {{240, 196, 68}},
     {{88, 188, 255}},
@@ -16,9 +13,7 @@ inline constexpr std::array<std::array<std::uint8_t, 3>, 8> kManualOverlayCatego
     {{180, 214, 92}},
     {{255, 168, 64}},
 }};
-
 [[nodiscard]] constexpr std::array<std::uint8_t, 3> manual_overlay_category_color(const std::size_t index) noexcept {
     return kManualOverlayCategoryPalette[index % kManualOverlayCategoryPalette.size()];
 }
-
 }  // namespace mmltk::backend::media::live

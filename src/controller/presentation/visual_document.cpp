@@ -1,5 +1,4 @@
 #include "src/controller/presentation/visual_document.h"
-
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -8,20 +7,15 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-
 #include "src/controller/contracts/application_boundary.h"
-
 namespace mmltk::controller {
-
 std::uint64_t VisualDocument::NextIdentity() {
     static std::atomic_uint64_t next{1U};
     const auto identity = next.fetch_add(1U, std::memory_order_relaxed);
     if (identity == 0U || identity == std::numeric_limits<std::uint64_t>::max()) std::terminate();
     return identity;
 }
-
 namespace {
-
 // Inspect canonical field declarations once at compile time. Nonspatial trees
 // (notably potentially large RLE storage) generate no runtime traversal.
 template <class T>
@@ -41,11 +35,9 @@ consteval bool contains_annotation_point() {
         return false;
     }
 }
-
 struct PointProjection final {
     float scale = 1.0F;
     VisualRegion crop{};
-
     void Apply(contracts::AnnotationPoint& point) const {
         point.x *= scale;
         point.y *= scale;
@@ -56,30 +48,24 @@ struct PointProjection final {
         }
     }
 };
-
 template <class T>
 void project_spatial_members(T& value, const PointProjection projection) {
     if constexpr (std::is_same_v<T, contracts::AnnotationPoint>) {
         projection.Apply(value);
     } else if constexpr (contains_annotation_point<T>()) {
         if constexpr (std::ranges::range<T>) {
-            for (auto& item : value)
-                project_spatial_members(item, projection);
+            for (auto& item : value) project_spatial_members(item, projection);
         } else {
             mmltk::frameworks::reflection::visit_materialized_members<T>(
                 [&]<class Declaration>(const auto&) { project_spatial_members(value.*Declaration::pointer, projection); });
         }
     }
 }
-
 }  // namespace
-
-contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent,
-                                                              VisualRegion crop) {
+contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop) {
     if (!crop.valid()) crop = {.width = extent.width, .height = extent.height};
-    if (!extent.valid() || crop.x > extent.width || crop.y > extent.height || crop.width > extent.width - crop.x ||
-        crop.height > extent.height - crop.y || crop.width > std::numeric_limits<std::uint16_t>::max() ||
-        crop.height > std::numeric_limits<std::uint16_t>::max())
+    if (!extent.valid() || crop.x > extent.width || crop.y > extent.height || crop.width > extent.width - crop.x || crop.height > extent.height - crop.y ||
+        crop.width > std::numeric_limits<std::uint16_t>::max() || crop.height > std::numeric_limits<std::uint16_t>::max())
         throw contracts::InvalidIntentError("Annotation crop is outside the image extent");
     auto scene = document.scene;
     scene.frame_width = static_cast<std::uint16_t>(crop.width);
@@ -108,12 +94,10 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
                     continue;
                 }
                 const auto first = x++;
-                while (x < last_x && supported(x))
-                    ++x;
+                while (x < last_x && supported(x)) ++x;
                 if (total_runs == contracts::kAnnotationMaskRunCapacity)
                     throw contracts::InvalidIntentError("Annotation import exceeds the document mask-run capacity");
-                object.mask.runs.push_back(
-                    {static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(x - 1U)});
+                object.mask.runs.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(x - 1U)});
                 ++total_runs;
             }
         }
@@ -121,9 +105,7 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
     if (!scene.valid()) throw contracts::InvalidIntentError("Annotation import exceeds the document geometry or catalog capacity");
     return scene;
 }
-
-std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>& source,
-                                                            const std::uint32_t scale) {
+std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_ptr<const VisualDocument>& source, const std::uint32_t scale) {
     if (!source || scale == 0U) throw contracts::InvalidIntentError("Visual document scale is invalid");
     auto target = std::make_shared<VisualDocument>(*source);
     project_spatial_members(target->scene.objects, {.scale = static_cast<float>(scale)});
@@ -132,5 +114,4 @@ std::shared_ptr<const VisualDocument> scale_visual_document(const std::shared_pt
     target->scene.frame_ready = false;
     return target;
 }
-
 }  // namespace mmltk::controller

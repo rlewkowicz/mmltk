@@ -8,12 +8,11 @@
 #include <string_view>
 #include <vector>
 #include "src/backend/models/rfdetr/contract/class_layout.h"
-
 namespace mmltk::backend::models::rfdetr {
 // Immutable admission result. Slots remain in physical order, retaining backend
 // top-k ties and query identity independently of the foreground catalog order.
 class ResolvedClassLayout final {
- public:
+   public:
     explicit ResolvedClassLayout(ModelClassLayout record);
     [[nodiscard]] const ModelClassLayout& record() const noexcept { return record_; }
     [[nodiscard]] const std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>& catalog() const noexcept { return catalog_; }
@@ -25,7 +24,8 @@ class ResolvedClassLayout final {
     [[nodiscard]] mmltk::backend::data::catalog::ClassReferenceDomain domain() const noexcept;
     [[nodiscard]] ModelClassLayoutSummary summary() const;
     void require_execution(bool require_semantic = false) const;
- private:
+
+   private:
     ModelClassLayout record_;
     std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog_;
     std::vector<std::int64_t> eligible_slots_, class_references_;
@@ -40,6 +40,6 @@ class ResolvedClassLayout final {
 [[nodiscard]] std::string encode_class_descriptor(const ModelClassDescriptor& descriptor);
 [[nodiscard]] ModelClassDescriptor decode_class_descriptor(std::string_view text);
 [[nodiscard]] std::vector<RfdetrNamedOutputRole> class_descriptor_output_roles(std::span<const ModelClassDescriptor> descriptors);
-[[nodiscard]] ModelClassLayout admit_artifact_class_layout(std::size_t output_width,
-    const std::optional<ModelClassLayout>& embedded, std::span<const ModelClassDescriptor> descriptors);
+[[nodiscard]] ModelClassLayout admit_artifact_class_layout(std::size_t output_width, const std::optional<ModelClassLayout>& embedded,
+                                                           std::span<const ModelClassDescriptor> descriptors);
 }  // namespace mmltk::backend::models::rfdetr

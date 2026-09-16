@@ -2,7 +2,6 @@
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -13,42 +12,30 @@
 #include <system_error>
 #include <utility>
 #include <vector>
-
 #include "src/common/io/event_fd.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/io/filesystem_utils.h"
 #include "src/common/io/noexcept_io.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/io/staging_directory.h"
-
 namespace mmltk::common::io {
-
 bool signal_event_fd(const int descriptor) noexcept {
     if (descriptor < 0) return false;
     constexpr std::uint64_t value = 1U;
     ssize_t written = -1;
-    do {
-        written = ::write(descriptor, &value, sizeof(value));
-    } while (written < 0 && errno == EINTR);
+    do { written = ::write(descriptor, &value, sizeof(value)); } while (written < 0 && errno == EINTR);
     return written == static_cast<ssize_t>(sizeof(value)) || (written < 0 && errno == EAGAIN);
 }
-
 EventFdWait wait_event_fd(const int descriptor) noexcept {
     pollfd readiness{.fd = descriptor, .events = POLLIN, .revents = 0};
     int poll_result = -1;
-    do {
-        poll_result = ::poll(&readiness, 1U, -1);
-    } while (poll_result < 0 && errno == EINTR);
+    do { poll_result = ::poll(&readiness, 1U, -1); } while (poll_result < 0 && errno == EINTR);
     if (poll_result != 1 || (readiness.revents & POLLIN) == 0) return {EventFdWaitStatus::WaitFailed, 0U};
     std::uint64_t count = 0U;
     ssize_t result = -1;
-    do {
-        result = ::read(descriptor, &count, sizeof(count));
-    } while (result < 0 && errno == EINTR);
-    return result == static_cast<ssize_t>(sizeof(count)) ? EventFdWait{EventFdWaitStatus::Woken, count}
-                                                         : EventFdWait{EventFdWaitStatus::ReadFailed, 0U};
+    do { result = ::read(descriptor, &count, sizeof(count)); } while (result < 0 && errno == EINTR);
+    return result == static_cast<ssize_t>(sizeof(count)) ? EventFdWait{EventFdWaitStatus::Woken, count} : EventFdWait{EventFdWaitStatus::ReadFailed, 0U};
 }
-
 void drain_event_fd(const int descriptor) noexcept {
     if (descriptor < 0) return;
     std::uint64_t value = 0U;
@@ -59,7 +46,6 @@ void drain_event_fd(const int descriptor) noexcept {
         return;
     }
 }
-
 namespace filesystem_utils {
 void remove_path_recursively_best_effort(const std::filesystem::path& path) {
     std::error_code error;
@@ -77,14 +63,12 @@ void remove_path_recursively_best_effort(const std::filesystem::path& path) {
         return;
     }
     while (dirent* entry = ::readdir(directory)) {
-        if (std::strcmp(entry->d_name, ".") != 0 && std::strcmp(entry->d_name, "..") != 0)
-            remove_path_recursively_best_effort(path / entry->d_name);
+        if (std::strcmp(entry->d_name, ".") != 0 && std::strcmp(entry->d_name, "..") != 0) remove_path_recursively_best_effort(path / entry->d_name);
     }
     static_cast<void>(::closedir(directory));
     static_cast<void>(::rmdir(native.c_str()));
 }
 }  // namespace filesystem_utils
-
 bool try_write_all_noexcept(const int descriptor, std::string_view data) noexcept {
     while (!data.empty()) {
         const ssize_t written = ::write(descriptor, data.data(), data.size());
@@ -96,11 +80,7 @@ bool try_write_all_noexcept(const int descriptor, std::string_view data) noexcep
     }
     return true;
 }
-
-void write_all_noexcept(const int descriptor, const std::string_view data) noexcept {
-    static_cast<void>(try_write_all_noexcept(descriptor, data));
-}
-
+void write_all_noexcept(const int descriptor, const std::string_view data) noexcept { static_cast<void>(try_write_all_noexcept(descriptor, data)); }
 ScopedFd::ScopedFd(const int descriptor) noexcept : fd_(descriptor) {}
 ScopedFd::~ScopedFd() { reset(); }
 ScopedFd::ScopedFd(ScopedFd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
@@ -114,7 +94,6 @@ void ScopedFd::reset(const int next) noexcept {
     if (fd_ >= 0) static_cast<void>(::close(fd_));
     fd_ = next;
 }
-
 StagingDirectory::StagingDirectory(const std::filesystem::path& destination, const std::string_view prefix, const std::string_view suffix,
                                    const char* const failure_action) {
     const std::filesystem::path parent = destination.parent_path().empty() ? std::filesystem::path{"."} : destination.parent_path();
@@ -133,5 +112,4 @@ StagingDirectory::~StagingDirectory() {
 }
 const std::filesystem::path& StagingDirectory::path() const noexcept { return path_; }
 void StagingDirectory::published() noexcept { published_ = true; }
-
 }  // namespace mmltk::common::io

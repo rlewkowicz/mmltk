@@ -15,21 +15,19 @@ namespace mmltk::backend::models::rfdetr {
 struct PredictionRecord {
     std::int64_t dataset_index = 0;
     std::int64_t image_id = 0;
-    std::string source_name;
-    std::vector<Prediction> detections;
+    std::string source_name{};
+    std::vector<Prediction> detections{};
 };
-
 struct PredictionRunResult {
-    ResolvedModelArtifacts artifacts;
-    std::string backend_name;
-    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
+    ResolvedModelArtifacts artifacts{};
+    std::string backend_name{};
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog{};
     mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot;
     bool masks_available = false;
     bool cancelled = false;
     std::size_t processed_images = 0;
-    PhaseTiming timing;
+    PhaseTiming timing{};
 };
-
 // Current-record pixels are either CHW device storage or owned decoded RGB8.
 // GPU receiver copies run on `stream`, so source reuse follows every read.
 // `custody` owns the exact source and compact annotations for failed-copy retirement.
@@ -42,18 +40,16 @@ struct PredictionPixels final {
     int device = -1;
     std::uintptr_t stream = 0U;
     const std::uint8_t* rgb8 = nullptr;
-    std::shared_ptr<void> custody;
+    std::shared_ptr<void> custody{};
     void (*stop_source)(void*) = nullptr;
     void* source_control = nullptr;
-    std::string_view preview_failure;
+    std::string_view preview_failure{};
 };
-
 struct PredictionDemand final {
     bool source_pixels = false;
     bool encoded_masks = false;
     bool preview_masks = false;
 };
-
 struct PredictionDelivery final {
     std::stop_token stop{};
     // Compact annotation planes accompany requested current pixels only. Without
@@ -70,5 +66,4 @@ struct PredictionDelivery final {
     std::function<void(std::size_t completed, std::size_t total)> progress{};
     std::function<void(std::size_t decoded, std::size_t total)> decoded{};
 };
-
-}
+}  // namespace mmltk::backend::models::rfdetr

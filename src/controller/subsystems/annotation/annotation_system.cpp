@@ -5,28 +5,23 @@
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/system_image_worker.h"
-
 #include <algorithm>
 #include <functional>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
-
 #include "src/common/types/generation.h"
-
 namespace mmltk::controller {
 namespace {
 namespace document = subsystems::annotation;
 using Runtime = mmltk::frameworks::gpu::SystemImageRuntime;
-
 [[nodiscard]] AnnotationAlgorithm& annotation_algorithm(Runtime& runtime) {
     auto* algorithm = dynamic_cast<AnnotationAlgorithm*>(runtime.model());
     if (!algorithm) throw std::runtime_error("Annotation renderer is unavailable");
     return *algorithm;
 }
 }  // namespace
-
 class AnnotationSystem::Impl final {
     friend class AnnotationSystem;
     using Command = std::variant<AnnotationOpen, AnnotationEditRequest, AnnotationSave>;
@@ -35,8 +30,8 @@ class AnnotationSystem::Impl final {
     using Completion = std::move_only_function<void()>;
 
    public:
-    Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
-         SystemEventSink<event_type> events, const VisualDiagnosticSink diagnostics)
+    Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source, SystemEventSink<event_type> events,
+         const VisualDiagnosticSink diagnostics)
         : settings_(settings),
           borrow_source_(std::move(borrow_source)),
           events_(std::move(events)),
@@ -58,7 +53,6 @@ class AnnotationSystem::Impl final {
             {}, true, detail::VisualRuntimeOwner::ContinuationCancellation::PreserveOrderedInput);
     }
     ~Impl() { Shutdown(); }
-
     [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen request) {
         if (!request.source.valid()) throw contracts::InvalidIntentError("Annotation source image is unavailable");
         return Admit(Command{std::move(request)});
@@ -281,8 +275,7 @@ class AnnotationSystem::Impl final {
         if (result.outcome != document::DocumentOutcome::Applied) Reject(std::move(result.detail), false);
         if (prior != document_.ui().scene_revision) InstallUi(false);
         if (result.render_changed) QueueRender();
-        if (result.outcome == document::DocumentOutcome::Applied && end &&
-            document_.ui().editor.tool == contracts::AnnotationTool::ColorSample &&
+        if (result.outcome == document::DocumentOutcome::Applied && end && document_.ui().editor.tool == contracts::AnnotationTool::ColorSample &&
             document_.ToolAvailable(contracts::AnnotationTool::ColorSample, pointer.target.object))
             Sample(pointer);
     }
@@ -383,8 +376,7 @@ class AnnotationSystem::Impl final {
                     try {
                         algorithm.Open(plane, crop);
                     } catch (...) { preparation_failure = std::current_exception(); }
-                    if (preparation_failure)
-                        return [this, preparation_failure] { Post([this, preparation_failure] { Failed(preparation_failure); }); };
+                    if (preparation_failure) return [this, preparation_failure] { Post([this, preparation_failure] { Failed(preparation_failure); }); };
                     std::optional<mmltk::common::system::ExecutionPolicyRequest> policy;
                     if (const auto* execution = runtime.execution())
                         policy = mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus,      "annot-input", 0U,
@@ -453,9 +445,8 @@ class AnnotationSystem::Impl final {
         supported.sampling = true;
         auto selected = document_.Edit({.value = AnnotationObjectEdit{*pointer.target.object}});
         const bool selection_changed = selected.render_changed;
-        auto result = selected.outcome == document::DocumentOutcome::Applied
-                          ? document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}})
-                          : std::move(selected);
+        auto result = selected.outcome == document::DocumentOutcome::Applied ? document_.Edit({.value = AnnotationMaskColorsEdit{supported, object.nosup}})
+                                                                             : std::move(selected);
         result.render_changed = result.render_changed || selection_changed;
         if (result.outcome != document::DocumentOutcome::Applied)
             Reject(std::move(result.detail), false);
@@ -490,23 +481,22 @@ class AnnotationSystem::Impl final {
         return state_;
     }
     void InstallUi(bool settle) { Publish(AnnotationChanged{CaptureUi(settle)}); }
-    void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description,
-                        const Runtime::CompletedOutput* baseline = nullptr, std::uint64_t revision = 0U) const noexcept {
+    void DiagnoseRender(VisualDiagnosticOperation operation, const AnnotationRenderState& description, const Runtime::CompletedOutput* baseline = nullptr,
+                        std::uint64_t revision = 0U) const noexcept {
         diagnostics_.Emit([&] {
-            return VisualDiagnosticFact{
-                .system = contracts::DiagnosticOwner::Annotation,
-                .operation = operation,
-                .device = settings_.device,
-                .generation = description.generation,
-                .value = description.scene_revision,
-                .detail = description.document_epoch,
-                .context = {.capacity_width = description.scene ? description.scene->frame_width : 0U,
-                            .capacity_height = description.scene ? description.scene->frame_height : 0U,
-                            .frame_revision = revision,
-                            .condition = baseline && baseline->valid() ? 1U : 0U,
-                            .source = {.source_session = presentation_source_session(PresentationSourceKind::Annotation),
-                                       .source_instance = 1U,
-                                       .source_revision = revision}}};
+            return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Annotation,
+                                        .operation = operation,
+                                        .device = settings_.device,
+                                        .generation = description.generation,
+                                        .value = description.scene_revision,
+                                        .detail = description.document_epoch,
+                                        .context = {.capacity_width = description.scene ? description.scene->frame_width : 0U,
+                                                    .capacity_height = description.scene ? description.scene->frame_height : 0U,
+                                                    .frame_revision = revision,
+                                                    .condition = baseline && baseline->valid() ? 1U : 0U,
+                                                    .source = {.source_session = presentation_source_session(PresentationSourceKind::Annotation),
+                                                               .source_instance = 1U,
+                                                               .source_revision = revision}}};
         });
     }
     void QueueRender() {
@@ -577,8 +567,8 @@ class AnnotationSystem::Impl final {
             frame.clean_revision = clean_revision_;
             std::optional<AnnotationRenderedFacts> evidence;
             if (diagnostics_.valid())
-                evidence = AnnotationRenderedFacts{completed_description.generation, completed_description.document_epoch,
-                                                   completed_description.scene_revision, completed_description.editor};
+                evidence = AnnotationRenderedFacts{completed_description.generation, completed_description.document_epoch, completed_description.scene_revision,
+                                                   completed_description.editor};
             AnnotationFrameState rendered;
             {
                 std::scoped_lock lock(mutex_);
@@ -633,7 +623,6 @@ class AnnotationSystem::Impl final {
     void Publish(Event event) noexcept {
         publish_visual_event_noexcept(events_, event_type{std::move(event)});
     }
-
     VisualDeviceSettings settings_;
     ExactVisualDocumentBorrower borrow_source_;
     SystemEventSink<event_type> events_;
@@ -661,7 +650,6 @@ class AnnotationSystem::Impl final {
     detail::VisualRuntimeOwner renderer_;
     mmltk::frameworks::gpu::SystemImageWorker input_worker_;
 };
-
 AnnotationSystem::AnnotationSystem(VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
                                    SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
     : impl_(std::make_unique<Impl>(settings, std::move(factory), std::move(borrow_source), std::move(events), diagnostics)) {}
@@ -677,9 +665,7 @@ void AnnotationSystem::Shutdown() noexcept { impl_->Shutdown(); }
 bool AnnotationSystem::stopped() const noexcept { return impl_->stopped(); }
 // CLEANUP-IGNORE: These direct methods expose Annotation's sealed owner; Live and Upscale retain independent system ownership.
 AnnotationSnapshot AnnotationSystem::snapshot() const { return impl_->snapshot(); }
-std::optional<AnnotationImageMetadata> AnnotationSystem::ImageSnapshot(const VisualFrame& frame) const {
-    return impl_->ImageSnapshot(frame);
-}
+std::optional<AnnotationImageMetadata> AnnotationSystem::ImageSnapshot(const VisualFrame& frame) const { return impl_->ImageSnapshot(frame); }
 // CLEANUP-IGNORE: Annotation forwards its sealed source API to its own owner and the existing shared renderer.
 VisualSourceObservation AnnotationSystem::ObserveSource() const { return impl_->ObserveSource(); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView AnnotationSystem::BorrowFrame() const { return impl_->BorrowFrame(); }

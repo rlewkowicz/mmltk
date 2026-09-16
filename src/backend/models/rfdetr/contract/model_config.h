@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -8,33 +7,25 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 namespace mmltk::backend::models::rfdetr {
-
 enum class CompilationMode : std::uint8_t {
     kNone,
     kSelective,
     kFullTrace,
 };
-
 MMLTK_REFLECT_ENUM(CompilationMode)
-
 [[nodiscard]] constexpr std::string_view cli_enum_spelling(const CompilationMode mode) noexcept {
     switch (mode) {
-        case CompilationMode::kNone:
-            return "none";
-        case CompilationMode::kSelective:
-            return "selective";
-        case CompilationMode::kFullTrace:
-            return "full";
+        case CompilationMode::kNone: return "none";
+        case CompilationMode::kSelective: return "selective";
+        case CompilationMode::kFullTrace: return "full";
     }
     return {};
 }
-
 struct NativeRfDetrConfig {
     std::string preset_name;
     int resolution = 0;
@@ -72,7 +63,6 @@ struct NativeRfDetrConfig {
     double set_cost_giou = 2.0;
     TrainingSupervisionConfig training_supervision;
 };
-
 [[nodiscard]] inline bool training_supervision_model_config_valid(const NativeRfDetrConfig& config) noexcept {
     if (!training_supervision_config_valid(config.training_supervision)) return false;
     if (training_supervision_enabled(config.training_supervision) &&
@@ -82,9 +72,9 @@ struct NativeRfDetrConfig {
         return false;
     }
     if (config.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
-        if (config.segmentation || !std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 ||
-            !std::isfinite(config.set_cost_bbox) || config.set_cost_bbox < 0.0 || !std::isfinite(config.set_cost_giou) ||
-            config.set_cost_giou < 0.0 || (config.set_cost_class == 0.0 && config.set_cost_bbox == 0.0 && config.set_cost_giou == 0.0)) {
+        if (config.segmentation || !std::isfinite(config.set_cost_class) || config.set_cost_class < 0.0 || !std::isfinite(config.set_cost_bbox) ||
+            config.set_cost_bbox < 0.0 || !std::isfinite(config.set_cost_giou) || config.set_cost_giou < 0.0 ||
+            (config.set_cost_class == 0.0 && config.set_cost_bbox == 0.0 && config.set_cost_giou == 0.0)) {
             return false;
         }
     }
@@ -93,18 +83,16 @@ struct NativeRfDetrConfig {
         return false;
     }
     if (config.training_supervision.denoising.enabled &&
-        (!std::isfinite(config.cls_loss_coef) || config.cls_loss_coef < 0.0 || !std::isfinite(config.bbox_loss_coef) ||
-         config.bbox_loss_coef < 0.0 || !std::isfinite(config.giou_loss_coef) || config.giou_loss_coef < 0.0 ||
+        (!std::isfinite(config.cls_loss_coef) || config.cls_loss_coef < 0.0 || !std::isfinite(config.bbox_loss_coef) || config.bbox_loss_coef < 0.0 ||
+         !std::isfinite(config.giou_loss_coef) || config.giou_loss_coef < 0.0 ||
          (config.cls_loss_coef == 0.0 && config.bbox_loss_coef == 0.0 && config.giou_loss_coef == 0.0))) {
         return false;
     }
     return true;
 }
-
 [[nodiscard]] std::span<const PresetCatalogEntry> model_presets() noexcept;
 [[nodiscard]] const PresetCatalogEntry* find_model_preset(std::string_view preset_name) noexcept;
 [[nodiscard]] const PresetCatalogEntry* find_model_preset_by_weight_filename(std::string_view filename) noexcept;
 [[nodiscard]] const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::path& path);
 [[nodiscard]] NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset);
-
 }  // namespace mmltk::backend::models::rfdetr

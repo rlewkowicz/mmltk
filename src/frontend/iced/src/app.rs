@@ -808,8 +808,11 @@ mod tests {
                 snapshot.generation = snapshot.generation.checked_add(1).unwrap();
                 snapshot.active = false;
                 snapshot.selection.key = crate::generated::project_model_settings(
-                    app.settings.draft().unwrap(), crate::generated::FeatureId::Train,
-                ).unwrap().key;
+                    app.settings.draft().unwrap(),
+                    crate::generated::FeatureId::Train,
+                )
+                .unwrap()
+                .key;
                 snapshot.selection.artifact = crate::generated::RFDETR_PRESET_CATALOG
                     .first()
                     .unwrap()

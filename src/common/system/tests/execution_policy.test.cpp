@@ -8,7 +8,6 @@
 #include <system_error>
 #include <algorithm>
 #include "src/common/concurrency/worker_pool.h"
-
 namespace {
 using namespace mmltk::common::system;
 NumaTopology topology() {
@@ -76,7 +75,6 @@ TEST_CASE("Denied priority and NUMA policy fail required worker startup", "[comm
     }
 }
 }  // namespace
-
 TEST_CASE("Synchronous policy failure restores every policy already changed", "[common][system][policy]") {
     CHECK(mmltk::common::system::test_support::with_denied_syscall(SYS_ioprio_set, [] {
               using namespace mmltk::common::system;
@@ -88,14 +86,12 @@ TEST_CASE("Synchronous policy failure restores every policy already changed", "[
                   ScopedExecutionPolicy scope({{cpu}, "denied-scope", 0, node, -10, true});
               } catch (const std::system_error&) {
                   const auto after = capture_execution_policy_snapshot();
-                  return after.affinity == before.affinity && after.nice_value == before.nice_value &&
-                         after.memory_policy.mode == before.memory_policy.mode && after.memory_policy.mask == before.memory_policy.mask &&
-                         after.thread_name == before.thread_name;
+                  return after.affinity == before.affinity && after.nice_value == before.nice_value && after.memory_policy.mode == before.memory_policy.mode &&
+                         after.memory_policy.mask == before.memory_policy.mask && after.thread_name == before.thread_name;
               }
               return false;
           }) == 0);
 }
-
 TEST_CASE("Policy denial rolls back partially constructed worker pools", "[common][system][policy]") {
     CHECK(mmltk::common::system::test_support::with_denied_syscall(SYS_setpriority, [] {
               try {

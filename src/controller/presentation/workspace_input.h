@@ -1,17 +1,13 @@
 #pragma once
-
 #include <cstddef>
 #include <optional>
 #include <utility>
 #include <type_traits>
 #include <stdexcept>
 #include <vector>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/workspace_input.h"
-
 namespace mmltk::controller {
-
 // The domain owner supplies synchronization and execution. Removing an item is
 // constant time; geometric growth retains capacity across strokes and commands.
 template <class Record>
@@ -23,8 +19,7 @@ class WorkspaceInputQueue final {
         if (size_ == storage_.size()) {
             if (storage_.size() > storage_.max_size() / 2U) throw std::length_error("Workspace input capacity is exhausted");
             std::vector<std::optional<Record>> grown(storage_.empty() ? 64U : storage_.size() * 2U);
-            for (std::size_t index = 0U; index != size_; ++index)
-                grown[index] = std::move(storage_[(head_ + index) % storage_.size()]);
+            for (std::size_t index = 0U; index != size_; ++index) grown[index] = std::move(storage_[(head_ + index) % storage_.size()]);
             storage_.swap(grown);
             head_ = 0U;
         }
@@ -55,7 +50,6 @@ class WorkspaceInputQueue final {
     std::size_t head_ = 0U;
     std::size_t size_ = 0U;
 };
-
 // Passive workspaces still consume every mouse record and retain their native
 // pointer state. Their domain may act on that state without scheduling GPU work.
 class WorkspaceInput final {
@@ -71,5 +65,4 @@ class WorkspaceInput final {
     std::optional<WorkspaceMouse> latest_;
     WorkspaceInputQueue<WorkspaceMouse> queue_;
 };
-
 }  // namespace mmltk::controller

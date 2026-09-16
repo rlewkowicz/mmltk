@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -7,30 +6,22 @@
 #include <optional>
 #include <string_view>
 #include <type_traits>
-
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 enum class ModelTask : std::uint8_t {
     Detection,
     Segmentation,
 };
-
 MMLTK_REFLECT_ENUM(ModelTask)
-
 [[nodiscard]] constexpr std::optional<std::string_view> model_task_name(const ModelTask task) noexcept {
     switch (task) {
-        case ModelTask::Detection:
-            return "detection";
-        case ModelTask::Segmentation:
-            return "segmentation";
+        case ModelTask::Detection: return "detection";
+        case ModelTask::Segmentation: return "segmentation";
     }
     return std::nullopt;
 }
-
 struct PresetCatalogEntry final {
     std::string_view preset_name;
     std::string_view display_name;
@@ -56,12 +47,9 @@ struct PresetCatalogEntry final {
     double generalized_iou_loss_coefficient;
     double mask_cross_entropy_loss_coefficient;
     double mask_dice_loss_coefficient;
-
     constexpr bool operator==(const PresetCatalogEntry&) const noexcept = default;
 };
-
 MMLTK_REFLECT_FIELDS(PresetCatalogEntry)
-
 inline constexpr std::array<PresetCatalogEntry, 10U> kPresetCatalog{{
     {"rf-detr-nano",
      "RF-DETR Nano",
@@ -224,16 +212,15 @@ inline constexpr std::array<PresetCatalogEntry, 10U> kPresetCatalog{{
      // CLEANUP-IGNORE: Each immutable preset row remains a complete independently audited catalog record.
      6U, 300U, 300U, 91U, 256U, 13U, true, 5.0, 5.0, 2.0, 5.0, 5.0},
 }};
-
 [[nodiscard]] consteval bool preset_catalog_is_valid() {
     for (std::size_t index = 0U; index < kPresetCatalog.size(); ++index) {
         const auto& preset = kPresetCatalog[index];
         if (preset.preset_name.empty() || preset.display_name.empty() || preset.size_label.empty() || preset.resolution == 0U ||
             !model_task_name(preset.task).has_value() || preset.resolution > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
             preset.encoder.empty() || preset.canonical_weight_filename.empty() || preset.canonical_weight_url.empty() ||
-            preset.canonical_weight_md5.size() != 32U || preset.patch_size == 0U || preset.window_count == 0U ||
-            preset.positional_encoding_size == 0U || preset.decoder_layer_count == 0U || preset.query_count == 0U ||
-            preset.selected_query_count == 0U || preset.class_count == 0U || preset.hidden_dimension == 0U || preset.group_count == 0U) {
+            preset.canonical_weight_md5.size() != 32U || preset.patch_size == 0U || preset.window_count == 0U || preset.positional_encoding_size == 0U ||
+            preset.decoder_layer_count == 0U || preset.query_count == 0U || preset.selected_query_count == 0U || preset.class_count == 0U ||
+            preset.hidden_dimension == 0U || preset.group_count == 0U) {
             return false;
         }
         for (std::size_t sibling = index + 1U; sibling < kPresetCatalog.size(); ++sibling) {
@@ -245,27 +232,21 @@ inline constexpr std::array<PresetCatalogEntry, 10U> kPresetCatalog{{
     }
     return true;
 }
-
 static_assert(preset_catalog_is_valid());
-
 struct RfdetrPresetCatalog final {
     using row_type = PresetCatalogEntry;
     static constexpr std::string_view identity = "rfdetr.presets";
-
     template <class Visitor>
     static constexpr void VisitRows(Visitor&& visitor) {
-        for (std::size_t index = 0U; index < kPresetCatalog.size(); ++index)
-            visitor(kPresetCatalog[index], index);
+        for (std::size_t index = 0U; index < kPresetCatalog.size(); ++index) visitor(kPresetCatalog[index], index);
     }
     [[nodiscard]] static constexpr std::string_view row_key(const row_type& row) noexcept { return row.preset_name; }
     [[nodiscard]] static consteval bool valid() noexcept { return preset_catalog_is_valid(); }
 };
-
 [[nodiscard]] constexpr const PresetCatalogEntry* find_preset_catalog_entry(const std::string_view preset_name) noexcept {
     for (const auto& preset : kPresetCatalog) {
         if (preset.preset_name == preset_name) return &preset;
     }
     return nullptr;
 }
-
 }  // namespace mmltk::backend::models::rfdetr

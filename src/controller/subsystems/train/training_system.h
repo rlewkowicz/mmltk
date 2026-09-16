@@ -1,5 +1,4 @@
 #pragma once
-
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -8,7 +7,6 @@
 #include <stop_token>
 #include <string>
 #include <variant>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/compute.h"
 #include "src/controller/contracts/provider.h"
@@ -20,9 +18,7 @@
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/system/system_events.h"
-
 namespace mmltk::controller {
-
 class TrainingRuntime {
    public:
     virtual ~TrainingRuntime() = default;
@@ -30,8 +26,8 @@ class TrainingRuntime {
                                                            const std::function<void(const services::TrainProcessProgress&)>&) = 0;
     [[nodiscard]] virtual contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) = 0;
     [[nodiscard]] virtual contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&,
-                                                                 contracts::ProviderOfferIdentity, int instance_id,
-                                                                 std::string_view launch_token, std::stop_token) = 0;
+                                                                 contracts::ProviderOfferIdentity, int instance_id, std::string_view launch_token,
+                                                                 std::stop_token) = 0;
     [[nodiscard]] virtual contracts::ProviderEffectResult Reconcile(const services::VastReconciliationRequest&, std::stop_token) = 0;
 };
 struct NativeTrainingConfiguration final {
@@ -44,14 +40,13 @@ class NativeTrainingRuntime final : public TrainingRuntime {
     [[nodiscard]] contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
                                                    const std::function<void(const services::TrainProcessProgress&)>&) override;
     [[nodiscard]] contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) override;
-    [[nodiscard]] contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&,
-                                                         contracts::ProviderOfferIdentity, int, std::string_view, std::stop_token) override;
+    [[nodiscard]] contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity,
+                                                         int, std::string_view, std::stop_token) override;
     [[nodiscard]] contracts::ProviderEffectResult Reconcile(const services::VastReconciliationRequest&, std::stop_token) override;
 
    private:
     NativeTrainingConfiguration config_;
 };
-
 enum class TrainingActivity : std::uint8_t {
     Idle,
     Local,
@@ -59,15 +54,13 @@ enum class TrainingActivity : std::uint8_t {
     Remote,
 };
 MMLTK_REFLECT_ENUM(TrainingActivity)
-
 struct TrainingSnapshot final {
     std::uint64_t revision = 0U;
     TrainingActivity activity = TrainingActivity::Idle;
     contracts::ComputeUiState local{};
     contracts::ProviderOfferState offers{};
     contracts::RemoteSessionState remote{};
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path output_directory;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_directory;
     std::uint64_t history_generation = 0;
     std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
     mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
@@ -89,8 +82,7 @@ class TrainingSystem final {
     using RuntimeFactory = std::function<std::unique_ptr<TrainingRuntime>()>;
     TrainingSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, RuntimeFactory, SystemEventSink<event_type> = {});
     ~TrainingSystem();
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Start(
-        contracts::WorkflowIntent<contracts::FeatureId::Train>);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Start(contracts::WorkflowIntent<contracts::FeatureId::Train>);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingOpenedRun OpenRun(
         mmltk::backend::models::rfdetr::TrainingDirectoryQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingHistoryPage History(
@@ -99,10 +91,8 @@ class TrainingSystem final {
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpoint PrepareResume(
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Resume(
-        mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Stop(
-        contracts::WorkflowIntent<contracts::FeatureId::Train>) noexcept;
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Resume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Stop(contracts::WorkflowIntent<contracts::FeatureId::Train>) noexcept;
     void Shutdown() noexcept;
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Query(contracts::ProviderQueryIntent);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Select(contracts::ProviderOfferIdentity);
@@ -118,9 +108,7 @@ class TrainingSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 MMLTK_REFLECT_FIELDS(TrainingSnapshot)
 MMLTK_REFLECT_FIELDS(TrainingProgress)
 MMLTK_REFLECT_FIELDS(TrainingChanged)
-
 }  // namespace mmltk::controller

@@ -2,11 +2,9 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -20,26 +18,19 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
-
 namespace mmltk::common::system {
-
 namespace {
-
 class CpuSetBuffer {
    public:
-    explicit CpuSetBuffer(size_t cpu_count)
-        : cpu_count_(std::max<size_t>(cpu_count, 1)), bytes_(CPU_ALLOC_SIZE(cpu_count_)), set_(CPU_ALLOC(cpu_count_)) {
+    explicit CpuSetBuffer(size_t cpu_count) : cpu_count_(std::max<size_t>(cpu_count, 1)), bytes_(CPU_ALLOC_SIZE(cpu_count_)), set_(CPU_ALLOC(cpu_count_)) {
         if (set_ == nullptr) { throw std::bad_alloc(); }
         CPU_ZERO_S(bytes_, set_);
     }
-
     ~CpuSetBuffer() {
         if (set_ != nullptr) { CPU_FREE(set_); }
     }
-
     CpuSetBuffer(const CpuSetBuffer&) = delete;
     CpuSetBuffer& operator=(const CpuSetBuffer&) = delete;
-
     [[nodiscard]] cpu_set_t* get() noexcept { return set_; }
     [[nodiscard]] size_t bytes() const noexcept { return bytes_; }
     [[nodiscard]] size_t cpu_count() const noexcept { return cpu_count_; }
@@ -49,23 +40,16 @@ class CpuSetBuffer {
     size_t bytes_ = 0;
     cpu_set_t* set_ = nullptr;
 };
-
 std::string_view trim_ascii(std::string_view value) {
     size_t begin = 0;
-    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])) != 0) {
-        ++begin;
-    }
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])) != 0) { ++begin; }
     size_t end = value.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
-        --end;
-    }
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) { --end; }
     return value.substr(begin, end - begin);
 }
-
 int parse_cpu_id(std::string_view token) {
     token = trim_ascii(token);
     if (token.empty()) { throw std::runtime_error("cpu affinity token must not be empty"); }
-
     int value = -1;
     const char* begin = token.data();
     const char* end = token.data() + token.size();
@@ -73,15 +57,12 @@ int parse_cpu_id(std::string_view token) {
     if (ec != std::errc() || ptr != end || value < 0) { throw std::runtime_error("invalid cpu affinity token: " + std::string(token)); }
     return value;
 }
-
 size_t configured_cpu_count() {
     const long configured = ::sysconf(_SC_NPROCESSORS_CONF);
     if (configured > 0) { return static_cast<size_t>(configured); }
     return CPU_SETSIZE;
 }
-
 }  // namespace
-
 std::vector<int> allowed_cpu_set() {
     for (std::size_t count = configured_cpu_count();;) {
         CpuSetBuffer mask(count);
@@ -99,7 +80,6 @@ std::vector<int> allowed_cpu_set() {
         return cpus;
     }
 }
-
 std::vector<int> parse_cpu_list(const std::string& spec) {
     std::vector<int> cpus;
     const std::string_view spec_view{spec};
@@ -126,17 +106,14 @@ std::vector<int> parse_cpu_list(const std::string& spec) {
         if (next == spec.size()) { break; }
         cursor = next + 1;
     }
-
     std::ranges::sort(cpus);
     cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
     if (cpus.empty()) { throw std::runtime_error("cpu affinity list must not be empty"); }
     return cpus;
 }
-
 std::vector<int> resolve_cpu_affinity(const std::string& spec) {
     std::vector<int> allowed = allowed_cpu_set();
     if (spec.empty()) { return allowed; }
-
     std::vector<int> requested = parse_cpu_list(spec);
     for (const int cpu : requested) {
         if (!std::binary_search(allowed.begin(), allowed.end(), cpu)) {
@@ -145,10 +122,8 @@ std::vector<int> resolve_cpu_affinity(const std::string& spec) {
     }
     return requested;
 }
-
 std::string format_cpu_list(const std::vector<int>& cpus) {
     if (cpus.empty()) { return ""; }
-
     std::string formatted;
     size_t index = 0;
     while (index < cpus.size()) {
@@ -168,21 +143,16 @@ std::string format_cpu_list(const std::vector<int>& cpus) {
     }
     return formatted;
 }
-
 void pin_thread_to_cpu(const std::vector<int>& cpus, size_t worker_index) {
     std::vector<int> fallback;
     const std::vector<int>& targets = cpus.empty() ? (fallback = allowed_cpu_set(), fallback) : cpus;
     if (targets.empty()) { throw std::runtime_error("pin_thread_to_cpu requires at least one CPU"); }
-
     set_thread_affinity({targets[worker_index % targets.size()]});
 }
-
 void set_thread_affinity(const std::vector<int>& cpus) {
-    if (cpus.empty() || std::ranges::any_of(cpus, [](int cpu) { return cpu < 0; }))
-        throw std::invalid_argument("thread affinity requires valid CPUs");
+    if (cpus.empty() || std::ranges::any_of(cpus, [](int cpu) { return cpu < 0; })) throw std::invalid_argument("thread affinity requires valid CPUs");
     CpuSetBuffer mask(static_cast<size_t>(*std::ranges::max_element(cpus)) + 1U);
-    for (int cpu : cpus)
-        CPU_SET_S(static_cast<size_t>(cpu), mask.bytes(), mask.get());
+    for (int cpu : cpus) CPU_SET_S(static_cast<size_t>(cpu), mask.bytes(), mask.get());
     const int rc = ::pthread_setaffinity_np(::pthread_self(), mask.bytes(), mask.get());
     if (rc) throw std::system_error(rc, std::generic_category(), "set thread affinity");
     auto expected = cpus;
@@ -190,15 +160,12 @@ void set_thread_affinity(const std::vector<int>& cpus) {
     expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
     if (allowed_cpu_set() != expected) throw std::runtime_error("effective thread affinity differs from request");
 }
-
 void set_thread_name(const std::string& name) {
     if (name.empty()) { return; }
-
     std::array<char, 16> buffer{};
     const size_t count = std::min(name.size(), buffer.size() - 1);
     std::copy_n(name.data(), count, buffer.data());
     const int rc = ::pthread_setname_np(::pthread_self(), buffer.data());
     if (rc != 0) { throw std::system_error(rc, std::generic_category(), "pthread_setname_np failed"); }
 }
-
 }  // namespace mmltk::common::system

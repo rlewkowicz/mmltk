@@ -1,12 +1,8 @@
 #pragma once
-
 #include <cuda.h>
-
 #include <cstddef>
 #include <cstdint>
-
 namespace mmltk::frameworks::gpu {
-
 class CudaPitchedBufferView {
    public:
     [[nodiscard]] CUdeviceptr data() const noexcept { return device_ptr_; }
@@ -21,5 +17,4 @@ class CudaPitchedBufferView {
     std::uint32_t width_ = 0U;
     std::uint32_t height_ = 0U;
 };
-
 }  // namespace mmltk::frameworks::gpu

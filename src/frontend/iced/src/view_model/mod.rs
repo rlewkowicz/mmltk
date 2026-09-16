@@ -11,6 +11,8 @@ pub(crate) mod test_support;
 mod workflow;
 
 #[cfg(test)]
+use crate::generated::VisualExtent;
+#[cfg(test)]
 pub(crate) use reduction::invalid_visual_frame;
 
 pub use crate::generated::ApplicationIntentEndpoint;
@@ -21,7 +23,9 @@ use reduction::{
     Observation, merge_compute_snapshot, merge_dialog_snapshot, merge_live_snapshot,
     merge_model_snapshot, merge_observation, merge_presentation_snapshot,
 };
-pub use workflow::{ModelSelectionReceipt, PendingStart, StartInputs, StartPreparation, WorkflowModel};
+pub use workflow::{
+    ModelSelectionReceipt, PendingStart, StartInputs, StartPreparation, WorkflowModel,
+};
 
 use std::collections::BTreeMap;
 
@@ -30,8 +34,7 @@ use crate::generated::{
     ComputeOperationOutcome, ComputeUiState, FeatureId, FileDialogFact, FileDialogSnapshot,
     FileDialogTarget, GuiSettingsState, LiveSnapshot, ModelSelection, ModelSelectionOutcome,
     ModelSelectionSource, ModelUiState, PredictSnapshot, PresentationSourceIdentity,
-    PresentationSourceKind, PresentationState, SettingsUiState, UpscaleSnapshot, VisualExtent,
-    VisualFrame,
+    PresentationSourceKind, PresentationState, SettingsUiState, UpscaleSnapshot, VisualFrame,
 };
 use crate::protocol::ApplicationError;
 

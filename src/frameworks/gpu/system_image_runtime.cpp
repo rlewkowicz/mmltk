@@ -6,7 +6,6 @@
 #include "src/common/types/generation.h"
 #include <stdexcept>
 #include <utility>
-
 namespace mmltk::frameworks::gpu {
 ImageProductRevisionSequence::ImageProductRevisionSequence(std::uint64_t next) : next_(next) {
     if (next == 0U) throw std::invalid_argument("image product revision sequence is zero");
@@ -16,51 +15,40 @@ std::uint64_t ImageProductRevisionSequence::Take() {
     return mmltk::common::types::take_monotonic_identity(next_);
 }
 namespace {
-
 [[nodiscard]] std::exception_ptr missing_retention_failure() noexcept {
     try {
         throw std::runtime_error("system image model retained physical resources without a failure");
     } catch (...) { return std::current_exception(); }
 }
-
 class UnsafeRuntimeConstruction final : public std::exception {
    public:
     explicit UnsafeRuntimeConstruction(SystemImageRuntime::UnsafeCustody custody) noexcept : custody_(std::move(custody)) {}
-
-    [[nodiscard]] const char* what() const noexcept override {
-        return "system image runtime construction retained unsafe physical resources";
-    }
+    [[nodiscard]] const char* what() const noexcept override { return "system image runtime construction retained unsafe physical resources"; }
     [[nodiscard]] SystemImageRuntime::UnsafeCustody TakeCustody() noexcept { return std::move(custody_); }
 
    private:
     SystemImageRuntime::UnsafeCustody custody_;
 };
-
 }  // namespace
-
 struct SystemImageRuntime::State final {
     explicit State(std::unique_ptr<SystemImageModel> adopted_model) noexcept : model(std::move(adopted_model)) {}
-
     void Finish(SystemImageRuntimeConfig& config, const std::shared_ptr<ImageProductRetirement>& products) {
         auto backend = config.backend ? std::move(config.backend) : cuda_image_copy_backend();
         if (config.adopted_context) {
             config.adopted_context->ValidateSelection(config.device, backend, config.context_mode, config.numa_node, config.execution);
             context = std::move(config.adopted_context);
         } else {
-            context.emplace(config.device, std::move(backend), config.context_mode,
-                            config.numa_node, std::move(config.execution));
+            context.emplace(config.device, std::move(backend), config.context_mode, config.numa_node, std::move(config.execution));
         }
         std::optional<mmltk::common::system::ScopedExecutionPolicy> policy;
         if (const auto* execution = context->execution())
-            policy.emplace(mmltk::common::system::ExecutionPolicyRequest{
-                execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
+            policy.emplace(mmltk::common::system::ExecutionPolicyRequest{execution->placement.cpus, {}, 0, execution->placement.numa_node, -10, false});
         input = std::make_unique<ImageProductBuffer>(*context, config.input_layout);
         output = std::make_unique<ImageProductPool>(*context, config.output_layout, config.output_buffer_count, products);
         stream = std::make_shared<ImageStream>(*context);
         if (model) model->BindExecutionContext(*context, stream);
         workspace_finalize = std::move(config.workspace_finalize);
     }
-
     std::optional<DeviceContext> context;
     std::unique_ptr<SystemImageModel> model;
     std::unique_ptr<ImageProductBuffer> input;
@@ -69,7 +57,6 @@ struct SystemImageRuntime::State final {
     ImageWorkspaceFinalize workspace_finalize;
     bool retired = false;
 };
-
 struct SystemImageRuntime::RetentionControl final {
     RetentionControl() : terminal(1U), lease(ReserveTerminalCudaLease(terminal)) {}
     ~RetentionControl() noexcept {
@@ -81,10 +68,8 @@ struct SystemImageRuntime::RetentionControl final {
                 failure = combine_image_failures(failure, std::current_exception());
             }
         }
-        if (state && (!deferred || products->unsafe()))
-            std::move(lease).Install(TerminalCudaCustody::Share(std::move(state)), cudaErrorUnknown);
+        if (state && (!deferred || products->unsafe())) std::move(lease).Install(TerminalCudaCustody::Share(std::move(state)), cudaErrorUnknown);
     }
-
     TerminalCudaRetirementOwner terminal;
     TerminalCudaRetirementLease lease;
     const std::shared_ptr<ImageProductRetirement> products = std::make_shared<ImageProductRetirement>();
@@ -92,15 +77,9 @@ struct SystemImageRuntime::RetentionControl final {
     std::exception_ptr failure{};
     bool deferred = false;
 };
-
-std::shared_ptr<SystemImageRuntime::RetentionControl> SystemImageRuntime::ReserveRetention() {
-    return std::make_shared<RetentionControl>();
-}
-
+std::shared_ptr<SystemImageRuntime::RetentionControl> SystemImageRuntime::ReserveRetention() { return std::make_shared<RetentionControl>(); }
 SystemImageRuntime::UnsafeCustody::UnsafeCustody(std::shared_ptr<RetentionControl> control) noexcept : control_(std::move(control)) {}
-
 bool SystemImageRuntime::UnsafeCustody::valid() const noexcept { return control_ && control_->state; }
-
 std::exception_ptr SystemImageRuntime::UnsafeCustody::failure() const noexcept {
     if (!control_) return {};
     return combine_image_failures(control_->failure, control_->state ? control_->products->failure() : std::exception_ptr{});
@@ -133,7 +112,6 @@ void SystemImageRuntime::UnsafeCustody::SetRetirementSink(std::shared_ptr<const 
     if (!valid()) return;
     control_->products->SetRetirementSink(std::move(sink));
 }
-
 std::optional<SystemImageRuntime::UnsafeCustody> SystemImageRuntime::UnsafeConstruction(const std::exception_ptr failure) noexcept {
     const auto construction = find_image_failure<UnsafeRuntimeConstruction>(failure);
     if (!construction) return std::nullopt;
@@ -146,7 +124,6 @@ std::optional<SystemImageRuntime::UnsafeCustody> SystemImageRuntime::UnsafeConst
         return std::nullopt;
     } catch (...) { return std::nullopt; }
 }
-
 SystemImageRuntime::SystemImageRuntime(SystemImageRuntimeConfig config)
     : retention_(ReserveRetention()), product_revision_sequence_(std::move(config.product_revisions)) {
     state_ = std::make_shared<State>(std::move(config.model));
@@ -177,9 +154,7 @@ bool SystemImageRuntime::UsesContext(const DeviceContext& context) const noexcep
     return state_ && !state_->retired && state_->context && *state_->context == context;
 }
 int SystemImageRuntime::device() const noexcept { return state_ && !state_->retired && state_->context ? state_->context->device() : -1; }
-const DeviceExecution* SystemImageRuntime::execution() const noexcept {
-    return state_ && state_->context ? state_->context->execution() : nullptr;
-}
+const DeviceExecution* SystemImageRuntime::execution() const noexcept { return state_ && state_->context ? state_->context->execution() : nullptr; }
 void SystemImageRuntime::BindContext() {
     auto& state = ActiveState();
     if (!state.context) throw std::runtime_error("system image runtime context is unavailable");
@@ -187,8 +162,7 @@ void SystemImageRuntime::BindContext() {
 }
 void SystemImageRuntime::BeginWork() { BindContext(); }
 SystemImageRuntime::Retirement SystemImageRuntime::Retire(std::exception_ptr unproved_execution) noexcept {
-    if (!state_ && retention_ && retention_->state)
-        return {.failure = UnsafeCustody{retention_}.failure(), .custody = UnsafeCustody{retention_}};
+    if (!state_ && retention_ && retention_->state) return {.failure = UnsafeCustody{retention_}.failure(), .custody = UnsafeCustody{retention_}};
     if (!state_ || state_->retired) return {.safe_to_destroy = true};
     if (unproved_execution) return {.failure = unproved_execution, .custody = Retain(std::move(unproved_execution))};
     if (state_->model) state_->model->StopIngress();
@@ -206,9 +180,7 @@ SystemImageRuntime::Retirement SystemImageRuntime::Retire(std::exception_ptr unp
         settled.completion_reached = settled.completion_reached && display.completion_reached;
         settled.failure = combine_image_failures(settled.failure, display.failure);
     }
-    if (const auto display_failure = retention_->products->failure()) {
-        settled.failure = combine_image_failures(settled.failure, display_failure);
-    }
+    if (const auto display_failure = retention_->products->failure()) { settled.failure = combine_image_failures(settled.failure, display_failure); }
     settled.completion_reached = settled.completion_reached && !retention_->products->unsafe();
     if (!settled.completion_reached) {
         const auto failure = settled.failure ? settled.failure : missing_retention_failure();
@@ -277,8 +249,7 @@ SystemImageRuntime::OutputCandidate SystemImageRuntime::TryAcquireOutput(Complet
     // CLEANUP-IGNORE: Acquisition, clearing publication and retained publication are distinct pool operations exposed by the runtime.
     return ActiveState().output->TryAcquire(baseline, preservation);
 }
-void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height,
-                                 ImageProductBuffer::ProductSubmit submit) {
+void SystemImageRuntime::Publish(OutputCandidate& candidate, const std::uint32_t width, const std::uint32_t height, ImageProductBuffer::ProductSubmit submit) {
     auto& state = ActiveState();
     state.output->Publish(*state.stream, candidate, width, height, TakeProductRevision(), std::move(submit));
 }
@@ -303,8 +274,7 @@ bool SystemImageRuntime::DetachDisplay(const std::shared_ptr<ImageWorkspace>& wo
 }
 bool SystemImageRuntime::PrepareDisplay(std::uint64_t revision, const std::shared_ptr<ImageWorkspace>& workspace) {
     auto& state = ActiveState();
-    if (!workspace || !workspace->admitted() || workspace->retired())
-        throw std::invalid_argument("shared display workspace is unavailable");
+    if (!workspace || !workspace->admitted() || workspace->retired()) throw std::invalid_argument("shared display workspace is unavailable");
     return state.output->PrepareDisplay(*state.stream, revision, workspace, state.workspace_finalize);
 }
 BorrowedImageWorkspace SystemImageRuntime::BorrowWorkspace() const { return ActiveState().output->BorrowWorkspace(); }
@@ -329,8 +299,7 @@ std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyFrom(BorrowedImageProductR
     auto& state = ActiveState();
     return state.output->CopyFrom(*state.stream, std::move(source), TakeProductRevision());
 }
-std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyInputFrom(BorrowedImageProductReadView source,
-                                                                ImageProductBuffer::MissingPlaneSubmit initialize_missing,
+std::array<ImageCopyPath, 2U> SystemImageRuntime::CopyInputFrom(BorrowedImageProductReadView source, ImageProductBuffer::MissingPlaneSubmit initialize_missing,
                                                                 const bool preserve_clean) {
     auto& state = ActiveState();
     return state.input->CopyFrom(*state.stream, std::move(source), std::move(initialize_missing), preserve_clean);

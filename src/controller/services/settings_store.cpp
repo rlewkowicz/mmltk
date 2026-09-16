@@ -1,5 +1,4 @@
 #include "src/controller/services/settings_store.h"
-
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -8,7 +7,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-
 #include "src/common/io/json_file.h"
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/gui_settings.h"
@@ -20,27 +18,19 @@
 #include "src/controller/contracts/settings_vocabulary.h"
 #include "src/controller/contracts/view_state.h"
 #include "src/controller/contracts/workflows.h"
-
 namespace mmltk::controller::services {
 namespace common_io = mmltk::common::io;
 namespace contracts = mmltk::controller::contracts;
-
 namespace {
-
 [[nodiscard]] SettingsStoreWriteStage settings_write_stage(const common_io::JsonWriteStage stage) noexcept {
     switch (stage) {
-        case common_io::JsonWriteStage::kOpen:
-            return SettingsStoreWriteStage::Open;
-        case common_io::JsonWriteStage::kFlush:
-            return SettingsStoreWriteStage::Flush;
-        case common_io::JsonWriteStage::kRename:
-            return SettingsStoreWriteStage::Rename;
+        case common_io::JsonWriteStage::kOpen: return SettingsStoreWriteStage::Open;
+        case common_io::JsonWriteStage::kFlush: return SettingsStoreWriteStage::Flush;
+        case common_io::JsonWriteStage::kRename: return SettingsStoreWriteStage::Rename;
     }
     return SettingsStoreWriteStage::Open;
 }
-
 constexpr std::string_view kRevisionField{"settings_revision"};
-
 [[nodiscard]] std::uint64_t read_revision(nlohmann::json& normalized) {
     const auto entry = normalized.find(kRevisionField);
     if (entry == normalized.end()) return 0U;
@@ -51,7 +41,6 @@ constexpr std::string_view kRevisionField{"settings_revision"};
     normalized.erase(entry);
     return revision;
 }
-
 [[nodiscard]] std::optional<std::uint64_t> inspect_raw_revision(const std::filesystem::path& path) {
     std::ifstream file(path);
     if (!file.is_open()) return std::nullopt;
@@ -63,9 +52,7 @@ constexpr std::string_view kRevisionField{"settings_revision"};
     }
     return revision.get<std::uint64_t>();
 }
-
 }  // namespace
-
 StoredSettings SettingsStore::load(const std::filesystem::path& path) {
     contracts::GuiSettingsState state = contracts::default_gui_settings_state();
     nlohmann::json normalized;
@@ -82,9 +69,7 @@ StoredSettings SettingsStore::load(const std::filesystem::path& path) {
     if ((loaded && (settings_repair || revision_repair)) || (!loaded && existed)) save(path, record.settings, record.revision_frontier);
     return record;
 }
-
-void SettingsStore::save(const std::filesystem::path& path, const contracts::GuiSettingsState& settings,
-                         const std::uint64_t revision_frontier) {
+void SettingsStore::save(const std::filesystem::path& path, const contracts::GuiSettingsState& settings, const std::uint64_t revision_frontier) {
     if (!contracts::gui_settings_valid(settings)) {
         throw SettingsStoreError{SettingsStoreWriteStage::Validation, "refusing to persist invalid typed GUI settings"};
     }
@@ -93,8 +78,7 @@ void SettingsStore::save(const std::filesystem::path& path, const contracts::Gui
         std::error_code error;
         std::filesystem::create_directories(parent, error);
         if (error) {
-            throw SettingsStoreError{SettingsStoreWriteStage::Parent,
-                                     "failed to create settings directory `" + parent.string() + "`: " + error.message()};
+            throw SettingsStoreError{SettingsStoreWriteStage::Parent, "failed to create settings directory `" + parent.string() + "`: " + error.message()};
         }
     }
     nlohmann::json document = contracts::snapshot_gui_settings(settings);
@@ -103,9 +87,8 @@ void SettingsStore::save(const std::filesystem::path& path, const contracts::Gui
     if (failure.has_value()) {
         std::error_code cleanup_error;
         std::filesystem::remove(path.string() + ".tmp", cleanup_error);
-        throw SettingsStoreError{settings_write_stage(*failure), "failed to persist GUI settings `" + path.string() + "` at stage " +
-                                                                     std::string(common_io::to_string(*failure))};
+        throw SettingsStoreError{settings_write_stage(*failure),
+                                 "failed to persist GUI settings `" + path.string() + "` at stage " + std::string(common_io::to_string(*failure))};
     }
 }
-
 }  // namespace mmltk::controller::services

@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -7,15 +6,11 @@
 #include <mutex>
 #include <span>
 #include <string_view>
-
 #include "src/common/io/scoped_fd.h"
-
 namespace mmltk::controller::services {
-
 struct DiagnosticRecord final {
     std::string_view json;
 };
-
 enum class DiagnosticSubmitResult : std::uint8_t {
     Accepted,
     Disabled,
@@ -25,38 +20,31 @@ enum class DiagnosticSubmitResult : std::uint8_t {
     Closed,
     Contended,
 };
-
 enum class DiagnosticsCloseMode : std::uint8_t { Flush, Discard };
 enum class DiagnosticsExecutionPolicy : std::uint8_t { BackgroundWriter, CallerDriven };
 enum class DiagnosticsTerminal : std::uint8_t { Pending, Drained, Failed };
-
 struct DiagnosticsCounters final {
     std::uint64_t accepted = 0U;
     std::uint64_t flushed = 0U;
     std::uint64_t dropped = 0U;
     std::uint64_t write_failures = 0U;
 };
-
 class DiagnosticsProducer;
-
 // Application-owned bounded JSONL sink.  A producer is a weak capability: it
 // never keeps file I/O or the writer alive after application shutdown.
 class DiagnosticsClient final {
    public:
     static constexpr std::size_t kRecordCapacity = 16U * 1024U;
     static constexpr std::size_t kQueueCapacity = 256U;
-
     DiagnosticsClient() noexcept = default;
     explicit DiagnosticsClient(const std::filesystem::path& path) noexcept;
     explicit DiagnosticsClient(mmltk::common::io::ScopedFd descriptor) noexcept;
     DiagnosticsClient(mmltk::common::io::ScopedFd descriptor, DiagnosticsExecutionPolicy policy) noexcept;
     ~DiagnosticsClient() noexcept;
-
     DiagnosticsClient(const DiagnosticsClient&) = delete;
     DiagnosticsClient& operator=(const DiagnosticsClient&) = delete;
     DiagnosticsClient(DiagnosticsClient&&) noexcept;
     DiagnosticsClient& operator=(DiagnosticsClient&&) noexcept;
-
     [[nodiscard]] static DiagnosticsClient from_environment() noexcept;
     [[nodiscard]] bool enabled() const noexcept;
     [[nodiscard]] DiagnosticsProducer producer() const noexcept;
@@ -73,12 +61,10 @@ class DiagnosticsClient final {
     [[nodiscard]] bool wait_for_capacity_waiter_for_test() noexcept;
     friend struct DiagnosticsClientTestAccess;
     void initialize(mmltk::common::io::ScopedFd descriptor, DiagnosticsExecutionPolicy policy) noexcept;
-
     struct State;
     std::shared_ptr<State> state_;
     friend class DiagnosticsProducer;
 };
-
 class DiagnosticsProducer final {
    public:
     class Operation final {
@@ -99,18 +85,14 @@ class DiagnosticsProducer final {
         [[nodiscard]] DiagnosticSubmitResult submit(DiagnosticRecord record, bool wait_for_capacity, bool validate = true) const noexcept;
         [[nodiscard]] DiagnosticSubmitResult submit_terminal_encoded(DiagnosticRecord record) const noexcept;
         using EncodedBatchWriter = bool (*)(void*, std::size_t, std::span<char>, std::size_t&) noexcept;
-        [[nodiscard]] DiagnosticSubmitResult submit_encoded_batch(std::size_t count, void* context, EncodedBatchWriter writer,
-                                                                  bool complete) const noexcept;
-        [[nodiscard]] DiagnosticSubmitResult submit_encoded(DiagnosticRecord record, bool complete) const noexcept {
-            return submit(record, complete, false);
-        }
+        [[nodiscard]] DiagnosticSubmitResult submit_encoded_batch(std::size_t count, void* context, EncodedBatchWriter writer, bool complete) const noexcept;
+        [[nodiscard]] DiagnosticSubmitResult submit_encoded(DiagnosticRecord record, bool complete) const noexcept { return submit(record, complete, false); }
         friend class RuntimeDiagnosticTarget;
         explicit Operation(std::shared_ptr<DiagnosticsClient::State> state, bool complete = false) noexcept;
         std::shared_ptr<DiagnosticsClient::State> state_;
         mutable bool complete_active_ = false;
         friend class DiagnosticsProducer;
     };
-
     DiagnosticsProducer() noexcept = default;
     [[nodiscard]] Operation acquire() const noexcept;
     [[nodiscard]] bool enabled() const noexcept;
@@ -124,5 +106,4 @@ class DiagnosticsProducer final {
     std::weak_ptr<DiagnosticsClient::State> state_;
     friend class DiagnosticsClient;
 };
-
 }  // namespace mmltk::controller::services

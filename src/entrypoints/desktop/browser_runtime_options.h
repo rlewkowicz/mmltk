@@ -5,7 +5,6 @@
 #include <utility>
 #include "src/controller/shell/application_shell.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
-
 namespace mmltk::entrypoints::desktop {
 using BrowserPresentationConfig = mmltk::controller::shell::ApplicationShellConfig::PresentationConfig;
 struct BrowserRuntimeConfig final {
@@ -15,12 +14,10 @@ struct BrowserRuntimeConfig final {
 MMLTK_REFLECT_FIELDS(BrowserRuntimeConfig)
 inline constexpr std::array kBrowserExecutionOptions{
     mmltk::frameworks::reflection::option<
-        BrowserRuntimeConfig,
-        mmltk::frameworks::reflection::member_path<&BrowserRuntimeConfig::presentation, &BrowserPresentationConfig::cuda_device_index>>(
+        BrowserRuntimeConfig, mmltk::frameworks::reflection::member_path<&BrowserRuntimeConfig::presentation, &BrowserPresentationConfig::cuda_device_index>>(
         "--device-id", "CUDA-visible visual device", "Execution"),
     mmltk::frameworks::reflection::option<
-        BrowserRuntimeConfig,
-        mmltk::frameworks::reflection::member_path<&BrowserRuntimeConfig::presentation, &BrowserPresentationConfig::numa_node>>(
+        BrowserRuntimeConfig, mmltk::frameworks::reflection::member_path<&BrowserRuntimeConfig::presentation, &BrowserPresentationConfig::numa_node>>(
         "--numa-node", "GPU-local NUMA node (-1 selects automatic locality)", "Execution"),
     mmltk::frameworks::reflection::negative_flag<BrowserRuntimeConfig, &BrowserRuntimeConfig::h2d_dataloader>(
         "--gdrcopy", "Use GDRCopy for compiled-image loading", "Execution")};

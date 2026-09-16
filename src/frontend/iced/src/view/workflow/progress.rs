@@ -41,8 +41,14 @@ pub fn compute_presentation(state: Option<&crate::generated::ComputeUiState>) ->
         };
     }
     if state.progress.sequence == 0 || state.progress.status.is_empty() {
-        return if state.terminal.detail.is_empty() { Presentation::Active } else {
-            Presentation::OpenEnded { stage: state.terminal.detail.clone(), activity: String::new(), completed: 0 }
+        return if state.terminal.detail.is_empty() {
+            Presentation::Active
+        } else {
+            Presentation::OpenEnded {
+                stage: state.terminal.detail.clone(),
+                activity: String::new(),
+                completed: 0,
+            }
         };
     }
     if state.progress.total == 0 {
@@ -306,20 +312,31 @@ mod tests {
 
     #[test]
     fn prediction_progress_preserves_processed_count_without_a_declared_total() {
-        let mut predict = snapshots().into_iter().find_map(|snapshot| match snapshot {
-            crate::generated::ApplicationSnapshot::Predict(value) => Some(value),
-            _ => None,
-        }).unwrap();
+        let mut predict = snapshots()
+            .into_iter()
+            .find_map(|snapshot| match snapshot {
+                crate::generated::ApplicationSnapshot::Predict(value) => Some(value),
+                _ => None,
+            })
+            .unwrap();
         predict.operation.active = true;
         predict.operation.progress.sequence = 1;
         predict.operation.progress.completed = 7;
         predict.operation.progress.total = 0;
         predict.operation.progress.status = "Processed".into();
-        assert!(matches!(compute_presentation(Some(&predict.operation)),
-            Presentation::OpenEnded { completed: 7, .. }));
+        assert!(matches!(
+            compute_presentation(Some(&predict.operation)),
+            Presentation::OpenEnded { completed: 7, .. }
+        ));
         predict.operation.progress.total = 10;
-        assert!(matches!(compute_presentation(Some(&predict.operation)),
-            Presentation::Determinate { completed: 7, total: 10, .. }));
+        assert!(matches!(
+            compute_presentation(Some(&predict.operation)),
+            Presentation::Determinate {
+                completed: 7,
+                total: 10,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -332,7 +349,8 @@ mod tests {
             })
             .unwrap();
         validation.operation.active = false;
-        validation.operation.terminal.outcome = crate::generated::ComputeOperationOutcome::Succeeded;
+        validation.operation.terminal.outcome =
+            crate::generated::ComputeOperationOutcome::Succeeded;
         validation.operation.terminal.output = "metrics.json".into();
         assert!(matches!(
             compute_presentation(Some(&validation.operation)),

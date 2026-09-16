@@ -6,24 +6,16 @@ module;
 #include <span>
 #include <stdexcept>
 #include <vector>
-
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/models/rfdetr/augmentation/annotation_support.h"
-
 module mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
-
 namespace mmltk::backend::models::rfdetr {
-
 namespace {
-
 constexpr std::array<float, kAugmentationTransformSize> kIdentity{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
-
 }
-
 void build_augmentation_preview_annotations(const std::span<const mmltk::backend::data::PackedInstance> source_instances,
                                             const mmltk::backend::data::PackedInstance* donor_instance, const AugmentationImagePlan* plan,
-                                            const int image_width, const int image_height,
-                                            std::vector<AugmentationPreviewAnnotation>& output,
+                                            const int image_width, const int image_height, std::vector<AugmentationPreviewAnnotation>& output,
                                             std::span<const mmltk::backend::data::RLEPair> source_runs) {
     output.clear();
     const bool has_paste = plan != nullptr && plan->paste_donor_slot >= 0;
@@ -35,8 +27,7 @@ void build_augmentation_preview_annotations(const std::span<const mmltk::backend
         const auto offset = instance.mask_rle_pairs != 0 ? instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair) : 0;
         if (offset > source_runs.size() || instance.mask_rle_pairs > source_runs.size() - offset)
             throw std::invalid_argument("augmentation source mask exceeds host run storage");
-        const auto mapped =
-            map_augmentation_instance(instance, image_width, image_height, plan, source_runs.subspan(offset, instance.mask_rle_pairs));
+        const auto mapped = map_augmentation_instance(instance, image_width, image_height, plan, source_runs.subspan(offset, instance.mask_rle_pairs));
         if (!mapped.visible) continue;
         output.push_back(AugmentationPreviewAnnotation{
             .source_ordinal = ordinal,
@@ -51,13 +42,11 @@ void build_augmentation_preview_annotations(const std::span<const mmltk::backend
         });
     }
     if (!has_paste) { return; }
-    const auto support = resolve_augmentation_annotation_support(
-        plan->paste_source_box, std::span{plan->paste_support, plan->paste_support_count}, image_width, image_height, plan, true);
+    const auto support = resolve_augmentation_annotation_support(plan->paste_source_box, std::span{plan->paste_support, plan->paste_support_count}, image_width,
+                                                                 image_height, plan, true);
     if (!support.present) return;
     const std::int32_t occluder_index = static_cast<std::int32_t>(output.size());
-    for (AugmentationPreviewAnnotation& annotation : output) {
-        annotation.occluder_index = occluder_index;
-    }
+    for (AugmentationPreviewAnnotation& annotation : output) { annotation.occluder_index = occluder_index; }
     output.push_back(AugmentationPreviewAnnotation{
         .source_ordinal = source_instances.size(),
         .visible_area_pixels = support.area_pixels,
@@ -69,5 +58,4 @@ void build_augmentation_preview_annotations(const std::span<const mmltk::backend
         .class_id = donor_instance->class_id,
     });
 }
-
 }  // namespace mmltk::backend::models::rfdetr

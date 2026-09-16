@@ -79,15 +79,6 @@ impl ApplicationModel {
             && !self.has_pending(ApplicationIntentEndpoint::DatasetStop)
     }
 
-    pub fn dataset_unsettled(&self) -> bool {
-        self.has_pending(ApplicationIntentEndpoint::DatasetCompile)
-            || self
-                .workflow
-                .dataset
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.active)
-    }
-
     pub fn dataset_stop_available(&self) -> bool {
         self.connection == ConnectionState::Connected
             && self.workflow.dataset.as_ref().is_some_and(|snapshot| {
@@ -100,14 +91,28 @@ impl ApplicationModel {
     }
 
     pub fn compute_start_available(&self, settings: &GuiSettingsState, page: FeatureId) -> bool {
-        let orchestrated = matches!(page, FeatureId::Train | FeatureId::Validate | FeatureId::Predict);
-        if self.connection != ConnectionState::Connected || self.settings_snapshot.is_none()
-            || self.workflow.pending_start.is_some() || self.dialog_context.is_some()
+        let orchestrated = matches!(
+            page,
+            FeatureId::Train | FeatureId::Validate | FeatureId::Predict
+        );
+        if self.connection != ConnectionState::Connected
+            || self.settings_snapshot.is_none()
+            || self.workflow.pending_start.is_some()
+            || self.dialog_context.is_some()
             || self.has_pending(ApplicationIntentEndpoint::SettingsReset)
-        { return false; }
+        {
+            return false;
+        }
         if orchestrated {
-            if !model_settings_projection(settings, page).is_some_and(|selection| selection.can_prepare()) { return false; }
-        } else if self.native_settings_unsettled() || self.model_request_pending() || !self.model_selection_matches(settings, page) {
+            if !model_settings_projection(settings, page)
+                .is_some_and(|selection| selection.can_prepare())
+            {
+                return false;
+            }
+        } else if self.native_settings_unsettled()
+            || self.model_request_pending()
+            || !self.model_selection_matches(settings, page)
+        {
             return false;
         }
         match page {
@@ -117,7 +122,10 @@ impl ApplicationModel {
                 }) && !self.training_family_pending()
             }
             FeatureId::Validate => self.compute_start_available_for(
-                self.workflow.validation.as_ref().map(|snapshot| &snapshot.operation),
+                self.workflow
+                    .validation
+                    .as_ref()
+                    .map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::ValidationStart,
                 ApplicationIntentEndpoint::ValidationStop,
             ),
@@ -149,10 +157,20 @@ impl ApplicationModel {
     }
 
     pub fn compute_stop_available(&self, page: FeatureId) -> bool {
-        if self.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == page) { return true; }
+        if self
+            .workflow
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| pending.feature == page)
+        {
+            return true;
+        }
         let (snapshot, start, stop) = match page {
             FeatureId::Validate => (
-                self.workflow.validation.as_ref().map(|snapshot| &snapshot.operation),
+                self.workflow
+                    .validation
+                    .as_ref()
+                    .map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::ValidationStart,
                 ApplicationIntentEndpoint::ValidationStop,
             ),
@@ -180,7 +198,14 @@ impl ApplicationModel {
     }
 
     pub fn training_stop_available(&self) -> bool {
-        if self.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == FeatureId::Train) { return true; }
+        if self
+            .workflow
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| pending.feature == FeatureId::Train)
+        {
+            return true;
+        }
         self.connection == ConnectionState::Connected
             && self.workflow.training.as_ref().is_some_and(|snapshot| {
                 snapshot.activity == crate::generated::TrainingActivity::Local

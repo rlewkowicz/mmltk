@@ -4,7 +4,6 @@
 #include <cuda_runtime_api.h>
 #include <poll.h>
 #include <sys/socket.h>
-
 #include <array>
 #include <bit>
 #include "src/controller/subsystems/explore/detail/gallery_atlas.h"
@@ -34,7 +33,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 #include "filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_format.h"
 #include "src/acceptance/tests/async_test_utils.hpp"
@@ -45,7 +43,6 @@
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/common/io/scoped_fd.h"
-
 namespace mmltk::controller::explore_detail {
 struct GalleryStreamTestAccess final {
     static void FailStreamWait(GalleryStream& owner) {
@@ -54,8 +51,7 @@ struct GalleryStreamTestAccess final {
     static std::weak_ptr<const void> Custody(const GalleryStream& owner) { return owner.impl_; }
     static auto Fact(const GalleryStream& owner) { return owner.terminal_.fact(); }
 };
-}
-
+}  // namespace mmltk::controller::explore_detail
 namespace native_gallery_allocations {
 thread_local bool enabled = false;
 thread_local std::size_t count = 0U;
@@ -92,10 +88,8 @@ struct Scope final {
 [[gnu::noinline]] void operator delete[](void* value, std::align_val_t) noexcept { std::free(value); }
 [[gnu::noinline]] void operator delete(void* value, std::size_t, std::align_val_t) noexcept { std::free(value); }
 [[gnu::noinline]] void operator delete[](void* value, std::size_t, std::align_val_t) noexcept { std::free(value); }
-
 namespace mmltk::controller {
 namespace {
-
 void check_labels(const std::span<const ExploreLabel> actual, const std::span<const ExploreLabel> expected) {
     REQUIRE(actual.size() == expected.size());
     for (std::size_t index = 0U; index != actual.size(); ++index) {
@@ -104,11 +98,10 @@ void check_labels(const std::span<const ExploreLabel> actual, const std::span<co
         CHECK(actual[index].compiled_index == expected[index].compiled_index);
     }
 }
-
 // A real compiled artifact keeps source reads, RLE projection, augmentation,
 // CUDA rendering, cache ownership and runtime publication in the test path.
-void write_gallery_artifact(const std::filesystem::path& path, const float red, const std::uint32_t mask_start,
-                            const std::uint32_t count = 203U, const std::uint32_t classes = 1U) {
+void write_gallery_artifact(const std::filesystem::path& path, const float red, const std::uint32_t mask_start, const std::uint32_t count = 203U,
+                            const std::uint32_t classes = 1U) {
     namespace data = mmltk::backend::data;
     data::FileHeader header{.magic = data::MAGIC,
                             .version = data::FORMAT_VERSION,
@@ -168,7 +161,6 @@ void write_gallery_artifact(const std::filesystem::path& path, const float red, 
     output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     REQUIRE(output.good());
 }
-
 struct GalleryEvidence final {
     std::mutex mutex;
     std::condition_variable changed;
@@ -192,8 +184,7 @@ struct GalleryEvidence final {
     [[nodiscard]] std::size_t Count(const VisualDiagnosticOperation operation) {
         std::scoped_lock lock(mutex);
         std::size_t count = 0U;
-        for (const auto& fact : facts)
-            count += fact.operation == operation;
+        for (const auto& fact : facts) count += fact.operation == operation;
         return count;
     }
     [[nodiscard]] std::size_t BackgroundSubmissions() {
@@ -207,8 +198,7 @@ struct GalleryEvidence final {
         std::scoped_lock lock(mutex);
         std::vector<std::uint64_t> images;
         for (const auto& fact : facts)
-            if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == generation)
-                images.push_back(fact.detail);
+            if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled && fact.generation == generation) images.push_back(fact.detail);
         return images;
     }
     [[nodiscard]] VisualDiagnosticSink Sink() {
@@ -225,17 +215,13 @@ struct GalleryEvidence final {
                 .pixel_probes = true};
     }
 };
-
 class NativeGalleryArtifact final {
     mmltk::testsupport::ScopedTempDir directory_;
 
    public:
     const std::filesystem::path path;
-    explicit NativeGalleryArtifact(const char* name) : directory_(name), path(directory_.path() / "compiled.bin") {
-        write_gallery_artifact(path, 0.25F, 9U);
-    }
+    explicit NativeGalleryArtifact(const char* name) : directory_(name), path(directory_.path() / "compiled.bin") { write_gallery_artifact(path, 0.25F, 9U); }
 };
-
 class GalleryReadPause final {
    public:
     explicit GalleryReadPause(const std::uint32_t image, const bool fail = false) : image_(image), fail_(fail) {}
@@ -273,7 +259,6 @@ class GalleryReadPause final {
     bool entered_ = false;
     bool released_ = false;
 };
-
 struct GalleryGpuPause final {
     std::mutex mutex;
     std::condition_variable changed;
@@ -303,20 +288,16 @@ struct GalleryGpuPause final {
     }
     ~GalleryGpuPause() { Release(); }
 };
-
-[[nodiscard]] std::vector<std::uint8_t> copy_product_plane(mmltk::frameworks::gpu::BorrowedImageProductReadView product,
-                                                           const std::size_t plane_index) {
+[[nodiscard]] std::vector<std::uint8_t> copy_product_plane(mmltk::frameworks::gpu::BorrowedImageProductReadView product, const std::size_t plane_index) {
     REQUIRE(product.valid());
     const auto plane = product.plane(plane_index).plane();
     std::vector<std::uint8_t> bytes(plane.descriptor.row_bytes() * plane.descriptor.height);
-    REQUIRE(cudaMemcpy2D(bytes.data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data),
-                         plane.descriptor.pitch_bytes, plane.descriptor.row_bytes(), plane.descriptor.height,
-                         cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy2D(bytes.data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes,
+                         plane.descriptor.row_bytes(), plane.descriptor.height, cudaMemcpyDeviceToHost) == cudaSuccess);
     return bytes;
 }
-
-[[nodiscard]] std::vector<std::uint8_t> copy_atlas_plane(mmltk::frameworks::gpu::BorrowedImageProductReadView product,
-                                                         const std::size_t plane_index, const ExploreAtlasLayout& layout) {
+[[nodiscard]] std::vector<std::uint8_t> copy_atlas_plane(mmltk::frameworks::gpu::BorrowedImageProductReadView product, const std::size_t plane_index,
+                                                         const ExploreAtlasLayout& layout) {
     REQUIRE(product.valid());
     REQUIRE(layout.row_capacity != 0U);
     REQUIRE(layout.row_count <= layout.row_capacity);
@@ -329,11 +310,9 @@ struct GalleryGpuPause final {
     const auto row_size = row_bytes * layout.card_extent;
     std::vector<std::uint8_t> logical(row_size * layout.row_count);
     for (std::size_t row = 0U; row < layout.row_count; ++row)
-        std::copy_n(physical.data() + (layout.row_origin + row) % layout.row_capacity * row_size, row_size,
-                    logical.data() + row * row_size);
+        std::copy_n(physical.data() + (layout.row_origin + row) % layout.row_capacity * row_size, row_size, logical.data() + row * row_size);
     return logical;
 }
-
 class NativeGallery final {
    public:
     GalleryEvidence evidence;
@@ -352,8 +331,8 @@ class NativeGallery final {
         if (atlas_side != side || atlas_columns != plan.viewport.columns) atlas_rows = 0U;
         atlas_side = side;
         atlas_columns = plan.viewport.columns;
-        atlas_rows = std::max(atlas_rows, std::min(std::bit_ceil(plan.viewport.row_count),
-                                                   static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns)));
+        atlas_rows = std::max(
+            atlas_rows, std::min(std::bit_ceil(plan.viewport.row_count), static_cast<std::uint32_t>(kExploreVisibleItemCapacity / plan.viewport.columns)));
         return {plan.viewport.extent.width, atlas_rows * side};
     }
     std::size_t publications = 0U;
@@ -365,7 +344,6 @@ class NativeGallery final {
     std::optional<ExploreAcceptanceGate::SubmissionStage> supersede_at;
     std::atomic_bool superseded{false};
     std::atomic<std::size_t> logical_copies{0U};
-
     explicit NativeGallery(const std::uint32_t columns, const bool delayed = false, const bool observed_submission = false) {
         if (delayed || observed_submission) {
             std::array<int, 2U> sockets{};
@@ -378,17 +356,15 @@ class NativeGallery final {
                 static_cast<NativeGallery*>(context)->logical_copies.fetch_add(observation.copied_entries);
             });
             if (observed_submission)
-                gate->SetSubmissionObserver(
-                    this, [](void* context, const std::uintptr_t stream, const ExploreAcceptanceGate::SubmissionStage stage) {
-                        auto& gallery = *static_cast<NativeGallery*>(context);
-                        if (gallery.supersede_at == stage) {
-                            gallery.demand->store(0U);
-                            gallery.superseded.store(true);
-                        }
-                        if (stage == ExploreAcceptanceGate::SubmissionStage::Background && gallery.pause) gallery.pause->Submit(stream);
-                        if (stage == ExploreAcceptanceGate::SubmissionStage::Probe && gallery.probe_pause)
-                            gallery.probe_pause->Submit(stream);
-                    });
+                gate->SetSubmissionObserver(this, [](void* context, const std::uintptr_t stream, const ExploreAcceptanceGate::SubmissionStage stage) {
+                    auto& gallery = *static_cast<NativeGallery*>(context);
+                    if (gallery.supersede_at == stage) {
+                        gallery.demand->store(0U);
+                        gallery.superseded.store(true);
+                    }
+                    if (stage == ExploreAcceptanceGate::SubmissionStage::Background && gallery.pause) gallery.pause->Submit(stream);
+                    if (stage == ExploreAcceptanceGate::SubmissionStage::Probe && gallery.probe_pause) gallery.probe_pause->Submit(stream);
+                });
         }
         runtime = make_native_explore_runtime_factory(
             {.device = 0, .maximum_width = 4096U, .maximum_height = 4096U}, 2U,
@@ -402,9 +378,7 @@ class NativeGallery final {
         plan.augmentation_config.enabled = false;
         plan.generation = 1U;
     }
-    void Command(const std::uint8_t command) {
-        REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command));
-    }
+    void Command(const std::uint8_t command) { REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command)); }
     ~NativeGallery() {
         demand->store(0U);
         if (algorithm) algorithm->StopIngress();
@@ -420,8 +394,8 @@ class NativeGallery final {
     ExploreGalleryPublication Begin(const ExploreOrderCandidate* order = nullptr, const bool commit = true) {
         // The fixture stands in for ExploreSystem, the identity issuer. Native
         // rendering itself receives only the issued scalar validity key.
-        if (plan.semantic_identity == 0U || plan.overlay.show_boxes != issued_semantics.show_boxes ||
-            plan.overlay.show_masks != issued_semantics.show_masks || plan.overlay.class_selection != issued_semantics.class_selection) {
+        if (plan.semantic_identity == 0U || plan.overlay.show_boxes != issued_semantics.show_boxes || plan.overlay.show_masks != issued_semantics.show_masks ||
+            plan.overlay.class_selection != issued_semantics.class_selection) {
             issued_semantics = plan.overlay;
             ++plan.semantic_identity;
         }
@@ -514,15 +488,13 @@ class NativeGallery final {
         return copy_atlas_plane(runtime->Borrow(), plane_index, displayed_layout);
     }
 };
-
 TEST_CASE("Atlas directories reconcile exact allocations and invalidate only touched physical cells", "[explore][atlas]") {
     using namespace explore_detail;
     using namespace mmltk::frameworks::gpu;
     GalleryAtlas directory;
     const auto plane = [](const std::uint64_t owner, const std::uint64_t identity, const ImagePlaneKind kind) {
-        return ImagePlaneView{.data = 1U,
-                              .descriptor = {.kind = kind, .width = 16U, .height = 64U, .pitch_bytes = 64U},
-                              .allocation = {identity, 16U, 64U, owner}};
+        return ImagePlaneView{
+            .data = 1U, .descriptor = {.kind = kind, .width = 16U, .height = 64U, .pitch_bytes = 64U}, .allocation = {identity, 16U, 64U, owner}};
     };
     auto clean = plane(1U, 11U, ImagePlaneKind::Clean);
     auto semantic = plane(2U, 12U, ImagePlaneKind::Semantic);
@@ -582,7 +554,6 @@ TEST_CASE("Atlas directories reconcile exact allocations and invalidate only tou
     static_cast<void>(directory.Begin(clean, semantic, viewport, pixels));
     CHECK_FALSE(directory.Contains(first_cell, first, 7U));
 }
-
 TEST_CASE("Atlas display coverage retains its exact prior content across write admission", "[explore][atlas][workspace]") {
     using namespace explore_detail;
     using namespace mmltk::frameworks::gpu;
@@ -607,8 +578,7 @@ TEST_CASE("Atlas display coverage retains its exact prior content across write a
                                 static_cast<std::size_t>(region.x2 - region.x1) * 4U);
         }
     };
-    SystemImageRuntime runtime(
-        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = finalize});
+    SystemImageRuntime runtime({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = finalize});
     GalleryAtlas atlas;
     const ExploreViewport viewport{.extent = {16U, 16U}, .row_count = 2U, .columns = 2U};
     const GalleryThumbnailCache::Identity identity{.dataset = 1U, .extent = 8U};
@@ -619,12 +589,10 @@ TEST_CASE("Atlas display coverage retains its exact prior content across write a
             if (initial) {
                 for (auto plane : {clean, semantic})
                     std::memset(reinterpret_cast<void*>(plane.data), 37, plane.descriptor.pitch_bytes * plane.descriptor.height);
-                for (std::size_t cell = 0U; cell != 4U; ++cell)
-                    atlas.Stage(cell);
+                for (std::size_t cell = 0U; cell != 4U; ++cell) atlas.Stage(cell);
             } else {
                 atlas.Touch(0U);
-                for (std::uint32_t row = 0U; row != 8U; ++row)
-                    std::memset(reinterpret_cast<void*>(clean.data + row * clean.descriptor.pitch_bytes), 73, 32U);
+                for (std::uint32_t row = 0U; row != 8U; ++row) std::memset(reinterpret_cast<void*>(clean.data + row * clean.descriptor.pitch_bytes), 73, 32U);
                 atlas.Stage(0U);
             }
         });
@@ -650,22 +618,18 @@ TEST_CASE("Atlas display coverage retains its exact prior content across write a
     CHECK(*(reinterpret_cast<const std::byte*>(output.data) + 8U * output.descriptor.pitch_bytes) == std::byte{37});
     REQUIRE(runtime.DetachDisplay(workspace));
     full = true;
-    SystemImageRuntime replacement(
-        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = finalize});
-    replacement.Publish(16U, 16U, [](auto clean, auto, auto) {
-        std::memset(reinterpret_cast<void*>(clean.data), 91, clean.descriptor.pitch_bytes * clean.descriptor.height);
-    });
+    SystemImageRuntime replacement({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .workspace_finalize = finalize});
+    replacement.Publish(
+        16U, 16U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 91, clean.descriptor.pitch_bytes * clean.descriptor.height); });
     REQUIRE(replacement.PrepareDisplay(replacement.Completed().revision(), workspace));
     CHECK(*reinterpret_cast<const std::byte*>(output.data) == std::byte{91});
     CHECK(*(reinterpret_cast<const std::byte*>(output.data) + 32U) == std::byte{91});
 }
-
 TEST_CASE("Detail framework prewrite failure invalidates its atlas before entering the renderer", "[explore][atlas]") {
     using namespace explore_detail;
     using namespace mmltk::frameworks::gpu;
     auto backend = std::make_shared<test_support::FakeImageBackend>();
-    SystemImageRuntime runtime{
-        {.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U}};
+    SystemImageRuntime runtime{{.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic, .output_buffer_count = 3U}};
     GalleryAtlas directory;
     const ExploreViewport viewport{.extent = {24U, 8U}, .columns = 3U};
     const GalleryThumbnailCache::Identity pixels{.dataset = 1U, .extent = 8U};
@@ -744,7 +708,6 @@ TEST_CASE("Detail framework prewrite failure invalidates its atlas before enteri
     CHECK(runtime.Completed().revision() == replacement.revision());
     check_selected(71U);
 }
-
 // CLEANUP-IGNORE: These independent gallery-return and initialization-rollback cases share only CUDA availability and dataset fixture
 // setup.
 TEST_CASE("Native gallery return selects its actual completed product and resumes partial demand", "[explore][native][atlas][detail]") {
@@ -813,9 +776,7 @@ TEST_CASE("Native gallery return selects its actual completed product and resume
     CHECK(gallery.runtime->Completed().revision() != revision);
     gallery.Drain();
 }
-
-TEST_CASE("Native gallery rollback and detail retain an unfinished independent image read",
-          "[explore][native][atlas][transaction][detail]") {
+TEST_CASE("Native gallery rollback and detail retain an unfinished independent image read", "[explore][native][atlas][transaction][detail]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
     const bool change_geometry = GENERATE(false, true);
@@ -842,8 +803,7 @@ TEST_CASE("Native gallery rollback and detail retain an unfinished independent i
                 if (!ready[slot]) continue;
                 REQUIRE(current[slot]);
                 for (std::size_t row = 0U; row < layout.card_extent; ++row) {
-                    const auto offset = ((slot / layout.columns * layout.card_extent + row) * layout.columns + slot % layout.columns) *
-                                        layout.card_extent * 4U;
+                    const auto offset = ((slot / layout.columns * layout.card_extent + row) * layout.columns + slot % layout.columns) * layout.card_extent * 4U;
                     CHECK(std::ranges::equal(std::span{pixels[plane]}.subspan(offset, layout.card_extent * 4U),
                                              std::span{next}.subspan(offset, layout.card_extent * 4U)));
                 }
@@ -908,9 +868,7 @@ TEST_CASE("Native gallery rollback and detail retain an unfinished independent i
     check_visible_continuity();
     CHECK(std::ranges::all_of(gallery.algorithm->AdvanceGallery().ready_slots, [](bool slot_ready) { return slot_ready; }));
 }
-
-TEST_CASE("Native gallery retains slot products across hot reuse semantic changes collisions and artifact replacement",
-          "[explore][native][cache]") {
+TEST_CASE("Native gallery retains slot products across hot reuse semantic changes collisions and artifact replacement", "[explore][native][cache]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
     const auto columns = GENERATE(4U, 10U);
@@ -968,7 +926,6 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreAugmentationBatchPrepared) == 0U);
     CHECK(gallery.Pixels(0U) == original);
-
     gallery.plan.overlay.show_masks = !gallery.plan.overlay.show_masks;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -999,7 +956,6 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
         CHECK(semantic_copies == columns * 2U * tile_bytes);
         CHECK(restored_tiles <= columns * 2U);
     }
-
     gallery.plan.viewport.first_row = 18U;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -1019,7 +975,6 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     gallery.demand->store(gallery.plan.generation);
     gallery.Begin();
     gallery.Drain();
-
     gallery.plan.viewport.first_row = 18U;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -1031,7 +986,6 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.Pixels(0U) == original);
-
     const auto stable_seed_identity = gallery.plan.dataset_identity;
     gallery.plan.overlay.show_masks = true;
     gallery.plan.overlay.show_boxes = false;
@@ -1056,7 +1010,6 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     gallery.Begin();
     gallery.Drain();
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) > before_jump);
-
     gallery.plan.viewport.extent = {columns * 16U, 32U};
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -1142,7 +1095,6 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     CHECK(gallery.algorithm->Visible(gallery.plan.viewport).visible_indices.size() == 3U);
     CHECK(gallery.Pixels(0U).back() == 0U);
     CHECK(gallery.Pixels(1U).back() == 0U);
-
     auto filtered = gallery.algorithm->PrepareFilter({.minimum_instances = 2U}, 0U, 2U, {});
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -1155,7 +1107,6 @@ TEST_CASE("Native gallery retains slot products across hot reuse semantic change
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == stopped_reads);
 }
-
 TEST_CASE("Native five six five row demand immediately retains pixel identity through reorder", "[explore][native][cache]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1206,7 +1157,6 @@ TEST_CASE("Native five six five row demand immediately retains pixel identity th
         }
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadScheduled) == reads);
 }
-
 TEST_CASE("Native visible admission retains completed gallery pixels through detail return", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1239,7 +1189,6 @@ TEST_CASE("Native visible admission retains completed gallery pixels through det
     CHECK(gallery.Begin().cumulative_tiles == 8U);
     CHECK(gallery.Pixels(0U) == pixels);
 }
-
 TEST_CASE("Native disk admission follows visible leading and prior rows in both directions", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1257,16 +1206,13 @@ TEST_CASE("Native disk admission follows visible leading and prior rows in both 
     {
         std::scoped_lock lock(gallery.evidence.mutex);
         for (const auto& fact : gallery.evidence.facts)
-            if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled)
-                admitted.push_back(static_cast<std::uint32_t>(fact.detail));
+            if (fact.operation == VisualDiagnosticOperation::GalleryReadScheduled) admitted.push_back(static_cast<std::uint32_t>(fact.detail));
     }
     std::vector<std::uint32_t> expected;
     const auto visible_end = std::min(203U, (first_row + 2U) * 2U);
-    for (auto image = first_row * 2U; image < visible_end; ++image)
-        expected.push_back(image);
+    for (auto image = first_row * 2U; image < visible_end; ++image) expected.push_back(image);
     const auto ahead = [&] {
-        for (auto image = visible_end; image < std::min(203U, (first_row + 6U) * 2U); ++image)
-            expected.push_back(image);
+        for (auto image = visible_end; image < std::min(203U, (first_row + 6U) * 2U); ++image) expected.push_back(image);
     };
     const auto behind = [&] {
         const auto begin = first_row > 4U ? first_row - 4U : 0U;
@@ -1285,7 +1231,6 @@ TEST_CASE("Native disk admission follows visible leading and prior rows in both 
     }
     CHECK(admitted == expected);
 }
-
 TEST_CASE("Native viewport restoration publishes cached rows from either side before fetching misses", "[explore][native][cache]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1298,8 +1243,7 @@ TEST_CASE("Native viewport restoration publishes cached rows from either side be
     gallery.Drain();
     const auto move = [&](std::uint32_t row) {
         if (row != gallery.plan.viewport.first_row)
-            gallery.plan.scroll_direction =
-                row > gallery.plan.viewport.first_row ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
+            gallery.plan.scroll_direction = row > gallery.plan.viewport.first_row ? ExploreScrollDirection::Forward : ExploreScrollDirection::Backward;
         gallery.plan.viewport.first_row = row;
         ++gallery.plan.generation;
         gallery.demand->store(gallery.plan.generation);
@@ -1340,7 +1284,6 @@ TEST_CASE("Native viewport restoration publishes cached rows from either side be
     CHECK(admissions[1U] == 3U);
     check_cached_row();
 }
-
 TEST_CASE("Native cold visible admission proceeds while obsolete speculation holds its physical lane", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1385,7 +1328,6 @@ TEST_CASE("Native cold visible admission proceeds while obsolete speculation hol
     gallery.Drain();
     CHECK(gallery.algorithm->Visible(gallery.plan.viewport).visible_indices == std::vector<std::uint32_t>{40U, 41U, 42U, 43U});
 }
-
 TEST_CASE("Native scroll reversal retains a useful pending read and cached visible tiles", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1430,9 +1372,7 @@ TEST_CASE("Native scroll reversal retains a useful pending read and cached visib
     CHECK(held_admissions == 1U);
     CHECK(gallery.Pixels(0U) != before);
 }
-
-TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed replacement resumes retained work",
-          "[explore][native][priority]") {
+TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed replacement resumes retained work", "[explore][native][priority]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
     mmltk::testsupport::ScopedTempDir directory{"native-gallery-priority"};
@@ -1493,7 +1433,6 @@ TEST_CASE("Native delayed visible completion prevents offscreen GPU and failed r
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == recorded);
     CHECK(gallery.Pixels(0U) == clean);
 }
-
 TEST_CASE("Native exact reuse performs no host allocation or logical copy after capacity growth", "[explore][native][cache]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1552,7 +1491,6 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreOverlayDescriptorsPrepared) == descriptors);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreRenderSubmitted) == renders);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer) == transfers);
-
     // A stationary repeat retains the cold viewport; its first visible card
     // starts when ordinary continuation scheduling advances.
     gallery.plan.viewport.first_row = 400U / columns;
@@ -1571,7 +1509,6 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
         CHECK(admitted.front() == 400U);
     }
     gallery.Drain();
-
     gallery.plan.mode = ExploreMode::Detail;
     gallery.plan.selected_image = 403U;
     ++gallery.plan.generation;
@@ -1607,53 +1544,57 @@ TEST_CASE("Native exact reuse performs no host allocation or logical copy after 
     CHECK(gallery.Pixels(0U) == detail_clean);
     CHECK(gallery.Pixels(1U) == detail_semantic);
 }
-
 TEST_CASE("Gallery suspension failure closes admission and retains its real runtime stream", "[explore][native][shutdown][custody]") {
-    namespace gpu=mmltk::frameworks::gpu;
-    using Access=explore_detail::GalleryStreamTestAccess;
-    int count=0;
-    if (cudaGetDeviceCount(&count)!=cudaSuccess || count==0) SKIP("CUDA unavailable; gallery failure custody unexecuted");
-    const auto execution=gpu::test_support::selected_test_device(0,mmltk::common::system::NumaTopology::Capture());
-    gpu::DeviceContext context(0,gpu::cuda_image_copy_backend(),gpu::DeviceContextMode::PrimaryInterop,-1,execution);
+    namespace gpu = mmltk::frameworks::gpu;
+    using Access = explore_detail::GalleryStreamTestAccess;
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable; gallery failure custody unexecuted");
+    const auto execution = gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
+    gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, -1, execution);
     context.Bind();
     NativeGalleryArtifact artifact("gallery-settlement-custody");
     std::weak_ptr<const mmltk::backend::data::CompiledDataset> source_custody;
     std::weak_ptr<const void> owner_custody;
     std::weak_ptr<gpu::ImageStream> stream_custody;
     {
-        auto stream=std::make_shared<gpu::ImageStream>(context);
-        stream_custody=stream;
-        explore_detail::GalleryStream gallery(1,execution,{},16U);
-        gallery.BindExecutionContext(context,stream);
-        owner_custody=Access::Custody(gallery);
+        auto stream = std::make_shared<gpu::ImageStream>(context);
+        stream_custody = stream;
+        explore_detail::GalleryStream gallery(1, execution, {}, 16U);
+        gallery.BindExecutionContext(context, stream);
+        owner_custody = Access::Custody(gallery);
         REQUIRE_NOTHROW(gallery.Suspend());
         CHECK_FALSE(Access::Fact(gallery).terminal);
-        auto store=std::make_shared<mmltk::backend::data::CompiledDataset>(mmltk::backend::data::CompiledDataset::open(artifact.path));
-        source_custody=store;
-        auto demand=std::make_shared<std::atomic<std::uint64_t>>(1U);
+        auto store = std::make_shared<mmltk::backend::data::CompiledDataset>(mmltk::backend::data::CompiledDataset::open(artifact.path));
+        source_custody = store;
+        auto demand = std::make_shared<std::atomic<std::uint64_t>>(1U);
         gallery.SetCurrentDemand(ExploreDemandCheck{demand});
         ExploreRenderPlan plan;
-        plan.mode=ExploreMode::Detail; plan.selected_image=0U; plan.dataset_identity=1U; plan.generation=1U;
-        plan.viewport={.extent={16U,16U},.row_count=1U,.columns=1U};
-        plan.augmentation.enabled=true;
-        plan.augmentation_config.enabled=true;
-        plan.augmentation_config.perceptual_downscale=true;
-        plan.augmentation_config.geometry={}; plan.augmentation_config.color={}; plan.augmentation_config.noise={};
-        plan.augmentation_config.blur={}; plan.augmentation_config.occlusion={}; plan.augmentation_config.copy_paste_probability=0;
-        plan.augmentation_config.resize={.probability=1.F,.min_strength=1.F,.max_strength=1.F};
-        gpu::ImageProductBuffer output(context,gpu::ImageProductLayout::CleanAndSemantic);
-        gallery.PrepareOutputPublication(ExploreOutputChange::Initialize,ExploreMode::Detail);
-        output.Publish(*stream,16U,16U,[&](auto clean,auto semantic,auto native) {
-            gallery.RenderDetail(plan,store,{},{},clean,semantic,native);
-        });
+        plan.mode = ExploreMode::Detail;
+        plan.selected_image = 0U;
+        plan.dataset_identity = 1U;
+        plan.generation = 1U;
+        plan.viewport = {.extent = {16U, 16U}, .row_count = 1U, .columns = 1U};
+        plan.augmentation.enabled = true;
+        plan.augmentation_config.enabled = true;
+        plan.augmentation_config.perceptual_downscale = true;
+        plan.augmentation_config.geometry = {};
+        plan.augmentation_config.color = {};
+        plan.augmentation_config.noise = {};
+        plan.augmentation_config.blur = {};
+        plan.augmentation_config.occlusion = {};
+        plan.augmentation_config.copy_paste_probability = 0;
+        plan.augmentation_config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
+        gpu::ImageProductBuffer output(context, gpu::ImageProductLayout::CleanAndSemantic);
+        gallery.PrepareOutputPublication(ExploreOutputChange::Initialize, ExploreMode::Detail);
+        output.Publish(*stream, 16U, 16U, [&](auto clean, auto semantic, auto native) { gallery.RenderDetail(plan, store, {}, {}, clean, semantic, native); });
         gallery.CommitOutputPublication();
-        CHECK(gallery.StorageFootprint().augmentation_device_bytes>0U);
+        CHECK(gallery.StorageFootprint().augmentation_device_bytes > 0U);
         store.reset();
         Access::FailStreamWait(gallery);
         REQUIRE_THROWS(gallery.Suspend());
         CHECK(Access::Fact(gallery).terminal);
-        CHECK(Access::Fact(gallery).first_failure==cudaErrorLaunchFailure);
-        CHECK(Access::Fact(gallery).occupancy==1U);
+        CHECK(Access::Fact(gallery).first_failure == cudaErrorLaunchFailure);
+        CHECK(Access::Fact(gallery).occupancy == 1U);
         REQUIRE_THROWS(gallery.Suspend());
         REQUIRE_THROWS(gallery.PrepareOutputPublication(ExploreOutputChange::Initialize));
         REQUIRE_THROWS(gallery.Advance());
@@ -1661,11 +1602,14 @@ TEST_CASE("Gallery suspension failure closes admission and retains its real runt
         CHECK_FALSE(gallery.ReleaseAfterRuntimeSettlement().all_released);
         CHECK_FALSE(gallery.ResetBuffersChecked().all_released);
         stream.reset();
-        CHECK_FALSE(owner_custody.expired()); CHECK_FALSE(stream_custody.expired()); CHECK_FALSE(source_custody.expired());
+        CHECK_FALSE(owner_custody.expired());
+        CHECK_FALSE(stream_custody.expired());
+        CHECK_FALSE(source_custody.expired());
     }
-    CHECK_FALSE(owner_custody.expired()); CHECK_FALSE(stream_custody.expired()); CHECK_FALSE(source_custody.expired());
+    CHECK_FALSE(owner_custody.expired());
+    CHECK_FALSE(stream_custody.expired());
+    CHECK_FALSE(source_custody.expired());
 }
-
 TEST_CASE("Native retirement settles held GPU and probe callbacks before checked release", "[explore][native][shutdown]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1732,7 +1676,6 @@ TEST_CASE("Native retirement settles held GPU and probe callbacks before checked
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreProbeResourcesReleased) == 1U);
 }
-
 TEST_CASE("Native initialization commit reserves useful reads and isolates obsolete failures", "[explore][native][transaction]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1784,8 +1727,8 @@ TEST_CASE("Native initialization commit reserves useful reads and isolates obsol
                   return fact.operation == VisualDiagnosticOperation::GalleryReadStarted && fact.detail == 68U;
               }) == 1);
         CHECK(std::ranges::count_if(gallery.evidence.facts, [&](const auto& fact) {
-                  return fact.operation == VisualDiagnosticOperation::GalleryReadCompleted && fact.detail == 68U &&
-                         fact.context.capacity_height == 1U && fact.context.demand.demand_generation == gallery.plan.generation;
+                  return fact.operation == VisualDiagnosticOperation::GalleryReadCompleted && fact.detail == 68U && fact.context.capacity_height == 1U &&
+                         fact.context.demand.demand_generation == gallery.plan.generation;
               }) == 1);
     } else {
         REQUIRE_NOTHROW(gallery.Drain());
@@ -1803,7 +1746,6 @@ TEST_CASE("Native initialization commit reserves useful reads and isolates obsol
         CHECK(gallery.Pixels(0U).size() == 32U * 8U * 4U);
     }
 }
-
 TEST_CASE("Native superseded source failure leaves newer system demand queued", "[explore][native][transaction]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1848,8 +1790,7 @@ TEST_CASE("Native superseded source failure leaves newer system demand queued", 
                 if (!state.evidence.changed.wait_for(lock, std::chrono::seconds{10}, [&] { return state.failed_ready.load(); }))
                     throw std::runtime_error("native failure did not reach its ready sink");
             }
-            const bool frontier =
-                state.before_consumption ? fact.detail == 10U && state.failed_ready.load() : fact.detail == 11U && fact.value == 1U;
+            const bool frontier = state.before_consumption ? fact.detail == 10U && state.failed_ready.load() : fact.detail == 11U && fact.value == 1U;
             if (fact.operation == VisualDiagnosticOperation::ExploreContinuationStarted && frontier && !state.superseded.exchange(true))
                 state.system->UpdateViewport({.viewport = state.next});
         } catch (...) { state.failures.fetch_add(1U); }
@@ -1879,8 +1820,7 @@ TEST_CASE("Native superseded source failure leaves newer system demand queued", 
                          },
                          diagnostics};
     interleave.system = &system;
-    static_cast<void>(system.Open(
-        {.viewport = {.extent = {32U, 32U}, .first_row = 17U, .row_count = 4U, .columns = 4U}, .compiled_source = path.string()}));
+    static_cast<void>(system.Open({.viewport = {.extent = {32U, 32U}, .first_row = 17U, .row_count = 4U, .columns = 4U}, .compiled_source = path.string()}));
     for (;;) {
         const auto observed = interleave.evidence.Epoch();
         const auto snapshot = system.snapshot();
@@ -1895,7 +1835,6 @@ TEST_CASE("Native superseded source failure leaves newer system demand queued", 
     system.Shutdown();
     CHECK(system.stopped());
 }
-
 TEST_CASE("Native initialization rollback resumes held incumbent input through automatic continuation", "[explore][native][transaction]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -1956,25 +1895,22 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
                     epoch = evidence.epoch;
                 }
                 std::ostringstream context;
-                context << failure.what() << "\nrollback stage=" << stage << " empty_candidate=" << empty_candidate
-                        << " observed_epoch=" << observed << " current_epoch=" << epoch << " ready=" << snapshot.ready
-                        << " busy=" << snapshot.busy << " failure=" << snapshot.failure << " revision=" << snapshot.revision
-                        << " frame_revision=" << snapshot.frame.revision << " gallery_generation=" << snapshot.gallery.generation
-                        << " first_row=" << snapshot.viewport.first_row << " rows=" << snapshot.viewport.row_count
-                        << " columns=" << snapshot.viewport.columns << " matching=" << snapshot.order.matching_count << "\nslots=";
-                for (const bool ready_slot : snapshot.gallery.slots)
-                    context << (ready_slot ? '1' : '0');
-                context << "\nheld="
-                        << std::ranges::count(facts, VisualDiagnosticOperation::AcceptanceCompletionHeld, &VisualDiagnosticFact::operation)
-                        << " gpu_completed="
-                        << std::ranges::count(facts, VisualDiagnosticOperation::GalleryGpuCompleted, &VisualDiagnosticFact::operation)
+                context << failure.what() << "\nrollback stage=" << stage << " empty_candidate=" << empty_candidate << " observed_epoch=" << observed
+                        << " current_epoch=" << epoch << " ready=" << snapshot.ready << " busy=" << snapshot.busy << " failure=" << snapshot.failure
+                        << " revision=" << snapshot.revision << " frame_revision=" << snapshot.frame.revision
+                        << " gallery_generation=" << snapshot.gallery.generation << " first_row=" << snapshot.viewport.first_row
+                        << " rows=" << snapshot.viewport.row_count << " columns=" << snapshot.viewport.columns << " matching=" << snapshot.order.matching_count
+                        << "\nslots=";
+                for (const bool ready_slot : snapshot.gallery.slots) context << (ready_slot ? '1' : '0');
+                context << "\nheld=" << std::ranges::count(facts, VisualDiagnosticOperation::AcceptanceCompletionHeld, &VisualDiagnosticFact::operation)
+                        << " gpu_completed=" << std::ranges::count(facts, VisualDiagnosticOperation::GalleryGpuCompleted, &VisualDiagnosticFact::operation)
                         << " facts=" << facts.size();
                 const auto first = facts.size() > 128U ? facts.size() - 128U : 0U;
                 for (auto index = first; index < facts.size(); ++index) {
                     const auto& fact = facts[index];
                     context << "\n"
-                            << index << " " << visual_diagnostic_event_name(fact.operation) << " generation=" << fact.generation
-                            << " value=" << fact.value << " detail=" << fact.detail << " condition=" << fact.context.condition;
+                            << index << " " << visual_diagnostic_event_name(fact.operation) << " generation=" << fact.generation << " value=" << fact.value
+                            << " detail=" << fact.detail << " condition=" << fact.context.condition;
                 }
                 throw std::runtime_error(context.str());
             }
@@ -1991,8 +1927,7 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
     std::uint32_t held_index = 0U;
     {
         std::scoped_lock lock(evidence.mutex);
-        const auto held =
-            std::ranges::find(evidence.facts, VisualDiagnosticOperation::AcceptanceCompletionHeld, &VisualDiagnosticFact::operation);
+        const auto held = std::ranges::find(evidence.facts, VisualDiagnosticOperation::AcceptanceCompletionHeld, &VisualDiagnosticFact::operation);
         REQUIRE(held != evidence.facts.end());
         held_index = static_cast<std::uint32_t>(held->detail);
     }
@@ -2032,9 +1967,8 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
     wait("restored cache completion", [&] { return evidence.Count(VisualDiagnosticOperation::GalleryGpuCompleted) == cached_tiles; });
     const auto reads_of_held = [&] {
         std::scoped_lock lock(evidence.mutex);
-        return std::ranges::count_if(evidence.facts, [&](const auto& fact) {
-            return fact.operation == VisualDiagnosticOperation::GalleryReadStarted && fact.detail == held_index;
-        });
+        return std::ranges::count_if(
+            evidence.facts, [&](const auto& fact) { return fact.operation == VisualDiagnosticOperation::GalleryReadStarted && fact.detail == held_index; });
     };
     CHECK(reads_of_held() == 1);
     auto overlay = restored.overlay;
@@ -2054,7 +1988,6 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
     system.Shutdown();
     CHECK(system.stopped());
 }
-
 TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged output", "[explore][native][detail]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -2085,7 +2018,6 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::ExploreCacheTransfer) == copies);
     CHECK(gallery.Pixels(0U) == clean);
     CHECK(gallery.Pixels(1U) == semantic);
-
     gallery.plan.overlay.class_selection.mode = ExploreClassSelectionMode::None;
     ++gallery.plan.generation;
     gallery.demand->store(gallery.plan.generation);
@@ -2123,7 +2055,6 @@ TEST_CASE("Native detail class selection reuses exact clean pixels and unchanged
     CHECK(gallery.Pixels(0U) == clean);
     CHECK(gallery.Pixels(1U) == semantic);
 }
-
 TEST_CASE("Native superseded background work preserves incumbent planes and meaning", "[explore][native][cache][shutdown]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -2187,7 +2118,6 @@ TEST_CASE("Native superseded background work preserves incumbent planes and mean
     gallery.Begin();
     CHECK(gallery.Pixels(1U) == semantic);
 }
-
 TEST_CASE("Native cache admission retains only completely submitted obsolete pixels", "[explore][native][cache]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -2213,7 +2143,6 @@ TEST_CASE("Native cache admission retains only completely submitted obsolete pix
     REQUIRE(expected_ready == std::vector<bool>{true});
     REQUIRE_FALSE(expected_labels.empty());
     REQUIRE(std::ranges::any_of(expected_semantic, [](const auto byte) { return byte != 0U; }));
-
     GalleryGpuPause pause;
     NativeGallery gallery{1U, false, true};
     gallery.plan.viewport = reference.plan.viewport;
@@ -2269,7 +2198,6 @@ TEST_CASE("Native cache admission retains only completely submitted obsolete pix
     CHECK(gallery.Pixels(1U) == expected_semantic);
     check_labels(gallery.algorithm->Labels(), expected_labels);
 }
-
 TEST_CASE("Native submitted GPU work settles after Stop without publication or new reads", "[explore][native][shutdown]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA device unavailable");
@@ -2298,13 +2226,11 @@ TEST_CASE("Native submitted GPU work settles after Stop without publication or n
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
 }
-
 class AcceptanceGateFixture final {
    public:
     explicit AcceptanceGateFixture(const int transport) : AcceptanceGateFixture(OpenSockets(transport)) {}
     [[nodiscard]] ExploreAcceptanceGate& gate() noexcept { return gate_; }
     [[nodiscard]] mmltk::common::io::ScopedFd& commands() noexcept { return commands_; }
-
     template <class T>
     T Await(std::future<T>& result) {
         const auto status = result.wait_for(std::chrono::seconds{2});
@@ -2321,11 +2247,9 @@ class AcceptanceGateFixture final {
         return {mmltk::common::io::ScopedFd{sockets[0]}, mmltk::common::io::ScopedFd{sockets[1]}};
     }
     explicit AcceptanceGateFixture(Sockets sockets) : commands_(std::move(sockets[0])), gate_(sockets[1].release()) {}
-
     mmltk::common::io::ScopedFd commands_;
     ExploreAcceptanceGate gate_;
 };
-
 TEST_CASE("acceptance gate retains one reader across settled frontend workflows", "[explore][acceptance][control]") {
     using Kind = contracts::IntegrationControlKind;
     const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
@@ -2364,7 +2288,6 @@ TEST_CASE("acceptance gate retains one reader across settled frontend workflows"
     CHECK(gate.ClaimTerminalReport());
     CHECK_FALSE(gate.ClaimTerminalReport());
 }
-
 TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits", "[explore][acceptance][control]") {
     const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
     AcceptanceGateFixture fixture{transport};
@@ -2385,17 +2308,13 @@ TEST_CASE("acceptance gate drains queued worker commands and wakes stale waits",
     gate.Stop();
     CHECK(gate.AwaitInitialRelease(8U) == ExploreAcceptanceGate::WaitResult::Stale);
 }
-
 TEST_CASE("acceptance failure forwards exact bounded text in its terminal packet", "[explore][acceptance][control]") {
     const auto size = GENERATE(std::size_t{0U}, std::size_t{17U}, contracts::kIntegrationFailureMaxBytes);
     AcceptanceGateFixture fixture{SOCK_SEQPACKET};
     auto& gate = fixture.gate();
     gate.SetFrontendCommand([](auto) { return true; });
-    contracts::IntegrationControlReceipt receipt{.kind = contracts::IntegrationControlKind::Failed,
-                                                 .sequence = 1U,
-                                                 .progress = 87U,
-                                                 .failureline = 123U,
-                                                 .failure = std::string(size, 'x')};
+    contracts::IntegrationControlReceipt receipt{
+        .kind = contracts::IntegrationControlKind::Failed, .sequence = 1U, .progress = 87U, .failureline = 123U, .failure = std::string(size, 'x')};
     auto invalid = receipt;
     invalid.sequence = 2U;
     CHECK_FALSE(gate.ObserveFrontend(invalid));
@@ -2417,7 +2336,6 @@ TEST_CASE("acceptance failure forwards exact bounded text in its terminal packet
     CHECK(gate.ClaimTerminalReport());
     CHECK_FALSE(gate.ObserveFrontend(receipt));
 }
-
 TEST_CASE("acceptance gate rejects premature advancement and unavailable callbacks", "[explore][acceptance][control]") {
     const unsigned terminal_path = GENERATE(0U, 1U, 2U, 3U, 4U);
     std::promise<void> invoked;
@@ -2429,8 +2347,7 @@ TEST_CASE("acceptance gate rejects premature advancement and unavailable callbac
         invoked.set_value();
         return terminal_path == 4U;
     });
-    if (terminal_path == 1U || terminal_path == 4U)
-        REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Settled, .sequence = 1U}));
+    if (terminal_path == 1U || terminal_path == 4U) REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Settled, .sequence = 1U}));
     if (terminal_path == 2U) {
         CHECK_FALSE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Failed, .sequence = 1U}));
         REQUIRE(gate.ObserveFrontend({.kind = contracts::IntegrationControlKind::Failed, .sequence = 1U, .failureline = 123U}));
@@ -2443,8 +2360,7 @@ TEST_CASE("acceptance gate rejects premature advancement and unavailable callbac
     }
     gate.AdvanceGeneration(1U);
     const std::uint8_t advance = 8U;
-    if (terminal_path < 2U || terminal_path == 4U)
-        REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
+    if (terminal_path < 2U || terminal_path == 4U) REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
     if (terminal_path == 1U || terminal_path == 4U) fixture.Await(invocation);
     if (terminal_path == 4U) REQUIRE(::send(commands.get(), &advance, sizeof(advance), MSG_NOSIGNAL) == sizeof(advance));
     if (terminal_path == 3U) commands.reset();
@@ -2452,7 +2368,6 @@ TEST_CASE("acceptance gate rejects premature advancement and unavailable callbac
     CHECK(fixture.Await(waiting) == ExploreAcceptanceGate::WaitResult::Stale);
     CHECK(gate.ClaimTerminalReport());
 }
-
 TEST_CASE("acceptance redraw is one shot and preserves the held read boundary", "[explore][acceptance][control]") {
     const int transport = GENERATE(SOCK_STREAM, SOCK_SEQPACKET);
     // Successful redraw, callback refusal, callback exception, unavailable
@@ -2489,9 +2404,7 @@ TEST_CASE("acceptance redraw is one shot and preserves the held read boundary", 
         // The real initial-wait receipt proves redraw left reads held.
         pollfd waiting{.fd = fixture.commands().get(), .events = POLLIN, .revents = 0};
         int ready = -1;
-        do {
-            ready = ::poll(&waiting, 1U, 2000);
-        } while (ready < 0 && errno == EINTR);
+        do { ready = ::poll(&waiting, 1U, 2000); } while (ready < 0 && errno == EINTR);
         if (ready != 1) gate.Stop();
         REQUIRE(ready == 1);
         std::uint8_t observation = 0U;
@@ -2512,15 +2425,11 @@ TEST_CASE("acceptance redraw is one shot and preserves the held read boundary", 
     CHECK(gate.ClaimTerminalReport());
     CHECK(gate.AwaitInitialRelease(7U) == ExploreAcceptanceGate::WaitResult::Stale);
 }
-
 }  // namespace
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 namespace {
-
-TEST_CASE("completed gallery read receipts retain identity through reentrant supersession and terminal callbacks",
-          "[explore][acceptance][control]") {
+TEST_CASE("completed gallery read receipts retain identity through reentrant supersession and terminal callbacks", "[explore][acceptance][control]") {
     using Kind = contracts::IntegrationControlKind;
     const auto outcome = GENERATE(0U, 1U, 2U, 3U, 4U, 5U, 6U, 7U);
     AcceptanceGateFixture fixture{SOCK_SEQPACKET};
@@ -2549,8 +2458,8 @@ TEST_CASE("completed gallery read receipts retain identity through reentrant sup
     auto held = std::async(std::launch::async, [&] { return gate.AwaitHeldCompletion(7U, 3U, 47U, 1024U); });
     CHECK(fixture.Await(held) == ExploreAcceptanceGate::WaitResult::Stale);
     REQUIRE(received.has_value());
-    CHECK((*received == contracts::IntegrationControlReceipt{
-                            .kind = Kind::GalleryReadCompletionHeld, .sequence = 1U, .read_generation = 7U, .compiled_index = 47U}));
+    CHECK((*received ==
+           contracts::IntegrationControlReceipt{.kind = Kind::GalleryReadCompletionHeld, .sequence = 1U, .read_generation = 7U, .compiled_index = 47U}));
     for (const auto expected : {ExploreAcceptanceGate::ControlEvent::HeldWait, ExploreAcceptanceGate::ControlEvent::HeldStale}) {
         ExploreAcceptanceGate::ControlObservation observation{};
         REQUIRE(::recv(fixture.commands().get(), &observation, sizeof(observation), MSG_DONTWAIT) == sizeof(observation));
@@ -2563,9 +2472,7 @@ TEST_CASE("completed gallery read receipts retain identity through reentrant sup
     CHECK(gate.ClaimTerminalReport() == (outcome >= 1U && outcome <= 3U));
     gate.StopAndJoin();
 }
-
-TEST_CASE("visible read gate holds the exact image across demand changes and rejects duplicate receipts",
-          "[explore][acceptance][control]") {
+TEST_CASE("visible read gate holds the exact image across demand changes and rejects duplicate receipts", "[explore][acceptance][control]") {
     using Kind = contracts::IntegrationControlKind;
     AcceptanceGateFixture fixture{SOCK_SEQPACKET};
     auto& gate = fixture.gate();
@@ -2605,7 +2512,6 @@ TEST_CASE("visible read gate holds the exact image across demand changes and rej
     gate.StopAndJoin();
     CHECK_FALSE(gate.ObserveFrontend({.kind = Kind::Progress, .sequence = 1U, .progress = 1U}));
 }
-
 TEST_CASE("native completion gate preserves the capacity-before-consumption wake", "[presentation][acceptance][control]") {
     PresentationAcceptanceGate gate;
     std::vector<PresentationAcceptanceGate::Receipt> receipts;
@@ -2656,6 +2562,5 @@ TEST_CASE("native completion gate preserves the capacity-before-consumption wake
     CHECK_FALSE(gate.SupersessionHeld());
     CHECK_FALSE(gate.Arm());
 }
-
 }  // namespace
 }  // namespace mmltk::controller

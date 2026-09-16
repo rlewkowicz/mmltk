@@ -23,15 +23,16 @@ namespace gpu = mmltk::frameworks::gpu;
 namespace raster = mmltk::backend::imaging::raster;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace {
-void checked(cudaError_t status) { if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status)); }
+void checked(cudaError_t status) {
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+}
 std::size_t preview_slot_count(std::size_t slots) {
-    if (slots == 0U || slots > PredictionPreviewComposition::kMaximumFrames)
-        throw std::invalid_argument("preview slot capacity is outside its bound");
+    if (slots == 0U || slots > PredictionPreviewComposition::kMaximumFrames) throw std::invalid_argument("preview slot capacity is outside its bound");
     return slots;
 }
-}
-gpu::DeviceContext CreatePredictionPreviewContext(const gpu::DeviceExecution& execution,
-    const std::shared_ptr<gpu::TerminalCudaRetirementOwner>& retirement, gpu::CudaContextApi api) {
+}  // namespace
+gpu::DeviceContext CreatePredictionPreviewContext(const gpu::DeviceExecution& execution, const std::shared_ptr<gpu::TerminalCudaRetirementOwner>& retirement,
+                                                  gpu::CudaContextApi api) {
     if (!retirement) throw std::invalid_argument("prediction preview retirement authority is unavailable");
     auto lease = gpu::ReserveTerminalCudaLease(*retirement);
     auto candidate = std::make_shared<std::optional<gpu::DeviceContext>>();
@@ -40,14 +41,15 @@ gpu::DeviceContext CreatePredictionPreviewContext(const gpu::DeviceExecution& ex
         std::shared_ptr<std::optional<gpu::DeviceContext>>& candidate;
     } construction{lease, candidate};
     if (cuInit(0U) != CUDA_SUCCESS) throw std::runtime_error("prediction CUDA initialization failed");
-    gpu::CudaContextScope scope({&construction, [](void* owner) noexcept {
-        auto& value = *static_cast<Construction*>(owner);
-        auto retained = value.candidate;
-        std::move(value.lease).Install(gpu::TerminalCudaCustody::Share(std::move(retained)), cudaErrorUnknown);
-    }}, api);
+    gpu::CudaContextScope scope({&construction,
+                                 [](void* owner) noexcept {
+                                     auto& value = *static_cast<Construction*>(owner);
+                                     auto retained = value.candidate;
+                                     std::move(value.lease).Install(gpu::TerminalCudaCustody::Share(std::move(retained)), cudaErrorUnknown);
+                                 }},
+                                api);
     scope.Run([&] {
-        candidate->emplace(execution.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated,
-            execution.placement.numa_node, execution);
+        candidate->emplace(execution.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
     });
     return **candidate;
 }
@@ -90,8 +92,8 @@ struct PredictionPreviewFrame::State final {
     std::size_t ground_truth_offset = 0, scratch_offset = 0;
     bool composition = false, ground_truth_uploaded = false;
 };
-PredictionPreviewFrame::PredictionPreviewFrame(const gpu::DeviceContext& context,
-    std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement, std::shared_ptr<void> source, gpu::CudaContextApi api)
+PredictionPreviewFrame::PredictionPreviewFrame(const gpu::DeviceContext& context, std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement,
+                                               std::shared_ptr<void> source, gpu::CudaContextApi api)
     : retirement_(std::move(retirement)) {
     auto lease = retirement_->Reserve();
     if (!lease) throw std::runtime_error("prediction preview retirement admission is closed");
@@ -100,16 +102,14 @@ PredictionPreviewFrame::PredictionPreviewFrame(const gpu::DeviceContext& context
     state_ = std::make_shared<State>(context, api, std::move(source));
 }
 gpu::CudaContextScope PredictionPreviewFrame::ContextScope() const noexcept {
-    return gpu::CudaContextScope({const_cast<PredictionPreviewFrame*>(this), [](void* owner) noexcept {
-        static_cast<PredictionPreviewFrame*>(owner)->RetainUnsafe(cudaErrorUnknown);
-    }}, state_->context_api);
+    return gpu::CudaContextScope(
+        {const_cast<PredictionPreviewFrame*>(this), [](void* owner) noexcept { static_cast<PredictionPreviewFrame*>(owner)->RetainUnsafe(cudaErrorUnknown); }},
+        state_->context_api);
 }
 gpu::CudaContextScope PredictionPreviewFrame::CompositionScope() const noexcept {
     // The enclosing submission has already reserved custody of this actual state
     // and every other participant. A context failure marks it for that aggregate.
-    return gpu::CudaContextScope({state_.get(), [](void* owner) noexcept {
-        static_cast<State*>(owner)->unsafe.store(cudaErrorUnknown);
-    }}, state_->context_api);
+    return gpu::CudaContextScope({state_.get(), [](void* owner) noexcept { static_cast<State*>(owner)->unsafe.store(cudaErrorUnknown); }}, state_->context_api);
 }
 PredictionPreviewFrame::~PredictionPreviewFrame() {
     if (!state_ || state_->unsafe != cudaSuccess) return;
@@ -149,46 +149,55 @@ std::span<const rfdetr::Prediction> PredictionPreviewFrame::ground_truth() const
 std::span<const rfdetr::Prediction> PredictionPreviewFrame::predictions() const noexcept { return state_->predictions; }
 std::span<const std::string> PredictionPreviewFrame::classes() const noexcept { return state_->catalog->names(); }
 int PredictionPreviewFrame::class_count() const noexcept { return state_->category_count; }
+PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu::DeviceContext context)
+    : PredictionPreviewPool(std::move(execution), std::move(context), {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister}) {}
 PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu::DeviceContext context, TransferOperations operations,
-                                           std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement, std::size_t slots)
-    : operations_(operations), execution_(std::move(execution)), context_(std::move(context)),
+                                             std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement, std::size_t slots)
+    : operations_(operations),
+      execution_(std::move(execution)),
+      context_(std::move(context)),
       retirement_(retirement ? std::move(retirement) : std::make_shared<gpu::TerminalCudaRetirementOwner>(preview_slot_count(slots) + 1U)),
       slots_(preview_slot_count(slots)) {
     if (!retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
-    if (!operations_.wait || !operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host || !operations_.upload || !operations_.convert || !operations_.context_api.get || !operations_.context_api.set)
+    if (!operations_.wait || !operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host || !operations_.upload ||
+        !operations_.convert || !operations_.context_api.get || !operations_.context_api.set)
         throw std::invalid_argument("prediction transfer operations are incomplete");
     // Compatibility follows the retained context, device and execution owner.
     // A backend decorating CUDA operations does not create a different context.
-    context_.ValidateSelection(execution_.device, {}, gpu::DeviceContextMode::Isolated,
-                               execution_.placement.numa_node, execution_);
+    context_.ValidateSelection(execution_.device, {}, gpu::DeviceContextMode::Isolated, execution_.placement.numa_node, execution_);
 }
-std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(const float* pixels, VisualExtent extent,
-    std::uintptr_t source_stream, std::span<const rfdetr::Prediction> predictions,
-    const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations, std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog, int classes, const std::uint8_t* rgb8,
-    std::shared_ptr<void> source_custody, void (*stop_source)(void*), void* source_control,
-    std::span<const rfdetr::Prediction> ground_truth, bool composition) {
+std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(const float* pixels, VisualExtent extent, std::uintptr_t source_stream,
+                                                                             std::span<const rfdetr::Prediction> predictions,
+                                                                             const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations,
+                                                                             std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog,
+                                                                             int classes, const std::uint8_t* rgb8, std::shared_ptr<void> source_custody,
+                                                                             void (*stop_source)(void*), void* source_control,
+                                                                             std::span<const rfdetr::Prediction> ground_truth, bool composition) {
     if (!retirement_->admission_open()) throw std::runtime_error("prediction preview CUDA retirement failed");
-    auto available = std::ranges::find_if(slots_, [](const auto& slot) {
-        return !slot || (slot.use_count() == 1 && slot->state_->unsafe == cudaSuccess);
-    });
+    auto available = std::ranges::find_if(slots_, [](const auto& slot) { return !slot || (slot.use_count() == 1 && slot->state_->unsafe == cudaSuccess); });
     if (available == slots_.end()) return {};
-    if ((!pixels && !rgb8) || (pixels && rgb8) || !source_custody || !extent.valid() || (predictions.size() > contracts::kAnnotationObjectCapacity || ground_truth.size() > contracts::kAnnotationObjectCapacity) || !catalog || classes < 0 || static_cast<std::size_t>(classes) > rfdetr::kMaximumClassOutputSlots)
+    if ((!pixels && !rgb8) || (pixels && rgb8) || !source_custody || !extent.valid() ||
+        (predictions.size() > contracts::kAnnotationObjectCapacity || ground_truth.size() > contracts::kAnnotationObjectCapacity) || !catalog || classes < 0 ||
+        static_cast<std::size_t>(classes) > rfdetr::kMaximumClassOutputSlots)
         throw std::invalid_argument("prediction preview source is invalid");
     const auto count = predictions.size();
     for (const auto& prediction : predictions) {
         const auto category = prediction.class_reference;
         if (category < 0 || category >= classes || prediction.class_domain != annotations.class_domain ||
             (prediction.class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::Foreground &&
-                static_cast<std::size_t>(category) >= catalog->size()))
+             static_cast<std::size_t>(category) >= catalog->size()))
             throw std::invalid_argument("prediction reference disagrees with its declared domain");
-        if (category >= 0 && static_cast<std::size_t>(category) < catalog->size() && catalog->names()[category].size() > mmltk::frameworks::reflection::kMaximumNameBytes)
+        if (category >= 0 && static_cast<std::size_t>(category) < catalog->size() &&
+            catalog->names()[category].size() > mmltk::frameworks::reflection::kMaximumNameBytes)
             throw std::invalid_argument("prediction label exceeds the visual name capacity");
     }
     if (count && (annotations.value_count != count || (annotations.masks_available && !annotations.masks.address)))
         throw std::invalid_argument("prediction annotations disagree with produced values");
     const auto pixel_count = rfdetr::checked_prediction_extent(extent.width, extent.height, rfdetr::kMaximumEncodedMaskPixels);
     const auto pixel_bytes = rfdetr::checked_prediction_extent(pixel_count, 3U * sizeof(float), rfdetr::kMaximumPredictionTensorBytes);
-    const auto mask_bytes = annotations.masks_available && annotations.masks.address && count ? rfdetr::checked_prediction_extent(pixel_count, count, rfdetr::kMaximumPredictionTensorBytes) : 0U;
+    const auto mask_bytes = annotations.masks_available && annotations.masks.address && count
+                                ? rfdetr::checked_prediction_extent(pixel_count, count, rfdetr::kMaximumPredictionTensorBytes)
+                                : 0U;
     std::size_t ground_truth_words = 0U;
     for (const auto& gt : ground_truth) {
         if (gt.class_reference < 0 || static_cast<std::size_t>(gt.class_reference) >= catalog->size())
@@ -203,7 +212,8 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
     const auto bytes = scratch_offset + (composition ? pixel_count * 8U : 0U);
     if (bytes > rfdetr::kMaximumPredictionTensorBytes) throw std::invalid_argument("prediction raw preview exceeds storage capacity");
     try {
-        if (!*available) *available = std::shared_ptr<PredictionPreviewFrame>(new PredictionPreviewFrame(context_, retirement_, source_custody, operations_.context_api));
+        if (!*available)
+            *available = std::shared_ptr<PredictionPreviewFrame>(new PredictionPreviewFrame(context_, retirement_, source_custody, operations_.context_api));
         auto& state = *(*available)->state_;
         std::unique_lock state_lock(state.mutex, std::try_to_lock);
         if (!state_lock) return {};
@@ -213,7 +223,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
         scope.Run([&] {
             if (!state.source_context) {
                 state.source_context.emplace(execution_.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop,
-                    execution_.placement.numa_node, execution_);
+                                             execution_.placement.numa_node, execution_);
             }
             if (!state.source_ready) {
                 state.source_context->Bind();
@@ -243,9 +253,11 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
             state.ground_truth.assign(ground_truth.begin(), ground_truth.end());
             state.ground_truth_runs.clear();
             state.ground_truth_runs.reserve(ground_truth_words);
-            for (const auto& gt : ground_truth) for (const auto& [start, length] : gt.mask.runs) {
-                state.ground_truth_runs.push_back(start); state.ground_truth_runs.push_back(length);
-            }
+            for (const auto& gt : ground_truth)
+                for (const auto& [start, length] : gt.mask.runs) {
+                    state.ground_truth_runs.push_back(start);
+                    state.ground_truth_runs.push_back(length);
+                }
             std::vector<int> ground_truth_labels;
             ground_truth_labels.reserve(ground_truth.size());
             for (const auto& gt : ground_truth) ground_truth_labels.push_back(gt.class_reference);
@@ -259,7 +271,10 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
             state.predictions.clear();
             state.predictions.reserve(count);
             for (const auto& prediction : predictions)
-                state.predictions.push_back({.class_reference = prediction.class_reference, .class_domain = prediction.class_domain, .score = prediction.score, .bbox_xyxy = prediction.bbox_xyxy});
+                state.predictions.push_back({.class_reference = prediction.class_reference,
+                                             .class_domain = prediction.class_domain,
+                                             .score = prediction.score,
+                                             .bbox_xyxy = prediction.bbox_xyxy});
             auto* destination = static_cast<std::uint8_t*>(state.storage.active());
             bool source_submitted = false;
             try {
@@ -279,15 +294,15 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
                     // copy or event record fails; no receiver-stream wait can be lost.
                     const auto copy = [&](void* target, const void* source, std::size_t size) {
                         source_submitted = true;
-                        if (operations_.copy(reinterpret_cast<CUdeviceptr>(target), receiver_context,
-                                              reinterpret_cast<CUdeviceptr>(source), source_context, size,
-                                              reinterpret_cast<CUstream>(source_stream)) != CUDA_SUCCESS)
+                        if (operations_.copy(reinterpret_cast<CUdeviceptr>(target), receiver_context, reinterpret_cast<CUdeviceptr>(source), source_context,
+                                             size, reinterpret_cast<CUstream>(source_stream)) != CUDA_SUCCESS)
                             throw std::runtime_error("prediction raw custody copy failed");
                     };
                     if (pixels) copy(destination, pixels, pixel_bytes);
                     if (count) {
                         copy(destination + state.boxes_offset, reinterpret_cast<const void*>(annotations.boxes_xyxy.address), count * 4U * sizeof(float));
-                        copy(destination + state.labels_offset, reinterpret_cast<const void*>(annotations.class_references.address), count * sizeof(std::int32_t));
+                        copy(destination + state.labels_offset, reinterpret_cast<const void*>(annotations.class_references.address),
+                             count * sizeof(std::int32_t));
                         if (mask_bytes) copy(destination + state.masks_offset, reinterpret_cast<const void*>(annotations.masks.address), mask_bytes);
                     }
                     checked(operations_.record(state.source_ready, reinterpret_cast<cudaStream_t>(source_stream)));
@@ -295,9 +310,11 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
                 });
             } catch (...) {
                 const auto failure = std::current_exception();
-                try { std::rethrow_exception(failure); }
-                catch (const gpu::CudaContextFailure& error) { if (error.terminal()) throw; }
-                catch (...) {}
+                try {
+                    std::rethrow_exception(failure);
+                } catch (const gpu::CudaContextFailure& error) {
+                    if (error.terminal()) throw;
+                } catch (...) {}
                 cudaError_t source_status = cudaSuccess;
                 if (source_submitted) {
                     try {
@@ -326,26 +343,27 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
         available->reset();
         if (!retirement_->admission_open()) {
             unsafe_source_ = true;
-            if (stop_source) { try { stop_source(source_control); } catch (...) {} }
+            if (stop_source) {
+                try {
+                    stop_source(source_control);
+                } catch (...) {}
+            }
             throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "prediction caller context custody"};
         }
         std::rethrow_exception(failure);
     }
 }
-bool PredictionPreviewFrame::CompatibleWith(const gpu::SystemImageRuntime& runtime) const noexcept {
-    return runtime.UsesContext(state_->context);
-}
+bool PredictionPreviewFrame::CompatibleWith(const gpu::SystemImageRuntime& runtime) const noexcept { return runtime.UsesContext(state_->context); }
 void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate) const {
     const std::array regions{PredictionPreviewComposition::Region{shared_from_this(), {0U, 0U, state_->extent.width, state_->extent.height}}};
     PredictionPreviewComposition::Draw(runtime, candidate, state_->extent, regions, {});
 }
-void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate,
-    VisualExtent extent, std::span<const Region> regions, Options options) {
+void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate, VisualExtent extent,
+                                        std::span<const Region> regions, Options options) {
     if (!extent.valid() || regions.size() > kMaximumFrames) throw std::invalid_argument("preview composition extent or count is invalid");
     std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement;
     for (const auto& region : regions) {
-        if (!region.frame || !region.crop.width || !region.crop.height ||
-            region.crop.x > extent.width || region.crop.width > extent.width - region.crop.x ||
+        if (!region.frame || !region.crop.width || !region.crop.height || region.crop.x > extent.width || region.crop.width > extent.width - region.crop.x ||
             region.crop.y > extent.height || region.crop.height > extent.height - region.crop.y)
             throw std::invalid_argument("preview composition region is invalid");
         if (!region.frame->CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
@@ -362,25 +380,29 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
         std::vector<Region> regions;
         gpu::SystemImageRuntime::UnsafeCustody output;
     };
-    auto submission = std::make_shared<Submission>(extent, options, std::vector<Region>(regions.begin(), regions.end()), gpu::SystemImageRuntime::UnsafeCustody{});
+    auto submission =
+        std::make_shared<Submission>(extent, options, std::vector<Region>(regions.begin(), regions.end()), gpu::SystemImageRuntime::UnsafeCustody{});
     try {
         runtime.PublishRetained(candidate, extent.width, extent.height, [submission, &runtime](auto clean, auto semantic, auto stream) {
             const auto clear = [&](auto plane) {
-                checked(cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0,
-                    plane.descriptor.row_bytes(), plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream)));
+                checked(cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes(),
+                                          plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream)));
             };
-            if (submission->regions.size() != 1U || submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height}) {
-                clear(clean); clear(semantic);
+            if (submission->regions.size() != 1U ||
+                submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height}) {
+                clear(clean);
+                clear(semantic);
             }
             const auto plane_region = [](gpu::ImagePlaneView plane, VisualRegion crop) {
                 plane.data += static_cast<std::size_t>(crop.y) * plane.descriptor.pitch_bytes + static_cast<std::size_t>(crop.x) * 4U;
-                plane.descriptor.width = crop.width; plane.descriptor.height = crop.height;
+                plane.descriptor.width = crop.width;
+                plane.descriptor.height = crop.height;
                 return plane;
             };
             const auto& overlays = submission->options;
             for (const auto& region : submission->regions)
-                region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream,
-                    overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks);
+                region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream, overlays.prediction_boxes,
+                                         overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks);
         });
         // PublishRetained's completion, including its outer stream settlement,
         // proves every source read and staging upload complete before release.
@@ -398,9 +420,8 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
         }
     } catch (...) {
         const auto failure = std::current_exception();
-        const bool unsafe_frame = std::ranges::any_of(submission->regions, [](const auto& region) {
-            return region.frame->state_->unsafe.load() != cudaSuccess;
-        });
+        const bool unsafe_frame =
+            std::ranges::any_of(submission->regions, [](const auto& region) { return region.frame->state_->unsafe.load() != cudaSuccess; });
         if (gpu::is_image_execution_failure(failure) || unsafe_frame || (retirement && !retirement->admission_open())) {
             submission->output = runtime.Retire(failure).custody;
             if (retirement) {
@@ -415,8 +436,8 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
         std::rethrow_exception(failure);
     }
 }
-void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic,
-    std::uintptr_t stream, bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks) const {
+void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic, std::uintptr_t stream,
+                                        bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks) const {
     if (!CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
     auto& state = *state_;
     std::lock_guard state_lock(state.mutex);
@@ -446,18 +467,24 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             const auto clean_pitch = scale ? pitch : clean.descriptor.pitch_bytes;
             const auto semantic_pitch = scale ? pitch : semantic.descriptor.pitch_bytes;
             raster::MutableBytes overlay{semantic_pixels, semantic_pitch, static_cast<int>(state.extent.width), static_cast<int>(state.extent.height)};
-            checked(static_cast<cudaError_t>(state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height,
-                                                           clean_pixels, clean_pitch, stream)));
+            checked(static_cast<cudaError_t>(
+                state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)));
             checked(cudaMemset2DAsync(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
             if (!state.predictions.empty() && (prediction_boxes || prediction_masks)) {
-                checked(static_cast<cudaError_t>(raster::build_category_colors_cuda({reinterpret_cast<const int*>(data + state.labels_offset), state.predictions.size(),
-                    state.category_count, data + state.colors_offset, {reinterpret_cast<void*>(stream)}})));
-                checked(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba({
-                    .overlay = overlay,
-                    .instances = {reinterpret_cast<const float*>(data + state.boxes_offset), data + state.colors_offset,
-                                  reinterpret_cast<const int*>(data + state.labels_offset), static_cast<int>(state.predictions.size())},
-                    .masks = prediction_masks && state.masks ? reinterpret_cast<const bool*>(data + state.masks_offset) : nullptr,
-                    .mask_alpha = 96U, .box_thickness = prediction_boxes ? 2 : 0, .stream = {reinterpret_cast<void*>(stream)}, .labels = !state.composition})));
+                checked(static_cast<cudaError_t>(raster::build_category_colors_cuda({reinterpret_cast<const int*>(data + state.labels_offset),
+                                                                                     state.predictions.size(),
+                                                                                     state.category_count,
+                                                                                     data + state.colors_offset,
+                                                                                     {reinterpret_cast<void*>(stream)}})));
+                checked(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(
+                    {.overlay = overlay,
+                     .instances = {reinterpret_cast<const float*>(data + state.boxes_offset), data + state.colors_offset,
+                                   reinterpret_cast<const int*>(data + state.labels_offset), static_cast<int>(state.predictions.size())},
+                     .masks = prediction_masks && state.masks ? reinterpret_cast<const bool*>(data + state.masks_offset) : nullptr,
+                     .mask_alpha = 96U,
+                     .box_thickness = prediction_boxes ? 2 : 0,
+                     .stream = {reinterpret_cast<void*>(stream)},
+                     .labels = !state.composition})));
             }
             if (!state.ground_truth_uploaded && !state.ground_truth_runs.empty()) {
                 const auto bytes = state.ground_truth_runs.size() * sizeof(std::uint32_t);
@@ -468,29 +495,41 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             }
             std::size_t word = 0U, gt_index = 0U;
             for (const auto& gt : state.ground_truth) {
-                const raster::RgbColor color{state.ground_truth_colors[gt_index * 3U], state.ground_truth_colors[gt_index * 3U + 1U], state.ground_truth_colors[gt_index * 3U + 2U]};
+                const raster::RgbColor color{state.ground_truth_colors[gt_index * 3U], state.ground_truth_colors[gt_index * 3U + 1U],
+                                             state.ground_truth_colors[gt_index * 3U + 2U]};
                 ++gt_index;
                 if (ground_truth_masks && !gt.mask.runs.empty())
-                    checked(static_cast<cudaError_t>(raster::raster_mask_runs_rgba({.overlay = overlay,
-                        .run_pairs = reinterpret_cast<const std::uint32_t*>(data + state.ground_truth_offset) + word,
-                        .run_count = static_cast<std::uint32_t>(gt.mask.runs.size()), .color = {color.r, color.g, color.b, 96U},
-                        .stream = {reinterpret_cast<void*>(stream)}})));
+                    checked(static_cast<cudaError_t>(
+                        raster::raster_mask_runs_rgba({.overlay = overlay,
+                                                       .run_pairs = reinterpret_cast<const std::uint32_t*>(data + state.ground_truth_offset) + word,
+                                                       .run_count = static_cast<std::uint32_t>(gt.mask.runs.size()),
+                                                       .color = {color.r, color.g, color.b, 96U},
+                                                       .stream = {reinterpret_cast<void*>(stream)}})));
                 if (ground_truth_boxes)
-                    checked(static_cast<cudaError_t>(raster::raster_box_outline_rgba({.overlay = overlay,
-                        .box = {static_cast<int>(std::floor(gt.bbox_xyxy[0])), static_cast<int>(std::floor(gt.bbox_xyxy[1])),
-                                static_cast<int>(std::ceil(gt.bbox_xyxy[2])), static_cast<int>(std::ceil(gt.bbox_xyxy[3]))},
-                        .color = {color.r, color.g, color.b}, .thickness = 1, .stream = {reinterpret_cast<void*>(stream)}})));
+                    checked(static_cast<cudaError_t>(
+                        raster::raster_box_outline_rgba({.overlay = overlay,
+                                                         .box = {static_cast<int>(std::floor(gt.bbox_xyxy[0])), static_cast<int>(std::floor(gt.bbox_xyxy[1])),
+                                                                 static_cast<int>(std::ceil(gt.bbox_xyxy[2])), static_cast<int>(std::ceil(gt.bbox_xyxy[3]))},
+                                                         .color = {color.r, color.g, color.b},
+                                                         .thickness = 1,
+                                                         .stream = {reinterpret_cast<void*>(stream)}})));
                 word += gt.mask.runs.size() * 2U;
             }
             if (scale) {
-                checked(static_cast<cudaError_t>(raster::scale_rgba_nearest({clean_pixels, clean_pitch, overlay.width, overlay.height},
-                    {reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes, static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)}, stream)));
-                checked(static_cast<cudaError_t>(raster::scale_rgba_nearest({semantic_pixels, semantic_pitch, overlay.width, overlay.height},
-                    {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes, static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)}, stream)));
+                checked(
+                    static_cast<cudaError_t>(raster::scale_rgba_nearest({clean_pixels, clean_pitch, overlay.width, overlay.height},
+                                                                        {reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes,
+                                                                         static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)},
+                                                                        stream)));
+                checked(static_cast<cudaError_t>(
+                    raster::scale_rgba_nearest({semantic_pixels, semantic_pitch, overlay.width, overlay.height},
+                                               {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes,
+                                                static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)},
+                                               stream)));
             }
         });
         // The enclosing PublishRetained owns completion and partial-write settlement.
         // Keep staging and decoded custody alive until that actual boundary.
     }
 }
-}
+}  // namespace mmltk::controller::detail

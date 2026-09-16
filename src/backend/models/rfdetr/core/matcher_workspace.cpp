@@ -17,9 +17,7 @@
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/common/io/scoped_fd.h"
-
 import mmltk.common.logging.profile_utils;
-
 namespace mmltk::backend::models::rfdetr {
 namespace {
 void check(CUresult status, const char* operation) {
@@ -41,7 +39,6 @@ struct MatcherContext final {
     CUcontext context{};
     bool primary_owned = false;
 };
-
 template <class Release>
 [[nodiscard]] bool release_matcher_resources(const std::shared_ptr<MatcherContext>& context, Release&& release) noexcept {
     if (!context) return true;
@@ -54,7 +51,6 @@ template <class Release>
     CUcontext prior{};
     return cuCtxPopCurrent(&prior) == CUDA_SUCCESS && released;
 }
-
 struct AssignmentResources final {
     std::shared_ptr<MatcherContext> context;
     std::unique_ptr<mmltk::frameworks::gpu::GdrMappedBuffer> mapped;
@@ -64,7 +60,6 @@ struct AssignmentResources final {
     std::optional<mmltk::frameworks::gpu::GdrMappedBuffer::ReadLease> lease;
     CUevent complete{};
     bool recorded = false;
-
     bool release() noexcept {
         return release_matcher_resources(context, [this] {
             if (!recorded)
@@ -90,8 +85,7 @@ struct AssignmentSlot final {
     // Counts tensor-storage owners, independent of the workspace's slot owner.
     std::shared_ptr<int> use = std::make_shared<int>(0);
     ~AssignmentSlot() {
-        if (!physical->release())
-            std::move(reservation).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(physical)), cudaErrorUnknown);
+        if (!physical->release()) std::move(reservation).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(physical)), cudaErrorUnknown);
     }
     void settle() {
         auto& p = *physical;
@@ -101,7 +95,6 @@ struct AssignmentSlot final {
         p.recorded = false;
     }
 };
-
 struct MatcherCostResources final {
     std::shared_ptr<MatcherContext> context;
     std::unique_ptr<mmltk::backend::ml::cuda::NumaHostTensor> host;
@@ -122,10 +115,8 @@ struct MatcherCostResources final {
         });
     }
 };
-
 template <auto Member>
-[[nodiscard]] bool append_matcher_statistic(char* const record, const std::size_t capacity, int& length,
-                                            const MatcherStatistics& statistics) noexcept {
+[[nodiscard]] bool append_matcher_statistic(char* const record, const std::size_t capacity, int& length, const MatcherStatistics& statistics) noexcept {
     constexpr auto name = std::meta::identifier_of(Member);
     const auto remaining = capacity - static_cast<std::size_t>(length);
     const int appended = std::snprintf(record + length, remaining, ",\"%.*s\":%llu", static_cast<int>(name.size()), name.data(),
@@ -134,16 +125,13 @@ template <auto Member>
     length += appended;
     return true;
 }
-
 inline constexpr auto kMatcherStatisticMembers =
     std::define_static_array(std::meta::nonstatic_data_members_of(^^MatcherStatistics, std::meta::access_context::current()));
-
 template <std::size_t... Indices>
-[[nodiscard]] bool append_matcher_statistics(char* const record, const std::size_t capacity, int& length,
-                                             const MatcherStatistics& statistics, std::index_sequence<Indices...>) noexcept {
+[[nodiscard]] bool append_matcher_statistics(char* const record, const std::size_t capacity, int& length, const MatcherStatistics& statistics,
+                                             std::index_sequence<Indices...>) noexcept {
     return (append_matcher_statistic<kMatcherStatisticMembers[Indices]>(record, capacity, length, statistics) && ...);
 }
-
 }  // namespace
 struct MatcherWorkspace::State {
     explicit State(bool upload_h2d) : h2d(upload_h2d) {
@@ -162,12 +150,10 @@ struct MatcherWorkspace::State {
     void log(const char* event) const noexcept {
         if (trace.get() < 0) return;
         char record[768];
-        int length = std::snprintf(record, sizeof(record), "{\"event\":\"%s\",\"device\":%d,\"transport\":\"%s\"", event,
-                                   context ? context->device : -1, h2d ? "h2d" : "gdr");
+        int length = std::snprintf(record, sizeof(record), "{\"event\":\"%s\",\"device\":%d,\"transport\":\"%s\"", event, context ? context->device : -1,
+                                   h2d ? "h2d" : "gdr");
         if (length < 0 || static_cast<std::size_t>(length) >= sizeof(record)) return;
-        if (!append_matcher_statistics(record, sizeof(record), length, statistics,
-                                       std::make_index_sequence<kMatcherStatisticMembers.size()>{}))
-            return;
+        if (!append_matcher_statistics(record, sizeof(record), length, statistics, std::make_index_sequence<kMatcherStatisticMembers.size()>{})) return;
         if (static_cast<std::size_t>(length) + 2 > sizeof(record)) return;
         record[length++] = '}';
         record[length++] = '\n';
@@ -183,8 +169,7 @@ struct MatcherWorkspace::State {
     std::vector<std::shared_ptr<mmltk::common::system::NumaMemory>> cpu_results;
     ~State() {
         assignments.clear();
-        if (!cost->release())
-            std::move(reservation).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(cost)), cudaErrorUnknown);
+        if (!cost->release()) std::move(reservation).Install(mmltk::frameworks::gpu::TerminalCudaCustody::Share(std::move(cost)), cudaErrorUnknown);
     }
     void bind(const at::Device& device) {
         if (!device.is_cuda()) return;
@@ -212,8 +197,7 @@ TracedLossOpCache& MatcherWorkspace::loss_cache() noexcept { return state_->loss
 void MatcherWorkspace::enable_statistics() noexcept { state_->observed = true; }
 MatcherStatistics MatcherWorkspace::statistics() const noexcept { return state_->statistics; }
 at::Tensor MatcherWorkspace::cpu_indices(std::int64_t count) {
-    if (count < 0 || count > std::numeric_limits<std::int64_t>::max() / 16)
-        throw std::invalid_argument("matcher CPU assignment extent overflows");
+    if (count < 0 || count > std::numeric_limits<std::int64_t>::max() / 16) throw std::invalid_argument("matcher CPU assignment extent overflows");
     std::shared_ptr<mmltk::common::system::NumaMemory> storage;
     const auto reusable = std::ranges::find_if(state_->cpu_results, [](const auto& slot) { return slot.use_count() == 1; });
     if (reusable == state_->cpu_results.end()) {
@@ -232,8 +216,7 @@ void MatcherWorkspace::prepare_cost(at::IntArrayRef shape, const at::Device& dev
     state_->bind(device);
     std::int64_t elements = 1;
     for (auto size : shape) {
-        if (size < 0 || (size && elements > std::numeric_limits<std::int64_t>::max() / size))
-            throw std::invalid_argument("matcher cost shape overflows");
+        if (size < 0 || (size && elements > std::numeric_limits<std::int64_t>::max() / size)) throw std::invalid_argument("matcher cost shape overflows");
         elements *= size;
     }
     if (!state_->cost->device_backing.defined() || state_->cost->device_backing.numel() < elements) {
@@ -253,8 +236,7 @@ at::Tensor MatcherWorkspace::read_cost() {
     state_->bind(at::Device(at::kCUDA, device_index));
     const auto stream = c10::cuda::getCurrentCUDAStream(device_index);
     const auto bytes = state_->cost->device_cost.nbytes();
-    check(cuMemcpyDtoHAsync(state_->cost->cpu_cost.data_ptr(), reinterpret_cast<CUdeviceptr>(state_->cost->device_cost.data_ptr()), bytes,
-                            stream.stream()),
+    check(cuMemcpyDtoHAsync(state_->cost->cpu_cost.data_ptr(), reinterpret_cast<CUdeviceptr>(state_->cost->device_cost.data_ptr()), bytes, stream.stream()),
           "copy active matcher costs");
     check(cuEventRecord(state_->cost->complete, stream.stream()), "record matcher cost completion");
     check(cuEventSynchronize(state_->cost->complete), "complete matcher cost copy");
@@ -353,9 +335,9 @@ std::vector<MatcherLayerIndices> MatcherWorkspace::pack(const std::vector<std::v
                 mmltk::common::logging::profile_add_value("rfdetr.matcher.assignment_storage_growth", 1);
             }
             destination = slot->physical->device_values.data_ptr();
-            check(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(destination), data, packed.nbytes(),
-                                    c10::cuda::getCurrentCUDAStream(device.index()).stream()),
-                  "upload packed assignments");
+            check(
+                cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(destination), data, packed.nbytes(), c10::cuda::getCurrentCUDAStream(device.index()).stream()),
+                "upload packed assignments");
             mmltk::common::logging::profile_add_value("rfdetr.matcher.assignment_h2d_submissions", 1);
             state_->count(&MatcherStatistics::h2d_submissions);
         }
@@ -382,8 +364,7 @@ void MatcherWorkspace::complete_assignments(CUstream stream) {
     c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(state_->context->device));
     state_->bind(at::Device(at::kCUDA, static_cast<c10::DeviceIndex>(state_->context->device)));
     for (auto& slot : state_->assignments) {
-        if (slot->use.use_count() != 1 || slot->physical->recorded || (!slot->physical->lease && !slot->physical->device_values.defined()))
-            continue;
+        if (slot->use.use_count() != 1 || slot->physical->recorded || (!slot->physical->lease && !slot->physical->device_values.defined())) continue;
         if (slot->physical->lease)
             slot->physical->lease->record_consumed(stream);
         else

@@ -5,9 +5,7 @@
 #include "src/controller/browser/application_visual_projection_emitter.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/controller/browser/tests/annotation_wire_fixture.h"
-
 #include <catch2/catch_test_macros.hpp>
-
 #include <algorithm>
 #include <cctype>
 #include <concepts>
@@ -21,7 +19,6 @@
 #include <string>
 #include <type_traits>
 #include <variant>
-
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/model_selection.h"
@@ -32,9 +29,7 @@
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
-
 namespace mmltk::controller::browser::relation_audit_test {
-
 struct OrphanProvider final {
     [[nodiscard]] static consteval bool valid() noexcept { return true; }
 };
@@ -47,7 +42,6 @@ struct SecondProvider final {
 struct InvalidDestinationProvider final {
     [[nodiscard]] static consteval bool valid() noexcept { return true; }
 };
-
 class[[= mmltk::frameworks::reflection::OpaqueRelationStorage{}]] OverrideState final {
    public:
     constexpr OverrideState() noexcept = default;
@@ -56,66 +50,53 @@ class[[= mmltk::frameworks::reflection::OpaqueRelationStorage{}]] OverrideState 
    private:
     [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{1U}]] std::uint16_t mask = 0U;
 };
-
 struct Row final {
     std::uint16_t value = 0U;
 };
-
 struct OrphanSettings final {
     OverrideState overrides;
 };
-
 struct MultipleClaimSettings final {
     [[= mmltk::frameworks::reflection::CatalogProvider<FirstProvider>{}]] std::uint16_t first = 0U;
     [[= mmltk::frameworks::reflection::CatalogProvider<SecondProvider>{}]] std::uint16_t second = 0U;
     std::uint16_t value = 0U;
     OverrideState overrides;
 };
-
 struct InvalidDestinationSettings final {
     [[= mmltk::frameworks::reflection::CatalogProvider<InvalidDestinationProvider>{}]] std::uint16_t selector = 0U;
     [[= mmltk::controller::contracts::reflection::PersistenceMetadata{}]] std::uint16_t persisted = 0U;
     OverrideState overrides;
 };
-
 MMLTK_REFLECT_FIELDS(OverrideState)
 MMLTK_REFLECT_FIELDS(Row)
 MMLTK_REFLECT_FIELDS(OrphanSettings)
 MMLTK_REFLECT_FIELDS(MultipleClaimSettings)
 MMLTK_REFLECT_FIELDS(InvalidDestinationSettings)
-
 template <class Settings, auto Selector, auto Destination>
 struct RelationFixture
     : mmltk::frameworks::reflection::StaticMemberRelation<
-          Row, Settings, 1U,
-          mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&Row::value>, Destination>> {
+          Row, Settings, 1U, mmltk::frameworks::reflection::MemberRelationEntry<mmltk::frameworks::reflection::member_path<&Row::value>, Destination>> {
     using override_state_type = OverrideState;
     inline static constexpr auto source_selector = mmltk::frameworks::reflection::member_path<&Row::value>;
     inline static constexpr auto destination_selector = Selector;
     inline static constexpr auto destination_override_state = mmltk::frameworks::reflection::member_path<&Settings::overrides>;
     inline static constexpr std::uint16_t valid_bits = 1U;
-
     [[nodiscard]] static consteval bool audit() { return RelationFixture::valid(); }
 };
-
 }  // namespace mmltk::controller::browser::relation_audit_test
-
 namespace mmltk::frameworks::reflection {
-
 template <>
 struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test::FirstProvider>
     : mmltk::controller::browser::relation_audit_test::RelationFixture<
           mmltk::controller::browser::relation_audit_test::MultipleClaimSettings,
           member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::first>,
           member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::value>> {};
-
 template <>
 struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test::SecondProvider>
     : mmltk::controller::browser::relation_audit_test::RelationFixture<
           mmltk::controller::browser::relation_audit_test::MultipleClaimSettings,
           member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::second>,
           member_path<&mmltk::controller::browser::relation_audit_test::MultipleClaimSettings::value>> {};
-
 // CLEANUP-IGNORE: Each specialization installs a distinct provider selector and malformed relation topology.
 template <>
 struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test::InvalidDestinationProvider>
@@ -123,12 +104,9 @@ struct catalog_provider_relation<mmltk::controller::browser::relation_audit_test
           mmltk::controller::browser::relation_audit_test::InvalidDestinationSettings,
           member_path<&mmltk::controller::browser::relation_audit_test::InvalidDestinationSettings::selector>,
           member_path<&mmltk::controller::browser::relation_audit_test::InvalidDestinationSettings::persisted>> {};
-
 }  // namespace mmltk::frameworks::reflection
-
 namespace mmltk::controller::browser {
 namespace {
-
 enum class IntegrationPolicyBaseline : std::uint8_t {
     Command[[= contracts::IntegrationCommandDirection{false, false, false}]] = 7U,
 };
@@ -150,12 +128,10 @@ enum class IntegrationPolicyRenamed : std::uint8_t {
 enum class IntegrationPolicyReassigned : std::uint8_t {
     Command[[= contracts::IntegrationCommandDirection{false, false, false}]] = 8U,
 };
-
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::OrphanSettings>());
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::MultipleClaimSettings>());
 static_assert(!application_schema_detail::settings_relations_are_valid<relation_audit_test::InvalidDestinationSettings>());
 static_assert(application_schema_detail::settings_relations_are_valid<contracts::GuiSettingsState>());
-
 struct Increment final {
     [[= mmltk::frameworks::reflection::Minimum{std::int32_t{1}}]] std::int32_t amount = 1;
 };
@@ -165,11 +141,9 @@ struct CounterSnapshot final {
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] CounterChanged final {
     std::int32_t value = 0;
 };
-
 MMLTK_REFLECT_FIELDS(Increment)
 MMLTK_REFLECT_FIELDS(CounterSnapshot)
 MMLTK_REFLECT_FIELDS(CounterChanged)
-
 [[nodiscard]] Interaction counter_interaction(const std::uint64_t endpoint_id, const std::int32_t amount) {
     wire::ByteBuffer bytes(64U);
     mmltk::frameworks::serialization::FixedCborEncoder writer(bytes);
@@ -177,13 +151,11 @@ MMLTK_REFLECT_FIELDS(CounterChanged)
     bytes.resize(writer.size());
     return {.endpoint_id = endpoint_id, .value = std::move(bytes)};
 }
-
 enum class DiscoveryMode : std::uint8_t {
     Ready,
     Complete,
 };
 MMLTK_REFLECT_ENUM(DiscoveryMode)
-
 struct DiscoveryLeaf final {
     DiscoveryMode mode = DiscoveryMode::Ready;
     std::vector<std::uint32_t> samples;
@@ -193,16 +165,13 @@ struct DiscoveryEnvelope final {
 };
 MMLTK_REFLECT_FIELDS(DiscoveryLeaf)
 MMLTK_REFLECT_FIELDS(DiscoveryEnvelope)
-
 struct UnreflectedReachable final {
     std::uint32_t value = 0U;
 };
-
 class InvalidAritySystem final {
    public:
     [[= contracts::reflection::direct::IntentEndpoint{}]] std::int32_t Invalid(Increment, Increment) { return 0; }
 };
-
 class AnnotationEligibilityExamples final {
    public:
     [[= contracts::reflection::direct::IntentEndpoint{}]] std::int32_t ValidEndpoint(Increment) { return 0; }
@@ -211,7 +180,6 @@ class AnnotationEligibilityExamples final {
     [[= contracts::reflection::Snapshot{256U}]] CounterSnapshot RefQualifiedSnapshot() const& { return {}; }
     [[= contracts::reflection::Snapshot{256U}]] static CounterSnapshot StaticSnapshot() { return {}; }
 };
-
 class CounterSystem final {
    public:
     using event_type = std::variant<CounterChanged>;
@@ -228,11 +196,9 @@ class CounterSystem final {
    private:
     std::int32_t value_ = 0;
 };
-
 struct TestSystems final {
     CounterSystem* counter = nullptr;
 };
-
 struct TestSettings final {
     std::uint32_t limit = 7U;
 };
@@ -245,36 +211,30 @@ struct OtherSettingsSnapshot final {
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] TestSettingsChanged final {
     TestSettingsSnapshot snapshot{};
 };
-
 MMLTK_REFLECT_FIELDS(TestSettings)
 MMLTK_REFLECT_FIELDS(TestSettingsSnapshot)
 MMLTK_REFLECT_FIELDS(OtherSettingsSnapshot)
 MMLTK_REFLECT_FIELDS(TestSettingsChanged)
-
 [[nodiscard]] TestSettings default_test_settings() { return {}; }
 [[nodiscard]] std::uint32_t wrong_test_settings_factory() { return 0U; }
-
 class TestSettingsSystem final {
    public:
     using event_type = std::variant<TestSettingsChanged>;
     using settings_surface = SettingsSurface<&TestSettingsSnapshot::settings, &default_test_settings>;
     [[= contracts::reflection::Snapshot{256U}]] [[nodiscard]] TestSettingsSnapshot snapshot() const noexcept { return {}; }
 };
-
 class WrongOwnerSettingsSystem final {
    public:
     using event_type = std::variant<TestSettingsChanged>;
     using settings_surface = SettingsSurface<&OtherSettingsSnapshot::settings, &default_test_settings>;
     [[= contracts::reflection::Snapshot{256U}]] [[nodiscard]] TestSettingsSnapshot snapshot() const noexcept { return {}; }
 };
-
 class WrongFactorySettingsSystem final {
    public:
     using event_type = std::variant<TestSettingsChanged>;
     using settings_surface = SettingsSurface<&TestSettingsSnapshot::settings, &wrong_test_settings_factory>;
     [[= contracts::reflection::Snapshot{256U}]] [[nodiscard]] TestSettingsSnapshot snapshot() const noexcept { return {}; }
 };
-
 struct TestSettingsSystems final {
     TestSettingsSystem* settings = nullptr;
     CounterSystem* counter = nullptr;
@@ -289,7 +249,6 @@ struct WrongOwnerSystems final {
 struct WrongFactorySystems final {
     WrongFactorySettingsSystem* settings = nullptr;
 };
-
 struct SyntheticRequest final {
     std::uint32_t value = 0U;
 };
@@ -302,7 +261,6 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Tra
 MMLTK_REFLECT_FIELDS(SyntheticRequest)
 MMLTK_REFLECT_FIELDS(SyntheticSnapshot)
 MMLTK_REFLECT_FIELDS(SyntheticChanged)
-
 class AdditionalSyntheticSystem final {
    public:
     using event_type = std::variant<SyntheticChanged>;
@@ -310,18 +268,15 @@ class AdditionalSyntheticSystem final {
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Observe(SyntheticRequest) {}
     [[= contracts::reflection::Snapshot{256U}]] [[nodiscard]] SyntheticSnapshot snapshot() const noexcept { return {}; }
 };
-
 struct ChangedTestSettingsSystems final {
     TestSettingsSystem* settings = nullptr;
     CounterSystem* counter = nullptr;
     AdditionalSyntheticSystem* additional = nullptr;
 };
-
 struct RoutingSystems final {
     CounterSystem* counter = nullptr;
     AdditionalSyntheticSystem* additional = nullptr;
 };
-
 struct SyntheticVisualOperation final {
     std::uint64_t revision = 0U;
     std::uint64_t alternate = 0U;
@@ -340,14 +295,13 @@ struct UnreflectedNestedVisualSnapshot final {
 MMLTK_REFLECT_FIELDS(SyntheticVisualOperation)
 MMLTK_REFLECT_FIELDS(SyntheticVisualSnapshot)
 MMLTK_REFLECT_FIELDS(UnreflectedNestedVisualSnapshot)
-
-template <PresentationSourceKind Kind, auto Revision = mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation,
-                                                                                                  &SyntheticVisualOperation::revision>>
+template <PresentationSourceKind Kind,
+          auto Revision = mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>
 class SyntheticVisualSystem final {
    public:
     using event_type = std::variant<SyntheticChanged>;
-    using visual_source = VisualSourceProjection<SyntheticVisualSnapshot, Kind,
-                                                 mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>, Revision>;
+    using visual_source =
+        VisualSourceProjection<SyntheticVisualSnapshot, Kind, mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>, Revision>;
     [[= contracts::reflection::direct::IntentEndpoint{}]] std::uint32_t Apply(SyntheticRequest request) { return request.value; }
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] SyntheticVisualSnapshot snapshot() const {
         ++samples;
@@ -380,22 +334,17 @@ struct VisualFingerprintComposition final {
 };
 struct AlternateVisualFingerprintComposition final {
     TestSettingsSystem* settings = nullptr;
-    SyntheticVisualSystem<
-        PresentationSourceKind::Predict,
-        mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer =
+    SyntheticVisualSystem<PresentationSourceKind::Predict,
+                          mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer =
         nullptr;
 };
-
 class RoutingTextWriter final {
    public:
     explicit RoutingTextWriter(std::ostringstream& output) : output_(output) {}
-
     [[nodiscard]] std::ostream& output() const noexcept { return output_; }
-
     void reserve(const std::string_view scope, const std::string_view symbol, std::string_view) {
         if (!symbols_.emplace(std::string(scope), std::string(symbol)).second) throw std::logic_error("projected symbol collision");
     }
-
     [[nodiscard]] std::string identifier(const std::string_view source, const bool upper) const {
         std::string result(source);
         if (!result.empty()) {
@@ -404,13 +353,11 @@ class RoutingTextWriter final {
         }
         return result;
     }
-
     template <class Type>
     [[nodiscard]] std::string rust_type() const {
         if constexpr (std::same_as<Type, void>) return "()";
         return identifier(mmltk::frameworks::serialization::reflected_schema_type_name<Type>(), true);
     }
-
     template <class Type>
     [[nodiscard]] std::string native_source() const {
         return std::string(std::meta::display_string_of(^^Type));
@@ -420,17 +367,14 @@ class RoutingTextWriter final {
     std::ostringstream& output_;
     std::set<std::pair<std::string, std::string>> symbols_;
 };
-
 static_assert(!application_settings_surface_is_valid<TestSystems>());
 static_assert(!application_settings_surface_is_valid<TwoSettingsSystems>());
 static_assert(!application_settings_surface_is_valid<WrongOwnerSystems>());
 static_assert(!application_settings_surface_is_valid<WrongFactorySystems>());
 static_assert(application_settings_surface_is_valid<TestSettingsSystems>());
-
 struct ChangedSystems final {
     CounterSystem* renamed_counter = nullptr;
 };
-
 inline constexpr mmltk::frameworks::reflection::FixedText kValidFixedText{
     .capacity = 4U,
     .characters = mmltk::frameworks::reflection::FixedTextCharacterPolicy::PrintableAscii,
@@ -440,7 +384,6 @@ struct[[= kValidFixedText]] ValidFixedText final {
     std::uint8_t size = 0U;
 };
 MMLTK_REFLECT_FIELDS(ValidFixedText)
-
 inline constexpr mmltk::frameworks::reflection::FixedText kMismatchedFixedText{
     .capacity = 5U,
     .characters = mmltk::frameworks::reflection::FixedTextCharacterPolicy::PrintableAscii,
@@ -450,7 +393,6 @@ struct[[= kMismatchedFixedText]] MismatchedFixedText final {
     std::uint8_t size = 0U;
 };
 MMLTK_REFLECT_FIELDS(MismatchedFixedText)
-
 inline constexpr mmltk::frameworks::reflection::FixedText kUnsupportedFixedText{
     .capacity = 4U,
     .characters = static_cast<mmltk::frameworks::reflection::FixedTextCharacterPolicy>(255U),
@@ -460,13 +402,11 @@ struct[[= kUnsupportedFixedText]] UnsupportedFixedText final {
     std::uint8_t size = 0U;
 };
 MMLTK_REFLECT_FIELDS(UnsupportedFixedText)
-
 struct[[= kValidFixedText]] SignedSizeFixedText final {
     std::array<char, kValidFixedText.capacity> bytes{};
     std::int8_t size = 0;
 };
 MMLTK_REFLECT_FIELDS(SignedSizeFixedText)
-
 inline constexpr mmltk::frameworks::reflection::FixedText kWideFixedText{
     .capacity = 300U,
     .characters = mmltk::frameworks::reflection::FixedTextCharacterPolicy::PrintableAscii,
@@ -476,91 +416,69 @@ struct[[= kWideFixedText]] NarrowSizeFixedText final {
     std::uint8_t size = 0U;
 };
 MMLTK_REFLECT_FIELDS(NarrowSizeFixedText)
-
 struct[[= kValidFixedText]] WrongByteStorageFixedText final {
     std::array<std::uint8_t, kValidFixedText.capacity> bytes{};
     std::uint8_t size = 0U;
 };
 MMLTK_REFLECT_FIELDS(WrongByteStorageFixedText)
-
 struct DirectInheritanceRequest final {
-    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{
-        1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
     bool derived_enabled = true;
 };
-
 struct InheritedRequestBase {
-    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{
-        1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
 };
-
 struct InheritedRequest final : InheritedRequestBase {
     bool derived_enabled = true;
 };
-
 struct ChangedInheritedRequestBase {
-    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{
-        2}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{2}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
 };
-
 struct ChangedInheritedRequest final : ChangedInheritedRequestBase {
     bool derived_enabled = true;
 };
-
 MMLTK_REFLECT_FIELDS(DirectInheritanceRequest)
 MMLTK_REFLECT_FIELDS(InheritedRequestBase)
 MMLTK_REFLECT_FIELDS(InheritedRequest)
 MMLTK_REFLECT_FIELDS(ChangedInheritedRequestBase)
 MMLTK_REFLECT_FIELDS(ChangedInheritedRequest)
-
 template <class Request>
 class InheritanceFixtureSystem final {
    public:
     using event_type = std::variant<CounterChanged>;
-
     [[= contracts::reflection::direct::IntentEndpoint{}]] std::int32_t Apply(Request request) { return request.inherited_limit; }
-
     [[= contracts::reflection::Snapshot{256U}]] [[nodiscard]] CounterSnapshot snapshot() const noexcept { return {}; }
 };
-
 struct DirectInheritanceSystems final {
     InheritanceFixtureSystem<DirectInheritanceRequest>* fixture = nullptr;
 };
-
 struct InheritedSystems final {
     InheritanceFixtureSystem<InheritedRequest>* fixture = nullptr;
 };
-
 struct ChangedInheritedSystems final {
     InheritanceFixtureSystem<ChangedInheritedRequest>* fixture = nullptr;
 };
-
 struct DirectInheritanceSettings final {
     [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
         2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit = 6U;
     [[= contracts::reflection::PersistenceMetadata{}]] std::uint64_t persisted_revision = 17U;
     bool derived_enabled = true;
 };
-
 struct InheritedSettingsBase {
     [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
         2U}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{12U}]] std::uint32_t inherited_limit = 6U;
     [[= contracts::reflection::PersistenceMetadata{}]] std::uint64_t persisted_revision = 17U;
 };
-
 struct InheritedSettings final : InheritedSettingsBase {
     bool derived_enabled = true;
 };
-
 MMLTK_REFLECT_FIELDS(DirectInheritanceSettings)
 MMLTK_REFLECT_FIELDS(InheritedSettingsBase)
 MMLTK_REFLECT_FIELDS(InheritedSettings)
-
 TEST_CASE("canonical application schema owns endpoint dispatch and stable identities", "[controller][browser][reflection]") {
     using Surface = ApplicationIntentSurface<TestSystems>;
     STATIC_REQUIRE(Surface::count == 2U);
     STATIC_REQUIRE(Surface::HasUniqueStableIds());
-
     CounterSystem counter;
     TestSystems systems{.counter = &counter};
     std::uint64_t intent_id = 0U;
@@ -571,7 +489,6 @@ TEST_CASE("canonical application schema owns endpoint dispatch and stable identi
         else
             intent_id = Endpoint::stable_id;
     });
-
     std::uint64_t amount_id = 0U;
     Surface::Visit([&]<class Endpoint>() {
         if constexpr (!Endpoint::interaction) {
@@ -581,64 +498,52 @@ TEST_CASE("canonical application schema owns endpoint dispatch and stable identi
     });
     REQUIRE(amount_id != 0U);
     const auto reply = dispatch_intent(
-        systems,
-        Intent{.correlation = 7U, .endpoint_id = intent_id, .fields = {{.field_id = amount_id, .value = wire::Value(std::int64_t{4})}}});
+        systems, Intent{.correlation = 7U, .endpoint_id = intent_id, .fields = {{.field_id = amount_id, .value = wire::Value(std::int64_t{4})}}});
     REQUIRE(reply.result.has_value());
     CHECK(counter.snapshot().value == 4);
-
     const auto accepted = dispatch_interaction(systems, counter_interaction(interaction_id, 9));
     CHECK(accepted.disposition == InteractionDispatchDisposition::Accepted);
     CHECK_FALSE(accepted.error.has_value());
     CHECK(counter.snapshot().value == 9);
-
     const auto unknown = dispatch_interaction(systems, Interaction{.endpoint_id = std::numeric_limits<std::uint64_t>::max(), .value = {}});
     CHECK(unknown.disposition == InteractionDispatchDisposition::ProtocolInvalid);
     CHECK_FALSE(unknown.error.has_value());
-
     const auto malformed = dispatch_interaction(systems, Interaction{.endpoint_id = interaction_id, .value = {std::byte{0xf6}}});
     CHECK(malformed.disposition == InteractionDispatchDisposition::ProtocolInvalid);
     CHECK_FALSE(malformed.error.has_value());
-
     TestSystems unavailable_systems{};
     const auto unavailable = dispatch_interaction(unavailable_systems, counter_interaction(interaction_id, 7));
     CHECK(unavailable.disposition == InteractionDispatchDisposition::ApplicationRejected);
     REQUIRE(unavailable.error.has_value());
     CHECK(unavailable.error->category == contracts::ApplicationErrorCategory::Unavailable);
-
     const auto failed = dispatch_interaction(systems, counter_interaction(interaction_id, 13));
     CHECK(failed.disposition == InteractionDispatchDisposition::ApplicationRejected);
     REQUIRE(failed.error.has_value());
     CHECK(failed.error->category == contracts::ApplicationErrorCategory::Failed);
 }
-
 TEST_CASE("visual producer projections derive nested observations and composition routing", "[controller][browser][reflection]") {
-    STATIC_REQUIRE(ApplicationSchema<ApplicationSystems>::VisualSourceCount() == 5U);
+    STATIC_REQUIRE(ApplicationSchema<ApplicationSystems>::VisualSourceCount() == 6U);
     STATIC_REQUIRE(ApplicationSchema<SyntheticVisualComposition>::VisualSourceCount() == 1U);
     STATIC_REQUIRE(ApplicationSchema<ExtendedVisualComposition>::VisualSourceCount() == 2U);
     STATIC_REQUIRE_FALSE(ApplicationSchema<DuplicateVisualComposition>::VisualSourcesAreUnique());
     using namespace mmltk::frameworks::reflection;
-    using WrongOwner =
-        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&ExploreSnapshot::frame>,
+    using WrongOwner = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&ExploreSnapshot::frame>,
+                                              member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using WrongType = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::operation>,
+                                             member_path<&SyntheticVisualSnapshot::product>>;
+    using EmptyKind = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::None, member_path<&SyntheticVisualSnapshot::product>,
+                                             member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
+    using UnknownKind =
+        VisualSourceProjection<SyntheticVisualSnapshot, static_cast<PresentationSourceKind>(255U), member_path<&SyntheticVisualSnapshot::product>,
                                member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
-    using WrongType =
-        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::operation>,
-                               member_path<&SyntheticVisualSnapshot::product>>;
-    using EmptyKind =
-        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::None, member_path<&SyntheticVisualSnapshot::product>,
-                               member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
-    using UnknownKind = VisualSourceProjection<SyntheticVisualSnapshot, static_cast<PresentationSourceKind>(255U),
-                                               member_path<&SyntheticVisualSnapshot::product>,
-                                               member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
     constexpr auto callable_frame = [](SyntheticVisualSnapshot& value) -> VisualFrame& { return value.product; };
     constexpr auto callable_operation = [](SyntheticVisualSnapshot& value) -> SyntheticVisualOperation& { return value.operation; };
     using CallableFrame = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, callable_frame,
                                                  member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>;
-    using CallableSegment =
-        VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::product>,
-                               member_path<callable_operation, &SyntheticVisualOperation::revision>>;
+    using CallableSegment = VisualSourceProjection<SyntheticVisualSnapshot, PresentationSourceKind::Predict, member_path<&SyntheticVisualSnapshot::product>,
+                                                   member_path<callable_operation, &SyntheticVisualOperation::revision>>;
     using UnreflectedSegment =
-        VisualSourceProjection<UnreflectedNestedVisualSnapshot, PresentationSourceKind::Predict,
-                               member_path<&UnreflectedNestedVisualSnapshot::product>,
+        VisualSourceProjection<UnreflectedNestedVisualSnapshot, PresentationSourceKind::Predict, member_path<&UnreflectedNestedVisualSnapshot::product>,
                                member_path<&UnreflectedNestedVisualSnapshot::operation, &UnreflectedVisualOperation::revision>>;
     STATIC_REQUIRE_FALSE(WrongOwner::valid());
     STATIC_REQUIRE_FALSE(WrongType::valid());
@@ -648,12 +553,10 @@ TEST_CASE("visual producer projections derive nested observations and compositio
     STATIC_REQUIRE_FALSE(CallableSegment::valid());
     STATIC_REQUIRE_FALSE(UnreflectedSegment::valid());
     STATIC_REQUIRE_FALSE(application_event_is_member<TestSystems, &TestSystems::counter, SyntheticChanged>());
-
     SyntheticVisualSystem<PresentationSourceKind::Predict> producer;
     SyntheticVisualSystem<PresentationSourceKind::Explore> additional;
     TestSettingsSystem settings;
-    auto readers = materialize_visual_source_readers(
-        ExtendedVisualComposition{.producer = &producer, .additional = &additional, .settings = &settings});
+    auto readers = materialize_visual_source_readers(ExtendedVisualComposition{.producer = &producer, .additional = &additional, .settings = &settings});
     for (const auto& reader : readers) {
         const auto observation = reader.observe();
         CHECK(observation.snapshot_revision == 91U);
@@ -667,8 +570,7 @@ TEST_CASE("visual producer projections derive nested observations and compositio
         const auto bytes = reader.image_metadata(frame);
         REQUIRE(bytes.has_value());
         CHECK(bytes->size() < 1024U);
-        const auto image =
-            wire::decode({.first = *bytes}, {.max_bytes = 1024U, .max_items = 1024U, .max_depth = wire::kMaximumNestingDepth});
+        const auto image = wire::decode({.first = *bytes}, {.max_bytes = 1024U, .max_items = 1024U, .max_depth = wire::kMaximumNestingDepth});
         REQUIRE(image.has_value());
         std::uint64_t system_id = 0U;
         ApplicationSchema<ExtendedVisualComposition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
@@ -699,10 +601,8 @@ TEST_CASE("visual producer projections derive nested observations and compositio
     RoutingTextWriter collision(collision_output);
     collision.reserve("module", "ApplicationVisualSnapshots", "conflicting declaration");
     CHECK_THROWS_AS(emit_application_visual_projection<ExtendedVisualComposition>(collision), std::logic_error);
-    CHECK(application_schema_fingerprint<VisualFingerprintComposition>() !=
-          application_schema_fingerprint<AlternateVisualFingerprintComposition>());
+    CHECK(application_schema_fingerprint<VisualFingerprintComposition>() != application_schema_fingerprint<AlternateVisualFingerprintComposition>());
 }
-
 TEST_CASE("materialized event publisher preserves transient and essential failure policy", "[controller][browser][reflection]") {
     std::size_t lost = 0U;
     std::function<void(SystemEvent)> failing = [](SystemEvent) { throw std::runtime_error("publication failed"); };
@@ -730,22 +630,18 @@ TEST_CASE("materialized event publisher preserves transient and essential failur
     CHECK(published.delivery == contracts::reflection::EventDelivery::Critical);
     CHECK(published.state_revision == 0U);
     CHECK(published.value == *expected);
-    CHECK(published.event_id ==
-          ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::presentation, PresentationFailed>::event_id);
+    CHECK(published.event_id == ApplicationEventIdentity<ApplicationSystems, &ApplicationSystems::presentation, PresentationFailed>::event_id);
     CHECK(lost == 2U);
     std::optional<PresentationSourceIdentity> notified;
     std::function<void(SystemEvent)> absent;
-    ApplicationEventPublisher<&ApplicationSystems::annotation> annotation(
-        absent, {}, [&](const PresentationSourceIdentity source) { notified = source; });
+    ApplicationEventPublisher<&ApplicationSystems::annotation> annotation(absent, {}, [&](const PresentationSourceIdentity source) { notified = source; });
     annotation(AnnotationSystem::event_type{AnnotationFrameChanged{}});
     CHECK((notified == std::optional{PresentationSourceIdentity{PresentationSourceKind::Annotation, 1U}}));
 }
-
 TEST_CASE("clean identity preserves semantic updates and distinguishes geometry and legacy products", "[controller][browser][reflection]") {
     const std::array kinds{PresentationSourceKind::None,    PresentationSourceKind::Explore, PresentationSourceKind::Annotation,
                            PresentationSourceKind::Predict, PresentationSourceKind::Live,    PresentationSourceKind::Upscale};
-    for (std::size_t session = 0U; session < kinds.size(); ++session)
-        CHECK(presentation_source_session(kinds[session]) == session);
+    for (std::size_t session = 0U; session < kinds.size(); ++session) CHECK(presentation_source_session(kinds[session]) == session);
     auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, {32U, 24U}, 7U);
     frame.content = {1U, 2U, 20U, 16U};
     CHECK(visual_clean_content_identity(frame).revision == 7U);
@@ -765,7 +661,6 @@ TEST_CASE("clean identity preserves semantic updates and distinguishes geometry 
     ++semantic.source.instance;
     CHECK(visual_clean_content_identity(semantic) != identity);
 }
-
 TEST_CASE("fixed text schema policy validates its complete native storage shape") {
     STATIC_REQUIRE(application_schema_detail::valid_fixed_text_shape<ValidFixedText>());
     STATIC_REQUIRE_FALSE(application_schema_detail::valid_fixed_text_shape<MismatchedFixedText>());
@@ -774,7 +669,6 @@ TEST_CASE("fixed text schema policy validates its complete native storage shape"
     STATIC_REQUIRE_FALSE(application_schema_detail::valid_fixed_text_shape<NarrowSizeFixedText>());
     STATIC_REQUIRE_FALSE(application_schema_detail::valid_fixed_text_shape<WrongByteStorageFixedText>());
 }
-
 TEST_CASE("closed application categories discover nested reflected declarations transitively") {
     STATIC_REQUIRE(application_schema_detail::runtime_boundary_projectable<DiscoveryEnvelope>());
     STATIC_REQUIRE(application_schema_detail::runtime_boundary_projectable<std::variant<DiscoveryEnvelope, std::array<std::byte, 4U>>>());
@@ -800,12 +694,9 @@ TEST_CASE("closed application categories discover nested reflected declarations 
     STATIC_REQUIRE(application_schema_detail::SupportedSnapshotMethod<^^AnnotationEligibilityExamples::ValidSnapshot>);
     STATIC_REQUIRE_FALSE(application_schema_detail::SupportedSnapshotMethod<^^AnnotationEligibilityExamples::RefQualifiedSnapshot>);
     STATIC_REQUIRE_FALSE(application_schema_detail::snapshot_member_eligible<^^AnnotationEligibilityExamples::StaticSnapshot>());
-    STATIC_REQUIRE(
-        application_schema_detail::annotation_count<^^AnnotationEligibilityExamples::StaticSnapshot, contracts::reflection::Snapshot>() ==
-        1U);
+    STATIC_REQUIRE(application_schema_detail::annotation_count<^^AnnotationEligibilityExamples::StaticSnapshot, contracts::reflection::Snapshot>() == 1U);
     STATIC_REQUIRE(application_schema_detail::annotation_count<^^CounterChanged, contracts::reflection::Event>() == 1U);
 }
-
 TEST_CASE("protocol-17 fingerprint is deterministic and covers stable composition identity", "[controller][browser][reflection]") {
     namespace cbor = mmltk::frameworks::serialization;
     STATIC_REQUIRE(cbor::compact_shape<WorkspaceMouse> == cbor::CompactShape::Object);
@@ -823,12 +714,9 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
         return sink.words();
     };
     CHECK(structural.template operator()<std::string>() == structural.template operator()<std::filesystem::path>());
-    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() !=
-          structural.template operator()<std::array<std::uint16_t, 3U>>());
-    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() !=
-          structural.template operator()<std::array<std::uint32_t, 2U>>());
-    CHECK(structural.template operator()<std::inplace_vector<std::uint16_t, 0U>>() !=
-          structural.template operator()<std::vector<std::uint16_t>>());
+    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() != structural.template operator()<std::array<std::uint16_t, 3U>>());
+    CHECK(structural.template operator()<std::array<std::uint16_t, 2U>>() != structural.template operator()<std::array<std::uint32_t, 2U>>());
+    CHECK(structural.template operator()<std::inplace_vector<std::uint16_t, 0U>>() != structural.template operator()<std::vector<std::uint16_t>>());
     application_schema_detail::FingerprintSink default_value;
     application_schema_detail::append_wire_value(default_value, wire::Value{std::uint64_t{7U}});
     application_schema_detail::FingerprintSink expected_default;
@@ -863,8 +751,7 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
         sink.append("type");
         sink.append("object");
         sink.append_number(fields.size());
-        for (const auto& append : fields)
-            append(sink);
+        for (const auto& append : fields) append(sink);
         sink.append("end-type");
         return sink.words();
     };
@@ -893,8 +780,7 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
         using Underlying = std::underlying_type_t<mmltk::controller::contracts::reflection::EventDelivery>;
         expected_enum.append_number(sizeof(Underlying));
         expected_enum.append_number(std::is_signed_v<Underlying>);
-        expected_enum.append_number(
-            mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>().size());
+        expected_enum.append_number(mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>().size());
         for (const auto entry : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::reflection::EventDelivery>()) {
             expected_enum.append(entry.name);
             expected_enum.append_number(static_cast<Underlying>(static_cast<Underlying>(entry.value) + (reassign ? 1U : 0U)));
@@ -912,9 +798,7 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
     const auto settings_facts = []<class Composition>() {
         std::vector<std::pair<std::string, std::uint64_t>> leaves;
         ApplicationSchema<Composition>::VisitApplicationSettingsLeaves(
-            [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& fact) {
-                leaves.emplace_back(fact.path, fact.stable_id);
-            });
+            [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& fact) { leaves.emplace_back(fact.path, fact.stable_id); });
         std::vector<std::pair<std::string, std::uint32_t>> defaults;
         ApplicationSchema<Composition>::VisitApplicationSettingsDefaults(
             [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& fact, const Member& value) {
@@ -924,9 +808,7 @@ TEST_CASE("protocol-17 fingerprint is deterministic and covers stable compositio
     };
     CHECK(settings_facts.template operator()<TestSettingsSystems>() == settings_facts.template operator()<ChangedTestSettingsSystems>());
 }
-
-TEST_CASE("application fingerprint includes canonical integration command identity and complete policy",
-          "[controller][browser][reflection]") {
+TEST_CASE("application fingerprint includes canonical integration command identity and complete policy", "[controller][browser][reflection]") {
     const auto schema = application_schema_detail::application_schema_sink<TestSettingsSystems>();
     const auto with_policy = [&]<class Kind>() {
         auto sink = schema;
@@ -941,15 +823,12 @@ TEST_CASE("application fingerprint includes canonical integration command identi
     CHECK(baseline != with_policy.template operator()<IntegrationPolicyCompiledIndex>());
     CHECK(baseline != with_policy.template operator()<IntegrationPolicyRenamed>());
     CHECK(baseline != with_policy.template operator()<IntegrationPolicyReassigned>());
-
     const auto canonical = with_policy.template operator()<contracts::IntegrationControlKind>();
     const auto actual = application_schema_fingerprint<TestSettingsSystems>();
     CHECK(actual == canonical);
     CHECK(actual != ApplicationSchemaFingerprint{schema.words()});
 }
-
-TEST_CASE("static outer routing derives intent-only ownership from an endpoint-only composition",
-          "[controller][browser][reflection][routing]") {
+TEST_CASE("static outer routing derives intent-only ownership from an endpoint-only composition", "[controller][browser][reflection][routing]") {
     std::ostringstream output;
     RoutingTextWriter writer(output);
     emit_application_outer_routing<RoutingSystems>(writer);
@@ -968,7 +847,6 @@ TEST_CASE("static outer routing derives intent-only ownership from an endpoint-o
     CHECK(intents.find("AdditionalApply") != std::string_view::npos);
     CHECK(intents.find("CounterReplace") == std::string_view::npos);
     CHECK(intents.find("AdditionalObserve") == std::string_view::npos);
-
     const auto decode_begin = text.find("decode_application_intent_endpoint");
     const auto decode_end = text.find("application_intent_endpoint_stable_id", decode_begin);
     REQUIRE(decode_begin != std::string::npos);
@@ -987,7 +865,6 @@ TEST_CASE("static outer routing derives intent-only ownership from an endpoint-o
     CHECK(replies.find("AdditionalApply") != std::string_view::npos);
     CHECK(replies.find("CounterReplace") == std::string_view::npos);
     CHECK(replies.find("AdditionalObserve") == std::string_view::npos);
-
     const std::array fixture_constants{
         std::pair{"SYSTEM_Counter", application_stable_id("counter")},
         std::pair{"SYSTEM_Additional", application_stable_id("additional")},
@@ -1005,9 +882,7 @@ TEST_CASE("static outer routing derives intent-only ownership from an endpoint-o
     CHECK(fixture_ids.size() == fixture_constants.size());
     CHECK(text.find("SCHEMA_FINGERPRINT") == std::string::npos);
 }
-
-TEST_CASE("native application schema flattens inherited request and settings declarations base first",
-          "[controller][browser][reflection][inheritance]") {
+TEST_CASE("native application schema flattens inherited request and settings declarations base first", "[controller][browser][reflection][inheritance]") {
     std::vector<std::string_view> request_names;
     std::vector<std::int32_t> request_defaults;
     std::vector<std::uint64_t> request_ids;
@@ -1037,14 +912,11 @@ TEST_CASE("native application schema flattens inherited request and settings dec
     REQUIRE((request_defaults == std::vector<std::int32_t>{4}));
     REQUIRE(request_ids.size() == 2U);
     CHECK(inherited_request_owner);
-
     std::uint64_t direct_request_id = 0U;
-    ApplicationSchema<DirectInheritanceSystems>::VisitRequestFields(
-        [&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) {
-            if (field.name == "inherited_limit") direct_request_id = field.stable_id;
-        });
+    ApplicationSchema<DirectInheritanceSystems>::VisitRequestFields([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) {
+        if (field.name == "inherited_limit") direct_request_id = field.stable_id;
+    });
     CHECK(request_ids.front() == direct_request_id);
-
     struct SettingsFact final {
         std::string path;
         std::uint64_t stable_id;
@@ -1075,31 +947,25 @@ TEST_CASE("native application schema flattens inherited request and settings dec
     CHECK(settings[2].path == "derived_enabled");
     CHECK(settings[2].mutable_leaf);
     CHECK(inherited_settings_owner);
-
     std::uint64_t direct_settings_id = 0U;
     ApplicationSchema<InheritedSystems>::VisitSettingsLeaves<DirectInheritanceSettings>(
         [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
             if (field.path == "inherited_limit") direct_settings_id = field.stable_id;
         });
     CHECK(settings.front().stable_id == direct_settings_id);
-
     std::vector<std::uint64_t> settings_default_ids;
     std::vector<std::uint64_t> integer_defaults;
     ApplicationSchema<InheritedSystems>::VisitSettingsDefaults(
-        InheritedSettings{},
-        [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& field, const Member& value) {
+        InheritedSettings{}, [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsDefaultFact& field, const Member& value) {
             settings_default_ids.push_back(field.stable_id);
-            if constexpr (std::unsigned_integral<Member> && !std::same_as<Member, bool>)
-                integer_defaults.push_back(static_cast<std::uint64_t>(value));
+            if constexpr (std::unsigned_integral<Member> && !std::same_as<Member, bool>) integer_defaults.push_back(static_cast<std::uint64_t>(value));
         });
     CHECK((settings_default_ids == std::vector<std::uint64_t>{application_settings_field_stable_id("inherited_limit"),
                                                               application_settings_field_stable_id("persisted_revision"),
                                                               application_settings_field_stable_id("derived_enabled")}));
     CHECK((integer_defaults == std::vector<std::uint64_t>{6U, 17U}));
 }
-
-TEST_CASE("native application fingerprint contribution changes with an inherited field policy",
-          "[controller][browser][reflection][inheritance]") {
+TEST_CASE("native application fingerprint contribution changes with an inherited field policy", "[controller][browser][reflection][inheritance]") {
     struct FieldContribution final {
         std::array<std::uint64_t, 2U> words;
         std::uint64_t endpoint_id = 0U;
@@ -1111,23 +977,21 @@ TEST_CASE("native application fingerprint contribution changes with an inherited
         bool appended = false;
         FieldContribution result{};
         ApplicationSchema<Systems>::VisitEndpoints([&]<class Endpoint>() {
-            ApplicationSchema<Systems>::template VisitRequestFields<Endpoint>(
-                [&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) {
-                    if constexpr (std::same_as<Owner, InheritedBase>) {
-                        REQUIRE(field.name == "inherited_limit");
-                        application_schema_detail::append_request_field_fingerprint<Declaration>(sink, field);
-                        appended = true;
-                        result.endpoint_id = field.endpoint_id;
-                        result.field_id = field.stable_id;
-                        result.name = field.name;
-                    }
-                });
+            ApplicationSchema<Systems>::template VisitRequestFields<Endpoint>([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) {
+                if constexpr (std::same_as<Owner, InheritedBase>) {
+                    REQUIRE(field.name == "inherited_limit");
+                    application_schema_detail::append_request_field_fingerprint<Declaration>(sink, field);
+                    appended = true;
+                    result.endpoint_id = field.endpoint_id;
+                    result.field_id = field.stable_id;
+                    result.name = field.name;
+                }
+            });
         });
         REQUIRE(appended);
         result.words = sink.words();
         return result;
     };
-
     const auto inherited = inherited_field_contribution.template operator()<InheritedSystems, InheritedRequestBase>();
     const auto repeated = inherited_field_contribution.template operator()<InheritedSystems, InheritedRequestBase>();
     // CLEANUP-IGNORE: This independent schema-change oracle is unrelated to the import-channel provenance field assertions.
@@ -1141,14 +1005,12 @@ TEST_CASE("native application fingerprint contribution changes with an inherited
     CHECK(inherited.name == changed.name);
     CHECK(inherited.words != changed.words);
 }
-
 TEST_CASE("canonical schema publishes unique request and recursive settings identities", "[controller][browser][reflection]") {
     std::set<std::uint64_t> identities;
     ApplicationSchema<TestSystems>::VisitRequestFields([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact& field) {
         REQUIRE(field.stable_id != 0U);
         CHECK(identities.insert(field.stable_id).second);
     });
-
     std::size_t dialog_count = 0U;
     std::size_t mutable_count = 0U;
     bool workspace_aspect_is_typed = false;
@@ -1165,11 +1027,9 @@ TEST_CASE("canonical schema publishes unique request and recursive settings iden
             }
             if (field.path == "workflows.explore.class_catalog_identity") {
                 explore_catalog_identity_is_persistence_metadata =
-                    !field.mutable_leaf &&
-                    field.stable_id == application_settings_field_stable_id("workflows.explore.class_catalog_identity");
+                    !field.mutable_leaf && field.stable_id == application_settings_field_stable_id("workflows.explore.class_catalog_identity");
             }
-            opaque_override_storage_was_exposed =
-                opaque_override_storage_was_exposed || field.path.find("recipe_overrides") != std::string_view::npos;
+            opaque_override_storage_was_exposed = opaque_override_storage_was_exposed || field.path.find("recipe_overrides") != std::string_view::npos;
             if (!field.file_dialog) return;
             ++dialog_count;
             const auto entries = services::file_dialog_catalog().entries();
@@ -1184,26 +1044,22 @@ TEST_CASE("canonical schema publishes unique request and recursive settings iden
     CHECK(explore_catalog_identity_is_persistence_metadata);
     CHECK_FALSE(opaque_override_storage_was_exposed);
     CHECK(dialog_count <= services::file_dialog_catalog().entries().size());
-
     std::size_t relation_count = 0U;
-    ApplicationSchema<TestSystems>::VisitSettingsRelations<contracts::GuiSettingsState>(
-        [&]<class Provider, class Relation, auto Selector>() {
-            STATIC_REQUIRE(std::same_as<Provider, mmltk::backend::models::rfdetr::TrainRecipeCatalog>);
-            STATIC_REQUIRE(Relation::member_count == 11U);
-            constexpr auto selector_path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Selector>();
-            CHECK(selector_path.view() == "workflows.train.request.optimizer");
-            Relation::VisitMembers([&]<class Entry>() {
-                constexpr auto rebased =
-                    mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, typename Relation::destination_type>(
-                        Selector, Entry::destination);
-                constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, rebased>();
-                CHECK(path.view().starts_with("workflows.train.request."));
-                ++relation_count;
-            });
+    ApplicationSchema<TestSystems>::VisitSettingsRelations<contracts::GuiSettingsState>([&]<class Provider, class Relation, auto Selector>() {
+        STATIC_REQUIRE(std::same_as<Provider, mmltk::backend::models::rfdetr::TrainRecipeCatalog>);
+        STATIC_REQUIRE(Relation::member_count == 11U);
+        constexpr auto selector_path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Selector>();
+        CHECK(selector_path.view() == "workflows.train.request.optimizer");
+        Relation::VisitMembers([&]<class Entry>() {
+            constexpr auto rebased = mmltk::frameworks::reflection::rebase_member_path<contracts::GuiSettingsState, typename Relation::destination_type>(
+                Selector, Entry::destination);
+            constexpr auto path = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, rebased>();
+            CHECK(path.view().starts_with("workflows.train.request."));
+            ++relation_count;
         });
+    });
     CHECK(relation_count == 11U);
 }
-
 TEST_CASE("custom model dialogs derive from the canonical compatibility catalog", "[controller][browser][reflection][dialog][model]") {
     const auto entries = services::file_dialog_catalog().entries();
     std::size_t row_index = 0U;
@@ -1253,7 +1109,6 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
     });
     CHECK(row_index == 9U);
 }
-
 TEST_CASE("export ONNX input and output publish distinct canonical dialogs", "[controller][browser][reflection][dialog]") {
     const auto entries = services::file_dialog_catalog().entries();
     const auto find_path = [&](const std::string_view path) {
@@ -1271,7 +1126,6 @@ TEST_CASE("export ONNX input and output publish distinct canonical dialogs", "[c
     CHECK(output->mode == contracts::FileDialogMode::SaveFile);
     CHECK_FALSE(output->model_input);
 }
-
 TEST_CASE("canonical schema projects typed catalog rows and settings defaults", "[controller][browser][reflection]") {
     std::set<std::uint64_t> identities;
     std::size_t provider_count = 0U;
@@ -1296,7 +1150,6 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
         });
     CHECK(provider_count != 0U);
     CHECK(catalog_row_count != 0U);
-
     std::set<std::uint64_t> default_ids;
     std::size_t default_count = 0U;
     ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitApplicationSettingsDefaults(
@@ -1308,7 +1161,6 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
             CHECK(mmltk::frameworks::serialization::reflected_value(value).has_value());
         });
     CHECK(default_count == contracts::settings_vocabulary::leaf_count<contracts::GuiSettingsState>());
-
     std::size_t request_default_count = 0U;
     ApplicationSchema<TestSystems>::VisitEndpoints([&]<class Endpoint>() {
         ApplicationSchema<TestSystems>::template VisitRequestDefaults<Endpoint>(
@@ -1321,11 +1173,9 @@ TEST_CASE("canonical schema projects typed catalog rows and settings defaults", 
             });
     });
     std::size_t request_field_count = 0U;
-    ApplicationSchema<TestSystems>::VisitRequestFields(
-        [&]<class Owner, class Declaration>(const ApplicationRequestFieldFact&) { ++request_field_count; });
+    ApplicationSchema<TestSystems>::VisitRequestFields([&]<class Owner, class Declaration>(const ApplicationRequestFieldFact&) { ++request_field_count; });
     CHECK(request_default_count == request_field_count);
 }
-
 TEST_CASE("model selection compatibility is a reachable deterministic nine-row catalog", "[controller][browser][reflection][model]") {
     constexpr std::array expected_keys{
         std::string_view{"train.weights"},     std::string_view{"validate.weights"}, std::string_view{"validate.onnx"},
@@ -1334,7 +1184,6 @@ TEST_CASE("model selection compatibility is a reachable deterministic nine-row c
     };
     STATIC_REQUIRE(contracts::ModelSelectionCompatibilityCatalog::identity == "model.selection.compatibility");
     STATIC_REQUIRE(contracts::ModelSelectionCompatibilityCatalog::valid());
-
     std::size_t provider_count = 0U;
     ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitCatalogProviders(
         [&]<class Provider, class Row>(const ApplicationCatalogProviderFact& provider) {
@@ -1364,21 +1213,18 @@ TEST_CASE("model selection compatibility is a reachable deterministic nine-row c
             }
         });
     CHECK(provider_count == 1U);
-
     for (std::uint8_t workflow_index = 0U; workflow_index <= static_cast<std::uint8_t>(contracts::FeatureId::Explore); ++workflow_index) {
         const auto workflow = static_cast<contracts::FeatureId>(workflow_index);
         CHECK(contracts::ModelSelectionRequest{.workflow = workflow}.valid() == contracts::model_selection_workflow_supported(workflow));
         for (const auto source : {contracts::ModelSelectionSource::Canonical, contracts::ModelSelectionSource::Custom}) {
             for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx,
                                      contracts::ModelArtifactInputKind::TensorRt, contracts::ModelArtifactInputKind::None}) {
-                const contracts::ModelSelectionKey key{
-                    .workflow = workflow, .source = source, .input = input, .preset = "rf-detr-nano", .resolution = 1U};
+                const contracts::ModelSelectionKey key{.workflow = workflow, .source = source, .input = input, .preset = "rf-detr-nano", .resolution = 1U};
                 CHECK(key.valid() == contracts::model_selection_compatible(workflow, source, input));
             }
         }
     }
 }
-
 TEST_CASE("protocol-17 Bootstrap contains fingerprint and current snapshots only", "[controller][browser][reflection]") {
     CounterSystem counter;
     TestSettingsSystem settings;
@@ -1390,27 +1236,23 @@ TEST_CASE("protocol-17 Bootstrap contains fingerprint and current snapshots only
     CHECK(bootstrap.snapshots[0].system_id == application_stable_id("settings"));
     CHECK(bootstrap.snapshots[1].system_id == application_stable_id("counter"));
 }
-
 }  // namespace
 }  // namespace mmltk::controller::browser
-
-TEST_CASE("Workspace graphics projection derives every native field offset without application codecs",
-          "[browser][workspace][generation]") {
+TEST_CASE("Workspace graphics projection derives every native field offset without application codecs", "[browser][workspace][generation]") {
     std::ostringstream output;
     mmltk::controller::browser::ApplicationWorkspaceAbiEmitter(output).Emit();
     const auto generated = output.str();
-    CHECK(generated.find("pub const ABI_VERSION: u32 = " +
-                         std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) + ";") !=
-          std::string::npos);
+    CHECK(generated.find("pub const ABI_VERSION: u32 = " + std::to_string(mmltk::controller::presentation::detail::workspace_surface_import::kAbiVersion) +
+                         ";") != std::string::npos);
     CHECK(generated.find("pub const OPCODE_ALLOCATE: u32 = 1;") != std::string::npos);
     CHECK(generated.find("pub const ALLOCATE_DESCRIPTOR_COUNT: usize = 3;") != std::string::npos);
     CHECK(generated.find("pub const READY_MEMORY_DESCRIPTOR: usize = 0;") != std::string::npos);
     CHECK(generated.find("pub const READY_TIMELINE_DESCRIPTOR: usize = 1;") != std::string::npos);
     CHECK(generated.find("pub opcode: u32") != std::string::npos);
-    CHECK(generated.find("pub const OPCODE_RELEASE_SUBMITTED: u32 = " +
-                         std::to_string(static_cast<std::uint32_t>(
-                             mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) +
-                         ";") != std::string::npos);
+    CHECK(
+        generated.find("pub const OPCODE_RELEASE_SUBMITTED: u32 = " +
+                       std::to_string(static_cast<std::uint32_t>(mmltk::controller::presentation::detail::workspace_surface_import::Opcode::ReleaseSubmitted)) +
+                       ";") != std::string::npos);
     CHECK(generated.find("pub sequence_lock: u64") != std::string::npos);
     CHECK(generated.find("pub metadata_bytes: u32") != std::string::npos);
     CHECK(generated.find("WORKSPACE_FRAME_MAPPING_BYTES") != std::string::npos);
@@ -1420,7 +1262,6 @@ TEST_CASE("Workspace graphics projection derives every native field offset witho
     CHECK(generated.find("cbor") == std::string::npos);
     CHECK(generated.find("application_bindings") == std::string::npos);
 }
-
 TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the existing wire budgets", "[browser][annotation][capacity]") {
     using namespace mmltk::controller;
     namespace c = contracts;
@@ -1453,8 +1294,7 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
     for (auto& item : displayed.objects) {
         item.shape = c::AnnotationShape::Skeleton;
         item.point.x += 0.12345F;
-        for (auto& knot : item.spline_knots)
-            knot.in.point.x += 0.23456F;
+        for (auto& knot : item.spline_knots) knot.in.point.x += 0.23456F;
     }
     displayed.objects.front().shape = c::AnnotationShape::Mask;
     auto value = browser::application_materializer_detail::reflected_value(snapshot);
@@ -1470,10 +1310,8 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
     REQUIRE(logical_size.has_value());
     INFO("Editable Annotation state bytes: " << *logical_size);
     browser::wire::ByteBuffer encoded;
-    REQUIRE(browser::wire::encode(*value, encoded,
-                                  {.max_bytes = browser::kMaxOutputValueBytes,
-                                   .max_items = browser::kMaxOutputValueItems,
-                                   .max_depth = browser::kMaxIntentValueDepth}));
+    REQUIRE(browser::wire::encode(
+        *value, encoded, {.max_bytes = browser::kMaxOutputValueBytes, .max_items = browser::kMaxOutputValueItems, .max_depth = browser::kMaxIntentValueDepth}));
     CHECK(encoded.size() <= c::kAnnotationUiStateByteBudget);
     {
         const auto failed = browser::encode_system_event<&ApplicationSystems::annotation>(
@@ -1503,12 +1341,11 @@ TEST_CASE("Maximum Annotation logical and distinct Upscale facts retain the exis
     REQUIRE(browser::encode_server_record(browser::ServerRecord{std::move(bootstrap)}, encoded));
     CHECK(encoded.size() < browser::kMaxRecordWireBytes);
 }
-
 TEST_CASE("Predict scalar progress excludes full retained labels and keeps native observation", "[browser][predict][reflection]") {
     using namespace mmltk::controller;
     namespace reflection = mmltk::frameworks::reflection;
-    constexpr auto snapshot_budget = browser::application_schema_detail::annotation_value<
-        ^^PredictSystem::snapshot, contracts::reflection::Snapshot>().byte_budget;
+    constexpr auto snapshot_budget =
+        browser::application_schema_detail::annotation_value<^^PredictSystem::snapshot, contracts::reflection::Snapshot>().byte_budget;
     STATIC_REQUIRE(mmltk::frameworks::serialization::reflected_maximum_cbor_bytes<PredictSnapshot>() <= snapshot_budget);
     PredictSnapshot snapshot;
     CHECK_FALSE(PredictSystem::visual_source::Observe(snapshot).valid());
@@ -1539,8 +1376,7 @@ TEST_CASE("Predict scalar progress excludes full retained labels and keeps nativ
     CHECK(metadata.content_identity == snapshot.content_identity);
     CHECK(metadata.labels.size() == contracts::kAnnotationObjectCapacity);
     snapshot.labels.clear();
-    CHECK(browser::application_materializer_detail::reflected_value(
-        PredictProgress{reflection::project_record<PredictProgressState>(snapshot)}) == encoded);
+    CHECK(browser::application_materializer_detail::reflected_value(PredictProgress{reflection::project_record<PredictProgressState>(snapshot)}) == encoded);
     browser::wire::CountingEncoder measure{{.max_bytes = 4096U, .max_items = 4096U, .max_depth = browser::kMaxIntentValueDepth}};
     const auto bytes = measure.measure(*encoded);
     REQUIRE(bytes);

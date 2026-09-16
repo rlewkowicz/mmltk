@@ -1,18 +1,11 @@
 #include <filesystem>
-
 #include "detail/onnx_tool_main.h"
-
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.common.logging.mmltk_logging;
-
 namespace rfdetr = mmltk::backend::models::rfdetr;
-
 namespace {
-
 void simplify_model(const std::filesystem::path& model_path) { rfdetr::simplify_onnx_model_file(model_path); }
-
 }  // namespace
-
 int main(const int argc, char** argv) {
     return mmltk::entrypoints::tools::run_onnx_tool_main(argc, argv,
                                                          {

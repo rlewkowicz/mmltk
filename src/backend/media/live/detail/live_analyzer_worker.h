@@ -1,7 +1,6 @@
 #pragma once
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -10,10 +9,8 @@
 #include <mutex>
 #include <optional>
 #include <string>
-
 #include "analysis_frame.h"
 #include "live_frame_fanout.h"
-
 namespace mmltk::backend::media::live {
 class LiveAnalyzerWorker final {
    public:
@@ -23,8 +20,8 @@ class LiveAnalyzerWorker final {
         std::uint64_t completed = 0U;
         std::uint64_t refused = 0U;
     };
-    LiveAnalyzerWorker(LiveFrameFanout& fanout, std::uint32_t slot_count, std::uint32_t maximum_regions, std::uint32_t width,
-                       std::uint32_t height, LivePhysicalCudaContext cuda);
+    LiveAnalyzerWorker(LiveFrameFanout& fanout, std::uint32_t slot_count, std::uint32_t maximum_regions, std::uint32_t width, std::uint32_t height,
+                       LivePhysicalCudaContext cuda);
     ~LiveAnalyzerWorker();
     LiveAnalyzerWorker(const LiveAnalyzerWorker&) = delete;
     LiveAnalyzerWorker& operator=(const LiveAnalyzerWorker&) = delete;

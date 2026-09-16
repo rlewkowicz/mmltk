@@ -7,7 +7,6 @@ module;
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
-
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -23,53 +22,35 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
-
 module mmltk.backend.media.capture.capture_session;
-
 #include "detail/capture_session_impl.hpp"
-
 namespace mmltk::backend::media::capture::capture_internal {
-
-std::uint64_t NowNs() {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
-}
-
+std::uint64_t NowNs() { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count()); }
 }  // namespace mmltk::backend::media::capture::capture_internal
-
 namespace mmltk::backend::media::capture::capture_internal {
-
 Status MakeStatus(StatusCode code, std::string message) { return Status{code, std::move(message)}; }
-
 Status MakeErrnoStatus(StatusCode code, const char* label) { return MakeErrnoStatus(code, label, errno); }
-
 Status MakeErrnoStatus(StatusCode code, const char* label, const int error_number) {
     std::ostringstream oss;
     oss << label << " failed: " << std::strerror(error_number);
     return {code, oss.str()};
 }
-
 Status MakeCudaStatus(cudaError_t code, const char* label) {
     std::ostringstream oss;
     oss << label << " failed: " << cudaGetErrorString(code);
     return {StatusCode::kCudaError, oss.str()};
 }
-
 int Xioctl(int fd, unsigned long request, void* arg) noexcept {
     int rc = 0;
-    do {
-        rc = ioctl(fd, request, arg);
-    } while (rc == -1 && errno == EINTR);
+    do { rc = ioctl(fd, request, arg); } while (rc == -1 && errno == EINTR);
     return rc;
 }
-
 std::size_t RoundUpToPage(std::size_t bytes, std::size_t page_size) {
     const std::size_t remainder = bytes % page_size;
     return remainder == 0 ? bytes : bytes + (page_size - remainder);
 }
-
 Status AllocateHostBuffer(std::size_t bytes, bool pinned, HostBuffer* out) {
     if (out == nullptr || bytes == 0U) { return MakeStatus(StatusCode::kInvalidArgument, "invalid host buffer request"); }
-
     try {
         HostBuffer candidate;
         if (pinned) {
@@ -89,7 +70,6 @@ Status AllocateHostBuffer(std::size_t bytes, bool pinned, HostBuffer* out) {
         return Status::Ok();
     } catch (const std::exception& error) { return MakeStatus(StatusCode::kInternalError, error.what()); }
 }
-
 Status FreeHostBuffer(HostBuffer* buffer) {
     if (buffer == nullptr || buffer->data == nullptr) return Status::Ok();
     if (buffer->registered_storage && buffer->registered_storage->ReleaseSettled() != CUDA_SUCCESS)
@@ -97,12 +77,10 @@ Status FreeHostBuffer(HostBuffer* buffer) {
     *buffer = {};
     return Status::Ok();
 }
-
 std::uint64_t PackRegion(const CaptureRegion& region) {
-    return static_cast<std::uint64_t>(region.x) | (static_cast<std::uint64_t>(region.y) << 16U) |
-           (static_cast<std::uint64_t>(region.width) << 32U) | (static_cast<std::uint64_t>(region.height) << 48U);
+    return static_cast<std::uint64_t>(region.x) | (static_cast<std::uint64_t>(region.y) << 16U) | (static_cast<std::uint64_t>(region.width) << 32U) |
+           (static_cast<std::uint64_t>(region.height) << 48U);
 }
-
 CaptureRegion UnpackRegion(std::uint64_t packed) {
     return CaptureRegion{
         .x = static_cast<std::uint32_t>(packed & 0xFFFFU),
@@ -111,5 +89,4 @@ CaptureRegion UnpackRegion(std::uint64_t packed) {
         .height = static_cast<std::uint32_t>((packed >> 48U) & 0xFFFFU),
     };
 }
-
 }  // namespace mmltk::backend::media::capture::capture_internal

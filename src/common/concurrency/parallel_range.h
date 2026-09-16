@@ -1,5 +1,4 @@
 #pragma once
-
 #include <algorithm>
 #include <cstddef>
 #include <exception>
@@ -11,19 +10,15 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-
 #include "src/common/math/checked_arithmetic.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
-
 namespace mmltk::common::concurrency {
-
 template <typename Index, typename Func>
-void parallel_for_range_indexed(const Index begin, const Index end, const int num_workers, const std::span<const int> cpu_affinity,
-                                Func&& func, const mmltk::common::system::ExecutionPlacement* placement = nullptr) {
+void parallel_for_range_indexed(const Index begin, const Index end, const int num_workers, const std::span<const int> cpu_affinity, Func&& func,
+                                const mmltk::common::system::ExecutionPlacement* placement = nullptr) {
     static_assert(std::is_integral_v<Index>, "parallel_for_range index must be integral");
     if (begin >= end) { return; }
-
     const Index total = end - begin;
     const int requested_workers =
         std::max(1, std::min(num_workers, mmltk::common::math::checked_cast<int>(total, "parallel range too large for worker count")));
@@ -40,8 +35,7 @@ void parallel_for_range_indexed(const Index begin, const Index end, const int nu
     if (!placement) worker_cpus = mmltk::common::system::physical_core_order(topology, worker_cpus);
     auto node_for = [&](std::size_t worker) {
         if (placement) return placement->numa_node;
-        const auto cpu =
-            std::ranges::find(topology.cpus, worker_cpus[worker % worker_cpus.size()], &mmltk::common::system::CpuTopology::cpu);
+        const auto cpu = std::ranges::find(topology.cpus, worker_cpus[worker % worker_cpus.size()], &mmltk::common::system::CpuTopology::cpu);
         if (cpu == topology.cpus.end()) throw std::invalid_argument("parallel range CPU topology unavailable");
         return cpu->node;
     };
@@ -51,7 +45,6 @@ void parallel_for_range_indexed(const Index begin, const Index end, const int nu
         policy.Restore();
         return;
     }
-
     const Index chunk = (total + static_cast<Index>(worker_count) - 1) / static_cast<Index>(worker_count);
     std::exception_ptr error;
     std::mutex error_mutex;
@@ -78,22 +71,16 @@ void parallel_for_range_indexed(const Index begin, const Index end, const int nu
             }
         });
     }
-    for (auto& thread : threads) {
-        thread.join();
-    }
+    for (auto& thread : threads) { thread.join(); }
     if (error) { std::rethrow_exception(error); }
 }
-
 template <typename Index, typename Func>
 void parallel_for_range_indexed(const Index begin, const Index end, const int num_workers, Func&& func) {
     const std::vector<int> worker_cpus = mmltk::common::system::allowed_cpu_set();
     parallel_for_range_indexed(begin, end, num_workers, std::span<const int>(worker_cpus), std::forward<Func>(func));
 }
-
 template <typename Index, typename Func>
 void parallel_for_range(const Index begin, const Index end, const int num_workers, Func&& func) {
-    parallel_for_range_indexed(begin, end, num_workers,
-                               [&](int, const Index chunk_begin, const Index chunk_end) { func(chunk_begin, chunk_end); });
+    parallel_for_range_indexed(begin, end, num_workers, [&](int, const Index chunk_begin, const Index chunk_end) { func(chunk_begin, chunk_end); });
 }
-
 }  // namespace mmltk::common::concurrency

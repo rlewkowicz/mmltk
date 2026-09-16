@@ -7,50 +7,37 @@
 #include <optional>
 #include <string>
 #include <vector>
-
 #include "async_test_utils.hpp"
 #include "catch2_compat.hpp"
 #include "detail/onnx_tool_main.h"
 #include "filesystem_test_utils.hpp"
-
 import mmltk.common.logging.mmltk_logging;
-
 namespace {
-
 std::filesystem::path captured_model_path;
-
 void capture_model_path(const std::filesystem::path& path) { captured_model_path = path; }
-
 constexpr mmltk::entrypoints::tools::OnnxToolMainConfig kTestConfig{
     .usage = "usage: mmltk-rfdetr-onnx-info [logging options] MODEL.onnx",
     .application_name = "mmltk-rfdetr-onnx-info-test",
     .logger_name = "onnx-info-test",
     .error_prefix = "onnx-info-test: ",
 };
-
-[[nodiscard]] int run_onnx_tool(std::vector<std::string> arguments,
-                                mmltk::entrypoints::tools::OnnxToolOperation operation = &capture_model_path) {
+[[nodiscard]] int run_onnx_tool(std::vector<std::string> arguments, mmltk::entrypoints::tools::OnnxToolOperation operation = &capture_model_path) {
     std::vector<char*> argv;
     argv.reserve(arguments.size());
-    for (std::string& argument : arguments)
-        argv.push_back(argument.data());
-
+    for (std::string& argument : arguments) argv.push_back(argument.data());
     mmltk::common::logging::initialize(mmltk::common::logging::default_config("onnx-test"));
     captured_model_path.clear();
     return mmltk::entrypoints::tools::run_onnx_tool_main(static_cast<int>(argv.size()), argv.data(), kTestConfig, operation);
 }
-
 void test_onnx_tool_main_routes_one_model_after_logging_options() {
-    CHECK(run_onnx_tool({"mmltk-rfdetr-onnx-info", "--log-level=off", "--log-file", "/tmp/mmltk-onnx-info-test.log", "--log-dir", "/tmp",
-                         "/tmp/model.onnx"}) == 0);
+    CHECK(run_onnx_tool({"mmltk-rfdetr-onnx-info", "--log-level=off", "--log-file", "/tmp/mmltk-onnx-info-test.log", "--log-dir", "/tmp", "/tmp/model.onnx"}) ==
+          0);
     CHECK(captured_model_path == "/tmp/model.onnx");
 }
-
 void test_onnx_tool_main_rejects_a_missing_model() {
     CHECK(run_onnx_tool({"mmltk-rfdetr-onnx-info", "--log-level", "off"}) == 1);
     CHECK(captured_model_path.empty());
 }
-
 std::size_t error_text_reads = 0U;
 struct ObservedFailure final : std::exception {
     const char* what() const noexcept override {
@@ -62,7 +49,6 @@ void fail_model_operation(const std::filesystem::path& path) {
     captured_model_path = path;
     throw ObservedFailure{};
 }
-
 void test_onnx_failure_diagnostics_are_lazy() {
     namespace logging = mmltk::common::logging;
     const mmltk::testsupport::ScopedTempDir root("mmltk_onnx_failure");
@@ -104,10 +90,7 @@ void test_onnx_failure_diagnostics_are_lazy() {
     const std::string text{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
     CHECK(text.find("onnx-info-test: observed model operation failure") != std::string::npos);
 }
-
 }  // namespace
-
 MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_tool_main_routes_one_model_after_logging_options);
 MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_tool_main_rejects_a_missing_model);
-
 MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_failure_diagnostics_are_lazy);

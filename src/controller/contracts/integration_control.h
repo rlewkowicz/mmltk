@@ -1,17 +1,13 @@
 #pragma once
-
 #include <cstdint>
 #include <cstddef>
 #include <concepts>
 #include <type_traits>
 #include <meta>
 #include <string>
-
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
-
 namespace mmltk::controller::contracts {
-
 // Explicit acceptance control, carried only by an installed integration driver.
 // These receipts never participate in ordinary product state or diagnostics.
 struct IntegrationCommandDirection final {
@@ -34,7 +30,6 @@ enum class IntegrationControlKind : std::uint8_t {
     VisibleReadReleaseRequested[[= IntegrationCommandDirection{false, true, true}]],
     GalleryReadCompletionHeld[[= IntegrationCommandDirection{true, true, true}]],
 };
-
 template <auto Kind>
     requires std::is_enum_v<decltype(Kind)>
 [[nodiscard]] consteval IntegrationCommandDirection integration_command_direction() {
@@ -54,7 +49,6 @@ template <auto Kind>
     if (count != 1U) throw "each integration kind requires its canonical direction";
     return result;
 }
-
 template <class Kind = IntegrationControlKind, class Visitor>
     requires std::is_enum_v<Kind>
 constexpr void visit_integration_commands(Visitor&& visitor) {
@@ -62,7 +56,6 @@ constexpr void visit_integration_commands(Visitor&& visitor) {
         visitor.template operator()<entry.value, integration_command_direction<entry.value>()>(entry.name);
     }
 }
-
 [[nodiscard]] constexpr bool integration_server_command(const IntegrationControlKind kind) noexcept {
     bool server = false;
     visit_integration_commands([&]<auto Value, auto Policy>(auto) {
@@ -70,9 +63,7 @@ constexpr void visit_integration_commands(Visitor&& visitor) {
     });
     return server;
 }
-
 inline constexpr std::size_t kIntegrationFailureMaxBytes = 4096U;
-
 struct IntegrationControlReceipt final {
     IntegrationControlKind kind = IntegrationControlKind::Progress;
     [[= mmltk::frameworks::reflection::Minimum{std::uint64_t{1U}}]] std::uint64_t sequence = 0U;
@@ -84,12 +75,9 @@ struct IntegrationControlReceipt final {
     [[= mmltk::frameworks::reflection::MaxBytes{kIntegrationFailureMaxBytes}]] std::string failure{};
     bool operator==(const IntegrationControlReceipt&) const = default;
 };
-
 [[nodiscard]] constexpr bool integration_receipt_valid(const IntegrationControlReceipt& receipt) noexcept {
     if (receipt.sequence == 0U || (receipt.kind == IntegrationControlKind::Failed) != (receipt.failureline != 0U)) return false;
-    if (receipt.failure.size() > kIntegrationFailureMaxBytes ||
-        (receipt.kind != IntegrationControlKind::Failed && !receipt.failure.empty()))
-        return false;
+    if (receipt.failure.size() > kIntegrationFailureMaxBytes || (receipt.kind != IntegrationControlKind::Failed && !receipt.failure.empty())) return false;
     bool valid = false;
     visit_integration_commands([&]<auto Kind, auto Policy>(auto) {
         if (receipt.kind == Kind)
@@ -98,9 +86,7 @@ struct IntegrationControlReceipt final {
     });
     return valid;
 }
-
 MMLTK_REFLECT_FIELDS(IntegrationCommandDirection)
 MMLTK_REFLECT_ENUM(IntegrationControlKind)
 MMLTK_REFLECT_FIELDS(IntegrationControlReceipt)
-
 }  // namespace mmltk::controller::contracts

@@ -1,8 +1,6 @@
 #include "src/backend/imaging/upscale/detail/shiftlut_model_format.h"
-
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
-
 #include <array>
 #include <cstddef>
 #include <cstring>
@@ -12,9 +10,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 namespace lut = mmltk::backend::imaging::upscale::shiftlut;
-
 TEST_CASE("ShiftLUT s7 external blocks preserve the fixed packed format", "[shiftlut_format]") {
     REQUIRE(lut::kTableElements == 222016);
     REQUIRE(lut::kTableBytes == 888064);
@@ -66,16 +62,13 @@ TEST_CASE("ShiftLUT s7 external blocks preserve the fixed packed format", "[shif
     REQUIRE(shifts.shape.domain == 16);
     REQUIRE(shifts.offset + shifts.shape.elements() - 1 == 222015);
 }
-
 TEST_CASE("ShiftLUT packed storage accepts fractional LUT values and all integral shifts", "[shiftlut_format]") {
     std::vector<float> tables(lut::kTableElements);
     const std::array values{-32767.0F, -0.5F, 0.0F, 0.5F, 32767.0F};
-    for (std::size_t index = 0; index < lut::table_offset(lut::TableFamily::Shifts); ++index)
-        tables[index] = values[index % values.size()];
+    for (std::size_t index = 0; index < lut::table_offset(lut::TableFamily::Shifts); ++index) tables[index] = values[index % values.size()];
     for (std::size_t index = lut::table_offset(lut::TableFamily::Shifts); index < tables.size(); ++index)
         tables[index] = static_cast<float>(static_cast<int>(index % 3) - 1);
     REQUIRE_NOTHROW(lut::validate_tables(std::as_bytes(std::span{tables})));
-
     // The generator's raw buffer need not be aligned for float access.
     std::vector<std::byte> unaligned(lut::kTableBytes + 1);
     std::memcpy(unaligned.data() + 1, tables.data(), lut::kTableBytes);
@@ -85,22 +78,19 @@ TEST_CASE("ShiftLUT packed storage accepts fractional LUT values and all integra
     std::memcpy(&tables.back(), unaligned.data() + 1 + lut::kTableBytes - sizeof(float), sizeof(float));
     REQUIRE(tables.back() == last);
 }
-
 TEST_CASE("ShiftLUT packed storage rejects invalid lengths before scalar access", "[shiftlut_format]") {
     const auto bytes = GENERATE(std::size_t{0}, std::size_t{1}, lut::kTableBytes - 1, lut::kTableBytes + 1);
     const std::vector<std::byte> storage(bytes);
     REQUIRE_THROWS_AS(lut::validate_tables(storage), std::invalid_argument);
 }
-
 TEST_CASE("ShiftLUT packed storage rejects nonfinite and excessive LUT magnitudes", "[shiftlut_format]") {
-    const auto value = GENERATE(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(),
-                                -std::numeric_limits<float>::infinity(), -32768.0F, 32768.0F);
+    const auto value =
+        GENERATE(std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), -32768.0F, 32768.0F);
     const auto index = GENERATE(std::size_t{0}, lut::table_offset(lut::TableFamily::Shifts) - 1);
     std::vector<float> tables(lut::kTableElements);
     tables[index] = value;
     REQUIRE_THROWS_AS(lut::validate_tables(std::as_bytes(std::span{tables})), std::invalid_argument);
 }
-
 TEST_CASE("ShiftLUT packed storage rejects invalid shifts including the last element", "[shiftlut_format]") {
     const auto value = GENERATE(-2.0F, 2.0F, -0.5F, 0.5F, std::numeric_limits<float>::quiet_NaN());
     const auto index = GENERATE(lut::table_offset(lut::TableFamily::Shifts), lut::kTableElements - 1);
@@ -108,7 +98,6 @@ TEST_CASE("ShiftLUT packed storage rejects invalid shifts including the last ele
     tables[index] = value;
     REQUIRE_THROWS_AS(lut::validate_tables(std::as_bytes(std::span{tables})), std::invalid_argument);
 }
-
 TEST_CASE("ShiftLUT tile and decision extents fit fixed resident storage", "[shiftlut_format]") {
     REQUIRE(lut::kMaximumTileExtent == 256);
     REQUIRE(lut::kScratchElements == 12582912);

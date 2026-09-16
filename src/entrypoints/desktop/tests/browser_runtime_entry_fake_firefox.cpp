@@ -3,7 +3,6 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-
 #include <array>
 #include <charconv>
 #include <cstdint>
@@ -13,19 +12,14 @@
 #include <string>
 #include <string_view>
 #include <system_error>
-
 #include "browser_runtime_fixture_args.hpp"
-
 namespace {
-
 constexpr std::string_view kPagePrefix{"http://127.0.0.1:"};
 constexpr std::string_view kFixtureMarker{"mmltk browser runtime entry fixture"};
-
 struct PageTarget final {
     std::uint16_t port = 0U;
     std::string_view path;
 };
-
 [[nodiscard]] bool parse_page(const std::string_view page, PageTarget* const target) noexcept {
     if (target == nullptr || !page.starts_with(kPagePrefix)) return false;
     const std::size_t port_end = page.find('/', kPagePrefix.size());
@@ -36,15 +30,11 @@ struct PageTarget final {
     unsigned int port = 0U;
     const std::string_view port_text = page.substr(kPagePrefix.size(), port_end - kPagePrefix.size());
     const auto [end, error] = std::from_chars(port_text.data(), port_text.data() + port_text.size(), port);
-    if (error != std::errc{} || end != port_text.data() + port_text.size() || port == 0U ||
-        port > std::numeric_limits<std::uint16_t>::max()) {
-        return false;
-    }
+    if (error != std::errc{} || end != port_text.data() + port_text.size() || port == 0U || port > std::numeric_limits<std::uint16_t>::max()) { return false; }
     target->port = static_cast<std::uint16_t>(port);
     target->path = page.substr(port_end);
     return true;
 }
-
 [[nodiscard]] bool send_request(const int descriptor, const PageTarget target) noexcept {
     const std::string request =
         "GET " + std::string{target.path} + " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(target.port) + "\r\nConnection: close\r\n\r\n";
@@ -56,7 +46,6 @@ struct PageTarget final {
     }
     return true;
 }
-
 [[nodiscard]] int fetch_page(const PageTarget target) noexcept {
     const int descriptor = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (descriptor < 0) return 70;
@@ -69,12 +58,11 @@ struct PageTarget final {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(target.port);
-    if (::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1 ||
-        ::connect(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 || !send_request(descriptor, target)) {
+    if (::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) != 1 || ::connect(descriptor, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) != 0 ||
+        !send_request(descriptor, target)) {
         static_cast<void>(::close(descriptor));
         return 72;
     }
-
     std::array<char, 4096U> response{};
     std::size_t received = 0U;
     for (;;) {
@@ -91,9 +79,7 @@ struct PageTarget final {
     static_cast<void>(::close(descriptor));
     return received == 0U ? 73 : 74;
 }
-
 }  // namespace
-
 int main(const int argc, char* argv[]) {
     if (!valid_browser_runtime_fixture_args(argc, argv)) { return 64; }
     PageTarget target;
@@ -107,8 +93,8 @@ int main(const int argc, char* argv[]) {
                     static_cast<int>(page.find("mmltk_pixel_trace=1") != std::string_view::npos),
                     static_cast<int>(pixel != nullptr && std::string_view{pixel} == "1")) < 0)
         return 75;
-    if (std::fputs("mmltk fake Firefox stdout\n", stdout) == EOF || std::fputs("mmltk fake Firefox stderr\n", stderr) == EOF ||
-        std::fflush(stdout) != 0 || std::fflush(stderr) != 0) {
+    if (std::fputs("mmltk fake Firefox stdout\n", stdout) == EOF || std::fputs("mmltk fake Firefox stderr\n", stderr) == EOF || std::fflush(stdout) != 0 ||
+        std::fflush(stderr) != 0) {
         return 75;
     }
     return 0;

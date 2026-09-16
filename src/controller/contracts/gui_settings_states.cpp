@@ -1,17 +1,13 @@
 #include "src/controller/contracts/gui_settings_states.h"
-
 #include <concepts>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
-
 #include "src/controller/contracts/settings_vocabulary.h"
-
 namespace mmltk::controller::contracts {
 namespace {
-
 template <class T>
 [[nodiscard]] bool equal_value(const T& left, const T& right) noexcept {
     using Value = std::remove_cvref_t<T>;
@@ -40,9 +36,6 @@ template <class T>
         return equal;
     }
 }
-
 }  // namespace
-
 bool GuiSettingsState::operator==(const GuiSettingsState& other) const noexcept { return equal_value(*this, other); }
-
 }  // namespace mmltk::controller::contracts

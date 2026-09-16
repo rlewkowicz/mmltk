@@ -9,7 +9,6 @@
 #include <cerrno>
 #include <cstddef>
 #include <stdexcept>
-
 namespace mmltk::common::system::test_support {
 // A child-only syscall denial exercises the ordinary error path without
 // weakening or changing the parent's privileges and execution policy.

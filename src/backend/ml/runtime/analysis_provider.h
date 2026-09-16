@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -8,34 +7,25 @@
 #include <span>
 #include <stop_token>
 #include <utility>
-
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/data/catalog/class_catalog.h"
 namespace mmltk::backend::ml::runtime {
-
 inline constexpr std::size_t kMaximumAnalysisRank = 4U;
 inline constexpr std::size_t kMaximumAnalysisRegions = 16U;
-
 struct AnalysisIdentity final {
     std::uint64_t operation = 0U;
     std::uint64_t source = 0U;
-
     [[nodiscard]] constexpr bool valid() const noexcept { return operation != 0U && source != 0U; }
-
     bool operator==(const AnalysisIdentity&) const noexcept = default;
 };
-
 struct AnalysisRegion final {
     std::uint32_t x = 0U;
     std::uint32_t y = 0U;
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
-
     [[nodiscard]] constexpr bool valid() const noexcept { return width != 0U && height != 0U; }
-
     bool operator==(const AnalysisRegion&) const noexcept = default;
 };
-
 enum class AnalysisElementType : std::uint8_t {
     Float16,
     Float32,
@@ -43,19 +33,16 @@ enum class AnalysisElementType : std::uint8_t {
     Int64,
     Uint8,
 };
-
 struct AnalysisShape final {
     std::uint8_t rank = 0U;
     std::uint32_t extents[kMaximumAnalysisRank]{};
 };
-
 struct AnalysisDeviceBuffer final {
     std::uintptr_t address = 0U;
     std::size_t capacity_bytes = 0U;
     AnalysisShape shape{};
     AnalysisElementType element_type = AnalysisElementType::Float32;
 };
-
 struct AnalysisImageView final {
     AnalysisDeviceBuffer pixels{};
     std::size_t pitch_bytes = 0U;
@@ -64,15 +51,12 @@ struct AnalysisImageView final {
     std::uint8_t channels = 0U;
     std::int32_t device = -1;
 };
-
 struct AnalysisCompletion final {
     std::int32_t device = -1;
     std::uintptr_t event = 0U;
     std::uintptr_t producer_stream = 0U;
-
     [[nodiscard]] constexpr bool valid() const noexcept { return device >= 0 && event != 0U && producer_stream != 0U; }
 };
-
 // This is the canonical model-neutral annotation storage vocabulary. RF-DETR
 // writes its interpretation into these caller-owned buffers once; Live
 // projects the same storage into its frame/overlay state without mirroring it.
@@ -88,10 +72,8 @@ struct AnalysisAnnotationStorage final {
     // Capacity does not establish that a provider initialized a mask product.
     bool masks_available = false;
     mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot;
-    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog;
-
+    std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog{};
 };
-
 struct AnalysisRequest final {
     AnalysisIdentity identity{};
     std::uint64_t captured_ns = 0U;
@@ -103,7 +85,6 @@ struct AnalysisRequest final {
     std::span<AnalysisAnnotationStorage> annotations{};
     std::stop_token cancellation{};
 };
-
 enum class AnalysisTerminal : std::uint8_t {
     Completed,
     Refused,
@@ -114,15 +95,12 @@ enum class AnalysisTerminal : std::uint8_t {
     ExecutionFailure,
     // CLEANUP-IGNORE: The terminal enum boundary only coincidentally precedes another move-only runtime result.
 };
-
 class AnalysisProvider;
-
 class AnalysisResult final {
    public:
     AnalysisResult() noexcept = default;
     AnalysisResult(const AnalysisResult&) = delete;
     AnalysisResult& operator=(const AnalysisResult&) = delete;
-
     AnalysisResult(AnalysisResult&& other) noexcept
         : owner_(std::move(other.owner_)),
           generation_(std::exchange(other.generation_, 0U)),
@@ -131,11 +109,9 @@ class AnalysisResult final {
           completed_ns_(std::exchange(other.completed_ns_, 0U)),
           output_count_(std::exchange(other.output_count_, 0U)),
           completion_(std::exchange(other.completion_, {})) {}
-
     AnalysisResult& operator=(AnalysisResult&&) = delete;
     ~AnalysisResult() noexcept;
     void Abandon() noexcept;
-
     [[nodiscard]] const AnalysisIdentity& identity() const noexcept { return identity_; }
     [[nodiscard]] AnalysisTerminal terminal() const noexcept { return terminal_; }
     [[nodiscard]] std::uint64_t completed_ns() const noexcept { return completed_ns_; }
@@ -153,7 +129,6 @@ class AnalysisResult final {
           completed_ns_(completed_ns),
           output_count_(output_count),
           completion_(completion) {}
-
     std::shared_ptr<AnalysisProvider> owner_;
     std::uint64_t generation_ = 0U;
     AnalysisIdentity identity_{};
@@ -161,16 +136,13 @@ class AnalysisResult final {
     std::uint64_t completed_ns_ = 0U;
     std::size_t output_count_ = 0U;
     AnalysisCompletion completion_{};
-
     void Disarm() noexcept {
         owner_.reset();
         generation_ = 0U;
         completion_ = {};
     }
-
     friend class AnalysisProvider;
 };
-
 class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
    public:
     AnalysisProvider() = default;
@@ -180,7 +152,6 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
     }
     AnalysisProvider(const AnalysisProvider&) = delete;
     AnalysisProvider& operator=(const AnalysisProvider&) = delete;
-
     [[nodiscard]] AnalysisResult Analyze(const AnalysisRequest& request) noexcept {
         std::shared_ptr<AnalysisProvider> owner = weak_from_this().lock();
         if (!owner) { return Terminal(request.identity, AnalysisTerminal::DependencyFailure); }
@@ -198,7 +169,6 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
             RestoreIdleAfterIssue(generation);
             return Terminal(request.identity, AnalysisTerminal::InvalidInput);
         }
-
         const ProviderWorkResult work = DoAnalyze(request);
         if (request.cancellation.stop_requested()) {
             RetireIssuedWork(work);
@@ -219,10 +189,8 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
             RestoreIdleAfterIssue(generation);
             return Terminal(request.identity, AnalysisTerminal::ExecutionFailure);
         }
-        return AnalysisResult{std::move(owner),  generation,        work.identity,  work.terminal,
-                              work.completed_ns, work.output_count, work.completion};
+        return AnalysisResult{std::move(owner), generation, work.identity, work.terminal, work.completed_ns, work.output_count, work.completion};
     }
-
     [[nodiscard]] bool ReleaseAfterCompletion(AnalysisResult&& result) noexcept {
         if (result.owner_.get() != this) { return false; }
         const std::shared_ptr<AnalysisProvider> keep_alive = result.owner_;
@@ -237,7 +205,6 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         }
         return completed;
     }
-
     [[nodiscard]] bool Shutdown() noexcept {
         {
             std::lock_guard lock(state_mutex_);
@@ -261,7 +228,6 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         std::size_t output_count = 0U;
         AnalysisCompletion completion{};
     };
-
     [[nodiscard]] virtual ProviderWorkResult DoAnalyze(const AnalysisRequest& request) noexcept = 0;
     [[nodiscard]] virtual bool ObserveCompletion(const AnalysisCompletion& completion) noexcept = 0;
     virtual void RetireIssuedWork(const ProviderWorkResult& work) noexcept = 0;
@@ -275,31 +241,23 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         Settling,
         Closed,
     };
-
     [[nodiscard]] static constexpr std::size_t ElementBytes(const AnalysisElementType type) noexcept {
         switch (type) {
-            case AnalysisElementType::Float16:
-                return 2U;
+            case AnalysisElementType::Float16: return 2U;
             case AnalysisElementType::Float32:
-            case AnalysisElementType::Int32:
-                return 4U;
-            case AnalysisElementType::Int64:
-                return 8U;
-            case AnalysisElementType::Uint8:
-                return 1U;
+            case AnalysisElementType::Int32: return 4U;
+            case AnalysisElementType::Int64: return 8U;
+            case AnalysisElementType::Uint8: return 1U;
         }
         return 0U;
     }
-
-    [[nodiscard]] static bool ValidateBuffer(const AnalysisDeviceBuffer& buffer, const std::uint8_t rank,
-                                             const std::span<const std::uint32_t> extents, const AnalysisElementType type,
-                                             const bool optional = false) noexcept {
+    [[nodiscard]] static bool ValidateBuffer(const AnalysisDeviceBuffer& buffer, const std::uint8_t rank, const std::span<const std::uint32_t> extents,
+                                             const AnalysisElementType type, const bool optional = false) noexcept {
         if (optional && buffer.address == 0U) { return buffer.capacity_bytes == 0U; }
         if (buffer.address == 0U || buffer.shape.rank != rank || extents.size() != rank || buffer.element_type != type) { return false; }
         std::size_t elements = 1U;
         for (std::size_t axis = 0U; axis < rank; ++axis) {
-            if (extents[axis] == 0U || buffer.shape.extents[axis] != extents[axis] ||
-                extents[axis] > std::numeric_limits<std::size_t>::max() / elements) {
+            if (extents[axis] == 0U || buffer.shape.extents[axis] != extents[axis] || extents[axis] > std::numeric_limits<std::size_t>::max() / elements) {
                 return false;
             }
             elements *= extents[axis];
@@ -307,15 +265,13 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         const std::size_t bytes = ElementBytes(type);
         return bytes != 0U && elements <= std::numeric_limits<std::size_t>::max() / bytes && buffer.capacity_bytes >= elements * bytes;
     }
-
     [[nodiscard]] static bool ValidateRequest(const AnalysisRequest& request) noexcept {
         if (!request.identity.valid() || request.source.device < 0 || request.source.width == 0U || request.source.height == 0U ||
             (request.source.channels != 3U && request.source.channels != 4U) || !request.source_ready.valid() ||
-            request.source_ready.device != request.source.device || request.regions.empty() ||
-            request.regions.size() > kMaximumAnalysisRegions || request.annotations.size() != request.regions.size()) {
+            request.source_ready.device != request.source.device || request.regions.empty() || request.regions.size() > kMaximumAnalysisRegions ||
+            request.annotations.size() != request.regions.size()) {
             return false;
         }
-
         const std::uint32_t image_extents[]{
             request.source.height,
             request.source.width,
@@ -323,25 +279,21 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         };
         if (!ValidateBuffer(request.source.pixels, 3U, image_extents, AnalysisElementType::Uint8)) { return false; }
         const std::size_t row_bytes = static_cast<std::size_t>(request.source.width) * request.source.channels;
-        if (request.source.pitch_bytes < row_bytes ||
-            request.source.height > std::numeric_limits<std::size_t>::max() / request.source.pitch_bytes ||
+        if (request.source.pitch_bytes < row_bytes || request.source.height > std::numeric_limits<std::size_t>::max() / request.source.pitch_bytes ||
             request.source.pixels.capacity_bytes < request.source.pitch_bytes * request.source.height) {
             return false;
         }
-
         for (std::size_t index = 0U; index < request.regions.size(); ++index) {
             const AnalysisRegion& region = request.regions[index];
             const AnalysisAnnotationStorage& output = request.annotations[index];
             if (!region.valid() || output.source_region != region || output.value_capacity == 0U || output.value_count != 0U ||
-                region.width > request.source.width || region.height > request.source.height ||
-                region.x > request.source.width - region.width || region.y > request.source.height - region.height ||
-                !ValidateAnnotationStorage(output)) {
+                region.width > request.source.width || region.height > request.source.height || region.x > request.source.width - region.width ||
+                region.y > request.source.height - region.height || !ValidateAnnotationStorage(output)) {
                 return false;
             }
         }
         return true;
     }
-
     [[nodiscard]] static bool ValidateAnnotationStorage(const AnalysisAnnotationStorage& output) noexcept {
         if (output.value_capacity > std::numeric_limits<std::uint32_t>::max()) { return false; }
         const auto capacity = static_cast<std::uint32_t>(output.value_capacity);
@@ -359,7 +311,6 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
                ValidateBuffer(output.colors_rgb, 2U, colors, AnalysisElementType::Uint8) &&
                ValidateBuffer(output.masks, 3U, masks, AnalysisElementType::Uint8, true);
     }
-
     [[nodiscard]] static bool ValidateResult(const AnalysisRequest& request, const ProviderWorkResult& result) noexcept {
         if (result.identity != request.identity) { return false; }
         if (result.terminal != AnalysisTerminal::Completed) {
@@ -378,12 +329,10 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         }
         return true;
     }
-
     [[nodiscard]] static AnalysisResult Terminal(const AnalysisIdentity identity, const AnalysisTerminal terminal,
                                                  const std::uint64_t completed_ns = 0U) noexcept {
         return AnalysisResult{{}, 0U, identity, terminal, completed_ns, 0U, {}};
     }
-
     [[nodiscard]] std::uint64_t ClaimIssuing() noexcept {
         std::lock_guard lock(state_mutex_);
         if (state_ != ProviderState::Idle) { return 0U; }
@@ -391,12 +340,10 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         if (++generation_ == 0U) { ++generation_; }
         return generation_;
     }
-
     void RestoreIdleAfterIssue(const std::uint64_t generation) noexcept {
         std::lock_guard lock(state_mutex_);
         if (state_ == ProviderState::Issuing && generation_ == generation) { state_ = ProviderState::Idle; }
     }
-
     [[nodiscard]] bool PublishActive(const std::uint64_t generation, const ProviderWorkResult& work) noexcept {
         std::lock_guard lock(state_mutex_);
         if (state_ == ProviderState::Issuing && generation_ == generation) {
@@ -406,7 +353,6 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         }
         return false;
     }
-
     [[nodiscard]] bool SettleAnalysis(const std::uint64_t generation, const bool observe_completion) noexcept {
         ProviderWorkResult work;
         {
@@ -415,10 +361,8 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
             state_ = ProviderState::Settling;
             work = active_work_;
         }
-
         const bool completed = observe_completion && ObserveCompletion(work.completion);
         if (!completed) { RetireIssuedWork(work); }
-
         {
             std::lock_guard lock(state_mutex_);
             if (state_ == ProviderState::Settling && generation == generation_) {
@@ -428,17 +372,13 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         }
         return completed;
     }
-
     mutable std::mutex state_mutex_;
     ProviderState state_ = ProviderState::Idle;
     std::uint64_t generation_ = 0U;
     ProviderWorkResult active_work_{};
-
     friend class AnalysisResult;
 };
-
 inline AnalysisResult::~AnalysisResult() noexcept { Abandon(); }
-
 inline void AnalysisResult::Abandon() noexcept {
     if (owner_) {
         static_cast<void>(owner_->SettleAnalysis(generation_, false));
@@ -448,5 +388,4 @@ inline void AnalysisResult::Abandon() noexcept {
         output_count_ = 0U;
     }
 }
-
 }  // namespace mmltk::backend::ml::runtime

@@ -16,15 +16,13 @@ class ModelSystem;
 class ExportRuntime {
    public:
     virtual ~ExportRuntime() = default;
-    [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token,
-                                                         const ComputeProgressSink&) = 0;
+    [[nodiscard]] virtual contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token, const ComputeProgressSink&) = 0;
 };
 class CudaExportRuntime final : public ExportRuntime {
    public:
     explicit CudaExportRuntime(DirectComputeConfiguration);
     ~CudaExportRuntime() override;
-    [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token,
-                                                 const ComputeProgressSink&) override;
+    [[nodiscard]] contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::ModelExportRequest, std::stop_token, const ComputeProgressSink&) override;
 
    private:
     class Impl;
@@ -37,7 +35,6 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     contracts::ComputeUiState snapshot{};
 };
 using ComputeSystemEvent = std::variant<ComputeProgressEvent, ComputeChanged>;
-
 using ExportRuntimeFactory = std::function<std::unique_ptr<ExportRuntime>()>;
 class ExportSystem final {
    public:
@@ -56,9 +53,6 @@ class ExportSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 MMLTK_REFLECT_FIELDS(ComputeProgressEvent)
 MMLTK_REFLECT_FIELDS(ComputeChanged)
-
-
 }  // namespace mmltk::controller

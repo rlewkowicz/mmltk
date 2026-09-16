@@ -1,7 +1,6 @@
 #pragma once
 #include <optional>
 #include "src/frameworks/gpu/device_execution.h"
-
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -12,15 +11,12 @@
 #include <mutex>
 #include <condition_variable>
 #include <stdexcept>
-
 #include "src/frameworks/gpu/image_geometry.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/image_product_retirement.h"
 #include "src/frameworks/gpu/image_workspace.h"
-
 namespace mmltk::frameworks::gpu {
-
 class ImageCopyBackend {
    public:
     class StreamNotification final {
@@ -45,24 +41,20 @@ class ImageCopyBackend {
     virtual void DestroyStream(std::uintptr_t context, std::uintptr_t stream) noexcept = 0;
     [[nodiscard]] virtual std::uintptr_t CreateEvent(std::uintptr_t context) = 0;
     virtual void DestroyEvent(std::uintptr_t context, std::uintptr_t event) noexcept = 0;
-    [[nodiscard]] virtual ImagePlaneView AllocatePlane(std::uintptr_t context, ImagePlaneKind kind, std::uint32_t width,
-                                                       std::uint32_t height) = 0;
+    [[nodiscard]] virtual ImagePlaneView AllocatePlane(std::uintptr_t context, ImagePlaneKind kind, std::uint32_t width, std::uint32_t height) = 0;
     virtual void FreePlane(std::uintptr_t context, CUdeviceptr data) noexcept = 0;
     virtual void ClearPlane(std::uintptr_t context, std::uintptr_t stream, const ImagePlaneView&) = 0;
     [[nodiscard]] virtual std::shared_ptr<void> AllocatePinned(std::uintptr_t receiver_context,
-                                                               const mmltk::common::system::ExecutionPlacement* receiver_placement,
-                                                               std::size_t bytes) = 0;
+                                                               const mmltk::common::system::ExecutionPlacement* receiver_placement, std::size_t bytes) = 0;
     [[nodiscard]] virtual bool CanAccessPeer(int receiver, int source) = 0;
     virtual void WaitEvent(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, std::uintptr_t source_event) = 0;
-    virtual void CopySameDevice(std::uintptr_t context, std::uintptr_t stream, const ImagePlaneView& destination,
-                                std::uintptr_t source_context, const ImagePlaneView& source) = 0;
-    virtual void CopyPeer(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, int receiver_device,
-                          const ImagePlaneView& destination, std::uintptr_t source_context, int source_device,
-                          const ImagePlaneView& source) = 0;
-    virtual void CopyDeviceToHost(std::uintptr_t source_context, const ImagePlaneView& source, void* destination,
-                                  std::size_t destination_pitch) = 0;
-    virtual void CopyHostToDevice(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, const void* source,
-                                  std::size_t source_pitch, const ImagePlaneView& destination) = 0;
+    virtual void CopySameDevice(std::uintptr_t context, std::uintptr_t stream, const ImagePlaneView& destination, std::uintptr_t source_context,
+                                const ImagePlaneView& source) = 0;
+    virtual void CopyPeer(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, int receiver_device, const ImagePlaneView& destination,
+                          std::uintptr_t source_context, int source_device, const ImagePlaneView& source) = 0;
+    virtual void CopyDeviceToHost(std::uintptr_t source_context, const ImagePlaneView& source, void* destination, std::size_t destination_pitch) = 0;
+    virtual void CopyHostToDevice(std::uintptr_t receiver_context, std::uintptr_t receiver_stream, const void* source, std::size_t source_pitch,
+                                  const ImagePlaneView& destination) = 0;
     virtual void RecordEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) = 0;
     virtual void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event) = 0;
     // Terminal notification runs on success and execution/context error.
@@ -73,13 +65,11 @@ class ImageCopyBackend {
     using StreamSettlement = ImageStreamSettlement;
     [[nodiscard]] virtual StreamSettlement SettleStream(std::uintptr_t context, std::uintptr_t stream) noexcept = 0;
 };
-
 [[nodiscard]] std::shared_ptr<ImageCopyBackend> cuda_image_copy_backend();
-
 class DeviceContext final {
    public:
-    DeviceContext(int device, std::shared_ptr<ImageCopyBackend> backend, DeviceContextMode mode = DeviceContextMode::Isolated,
-                  int numa_node = -1, std::optional<DeviceExecution> execution = {});
+    DeviceContext(int device, std::shared_ptr<ImageCopyBackend> backend, DeviceContextMode mode = DeviceContextMode::Isolated, int numa_node = -1,
+                  std::optional<DeviceExecution> execution = {});
     ~DeviceContext();
     DeviceContext(const DeviceContext&) noexcept = default;
     DeviceContext& operator=(const DeviceContext&) noexcept = default;
@@ -101,10 +91,8 @@ class DeviceContext final {
     friend class ImageProductBuffer;
     friend class ImageStream;
 };
-
 class BorrowedImageProductReadView;
 class ImageProductReadCompletion;
-
 class ImageStream final {
    public:
     explicit ImageStream(DeviceContext);
@@ -136,7 +124,6 @@ class ImageStream final {
     friend class ImageBuffer;
     friend class ImageProductBuffer;
 };
-
 class BorrowedImageReadView final {
    public:
     BorrowedImageReadView() noexcept;
@@ -163,19 +150,16 @@ class BorrowedImageReadView final {
     friend class ImageProductBuffer;
     friend class ImageProductReadCompletion;
 };
-
 class ImageBuffer final {
    public:
     struct State;
-
     explicit ImageBuffer(DeviceContext);
     ~ImageBuffer();
     ImageBuffer(const ImageBuffer&) = delete;
     ImageBuffer& operator=(const ImageBuffer&) = delete;
     ImageBuffer(ImageBuffer&&) noexcept;
     ImageBuffer& operator=(ImageBuffer&&) noexcept;
-    void Write(ImageStream&, ImagePlaneKind, std::uint32_t width, std::uint32_t height,
-               const std::function<void(ImagePlaneView, std::uintptr_t)>&);
+    void Write(ImageStream&, ImagePlaneKind, std::uint32_t width, std::uint32_t height, const std::function<void(ImagePlaneView, std::uintptr_t)>&);
     [[nodiscard]] ImageCopyPath CopyFrom(ImageStream&, BorrowedImageReadView);
     [[nodiscard]] BorrowedImageReadView Borrow() const;
     [[nodiscard]] std::uint32_t capacity_width() const noexcept;
@@ -187,13 +171,11 @@ class ImageBuffer final {
     std::shared_ptr<State> state_;
     friend class ImageProductBuffer;
 };
-
 enum class ImageProductLayout : std::uint8_t {
     Clean,
     CleanAndSemantic,
 };  // CLEANUP-IGNORE: Single-plane and product borrows are separate move-only resource views with different lease
     // ownership.
-
 class BorrowedImageProductReadView final {
    public:
     BorrowedImageProductReadView() noexcept;
@@ -218,7 +200,6 @@ class BorrowedImageProductReadView final {
     friend class ImageStream;
     friend class ImageProductReadCompletion;
 };
-
 // Converts thread-affine CPU read locks into a receiver-completion access
 // count. Construct and destroy on the borrowing thread. Complete may run in
 // a GPU host callback: it releases access and notifies availability, but never
@@ -239,7 +220,6 @@ class ImageProductReadCompletion final {
     std::atomic_bool pending_{false};
     std::shared_ptr<const std::function<void()>> available_;
 };
-
 class ImageProductBuffer final {
    public:
     ImageProductBuffer(DeviceContext, ImageProductLayout, std::shared_ptr<ImageProductRetirement> = {});
@@ -253,8 +233,7 @@ class ImageProductBuffer final {
     using MissingPlaneSubmit = std::function<void(ImagePlaneView, std::uintptr_t stream)>;
     // Optional receiver initialization for planes absent from the source.
     // The initializer joins the same completion boundary as the copied planes.
-    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit = {},
-                                                         bool preserve_clean = false);
+    [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFrom(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit = {}, bool preserve_clean = false);
     [[nodiscard]] BorrowedImageProductReadView Borrow() const;
     [[nodiscard]] BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] ImageWorkspaceObservation ObserveWorkspace() const;
@@ -281,8 +260,7 @@ class ImageProductBuffer final {
     void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);
     [[nodiscard]] std::array<ImageAllocation, 2U> Allocations() const;
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit, std::uint64_t,
-                                                           bool preserve_clean = false,
-                                                           ImagePlanePreservation = ImagePlanePreservation::All);
+                                                           bool preserve_clean = false, ImagePlanePreservation = ImagePlanePreservation::All);
     [[nodiscard]] bool writable() const;
     [[nodiscard]] bool ReserveWorkspaceWrite();
     void CancelWorkspaceWrite() noexcept;
@@ -296,5 +274,4 @@ class ImageProductBuffer final {
     std::shared_ptr<State> state_;
     bool deferred_release_ = false;
 };
-
 }  // namespace mmltk::frameworks::gpu

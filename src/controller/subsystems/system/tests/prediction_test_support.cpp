@@ -7,7 +7,6 @@
 #include <exception>
 #include <stdexcept>
 #include <utility>
-
 namespace mmltk::controller::test_support {
 namespace gpu = mmltk::frameworks::gpu;
 namespace rfdetr = mmltk::backend::models::rfdetr;
@@ -19,14 +18,12 @@ void checked(cudaError_t result) {
 }
 std::size_t pixel_values(VisualExtent extent) {
     if (!extent.valid()) throw std::invalid_argument("test source extent is empty");
-    return rfdetr::checked_prediction_extent(
-        rfdetr::checked_prediction_extent(extent.width, extent.height, rfdetr::kMaximumEncodedMaskPixels),
-        3U, rfdetr::kMaximumPredictionTensorBytes / sizeof(float));
+    return rfdetr::checked_prediction_extent(rfdetr::checked_prediction_extent(extent.width, extent.height, rfdetr::kMaximumEncodedMaskPixels), 3U,
+                                             rfdetr::kMaximumPredictionTensorBytes / sizeof(float));
 }
 struct DeviceAllocation final {
     explicit DeviceAllocation(const gpu::DeviceExecution& execution)
-        : context(execution.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop,
-            execution.placement.numa_node, execution) {}
+        : context(execution.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::PrimaryInterop, execution.placement.numa_node, execution) {}
     gpu::DeviceContext context;
     void* address = nullptr;
     static void Release(DeviceAllocation* allocation) noexcept {
@@ -34,19 +31,27 @@ struct DeviceAllocation final {
         // the complete aggregate; injected preview failures do not bypass this.
         CUcontext previous{};
         if (cuCtxGetCurrent(&previous) != CUDA_SUCCESS) return;
-        try { allocation->context.Bind(); } catch (...) { return; }
+        try {
+            allocation->context.Bind();
+        } catch (...) { return; }
         const auto result = allocation->address ? cudaFree(allocation->address) : cudaSuccess;
         if (result == cudaSuccess) allocation->address = nullptr;
         const auto restored = cuCtxSetCurrent(previous);
         if (result == cudaSuccess && restored == CUDA_SUCCESS) delete allocation;
     }
 };
-}
+}  // namespace
 void StopGate::Release() {
-    { std::scoped_lock lock(mutex_); released_ = true; }
+    {
+        std::scoped_lock lock(mutex_);
+        released_ = true;
+    }
     condition_.notify_all();
 }
-void StopGate::Reset() { std::scoped_lock lock(mutex_); released_ = false; }
+void StopGate::Reset() {
+    std::scoped_lock lock(mutex_);
+    released_ = false;
+}
 bool StopGate::Wait(std::stop_token stop) {
     std::unique_lock lock(mutex_);
     return condition_.wait(lock, stop, [this] { return released_; });
@@ -55,11 +60,11 @@ PredictionSource::PredictionSource(VisualExtent extent, Catalog classes)
     : extent_(extent), classes_(classes ? std::move(classes) : std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>()) {
     annotations_.source_region = {.width = extent.width, .height = extent.height};
     annotations_.class_catalog = classes_;
-    annotations_.class_domain = classes_->empty() ? mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot :
-        mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
+    annotations_.class_domain = classes_->empty() ? mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot
+                                                  : mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
 }
-PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution, VisualExtent extent,
-    std::span<const float> pixels, std::vector<Detection> detections, Catalog classes, std::span<const std::uint8_t> masks) {
+PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution, VisualExtent extent, std::span<const float> pixels,
+                                          std::vector<Detection> detections, Catalog classes, std::span<const std::uint8_t> masks) {
     const auto values = pixel_values(extent);
     if (pixels.size() != values || detections.size() > contracts::kAnnotationObjectCapacity)
         throw std::invalid_argument("test source data does not match its geometry");
@@ -104,8 +109,7 @@ PredictionSource PredictionSource::Decoded(VisualExtent extent, std::span<const 
     result.custody_ = std::shared_ptr<void>(allocation, allocation.get());
     return result;
 }
-ScopedPredictionReceiverFault::ScopedPredictionReceiverFault(PredictionReceiverFault& fault)
-    : previous_(receiver_fault.exchange(&fault)) {}
+ScopedPredictionReceiverFault::ScopedPredictionReceiverFault(PredictionReceiverFault& fault) : previous_(receiver_fault.exchange(&fault)) {}
 ScopedPredictionReceiverFault::~ScopedPredictionReceiverFault() { receiver_fault.store(previous_); }
 cudaError_t PredictionReceiverFault::Upload(void* destination, const void* source, std::size_t bytes, cudaMemcpyKind kind, cudaStream_t stream) {
     const auto copied = cudaMemcpyAsync(destination, source, bytes, kind, stream);
@@ -118,12 +122,11 @@ cudaError_t PredictionReceiverFault::Upload(void* destination, const void* sourc
     // settled before the deliberately unobservable receiver outcome is reported.
     const auto settled = cudaStreamSynchronize(stream);
     fault->upload.receipt().ArriveAndWait();
-    if (fault->terminal) throw gpu::ImageStreamExecutionFailure(
-        std::make_exception_ptr(std::runtime_error("injected receiver completion failure")));
+    if (fault->terminal) throw gpu::ImageStreamExecutionFailure(std::make_exception_ptr(std::runtime_error("injected receiver completion failure")));
     return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
 }
-int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, std::uint32_t height,
-    std::uint8_t* destination, std::size_t pitch, std::uintptr_t stream) noexcept {
+int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, std::uint32_t height, std::uint8_t* destination, std::size_t pitch,
+                                     cudaStream_t stream) noexcept {
     auto* fault = receiver_fault.load();
     bool fail = false;
     if (fault) {
@@ -134,10 +137,9 @@ int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, s
         fail = fail || remaining != 0U;
     }
     if (fail) {
-        const auto command = reinterpret_cast<cudaStream_t>(stream);
-        const auto written = cudaMemset2DAsync(destination, pitch, 123, width * 4U, 1U, command);
+        const auto written = cudaMemset2DAsync(destination, pitch, 123, width * 4U, 1U, stream);
         if (written != cudaSuccess) return written;
-        const auto settled = cudaStreamSynchronize(command);
+        const auto settled = cudaStreamSynchronize(stream);
         return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
     }
     return mmltk::backend::imaging::raster::chw_float_to_rgba(source, width, height, destination, pitch, stream);
@@ -147,21 +149,15 @@ detail::PredictionPreviewPool::TransferOperations PredictionReceiverFault::Opera
 }
 namespace {
 class SettlementBackend final : public gpu::ImageCopyBackend {
- public:
+   public:
     explicit SettlementBackend(PredictionSettlementFault& fault) : fault_(fault) {}
-    std::optional<gpu::DeviceExecution> ResolveExecution(int device, int numa)  override {
-        return native_->ResolveExecution(device, numa);
-    }
-    std::uintptr_t CreateContext(int device, gpu::DeviceContextMode mode)  override {
-        return native_->CreateContext(device, mode);
-    }
+    std::optional<gpu::DeviceExecution> ResolveExecution(int device, int numa) override { return native_->ResolveExecution(device, numa); }
+    std::uintptr_t CreateContext(int device, gpu::DeviceContextMode mode) override { return native_->CreateContext(device, mode); }
     void DestroyContext(int device, gpu::DeviceContextMode mode, std::uintptr_t context) noexcept override {
         return native_->DestroyContext(device, mode, context);
     }
-    void BindContext(std::uintptr_t context)  override {
-        return native_->BindContext(context);
-    }
-    std::uintptr_t CreateStream(std::uintptr_t context)  override {
+    void BindContext(std::uintptr_t context) override { return native_->BindContext(context); }
+    std::uintptr_t CreateStream(std::uintptr_t context) override {
         const auto stream = native_->CreateStream(context);
         ++fault_.streams_created;
         return stream;
@@ -170,46 +166,37 @@ class SettlementBackend final : public gpu::ImageCopyBackend {
         ++fault_.streams_destroyed;
         return native_->DestroyStream(context, stream);
     }
-    std::uintptr_t CreateEvent(std::uintptr_t context)  override {
-        return native_->CreateEvent(context);
-    }
-    void DestroyEvent(std::uintptr_t context, std::uintptr_t event) noexcept override {
-        return native_->DestroyEvent(context, event);
-    }
-    gpu::ImagePlaneView AllocatePlane(std::uintptr_t context, gpu::ImagePlaneKind kind, std::uint32_t width, std::uint32_t height)  override {
+    std::uintptr_t CreateEvent(std::uintptr_t context) override { return native_->CreateEvent(context); }
+    void DestroyEvent(std::uintptr_t context, std::uintptr_t event) noexcept override { return native_->DestroyEvent(context, event); }
+    gpu::ImagePlaneView AllocatePlane(std::uintptr_t context, gpu::ImagePlaneKind kind, std::uint32_t width, std::uint32_t height) override {
         return native_->AllocatePlane(context, kind, width, height);
     }
-    void FreePlane(std::uintptr_t context, CUdeviceptr data) noexcept override {
-        return native_->FreePlane(context, data);
-    }
-    void ClearPlane(std::uintptr_t context, std::uintptr_t stream, const gpu::ImagePlaneView& plane)  override {
+    void FreePlane(std::uintptr_t context, CUdeviceptr data) noexcept override { return native_->FreePlane(context, data); }
+    void ClearPlane(std::uintptr_t context, std::uintptr_t stream, const gpu::ImagePlaneView& plane) override {
         return native_->ClearPlane(context, stream, plane);
     }
-    std::shared_ptr<void> AllocatePinned(std::uintptr_t context, const mmltk::common::system::ExecutionPlacement* placement, std::size_t bytes)  override {
+    std::shared_ptr<void> AllocatePinned(std::uintptr_t context, const mmltk::common::system::ExecutionPlacement* placement, std::size_t bytes) override {
         return native_->AllocatePinned(context, placement, bytes);
     }
-    bool CanAccessPeer(int receiver, int source)  override {
-        return native_->CanAccessPeer(receiver, source);
-    }
-    void WaitEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event)  override {
-        return native_->WaitEvent(context, stream, event);
-    }
-    void CopySameDevice(std::uintptr_t context, std::uintptr_t stream, const gpu::ImagePlaneView& destination, std::uintptr_t source_context, const gpu::ImagePlaneView& source)  override {
+    bool CanAccessPeer(int receiver, int source) override { return native_->CanAccessPeer(receiver, source); }
+    void WaitEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) override { return native_->WaitEvent(context, stream, event); }
+    void CopySameDevice(std::uintptr_t context, std::uintptr_t stream, const gpu::ImagePlaneView& destination, std::uintptr_t source_context,
+                        const gpu::ImagePlaneView& source) override {
         return native_->CopySameDevice(context, stream, destination, source_context, source);
     }
-    void CopyPeer(std::uintptr_t context, std::uintptr_t stream, int device, const gpu::ImagePlaneView& destination, std::uintptr_t source_context, int source_device, const gpu::ImagePlaneView& source)  override {
+    void CopyPeer(std::uintptr_t context, std::uintptr_t stream, int device, const gpu::ImagePlaneView& destination, std::uintptr_t source_context,
+                  int source_device, const gpu::ImagePlaneView& source) override {
         return native_->CopyPeer(context, stream, device, destination, source_context, source_device, source);
     }
-    void CopyDeviceToHost(std::uintptr_t context, const gpu::ImagePlaneView& source, void* destination, std::size_t pitch)  override {
+    void CopyDeviceToHost(std::uintptr_t context, const gpu::ImagePlaneView& source, void* destination, std::size_t pitch) override {
         return native_->CopyDeviceToHost(context, source, destination, pitch);
     }
-    void CopyHostToDevice(std::uintptr_t context, std::uintptr_t stream, const void* source, std::size_t pitch, const gpu::ImagePlaneView& destination)  override {
+    void CopyHostToDevice(std::uintptr_t context, std::uintptr_t stream, const void* source, std::size_t pitch,
+                          const gpu::ImagePlaneView& destination) override {
         return native_->CopyHostToDevice(context, stream, source, pitch, destination);
     }
-    void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event)  override {
-        return native_->SynchronizeEvent(context, event);
-    }
-    void NotifyStream(std::uintptr_t context, std::uintptr_t stream, StreamNotification& notification)  override {
+    void SynchronizeEvent(std::uintptr_t context, std::uintptr_t event) override { return native_->SynchronizeEvent(context, event); }
+    void NotifyStream(std::uintptr_t context, std::uintptr_t stream, StreamNotification& notification) override {
         return native_->NotifyStream(context, stream, notification);
     }
     void RecordEvent(std::uintptr_t context, std::uintptr_t stream, std::uintptr_t event) override {
@@ -224,18 +211,23 @@ class SettlementBackend final : public gpu::ImageCopyBackend {
         }
         return result;
     }
- private:
+
+   private:
     PredictionSettlementFault& fault_;
     std::shared_ptr<gpu::ImageCopyBackend> native_ = gpu::cuda_image_copy_backend();
 };
-}
+}  // namespace
 std::shared_ptr<gpu::ImageCopyBackend> PredictionSettlementFault::Backend() { return std::make_shared<SettlementBackend>(*this); }
 PredictionTransferFault::PredictionTransferFault() : previous_(std::exchange(transfer_fault, this)) {}
 PredictionTransferFault::~PredictionTransferFault() { transfer_fault = previous_; }
 void PredictionTransferFault::Reset() { Reset(Selection{}); }
-void PredictionTransferFault::Reset(Selection selection) { selection_ = selection; copies = settlements = waits = 0; waited_stream = nullptr; }
-CUresult PredictionTransferFault::Copy(CUdeviceptr destination, CUcontext destination_context, CUdeviceptr source,
-    CUcontext source_context, std::size_t bytes, CUstream stream) {
+void PredictionTransferFault::Reset(Selection selection) {
+    selection_ = selection;
+    copies = settlements = waits = 0;
+    waited_stream = nullptr;
+}
+CUresult PredictionTransferFault::Copy(CUdeviceptr destination, CUcontext destination_context, CUdeviceptr source, CUcontext source_context, std::size_t bytes,
+                                       CUstream stream) {
     if (transfer_fault && ++transfer_fault->copies == transfer_fault->selection_.fail_copy) return CUDA_ERROR_INVALID_VALUE;
     return cuMemcpyPeerAsync(destination, destination_context, source, source_context, bytes, stream);
 }
@@ -264,15 +256,17 @@ detail::PredictionPreviewPool::TransferOperations PredictionTransferFault::Opera
     return operations;
 }
 detail::PredictionPreviewPool::TransferOperations RefusePinnedRegistration() {
-    return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize,
-        +[](void*, std::size_t, unsigned) -> CUresult { return CUDA_ERROR_OUT_OF_MEMORY; }};
+    return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, +[](void*, std::size_t, unsigned) -> CUresult { return CUDA_ERROR_OUT_OF_MEMORY; }};
 }
 void CountPredictionSourceStop(void* count) noexcept { ++*static_cast<int*>(count); }
 gpu::CudaContextApi PredictionContextFault::Api() noexcept { return {this, &Get, &Set}; }
 CUresult PredictionContextFault::Get(void* owner, CUcontext* context) noexcept {
     auto& driver = *static_cast<PredictionContextFault*>(owner);
     ++driver.calls;
-    if (driver.armed && driver.failure_ == Failure::Query) { ++driver.failures; return CUDA_ERROR_INVALID_CONTEXT; }
+    if (driver.armed && driver.failure_ == Failure::Query) {
+        ++driver.failures;
+        return CUDA_ERROR_INVALID_CONTEXT;
+    }
     return cuCtxGetCurrent(context);
 }
 CUresult PredictionContextFault::Set(void* owner, CUcontext context) noexcept {
@@ -281,31 +275,32 @@ CUresult PredictionContextFault::Set(void* owner, CUcontext context) noexcept {
     if (driver.observe_candidate && driver.restores == 0U) static_cast<void>(cuCtxGetCurrent(&driver.candidate));
     const auto result = cuCtxSetCurrent(context);
     ++driver.restores;
-    if (driver.armed && (driver.failure_ == Failure::RestoreAlways ||
-        (driver.failure_ == Failure::RestoreOnce && driver.failures == 0U))) {
+    if (driver.armed && (driver.failure_ == Failure::RestoreAlways || (driver.failure_ == Failure::RestoreOnce && driver.failures == 0U))) {
         ++driver.failures;
         return CUDA_ERROR_INVALID_CONTEXT;
     }
     return result;
 }
 contracts::ComputeTerminal ComputeSequence::Run(std::stop_token stop, const ComputeProgressSink& progress) {
-    progress(scenario_.fail ? contracts::ComputeProgress{.sequence = 0U, .completed = 2U, .total = 1U,
-        .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
-        : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 2U, .status = "running"});
+    progress(scenario_.fail
+                 ? contracts::ComputeProgress{.sequence = 0U, .completed = 2U, .total = 1U, .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
+                 : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 2U, .status = "running"});
     if (!scenario_.gate->Wait(stop)) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
-    if (scenario_.fail) return {.outcome = static_cast<contracts::ComputeOperationOutcome>(255U),
-        .output = std::string(contracts::kComputePathCapacity + 1U, 'x'), .detail = std::string(contracts::kComputeErrorCapacity + 1U, 'x')};
+    if (scenario_.fail)
+        return {.outcome = static_cast<contracts::ComputeOperationOutcome>(255U),
+                .output = std::string(contracts::kComputePathCapacity + 1U, 'x'),
+                .detail = std::string(contracts::kComputeErrorCapacity + 1U, 'x')};
     return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded, 0U, 2U, "result");
 }
-ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest, std::stop_token stop, const ComputeProgressSink& progress, const rfdetr::ValidationDelivery&) {
+ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest, std::stop_token stop, const ComputeProgressSink& progress,
+                                                         const rfdetr::ValidationDelivery&) {
     ValidationRuntimeResult result{.terminal = sequence_.Run(stop, progress)};
     if (result.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded) {
         result.evaluation.emplace();
         result.evaluation->summary.bbox.available = true;
         result.evaluation->summary.bbox.ap = 0.75;
-        result.evaluation->class_catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(
-            std::vector<std::string>{"last in model", "absent", "middle", "first in model",
-                std::string(mmltk::backend::data::catalog::kClassNameCapacity, 'z')});
+        result.evaluation->class_catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{
+            "last in model", "absent", "middle", "first in model", std::string(mmltk::backend::data::catalog::kClassNameCapacity, 'z')});
         result.evaluation->details.resize(5U);
         for (std::uint32_t index = 0U; index < 5U; ++index) result.evaluation->details[index].category = index;
     }
@@ -314,11 +309,10 @@ ValidationRuntimeResult FakeNonvisualComputeRuntime::Run(rfdetr::ValidateRequest
 contracts::ComputeTerminal FakeNonvisualComputeRuntime::Run(rfdetr::ModelExportRequest, std::stop_token stop, const ComputeProgressSink& progress) {
     return sequence_.Run(stop, progress);
 }
-FakePredictRuntime::FakePredictRuntime(PredictionScenario scenario)
-    : sequence_(std::move(scenario.compute)), scenario_(std::move(scenario)) {}
-contracts::ComputeTerminal FakePredictRuntime::Run(rfdetr::PredictRequest, std::stop_token stop,
-    const ComputeProgressSink& progress, const ProductSink& products, const PlaybackGate&, VisualExtent,
-    const ContextProvider& current_context, const PreviewRetirement& retirement) {
+FakePredictRuntime::FakePredictRuntime(PredictionScenario scenario) : sequence_(std::move(scenario.compute)), scenario_(std::move(scenario)) {}
+contracts::ComputeTerminal FakePredictRuntime::Run(rfdetr::PredictRequest, std::stop_token stop, const ComputeProgressSink& progress,
+                                                   const ProductSink& products, const PlaybackGate&, VisualExtent, const ContextProvider& current_context,
+                                                   const PreviewRetirement& retirement) {
     if (scenario_.predictions) ++*scenario_.predictions;
     auto terminal = sequence_.Run(stop, progress);
     if (terminal.outcome != contracts::ComputeOperationOutcome::Succeeded) return terminal;
@@ -329,8 +323,7 @@ contracts::ComputeTerminal FakePredictRuntime::Run(rfdetr::PredictRequest, std::
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     const auto context = current_context();
     if (!context) return terminal;
-    if (!preview_) preview_ = std::make_unique<detail::PredictionPreviewPool>(execution, *context,
-        PredictionReceiverFault::Operations(), retirement);
+    if (!preview_) preview_ = std::make_unique<detail::PredictionPreviewPool>(execution, *context, PredictionReceiverFault::Operations(), retirement);
     if (scenario_.receiver_fault && scenario_.receiver_fault->enabled) {
         scenario_.receiver_fault->retirement = retirement;
         std::array<std::uint8_t, 48U> white;
@@ -343,14 +336,15 @@ contracts::ComputeTerminal FakePredictRuntime::Run(rfdetr::PredictRequest, std::
     }
     std::array<float, 48U> white;
     white.fill(1.0F);
-    auto source = PredictionSource::Device(execution, {4U, 4U}, white,
+    auto source = PredictionSource::Device(
+        execution, {4U, 4U}, white,
         std::vector<rfdetr::Prediction>(scenario_.labels, {.class_reference = 0, .score = .75F, .bbox_xyxy = {0.0F, 0.0F, 3.0F, 3.0F}}),
         std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{std::string(256U, 'p')}));
-    auto raw = preview_->Capture(source.pixels(), source.extent(), 0U, source.detections(), source.annotations(),
-        source.classes(), 1, nullptr, source.custody());
-    products(Product{.extent = source.extent(), .raw = std::move(raw), .image_id = 41,
-        .source_index = scenario_.source_index ? scenario_.source_index->load() : 0});
+    auto raw =
+        preview_->Capture(source.pixels(), source.extent(), 0U, source.detections(), source.annotations(), source.classes(), 1, nullptr, source.custody());
+    products(
+        Product{.extent = source.extent(), .raw = std::move(raw), .image_id = 41, .source_index = scenario_.source_index ? scenario_.source_index->load() : 0});
     if (scenario_.after_product && scenario_.after_product->Wait(stop)) progress({2U, 2U, 2U, "Processed"});
     return terminal;
 }
-} // namespace mmltk::controller::test_support
+}  // namespace mmltk::controller::test_support

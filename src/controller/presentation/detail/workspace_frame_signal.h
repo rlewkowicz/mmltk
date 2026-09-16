@@ -1,5 +1,4 @@
 #pragma once
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -8,13 +7,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <type_traits>
-
 #include "src/controller/presentation/workspace_presentation_types.h"
-
 namespace mmltk::controller::presentation::detail {
-
 inline constexpr std::size_t kWorkspaceMetadataByteCapacity = 16U * 1024U * 1024U + 4096U;
-
 // CLEANUP-IGNORE: This cache-line signal is a fixed shared-memory protocol, not an application layout abstraction.
 struct alignas(64) WorkspaceFrameSignal final {
     // CLEANUP-IGNORE: Signal timeline fields have atomic ABI offsets unrelated to image-layout dimension sequences.
@@ -31,9 +26,7 @@ struct alignas(64) WorkspaceFrameSignal final {
     std::uint64_t physical_revision = 0U;
     std::uint32_t metadata_bytes = 0U;
 };
-
 inline constexpr std::size_t kWorkspaceFrameMappingBytes = sizeof(WorkspaceFrameSignal) + kWorkspaceMetadataByteCapacity;
-
 static_assert(std::is_standard_layout_v<WorkspaceFrameSignal>);
 static_assert(std::is_trivially_copyable_v<WorkspaceFrameSignal>);
 static_assert(sizeof(WorkspaceFrameSignal) == 128U);
@@ -49,18 +42,14 @@ static_assert(offsetof(WorkspaceFrameSignal, content_width) == 56U);
 static_assert(offsetof(WorkspaceFrameSignal, content_height) == 60U);
 static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free);
 static_assert(std::atomic_ref<std::uint32_t>::is_always_lock_free);
-
 [[nodiscard]] inline constexpr std::uint64_t workspace_timeline_ready(const std::uint64_t transfer_sequence) {
     constexpr std::uint64_t kMaximumTransferSequence = std::numeric_limits<std::uint64_t>::max() / 2U + 1U;
-    if (transfer_sequence == 0U || transfer_sequence > kMaximumTransferSequence)
-        throw std::overflow_error("workspace transfer sequence is out of range");
+    if (transfer_sequence == 0U || transfer_sequence > kMaximumTransferSequence) throw std::overflow_error("workspace transfer sequence is out of range");
     return (transfer_sequence - 1U) * 2U + 1U;
 }
-
-inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, const std::uint64_t timeline_ready,
-                                           const std::uint64_t transfer_sequence, const WorkspacePresentationLayer layer,
-                                           const WorkspaceContentIdentity logical_content, const std::uint64_t presentation_revision,
-                                           const std::uint32_t content_width, const std::uint32_t content_height,
+inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, const std::uint64_t timeline_ready, const std::uint64_t transfer_sequence,
+                                           const WorkspacePresentationLayer layer, const WorkspaceContentIdentity logical_content,
+                                           const std::uint64_t presentation_revision, const std::uint32_t content_width, const std::uint32_t content_height,
                                            const std::uint64_t physical_revision, const std::span<const std::byte> metadata = {}) {
     if (signal == nullptr) return;
     if (metadata.size() > kWorkspaceMetadataByteCapacity) throw std::length_error("workspace image metadata exceeds its graphics envelope");
@@ -84,5 +73,4 @@ inline void publish_workspace_frame_signal(WorkspaceFrameSignal* const signal, c
     std::atomic_ref<std::uint32_t>{signal->metadata_bytes}.store(static_cast<std::uint32_t>(metadata.size()), std::memory_order_seq_cst);
     static_cast<void>(sequence.fetch_add(1U, std::memory_order_seq_cst));
 }
-
 }  // namespace mmltk::controller::presentation::detail

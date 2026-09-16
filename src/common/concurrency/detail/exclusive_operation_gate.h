@@ -1,10 +1,7 @@
 #pragma once
-
 #include <atomic>
 #include <utility>
-
 namespace mmltk::common::concurrency {
-
 class ExclusiveOperationGate final {
    public:
     class Guard final {
@@ -34,12 +31,10 @@ class ExclusiveOperationGate final {
         }
         ExclusiveOperationGate* gate_ = nullptr;
     };
-
     [[nodiscard]] Guard try_acquire() noexcept { return Guard{held_.test_and_set(std::memory_order_acquire) ? nullptr : this}; }
     [[nodiscard]] bool in_flight() const noexcept { return held_.test(std::memory_order_acquire); }
 
    private:
     std::atomic_flag held_ = ATOMIC_FLAG_INIT;
 };
-
 }  // namespace mmltk::common::concurrency

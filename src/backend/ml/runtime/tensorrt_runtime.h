@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -9,9 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 namespace mmltk::backend::ml::runtime {
-
 class TensorRtCacheIntegrityError final : public std::runtime_error {
    public:
     using std::runtime_error::runtime_error;
@@ -24,20 +21,17 @@ class TensorRtOperationError final : public std::runtime_error {
    private:
     std::int32_t code_;
 };
-
 enum class TensorRtProfilingVerbosity : std::uint8_t {
     LayerNames,
     Detailed,
     Disabled,
 };
-
 struct TensorRtOptimizationProfile final {
     std::string input_name;
     std::vector<std::int64_t> minimum;
     std::vector<std::int64_t> optimum;
     std::vector<std::int64_t> maximum;
 };
-
 struct TensorRtEngineOptions final {
     std::int32_t device = 0;
     // Permission for automatic FP16 lowering; TensorRT 11 preserves model-defined types.
@@ -51,21 +45,17 @@ struct TensorRtEngineOptions final {
     std::function<void(std::string_view)> log;
     std::function<bool()> continue_build;
 };
-
 namespace detail {
 class TensorRtEngineAccess;
 }
-
 class TensorRtEngine final {
    public:
     TensorRtEngine(const std::filesystem::path& model_path, TensorRtEngineOptions options);
     ~TensorRtEngine();
-
     TensorRtEngine(const TensorRtEngine&) = delete;
     TensorRtEngine& operator=(const TensorRtEngine&) = delete;
     TensorRtEngine(TensorRtEngine&&) noexcept;
     TensorRtEngine& operator=(TensorRtEngine&&) noexcept;
-
     [[nodiscard]] std::int32_t device() const noexcept;
     [[nodiscard]] const std::filesystem::path& model_path() const noexcept;
     [[nodiscard]] bool built_from_onnx() const noexcept;
@@ -81,8 +71,6 @@ class TensorRtEngine final {
    private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-
     friend class detail::TensorRtEngineAccess;
 };
-
 }  // namespace mmltk::backend::ml::runtime

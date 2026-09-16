@@ -1,19 +1,15 @@
 #include "src/controller/subsystems/train/training_system.h"
-
 #include <algorithm>
 #include <atomic>
 #include <ranges>
 #include <stdexcept>
 #include <utility>
-
 #include "src/controller/services/train_process_client.h"
 #include "src/controller/services/train_run_store.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
-
 namespace mmltk::controller {
 namespace {
-
 [[nodiscard]] contracts::ProviderEffectResult reconcile_result(const services::VastReconciliation& result, const int fallback) {
     const int instance = result.instance ? result.instance->instance_id : fallback;
     using Source = services::VastReconciliation::Disposition;
@@ -22,16 +18,12 @@ namespace {
     if (result.disposition == Source::NotApplied) return {.disposition = Target::NotApplied};
     return {.disposition = Target::Inconclusive, .instance_id = instance};
 }
-
 template <class Source>
 auto cancellation_bridge(Source& source, const std::stop_token stop) {
     return std::stop_callback{stop, [&source] { static_cast<void>(source.RequestCancel()); }};
 }
-
 }  // namespace
-
 NativeTrainingRuntime::NativeTrainingRuntime(NativeTrainingConfiguration configuration) : config_(std::move(configuration)) {}
-
 contracts::ComputeTerminal NativeTrainingRuntime::Train(mmltk::backend::models::rfdetr::TrainRequest request, const std::stop_token stop,
                                                         const std::function<void(const services::TrainProcessProgress&)>& progress) {
     if (config_.training_executable.empty()) throw contracts::UnavailableError("local training executable is unavailable");
@@ -47,14 +39,12 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(mmltk::backend::models::
         }
     } observer{&progress};
     const auto result = process.Run(std::move(token), {.context = &observer, .report = &Observer::Report});
-    const auto outcome =
-        result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded   ? contracts::ComputeOperationOutcome::Succeeded
-        : result.terminal.outcome == services::TrainProcessExitOutcome::Cancelled ? contracts::ComputeOperationOutcome::Cancelled
-                                                                                  : contracts::ComputeOperationOutcome::Failed;
-    return contracts::make_compute_terminal(
-        outcome, 0, result.terminal.final_progress ? result.terminal.final_progress->progress.completed : 0, {}, result.terminal.error);
+    const auto outcome = result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded   ? contracts::ComputeOperationOutcome::Succeeded
+                         : result.terminal.outcome == services::TrainProcessExitOutcome::Cancelled ? contracts::ComputeOperationOutcome::Cancelled
+                                                                                                   : contracts::ComputeOperationOutcome::Failed;
+    return contracts::make_compute_terminal(outcome, 0, result.terminal.final_progress ? result.terminal.final_progress->progress.completed : 0, {},
+                                            result.terminal.error);
 }
-
 contracts::ProviderQueryResult NativeTrainingRuntime::Query(const contracts::ProviderPreferences& preferences, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
     auto [source, token] = services::VastCancellationSource::Mint();
@@ -62,9 +52,7 @@ contracts::ProviderQueryResult NativeTrainingRuntime::Query(const contracts::Pro
     const auto offers = services::VastClient{config_.provider}.query(preferences, token);
     return services::materialize_provider_query_result(offers);
 }
-
-contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::ProviderMutation mutation,
-                                                              const contracts::ProviderPreferences& preferences,
+contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::ProviderMutation mutation, const contracts::ProviderPreferences& preferences,
                                                               const contracts::ProviderOfferIdentity offer, const int instance,
                                                               const std::string_view launch_token, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
@@ -75,8 +63,7 @@ contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::P
         services::VastClient client{config_.provider};
         if (mutation == contracts::ProviderMutation::Create) {
             const auto created = client.create(offer.offer_id, preferences, launch_token, attempt, token);
-            if (!created.success || created.instance_id <= 0)
-                return contracts::provider_effect_not_applied("provider did not allocate the selected offer");
+            if (!created.success || created.instance_id <= 0) return contracts::provider_effect_not_applied("provider did not allocate the selected offer");
             return {.disposition = contracts::ProviderReconciliationDisposition::Applied, .instance_id = created.instance_id};
         }
         client.mutate(mutation, instance, attempt, token);
@@ -86,16 +73,13 @@ contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::P
         return attempt.started() ? contracts::provider_effect_inconclusive(error.what(), cancelled)
                                  : contracts::provider_effect_not_applied(error.what(), cancelled);
     } catch (const std::exception& error) {
-        return attempt.started() ? contracts::provider_effect_inconclusive(error.what())
-                                 : contracts::provider_effect_not_applied(error.what());
+        return attempt.started() ? contracts::provider_effect_inconclusive(error.what()) : contracts::provider_effect_not_applied(error.what());
     } catch (...) {
         return attempt.started() ? contracts::provider_effect_inconclusive("provider mutation failed")
                                  : contracts::provider_effect_not_applied("provider mutation failed");
     }
 }
-
-contracts::ProviderEffectResult NativeTrainingRuntime::Reconcile(const services::VastReconciliationRequest& request,
-                                                                 const std::stop_token stop) {
+contracts::ProviderEffectResult NativeTrainingRuntime::Reconcile(const services::VastReconciliationRequest& request, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
     auto [source, token] = services::VastCancellationSource::Mint();
     auto cancellation = cancellation_bridge(source, stop);
@@ -107,7 +91,6 @@ contracts::ProviderEffectResult NativeTrainingRuntime::Reconcile(const services:
         return contracts::provider_effect_inconclusive("provider reconciliation failed");
     }
 }
-
 class TrainingSystem::Impl final {
    private:
     friend class TrainingSystem;
@@ -120,23 +103,19 @@ class TrainingSystem::Impl final {
         int instance = 0;
         std::string launch_token;
     };
-
     Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, RuntimeFactory factory, SystemEventSink<event_type> events)
         : settings_(settings), dataset_(dataset), model_(model), factory_(std::move(factory)), events_(std::move(events)) {
         if (!factory_) throw contracts::UnavailableError("training runtime factory is unavailable");
     }
-
     TrainingRuntime& runtime() {
         if (!runtime_) runtime_ = factory_();
         if (!runtime_) throw std::runtime_error("training runtime is unavailable");
         return *runtime_;
     }
-
     [[nodiscard]] TrainingSnapshot snapshot() const {
         std::scoped_lock lock(mutex_);
         return state_;
     }
-
     [[nodiscard]] direct::LocalRun::Notification notification(event_type event) {
         return [this, event = std::move(event)]() mutable noexcept {
             if (!events_) return;
@@ -145,14 +124,13 @@ class TrainingSystem::Impl final {
             } catch (...) {}
         };
     }
-
     services::TrainRunStore run_store_;
     std::mutex run_store_mutex_;
-
     [[nodiscard]] TrainingSnapshot Start(std::filesystem::path resume = {}) {
         auto facts = settings_.materialization_facts();
         if (!facts.loaded) throw contracts::UnavailableError("settings are unavailable");
-        if (resume.empty()) facts.settings.workflows.train.request.resume_path.clear();
+        if (resume.empty())
+            facts.settings.workflows.train.request.resume_path.clear();
         else if (facts.settings.workflows.train.request.resume_path != resume)
             throw contracts::InvalidIntentError("Resume settings no longer match the selected checkpoint");
         const auto selection = model_.selection();
@@ -166,8 +144,7 @@ class TrainingSystem::Impl final {
                     state_.local.active = true;
                     state_.local.generation_frontier = *next;
                     state_.local.progress = {};
-                    state_.local.terminal =
-                        contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
+                    state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Running, state_.local.generation_frontier);
                     state_.local.terminal.detail = "Inspecting selected training inputs";
                     AdvanceObservation();
                 },
@@ -179,18 +156,18 @@ class TrainingSystem::Impl final {
                     const auto& selected = settings.workflows.train.request;
                     contracts::ArtifactInspection inspection;
                     if (!stop.stop_requested()) {
-                        inspection = dataset_.Inspect(
-                            {selected.train_compiled_path, selected.val_compiled_path, selected.test_compiled_path},
-                            selection.key.preset, selection.key.resolution, stop);
+                        inspection = dataset_.Inspect({selected.train_compiled_path, selected.val_compiled_path, selected.test_compiled_path},
+                                                      selection.key.preset, selection.key.resolution, stop);
                     }
                     if (stop.stop_requested()) {
                         terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
                     } else {
                         auto request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, selection);
                         if (!request) throw contracts::InvalidIntentError(request.error().detail);
-                        request->output_dir = services::TrainRunStore::ResolveOutput(request->output_dir, request->resume_path.empty() ?
-                            std::optional<mmltk::backend::models::rfdetr::TrainingCheckpoint>{} :
-                            std::optional{mmltk::backend::models::rfdetr::inspect_training_checkpoint(request->resume_path)});
+                        request->output_dir = services::TrainRunStore::ResolveOutput(
+                            request->output_dir, request->resume_path.empty()
+                                                     ? std::optional<mmltk::backend::models::rfdetr::TrainingCheckpoint>{}
+                                                     : std::optional{mmltk::backend::models::rfdetr::inspect_training_checkpoint(request->resume_path)});
                         {
                             std::scoped_lock lock(mutex_);
                             state_.output_directory = request->output_dir;
@@ -199,34 +176,31 @@ class TrainingSystem::Impl final {
                             AdvanceObservation();
                         }
                         direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
-                        terminal =
-                            runtime().Train(std::move(*request), stop, [this, &malformed_progress](const services::TrainProcessProgress& update) {
-                                const auto& progress = update.progress;
-                                if (!progress.valid()) {
-                                    malformed_progress.store(true, std::memory_order_relaxed);
-                                    return;
-                                }
-                                TrainingProgress observation;
-                                {
-                                    std::scoped_lock lock(mutex_);
-                                    if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence))
-                                        return;
-                                    state_.local.progress = progress;
-                                    if (update.metrics) state_.metrics = update.metrics;
-                                    state_.persistence = update.persistence;
-                                    if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running)
-                                        state_.local.terminal.detail.clear();
-                                    AdvanceObservation();
-                                    observation = {
-                                        .revision = state_.revision,
-                                        .activity = state_.activity,
-                                        .local = state_.local,
-                                        .metrics = state_.metrics,
-                                        .persistence = state_.persistence,
-                                    };
-                                }
-                                direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
-                            });
+                        terminal = runtime().Train(std::move(*request), stop, [this, &malformed_progress](const services::TrainProcessProgress& update) {
+                            const auto& progress = update.progress;
+                            if (!progress.valid()) {
+                                malformed_progress.store(true, std::memory_order_relaxed);
+                                return;
+                            }
+                            TrainingProgress observation;
+                            {
+                                std::scoped_lock lock(mutex_);
+                                if (!state_.local.active || !contracts::compute_progress_follows(progress, state_.local.progress.sequence)) return;
+                                state_.local.progress = progress;
+                                if (update.metrics) state_.metrics = update.metrics;
+                                state_.persistence = update.persistence;
+                                if (state_.local.terminal.outcome == contracts::ComputeOperationOutcome::Running) state_.local.terminal.detail.clear();
+                                AdvanceObservation();
+                                observation = {
+                                    .revision = state_.revision,
+                                    .activity = state_.activity,
+                                    .local = state_.local,
+                                    .metrics = state_.metrics,
+                                    .persistence = state_.persistence,
+                                };
+                            }
+                            direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(observation)}; });
+                        });
                     }
                     if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal())
                         throw std::runtime_error("local training runtime returned an invalid result");
@@ -238,8 +212,7 @@ class TrainingSystem::Impl final {
                 if (failed) runtime_.reset();
                 {
                     std::scoped_lock lock(mutex_);
-                    if (stop.stop_requested() && !failed)
-                        terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
+                    if (stop.stop_requested() && !failed) terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
                     terminal.generation = state_.local.generation_frontier;
                     state_.local.active = false;
                     state_.local.terminal = terminal;
@@ -253,7 +226,6 @@ class TrainingSystem::Impl final {
         });
         return snapshot();
     }
-
     [[nodiscard]] TrainingSnapshot Query() {
         const auto preferences = settings_.provider_preferences();
         if (!preferences.valid()) throw contracts::UnavailableError("provider preferences are unavailable");
@@ -262,8 +234,7 @@ class TrainingSystem::Impl final {
                 [this] {
                     std::scoped_lock lock(mutex_);
                     const auto next = contracts::next_compute_generation(state_.offers.revision);
-                    if (!next || !contracts::next_compute_generation(*next))
-                        throw contracts::FailedError("provider query revision exhausted");
+                    if (!next || !contracts::next_compute_generation(*next)) throw contracts::FailedError("provider query revision exhausted");
                     state_.activity = TrainingActivity::ProviderQuery;
                     state_.offers.revision = *next;
                     state_.offers.outcome = contracts::ProviderQueryOutcome::Idle;
@@ -276,12 +247,10 @@ class TrainingSystem::Impl final {
                 bool failed = false;
                 try {
                     result = contracts::normalize_provider_query_result(runtime().Query(preferences, stop));
-                    failed = result.outcome == contracts::ProviderQueryOutcome::Failed ||
-                             result.outcome == contracts::ProviderQueryOutcome::Rejected;
+                    failed = result.outcome == contracts::ProviderQueryOutcome::Failed || result.outcome == contracts::ProviderQueryOutcome::Rejected;
                 } catch (const std::exception& error) {
                     failed = true;
-                    result = {.outcome = contracts::ProviderQueryOutcome::Failed,
-                              .detail = contracts::bounded_provider_detail(error.what())};
+                    result = {.outcome = contracts::ProviderQueryOutcome::Failed, .detail = contracts::bounded_provider_detail(error.what())};
                 } catch (...) {
                     failed = true;
                     result = {.outcome = contracts::ProviderQueryOutcome::Failed, .detail = "provider query failed"};
@@ -299,9 +268,8 @@ class TrainingSystem::Impl final {
                     state_.offers.outcome = result.outcome;
                     state_.offers.cancellation_requested = false;
                     state_.offers.detail = contracts::bounded_provider_detail(result.detail);
-                    state_.offers.offers = result.outcome == contracts::ProviderQueryOutcome::Succeeded
-                                               ? std::move(result.offers)
-                                               : std::vector<contracts::ProviderOffer>{};
+                    state_.offers.offers =
+                        result.outcome == contracts::ProviderQueryOutcome::Succeeded ? std::move(result.offers) : std::vector<contracts::ProviderOffer>{};
                     // CLEANUP-IGNORE: Query settlement clears selection; local-compute settlement owns terminal
                     // progress instead.
                     state_.offers.selected.reset();
@@ -315,7 +283,6 @@ class TrainingSystem::Impl final {
         });
         return snapshot();
     }
-
     [[nodiscard]] TrainingSnapshot Mutate(Pending pending, const bool reconcile) {
         auto failure_pending = pending;
         run_.Start({
@@ -323,8 +290,7 @@ class TrainingSystem::Impl final {
                 [this] {
                     std::scoped_lock lock(mutex_);
                     const auto next = contracts::next_compute_generation(state_.remote.revision);
-                    if (!next || !contracts::next_compute_generation(*next))
-                        throw contracts::FailedError("remote operation revision exhausted");
+                    if (!next || !contracts::next_compute_generation(*next)) throw contracts::FailedError("remote operation revision exhausted");
                     state_.activity = TrainingActivity::Remote;
                     state_.remote.revision = *next;
                     state_.remote.outcome = contracts::RemoteOperationOutcome::Idle;
@@ -338,11 +304,9 @@ class TrainingSystem::Impl final {
                     result = reconcile ? runtime().Reconcile(
                                              {.mutation = pending.mutation,
                                               .instance_id = pending.mutation == contracts::ProviderMutation::Create ? 0 : pending.instance,
-                                              .launch_token = pending.mutation == contracts::ProviderMutation::Create ? pending.launch_token
-                                                                                                                      : std::string{}},
+                                              .launch_token = pending.mutation == contracts::ProviderMutation::Create ? pending.launch_token : std::string{}},
                                              stop)
-                                       : runtime().Mutate(pending.mutation, pending.preferences, pending.offer, pending.instance,
-                                                          pending.launch_token, stop);
+                                       : runtime().Mutate(pending.mutation, pending.preferences, pending.offer, pending.instance, pending.launch_token, stop);
                     if (!result.valid()) throw std::runtime_error("provider runtime returned an invalid effect");
                 } catch (const std::exception& error) {
                     worker_failed = true;
@@ -368,7 +332,6 @@ class TrainingSystem::Impl final {
         });
         return snapshot();
     }
-
     [[nodiscard]] direct::LocalRun::Notification FailLocal() {
         runtime_.reset();
         {
@@ -384,7 +347,6 @@ class TrainingSystem::Impl final {
         }
         return notification(event_type{TrainingChanged{snapshot()}});
     }
-
     [[nodiscard]] direct::LocalRun::Notification FailQuery() {
         runtime_.reset();
         {
@@ -400,7 +362,6 @@ class TrainingSystem::Impl final {
         }
         return notification(event_type{TrainingChanged{snapshot()}});
     }
-
     [[nodiscard]] direct::LocalRun::Notification FailRemote(Pending pending) {
         runtime_.reset();
         {
@@ -416,7 +377,6 @@ class TrainingSystem::Impl final {
         }
         return notification(event_type{TrainingChanged{snapshot()}});
     }
-
     void SettleRemote(const Pending& operation, const contracts::ProviderEffectResult& result, bool reconcile) {
         using Disposition = contracts::ProviderReconciliationDisposition;
         if (result.disposition == Disposition::Applied) {
@@ -427,10 +387,9 @@ class TrainingSystem::Impl final {
                 state_.remote.detail = "provider create applied without an instance identity";
             } else {
                 pending_.reset();
-                state_.remote.instance_id =
-                    operation.mutation == contracts::ProviderMutation::Create ? result.instance_id : operation.instance;
-                state_.remote.phase = operation.mutation == contracts::ProviderMutation::Stop ? contracts::RemoteSessionPhase::Stopped
-                                                                                              : contracts::RemoteSessionPhase::Running;
+                state_.remote.instance_id = operation.mutation == contracts::ProviderMutation::Create ? result.instance_id : operation.instance;
+                state_.remote.phase =
+                    operation.mutation == contracts::ProviderMutation::Stop ? contracts::RemoteSessionPhase::Stopped : contracts::RemoteSessionPhase::Running;
                 state_.remote.outcome = contracts::RemoteOperationOutcome::Applied;
                 state_.remote.detail.clear();
             }
@@ -438,27 +397,23 @@ class TrainingSystem::Impl final {
             pending_ = operation;
             state_.remote.phase = contracts::RemoteSessionPhase::Unknown;
             state_.remote.outcome = contracts::RemoteOperationOutcome::Inconclusive;
-            state_.remote.detail =
-                contracts::bounded_provider_detail(result.detail.empty() ? (reconcile ? "provider reconciliation is inconclusive"
-                                                                                      : "provider mutation reconciliation is inconclusive")
-                                                                         : result.detail);
+            state_.remote.detail = contracts::bounded_provider_detail(
+                result.detail.empty() ? (reconcile ? "provider reconciliation is inconclusive" : "provider mutation reconciliation is inconclusive")
+                                      : result.detail);
         } else {
             pending_.reset();
-            state_.remote.outcome =
-                result.cancelled ? contracts::RemoteOperationOutcome::Cancelled : contracts::RemoteOperationOutcome::Failed;
-            state_.remote.detail =
-                contracts::bounded_provider_detail(result.detail.empty() ? "provider mutation was not applied" : result.detail);
+            state_.remote.outcome = result.cancelled ? contracts::RemoteOperationOutcome::Cancelled : contracts::RemoteOperationOutcome::Failed;
+            state_.remote.detail = contracts::bounded_provider_detail(result.detail.empty() ? "provider mutation was not applied" : result.detail);
             if (operation.mutation == contracts::ProviderMutation::Create) {
                 state_.remote.phase = contracts::RemoteSessionPhase::Absent;
                 state_.remote.instance_id = 0;
             } else {
-                state_.remote.phase = operation.mutation == contracts::ProviderMutation::Start ? contracts::RemoteSessionPhase::Stopped
-                                                                                               : contracts::RemoteSessionPhase::Running;
+                state_.remote.phase =
+                    operation.mutation == contracts::ProviderMutation::Start ? contracts::RemoteSessionPhase::Stopped : contracts::RemoteSessionPhase::Running;
             }
         }
         state_.remote.reconciliation_pending = pending_.has_value();
     }
-
     static void AdvanceRevision(std::uint64_t& revision, const char* detail) {
         const auto next = contracts::next_compute_generation(revision);
         if (!next) throw contracts::FailedError(detail);
@@ -479,9 +434,7 @@ class TrainingSystem::Impl final {
     // CLEANUP-IGNORE: Training owns one LocalRun behind its sealed facade; compute systems have separate cores.
     direct::LocalRun run_;
 };
-
-TrainingSystem::TrainingSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, RuntimeFactory factory,
-                               SystemEventSink<event_type> events)
+TrainingSystem::TrainingSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, RuntimeFactory factory, SystemEventSink<event_type> events)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events))) {}
 TrainingSystem::~TrainingSystem() = default;
 mmltk::backend::models::rfdetr::TrainingOpenedRun TrainingSystem::OpenRun(mmltk::backend::models::rfdetr::TrainingDirectoryQuery query) {
@@ -524,8 +477,8 @@ TrainingSnapshot TrainingSystem::Stop(contracts::WorkflowIntent<contracts::Featu
         if (impl_->state_.activity == TrainingActivity::Local &&
             impl_->state_.local.terminal.outcome != contracts::ComputeOperationOutcome::CancellationRequested) {
             stop = impl_->run_.CurrentStopSource();
-            impl_->state_.local.terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::CancellationRequested,
-                                                                            impl_->state_.local.generation_frontier);
+            impl_->state_.local.terminal =
+                contracts::make_compute_terminal(contracts::ComputeOperationOutcome::CancellationRequested, impl_->state_.local.generation_frontier);
             impl_->AdvanceObservation();
         }
         result = impl_->state_;
@@ -542,8 +495,8 @@ TrainingSnapshot TrainingSystem::Select(const contracts::ProviderOfferIdentity i
     if (impl_->run_.active()) throw contracts::BusyError("training operation is active");
     std::scoped_lock lock(impl_->mutex_);
     if (impl_->state_.activity != TrainingActivity::Idle) throw contracts::BusyError("training operation is active");
-    if (!identity.valid() || std::ranges::find(impl_->state_.offers.offers, identity.offer_id, &contracts::ProviderOffer::offer_id) ==
-                                 impl_->state_.offers.offers.end())
+    if (!identity.valid() ||
+        std::ranges::find(impl_->state_.offers.offers, identity.offer_id, &contracts::ProviderOffer::offer_id) == impl_->state_.offers.offers.end())
         throw contracts::InvalidIntentError("selected provider offer is stale or unknown");
     Impl::AdvanceRevision(impl_->state_.offers.revision, "provider selection revision exhausted");
     impl_->state_.offers.selected = identity;
@@ -582,23 +535,20 @@ TrainingSnapshot TrainingSystem::Clear(contracts::ProviderClearIntent) {
 TrainingSnapshot TrainingSystem::StartRemote(contracts::ProviderStartIntent) {
     const auto current = impl_->snapshot();
     if (current.activity != TrainingActivity::Idle) throw contracts::BusyError("training operation is active");
-    if (current.remote.phase == contracts::RemoteSessionPhase::Running)
-        throw contracts::InvalidIntentError("remote training is already running");
+    if (current.remote.phase == contracts::RemoteSessionPhase::Running) throw contracts::InvalidIntentError("remote training is already running");
     if (current.remote.reconciliation_pending) throw contracts::InvalidIntentError("remote training requires reconciliation");
     if (current.remote.phase == contracts::RemoteSessionPhase::Stopped) {
         if (current.remote.instance_id <= 0) throw contracts::InvalidIntentError("remote training session is unavailable");
-        return impl_->Mutate({.mutation = contracts::ProviderMutation::Start, .instance = current.remote.instance_id, .launch_token = {}},
-                             false);
+        return impl_->Mutate({.mutation = contracts::ProviderMutation::Start, .instance = current.remote.instance_id, .launch_token = {}}, false);
     }
     if (!current.offers.selected) throw contracts::InvalidIntentError("no provider offer is selected");
     const auto preferences = impl_->settings_.provider_preferences();
     if (!preferences.valid()) throw contracts::UnavailableError("provider preferences are unavailable");
-    return impl_->Mutate(
-        {.mutation = contracts::ProviderMutation::Create,
-         .offer = *current.offers.selected,
-         .preferences = preferences,
-         .launch_token = "mmltk-vast-" + std::to_string(current.offers.revision) + "-" + std::to_string(current.offers.selected->offer_id)},
-        false);
+    return impl_->Mutate({.mutation = contracts::ProviderMutation::Create,
+                          .offer = *current.offers.selected,
+                          .preferences = preferences,
+                          .launch_token = "mmltk-vast-" + std::to_string(current.offers.revision) + "-" + std::to_string(current.offers.selected->offer_id)},
+                         false);
 }
 TrainingSnapshot TrainingSystem::StopRemote(contracts::ProviderStopIntent) {
     const auto snapshot = impl_->snapshot();
@@ -620,5 +570,4 @@ TrainingSnapshot TrainingSystem::RetryReconciliation() {
     return impl_->Mutate(std::move(*pending), true);
 }
 TrainingSnapshot TrainingSystem::snapshot() const { return impl_->snapshot(); }
-
 }  // namespace mmltk::controller

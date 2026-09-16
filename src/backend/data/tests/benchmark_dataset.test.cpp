@@ -30,7 +30,6 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
-
 #include "async_test_utils.hpp"
 #include "detail/benchmark_annotations.h"
 #include "detail/benchmark_cache.h"
@@ -50,21 +49,16 @@
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/io/scoped_fd.h"
-
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 using namespace mmltk::backend::data;
 using namespace mmltk::backend::data::benchmark_internal;
 using mmltk::common::io::FileHandle;
-
 namespace {
-
 void require_condition(const bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
-
-[[nodiscard]] BenchmarkWriteRequest benchmark_write_request(const PreparedBenchmarkSplit& split, fs::path output,
-                                                            const std::uint32_t resolution,
+[[nodiscard]] BenchmarkWriteRequest benchmark_write_request(const PreparedBenchmarkSplit& split, fs::path output, const std::uint32_t resolution,
                                                             const mmltk::common::concurrency::CancellationObservation cancellation = {}) {
     return {
         .split = split,
@@ -77,7 +71,6 @@ void require_condition(const bool condition, const char* message) {
         .progress = {},
     };
 }
-
 void test_benchmark_trace_gate_is_lazy() {
     std::size_t builder_invocations = 0U;
     const BenchmarkTraceSink disabled;
@@ -86,7 +79,6 @@ void test_benchmark_trace_gate_is_lazy() {
         return nlohmann::json{{"value", 1U}};
     });
     REQUIRE(builder_invocations == 0U);
-
     std::size_t deliveries = 0U;
     const BenchmarkTraceSink enabled = [&](const std::string_view event, const nlohmann::json& fields) {
         ++deliveries;
@@ -100,14 +92,12 @@ void test_benchmark_trace_gate_is_lazy() {
     REQUIRE(builder_invocations == 1U);
     REQUIRE(deliveries == 1U);
 }
-
 void write_text(const fs::path& path, const std::string& text) {
     fs::create_directories(path.parent_path());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output << text;
     require_condition(output.good(), "failed to write benchmark test input");
 }
-
 void corrupt_byte(const fs::path& path, const std::uint64_t offset) {
     std::fstream file(path, std::ios::binary | std::ios::in | std::ios::out);
     file.seekg(static_cast<std::streamoff>(offset));
@@ -119,33 +109,25 @@ void corrupt_byte(const fs::path& path, const std::uint64_t offset) {
     file.write(&value, 1);
     require_condition(file.good(), "failed to corrupt benchmark test artifact");
 }
-
 std::vector<std::uint8_t> make_payload(const std::size_t bytes) {
     std::vector<std::uint8_t> payload(bytes);
-    for (std::size_t index = 0; index < payload.size(); ++index) {
-        payload[index] = static_cast<std::uint8_t>((index * 131U + 17U) & 0xFFU);
-    }
+    for (std::size_t index = 0; index < payload.size(); ++index) { payload[index] = static_cast<std::uint8_t>((index * 131U + 17U) & 0xFFU); }
     return payload;
 }
-
 class HttpServer {
    public:
-    explicit HttpServer(std::span<const std::uint8_t> payload)
-        : payload_(payload), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
+    explicit HttpServer(std::span<const std::uint8_t> payload) : payload_(payload), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
         require_condition(listener_.get() >= 0, "failed to create benchmark HTTP socket");
         const int reuse = 1;
-        require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0,
-                          "failed to configure benchmark HTTP socket");
+        require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0, "failed to configure benchmark HTTP socket");
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         address.sin_port = 0;
-        require_condition(::bind(listener_.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0,
-                          "failed to bind benchmark HTTP socket");
+        require_condition(::bind(listener_.get(), reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "failed to bind benchmark HTTP socket");
         require_condition(::listen(listener_.get(), 8) == 0, "failed to listen on benchmark HTTP socket");
         socklen_t length = sizeof(address);
-        require_condition(::getsockname(listener_.get(), reinterpret_cast<sockaddr*>(&address), &length) == 0,
-                          "failed to inspect benchmark HTTP socket");
+        require_condition(::getsockname(listener_.get(), reinterpret_cast<sockaddr*>(&address), &length) == 0, "failed to inspect benchmark HTTP socket");
         port_ = ntohs(address.sin_port);
         worker_ = std::jthread([this] {
             try {
@@ -153,12 +135,9 @@ class HttpServer {
             } catch (...) { failure_ = std::current_exception(); }
         });
     }
-
     HttpServer(const HttpServer&) = delete;
     HttpServer& operator=(const HttpServer&) = delete;
-
     ~HttpServer() { Stop(); }
-
     void Stop() noexcept {
         stop_.store(true, std::memory_order_release);
         partial_.Release();
@@ -177,13 +156,9 @@ class HttpServer {
     void GateNextTransfer() { gate_next_.store(true, std::memory_order_release); }
     [[nodiscard]] bool WaitPartial() const { return partial_.WaitEntered(3s); }
     void ReleasePartial() const { partial_.Release(); }
-
     [[nodiscard]] std::string url(const std::string& path) const { return "http://127.0.0.1:" + std::to_string(port_) + "/" + path; }
-
     void fail_next(const int count) { failures_remaining_.store(count, std::memory_order_relaxed); }
-
     [[nodiscard]] std::uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }
-
     [[nodiscard]] std::uint64_t ranged_requests() const { return ranged_requests_.load(std::memory_order_relaxed); }
 
    private:
@@ -198,7 +173,6 @@ class HttpServer {
         }
         return true;
     }
-
     void run() {
         while (!stop_.load(std::memory_order_relaxed)) {
             const mmltk::common::io::ScopedFd client_owner{::accept4(listener_.get(), nullptr, nullptr, SOCK_CLOEXEC)};
@@ -223,7 +197,6 @@ class HttpServer {
             serve(client);
         }
     }
-
     void serve(const int client) {
         std::size_t received = 0U;
         std::string_view request;
@@ -245,7 +218,6 @@ class HttpServer {
             return;
         }
         failures_remaining_.store(0, std::memory_order_relaxed);
-
         std::size_t begin = 0U;
         bool ranged = false;
         const std::size_t range_header = request.find("\r\nRange: bytes=");
@@ -263,19 +235,16 @@ class HttpServer {
         } else {
             begin = 0U;
         }
-
         const std::size_t bytes = payload_.size() - begin;
-        std::string header = std::string(ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n") +
-                             "Content-Length: " + std::to_string(bytes) +
+        std::string header = std::string(ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n") + "Content-Length: " + std::to_string(bytes) +
                              "\r\nAccept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
                              "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
         if (ranged) {
-            header += "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(payload_.size() - 1U) + "/" +
-                      std::to_string(payload_.size()) + "\r\n";
+            header +=
+                "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(payload_.size() - 1U) + "/" + std::to_string(payload_.size()) + "\r\n";
         }
         header += "Connection: close\r\n\r\n";
         if (!send_all(client, header.data(), header.size())) { return; }
-
         constexpr std::size_t chunk = std::size_t{16U} * 1024U;
         const bool gated = gate_next_.exchange(false, std::memory_order_acq_rel);
         std::size_t offset = begin;
@@ -287,7 +256,6 @@ class HttpServer {
             if (stop_.load(std::memory_order_acquire)) return;
         }
     }
-
     const std::span<const std::uint8_t> payload_;
     mmltk::common::io::ScopedFd listener_;
     std::array<char, 16U * 1024U> receive_{};
@@ -303,34 +271,30 @@ class HttpServer {
     std::atomic<std::uint64_t> ranged_requests_{0U};
     std::jthread worker_;
 };
-
 DownloadRequest request_for(const fs::path& root, const std::string& id, const std::string& url, const std::vector<std::uint8_t>& payload) {
     return DownloadRequest{
-        id, url, root / (id + ".bin"), root / "locks" / (id + ".lock"), payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)), 3U,
+        id, url, root / (id + ".bin"), root / "locks" / (id + ".lock"), payload.size(), mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(payload)),
+        3U,
     };
 }
-
 void test_benchmark_download_cache_lifecycle() {
     mmltk::testsupport::ScopedTempDir root("downloads");
     const std::vector<std::uint8_t> payload = make_payload(std::size_t{8U} * 1024U * 1024U);
     HttpServer server(payload);
-
     DownloadRequest retry = request_for(root.path(), "retry", server.url("retry"), payload);
     server.fail_next(1);
     const auto retry_result = download_artifacts({retry}, 1U, {});
     REQUIRE(retry_result.size() == 1U);
     REQUIRE(retry_result[0].attempts == 2U);
-
     DownloadRequest resume = request_for(root.path(), "resume", server.url("resume"), payload);
     std::atomic<bool> cancel{false};
     server.GateNextTransfer();
     mmltk::testsupport::TestGate received("HTTP partial bytes persisted");
     auto download = std::async(std::launch::async, [&] {
         try {
-            (void)download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel),
-                                     [&](const DownloadProgress& progress) {
-                                         if (progress.completed_bytes >= HttpServer::partial_bytes) received.receipt().ArriveAndWait();
-                                     });
+            (void)download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel), [&](const DownloadProgress& progress) {
+                if (progress.completed_bytes >= HttpServer::partial_bytes) received.receipt().ArriveAndWait();
+            });
             return false;
         } catch (const std::exception&) { return true; }
     });
@@ -353,12 +317,10 @@ void test_benchmark_download_cache_lifecycle() {
     const auto resumed = download_artifacts({resume}, 1U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel));
     REQUIRE(resumed[0].resumed);
     REQUIRE(server.ranged_requests() > 0U);
-
     const std::uint64_t before_cache_hit = server.requests();
     const auto cached = download_artifacts({resume}, 1U, {});
     REQUIRE(cached[0].cache_hit);
     REQUIRE(server.requests() == before_cache_hit);
-
     corrupt_byte(resume.destination, 0U);
     invalidate_download_artifact(resume);
     const auto repaired = download_artifacts({resume}, 1U, {});
@@ -366,7 +328,6 @@ void test_benchmark_download_cache_lifecycle() {
     REQUIRE(server.requests() > before_cache_hit);
     REQUIRE(repaired[0].size == payload.size());
     REQUIRE(!repaired[0].identity.empty());
-
     DownloadRequest unavailable = request_for(root.path(), "unavailable", "http://127.0.0.1:1/unavailable", payload);
     unavailable.maximum_attempts = 1U;
     bool source_failed = false;
@@ -377,7 +338,6 @@ void test_benchmark_download_cache_lifecycle() {
     REQUIRE(!fs::exists(unavailable.destination));
     server.Check();
 }
-
 void test_benchmark_annotation_indexes() {
     mmltk::testsupport::ScopedTempDir root("annotations");
     const fs::path coco = root.path() / "mini-coco.json";
@@ -403,7 +363,6 @@ void test_benchmark_annotation_indexes() {
     REQUIRE(parsed.rejected.duplicate_boxes == 1U);
     REQUIRE(parsed.rejected.degenerate_boxes == 1U);
     REQUIRE(parsed.rejected.unmapped_categories == 1U);
-
     const fs::path index_path = root.path() / "mini-coco.index";
     store_normalized_annotation_index(index_path, parsed, {});
     auto loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
@@ -414,7 +373,6 @@ void test_benchmark_annotation_indexes() {
     loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
     REQUIRE(!loaded);
     store_normalized_annotation_index(index_path, parsed, {});
-
     const fs::path classes = root.path() / "classes.csv";
     const fs::path boxes = root.path() / "boxes.csv";
     write_text(classes, "/m/person,Person\n");
@@ -437,7 +395,6 @@ void test_benchmark_annotation_indexes() {
     REQUIRE(open.rejected.duplicate_boxes == 1U);
     REQUIRE(open.rejected.degenerate_boxes == 1U);
 }
-
 void test_benchmark_supplemental_sampling() {
     NormalizedAnnotationIndex source;
     source.source = BenchmarkDatasetSource::kObjects365V2;
@@ -450,14 +407,11 @@ void test_benchmark_supplemental_sampling() {
     for (std::size_t image_index = 0U; image_index < kImageCount; ++image_index) {
         const std::uint64_t first_box = source.boxes.size();
         source.boxes.push_back(NormalizedBox{0.1F, 0.2F, 0.8F, 0.9F, 0U, 0U, static_cast<std::uint8_t>(image_index % 3U), {}});
-        if (image_index % 5U == 0U) {
-            source.boxes.push_back(NormalizedBox{0.2F, 0.3F, 0.7F, 0.8F, 0U, 0U, static_cast<std::uint8_t>(image_index % 3U), {}});
-        }
+        if (image_index % 5U == 0U) { source.boxes.push_back(NormalizedBox{0.2F, 0.3F, 0.7F, 0.8F, 0U, 0U, static_cast<std::uint8_t>(image_index % 3U), {}}); }
         original_box_counts[image_index] = static_cast<std::uint32_t>(source.boxes.size() - first_box);
-        source.images.push_back(NormalizedImage{image_index, first_box, original_box_counts[image_index], 640U, 480U,
-                                                static_cast<std::uint16_t>(image_index % 4U), 0U});
+        source.images.push_back(
+            NormalizedImage{image_index, first_box, original_box_counts[image_index], 640U, 480U, static_cast<std::uint16_t>(image_index % 4U), 0U});
     }
-
     NormalizedAnnotationIndex coco;
     coco.source = BenchmarkDatasetSource::kCoco2017;
     NormalizedAnnotationIndex open_images = source;
@@ -477,12 +431,11 @@ void test_benchmark_supplemental_sampling() {
     REQUIRE(first.stats.selected_boxes == first.index.boxes.size());
     REQUIRE(first.index.images.size() == second.index.images.size());
     REQUIRE(first.index.boxes.size() == second.index.boxes.size());
-
     std::uint64_t previous_id = 0U;
     bool first_image = true;
     const auto boxes_equal = [](const NormalizedBox& left, const NormalizedBox& right) {
-        return left.x1 == right.x1 && left.y1 == right.y1 && left.x2 == right.x2 && left.y2 == right.y2 &&
-               left.class_id == right.class_id && std::ranges::equal(left.reserved, right.reserved);
+        return left.x1 == right.x1 && left.y1 == right.y1 && left.x2 == right.x2 && left.y2 == right.y2 && left.class_id == right.class_id &&
+               std::ranges::equal(left.reserved, right.reserved);
     };
     for (std::size_t image_index = 0U; image_index < first.index.images.size(); ++image_index) {
         const NormalizedImage& selected = first.index.images[image_index];
@@ -505,21 +458,17 @@ void test_benchmark_supplemental_sampling() {
     }
     std::array<std::uint64_t, 80U> combined_class_images{};
     for (std::size_t class_id = 0U; class_id < combined_class_images.size(); ++class_id) {
-        combined_class_images[class_id] =
-            first.stats.selected_class_images[class_id] + first_combined.open_images.stats.selected_class_images[class_id];
+        combined_class_images[class_id] = first.stats.selected_class_images[class_id] + first_combined.open_images.stats.selected_class_images[class_id];
     }
     const auto [minimum, maximum] = std::ranges::minmax_element(combined_class_images.begin(), combined_class_images.begin() + 3);
     REQUIRE(*maximum - *minimum <= 1U);
-    REQUIRE(std::ranges::all_of(combined_class_images.begin() + 3, combined_class_images.end(),
-                                [](const std::uint64_t count) { return count == 0U; }));
+    REQUIRE(std::ranges::all_of(combined_class_images.begin() + 3, combined_class_images.end(), [](const std::uint64_t count) { return count == 0U; }));
 }
-
 void append_bytes(void* context, void* data, const int size) {
     auto& output = *static_cast<std::vector<std::uint8_t>*>(context);
     const auto* begin = static_cast<const std::uint8_t*>(data);
     output.insert(output.end(), begin, begin + size);
 }
-
 std::vector<std::uint8_t> make_jpeg(const std::uint8_t red, const std::uint8_t green, const std::uint8_t blue) {
     constexpr int width = 16;
     constexpr int height = 8;
@@ -534,7 +483,6 @@ std::vector<std::uint8_t> make_jpeg(const std::uint8_t red, const std::uint8_t g
     require_condition(result != 0 && !jpeg.empty(), "failed to encode benchmark test JPEG");
     return jpeg;
 }
-
 void write_tar_octal(std::array<std::uint8_t, 512U>* header, const std::size_t offset, const std::size_t width, const std::uint64_t value) {
     std::array<char, 32U> digits{};
     const auto converted = std::to_chars(digits.data(), digits.data() + digits.size(), value, 8);
@@ -546,7 +494,6 @@ void write_tar_octal(std::array<std::uint8_t, 512U>* header, const std::size_t o
                 header->begin() + static_cast<std::ptrdiff_t>(offset + width - digit_count - 1U));
     (*header)[offset + width - 1U] = '\0';
 }
-
 void write_single_jpeg_tar(const fs::path& path, const std::uint64_t image_id, const std::span<const std::uint8_t> jpeg) {
     std::array<std::uint8_t, 512U> header{};
     const std::string name = "images/" + std::to_string(image_id) + ".jpg";
@@ -565,12 +512,9 @@ void write_single_jpeg_tar(const fs::path& path, const std::uint64_t image_id, c
     header[263] = static_cast<std::uint8_t>('0');
     header[264] = static_cast<std::uint8_t>('0');
     std::uint64_t checksum = 0U;
-    for (const std::uint8_t byte : header) {
-        checksum += byte;
-    }
+    for (const std::uint8_t byte : header) { checksum += byte; }
     write_tar_octal(&header, 148U, 7U, checksum);
     header[155] = static_cast<std::uint8_t>(' ');
-
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
     output.write(reinterpret_cast<const char*>(jpeg.data()), static_cast<std::streamsize>(jpeg.size()));
@@ -581,7 +525,6 @@ void write_single_jpeg_tar(const fs::path& path, const std::uint64_t image_id, c
     output.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
     require_condition(output.good(), "failed to write benchmark test tar");
 }
-
 void test_benchmark_archive_training_quarantine() {
     mmltk::testsupport::ScopedTempDir root("archive-quarantine");
     const fs::path archive_path = root.path() / "images.tar";
@@ -620,15 +563,13 @@ void test_benchmark_archive_training_quarantine() {
     REQUIRE(extracted.quarantined.front().image_id == 2U);
     REQUIRE(progress_completed == requested.size());
     REQUIRE(progress_total == requested.size());
-
     std::uint64_t cached_bytes = 0U;
     std::vector<CachedImageRejection> cached_rejections;
-    REQUIRE(validate_cached_image_group(extracted.path, extracted.path / ".complete.json", "objects:test", requested, &cached_bytes, {}, {},
-                                        &cached_rejections));
+    REQUIRE(
+        validate_cached_image_group(extracted.path, extracted.path / ".complete.json", "objects:test", requested, &cached_bytes, {}, {}, &cached_rejections));
     REQUIRE(cached_rejections.size() == 1U);
     REQUIRE(cached_rejections.front().image_id == 2U);
 }
-
 void test_benchmark_cached_image_writer_and_loader() {
     constexpr std::uint32_t kNanoResolution = 384U;
     mmltk::testsupport::ScopedTempDir root("writer");
@@ -648,16 +589,13 @@ void test_benchmark_cached_image_writer_and_loader() {
     write_cached_image_atomically(cached_image_path(image_root, 1U), red, {});
     write_cached_image_atomically(cached_image_path(image_root, 2U), green, {});
     const fs::path completion = image_root / ".complete.json";
-    complete_cached_image_group(image_root, completion, "validation:mini", requested_ids, red.size() + green.size(), {}, {},
-                                cache_rejections);
+    complete_cached_image_group(image_root, completion, "validation:mini", requested_ids, red.size() + green.size(), {}, {}, cache_rejections);
     std::uint64_t cached_bytes = 0U;
     std::vector<CachedImageRejection> loaded_rejections;
-    REQUIRE(
-        validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, {}, &loaded_rejections));
+    REQUIRE(validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, {}, &loaded_rejections));
     REQUIRE(cached_bytes == red.size() + green.size());
     REQUIRE(loaded_rejections.size() == 1U);
     REQUIRE(loaded_rejections.front().image_id == 3U);
-
     PreparedBenchmarkSplit split;
     split.name = "validation";
     split.class_names = {"person"};
@@ -681,7 +619,6 @@ void test_benchmark_cached_image_writer_and_loader() {
             0U,
         });
     }
-
     const fs::path output = root.path() / "validation.bin";
     std::atomic<std::uint64_t> producer_events{0U};
     write_benchmark_split(BenchmarkWriteRequest{
@@ -693,8 +630,7 @@ void test_benchmark_cached_image_writer_and_loader() {
         false,
         {},
         {.context = &producer_events,
-         .image_completed =
-             [](void* context) { static_cast<std::atomic<std::uint64_t>*>(context)->fetch_add(1U, std::memory_order_relaxed); }},
+         .image_completed = [](void* context) { static_cast<std::atomic<std::uint64_t>*>(context)->fetch_add(1U, std::memory_order_relaxed); }},
     });
     REQUIRE(producer_events.load(std::memory_order_relaxed) == split.images.size());
     REQUIRE_FALSE(static_cast<bool>(benchmark_write_request(split, output, kNanoResolution).progress));
@@ -703,7 +639,6 @@ void test_benchmark_cached_image_writer_and_loader() {
     REQUIRE(info.width == kNanoResolution);
     REQUIRE(info.height == kNanoResolution);
     REQUIRE(std::ranges::equal(info.class_names(), std::vector<std::string>{"person"}));
-
     const FileHandle file = FileHandle::open_readonly(output.string());
     const FileHeader header = read_compiled_header(file);
     const CompiledFileSections sections = validate_compiled_file_sections(header, file.size());
@@ -716,13 +651,11 @@ void test_benchmark_cached_image_writer_and_loader() {
     REQUIRE(index[0].original_width == 16U);
     REQUIRE(index[0].original_height == 8U);
     REQUIRE(validate_compiled_label_entries(labels, header, sections.rle_region_bytes) == 0U);
-    REQUIRE(
-        std::ranges::all_of(labels, [](const PackedInstance& label) { return label.mask_rle_offset == 0U && label.mask_rle_pairs == 0U; }));
+    REQUIRE(std::ranges::all_of(labels, [](const PackedInstance& label) { return label.mask_rle_offset == 0U && label.mask_rle_pairs == 0U; }));
     REQUIRE(labels[0].bbox_x1 == 0);
     REQUIRE(labels[0].bbox_y1 == 96);
     REQUIRE(labels[0].bbox_x2 == 384);
     REQUIRE(labels[0].bbox_y2 == 288);
-
     DatasetLoader::Config loader_config;
     loader_config.loading.h2d_dataloader = true;
     loader_config.compiled_path = output.string();
@@ -751,7 +684,6 @@ void test_benchmark_cached_image_writer_and_loader() {
     }
     loader.synchronize();
     REQUIRE(loaded_images == 2U);
-
     const auto source_digest = mmltk::common::io::sha256_file(cached_image_path(image_root, 1U));
     const auto cache_manifest_digest = mmltk::common::io::sha256_file(completion);
     auto perceptual_request = benchmark_write_request(split, root.path() / "perceptual.bin", kNanoResolution);
@@ -762,7 +694,6 @@ void test_benchmark_cached_image_writer_and_loader() {
     CHECK(mmltk::common::io::sha256_file(cached_image_path(image_root, 1U)) == source_digest);
     CHECK(mmltk::common::io::sha256_file(completion) == cache_manifest_digest);
     CHECK(validate_cached_image_group(image_root, completion, "validation:mini", requested_ids, &cached_bytes, {}, {}, &loaded_rejections));
-
     const auto raw_cache_identity = read_json_file(completion);
     for (const bool perceptual : {false, true}) {
         BenchmarkCompilerConfig manifest_config;
@@ -773,8 +704,8 @@ void test_benchmark_cached_image_writer_and_loader() {
         // Acquired facts come from the real raw-cache fixture. The production
         // publication boundary owns the envelope and selected policy/version.
         const nlohmann::json acquired{{"image_cache", nlohmann::json::array({raw_cache_identity})},
-                                     {"train", {{"bytes", fs::file_size(output)}}},
-                                     {"val", {{"bytes", fs::file_size(perceptual_request.output_path)}}}};
+                                      {"train", {{"bytes", fs::file_size(output)}}},
+                                      {"val", {{"bytes", fs::file_size(perceptual_request.output_path)}}}};
         publish_benchmark_manifest(manifest_config, staged, image_root, acquired, {});
         const auto manifest = read_json_file(staged / "benchmark_manifest.json");
         CHECK(manifest.at("resampling").at("perceptual_downscale").get<bool>() == perceptual);
@@ -786,7 +717,6 @@ void test_benchmark_cached_image_writer_and_loader() {
         CHECK(mmltk::common::io::sha256_file(completion) == cache_manifest_digest);
         CHECK(mmltk::common::io::sha256_file(cached_image_path(image_root, 1U)) == source_digest);
     }
-
     const std::string original_digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(output));
     bool refused = false;
     try {
@@ -794,17 +724,15 @@ void test_benchmark_cached_image_writer_and_loader() {
     } catch (const std::exception&) { refused = true; }
     REQUIRE(refused);
     REQUIRE(mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(output)) == original_digest);
-
     std::atomic<bool> cancel{true};
     const fs::path cancelled_output = root.path() / "cancelled.bin";
     bool cancelled = false;
     try {
-        write_benchmark_split(benchmark_write_request(split, cancelled_output, kNanoResolution,
-                                                      mmltk::common::concurrency::CancellationObservation::Atomic(cancel)));
+        write_benchmark_split(
+            benchmark_write_request(split, cancelled_output, kNanoResolution, mmltk::common::concurrency::CancellationObservation::Atomic(cancel)));
     } catch (const std::exception&) { cancelled = true; }
     REQUIRE(cancelled);
     REQUIRE(!fs::exists(cancelled_output));
-
     PreparedBenchmarkSplit broken = split;
     broken.images[0].source_width = 15U;
     const fs::path broken_output = root.path() / "broken.bin";
@@ -815,29 +743,26 @@ void test_benchmark_cached_image_writer_and_loader() {
     REQUIRE(failed);
     REQUIRE(!fs::exists(broken_output));
 }
-
 void test_benchmark_archive_quarantine_policy() {
     REQUIRE(archive_selection_allows_quarantine(BenchmarkDatasetSource::kCoco2017, "train2017"));
     REQUIRE(!archive_selection_allows_quarantine(BenchmarkDatasetSource::kCoco2017, "val2017"));
     REQUIRE(archive_selection_allows_quarantine(BenchmarkDatasetSource::kObjects365V2, "patch-0"));
 }
-
 void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress() {
     mmltk::testsupport::ScopedTempDir root("event-cancellation");
     const fs::path output = root.path() / "compiled";
     const fs::path cache = root.path() / "cache";
     const std::string normalized_output = fs::weakly_canonical(fs::absolute(output)).generic_string();
-    const fs::path lock_path =
-        root.path() / ".cache" / "benchmark-dataset" / "v1" / "locks" /
-        ("output-" +
-         mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(std::span(reinterpret_cast<const std::uint8_t*>(normalized_output.data()), normalized_output.size()))) +
-         ".lock");
+    const fs::path lock_path = root.path() / ".cache" / "benchmark-dataset" / "v1" / "locks" /
+                               ("output-" +
+                                mmltk::common::io::sha256_hex(mmltk::common::io::sha256_bytes(
+                                    std::span(reinterpret_cast<const std::uint8_t*>(normalized_output.data()), normalized_output.size()))) +
+                                ".lock");
     fs::create_directories(lock_path.parent_path());
     const mmltk::common::io::ScopedFd lock_descriptor{::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)};
     const int descriptor = lock_descriptor.get();
     require_condition(descriptor >= 0, "failed to open benchmark heartbeat lock");
     require_condition(::flock(descriptor, LOCK_EX | LOCK_NB) == 0, "failed to acquire benchmark heartbeat lock");
-
     struct CancellationTag;
     using CancellationSource = mmltk::common::concurrency::EventCancellationSource<CancellationTag, false>;
     auto [cancellation, token] = CancellationSource::Mint();
@@ -875,7 +800,6 @@ void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress()
     mmltk::testsupport::await_test_future(compiler, "benchmark cancelled lock settlement", 3s);
     REQUIRE(compile_error != nullptr);
 }
-
 void test_benchmark_cli_source_status_preserves_active_transfer_state() {
     BenchmarkSourceProgress active;
     active.source = BenchmarkDatasetSource::kObjects365V2;
@@ -887,28 +811,20 @@ void test_benchmark_cli_source_status_preserves_active_transfer_state() {
     REQUIRE(status.starts_with("Downloading objects365-train-patch-4"));
     REQUIRE(status.find("resumed") != std::string::npos);
     REQUIRE(status.find("2 retries") != std::string::npos);
-
     active.activity = "Verifying cached objects365-train-patch-4";
     REQUIRE(format_benchmark_source_status(active, "extracting").starts_with("Verifying cached"));
-
     active.complete = true;
     REQUIRE(format_benchmark_source_status(active, "extracting") == "Cache hit");
 }
-
 }  // namespace
-
 TEST_CASE("benchmark download cache lifecycle", "[backend][data][benchmark][download]") { test_benchmark_download_cache_lifecycle(); }
 TEST_CASE("benchmark annotation indexes", "[backend][data][benchmark][annotations]") { test_benchmark_annotation_indexes(); }
 TEST_CASE("benchmark supplemental sampling", "[backend][data][benchmark][sampling]") { test_benchmark_supplemental_sampling(); }
-TEST_CASE("benchmark cached image writer and loader", "[backend][data][benchmark][writer]") {
-    test_benchmark_cached_image_writer_and_loader();
-}
+TEST_CASE("benchmark cached image writer and loader", "[backend][data][benchmark][writer]") { test_benchmark_cached_image_writer_and_loader(); }
 TEST_CASE("benchmark archive quarantine policy", "[backend][data][benchmark][images]") { test_benchmark_archive_quarantine_policy(); }
 TEST_CASE("benchmark archive training quarantine", "[backend][data][benchmark][images]") { test_benchmark_archive_training_quarantine(); }
 TEST_CASE("benchmark event cancellation without progress", "[backend][data][benchmark][cancel]") {
     test_benchmark_event_cancellation_while_waiting_for_lock_without_progress();
 }
-TEST_CASE("benchmark source status", "[backend][data][benchmark][progress]") {
-    test_benchmark_cli_source_status_preserves_active_transfer_state();
-}
+TEST_CASE("benchmark source status", "[backend][data][benchmark][progress]") { test_benchmark_cli_source_status_preserves_active_transfer_state(); }
 TEST_CASE("benchmark trace gate is lazy", "[backend][data][benchmark][trace]") { test_benchmark_trace_gate_is_lazy(); }

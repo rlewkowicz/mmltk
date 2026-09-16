@@ -1,5 +1,4 @@
 #pragma once
-
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -11,7 +10,6 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-
 #include "src/controller/contracts/diagnostic_context.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/services/runtime_diagnostics.h"
@@ -19,17 +17,13 @@
 #include "src/frameworks/gpu/image_types.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
-
 namespace mmltk::frameworks::gpu {
 class ImageWorkspace;
 }
-
 namespace mmltk::controller {
 namespace detail {
-
 struct VisualDiagnosticName final {
     char value[97]{};
-
     template <std::size_t Extent>
     consteval explicit VisualDiagnosticName(const char (&name)[Extent]) {
         static_assert(Extent > 0U);
@@ -41,9 +35,7 @@ struct VisualDiagnosticName final {
         }
     }
 };
-
 }  // namespace detail
-
 enum class VisualDiagnosticOperation : std::uint8_t {
     // CLEANUP-IGNORE: These distinct enum declarations and diagnostic aliases are the canonical reflected vocabulary,
     // not repeated mapping logic.
@@ -177,9 +169,7 @@ enum class VisualDiagnosticOperation : std::uint8_t {
     AnnotationOutputAcquired[[= detail::VisualDiagnosticName{"annotation.output.acquired"}]],
     AnnotationRenderPublished[[= detail::VisualDiagnosticName{"annotation.render.published"}]],
 };
-
 namespace detail {
-
 struct VisualDiagnosticNameMaterializer final {
     template <class Enum, class Reflection>
         requires std::is_same_v<Enum, VisualDiagnosticOperation>
@@ -190,16 +180,15 @@ struct VisualDiagnosticNameMaterializer final {
             static_assert(mmltk::frameworks::reflection::reflected_annotation_count<enumerator>(
                               []<class Annotation> { return std::is_same_v<Annotation, VisualDiagnosticName>; }) == 1U,
                           "each visual diagnostic operation requires exactly one name annotation");
-            if (static_cast<std::size_t>([:enumerator:]) != index)
-                throw "visual diagnostic operations require dense unique values starting at zero";
+            if (static_cast<std::size_t>([:enumerator:]) != index) throw "visual diagnostic operations require dense unique values starting at zero";
             template for (constexpr auto annotation : mmltk::frameworks::reflection::reflected_annotations<enumerator>()) {
                 using Annotation = std::remove_cvref_t<typename[:std::meta::type_of(annotation):]>;
                 if constexpr (std::is_same_v<Annotation, VisualDiagnosticName>) {
                     constexpr auto name = std::meta::extract<Annotation>(annotation);
                     const std::string_view alias{name.value};
                     if (alias.empty() || !std::all_of(alias.begin(), alias.end(), [](const char character) {
-                            return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
-                                   (character >= '0' && character <= '9') || character == '.' || character == '_';
+                            return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') ||
+                                   character == '.' || character == '_';
                         }))
                         throw "visual diagnostic names require nonempty alphanumeric, dot, or underscore text";
                     names[index] = std::define_static_string(std::string_view{name.value});
@@ -209,17 +198,12 @@ struct VisualDiagnosticNameMaterializer final {
         }
         auto sorted_names = names;
         std::sort(sorted_names.begin(), sorted_names.end());
-        if (std::adjacent_find(sorted_names.begin(), sorted_names.end()) != sorted_names.end())
-            throw "visual diagnostic names must be unique";
+        if (std::adjacent_find(sorted_names.begin(), sorted_names.end()) != sorted_names.end()) throw "visual diagnostic names must be unique";
         return names;
     }
 };
-
-inline constexpr auto kVisualDiagnosticNames =
-    mmltk::frameworks::reflection::materialize<VisualDiagnosticOperation>(VisualDiagnosticNameMaterializer{});
-
+inline constexpr auto kVisualDiagnosticNames = mmltk::frameworks::reflection::materialize<VisualDiagnosticOperation>(VisualDiagnosticNameMaterializer{});
 }  // namespace detail
-
 [[nodiscard]] constexpr std::string_view visual_diagnostic_event_name(const VisualDiagnosticOperation operation) noexcept {
     const auto index = static_cast<std::size_t>(operation);
     return index < detail::kVisualDiagnosticNames.size() ? detail::kVisualDiagnosticNames[index] : std::string_view{};
@@ -247,7 +231,6 @@ struct VisualDiagnosticSink final {
     void (*write_batch)(void*, std::span<const VisualDiagnosticFact>) noexcept = nullptr;
     bool (*enabled)(void*) noexcept = nullptr;
     bool pixel_probes = false;
-
     [[nodiscard]] bool valid() const noexcept { return context != nullptr && write != nullptr && (!enabled || enabled(context)); }
     [[nodiscard]] bool pixel_probes_enabled() const noexcept { return pixel_probes && valid(); }
     void operator()(const VisualDiagnosticFact fact) const noexcept {
@@ -259,8 +242,7 @@ struct VisualDiagnosticSink final {
             write_batch(context, facts);
             return;
         }
-        for (const auto& fact : facts)
-            write(context, fact);
+        for (const auto& fact : facts) write(context, fact);
     }
     template <class Factory>
     void Emit(Factory&& factory) const noexcept {
@@ -273,29 +255,24 @@ struct VisualDiagnosticSink final {
 [[nodiscard]] contracts::DiagnosticSource visual_diagnostic_source(const VisualSourceObservation&) noexcept;
 void observe_workspace_storage(contracts::DiagnosticContext&, const mmltk::frameworks::gpu::ImageWorkspace&) noexcept;
 [[nodiscard]] services::RuntimeDiagnosticFact visual_runtime_diagnostic(VisualDiagnosticFact) noexcept;
-
 struct VisualWorkspaceDiagnostics final {
     VisualDiagnosticSink sink{};
     contracts::DiagnosticContext context{};
 };
-
 // The shell owns the target until after every visual worker is joined. Test
 // sinks retain their direct typed injection, including dynamic disablement.
 [[nodiscard]] inline VisualDiagnosticSink visual_diagnostic_sink(services::RuntimeDiagnosticTarget& target) noexcept {
     if (!target.valid()) return {};
     return {
         .context = &target,
-        .write =
-            [](void* context, VisualDiagnosticFact fact) noexcept {
-                static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact));
-            },
+        .write = [](void* context,
+                    VisualDiagnosticFact fact) noexcept { static_cast<services::RuntimeDiagnosticTarget*>(context)->write(visual_runtime_diagnostic(fact)); },
         .write_batch =
             [](void* context, const std::span<const VisualDiagnosticFact> facts) noexcept {
                 constexpr std::size_t capacity = 25U;
                 auto& runtime_target = *static_cast<services::RuntimeDiagnosticTarget*>(context);
                 if (facts.size() > capacity) {
-                    for (const auto& fact : facts)
-                        runtime_target.write(visual_runtime_diagnostic(fact));
+                    for (const auto& fact : facts) runtime_target.write(visual_runtime_diagnostic(fact));
                     return;
                 }
                 std::array<services::RuntimeDiagnosticFact, capacity> runtime_facts;
@@ -306,13 +283,9 @@ struct VisualWorkspaceDiagnostics final {
         .pixel_probes = target.pixel_probes_enabled(),
     };
 }
-void report_visual_worker_failure(VisualDiagnosticSink, contracts::DiagnosticOwner, int, std::string_view,
-                                  std::uint64_t generation = 0U) noexcept;
-
+void report_visual_worker_failure(VisualDiagnosticSink, contracts::DiagnosticOwner, int, std::string_view, std::uint64_t generation = 0U) noexcept;
 inline constexpr std::size_t kVisualFailureByteCapacity = 1024U;
-
 [[nodiscard]] std::string visual_failure_detail(std::exception_ptr, std::string_view fallback);
-
 template <class Sink, class Event>
 void publish_visual_event_noexcept(Sink& sink, Event event) noexcept {
     if (!sink) return;
@@ -320,5 +293,4 @@ void publish_visual_event_noexcept(Sink& sink, Event event) noexcept {
         sink(std::move(event));
     } catch (...) { sink = {}; }
 }
-
 }  // namespace mmltk::controller

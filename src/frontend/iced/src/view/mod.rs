@@ -1,5 +1,3 @@
-pub mod metrics;
-pub mod image_viewer;
 pub mod annotation;
 pub mod aspect_ratio;
 pub mod diagnostics;
@@ -7,7 +5,9 @@ pub mod error_modal;
 pub mod explore;
 pub mod export;
 pub mod file_dialog;
+pub mod image_viewer;
 pub mod live;
+pub mod metrics;
 pub mod navigation;
 pub mod predict;
 pub mod router;

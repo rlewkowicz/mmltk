@@ -1,6 +1,5 @@
 #include "numa_host_tensor.h"
 #include "detail/torch_cuda_utils.h"
-
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
@@ -8,10 +7,8 @@
 #include <algorithm>
 #include <stdexcept>
 #include "src/frameworks/gpu/device_execution.h"
-
 namespace mmltk::backend::ml::cuda {
-NumaHostTensor::NumaHostTensor(int device, std::shared_ptr<void> context_custody)
-    : device_(device), context_custody_(std::move(context_custody)) {
+NumaHostTensor::NumaHostTensor(int device, std::shared_ptr<void> context_custody) : device_(device), context_custody_(std::move(context_custody)) {
     if (device_ < 0 && cudaGetDevice(&device_) != cudaSuccess) throw std::runtime_error("resolve NUMA host tensor device");
     c10::cuda::CUDAGuard guard(checked_device_index(device_));
     CUcontext context{};
@@ -33,11 +30,13 @@ at::Tensor NumaHostTensor::view(at::IntArrayRef shape, at::ScalarType dtype) {
     } else {
         storage_->ensure_bytes(std::max<std::size_t>(bytes, 1));
     }
-    return at::from_blob(storage_->data(), shape, [context = context_custody_, storage = storage_](void*) mutable {
-                             storage.reset();
-                             context.reset();
-                         },
-                         at::TensorOptions().dtype(dtype).device(at::kCPU));
+    return at::from_blob(
+        storage_->data(), shape,
+        [context = context_custody_, storage = storage_](void*) mutable {
+            storage.reset();
+            context.reset();
+        },
+        at::TensorOptions().dtype(dtype).device(at::kCPU));
 }
 std::size_t NumaHostTensor::capacity_bytes() const noexcept { return storage_->capacity_bytes(); }
 CUresult NumaHostTensor::ReleaseSettled() noexcept { return storage_.use_count() == 1 ? storage_->ReleaseSettled() : CUDA_ERROR_NOT_READY; }

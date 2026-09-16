@@ -1,28 +1,21 @@
 #pragma once
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
-
 #include "src/frameworks/serialization/serialization.h"
-
 namespace mmltk::frameworks::transport {
-
 inline constexpr std::size_t kBrowserRecordRingCapacity = 64U;
-
 enum class BrowserRecordPriority : std::uint8_t {
     Transient,
     Critical,
 };
-
 enum class BrowserRecordPush : std::uint8_t {
     Enqueued,
     Dropped,
     ClosePeer,
 };
-
 struct BrowserOutputRecord final {
     mmltk::frameworks::serialization::wire::ByteBuffer bytes;
     BrowserRecordPriority priority = BrowserRecordPriority::Transient;
@@ -31,7 +24,6 @@ struct BrowserOutputRecord final {
     std::uint64_t state_event = 0U;
     std::uint64_t state_revision = 0U;
 };
-
 // The ring has one uWebSockets-loop consumer and any number of system-worker
 // producers. Storage is allocated once; indices and occupancy remain bounded.
 // The short mutex section moves an already encoded record and never performs
@@ -51,5 +43,4 @@ class BrowserRecordRing final {
     std::size_t write_ = 0U;
     std::size_t size_ = 0U;
 };
-
 }  // namespace mmltk::frameworks::transport

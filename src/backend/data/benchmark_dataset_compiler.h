@@ -1,5 +1,4 @@
 #pragma once
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -8,18 +7,14 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/dataset_compile_phase.h"
-
 namespace mmltk::backend::data {
-
 enum class BenchmarkDatasetSource : std::uint8_t {
     kCoco2017,
     kObjects365V2,
     kOpenImagesV7,
 };
-
 struct BenchmarkSourceProgress {
     BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
     std::string activity;
@@ -32,7 +27,6 @@ struct BenchmarkSourceProgress {
     bool resumed = false;
     bool complete = false;
 };
-
 struct BenchmarkCompileProgress {
     DatasetCompilePhase phase = DatasetCompilePhase::Planning;
     std::string activity;
@@ -46,12 +40,9 @@ struct BenchmarkCompileProgress {
     std::uint64_t quarantined_images = 0;
     std::vector<BenchmarkSourceProgress> sources;
 };
-
 using BenchmarkProgressCallback = std::function<void(const BenchmarkCompileProgress&)>;
 using BenchmarkTraceCallback = std::function<void(std::string_view event, std::string_view json_fields)>;
-
 [[nodiscard]] std::string format_benchmark_source_status(const BenchmarkSourceProgress& progress, std::string_view default_status);
-
 struct BenchmarkCompilerConfig {
     std::filesystem::path output_dir{"./compiled"};
     std::filesystem::path cache_dir;
@@ -63,10 +54,8 @@ struct BenchmarkCompilerConfig {
     BenchmarkProgressCallback progress;
     BenchmarkTraceCallback trace;
 };
-
 class BenchmarkDatasetCompiler {
    public:
     static void compile(BenchmarkCompilerConfig config);
 };
-
 }  // namespace mmltk::backend::data

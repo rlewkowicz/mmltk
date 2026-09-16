@@ -9,13 +9,9 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
-
 export module mmltk.backend.imaging.annotation.common;
-
 export import mmltk.backend.imaging.annotation.semantic_scene;
-
 export namespace mmltk::backend::imaging::annotation {
-
 template <typename SampleFn>
 void rasterize_line_samples(const int x0, const int y0, const int x1, const int y1, SampleFn&& sample_fn) {
     const int dx = std::abs(x1 - x0);
@@ -32,12 +28,10 @@ void rasterize_line_samples(const int x0, const int y0, const int x1, const int 
         sample_fn(sample_x, sample_y);
     }
 }
-
 using AnnotationHsv = Hsv;
 using AnnotationColorTolerance = ColorTolerance;
 using AnnotationColorRange = ColorRange;
 using AnnotationBox = Box;
-
 struct AnnotationFrame {
     std::string source_name;
     std::filesystem::path source_path;
@@ -51,16 +45,12 @@ struct AnnotationFrame {
     std::uint32_t capture_height = 0;
     std::shared_ptr<const std::vector<std::uint8_t>> pixels_bgr;
 };
-
 [[nodiscard]] inline const std::vector<std::uint8_t>& annotation_frame_pixels(const AnnotationFrame& frame) noexcept {
     static const std::vector<std::uint8_t> kEmptyAnnotationPixels;
     return frame.pixels_bgr != nullptr ? *frame.pixels_bgr : kEmptyAnnotationPixels;
 }
-
 inline void set_annotation_frame_pixels(AnnotationFrame& frame, std::vector<std::uint8_t> pixels) {
     frame.pixels_bgr = std::make_shared<const std::vector<std::uint8_t>>(std::move(pixels));
 }
-
 using AnnotationMaskRegion = MaskRegion;
-
 }  // namespace mmltk::backend::imaging::annotation

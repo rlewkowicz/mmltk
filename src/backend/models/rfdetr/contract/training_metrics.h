@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -8,9 +7,7 @@
 #include "evaluation_metrics.h"
 #include "class_layout.h"
 #include "workflow_requests.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 inline constexpr std::uint32_t kTrainingRunFormat = 1;
 inline constexpr std::size_t kTrainingHistoryPageSize = 32;
 inline constexpr std::size_t kTrainingRecordBytes = 512U * 1024U;
@@ -22,7 +19,6 @@ enum class TrainingRecordRole : std::uint8_t { Live, Boundary, Epoch, Terminal }
 MMLTK_REFLECT_ENUM(EvaluatedWeights)
 MMLTK_REFLECT_ENUM(TrainingPhase)
 MMLTK_REFLECT_ENUM(TrainingRecordRole)
-
 // Hungarian components are raw main-output losses; Match-Free components are
 // weighted main-output losses. TrainingRun.configuration selects the convention.
 // Auxiliary and DN are separate weighted groups, excluded from main components.
@@ -48,7 +44,6 @@ struct TrainingScalars final {
     std::optional<double> images_per_second;
 };
 MMLTK_REFLECT_FIELDS(TrainingScalars)
-
 struct TrainingMetricProgress final {
     bool operator==(const TrainingMetricProgress&) const = default;
     TrainingPhase phase = TrainingPhase::Starting;
@@ -76,13 +71,10 @@ struct TrainingMetricProgress final {
     std::optional<double> val_loss;
     std::optional<EvalSummary> val;
     std::optional<EvalSummary> test;
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path checkpoint_path;
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path full_checkpoint_path;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path checkpoint_path;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path full_checkpoint_path;
 };
 MMLTK_REFLECT_FIELDS(TrainingMetricProgress)
-
 struct TrainingRecord final {
     bool operator==(const TrainingRecord&) const = default;
     std::uint32_t format_version = kTrainingRunFormat;
@@ -96,7 +88,6 @@ struct TrainingRecord final {
     std::optional<TrainRequest> attempt_configuration;
 };
 MMLTK_REFLECT_FIELDS(TrainingRecord)
-
 struct TrainingDatasetLimits final {
     std::uint32_t train_max_instances = 0;
     std::uint32_t val_max_instances = 0;
@@ -117,7 +108,6 @@ struct TrainingExecutionFacts final {
     TrainingDatasetLimits dataset_limits;
 };
 MMLTK_REFLECT_FIELDS(TrainingExecutionFacts)
-
 struct TrainingRun final {
     std::uint32_t format_version = kTrainingRunFormat;
     [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string run_id;
@@ -126,10 +116,8 @@ struct TrainingRun final {
     [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string source_checkpoint_attempt_id;
     TrainRequest configuration{};
     TrainingExecutionFacts execution;
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::string original_weights;
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path original_class_descriptor;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string original_weights;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path original_class_descriptor;
     EvaluatedWeights evaluated_weights = EvaluatedWeights::Ordinary;
     ModelClassLayout class_layout{};
     int resume_epoch = -1;
@@ -138,12 +126,10 @@ struct TrainingRun final {
 MMLTK_REFLECT_FIELDS(TrainingRun)
 struct TrainingOpenedRun final {
     std::uint64_t generation = 0;
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path directory;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path directory;
     TrainingRun run;
 };
 MMLTK_REFLECT_FIELDS(TrainingOpenedRun)
-
 struct TrainingPersistence final {
     bool operator==(const TrainingPersistence&) const = default;
     bool degraded = false;
@@ -151,14 +137,11 @@ struct TrainingPersistence final {
     [[= mmltk::frameworks::reflection::MaxBytes{1024}]] std::string error;
 };
 MMLTK_REFLECT_FIELDS(TrainingPersistence)
-
 struct TrainingCheckpoint final {
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path path;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path path;
     [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string attempt_id;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string original_weights;
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path original_class_descriptor;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path original_class_descriptor;
     bool resumable = false;
     int epoch = -1;
     std::optional<TrainRequest> configuration;
@@ -166,31 +149,26 @@ struct TrainingCheckpoint final {
     EvaluatedWeights evaluated_weights = EvaluatedWeights::Ordinary;
 };
 MMLTK_REFLECT_FIELDS(TrainingCheckpoint)
-
 struct TrainingDirectoryQuery final {
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path directory;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path directory;
 };
 MMLTK_REFLECT_FIELDS(TrainingDirectoryQuery)
 struct TrainingCheckpointQuery final {
-    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
-    std::filesystem::path path;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path path;
 };
 MMLTK_REFLECT_FIELDS(TrainingCheckpointQuery)
 struct TrainingHistoryQuery final {
     std::uint64_t generation = 0;
     std::uint64_t cursor = 0;
-    [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{1}]]
-    [[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{kTrainingHistoryPageSize}]]
-    std::uint32_t count = kTrainingHistoryPageSize;
+    [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
+        1}]][[= mmltk::frameworks::reflection::Maximum<std::uint32_t>{kTrainingHistoryPageSize}]] std::uint32_t count = kTrainingHistoryPageSize;
 };
 MMLTK_REFLECT_FIELDS(TrainingHistoryQuery)
 struct TrainingHistoryPage final {
     std::uint64_t generation = 0;
     std::uint64_t next_cursor = 0;
     bool more = false;
-    [[= mmltk::frameworks::reflection::MaxItems{kTrainingHistoryPageSize}]]
-    std::vector<TrainingRecord> records;
+    [[= mmltk::frameworks::reflection::MaxItems{kTrainingHistoryPageSize}]] std::vector<TrainingRecord> records;
 };
 MMLTK_REFLECT_FIELDS(TrainingHistoryPage)
 }  // namespace mmltk::backend::models::rfdetr

@@ -21,7 +21,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
 #include "async_test_utils.hpp"
 #include "filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_file_utils.h"
@@ -31,23 +30,17 @@
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/file_memory.h"
 #include "test_fixture.h"
-
 using namespace mmltk::backend::data;
 using mmltk::common::io::FileHandle;
 using namespace mmltk::backend::data::testsupport;
-
 namespace fs = std::filesystem;
-
 namespace {
-
 std::atomic<std::uint64_t> g_compile_elapsed_seconds{0U};
 std::atomic<std::size_t> g_overlap_clock_calls{0U};
 std::atomic<std::shared_ptr<const mmltk::testsupport::TestGate::Receipt>> g_overlap_reset;
-
 CompileTelemetry::Clock::time_point compile_test_now() noexcept {
     return CompileTelemetry::Clock::time_point{std::chrono::seconds{g_compile_elapsed_seconds.load(std::memory_order_relaxed)}};
 }
-
 CompileTelemetry::Clock::time_point overlap_compile_test_now() noexcept {
     const std::uint64_t captured_seconds = g_compile_elapsed_seconds.load(std::memory_order_relaxed);
     if (g_overlap_clock_calls.fetch_add(1U, std::memory_order_relaxed) == 1U) {
@@ -55,13 +48,11 @@ CompileTelemetry::Clock::time_point overlap_compile_test_now() noexcept {
     }
     return CompileTelemetry::Clock::time_point{std::chrono::seconds{captured_seconds}};
 }
-
-void expect_compile_failure(const FixtureSpec& fixture, const std::function<void(const fs::path&)>& mutate,
-                            const std::string& expected_error, int target_width = -1, int target_height = -1) {
+void expect_compile_failure(const FixtureSpec& fixture, const std::function<void(const fs::path&)>& mutate, const std::string& expected_error,
+                            int target_width = -1, int target_height = -1) {
     create_synthetic_dataset(fixture);
     const fs::path annotation_path = fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl";
     mutate(annotation_path);
-
     CompilerConfig config;
     config.source_dir = dataset_dir(fixture);
     config.output_dir = fixture.root_dir + "/compiled";
@@ -69,7 +60,6 @@ void expect_compile_failure(const FixtureSpec& fixture, const std::function<void
     config.target_width = static_cast<uint32_t>(target_width > 0 ? target_width : fixture.width);
     config.target_height = static_cast<uint32_t>(target_height > 0 ? target_height : fixture.height);
     config.num_workers = 2;
-
     bool threw = false;
     try {
         const DatasetCompilePlan plan = DatasetCompiler::prepare(config, {config.split});
@@ -80,13 +70,11 @@ void expect_compile_failure(const FixtureSpec& fixture, const std::function<void
     }
     REQUIRE(threw);
 }
-
 void overwrite_annotation(const fs::path& annotation_path, const std::string& record) {
     std::ofstream file(annotation_path, std::ios::trunc);
     REQUIRE(file.is_open());
     file << record << "\n";
 }
-
 void compile_resized_fixture(const FixtureSpec& fixture) {
     CompilerConfig config;
     config.source_dir = dataset_dir(fixture);
@@ -95,11 +83,9 @@ void compile_resized_fixture(const FixtureSpec& fixture) {
     config.target_width = 8;
     config.target_height = 8;
     config.num_workers = 2;
-
     const DatasetCompilePlan plan = DatasetCompiler::prepare(config, {config.split});
     DatasetCompiler::compile(plan, 0U);
 }
-
 [[nodiscard]] DatasetLoader::Config resized_fixture_loader_config(const FixtureSpec& fixture) {
     DatasetLoader::Config config;
     config.loading.h2d_dataloader = true;
@@ -108,7 +94,6 @@ void compile_resized_fixture(const FixtureSpec& fixture) {
     config.shuffle = false;
     return config;
 }
-
 [[nodiscard]] DatasetCompilePlan prepare_cancellation_compile(const FixtureSpec& fixture) {
     create_synthetic_dataset(fixture);
     CompilerConfig config;
@@ -119,23 +104,19 @@ void compile_resized_fixture(const FixtureSpec& fixture) {
     config.target_height = 32U;
     return DatasetCompiler::prepare(config, {config.split});
 }
-
 void test_vanished_masks_are_omitted() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_drop_vanished_mask");
     const FixtureSpec fixture{
         root.path().string(), "train", 16, 16, 20,
     };
     create_synthetic_dataset(fixture);
-    overwrite_annotation(
-        fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl",
-        R"({"class":"person","bbox_xyxy":[0,0,1,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:1","image_size_wh":[16,16]})");
-
+    overwrite_annotation(fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl",
+                         R"({"class":"person","bbox_xyxy":[0,0,1,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:1","image_size_wh":[16,16]})");
     compile_resized_fixture(fixture);
     DatasetLoader loader(resized_fixture_loader_config(fixture));
     REQUIRE(loader.num_label_instances() == 9);
     REQUIRE(loader.label_index()[10].num_instances == 0);
 }
-
 void test_partial_mask_vanish_keeps_instance() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_keep_partial_mask");
     const FixtureSpec fixture{
@@ -145,7 +126,6 @@ void test_partial_mask_vanish_keeps_instance() {
     overwrite_annotation(
         fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl",
         R"({"class":"person","bbox_xyxy":[0,0,6,6],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:1 17:1 85:1","image_size_wh":[16,16]})");
-
     compile_resized_fixture(fixture);
     DatasetLoader loader(resized_fixture_loader_config(fixture));
     REQUIRE(loader.num_label_instances() == 10);
@@ -158,7 +138,6 @@ void test_partial_mask_vanish_keeps_instance() {
     REQUIRE(instance.bbox_x2 == 3);
     REQUIRE(instance.bbox_y2 == 3);
 }
-
 void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_letterbox");
     const FixtureSpec fixture{
@@ -168,19 +147,16 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     overwrite_annotation(
         fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl",
         R"({"class":"person","bbox_xyxy":[4,2,12,6],"mask_rle_encoding":"row_major_start_length","mask_rle":"36:8 52:8 68:8 84:8","image_size_wh":[16,8]})");
-
     compile_resized_fixture(fixture);
     DatasetLoader loader(resized_fixture_loader_config(fixture));
     REQUIRE(loader.image_width() == 8U);
     REQUIRE(loader.image_height() == 8U);
-
     const FileHandle compiled_file = FileHandle::open_readonly(compiled_bin_path(fixture));
     const FileHeader compiled_header = read_compiled_header(compiled_file);
     std::vector<ImageEntry> compiled_index(compiled_header.num_images);
     compiled_file.pread_all(compiled_index.data(), compiled_index.size() * sizeof(ImageEntry), compiled_header.index_offset);
     REQUIRE(compiled_index[0].original_width == 16U);
     REQUIRE(compiled_index[0].original_height == 8U);
-
     constexpr size_t row = 8U;
     constexpr size_t plane = row * row;
     const float* first_image = loader.pixel_blob();
@@ -189,7 +165,6 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
         REQUIRE(first_image[channel * plane + 7U * row] == 0.0F);
     }
     REQUIRE((first_image[2U * row] != 0.0F || first_image[plane + 2U * row] != 0.0F || first_image[plane * 2U + 2U * row] != 0.0F));
-
     const LabelIndexEntry& entry = loader.label_index()[10];
     REQUIRE(entry.num_instances == 1U);
     const PackedInstance& instance = loader.label_data()[entry.label_begin];
@@ -198,7 +173,6 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     REQUIRE(instance.bbox_x2 == 6);
     REQUIRE(instance.bbox_y2 == 5);
     REQUIRE(instance.mask_rle_pairs != 0U);
-
     std::vector<uint8_t> dense_mask(plane, uint8_t{0});
     const size_t first_pair = static_cast<size_t>(instance.mask_rle_offset) / sizeof(RLEPair);
     for (size_t pair_index = 0U; pair_index < instance.mask_rle_pairs; ++pair_index) {
@@ -212,17 +186,15 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     REQUIRE(std::ranges::all_of(dense_mask.begin(), dense_mask.begin() + 3 * row_offset, [](const uint8_t value) { return value == 0U; }));
     REQUIRE(std::ranges::all_of(dense_mask.begin() + 5 * row_offset, dense_mask.end(), [](const uint8_t value) { return value == 0U; }));
 }
-
 void test_compiled_tiny_masks_keep_outer_pixel_edges() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_tiny_masks");
     const FixtureSpec fixture{root.path().string(), "train", 8, 4, 11};
     create_synthetic_dataset(fixture);
-    const std::array source_runs{RLEPair{0, 1},  RLEPair{7, 1},  RLEPair{24, 1}, RLEPair{31, 1},
-                                 RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}};
+    const std::array source_runs{RLEPair{0, 1}, RLEPair{7, 1}, RLEPair{24, 1}, RLEPair{31, 1}, RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}};
     std::ostringstream annotations;
     for (const auto run : source_runs) {
-        annotations << R"({"class":"person","bbox_xyxy":[0,0,8,4],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << run.start
-                    << ':' << run.length << R"(","image_size_wh":[8,4]})" << '\n';
+        annotations << R"({"class":"person","bbox_xyxy":[0,0,8,4],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << run.start << ':' << run.length
+                    << R"(","image_size_wh":[8,4]})" << '\n';
     }
     overwrite_annotation(fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl", annotations.str());
     compile_resized_fixture(fixture);
@@ -242,7 +214,6 @@ void test_compiled_tiny_masks_keep_outer_pixel_edges() {
         CHECK(compiled.length == source.length);
     }
 }
-
 void test_invalid_annotations_fail_loud() {
     const mmltk::testsupport::ScopedTempDir invalid_json("mmltk_compile_invalid_json");
     const mmltk::testsupport::ScopedTempDir unknown_class("mmltk_compile_unknown_class");
@@ -260,7 +231,6 @@ void test_invalid_annotations_fail_loud() {
             file << "{invalid json}\n";
         },
         "invalid JSON annotation record");
-
     expect_compile_failure(
         FixtureSpec{
             unknown_class.path().string(),
@@ -272,13 +242,11 @@ void test_invalid_annotations_fail_loud() {
         [](const fs::path& annotation_path) {
             std::ofstream file(annotation_path, std::ios::trunc);
             REQUIRE(file.is_open());
-            file
-                << R"({"class":"unknown","bbox_xyxy":[10,10,20,20],"mask_rle_encoding":"row_major_start_length","mask_rle":"660:10","image_size_wh":[65,65]})"
-                << "\n";
+            file << R"({"class":"unknown","bbox_xyxy":[10,10,20,20],"mask_rle_encoding":"row_major_start_length","mask_rle":"660:10","image_size_wh":[65,65]})"
+                 << "\n";
         },
         "is not declared in categories.json");
 }
-
 void test_checked_progress_estimates() {
     CHECK(estimate_progress(0U, 100U, 10U) == ProgressEstimate{});
     CHECK(estimate_progress(10U, 100U, 0U) == ProgressEstimate{});
@@ -289,16 +257,13 @@ void test_checked_progress_estimates() {
     CHECK(estimate_progress(1U, maximum, maximum) == (ProgressEstimate{.remaining_seconds = maximum, .throughput_per_second = 0U}));
     CHECK(estimate_progress(maximum - 1U, maximum, maximum) == (ProgressEstimate{.remaining_seconds = 1U, .throughput_per_second = 0U}));
 }
-
 }  // namespace
-
 void test_compile_progress_reports_monotonic_updates() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_progress");
     const FixtureSpec fixture{
         root.path().string(), "train", 257, 193, 96,
     };
     create_synthetic_dataset(fixture);
-
     CompilerConfig config;
     config.source_dir = dataset_dir(fixture);
     config.output_dir = fixture.root_dir + "/compiled";
@@ -306,7 +271,6 @@ void test_compile_progress_reports_monotonic_updates() {
     config.target_width = 97;
     config.target_height = 73;
     config.num_workers = 4;
-
     const std::thread::id main_thread_id = std::this_thread::get_id();
     struct ProgressRecorder final {
         struct Entry {
@@ -342,11 +306,9 @@ void test_compile_progress_reports_monotonic_updates() {
     CompileTelemetry telemetry{
         plan.splits[0].image_count,
         {.context = &state,
-         .report = [](void* context,
-                      const CompileProgress& progress) noexcept { static_cast<ProgressRecorder*>(context)->Record(progress); }},
+         .report = [](void* context, const CompileProgress& progress) noexcept { static_cast<ProgressRecorder*>(context)->Record(progress); }},
         &compile_test_now};
     DatasetCompiler::compile(plan, 0U, &telemetry);
-
     REQUIRE_FALSE(state.overflow);
     REQUIRE_FALSE(state.overlap.load(std::memory_order_relaxed));
     REQUIRE(state.size != 0U);
@@ -382,14 +344,12 @@ void test_compile_progress_reports_monotonic_updates() {
     CHECK(completed.remaining_seconds == 0U);
     CHECK(observed.front().progress.elapsed_seconds == 0U);
     CHECK(main_thread_observed);
-
     test_vanished_masks_are_omitted();
     test_partial_mask_vanish_keeps_instance();
     test_native_compile_letterboxes_pixels_boxes_and_masks();
     test_compiled_tiny_masks_keep_outer_pixel_edges();
     test_invalid_annotations_fail_loud();
 }
-
 void test_snapshot_overlaps_compile_reset() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_progress_reset_overlap");
     const FixtureSpec fixture{
@@ -404,7 +364,6 @@ void test_snapshot_overlaps_compile_reset() {
     config.target_height = 16U;
     config.num_workers = 1;
     const DatasetCompilePlan plan = DatasetCompiler::prepare(config, {config.split});
-
     g_compile_elapsed_seconds.store(5U, std::memory_order_relaxed);
     g_overlap_clock_calls.store(0U, std::memory_order_relaxed);
     mmltk::testsupport::TestGate reset("compile reset clock sample");
@@ -421,15 +380,13 @@ void test_snapshot_overlaps_compile_reset() {
         if (compiler.valid()) compiler.wait();
         g_overlap_reset.store(nullptr);
     });
-    compiler = std::async(std::launch::async, [&] {
-        DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token));
-    });
+    compiler = std::async(std::launch::async,
+                          [&] { DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token)); });
     REQUIRE(reset.WaitEntered(std::chrono::seconds{2}));
     g_compile_elapsed_seconds.store(30U, std::memory_order_relaxed);
     const CompileProgress overlapping = telemetry.snapshot();
     reset.Release();
     mmltk::testsupport::await_test_future(compiler, "compile reset settlement", std::chrono::seconds{30});
-
     CHECK(overlapping.elapsed_seconds == 25U);
     const ProgressEstimate overlapping_estimate = estimate_progress(overlapping.done, overlapping.total, overlapping.elapsed_seconds);
     CHECK(overlapping.remaining_seconds == overlapping_estimate.remaining_seconds);
@@ -439,7 +396,6 @@ void test_snapshot_overlaps_compile_reset() {
     CHECK(completed.elapsed_seconds == 10U);
     CHECK(completed.remaining_seconds == 0U);
 }
-
 void test_compile_observes_event_cancellation_without_progress() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_event_cancellation");
     const FixtureSpec fixture{
@@ -450,10 +406,8 @@ void test_compile_observes_event_cancellation_without_progress() {
     auto [source, token] = CancellationSource::Mint();
     const DatasetCompilePlan plan = prepare_cancellation_compile(fixture);
     REQUIRE(source.RequestCancel());
-    REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, nullptr, mmltk::common::concurrency::CancellationObservation::Borrow(token)),
-                      std::runtime_error);
+    REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, nullptr, mmltk::common::concurrency::CancellationObservation::Borrow(token)), std::runtime_error);
 }
-
 void test_compile_reobserves_cancellation_after_publishing_event() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_publish_cancellation");
     const FixtureSpec fixture{
@@ -463,17 +417,14 @@ void test_compile_reobserves_cancellation_after_publishing_event() {
     using CancellationSource = mmltk::common::concurrency::EventCancellationSource<CancellationTag, false>;
     auto [source, token] = CancellationSource::Mint();
     const DatasetCompilePlan plan = prepare_cancellation_compile(fixture);
-    CompileTelemetry telemetry{plan.splits.front().image_count,
-                               {.context = &source, .report = [](void* context, const CompileProgress& progress) noexcept {
-                                    if (progress.phase == DatasetCompilePhase::Publishing) {
-                                        static_cast<void>(static_cast<CancellationSource*>(context)->RequestCancel());
-                                    }
-                                }}};
-    REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token)),
-                      std::runtime_error);
+    CompileTelemetry telemetry{plan.splits.front().image_count, {.context = &source, .report = [](void* context, const CompileProgress& progress) noexcept {
+                                                                     if (progress.phase == DatasetCompilePhase::Publishing) {
+                                                                         static_cast<void>(static_cast<CancellationSource*>(context)->RequestCancel());
+                                                                     }
+                                                                 }}};
+    REQUIRE_THROWS_AS(DatasetCompiler::compile(plan, 0U, &telemetry, mmltk::common::concurrency::CancellationObservation::Borrow(token)), std::runtime_error);
     REQUIRE_FALSE(std::filesystem::exists(std::filesystem::path(plan.config.output_dir) / "train.bin"));
 }
-
 TEST_CASE("compiler progress remains monotonic", "[backend][data][compile_progress]") {
     test_checked_progress_estimates();
     test_compile_progress_reports_monotonic_updates();
@@ -481,12 +432,11 @@ TEST_CASE("compiler progress remains monotonic", "[backend][data][compile_progre
     test_compile_observes_event_cancellation_without_progress();
     test_compile_reobserves_cancellation_after_publishing_event();
 }
-
 TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense tables", "[data][catalog]") {
     const auto root = mmltk::testsupport::make_temp_root("compiler-class-catalog");
     const mmltk::testsupport::ScopedTestCleanup cleanup{[&] { fs::remove_all(root); }};
     for (const int base : {0, 1}) {
-        FixtureSpec fixture{.root_dir=(root / std::to_string(base)).string(), .num_images=12, .first_class_id=base};
+        FixtureSpec fixture{.root_dir = (root / std::to_string(base)).string(), .num_images = 12, .first_class_id = base};
         create_synthetic_dataset(fixture);
         const auto path = fs::path(dataset_dir(fixture)) / "categories.json";
         std::ifstream input(path);
@@ -494,7 +444,10 @@ TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense 
         input.close();
         auto& classes = categories.at("classes");
         std::reverse(classes.begin(), classes.end());
-        const auto write = [&] { std::ofstream output(path); output << categories; };
+        const auto write = [&] {
+            std::ofstream output(path);
+            output << categories;
+        };
         write();
         CompilerConfig config;
         config.source_dir = dataset_dir(fixture);

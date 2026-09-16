@@ -9,7 +9,6 @@
 #include <stdexcept>
 #include <string_view>
 #include "src/common/system/cpu_affinity.h"
-
 namespace {
 TEST_CASE("CUDA device enumeration distinguishes unavailable capability from runtime failures", "[frameworks][gpu]") {
     using mmltk::testsupport::classify_cuda_device_count;
@@ -32,23 +31,18 @@ TEST_CASE("CUDA device enumeration distinguishes unavailable capability from run
     REQUIRE_FALSE(invalid_count.has_value());
     CHECK(invalid_count.error() == cudaSuccess);
 }
-
 TEST_CASE("Device placement rejects every forbidden explicit CPU before locality filtering", "[frameworks][gpu][placement]") {
     using namespace mmltk::common::system;
     const auto topology = NumaTopology::Capture();
     const auto allowed = allowed_cpu_set();
     int forbidden = 0;
-    while (std::binary_search(allowed.begin(), allowed.end(), forbidden))
-        ++forbidden;
+    while (std::binary_search(allowed.begin(), allowed.end(), forbidden)) ++forbidden;
     const auto requested = std::to_string(allowed.front()) + "," + std::to_string(forbidden);
     try {
         (void)mmltk::frameworks::gpu::resolve_device_execution(-1, topology, -1, requested);
         FAIL("forbidden explicit CPU was accepted");
-    } catch (const std::runtime_error& error) {
-        CHECK(std::string_view(error.what()).find("outside the current allowed cpuset") != std::string_view::npos);
-    }
+    } catch (const std::runtime_error& error) { CHECK(std::string_view(error.what()).find("outside the current allowed cpuset") != std::string_view::npos); }
 }
-
 TEST_CASE("CUDA-visible placement resolves the device PCI identity", "[frameworks][gpu][placement][hardware]") {
     if (cuInit(0) != CUDA_SUCCESS) SKIP("CUDA driver unavailable; device placement hardware remains unverified");
     int count = 0;
@@ -67,8 +61,8 @@ TEST_CASE("CUDA-visible placement resolves the device PCI identity", "[framework
         CHECK(selected.device == ordinal);
         CHECK(selected.placement.numa_node >= 0);
         REQUIRE_FALSE(selected.placement.cpus.empty());
-        const auto constrained = mmltk::frameworks::gpu::resolve_device_execution(
-            ordinal, topology, selected.placement.numa_node, mmltk::common::system::format_cpu_list(topology.permitted_cpus));
+        const auto constrained = mmltk::frameworks::gpu::resolve_device_execution(ordinal, topology, selected.placement.numa_node,
+                                                                                  mmltk::common::system::format_cpu_list(topology.permitted_cpus));
         CHECK(constrained.placement.cpus == selected.placement.cpus);
     }
 }

@@ -4,40 +4,28 @@ module;
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
-
 #include <stdexcept>
-
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
-
 module mmltk.backend.ml.cuda.torch_scope;
-
 namespace mmltk::backend::ml::cuda {
 namespace {
-
 [[nodiscard]] c10::DeviceIndex checked_device_index(const std::int32_t device) {
     if (device < 0) { throw std::invalid_argument("LibTorch CUDA stream scope requires a valid device"); }
     return static_cast<c10::DeviceIndex>(device);
 }
-
 [[nodiscard]] at::ScalarType scalar_type(const TorchCudaPrecision precision) {
     switch (precision) {
-        case TorchCudaPrecision::Float32:
-            return at::kFloat;
-        case TorchCudaPrecision::Float16:
-            return at::kHalf;
-        case TorchCudaPrecision::BFloat16:
-            return at::kBFloat16;
+        case TorchCudaPrecision::Float32: return at::kFloat;
+        case TorchCudaPrecision::Float16: return at::kHalf;
+        case TorchCudaPrecision::BFloat16: return at::kBFloat16;
     }
     throw std::invalid_argument("invalid LibTorch CUDA precision");
 }
-
 [[nodiscard]] c10::cuda::CUDAStream torch_stream(const std::uintptr_t stream, const c10::DeviceIndex device_index) {
     if (stream == 0U) { return c10::cuda::getDefaultCUDAStream(device_index); }
     return c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream), device_index);
 }
-
 }  // namespace
-
 void run_on_torch_cuda_stream(const std::int32_t device, const std::uintptr_t stream, void* const context, const TorchCudaWork work) {
     if (work == nullptr) { throw std::invalid_argument("LibTorch CUDA stream scope requires work"); }
     const auto device_index = checked_device_index(device);
@@ -45,7 +33,6 @@ void run_on_torch_cuda_stream(const std::int32_t device, const std::uintptr_t st
     c10::cuda::CUDAStreamGuard stream_guard{torch_stream(stream, device_index)};
     work(context);
 }
-
 void run_with_torch_cuda_scope(const TorchCudaExecutionOptions& options, void* const context, const TorchCudaWork work) {
     if (work == nullptr) { throw std::invalid_argument("LibTorch CUDA execution scope requires work"); }
     const auto device_index = checked_device_index(options.device);
@@ -55,13 +42,11 @@ void run_with_torch_cuda_scope(const TorchCudaExecutionOptions& options, void* c
     TorchAutocastScope autocast_scope{options.autocast, scalar_type(options.precision)};
     work(context);
 }
-
 std::uintptr_t current_torch_cuda_stream(const std::int32_t device) {
     const auto device_index = checked_device_index(device);
     c10::cuda::CUDAGuard device_guard{device_index};
     return reinterpret_cast<std::uintptr_t>(c10::cuda::getCurrentCUDAStream(device_index).stream());
 }
-
 TorchCudaPrecision preferred_torch_cuda_precision(const std::int32_t device) {
     if (device < 0) { throw std::invalid_argument("LibTorch CUDA precision requires a valid device"); }
     cudaDeviceProp properties{};
@@ -70,5 +55,4 @@ TorchCudaPrecision preferred_torch_cuda_precision(const std::int32_t device) {
     if (properties.major < 7) { throw std::runtime_error("LibTorch CUDA autocast requires compute capability 7.0"); }
     return properties.major >= 8 ? TorchCudaPrecision::BFloat16 : TorchCudaPrecision::Float16;
 }
-
 }  // namespace mmltk::backend::ml::cuda

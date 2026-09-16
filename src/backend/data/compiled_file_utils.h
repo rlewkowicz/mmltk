@@ -1,5 +1,4 @@
 #pragma once
-
 #include <memory>
 #include <algorithm>
 #include <atomic>
@@ -11,15 +10,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 #include "src/common/concurrency/cancellation_observation.h"
-
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data {
-
 struct CompiledFileSections {
     size_t index_offset = 0;
     size_t label_offset = 0;
@@ -31,7 +27,6 @@ struct CompiledFileSections {
     size_t rle_region_bytes = 0;
     size_t pixel_blob_size = 0;
 };
-
 struct CompiledDatasetInfo {
     std::filesystem::path path;
     std::uint32_t image_count = 0;
@@ -42,7 +37,6 @@ struct CompiledDatasetInfo {
     std::shared_ptr<const catalog::ClassCatalog> class_catalog;
     [[nodiscard]] std::span<const std::string> class_names() const noexcept { return class_catalog ? class_catalog->names() : std::span<const std::string>{}; }
 };
-
 inline void validate_compiled_header(const FileHeader& header) {
     if (header.magic != MAGIC) { throw std::runtime_error("Bad magic in compiled file"); }
     if (header.version != FORMAT_VERSION) { throw std::runtime_error("Version mismatch"); }
@@ -53,30 +47,24 @@ inline void validate_compiled_header(const FileHeader& header) {
     if (header.max_instances_per_image > std::numeric_limits<std::uint16_t>::max()) {
         throw std::runtime_error("compiled file maximum instance count exceeds the index representation");
     }
-    const uint64_t expected_image_stride =
-        static_cast<uint64_t>(header.image_width) * header.image_height * header.channels * sizeof(float);
+    const uint64_t expected_image_stride = static_cast<uint64_t>(header.image_width) * header.image_height * header.channels * sizeof(float);
     if (header.image_stride != expected_image_stride) { throw std::runtime_error("compiled file has an invalid image stride"); }
 }
-
 inline FileHeader read_compiled_header(const mmltk::common::io::FileHandle& file) {
     FileHeader header{};
     file.pread_all(&header, sizeof(header), 0);
     validate_compiled_header(header);
     return header;
 }
-
 inline FileHeader read_compiled_header(const std::string& path) {
     const mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::open_readonly(path);
     return read_compiled_header(file);
 }
-
 // Aborts compiled-file validation loops when cancellation is requested; the flag is sampled every
 // 4096 iterations so hot loops stay cheap.
-inline void throw_if_compiled_validation_cancelled(const size_t index,
-                                                   mmltk::common::concurrency::CancellationObservation cancel_requested) {
+inline void throw_if_compiled_validation_cancelled(const size_t index, mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if ((index & 4095U) == 0U && cancel_requested.requested()) { throw std::runtime_error("dataset compilation cancelled"); }
 }
-
 inline CompiledFileSections validate_compiled_file_sections(const FileHeader& header, size_t file_size) {
     const auto index_offset = mmltk::common::math::checked_cast<size_t>(header.index_offset, "index offset overflow");
     const auto label_offset = mmltk::common::math::checked_cast<size_t>(header.label_offset, "label offset overflow");
@@ -88,37 +76,24 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
         total_file_size < rle_offset) {
         throw std::runtime_error("compiled file layout is invalid");
     }
-
     const auto expected_index_bytes =
         mmltk::common::math::checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * sizeof(ImageEntry), "index size overflow");
     if (pixel_offset != align_up(index_offset + expected_index_bytes, HUGE_PAGE_SIZE)) {
         throw std::runtime_error("compiled file index or pixel alignment is invalid");
     }
-
     const size_t label_bytes = rle_offset - label_offset;
     if (label_bytes % sizeof(PackedInstance) != 0) { throw std::runtime_error("label block is not aligned to PackedInstance"); }
-
     const size_t pixel_blob_size = label_offset - pixel_offset;
-    const auto expected_pixel_blob_size = mmltk::common::math::checked_cast<size_t>(
-        static_cast<uint64_t>(header.num_images) * header.image_stride, "pixel blob size overflow");
+    const auto expected_pixel_blob_size =
+        mmltk::common::math::checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * header.image_stride, "pixel blob size overflow");
     if (pixel_blob_size != expected_pixel_blob_size) { throw std::runtime_error("compiled pixel blob size mismatch"); }
-
     const size_t rle_region_bytes = total_file_size - rle_offset;
     if (rle_region_bytes % sizeof(RLEPair) != 0U) { throw std::runtime_error("compiled RLE block is not aligned to RLEPair"); }
-
     return CompiledFileSections{
-        index_offset,
-        label_offset,
-        rle_offset,
-        pixel_offset,
-        expected_index_bytes,
-        label_bytes,
-        label_bytes / sizeof(PackedInstance),
-        rle_region_bytes,
-        pixel_blob_size,
+        index_offset,     label_offset,    rle_offset, pixel_offset, expected_index_bytes, label_bytes, label_bytes / sizeof(PackedInstance),
+        rle_region_bytes, pixel_blob_size,
     };
 }
-
 inline void validate_compiled_index_entries(const std::span<const ImageEntry> index, const FileHeader& header, const size_t label_count,
                                             mmltk::common::concurrency::CancellationObservation cancel_requested = {}) {
     if (index.size() != header.num_images) { throw std::runtime_error("compiled index entry count does not match header"); }
@@ -144,7 +119,6 @@ inline void validate_compiled_index_entries(const std::span<const ImageEntry> in
         throw std::runtime_error("compiled label index does not reference the complete label block");
     }
 }
-
 inline void validate_compiled_original_image_dimensions(const std::span<const ImageEntry> index,
                                                         mmltk::common::concurrency::CancellationObservation cancel_requested = {}) {
     for (size_t image_index = 0U; image_index < index.size(); ++image_index) {
@@ -155,7 +129,6 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
         }
     }
 }
-
 [[nodiscard]] inline size_t validate_compiled_label_entries(const std::span<const PackedInstance> labels, const FileHeader& header,
                                                             const size_t rle_region_bytes,
                                                             mmltk::common::concurrency::CancellationObservation cancel_requested = {}) {
@@ -167,8 +140,7 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
             throw std::runtime_error("compiled instance class id is out of bounds at label " + std::to_string(label_index));
         }
         if (instance.bbox_x1 < 0 || instance.bbox_y1 < 0 || instance.bbox_x2 <= instance.bbox_x1 || instance.bbox_y2 <= instance.bbox_y1 ||
-            static_cast<std::uint32_t>(instance.bbox_x2) > header.image_width ||
-            static_cast<std::uint32_t>(instance.bbox_y2) > header.image_height) {
+            static_cast<std::uint32_t>(instance.bbox_x2) > header.image_width || static_cast<std::uint32_t>(instance.bbox_y2) > header.image_height) {
             throw std::runtime_error("compiled instance bounding box is invalid at label " + std::to_string(label_index));
         }
         if (instance.mask_rle_offset != used_rle_bytes || instance.mask_rle_offset % sizeof(RLEPair) != 0U) {
@@ -182,9 +154,7 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
     }
     return used_rle_bytes;
 }
-
-inline void validate_compiled_rle_pairs(const std::span<const PackedInstance> labels, const std::span<const RLEPair> pairs,
-                                        const size_t mask_pixels,
+inline void validate_compiled_rle_pairs(const std::span<const PackedInstance> labels, const std::span<const RLEPair> pairs, const size_t mask_pixels,
                                         mmltk::common::concurrency::CancellationObservation cancel_requested = {}) {
     for (size_t label_index = 0U; label_index < labels.size(); ++label_index) {
         throw_if_compiled_validation_cancelled(label_index, cancel_requested);
@@ -201,14 +171,12 @@ inline void validate_compiled_rle_pairs(const std::span<const PackedInstance> la
             const size_t start = pair.start;
             const size_t length = pair.length;
             if (length == 0U || start < previous_end || start > mask_pixels || length > mask_pixels - start) {
-                throw std::runtime_error("compiled RLE run is invalid at label " + std::to_string(label_index) + ", pair " +
-                                         std::to_string(local_pair_index));
+                throw std::runtime_error("compiled RLE run is invalid at label " + std::to_string(label_index) + ", pair " + std::to_string(local_pair_index));
             }
             previous_end = start + length;
         }
     }
 }
-
 inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
     std::vector<std::string> names;
     names.reserve(header.num_classes);
@@ -223,12 +191,10 @@ inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
     }
     return catalog::ClassCatalog(std::move(names), 31U);
 }
-
 inline CompiledDatasetInfo inspect_compiled_dataset(const std::filesystem::path& path) {
     const mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::open_readonly(path.string());
     const FileHeader header = read_compiled_header(file);
     (void)validate_compiled_file_sections(header, file.size());
-
     CompiledDatasetInfo info;
     info.path = path;
     info.image_count = header.num_images;
@@ -239,5 +205,4 @@ inline CompiledDatasetInfo inspect_compiled_dataset(const std::filesystem::path&
     info.class_catalog = std::make_shared<const catalog::ClassCatalog>(compiled_class_catalog(header));
     return info;
 }
-
 }  // namespace mmltk::backend::data

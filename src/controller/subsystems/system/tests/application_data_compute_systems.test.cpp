@@ -9,10 +9,10 @@
 #include "src/acceptance/tests/async_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <cuda.h>
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/image_failure.h"
-
 #include <atomic>
 #include <algorithm>
 #include <array>
@@ -38,7 +38,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 #include "filesystem_test_utils.hpp"
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/controller/contracts/default_state.h"
@@ -59,17 +58,13 @@
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-
 using namespace mmltk::controller::test_support;
-
 namespace mmltk::controller {
 namespace {
-
 TEST_CASE("Predict revision capacity preserves cancellation and terminal observations", "[controller][systems][predict]") {
     using Revision = detail::PredictRevision;
     constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-    for (std::uint64_t reserved = 0U; reserved <= 5U; ++reserved)
-        CHECK_THROWS_AS(Revision::Admit(maximum - reserved), contracts::FailedError);
+    for (std::uint64_t reserved = 0U; reserved <= 5U; ++reserved) CHECK_THROWS_AS(Revision::Admit(maximum - reserved), contracts::FailedError);
     const auto admitted = Revision::Admit(maximum - 7U);
     REQUIRE(admitted == maximum - 6U);
     const auto progressed = Revision::Progress(admitted, false);
@@ -94,25 +89,16 @@ TEST_CASE("Predict revision capacity preserves cancellation and terminal observa
     REQUIRE(earlier_cancel == maximum - 5U);
     CHECK(Revision::Progress(*earlier_cancel, true) == maximum - 4U);
 }
-
 class TrainingTerminals final {
    public:
     using Event = TrainingSystem::event_type;
-
     void Publish(Event event) {
         switch (next_.fetch_add(1U)) {
-            case 0U:
-                first_.set_value(std::move(event));
-                break;
-            case 1U:
-                second_.set_value(std::move(event));
-                break;
-            default:
-                third_.set_value(std::move(event));
-                break;
+            case 0U: first_.set_value(std::move(event)); break;
+            case 1U: second_.set_value(std::move(event)); break;
+            default: third_.set_value(std::move(event)); break;
         }
     }
-
     [[nodiscard]] std::future<Event> First() { return first_.get_future(); }
     [[nodiscard]] std::future<Event> Second() { return second_.get_future(); }
     [[nodiscard]] std::future<Event> Third() { return third_.get_future(); }
@@ -123,7 +109,6 @@ class TrainingTerminals final {
     std::promise<Event> third_;
     std::atomic_size_t next_ = 0U;
 };
-
 void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesystem::path& root) {
     const auto settings_path = root / "settings.json";
     REQUIRE(std::filesystem::remove(settings_path));
@@ -136,22 +121,19 @@ void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesyst
     CHECK_THROWS_AS(settings.Update(std::move(request)), contracts::FailedError);
     CHECK_FALSE(settings.snapshot().settings_state.ui.dark_mode);
 }
-
-[[nodiscard]] contracts::ModelSelection export_model_selection(const contracts::GuiSettingsState& settings,
-                                                               const contracts::ModelArtifactInputKind input, std::string artifact) {
+[[nodiscard]] contracts::ModelSelection export_model_selection(const contracts::GuiSettingsState& settings, const contracts::ModelArtifactInputKind input,
+                                                               std::string artifact) {
     auto projection = contracts::model_settings_projection(settings, contracts::FeatureId::Export);
     REQUIRE(projection);
     projection->key.source = contracts::ModelSelectionSource::Custom;
     projection->key.input = input;
     return {.key = std::move(projection->key), .artifact = std::move(artifact)};
 }
-
 [[nodiscard]] contracts::ModelSelection selected_model(const contracts::GuiSettingsState& settings, const contracts::FeatureId workflow) {
     const auto input = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, workflow);
     REQUIRE(input);
     return {.key = input->key, .artifact = input->custom_artifact};
 }
-
 TEST_CASE("export materialization keeps ONNX branch input and output identities disjoint", "[controller][systems][compute][export]") {
     auto settings = contracts::default_gui_settings_state();
     settings.workflows.train.request.train_compiled_path = "/tmp/train.bin";
@@ -174,7 +156,6 @@ TEST_CASE("export materialization keeps ONNX branch input and output identities 
     const auto& engine_request = std::get<mmltk::backend::models::rfdetr::BuildEngineRequest>(*engine);
     CHECK(engine_request.onnx_path == "/tmp/source.onnx");
     CHECK(engine_request.output_path == "/tmp/exported.engine");
-
     settings.workflows.export_state.build_tensorrt = false;
     settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Weights;
     const auto weight_model =
@@ -189,7 +170,6 @@ TEST_CASE("export materialization keeps ONNX branch input and output identities 
     CHECK(settings.workflows.export_state.onnx_input_path == "/tmp/source.onnx");
     CHECK(settings.workflows.export_state.onnx_output_path == "/tmp/exported.onnx");
 }
-
 TEST_CASE("model keys separate workflow artifacts from dataset splits and reject stale settings", "[controller][systems][compute][model]") {
     auto settings = contracts::default_gui_settings_state();
     settings.workflows.train.request.train_compiled_path = "/tmp/train.bin";
@@ -216,7 +196,6 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
         .splits = {split("/tmp/train.bin"), split("/tmp/val.bin")},
         .detail = {},
     };
-
     const auto train = selected_model(settings, contracts::FeatureId::Train);
     const auto train_request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, train);
     REQUIRE(train_request);
@@ -230,7 +209,6 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     CHECK(resumed->resume_path == train.artifact);
     resume_settings.workflows.train.request.resume_path = "/tmp/other-checkpoint.pt";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(resume_settings, inspection, train));
-
     const auto validation = selected_model(settings, contracts::FeatureId::Validate);
     const auto validation_request = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, validation);
     REQUIRE(validation_request);
@@ -239,13 +217,11 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     CHECK(validation_request->onnx_path == "/tmp/validate.onnx");
     CHECK(validation_request->eval_order == "onnx");
     CHECK(validation_request->tensorrt_path.empty());
-
     const auto predict = selected_model(settings, contracts::FeatureId::Predict);
     const auto predict_request = subsystems::system::ComputeIntentMaterializer::Predict(settings, inspection, predict);
     REQUIRE(predict_request);
     CHECK(predict_request->compiled_path == "/tmp/train.bin");
     CHECK(predict_request->weights_path == "/tmp/predict.pt");
-
     auto stale = settings;
     stale.workflows.predict.request.preset_name = "rf-detr-small";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(stale, inspection, predict));
@@ -263,7 +239,6 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     inconsistent.splits[1].class_names[0].value = "different";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inconsistent, train));
 }
-
 TEST_CASE("compute inputs retain normalized full-path identity and image independence", "[controller][systems][compute]") {
     auto settings = contracts::default_gui_settings_state();
     settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
@@ -273,8 +248,8 @@ TEST_CASE("compute inputs retain normalized full-path identity and image indepen
     settings.workflows.validate.request.tensorrt_path = "/stale/model.engine";
     settings.workflows.validate.request.save_engine_path = "/stale/generated.engine";
     auto selection = selected_model(settings, contracts::FeatureId::Validate);
-    const contracts::ArtifactInspection inspected{.compatible = true,
-        .splits = {split("/first/compiled.mmltk"), split("/second/compiled.mmltk")}, .detail = {}};
+    const contracts::ArtifactInspection inspected{
+        .compatible = true, .splits = {split("/first/compiled.mmltk"), split("/second/compiled.mmltk")}, .detail = {}};
     const auto validation = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspected, selection);
     REQUIRE(validation);
     CHECK(validation->compiled_path == "/second/compiled.mmltk");
@@ -284,7 +259,6 @@ TEST_CASE("compute inputs retain normalized full-path identity and image indepen
     CHECK(validation->save_engine_path.empty());
     settings.workflows.validate.request.compiled_path = "/third/compiled.mmltk";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Validation(settings, inspected, selection));
-
     settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
     settings.workflows.predict.request.weights_path = "/selected/model.pt";
     settings.workflows.predict.source.kind = contracts::SourceKind::SingleImage;
@@ -314,7 +288,6 @@ TEST_CASE("compute inputs retain normalized full-path identity and image indepen
     settings.workflows.predict.source.compiled_path.clear();
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Predict(settings, inspected, selection));
 }
-
 TEST_CASE("model input materialization exhausts the canonical compatibility catalog", "[controller][systems][compute][model]") {
     const auto check_case = [](const contracts::FeatureId workflow, const contracts::ModelSelectionSource source,
                                const contracts::ModelArtifactInputKind selected_input, const bool build_tensorrt) {
@@ -329,25 +302,17 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
             .input = selected_input,
         };
         switch (workflow) {
-            case contracts::FeatureId::Train:
-                contracts::apply_model_artifacts(settings.workflows.train, artifacts);
-                break;
-            case contracts::FeatureId::Validate:
-                contracts::apply_model_artifacts(settings.workflows.validate, artifacts);
-                break;
-            case contracts::FeatureId::Predict:
-                contracts::apply_model_artifacts(settings.workflows.predict, artifacts);
-                break;
+            case contracts::FeatureId::Train: contracts::apply_model_artifacts(settings.workflows.train, artifacts); break;
+            case contracts::FeatureId::Validate: contracts::apply_model_artifacts(settings.workflows.validate, artifacts); break;
+            case contracts::FeatureId::Predict: contracts::apply_model_artifacts(settings.workflows.predict, artifacts); break;
             case contracts::FeatureId::Export:
                 settings.workflows.export_state.build_tensorrt = build_tensorrt;
                 contracts::apply_model_artifacts(settings.workflows.export_state, artifacts);
                 break;
             case contracts::FeatureId::Annotate:
             case contracts::FeatureId::Live:
-            case contracts::FeatureId::Explore:
-                FAIL("test case requires a ModelSystem workflow");
+            case contracts::FeatureId::Explore: FAIL("test case requires a ModelSystem workflow");
         }
-
         settings.workflows.train.request.class_layout_path = "/tmp/train.classes.json";
         settings.workflows.validate.request.class_layout_path = "/tmp/validate.classes.json";
         settings.workflows.predict.request.class_layout_path = "/tmp/predict.classes.json";
@@ -359,9 +324,10 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
         CHECK(projection->key.input == selected_input);
         CHECK(projection->key.preset == contracts::kDefaultModelPresetName);
         CHECK(projection->key.resolution == contracts::kDefaultModelResolution);
-        const std::string workflow_name = workflow == contracts::FeatureId::Train ? "train" :
-                                          workflow == contracts::FeatureId::Validate ? "validate" :
-                                          workflow == contracts::FeatureId::Predict ? "predict" : "export";
+        const std::string workflow_name = workflow == contracts::FeatureId::Train      ? "train"
+                                          : workflow == contracts::FeatureId::Validate ? "validate"
+                                          : workflow == contracts::FeatureId::Predict  ? "predict"
+                                                                                       : "export";
         CHECK(projection->key.class_layout_path == "/tmp/" + workflow_name + ".classes.json");
         CHECK(projection->export_build_tensorrt == build_tensorrt);
         // Distinct raw drafts prove source meaning independently of relation-fed fixtures.
@@ -378,13 +344,11 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
         REQUIRE(draft_projection);
         CHECK(draft_projection->key.preset == workflow_name + "-draft");
         CHECK(draft_projection->key.resolution == 100U + static_cast<std::uint32_t>(workflow));
-
         const auto* compatibility = workflow == contracts::FeatureId::Export
                                         ? contracts::find_model_selection_compatibility(workflow, selected_input, build_tensorrt)
                                         : contracts::find_model_selection_compatibility(workflow, selected_input);
         const bool expected = selected_input != contracts::ModelArtifactInputKind::None && compatibility != nullptr &&
                               contracts::model_selection_source_allowed(*compatibility, source);
-
         CAPTURE(workflow, source, selected_input, build_tensorrt);
         const auto result = subsystems::system::ComputeIntentMaterializer::ModelInputFor(settings, workflow);
         CHECK(result.has_value() == expected);
@@ -402,21 +366,13 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
             CHECK(result->custom_artifact.empty());
         } else {
             switch (selected_input) {
-                case contracts::ModelArtifactInputKind::Weights:
-                    CHECK(result->custom_artifact == artifacts.weights_path);
-                    break;
-                case contracts::ModelArtifactInputKind::Onnx:
-                    CHECK(result->custom_artifact == artifacts.onnx_path);
-                    break;
-                case contracts::ModelArtifactInputKind::TensorRt:
-                    CHECK(result->custom_artifact == artifacts.tensorrt_path);
-                    break;
-                case contracts::ModelArtifactInputKind::None:
-                    FAIL("materialized model input cannot be None");
+                case contracts::ModelArtifactInputKind::Weights: CHECK(result->custom_artifact == artifacts.weights_path); break;
+                case contracts::ModelArtifactInputKind::Onnx: CHECK(result->custom_artifact == artifacts.onnx_path); break;
+                case contracts::ModelArtifactInputKind::TensorRt: CHECK(result->custom_artifact == artifacts.tensorrt_path); break;
+                case contracts::ModelArtifactInputKind::None: FAIL("materialized model input cannot be None");
             }
         }
     };
-
     for (const auto workflow : {contracts::FeatureId::Train, contracts::FeatureId::Validate, contracts::FeatureId::Predict}) {
         for (const auto source : {contracts::ModelSelectionSource::Canonical, contracts::ModelSelectionSource::Custom}) {
             for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx,
@@ -433,19 +389,17 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
             }
         }
     }
-
     auto unsupported = contracts::default_gui_settings_state();
     for (const auto workflow : {contracts::FeatureId::Annotate, contracts::FeatureId::Live, contracts::FeatureId::Explore}) {
         const auto rejected = subsystems::system::ComputeIntentMaterializer::ModelInputFor(unsupported, workflow);
         REQUIRE_FALSE(rejected);
         CHECK(rejected.error().detail == "workflow does not support model selection");
     }
-    const auto malformed = subsystems::system::ComputeIntentMaterializer::ModelInputFor(
-        unsupported, static_cast<contracts::FeatureId>(std::numeric_limits<std::uint8_t>::max()));
+    const auto malformed =
+        subsystems::system::ComputeIntentMaterializer::ModelInputFor(unsupported, static_cast<contracts::FeatureId>(std::numeric_limits<std::uint8_t>::max()));
     REQUIRE_FALSE(malformed);
     CHECK(malformed.error().detail == "model selection is incomplete");
 }
-
 [[nodiscard]] contracts::ProviderOffer provider_offer() {
     return {.offer_id = 17,
             .gpu_name = "A100",
@@ -456,15 +410,17 @@ TEST_CASE("model input materialization exhausts the canonical compatibility cata
             .location = "US",
             .family = contracts::ProviderGpuFamily::A100};
 }
-
 class UnsafePredictRuntime final : public PredictRuntime {
    public:
     UnsafePredictRuntime(bool on_close, std::shared_ptr<int> custody, bool preview_terminal = false)
         : on_close_(on_close), preview_terminal_(preview_terminal), custody_(std::move(custody)) {}
-    void Close() noexcept override { ++*custody_; unsafe_ = true; }
+    void Close() noexcept override {
+        ++*custody_;
+        unsafe_ = true;
+    }
     [[nodiscard]] bool HasUnsafeCustody() const noexcept override { return unsafe_; }
-    contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token,
-        const ComputeProgressSink&, const ProductSink&, const PlaybackGate&, VisualExtent, const ContextProvider&, const PreviewRetirement& retirement) override {
+    contracts::ComputeTerminal Run(mmltk::backend::models::rfdetr::PredictRequest, std::stop_token, const ComputeProgressSink&, const ProductSink&,
+                                   const PlaybackGate&, VisualExtent, const ContextProvider&, const PreviewRetirement& retirement) override {
         if (preview_terminal_) {
             auto lease = mmltk::frameworks::gpu::ReserveTerminalCudaLease(*retirement);
             auto retained = custody_;
@@ -474,17 +430,16 @@ class UnsafePredictRuntime final : public PredictRuntime {
         unsafe_ = !on_close_;
         throw std::runtime_error("test prediction failure");
     }
+
    private:
     bool on_close_;
     bool preview_terminal_;
     bool unsafe_ = false;
     std::shared_ptr<int> custody_;
 };
-
 class FakeDialogRuntime final : public FileDialogRuntime {
    public:
     FakeDialogRuntime(std::shared_ptr<StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
-
     services::FileDialogSelection Open(const services::ResolvedFileDialog& dialog, const std::stop_token stop) override {
         if (!gate_->Wait(stop)) return {.target = dialog.target};
         if (fail_) throw contracts::FailedError("file dialog failed");
@@ -495,16 +450,14 @@ class FakeDialogRuntime final : public FileDialogRuntime {
     std::shared_ptr<StopGate> gate_;
     bool fail_ = false;
 };
-
 class FakeTrainingRuntime final : public TrainingRuntime {
    public:
     FakeTrainingRuntime(std::shared_ptr<StopGate> gate, const bool fail, const bool inconclusive = false)
         : gate_(std::move(gate)), fail_(fail), inconclusive_(inconclusive) {}
-
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, const std::stop_token stop,
                                      const std::function<void(const services::TrainProcessProgress&)>& progress) override {
         progress({.progress = fail_ ? contracts::ComputeProgress{.sequence = 0U, .status = std::string(contracts::kComputeStatusCapacity + 1U, 'x')}
-                       : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 1U, .status = "trained"}});
+                                    : contracts::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 1U, .status = "trained"}});
         if (!gate_->Wait(stop)) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
         if (fail_)
             return {.outcome = static_cast<contracts::ComputeOperationOutcome>(255U),
@@ -512,7 +465,6 @@ class FakeTrainingRuntime final : public TrainingRuntime {
                     .detail = {}};
         return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
     }
-
     contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, const std::stop_token stop) override {
         if (!gate_->Wait(stop)) return {.outcome = contracts::ProviderQueryOutcome::Cancelled};
         if (fail_)
@@ -521,9 +473,8 @@ class FakeTrainingRuntime final : public TrainingRuntime {
                     .detail = std::string(contracts::kProviderDetailCapacity + 1U, 'x')};
         return {.outcome = contracts::ProviderQueryOutcome::Succeeded, .offers = {provider_offer()}};
     }
-
-    contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&,
-                                           contracts::ProviderOfferIdentity, int, std::string_view, std::stop_token) override {
+    contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity, int,
+                                           std::string_view, std::stop_token) override {
         if (inconclusive_) return contracts::provider_effect_inconclusive("provider result is unknown");
         return {.disposition = contracts::ProviderReconciliationDisposition::Applied, .instance_id = 41};
     }
@@ -536,26 +487,21 @@ class FakeTrainingRuntime final : public TrainingRuntime {
     bool fail_ = false;
     bool inconclusive_ = false;
 };
-
-[[nodiscard]] TrainingSystem::RuntimeFactory reconstructing_training_runtime(std::shared_ptr<StopGate>& gate,
-                                                                             std::atomic_size_t& constructions) {
+[[nodiscard]] TrainingSystem::RuntimeFactory reconstructing_training_runtime(std::shared_ptr<StopGate>& gate, std::atomic_size_t& constructions) {
     return [&gate, &constructions] {
         const bool fail = constructions++ == 0U;
         return std::make_unique<FakeTrainingRuntime>(gate, fail);
     };
 }
-
 struct QueryCancellationProbe final {
     std::promise<void> started;
     std::promise<void> cancellation_observed;
     std::promise<void> release;
     std::shared_future<void> released = release.get_future().share();
 };
-
 class BlockingCancellationTrainingRuntime final : public TrainingRuntime {
    public:
     explicit BlockingCancellationTrainingRuntime(std::shared_ptr<QueryCancellationProbe> probe) : probe_(std::move(probe)) {}
-
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
                                      const std::function<void(const services::TrainProcessProgress&)>&) override {
         return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
@@ -570,8 +516,8 @@ class BlockingCancellationTrainingRuntime final : public TrainingRuntime {
         probe_->released.wait();
         return {.outcome = contracts::ProviderQueryOutcome::Cancelled};
     }
-    contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&,
-                                           contracts::ProviderOfferIdentity, int, std::string_view, std::stop_token) override {
+    contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity, int,
+                                           std::string_view, std::stop_token) override {
         return contracts::provider_effect_not_applied("unused");
     }
     contracts::ProviderEffectResult Reconcile(const services::VastReconciliationRequest&, std::stop_token) override {
@@ -581,24 +527,21 @@ class BlockingCancellationTrainingRuntime final : public TrainingRuntime {
    private:
     std::shared_ptr<QueryCancellationProbe> probe_;
 };
-
 class UnusedWeightOperations final : public services::ArtifactWeightOperations {
    public:
     [[nodiscard]] std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { return std::nullopt; }
     void download(std::string_view, const std::filesystem::path&, const services::ArtifactCancellationToken&,
                   services::ArtifactWeightProgressObserver) const override {}
 };
-
 class DiagnosticCompiler final : public services::ArtifactCompilerOperations {
    private:
-    void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool,
-                           mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
+    void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::common::concurrency::CancellationObservation,
+                           services::ArtifactProgressObserver) const override {}
     void compile_benchmark(const std::filesystem::path&, std::uint32_t, bool, mmltk::common::concurrency::CancellationObservation,
                            services::ArtifactProgressObserver, services::ArtifactBenchmarkTraceObserver trace) const override {
         trace("benchmark.direct", R"({"records":1})");
     }
 };  // CLEANUP-IGNORE: Diagnostic compiler and blocking training runtime are separate typed dependency fakes.
-
 class BlockingRemoteRuntime final : public TrainingRuntime {
    public:
     explicit BlockingRemoteRuntime(std::shared_ptr<StopGate> remote_gate) : remote_gate_(std::move(remote_gate)) {}
@@ -609,8 +552,8 @@ class BlockingRemoteRuntime final : public TrainingRuntime {
     contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) override {
         return {.outcome = contracts::ProviderQueryOutcome::Succeeded, .offers = {provider_offer()}};
     }
-    contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&,
-                                           contracts::ProviderOfferIdentity, int, std::string_view, const std::stop_token stop) override {
+    contracts::ProviderEffectResult Mutate(contracts::ProviderMutation, const contracts::ProviderPreferences&, contracts::ProviderOfferIdentity, int,
+                                           std::string_view, const std::stop_token stop) override {
         const bool released = remote_gate_->Wait(stop);
         if (!released || stop.stop_requested()) return contracts::provider_effect_not_applied("remote effect cancelled", true);
         return {.disposition = contracts::ProviderReconciliationDisposition::Applied, .instance_id = 41};
@@ -622,7 +565,6 @@ class BlockingRemoteRuntime final : public TrainingRuntime {
    private:
     std::shared_ptr<StopGate> remote_gate_;
 };
-
 TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, and reconstruction", "[controller][systems][services]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-services");
     std::size_t settings_events = 0U;
@@ -637,7 +579,6 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
     CHECK(explore_preferences.filter.minimum_compiled_index == 0U);
     CHECK(explore_preferences.filter.maximum_compiled_index == std::numeric_limits<std::uint64_t>::max());
     CHECK(explore_preferences.overlay.class_selection.mode == ExploreClassSelectionMode::All);
-
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0U;
     std::promise<FileDialogSystem::event_type> first_completion;
@@ -650,15 +591,9 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
                             },
                             [&](FileDialogSystem::event_type event) {
                                 switch (completions++) {
-                                    case 0U:
-                                        first_completion.set_value(std::move(event));
-                                        throw std::runtime_error("observer failure");
-                                    case 1U:
-                                        second_completion.set_value(std::move(event));
-                                        break;
-                                    default:
-                                        third_completion.set_value(std::move(event));
-                                        break;
+                                    case 0U: first_completion.set_value(std::move(event)); throw std::runtime_error("observer failure");
+                                    case 1U: second_completion.set_value(std::move(event)); break;
+                                    default: third_completion.set_value(std::move(event)); break;
                                 }
                             }};
     const services::FileDialogOpen selector{
@@ -678,7 +613,6 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
     CHECK_FALSE(dialog.snapshot().active);
     CHECK(dialog.snapshot().valid());
     CHECK_FALSE(dialog.snapshot().selection);
-
     gate = std::make_shared<StopGate>();
     static_cast<void>(dialog.Open(selector));
     const auto stopping = dialog.Stop();
@@ -706,25 +640,20 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
     REQUIRE(dialog.snapshot().selection->selected());
     CHECK(std::get<services::FileDialogSelected>(dialog.snapshot().selection->result).path == "/tmp/input");
     CHECK(constructions == 2U);
-
 }
-
 TEST_CASE("production direct adapters reject unavailable physical dependencies", "[controller][systems][production-adapters]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-production-adapters");
     SettingsSystem settings;
     REQUIRE(settings.Load(install_settings(root)).applied());
-
     std::promise<FileDialogSystem::event_type> dialog_terminal;
     FileDialogSystem dialog{[&] { return std::make_unique<NativeFileDialogRuntime>(services::FileDialogClient{}, settings); },
                             [&](FileDialogSystem::event_type event) { dialog_terminal.set_value(std::move(event)); }};
     static_cast<void>(dialog.Open(services::FileDialogOpen{
         .target = services::FileDialogTarget{services::SettingsFieldTarget{services::file_dialog_catalog().entries().front().stable_id}}}));
     CHECK(std::holds_alternative<FileDialogFailed>(dialog_terminal.get_future().get()));
-
     ArtifactDatasetRuntime artifacts;
     const auto rejected = artifacts.Compile({}, {}, {});
     CHECK_FALSE(rejected.inspection.available());
-
     CHECK_THROWS_AS(CudaValidationRuntime(DirectComputeConfiguration{}), contracts::UnavailableError);
     CHECK_THROWS_AS(CudaExportRuntime(DirectComputeConfiguration{}), contracts::UnavailableError);
     CHECK_THROWS_AS(CudaPredictRuntime(DirectComputeConfiguration{}), contracts::UnavailableError);
@@ -732,7 +661,6 @@ TEST_CASE("production direct adapters reject unavailable physical dependencies",
     CHECK_THROWS_AS(training.Query(settings.provider_preferences(), {}), contracts::UnavailableError);
     CHECK_THROWS(training.Train({}, {}, {}));
 }
-
 TEST_CASE("provider result materialization enforces reflected bounds and identity", "[controller][systems][provider-materialization]") {
     services::VastOfferSummary offer;
     offer.offer_id = 7;
@@ -747,7 +675,6 @@ TEST_CASE("provider result materialization enforces reflected bounds and identit
     REQUIRE(valid.outcome == contracts::ProviderQueryOutcome::Succeeded);
     REQUIRE(valid.offers.size() == 1U);
     CHECK(valid.offers.front().offer_id == 7);
-
     offers.front().gpu_name.assign(129U, 'x');
     CHECK(services::materialize_provider_query_result(offers).outcome == contracts::ProviderQueryOutcome::Failed);
     offers.front() = offer;
@@ -763,7 +690,6 @@ TEST_CASE("provider result materialization enforces reflected bounds and identit
               {.outcome = contracts::ProviderQueryOutcome::Succeeded, .offers = {valid.offers.front(), valid.offers.front()}})
               .outcome == contracts::ProviderQueryOutcome::Failed);
 }
-
 TEST_CASE("artifact dataset runtime forwards only its configured diagnostics observer", "[controller][systems][dataset][diagnostics]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-dataset-diagnostics");
     UnusedWeightOperations weights;
@@ -775,21 +701,19 @@ TEST_CASE("artifact dataset runtime forwards only its configured diagnostics obs
                                                    .preset = "rf-detr-base",
                                                    .resolution = 560U,
                                                    .overwrite = true};
-    const auto diagnostics = services::ArtifactDiagnosticObserver{
-        .benchmark = {.context = &traces, .report = [](const void* context, std::string_view, std::string_view) noexcept {
-                          ++*const_cast<std::atomic_size_t*>(static_cast<const std::atomic_size_t*>(context));
-                      }}};
+    const auto diagnostics =
+        services::ArtifactDiagnosticObserver{.benchmark = {.context = &traces, .report = [](const void* context, std::string_view, std::string_view) noexcept {
+                                                               ++*const_cast<std::atomic_size_t*>(static_cast<const std::atomic_size_t*>(context));
+                                                           }}};
     ArtifactDatasetRuntime enabled{services::ArtifactStore{root / "cache", weights, compiler}, diagnostics};
     static_cast<void>(enabled.Compile(request, {}, {}));
     CHECK(traces == 1U);
-
     ArtifactDatasetRuntime disabled{services::ArtifactStore{root / "cache", weights, compiler}};
     auto disabled_request = request;
     disabled_request.output = root / "disabled";
     static_cast<void>(disabled.Compile(disabled_request, {}, {}));
     CHECK(traces == 1U);
 }
-
 TEST_CASE("local run linearizes Stop with admission and installed worker", "[controller][systems][run]") {
     direct::LocalRun run;
     std::promise<void> preparing;
@@ -821,7 +745,6 @@ TEST_CASE("local run linearizes Stop with admission and installed worker", "[con
     launch.get();
     CHECK(observed_stop.get_future().get());
     run.StopAndJoin();
-
     auto second_gate = std::make_shared<StopGate>();
     std::promise<void> second_started;
     std::promise<bool> second_cancelled;
@@ -839,7 +762,6 @@ TEST_CASE("local run linearizes Stop with admission and installed worker", "[con
     second_gate->Release();
     CHECK_FALSE(second_cancelled.get_future().get());
 }
-
 TEST_CASE("local run preserves admission after prepare throws", "[controller][systems][run]") {
     direct::LocalRun run;
     direct::LocalRun::Job rejected{
@@ -858,7 +780,6 @@ TEST_CASE("local run preserves admission after prepare throws", "[controller][sy
     });
     completed.get_future().wait();
 }
-
 TEST_CASE("settings serializes competing durable updates", "[controller][systems][settings]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-concurrent");
     SettingsSystem settings;
@@ -874,11 +795,9 @@ TEST_CASE("settings serializes competing durable updates", "[controller][systems
             ++applied;
         } catch (...) {}
     };
-    std::jthread first{
-        update, contracts::SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
-    std::jthread second{update,
-                        contracts::SettingsValueUpdate{.path = "ui.annotation_brush_radius",
-                                                       .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}}};
+    std::jthread first{update, contracts::SettingsValueUpdate{.path = "ui.dark_mode", .value = mmltk::frameworks::serialization::wire::FlatValue{true}}};
+    std::jthread second{update, contracts::SettingsValueUpdate{.path = "ui.annotation_brush_radius",
+                                                               .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}}};
     start.arrive_and_wait();
     first.join();
     second.join();
@@ -888,13 +807,10 @@ TEST_CASE("settings serializes competing durable updates", "[controller][systems
     CHECK(snapshot.settings_state.ui.dark_mode);
     CHECK(snapshot.settings_state.ui.annotation_brush_radius == 9);
 }
-
 TEST_CASE("settings rejects empty updates without persisting and accepts relation clears", "[controller][systems][settings]") {
     using TrainRequest = mmltk::backend::models::rfdetr::TrainRequest;
-    using TrainRecipeRelation =
-        mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
+    using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
     constexpr auto lr = mmltk::frameworks::reflection::member_path<&TrainRequest::lr>;
-
     const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-empty-update");
     const services::SettingsLocation location{(root / "gui.json").string()};
     std::size_t events = 0U;
@@ -902,15 +818,12 @@ TEST_CASE("settings rejects empty updates without persisting and accepts relatio
     REQUIRE(settings.Load(location).applied());
     const auto before = settings.snapshot();
     const auto events_before = events;
-
     CHECK_THROWS_AS(settings.Update({}), contracts::InvalidIntentError);
     CHECK(settings.snapshot() == before);
     CHECK(events == events_before);
-
     SettingsSystem reloaded;
     REQUIRE(reloaded.Load(location).applied());
     CHECK(reloaded.snapshot() == before);
-
     contracts::SettingsUpdateRequest pin;
     pin.updates.emplace_back(contracts::SettingsValueUpdate{
         .path = "workflows.train.request.lr",
@@ -918,7 +831,6 @@ TEST_CASE("settings rejects empty updates without persisting and accepts relatio
     });
     const auto pinned = settings.Update(std::move(pin));
     CHECK(TrainRecipeRelation::template overridden<lr>(pinned.settings_state.workflows.train.request.recipe_overrides));
-
     contracts::SettingsUpdateRequest clear;
     clear.updates.emplace_back(contracts::SettingsValueUpdate{
         .path = "workflows.train.request.lr",
@@ -930,14 +842,12 @@ TEST_CASE("settings rejects empty updates without persisting and accepts relatio
     CHECK(cleared.settings_state.workflows.train.request.lr ==
           mmltk::backend::models::rfdetr::train_recipe(cleared.settings_state.workflows.train.request.optimizer).lr);
 }
-
 TEST_CASE("Explore catalog identity changes only through successful catalog persistence", "[controller][systems][settings][explore]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-explore-catalog");
     const auto location = install_settings(root);
     SettingsSystem settings;
     REQUIRE(settings.Load(location).applied());
     const auto before = settings.snapshot();
-
     contracts::SettingsUpdateRequest request;
     request.updates.emplace_back(contracts::SettingsValueUpdate{
         .path = "workflows.explore.class_catalog_identity",
@@ -945,24 +855,20 @@ TEST_CASE("Explore catalog identity changes only through successful catalog pers
     });
     CHECK_THROWS_AS(settings.Update(std::move(request)), contracts::InvalidIntentError);
     CHECK(settings.snapshot() == before);
-
     constexpr ExploreClassCatalogIdentity identity = 0x9123'4567'89ab'cdefULL;
     const auto candidate = settings.explore_settings_candidate();
     settings.persist_explore_class_catalog(candidate, identity, candidate.preferences.policy);
     CHECK(settings.snapshot().settings_state.workflows.explore.class_catalog_identity == identity);
-
     SettingsSystem reloaded;
     REQUIRE(reloaded.Load(location).applied());
     CHECK(reloaded.snapshot().settings_state.workflows.explore.class_catalog_identity == identity);
 }
-
 TEST_CASE("successful Explore catalog persistence includes a pending Settings recovery", "[controller][systems][settings][explore]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-explore-catalog-pending");
     const auto location = install_settings(root);
     SettingsSystem settings;
     REQUIRE(settings.Load(location).applied());
     queue_failed_dark_mode_update(settings, root);
-
     REQUIRE(std::filesystem::remove(root / "settings.json"));
     constexpr ExploreClassCatalogIdentity identity = 0x1234'5678U;
     const auto candidate = settings.explore_settings_candidate();
@@ -970,12 +876,10 @@ TEST_CASE("successful Explore catalog persistence includes a pending Settings re
     const auto committed = settings.snapshot();
     CHECK(committed.settings_state.ui.dark_mode);
     CHECK(committed.settings_state.workflows.explore.class_catalog_identity == identity);
-
     SettingsSystem reloaded;
     REQUIRE(reloaded.Load(location).applied());
     CHECK(reloaded.snapshot() == committed);
 }
-
 TEST_CASE("failed Explore catalog persistence preserves the exact pending Settings recovery", "[controller][systems][settings][explore]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-explore-catalog-retry");
     const auto location = install_settings(root);
@@ -984,20 +888,16 @@ TEST_CASE("failed Explore catalog persistence preserves the exact pending Settin
     queue_failed_dark_mode_update(settings, root);
     constexpr ExploreClassCatalogIdentity rejected_identity = 0x8765'4321U;
     const auto candidate = settings.explore_settings_candidate();
-    CHECK_THROWS_AS(settings.persist_explore_class_catalog(candidate, rejected_identity, candidate.preferences.policy),
-                    contracts::FailedError);
-
+    CHECK_THROWS_AS(settings.persist_explore_class_catalog(candidate, rejected_identity, candidate.preferences.policy), contracts::FailedError);
     REQUIRE(std::filesystem::remove(root / "settings.json"));
     REQUIRE(settings.Retry().applied());
     const auto recovered = settings.snapshot();
     CHECK(recovered.settings_state.ui.dark_mode);
     CHECK(recovered.settings_state.workflows.explore.class_catalog_identity == 0U);
-
     SettingsSystem reloaded;
     REQUIRE(reloaded.Load(location).applied());
     CHECK(reloaded.snapshot() == recovered);
 }
-
 TEST_CASE("settings retry cannot overwrite a newer committed update", "[controller][systems][settings]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-settings-retry");
     std::atomic_bool block_changed = false;
@@ -1013,12 +913,11 @@ TEST_CASE("settings retry cannot overwrite a newer committed update", "[controll
     REQUIRE(settings.Load(install_settings(root)).applied());
     queue_failed_dark_mode_update(settings, root);
     REQUIRE(std::filesystem::remove(root / "settings.json"));
-
     block_changed = true;
     std::jthread update{[&] {
         contracts::SettingsUpdateRequest request;
-        request.updates.emplace_back(contracts::SettingsValueUpdate{
-            .path = "ui.annotation_brush_radius", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}});
+        request.updates.emplace_back(
+            contracts::SettingsValueUpdate{.path = "ui.annotation_brush_radius", .value = mmltk::frameworks::serialization::wire::FlatValue{std::int64_t{9}}});
         static_cast<void>(settings.Update(std::move(request)));
     }};
     update_committed.get_future().wait();
@@ -1036,9 +935,7 @@ TEST_CASE("settings retry cannot overwrite a newer committed update", "[controll
     CHECK_FALSE(snapshot.settings_state.ui.dark_mode);
     CHECK(snapshot.settings_state.ui.annotation_brush_radius == 9);
 }
-
-TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and reconstructs after failure",
-          "[controller][systems][dataset]") {
+TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and reconstructs after failure", "[controller][systems][dataset]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-dataset");
     SettingsSystem settings;
     REQUIRE(settings.Load(install_settings(root)).applied());
@@ -1059,15 +956,9 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
                                   ++progress;
                               else {
                                   switch (terminals++) {
-                                      case 0U:
-                                          first_terminal.set_value(std::move(event));
-                                          break;
-                                      case 1U:
-                                          second_terminal.set_value(std::move(event));
-                                          break;
-                                      default:
-                                          third_terminal.set_value(std::move(event));
-                                          break;
+                                      case 0U: first_terminal.set_value(std::move(event)); break;
+                                      case 1U: second_terminal.set_value(std::move(event)); break;
+                                      default: third_terminal.set_value(std::move(event)); break;
                                   }
                               }
                           }};
@@ -1082,7 +973,6 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
     CHECK(std::get<DatasetChanged>(failed_dataset).snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
     CHECK(progress == 0U);
     CHECK_FALSE(dataset.snapshot().active);
-
     gate = std::make_shared<StopGate>();
     static_cast<void>(dataset.Compile({}));
     static_cast<void>(dataset.Stop());
@@ -1094,7 +984,6 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
     CHECK(dataset.snapshot().terminal.outcome == contracts::ArtifactTerminalOutcome::Succeeded);
     CHECK(constructions == 2U);
 }
-
 TEST_CASE("dataset rejects Compile and a second Inspect while Inspect owns the runtime", "[controller][systems][dataset][admission]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-dataset-inspect-admission");
     SettingsSystem settings;
@@ -1113,13 +1002,11 @@ TEST_CASE("dataset rejects Compile and a second Inspect while Inspect owns the r
     const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity> paths{root / "train.bin", {}, {}};
     auto inspecting = std::async(std::launch::async, [&] { return dataset.Inspect(paths, "rf-detr-base", 560U); });
     observation->inspect_started.get_future().wait();
-
     CHECK_THROWS_AS(dataset.Compile({}), contracts::BusyError);
     CHECK_THROWS_AS(dataset.Inspect(paths, "rf-detr-base", 560U), contracts::BusyError);
     CHECK(constructions == 1);
     CHECK(observation->compile_calls == 0);
     CHECK(observation->maximum_active_calls == 1);
-
     observation->inspect_gate->Release();
     CHECK(inspecting.get().available());
     static_cast<void>(dataset.Compile({}));
@@ -1127,14 +1014,11 @@ TEST_CASE("dataset rejects Compile and a second Inspect while Inspect owns the r
     CHECK(observation->compile_calls == 1);
     CHECK(observation->maximum_active_calls == 1);
 }
-
 TEST_CASE("checked operation identity advancement refuses exhaustion", "[controller][systems][identity]") {
     CHECK_FALSE(contracts::next_compute_generation(std::numeric_limits<std::uint64_t>::max()));
     CHECK(contracts::next_compute_generation(0U) == 1U);
 }
-
-TEST_CASE("model selection shutdown cancels and joins one active acquisition without publishing a selection",
-          "[controller][systems][model]") {
+TEST_CASE("model selection shutdown cancels and joins one active acquisition without publishing a selection", "[controller][systems][model]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-model");
     SettingsSystem settings;
     REQUIRE(settings.Load(install_settings(root)).applied());
@@ -1169,14 +1053,11 @@ TEST_CASE("model selection shutdown cancels and joins one active acquisition wit
     CHECK(progress == 1U);
     CHECK_FALSE(malformed_progress);
 }
-
-TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and lazy runtime reconstruction",
-          "[controller][systems][compute]") {
+TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and lazy runtime reconstruction", "[controller][systems][compute]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-compute");
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel(contracts::FeatureId::Validate);
     auto [settings, dataset, model] = fixture.systems();
-
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0U;
     std::promise<ValidationSystem::event_type> first_terminal;
@@ -1196,15 +1077,9 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
                                                      // event stream; dataset events are validated independently above.
                                     else {
                                         switch (terminals++) {
-                                            case 0U:
-                                                first_terminal.set_value(std::move(event));
-                                                break;
-                                            case 1U:
-                                                second_terminal.set_value(std::move(event));
-                                                break;
-                                            default:
-                                                third_terminal.set_value(std::move(event));
-                                                break;
+                                            case 0U: first_terminal.set_value(std::move(event)); break;
+                                            case 1U: second_terminal.set_value(std::move(event)); break;
+                                            default: third_terminal.set_value(std::move(event)); break;
                                         }
                                     }
                                 }};
@@ -1218,7 +1093,6 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     CHECK(std::get<ValidationChanged>(failed_compute).snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
     CHECK(progress == 0U);
     CHECK_FALSE(validation.snapshot().operation.active);
-
     gate = std::make_shared<StopGate>();
     static_cast<void>(validation.Start({}));
     static_cast<void>(validation.Stop());
@@ -1246,18 +1120,24 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     CHECK(last.rows.front().category_name->value == std::string(mmltk::backend::data::catalog::kClassNameCapacity, 'z'));
     CHECK_THROWS_AS(validation.Details({measured.operation.generation_frontier, 0U, 0U}), contracts::InvalidIntentError);
     contracts::SettingsUpdateRequest edit;
-    edit.updates = {{.path = "workflows.validate.request.compiled_path", .value = (root / "later.bin").string()},
-                    {.path = "workflows.validate.request.weights_path", .value = (root / "later.pt").string()}};
+    edit.updates = {
+        {.path = "workflows.validate.request.compiled_path",
+         .value =
+             mmltk::frameworks::serialization::wire::FlatValue::text((root / "later.bin").string(), mmltk::frameworks::reflection::kMaximumPathBytes).value()},
+        {.path = "workflows.validate.request.weights_path",
+         .value =
+             mmltk::frameworks::serialization::wire::FlatValue::text((root / "later.pt").string(), mmltk::frameworks::reflection::kMaximumPathBytes).value()}};
     static_cast<void>(settings.Update(std::move(edit)));
     const auto retained = validation.Details({measured.operation.generation_frontier, 0U, 4U});
     REQUIRE(retained.rows.front().category_name);
     CHECK(retained.rows.front().category_name->value == "last in model");
     CHECK(retained.rows.back().category_name->value == "first in model");
-    CHECK_FALSE(retained.rows[1].available); // No-GT category still has its evaluated name.
+    CHECK_FALSE(retained.rows[1].available);  // No-GT category still has its evaluated name.
 }
-
-struct PredictReaderComposition final { SettingsSystem* settings; PredictSystem* predict; };
-
+struct PredictReaderComposition final {
+    SettingsSystem* settings;
+    PredictSystem* predict;
+};
 // Exercises real source observation/borrowing/paired metadata and Presentation
 // routing; this writer supplies publication receipts, not Firefox GPU acceptance.
 class PredictReaderWriter final : public PresentationNativeWriter {
@@ -1265,35 +1145,40 @@ class PredictReaderWriter final : public PresentationNativeWriter {
     explicit PredictReaderWriter(std::function<void()> pumped = {}) : pumped_(std::move(pumped)) {}
     void Submit(PresentationSubmittedSource submitted, const VisualSourceReader& reader) override {
         auto pixels = reader.borrow();
-        if (!visual_product_matches_frame(submitted.observation.frame, pixels) ||
-            !reader.image_metadata(submitted.observation.frame))
+        if (!visual_product_matches_frame(submitted.observation.frame, pixels) || !reader.image_metadata(submitted.observation.frame))
             throw std::runtime_error("Predict materialized reader lost its exact image");
         pending_ = submitted;
     }
     PresentationNativeOutcome Pump(std::uint64_t generation) override {
-        const mmltk::testsupport::ScopedTestCleanup notify{[&] { if (pumped_) pumped_(); }};
+        const mmltk::testsupport::ScopedTestCleanup notify{[&] {
+            if (pumped_) pumped_();
+        }};
         if (!pending_) return {};
         const auto submitted = *std::exchange(pending_, std::nullopt);
-        if (submitted.selection_generation != generation)
-            return {.progress = PresentationNativeProgress::Superseded, .submitted = submitted};
+        if (submitted.selection_generation != generation) return {.progress = PresentationNativeProgress::Superseded, .submitted = submitted};
         ++sequence_;
-        return {.progress = PresentationNativeProgress::Published, .submitted = submitted,
-            .publication = {.capability = {.surface_high = 1U, .surface_low = 1U,
-                .extent = submitted.observation.frame.extent, .generation = 1U,
-                .condition = PresentationCapabilityCondition::Ready},
-                .timeline_ready = sequence_, .presentation_revision = sequence_, .transfer_sequence = sequence_}};
+        return {.progress = PresentationNativeProgress::Published,
+                .submitted = submitted,
+                .publication = {.capability = {.surface_high = 1U,
+                                               .surface_low = 1U,
+                                               .extent = submitted.observation.frame.extent,
+                                               .generation = 1U,
+                                               .condition = PresentationCapabilityCondition::Ready},
+                                .timeline_ready = sequence_,
+                                .presentation_revision = sequence_,
+                                .transfer_sequence = sequence_}};
     }
     int poll_fd() const noexcept override { return -1; }
     int completion_fd() const noexcept override { return -1; }
     bool wants_write() const noexcept override { return false; }
     void SetExpectedBrowserProcessGroup(pid_t) override {}
     Retirement BrowserPeerLost() noexcept override { return Retirement::Released; }
+
    private:
     std::function<void()> pumped_;
     std::optional<PresentationSubmittedSource> pending_;
     std::uint64_t sequence_ = 0U;
 };
-
 TEST_CASE("Predict materialized routing keeps one producer across input changes and ordinary restart", "[controller][systems][predict][presentation]") {
     const bool invalid_first = GENERATE(false, true);
     const auto kind = GENERATE(contracts::SourceKind::CompiledDataset, contracts::SourceKind::SingleImage, contracts::SourceKind::VideoFile);
@@ -1301,12 +1186,14 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto [settings, dataset, model] = fixture.systems();
-    const auto field = kind == contracts::SourceKind::CompiledDataset ? "workflows.predict.source.compiled_path" :
-        kind == contracts::SourceKind::SingleImage ? "workflows.predict.source.single_image_path" : "workflows.predict.source.video_file_path";
+    const auto field = kind == contracts::SourceKind::CompiledDataset ? "workflows.predict.source.compiled_path"
+                       : kind == contracts::SourceKind::SingleImage   ? "workflows.predict.source.single_image_path"
+                                                                      : "workflows.predict.source.video_file_path";
     const auto select = [&](std::string path) {
         contracts::SettingsUpdateRequest update;
-        update.updates = {{.path = "workflows.predict.source.kind", .value = static_cast<std::int64_t>(kind)},
-                          {.path = field, .value = std::move(path)}};
+        update.updates = {
+            {.path = "workflows.predict.source.kind", .value = static_cast<std::int64_t>(kind)},
+            {.path = field, .value = mmltk::frameworks::serialization::wire::FlatValue::text(path, mmltk::frameworks::reflection::kMaximumPathBytes).value()}};
         static_cast<void>(settings.Update(std::move(update)));
     };
     select((root / "first.input").string());
@@ -1320,41 +1207,53 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
     std::uint64_t terminal_generation = 0U;
     PresentationSnapshot displayed;
     std::string routing_failure;
-    PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate, .fail = invalid_first && constructions++ == 0U}, .source_index = index}); },
-        [&](PredictSystem::event_type event) {
-            if (auto* presentation = route.load()) presentation->SourceChanged({PresentationSourceKind::Predict, 1U});
-            std::visit([&](const auto& value) {
-                if (!value.snapshot.operation.active) {
-                    std::scoped_lock lock(mutex);
-                    terminal_generation = std::max(terminal_generation, value.snapshot.operation.generation_frontier);
-                    changed.notify_all();
-                }
-            }, event);
-        }};
+    PredictSystem prediction{settings,
+                             dataset,
+                             model,
+                             {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+                             [&] {
+                                 return std::make_unique<FakePredictRuntime>(
+                                     PredictionScenario{.compute = {.gate = gate, .fail = invalid_first && constructions++ == 0U}, .source_index = index});
+                             },
+                             [&](PredictSystem::event_type event) {
+                                 if (auto* presentation = route.load()) presentation->SourceChanged({PresentationSourceKind::Predict, 1U});
+                                 std::visit(
+                                     [&](const auto& value) {
+                                         if (!value.snapshot.operation.active) {
+                                             std::scoped_lock lock(mutex);
+                                             terminal_generation = std::max(terminal_generation, value.snapshot.operation.generation_frontier);
+                                             changed.notify_all();
+                                         }
+                                     },
+                                     event);
+                             }};
     const auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
     REQUIRE(readers.size() == 1U);
     CHECK((readers[0].source == PresentationSourceIdentity{PresentationSourceKind::Predict, 1U}));
     CHECK_FALSE(prediction.ObserveSource().valid());
     CHECK(prediction.ObserveSource() == readers[0].observe());
     PresentationSystem presentation{{.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [] { return std::make_unique<PredictReaderWriter>(); }, readers,
-        [&](PresentationSystem::event_type event) {
-            std::scoped_lock lock(mutex);
-            if (const auto* completed = std::get_if<PresentationCompleted>(&event)) displayed = completed->snapshot;
-            if (const auto* failure = std::get_if<PresentationFailed>(&event)) routing_failure = failure->detail;
-            changed.notify_all();
-        }};
+                                    [] { return std::make_unique<PredictReaderWriter>(); },
+                                    readers,
+                                    [&](PresentationSystem::event_type event) {
+                                        std::scoped_lock lock(mutex);
+                                        if (const auto* completed = std::get_if<PresentationCompleted>(&event)) displayed = completed->snapshot;
+                                        if (const auto* failure = std::get_if<PresentationFailed>(&event)) routing_failure = failure->detail;
+                                        changed.notify_all();
+                                    }};
     route = &presentation;
-    const mmltk::testsupport::ScopedTestCleanup stop{[&] { prediction.Shutdown(); route = nullptr; }};
+    const mmltk::testsupport::ScopedTestCleanup stop{[&] {
+        prediction.Shutdown();
+        route = nullptr;
+    }};
     static_cast<void>(presentation.Select(readers[0].source));
     const auto run = [&](bool expect_image) {
         const auto previous = prediction.ObserveSource().frame.revision;
         const auto admitted = prediction.Start({});
         std::unique_lock lock(mutex);
         REQUIRE(changed.wait_for(lock, std::chrono::seconds{2}, [&] {
-            return !routing_failure.empty() || (terminal_generation >= admitted.operation.generation_frontier &&
-                (!expect_image || displayed.completed.revision > previous));
+            return !routing_failure.empty() ||
+                   (terminal_generation >= admitted.operation.generation_frontier && (!expect_image || displayed.completed.revision > previous));
         }));
         REQUIRE(routing_failure.empty());
         lock.unlock();
@@ -1384,7 +1283,6 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
         CHECK((next.content_identity == same.content_identity) == (kind == contracts::SourceKind::VideoFile));
     }
 }
-
 TEST_CASE("Predict compact publication and source observation do not reread retained labels", "[controller][systems][predict][presentation]") {
     ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-compact-progress")};
     fixture.PrepareModel(contracts::FeatureId::Predict);
@@ -1400,13 +1298,22 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
     std::promise<void> scalar_pumped;
     using Publisher = browser::ApplicationEventPublisher<&PredictReaderComposition::predict, PredictReaderComposition>;
     Publisher::Sink sink = [](browser::SystemEvent) {};
-    Publisher publisher{sink, [] {}, [&](auto source) { if (auto* selected = route.load()) selected->SourceChanged(source); }};
-    PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = begin},
-            .labels = contracts::kAnnotationObjectCapacity, .after_product = after_image}); },
+    Publisher publisher{sink, [] {},
+                        [&](auto source) {
+                            if (auto* selected = route.load()) selected->SourceChanged(source);
+                        }};
+    PredictSystem prediction{
+        settings,
+        dataset,
+        model,
+        {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+        [&] {
+            return std::make_unique<FakePredictRuntime>(
+                PredictionScenario{.compute = {.gate = begin}, .labels = contracts::kAnnotationObjectCapacity, .after_product = after_image});
+        },
         [&](PredictSystem::event_type event) {
-            if (const auto* progress = std::get_if<PredictProgress>(&event);
-                progress && progress->snapshot.operation.progress.sequence == 2U) scalar_sent = true;
+            if (const auto* progress = std::get_if<PredictProgress>(&event); progress && progress->snapshot.operation.progress.sequence == 2U)
+                scalar_sent = true;
             publisher(event);
         }};
     auto readers = browser::materialize_visual_source_readers(PredictReaderComposition{&settings, &prediction});
@@ -1422,13 +1329,21 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
         return metadata(frame);
     };
     PresentationSystem presentation{{.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [&] { return std::make_unique<PredictReaderWriter>([&] {
-            if (scalar_observed) mmltk::testsupport::release_test_promise(scalar_pumped);
-        }); }, readers, [&](PresentationSystem::event_type event) {
-            if (std::holds_alternative<PresentationCompleted>(event)) mmltk::testsupport::release_test_promise(shown);
-        }};
+                                    [&] {
+                                        return std::make_unique<PredictReaderWriter>([&] {
+                                            if (scalar_observed) mmltk::testsupport::release_test_promise(scalar_pumped);
+                                        });
+                                    },
+                                    readers,
+                                    [&](PresentationSystem::event_type event) {
+                                        if (std::holds_alternative<PresentationCompleted>(event)) mmltk::testsupport::release_test_promise(shown);
+                                    }};
     route = &presentation;
-    const mmltk::testsupport::ScopedTestCleanup stop{[&] { after_image->Release(); prediction.Shutdown(); route = nullptr; }};
+    const mmltk::testsupport::ScopedTestCleanup stop{[&] {
+        after_image->Release();
+        prediction.Shutdown();
+        route = nullptr;
+    }};
     static_cast<void>(presentation.Select(readers[0].source));
     static_cast<void>(prediction.Start({}));
     mmltk::testsupport::await_test_promise(shown, "full Predict label image");
@@ -1442,7 +1357,6 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
     CHECK(metadata_reads == reads);
     CHECK(prediction.snapshot().revision > before.snapshot_revision);
 }
-
 TEST_CASE("Predict seals unsafe execution and close custody across repeated admission", "[controller][systems][predict][custody]") {
     const bool on_close = GENERATE(false, true);
     const bool preview_terminal = GENERATE(false, true);
@@ -1454,24 +1368,28 @@ TEST_CASE("Predict seals unsafe execution and close custody across repeated admi
     std::atomic_size_t constructions = 0U;
     std::promise<void> failed;
     {
-        PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-            [&] { ++constructions; return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal); },
-            [&](PredictSystem::event_type event) {
-                if (const auto* failure = std::get_if<PredictFailed>(&event);
-                    failure && !failure->snapshot.operation.active) mmltk::testsupport::release_test_promise(failed);
-            }};
+        PredictSystem prediction{settings,
+                                 dataset,
+                                 model,
+                                 {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+                                 [&] {
+                                     ++constructions;
+                                     return std::make_unique<UnsafePredictRuntime>(on_close, custody, preview_terminal);
+                                 },
+                                 [&](PredictSystem::event_type event) {
+                                     if (const auto* failure = std::get_if<PredictFailed>(&event); failure && !failure->snapshot.operation.active)
+                                         mmltk::testsupport::release_test_promise(failed);
+                                 }};
         static_cast<void>(prediction.Start({}));
         mmltk::testsupport::await_test_promise(failed, "unsafe Predict settlement");
         REQUIRE_FALSE(prediction.snapshot().operation.active);
-        for (unsigned attempt = 0U; attempt < 4U; ++attempt)
-            CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
+        for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
         CHECK(constructions == 1U);
         CHECK(*custody == (on_close && !preview_terminal ? 8 : 7));
         custody.reset();
     }
     CHECK_FALSE(retained.expired());
 }
-
 TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[controller][gpu][custody]") {
     namespace gpu = mmltk::frameworks::gpu;
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
@@ -1492,8 +1410,10 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
     REQUIRE(raw);
     auto draw = std::async(std::launch::async, [raw, context] {
         try {
-            gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated,
-                .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+            gpu::SystemImageRuntime runtime({.device = 0,
+                                             .context_mode = gpu::DeviceContextMode::Isolated,
+                                             .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+                                             .adopted_context = context});
             auto candidate = runtime.AcquireOutput();
             raw->Draw(runtime, candidate);
         } catch (...) { return std::current_exception(); }
@@ -1507,7 +1427,7 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
     CHECK_FALSE(pool->HasUnsafeSourceCustody());
     raw.reset();
     decoded.reset();
-    pool.reset(); // the receiver transaction, not this replaceable shell, owns the fact
+    pool.reset();  // the receiver transaction, not this replaceable shell, owns the fact
     CHECK(authority->admission_open());
     CHECK(authority->fact().reservations == 1U);
     fault.upload.Release();
@@ -1517,11 +1437,9 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
     CHECK(authority->fact().occupancy == 1U);
     CHECK(authority->fact().reservations == 0U);
     CHECK_FALSE(retained.expired());
-    for (unsigned attempt = 0U; attempt < 4U; ++attempt)
-        CHECK_THROWS(detail::PredictionPreviewPool(execution, context, operations, authority));
+    for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS(detail::PredictionPreviewPool(execution, context, operations, authority));
     CHECK(authority->fact().occupancy == 1U);
 }
-
 TEST_CASE("late receiver custody seals Predict admission while optional visual failure preserves semantic success", "[controller][systems][predict][custody]") {
     const bool terminal = GENERATE(false, true);
     ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-late-receiver")};
@@ -1535,23 +1453,32 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
     std::atomic_size_t constructions = 0U;
     std::promise<void> first_frame, first_done, second_done, visual_failure, recovered;
     {
-        PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-            [&] { ++constructions; return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault}); },
-            [&](PredictSystem::event_type event) {
-                if (const auto* changed = std::get_if<PredictChanged>(&event)) {
-                    const auto& state = changed->snapshot;
-                    if (state.frame.valid() && state.operation.generation_frontier == 1U)
-                        mmltk::testsupport::release_test_promise(first_frame);
-                    if (!state.operation.active) {
-                        if (state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_done);
-                        if (state.operation.generation_frontier == 2U) mmltk::testsupport::release_test_promise(second_done);
-                    }
-                    if (state.operation.generation_frontier == 3U && state.frame.revision > 1U)
-                        mmltk::testsupport::release_test_promise(recovered);
-                }
-                if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
-            }};
-        const mmltk::testsupport::ScopedTestCleanup stop{[&] { fault->upload.Release(); prediction.Shutdown(); }};
+        PredictSystem prediction{settings,
+                                 dataset,
+                                 model,
+                                 {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+                                 [&] {
+                                     ++constructions;
+                                     return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .receiver_fault = fault});
+                                 },
+                                 [&](PredictSystem::event_type event) {
+                                     if (const auto* changed = std::get_if<PredictChanged>(&event)) {
+                                         const auto& state = changed->snapshot;
+                                         if (state.frame.valid() && state.operation.generation_frontier == 1U)
+                                             mmltk::testsupport::release_test_promise(first_frame);
+                                         if (!state.operation.active) {
+                                             if (state.operation.generation_frontier == 1U) mmltk::testsupport::release_test_promise(first_done);
+                                             if (state.operation.generation_frontier == 2U) mmltk::testsupport::release_test_promise(second_done);
+                                         }
+                                         if (state.operation.generation_frontier == 3U && state.frame.revision > 1U)
+                                             mmltk::testsupport::release_test_promise(recovered);
+                                     }
+                                     if (std::holds_alternative<PredictFailed>(event)) mmltk::testsupport::release_test_promise(visual_failure);
+                                 }};
+        const mmltk::testsupport::ScopedTestCleanup stop{[&] {
+            fault->upload.Release();
+            prediction.Shutdown();
+        }};
         static_cast<void>(prediction.Start({}));
         mmltk::testsupport::await_test_promise(first_frame, "initial retained Predict image");
         mmltk::testsupport::await_test_promise(first_done, "initial semantic completion");
@@ -1571,8 +1498,7 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
         CHECK(fault->retirement->admission_open() == !terminal);
         if (terminal) {
             CHECK(fault->retirement->fact().occupancy == 1U);
-            for (unsigned attempt = 0U; attempt < 4U; ++attempt)
-                CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
+            for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS_AS(prediction.Start({}), contracts::UnavailableError);
             CHECK_FALSE(fault->decoded.expired());
         } else {
             fault->enabled = false;
@@ -1590,7 +1516,6 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
         CHECK(facts.occupancy + facts.reservations <= detail::PredictionPreviewPool::kSlotCapacity + 4U);
     }
 }
-
 TEST_CASE("prediction preview refusal preserves successful inference completion", "[controller][systems][compute]") {
     const auto root = mmltk::testsupport::make_temp_root("prediction-preview-refusal");
     ApplicationDataFixture fixture{root};
@@ -1600,13 +1525,16 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
     gate->Release();
     std::promise<PredictSnapshot> completed;
     std::promise<PredictFailed> preview_failed;
-    PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-        [gate] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
-        [&](PredictSystem::event_type event) {
-            if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
-            if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active)
-                completed.set_value(std::move(changed->snapshot));
-        }};
+    PredictSystem prediction{settings,
+                             dataset,
+                             model,
+                             {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+                             [gate] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .refuse_preview = true}); },
+                             [&](PredictSystem::event_type event) {
+                                 if (auto* failure = std::get_if<PredictFailed>(&event)) preview_failed.set_value(std::move(*failure));
+                                 if (auto* changed = std::get_if<PredictChanged>(&event); changed && !changed->snapshot.operation.active)
+                                     completed.set_value(std::move(changed->snapshot));
+                             }};
     static_cast<void>(prediction.Start({}));
     const auto failure = mmltk::testsupport::await_test_promise(preview_failed, "prediction preview refusal");
     CHECK(failure.snapshot.operation.terminal.outcome != contracts::ComputeOperationOutcome::Failed);
@@ -1615,16 +1543,15 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
     CHECK(terminal.operation.terminal.completed == 2U);
     CHECK(terminal.operation.terminal.output == "result");
 }
-
 TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "[controller][systems][compute]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-export-predict");
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel(contracts::FeatureId::Export);
     auto [settings, dataset, model] = fixture.systems();
-
     auto export_gate = std::make_shared<StopGate>();
     std::promise<ComputeSystemEvent> export_terminal;
-    ExportSystem export_system{settings, dataset, model, [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
+    ExportSystem export_system{settings, dataset, model,
+                               [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
                                [&](ComputeSystemEvent event) {
                                    if (!std::holds_alternative<ComputeProgressEvent>(event)) export_terminal.set_value(std::move(event));
                                }};
@@ -1633,7 +1560,6 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     static_cast<void>(export_system.Stop());
     CHECK(std::holds_alternative<ComputeChanged>(export_terminal.get_future().get()));
     CHECK(export_system.snapshot().terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
-
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto predict_gate = std::make_shared<StopGate>();
     auto predictions = std::make_shared<std::atomic_size_t>(0U);
@@ -1644,23 +1570,26 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     std::promise<void> prediction_frame;
     std::atomic_bool frame_seen = false;
     std::atomic_size_t predict_terminals = 0U;
-    PredictSystem predict{settings,
-                          dataset,
-                          model,
-                          {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
-                          [&] {
-                              const bool fail = constructions++ == 0U;
-                              return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = predict_gate, .fail = fail}, .predictions = predictions});
-                          },
-                          [&](PredictSystem::event_type event) {
-                              if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.frame.valid() && !frame_seen.exchange(true))
-                                  prediction_frame.set_value();
-                              const auto terminal = std::visit([](const auto& value) { return value.snapshot.operation.terminal.outcome; }, event);
-                              if (std::holds_alternative<PredictFailed>(event)) predict_failed.set_value(std::move(event));
-                              else if (terminal == contracts::ComputeOperationOutcome::Succeeded && predict_terminals.fetch_add(1U) == 0U)
-                                  predict_succeeded.set_value(std::move(event));
-                              else if (terminal == contracts::ComputeOperationOutcome::Cancelled) predict_cancelled.set_value(std::move(event));
-                          }};
+    PredictSystem predict{
+        settings,
+        dataset,
+        model,
+        {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+        [&] {
+            const bool fail = constructions++ == 0U;
+            return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = predict_gate, .fail = fail}, .predictions = predictions});
+        },
+        [&](PredictSystem::event_type event) {
+            if (const auto* changed = std::get_if<PredictChanged>(&event); changed && changed->snapshot.frame.valid() && !frame_seen.exchange(true))
+                prediction_frame.set_value();
+            const auto terminal = std::visit([](const auto& value) { return value.snapshot.operation.terminal.outcome; }, event);
+            if (std::holds_alternative<PredictFailed>(event))
+                predict_failed.set_value(std::move(event));
+            else if (terminal == contracts::ComputeOperationOutcome::Succeeded && predict_terminals.fetch_add(1U) == 0U)
+                predict_succeeded.set_value(std::move(event));
+            else if (terminal == contracts::ComputeOperationOutcome::Cancelled)
+                predict_cancelled.set_value(std::move(event));
+        }};
     CHECK_FALSE(predict.BorrowFrame().valid());
     const auto first_admitted = predict.Start({});
     CHECK(first_admitted.revision > 0U);
@@ -1697,9 +1626,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
             auto ready = std::make_shared<std::promise<void>>();
             auto result = ready->get_future();
             predict.RequestWorkspace(
-                {.product_owner = expected.owner, .product_revision = expected.revision, .destination = workspace, .ready = [ready] {
-                     ready->set_value();
-                 }});
+                {.product_owner = expected.owner, .product_revision = expected.revision, .destination = workspace, .ready = [ready] { ready->set_value(); }});
             return result;
         };
         auto ready = request();
@@ -1758,19 +1685,16 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     CHECK(predict.BorrowFrame().valid());
     CHECK(constructions == 2U);
 }
-
 TEST_CASE("training owns provider offers and remote control with Busy and lazy failure isolation", "[controller][systems][training]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training");
     ApplicationDataFixture fixture{root};
     // CLEANUP-IGNORE: Provider training intentionally starts without the accepted local-model prerequisite used by
     // local training.
     auto [settings, dataset, model] = fixture.systems();
-
     auto gate = std::make_shared<StopGate>();
     std::atomic_size_t constructions = 0U;
     TrainingTerminals terminals;
-    TrainingSystem training{settings, dataset, model, reconstructing_training_runtime(gate, constructions),
-                            [&](TrainingSystem::event_type event) {
+    TrainingSystem training{settings, dataset, model, reconstructing_training_runtime(gate, constructions), [&](TrainingSystem::event_type event) {
                                 if (std::holds_alternative<TrainingProgress>(event)) return;
                                 terminals.Publish(std::move(event));
                             }};
@@ -1783,7 +1707,6 @@ TEST_CASE("training owns provider offers and remote control with Busy and lazy f
     CHECK(std::get<TrainingChanged>(provider_failure).snapshot.offers.revision > admitted_query.offers.revision);
     CHECK(std::get<TrainingChanged>(provider_failure).snapshot.offers.outcome == contracts::ProviderQueryOutcome::Failed);
     CHECK_FALSE(std::get<TrainingChanged>(provider_failure).snapshot.offers.detail.empty());
-
     const auto admitted_successful_query = training.Query({});
     CHECK(admitted_successful_query.offers.outcome == contracts::ProviderQueryOutcome::Idle);
     CHECK(admitted_successful_query.offers.detail.empty());
@@ -1800,13 +1723,11 @@ TEST_CASE("training owns provider offers and remote control with Busy and lazy f
     CHECK(training.snapshot().remote.phase == contracts::RemoteSessionPhase::Running);
     CHECK(constructions == 2U);
 }
-
 TEST_CASE("local training resets progress and supports failure Stop and reconstruction", "[controller][systems][training][local]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-local-training");
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel();
     auto [settings, dataset, model] = fixture.systems();
-
     auto gate = std::make_shared<StopGate>();
     // CLEANUP-IGNORE: Local progress accounting and provider offer sequencing use different event invariants.
     std::atomic_size_t constructions = 0U;
@@ -1814,8 +1735,7 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     std::promise<void> first_successful_progress;
     auto first_successful_progress_observed = first_successful_progress.get_future();
     TrainingTerminals terminals;
-    TrainingSystem training{settings, dataset, model, reconstructing_training_runtime(gate, constructions),
-                            [&](TrainingSystem::event_type event) {
+    TrainingSystem training{settings, dataset, model, reconstructing_training_runtime(gate, constructions), [&](TrainingSystem::event_type event) {
                                 if (const auto* progress = std::get_if<TrainingProgress>(&event)) {
                                     if (progress->local.progress.sequence == 1U) {
                                         CHECK(progress->local.generation_frontier != 0U);
@@ -1832,7 +1752,6 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     REQUIRE(std::holds_alternative<TrainingChanged>(local_failure));
     CHECK(std::get<TrainingChanged>(local_failure).snapshot.local.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
     CHECK(std::get<TrainingChanged>(local_failure).snapshot.local.generation_frontier == 1U);
-
     gate = std::make_shared<StopGate>();
     static_cast<void>(training.Start({}));
     first_successful_progress_observed.get();
@@ -1842,7 +1761,6 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     static_cast<void>(training.Stop({}));
     CHECK(std::holds_alternative<TrainingChanged>(terminals.Second().get()));
     CHECK(training.snapshot().local.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
-
     gate->Release();
     static_cast<void>(training.Start({}));
     CHECK(std::holds_alternative<TrainingChanged>(terminals.Third().get()));
@@ -1850,7 +1768,6 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     CHECK(sequence_one_progress == 2U);
     CHECK(constructions == 2U);
 }
-
 TEST_CASE("remote training rejects duplicate starts and reconciles an inconclusive create", "[controller][systems][training][provider]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-reconcile");
     ApplicationDataFixture fixture{root};
@@ -1865,15 +1782,9 @@ TEST_CASE("remote training rejects duplicate starts and reconciles an inconclusi
                             [&](TrainingSystem::event_type event) {
                                 if (!std::holds_alternative<TrainingChanged>(event)) return;
                                 switch (changed++) {
-                                    case 0U:
-                                        query_done.set_value();
-                                        break;
-                                    case 1U:
-                                        mutation_done.set_value();
-                                        break;
-                                    default:
-                                        reconciliation_done.set_value();
-                                        break;
+                                    case 0U: query_done.set_value(); break;
+                                    case 1U: mutation_done.set_value(); break;
+                                    default: reconciliation_done.set_value(); break;
                                 }
                             }};
     static_cast<void>(training.Query({}));
@@ -1888,7 +1799,6 @@ TEST_CASE("remote training rejects duplicate starts and reconciles an inconclusi
     CHECK(training.snapshot().remote.phase == contracts::RemoteSessionPhase::Running);
     CHECK_THROWS_AS(training.StartRemote({}), contracts::InvalidIntentError);
 }
-
 TEST_CASE("provider Clear cancels the active query and clears selection state", "[controller][systems][training][provider]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-clear");
     ApplicationDataFixture fixture{root};
@@ -1909,7 +1819,6 @@ TEST_CASE("provider Clear cancels the active query and clears selection state", 
     CHECK(training.snapshot().offers.offers.empty());
     CHECK_FALSE(training.snapshot().offers.selected);
 }
-
 TEST_CASE("provider Clear is admitted once until the query worker settles", "[controller][systems][training][provider]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-clear-once");
     ApplicationDataFixture fixture{root};
@@ -1934,17 +1843,14 @@ TEST_CASE("provider Clear is admitted once until the query worker settles", "[co
     CHECK_FALSE(training.snapshot().offers.cancellation_requested);
     CHECK(training.snapshot().offers.outcome == contracts::ProviderQueryOutcome::Cancelled);
 }
-
 TEST_CASE("local Stop does not cancel provider query or remote effect", "[controller][systems][training][provider]") {
     // CLEANUP-IGNORE: Stop-isolation and Clear-cancellation are distinct provider ownership scenarios.
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-stop-ownership");
     ApplicationDataFixture fixture{root};
     auto [settings, dataset, model] = fixture.systems();
-
     auto query_gate = std::make_shared<StopGate>();
     std::promise<void> query_done;
-    TrainingSystem query_training{settings, dataset, model,
-                                  [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
+    TrainingSystem query_training{settings, dataset, model, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
                                   [&](TrainingSystem::event_type event) {
                                       if (std::holds_alternative<TrainingChanged>(event)) query_done.set_value();
                                   }};
@@ -1953,7 +1859,6 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
     query_gate->Release();
     query_done.get_future().wait();
     CHECK(query_training.snapshot().offers.outcome == contracts::ProviderQueryOutcome::Succeeded);
-
     auto remote_gate = std::make_shared<StopGate>();
     std::promise<void> offers_ready;
     std::promise<void> remote_done;
@@ -1978,7 +1883,6 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
     CHECK(remote_training.snapshot().remote.phase == contracts::RemoteSessionPhase::Running);
     CHECK(remote_training.snapshot().remote.revision > remote_admitted.remote.revision);
 }
-
 [[nodiscard]] auto release_training_publication_on_exit(TrainingSystem& system, StopGate& runtime, std::promise<void>& publication) {
     return mmltk::testsupport::ScopedTestCleanup{[&system, &runtime, &publication] {
         mmltk::testsupport::release_test_promise(publication);
@@ -1986,13 +1890,11 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
         static_cast<void>(system.Stop({}));
     }};
 }
-
 TEST_CASE("training completion releases admission before observer publication returns", "[controller][systems][training][settlement]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-settlement");
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel();
     auto [settings, dataset, model] = fixture.systems();
-
     auto local_gate = std::make_shared<StopGate>();
     local_gate->Release();
     std::promise<void> local_publishing;
@@ -2012,7 +1914,6 @@ TEST_CASE("training completion releases admission before observer publication re
     CHECK(local.Stop({}).local.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     CHECK(local.snapshot().local.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     release_local_publication.set_value();
-
     auto query_gate = std::make_shared<StopGate>();
     query_gate->Release();
     std::promise<TrainingSnapshot> query_publishing;
@@ -2038,9 +1939,7 @@ TEST_CASE("training completion releases admission before observer publication re
     CHECK(cleared.offers.outcome == contracts::ProviderQueryOutcome::Idle);
     CHECK(cleared.offers.offers.empty());
 }
-
-TEST_CASE("training admission and matching cancellation do not invert system and worker locks",
-          "[controller][systems][training][admission]") {
+TEST_CASE("training admission and matching cancellation do not invert system and worker locks", "[controller][systems][training][admission]") {
     const bool provider_query = GENERATE(false, true);
     CAPTURE(provider_query);
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-admission");
@@ -2049,15 +1948,13 @@ TEST_CASE("training admission and matching cancellation do not invert system and
     // do not.
     fixture.PrepareModel();
     auto [settings, dataset, model] = fixture.systems();
-
     auto runtime_gate = std::make_shared<StopGate>();
     std::promise<void> done;
     TrainingSystem system{settings, dataset, model, [runtime_gate] { return std::make_unique<FakeTrainingRuntime>(runtime_gate, false); },
                           [&](TrainingSystem::event_type event) {
                               if (!std::holds_alternative<TrainingProgress>(event)) done.set_value();
                           }};
-    mmltk::testsupport::TestGate admission{provider_query ? "concurrent provider Query and Clear admission"
-                                                          : "concurrent training Start and Stop admission"};
+    mmltk::testsupport::TestGate admission{provider_query ? "concurrent provider Query and Clear admission" : "concurrent training Start and Stop admission"};
     std::future<TrainingSnapshot> starting;
     std::future<void> cancelling;
     mmltk::testsupport::ScopedTestCleanup release_runtime{[&] {
@@ -2097,10 +1994,8 @@ TEST_CASE("training admission and matching cancellation do not invert system and
     REQUIRE(terminal.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
     terminal.get();
 }
-
 }  // namespace
 }  // namespace mmltk::controller
-
 TEST_CASE("Local compute admission waits for required worker placement", "[controller][compute][placement]") {
     using namespace mmltk::common::system;
     using namespace mmltk::controller;
@@ -2125,7 +2020,6 @@ TEST_CASE("Local compute admission waits for required worker placement", "[contr
     CHECK(observed->scheduler_policy == SCHED_OTHER);
     CHECK(capture_execution_policy_snapshot().affinity == before.affinity);
 }
-
 TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[controller][compute][placement]") {
     using namespace mmltk::common::system;
     using namespace mmltk::controller;
@@ -2145,11 +2039,10 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
                   } catch (const std::system_error& error) {
                       if (admitted || run.active() || error.code().value() != EPERM) return false;
                       const DirectComputeConfiguration configuration{
-                          .execution =
-                              mmltk::frameworks::gpu::DeviceExecution{.device = 999999, .placement = {.numa_node = node, .cpus = {cpu}}}};
-                      for (const auto& construct : std::array<std::function<void()>, 3>{
-                               [&] { CudaValidationRuntime runtime(configuration); }, [&] { CudaExportRuntime runtime(configuration); },
-                               [&] { CudaPredictRuntime runtime(configuration); }}) {
+                          .execution = mmltk::frameworks::gpu::DeviceExecution{.device = 999999, .placement = {.numa_node = node, .cpus = {cpu}}}};
+                      for (const auto& construct : std::array<std::function<void()>, 3>{[&] { CudaValidationRuntime runtime(configuration); },
+                                                                                        [&] { CudaExportRuntime runtime(configuration); },
+                                                                                        [&] { CudaPredictRuntime runtime(configuration); }}) {
                           try {
                               construct();
                               return false;
@@ -2163,7 +2056,6 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
               }) == 0);
     }
 }
-
 TEST_CASE("prediction raw custody is bounded under retained readers and preserves pixels", "[controller][gpu]") {
     using namespace mmltk::controller;
     namespace gpu = mmltk::frameworks::gpu;
@@ -2178,10 +2070,15 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
     gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
     pool.emplace(execution, context);
     std::array<std::shared_ptr<const detail::PredictionPreviewFrame>, 3U> readers;
-    for (auto& reader : readers) { reader = pool->Capture(source, {2U, 2U}, 0U, {}, {}, classes, 2, nullptr, custody); REQUIRE(reader); }
+    for (auto& reader : readers) {
+        reader = pool->Capture(source, {2U, 2U}, 0U, {}, {}, classes, 2, nullptr, custody);
+        REQUIRE(reader);
+    }
     CHECK_FALSE(pool->Capture(source, {2U, 2U}, 0U, {}, {}, classes, 2, nullptr, custody));
-    gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated,
-        .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+    gpu::SystemImageRuntime runtime({.device = 0,
+                                     .context_mode = gpu::DeviceContextMode::Isolated,
+                                     .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+                                     .adopted_context = context});
     auto candidate = runtime.AcquireOutput();
     readers[0]->Draw(runtime, candidate);
     const auto complete = runtime.CommitOutput(std::move(candidate));
@@ -2192,13 +2089,15 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
     auto image = complete.Borrow();
     const auto plane = image.plane(0U).plane();
     std::array<std::uint8_t, 16U> rgba{};
-    REQUIRE(cudaMemcpy2D(rgba.data(), 8U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 8U, 2U, cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy2D(rgba.data(), 8U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 8U, 2U, cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
     CHECK(rgba == std::array<std::uint8_t, 16U>{255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255});
     // A replacement renderer rejects a pending old-context frame before touching its candidate.
-    gpu::DeviceContext replacement_context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated,
-        execution.placement.numa_node, execution);
-    gpu::SystemImageRuntime replacement({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated,
-        .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = replacement_context});
+    gpu::DeviceContext replacement_context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+    gpu::SystemImageRuntime replacement({.device = 0,
+                                         .context_mode = gpu::DeviceContextMode::Isolated,
+                                         .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+                                         .adopted_context = replacement_context});
     CHECK(readers[0]->CompatibleWith(runtime));
     CHECK_FALSE(readers[0]->CompatibleWith(replacement));
     gpu::SystemImageRuntime::OutputCandidate untouched;
@@ -2233,7 +2132,6 @@ TEST_CASE("prediction raw custody is bounded under retained readers and preserve
     CHECK(after == before);
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
 }
-
 TEST_CASE("prediction transfer faults settle or retain exact source custody", "[controller][gpu]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace controller = mmltk::controller;
@@ -2242,8 +2140,7 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
     const std::array<float, 12U> pixels{};
-    auto input = PredictionSource::Device(execution, {2U, 2U}, pixels,
-        {{.class_reference = 0, .score = .7F}}, classes);
+    auto input = PredictionSource::Device(execution, {2U, 2U}, pixels, {{.class_reference = 0, .score = .7F}}, classes);
     const auto* source = input.pixels();
     auto& custody = input.custody();
     const std::weak_ptr<void> lifetime = custody;
@@ -2265,8 +2162,8 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
     }
     fault.Reset({.fail_copy = 2, .fail_settle = true});
     int stopped = 0;
-    CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody,
-        &CountPredictionSourceStop, &stopped), runtime::CudaOperationError);
+    CHECK_THROWS_AS(pool->Capture(source, {2, 2}, 0, predictions, annotations, classes, 1, nullptr, custody, &CountPredictionSourceStop, &stopped),
+                    runtime::CudaOperationError);
     CHECK(stopped == 1);
     CHECK(pool->HasUnsafeSourceCustody());
     const auto attempted = fault.copies;
@@ -2278,7 +2175,6 @@ TEST_CASE("prediction transfer faults settle or retain exact source custody", "[
     CHECK_FALSE(lifetime.expired());
     fault.Reset();
 }
-
 TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault custody", "[controller][gpu]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace runtime = mmltk::backend::ml::runtime;
@@ -2296,13 +2192,14 @@ TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault cus
     PredictionTransferFault fault;
     for (int stage : {0, 1, 2, 3, 4}) {
         fault.Reset();
-        detail::PredictionPreviewPool pool(execution, context, PredictionTransferFault::Operations(), {}, 1U);
+        mmltk::controller::detail::PredictionPreviewPool pool(execution, context, PredictionTransferFault::Operations(), {}, 1U);
         auto capture = [&](cudaStream_t stream) {
-            return pool.Capture(input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), {}, input.annotations(), classes, 1, nullptr, input.custody());
+            return pool.Capture(input.pixels(), {2U, 2U}, reinterpret_cast<std::uintptr_t>(stream), {}, input.annotations(), classes, 1, nullptr,
+                                input.custody());
         };
         auto previous = capture(first.get());
         REQUIRE(previous);
-        previous.reset(); // The peer copy need not have completed or been drawn.
+        previous.reset();  // The peer copy need not have completed or been drawn.
         fault.Reset({.fail_copy = stage == 2 || stage == 4 ? 1 : 0, .fail_record = stage == 3, .fail_settle = stage == 4, .fail_wait = stage == 1});
         if (stage == 0) {
             REQUIRE(capture(second.get()));
@@ -2322,7 +2219,6 @@ TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault cus
     }
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
 }
-
 TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact", "[controller][gpu]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace controller = mmltk::controller;
@@ -2338,8 +2234,10 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
     auto raw = pool.Capture(nullptr, input.extent(), 0, {}, {}, classes, 1, input.rgb8(), source);
     REQUIRE(raw);
     CHECK(source.use_count() == 2);
-    gpu::SystemImageRuntime runtime({.device = 0, .context_mode = gpu::DeviceContextMode::Isolated,
-        .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
+    gpu::SystemImageRuntime runtime({.device = 0,
+                                     .context_mode = gpu::DeviceContextMode::Isolated,
+                                     .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+                                     .adopted_context = context});
     auto candidate = runtime.AcquireOutput();
     CHECK_THROWS(raw->Draw(runtime, candidate));
     CHECK(input.rgb8()[0] == 255U);
@@ -2353,23 +2251,23 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
     auto view = completed.Borrow();
     const auto plane = view.plane(0U).plane();
     std::array<std::uint8_t, 16> rgba{};
-    REQUIRE(cudaMemcpy2D(rgba.data(), 8U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 8U, 2U, cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy2D(rgba.data(), 8U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 8U, 2U, cudaMemcpyDeviceToHost) ==
+            cudaSuccess);
     CHECK(rgba[0] == 255U);
     CHECK(rgba[1] == 0U);
     CHECK(rgba[2] == 0U);
     CHECK(rgba[3] == 255U);
 }
-
 namespace mmltk::controller {
-
 TEST_CASE("preview context failure retains initialized state and source before returning", "[controller][gpu][context]") {
     namespace gpu = mmltk::frameworks::gpu;
     const bool query_failure = GENERATE(false, true);
     const bool terminal = GENERATE(false, true);
     enum class Stage { Capture, Draw, Destruction };
     const auto stage = GENERATE(Stage::Capture, Stage::Draw, Stage::Destruction);
-    PredictionContextFault driver{query_failure ? PredictionContextFault::Failure::Query :
-        terminal ? PredictionContextFault::Failure::RestoreAlways : PredictionContextFault::Failure::RestoreOnce};
+    PredictionContextFault driver{query_failure ? PredictionContextFault::Failure::Query
+                                  : terminal    ? PredictionContextFault::Failure::RestoreAlways
+                                                : PredictionContextFault::Failure::RestoreOnce};
     const auto api = driver.Api();
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
@@ -2383,18 +2281,17 @@ TEST_CASE("preview context failure retains initialized state and source before r
     const std::weak_ptr<void> retained = decoded;
     const auto& classes = input.classes();
     int stopped = 0;
-    const auto capture = [&] {
-        return pool->Capture(nullptr, {2U, 2U}, 0U, {}, {}, classes, 1, input.rgb8(), decoded,
-            &CountPredictionSourceStop, &stopped);
-    };
+    const auto capture = [&] { return pool->Capture(nullptr, {2U, 2U}, 0U, {}, {}, classes, 1, input.rgb8(), decoded, &CountPredictionSourceStop, &stopped); };
     const mmltk::testsupport::ScopedTestCleanup disarm{[&] { driver.armed = false; }};
-    if (stage == Stage::Destruction) { auto raw = capture(); REQUIRE(raw); }
+    if (stage == Stage::Destruction) {
+        auto raw = capture();
+        REQUIRE(raw);
+    }
     const bool unsafe = query_failure || terminal;
     if (stage == Stage::Draw) {
         auto raw = capture();
         REQUIRE(raw);
-        gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
-            .adopted_context = context});
+        gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .adopted_context = context});
         auto candidate = runtime.AcquireOutput();
         const mmltk::testsupport::ScopedTestCleanup disarm_draw{[&] { driver.armed = false; }};
         driver.armed = true;
@@ -2412,11 +2309,12 @@ TEST_CASE("preview context failure retains initialized state and source before r
     } else if (stage == Stage::Destruction) {
         driver.armed = true;
         pool.reset();
-    }
-    else {
+    } else {
         driver.armed = true;
-        if (unsafe) CHECK_THROWS_AS(capture(), mmltk::backend::ml::runtime::CudaOperationError);
-        else CHECK_THROWS_AS(capture(), gpu::CudaContextFailure);
+        if (unsafe)
+            CHECK_THROWS_AS(capture(), mmltk::backend::ml::runtime::CudaOperationError);
+        else
+            CHECK_THROWS_AS(capture(), gpu::CudaContextFailure);
         CHECK(stopped == (unsafe ? 1 : 0));
         if (unsafe) {
             const auto calls = driver.calls;
@@ -2432,7 +2330,6 @@ TEST_CASE("preview context failure retains initialized state and source before r
     if (stage == Stage::Capture || query_failure) CHECK(retained.expired() == !unsafe);
     driver.armed = false;
 }
-
 TEST_CASE("Predict replacement pressure coalesces without overwriting its selected image", "[controller][systems][predict][gpu]") {
     ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-replacement-pressure")};
     fixture.PrepareModel(contracts::FeatureId::Predict);
@@ -2447,7 +2344,11 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
     std::promise<void> failed;
     std::atomic_size_t published = 0U;
     std::atomic_uint64_t last_revision = 0U;
-    PredictSystem prediction{settings, dataset, model, {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
+    PredictSystem prediction{
+        settings,
+        dataset,
+        model,
+        {.device = 0, .maximum_width = 64U, .maximum_height = 64U},
         [&] { return std::make_unique<FakePredictRuntime>(PredictionScenario{.compute = {.gate = gate}, .source_index = source_index, .labels = 1U}); },
         [&](PredictSystem::event_type event) {
             if (const auto* changed = std::get_if<PredictChanged>(&event)) {
@@ -2481,8 +2382,8 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
         const auto plane = borrowed.plane(0U).plane();
         borrowed.plane(0U).context().Bind();
         std::array<std::uint8_t, 64U> result{};
-        REQUIRE(cudaMemcpy2D(result.data(), 16U, reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes,
-            16U, 4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+        REQUIRE(cudaMemcpy2D(result.data(), 16U, reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 16U, 4U, cudaMemcpyDeviceToHost) ==
+                cudaSuccess);
         return result;
     };
     const auto selected_pixels = pixels();
@@ -2504,7 +2405,7 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
     };
     fault->partial_draw = true;
     run(2U);
-    run(3U); // bounded latest-product replacement while the other output is held
+    run(3U);  // bounded latest-product replacement while the other output is held
     CHECK(published == 2U);
     CHECK(prediction.snapshot().frame == selected.frame);
     check_metadata();
@@ -2523,13 +2424,12 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
     CHECK(prediction.BorrowFrame().valid());
     gate->Reset();
     static_cast<void>(prediction.Start({}));
-    auto stopping = std::async(std::launch::async, [&] { return prediction.Stop(); });
+    auto stopping = std::async(std::launch::async, [&] { return prediction.Stop({}); });
     static_cast<void>(mmltk::testsupport::await_test_future(stopping, "Stop while old output remains borrowed"));
     mmltk::testsupport::await_test_promise(done[5U], "cancelled Predict execution with both display roles occupied");
     CHECK_FALSE(prediction.snapshot().operation.active);
     CHECK(prediction.snapshot().operation.terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
 }
-
 TEST_CASE("preview context construction publishes only after exact caller restoration", "[controller][gpu][context]") {
     namespace gpu = mmltk::frameworks::gpu;
     using Failure = PredictionContextFault::Failure;
@@ -2551,8 +2451,10 @@ TEST_CASE("preview context construction publishes only after exact caller restor
     for (auto& lease : frames) lease = gpu::ReserveTerminalCudaLease(*authority);
     std::optional<gpu::DeviceContext> published;
     const auto create = [&] { published = detail::CreatePredictionPreviewContext(execution, authority, api); };
-    if (failure == Failure::None) CHECK_NOTHROW(create());
-    else CHECK_THROWS_AS(create(), gpu::CudaContextFailure);
+    if (failure == Failure::None)
+        CHECK_NOTHROW(create());
+    else
+        CHECK_THROWS_AS(create(), gpu::CudaContextFailure);
     const bool terminal = failure == Failure::Query || failure == Failure::RestoreAlways;
     CHECK(published.has_value() == (failure == Failure::None));
     CHECK(authority->admission_open() == !terminal);
@@ -2567,9 +2469,7 @@ TEST_CASE("preview context construction publishes only after exact caller restor
         CHECK(cuCtxGetApiVersion(driver.candidate, &version) == CUDA_SUCCESS);
     }
 }
-
 }  // namespace mmltk::controller
-
 TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior artifacts", "[controller][compute][gpu]") {
     namespace controller = mmltk::controller;
     namespace r = mmltk::backend::models::rfdetr;
@@ -2578,12 +2478,18 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
     const auto output = root.path() / "model.output";
     const auto companion = std::filesystem::path(output.string() + ".classes.json");
     const auto layout = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
-    { std::ofstream file(output); file << "completed artifact"; }
+    {
+        std::ofstream file(output);
+        file << "completed artifact";
+    }
     const auto previous = io::sha256_file(output);
-    { std::ofstream file(companion); file << r::encode_class_descriptor({1, io::sha256_hex(previous), layout}); }
+    {
+        std::ofstream file(companion);
+        file << r::encode_class_descriptor({1, io::sha256_hex(previous), layout});
+    }
     const auto previous_companion = io::sha256_file(companion);
-    const controller::DirectComputeConfiguration configuration{.execution = mmltk::frameworks::gpu::test_support::selected_test_device(
-        0, mmltk::common::system::NumaTopology::Capture())};
+    const controller::DirectComputeConfiguration configuration{
+        .execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture())};
     controller::CudaExportRuntime exporter(configuration);
     controller::CudaValidationRuntime validator(configuration);
     std::stop_source stop;
@@ -2606,30 +2512,34 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
     CHECK(io::sha256_file(companion) == previous_companion);
     for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
 }
-
 TEST_CASE("artifact model inspection observes cancellation before each opaque input loader", "[controller][systems][model]") {
     namespace contracts = mmltk::controller::contracts;
     const mmltk::testsupport::ScopedTempDir root("model-inspection-stop");
     const auto artifact = root.path() / "selected.model";
-    { std::ofstream output(artifact); output << "loader must not consume these bytes"; }
-    for (const auto input : {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx,
-                            contracts::ModelArtifactInputKind::TensorRt}) {
-        contracts::ModelSelectionKey key{.workflow = contracts::FeatureId::Predict,
-            .source = contracts::ModelSelectionSource::Custom, .input = input, .preset = "nano", .resolution = 64};
+    {
+        std::ofstream output(artifact);
+        output << "loader must not consume these bytes";
+    }
+    for (const auto input :
+         {contracts::ModelArtifactInputKind::Weights, contracts::ModelArtifactInputKind::Onnx, contracts::ModelArtifactInputKind::TensorRt}) {
+        contracts::ModelSelectionKey key{
+            .workflow = contracts::FeatureId::Predict, .source = contracts::ModelSelectionSource::Custom, .input = input, .preset = "nano", .resolution = 64};
         REQUIRE(key.valid());
         mmltk::controller::ArtifactModelRuntime runtime;
         std::stop_source source;
         bool verified = false;
-        CHECK_THROWS_WITH(runtime.Acquire(key, artifact, 0, source.get_token(), [&](const auto& progress) {
+        const auto verifying = [&](const auto& progress) {
             CHECK(progress.stage == contracts::ModelProgressStage::Verifying);
             verified = true;
             source.request_stop();
-        }), "model selection cancelled");
+        };
+        CHECK_THROWS_WITH(runtime.Acquire(key, artifact, 0, source.get_token(), verifying), "model selection cancelled");
         CHECK(verified);
     }
 }
-
 TEST_CASE("compilation captures its perceptual selection independently of augmentation", "[controller][systems][dataset][perceptual]") {
+    namespace contracts = mmltk::controller::contracts;
+    namespace services = mmltk::controller::services;
     contracts::GuiSettingsState settings;
     settings.workflows.train.compile_perceptual_downscale = true;
     settings.workflows.train.request.gpu_augmentation.enabled = false;

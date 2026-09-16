@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -16,7 +15,6 @@
 #include <fstream>
 #include <string>
 #include <vector>
-
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/compiled_image_stream.h"
@@ -34,7 +32,6 @@ import mmltk.common.logging.profile_utils;
 #include "src/common/system/cpu_affinity.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
-
 namespace fs = std::filesystem;
 using namespace mmltk::backend::data;
 using namespace mmltk::common::concurrency;
@@ -42,7 +39,6 @@ using namespace mmltk::common::logging;
 using namespace mmltk::common::system;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 using namespace mmltk::backend::data::testsupport;
-
 void exercise_compiled_stream(const std::string& path, bool h2d) {
     const auto source = CompiledDataset::open(path);
     const auto stride = static_cast<std::size_t>(source.header().image_stride);
@@ -71,7 +67,6 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     stream.prepare_images(0, 2U * stride);
     CHECK(stream.host_storage(0).owns_allocation() == h2d);
     const auto* host = stream.host_storage(0).data();
-
     const std::array reads{CompiledImageRead{3U, 0U}, CompiledImageRead{1U, stride}};
     stream.submit(0U, source, reads, {});
     REQUIRE(stream.wait_read(0U));
@@ -80,10 +75,8 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     REQUIRE(std::memcmp(host, source.image_pixels(3U), stride) == 0);
     REQUIRE(std::memcmp(static_cast<const std::byte*>(host) + stride, source.image_pixels(1U), stride) == 0);
     stream.handoff(0U, nullptr);
-    ensure_cuda_ok(cudaMemcpyAsync(received.data(), device, received.size(), cudaMemcpyDeviceToHost, nullptr),
-                   "compiled stream consumer read");
-    const CompiledImageStream::CompletionObserver completed{.context = &completion,
-                                                            .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
+    ensure_cuda_ok(cudaMemcpyAsync(received.data(), device, received.size(), cudaMemcpyDeviceToHost, nullptr), "compiled stream consumer read");
+    const CompiledImageStream::CompletionObserver completed{.context = &completion, .complete = [](void* raw, std::size_t, std::exception_ptr error) noexcept {
                                                                 auto& state = *static_cast<Completion*>(raw);
                                                                 state.failure = error;
                                                                 state.done.store(true, std::memory_order_release);
@@ -117,7 +110,6 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
         host = stream.host_images(0U).data();
         CHECK(std::memcmp(host, source.image_pixels(3U), stride) == 0);
     }
-
     const std::array invalid{CompiledImageRead{source.header().num_images, 0U}};
     stream.submit(0U, source, invalid, {});
     REQUIRE_THROWS_AS(stream.wait_read(0U), std::out_of_range);
@@ -155,8 +147,7 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     stream.submit(0U, source, reads, {});
     REQUIRE(stream.wait_read(0U));
     stream.handoff(0U, nullptr);
-    ensure_cuda_ok(cudaMemcpyAsync(received.data(), device, received.size(), cudaMemcpyDeviceToHost, nullptr),
-                   "compiled stream reused consumer read");
+    ensure_cuda_ok(cudaMemcpyAsync(received.data(), device, received.size(), cudaMemcpyDeviceToHost, nullptr), "compiled stream reused consumer read");
     completion.done.store(false, std::memory_order_release);
     stream.release(0U, nullptr, completed);
     stream.synchronize();
@@ -169,7 +160,6 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     stream.close();
     REQUIRE_FALSE(stream.owns_resources());
 }
-
 void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cudaStream_t compute_stream) {
     const std::string bin_path = compiled_bin_path(fixture);
     const std::string dataset_dir_path = dataset_dir(fixture);
@@ -192,31 +182,26 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
         REQUIRE(direct_loader.num_images() == static_cast<size_t>(NUM_IMAGES));
         REQUIRE(direct_loader.num_classes() == 6u);
     }
-
     DatasetLoader::Config direct_cfg;
     direct_cfg.loading.h2d_dataloader = h2d;
     direct_cfg.compiled_path = bin_path;
     direct_cfg.batch_size = 8;
     direct_cfg.shuffle = false;
     direct_cfg.prefetch_factor = 1;
-
     DatasetLoader direct_loader(direct_cfg);
     REQUIRE(direct_loader.num_images() == static_cast<size_t>(NUM_IMAGES));
     REQUIRE(direct_loader.image_width() == static_cast<uint32_t>(W));
     REQUIRE(direct_loader.image_height() == static_cast<uint32_t>(H));
     REQUIRE(direct_loader.num_classes() == 6u);
     REQUIRE(direct_loader.image_stride() == IMAGE_STRIDE);
-
     const fs::path first_image_path = fs::path(dataset_dir_path) / split / "000001.png";
     const std::vector<float> expected_first_image = expected_nchw_stub(first_image_path.string(), W, H);
     assert_image_matches(direct_loader.pixel_blob(), expected_first_image);
-
     for (size_t i = 0; i < 100; ++i) {
         const float pixel = direct_loader.pixel_blob()[i];
         REQUIRE((pixel >= 0.0f && pixel <= 1.0f));
     }
     printf("Pixel values in [0,1] — OK\n");
-
     direct_loader.begin_epoch();
     Batch batch;
     size_t total = 0;
@@ -226,18 +211,15 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
         REQUIRE(batch.image_indices[0] == next_expected_idx);
         REQUIRE(direct_loader.host_images(batch).data() == direct_loader.pixel_blob() + next_expected_idx * STRIDE_FLOATS);
         total += batch.num_images;
-
         for (size_t i = 0; i < batch.num_images; ++i) {
             const uint32_t idx = batch.image_indices[i];
             const auto& entry = batch.label_index[idx];
             total_instances += entry.num_instances;
             REQUIRE(idx == batch.image_indices[0] + i);
-
             for (int p = 0; p < 10; ++p) {
                 const float pixel = direct_loader.host_images(batch).data()[i * STRIDE_FLOATS + static_cast<size_t>(p)];
                 REQUIRE((pixel >= 0.0f && pixel <= 1.0f));
             }
-
             REQUIRE(entry.num_instances == (idx >= 10 ? 1 : 0));
             if (entry.num_instances > 0) {
                 const PackedInstance& inst = batch.labels[entry.label_begin];
@@ -249,8 +231,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
             }
         }
         direct_loader.handoff_batch(batch, compute_stream);
-        ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, compute_stream),
-                       "cudaMemsetAsync");
+        ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, compute_stream), "cudaMemsetAsync");
         direct_loader.release_batch(batch, compute_stream);
         next_expected_idx += batch.num_images;
     }
@@ -259,7 +240,6 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     REQUIRE(total == static_cast<size_t>(NUM_IMAGES));
     REQUIRE(total_instances == static_cast<size_t>(std::max(NUM_IMAGES - 10, 0)));
     printf("Sequential iteration: %zu images, %zu instances\n", total, total_instances);
-
     direct_loader.begin_epoch();
     total = 0;
     while (direct_loader.next_batch(batch)) {
@@ -269,26 +249,20 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     }
     direct_loader.synchronize();
     REQUIRE(total == static_cast<size_t>(NUM_IMAGES));
-
     direct_loader.begin_epoch();
     if (direct_loader.next_batch(batch)) {
         direct_loader.wait_batch(batch);
         direct_loader.handoff_batch(batch, nullptr);
-        ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, nullptr),
-                       "cudaMemsetAsync");
+        ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, nullptr), "cudaMemsetAsync");
         direct_loader.release_batch(batch, nullptr);
     }
-    while (direct_loader.next_batch(batch)) {
-        direct_loader.release_batch(batch);
-    }
+    while (direct_loader.next_batch(batch)) { direct_loader.release_batch(batch); }
     ensure_cuda_ok(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize");
     direct_loader.synchronize();
-
     DatasetLoader::Config shuffled_cfg = direct_cfg;
     shuffled_cfg.shuffle = true;
     shuffled_cfg.seed = 7;
     shuffled_cfg.prefetch_factor = 5;
-
     DatasetLoader shuffled_loader(shuffled_cfg);
     shuffled_loader.begin_epoch();
     std::vector<uint32_t> seen_indices;
@@ -297,16 +271,12 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
         CHECK_THROWS_AS(direct_loader.host_images(batch), std::runtime_error);
         total += batch.num_images;
         seen_indices.insert(seen_indices.end(), batch.image_indices, batch.image_indices + batch.num_images);
-        const bool direct_shuffle_span =
-            shuffled_loader.host_images(batch).data() == shuffled_loader.pixel_blob() + batch.image_indices[0] * STRIDE_FLOATS;
+        const bool direct_shuffle_span = shuffled_loader.host_images(batch).data() == shuffled_loader.pixel_blob() + batch.image_indices[0] * STRIDE_FLOATS;
         if (direct_shuffle_span) {
-            for (size_t i = 0; i < batch.num_images; ++i) {
-                REQUIRE(batch.image_indices[i] == batch.image_indices[0] + i);
-            }
+            for (size_t i = 0; i < batch.num_images; ++i) { REQUIRE(batch.image_indices[i] == batch.image_indices[0] + i); }
         }
         shuffled_loader.handoff_batch(batch, compute_stream);
-        ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, compute_stream),
-                       "cudaMemsetAsync");
+        ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, compute_stream), "cudaMemsetAsync");
         shuffled_loader.release_batch(batch, compute_stream);
         CHECK_THROWS_AS(shuffled_loader.host_images(batch), std::runtime_error);
     }
@@ -314,11 +284,8 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     shuffled_loader.synchronize();
     REQUIRE(total == static_cast<size_t>(NUM_IMAGES));
     std::sort(seen_indices.begin(), seen_indices.end());
-    for (uint32_t i = 0; i < static_cast<uint32_t>(seen_indices.size()); ++i) {
-        REQUIRE(seen_indices[i] == i);
-    }
+    for (uint32_t i = 0; i < static_cast<uint32_t>(seen_indices.size()); ++i) { REQUIRE(seen_indices[i] == i); }
     printf("Shuffled iteration: %zu images with prefetch_factor=%d\n", total, shuffled_cfg.prefetch_factor);
-
     shuffled_loader.begin_epoch();
     seen_indices.clear();
     while (shuffled_loader.next_batch(batch)) {
@@ -327,16 +294,12 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     }
     shuffled_loader.synchronize();
     std::sort(seen_indices.begin(), seen_indices.end());
-    for (uint32_t i = 0; i < static_cast<uint32_t>(seen_indices.size()); ++i) {
-        REQUIRE(seen_indices[i] == i);
-    }
-
+    for (uint32_t i = 0; i < static_cast<uint32_t>(seen_indices.size()); ++i) { REQUIRE(seen_indices[i] == i); }
     const std::vector<int> cpu_set = allowed_cpu_set();
     DatasetLoader::Config budgeted_cfg = shuffled_cfg;
     budgeted_cfg.prefetch_factor = 2;
     budgeted_cfg.gather_workers = 1;
     budgeted_cfg.cpu_affinity = std::to_string(cpu_set.front());
-
     DatasetLoader budgeted_loader(budgeted_cfg);
     std::vector<const float*> persistent_device_slots(static_cast<std::size_t>(budgeted_cfg.prefetch_factor));
     std::vector<std::uint64_t> previous_leases(persistent_device_slots.size());
@@ -360,7 +323,6 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
         budgeted_loader.synchronize();
         REQUIRE(total == static_cast<size_t>(NUM_IMAGES));
     }
-
     DatasetLoader::Config invalid_budget_cfg = shuffled_cfg;
     invalid_budget_cfg.prefetch_factor = 2;
     invalid_budget_cfg.gather_workers = 3;
@@ -369,7 +331,6 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
         DatasetLoader invalid_budget_loader(invalid_budget_cfg);
     } catch (const std::invalid_argument&) { invalid_budget_threw = true; }
     REQUIRE(invalid_budget_threw);
-
     DatasetLoader::Config invalid_affinity_cfg = direct_cfg;
     invalid_affinity_cfg.cpu_affinity = "999999";
     bool invalid_affinity_threw = false;
@@ -377,19 +338,16 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
         DatasetLoader invalid_affinity_loader(invalid_affinity_cfg);
     } catch (const std::runtime_error&) { invalid_affinity_threw = true; }
     REQUIRE(invalid_affinity_threw);
-
     DatasetLoader::Config shard0_cfg = direct_cfg;
     shard0_cfg.batch_size = 4;
     shard0_cfg.batch_shard_rank = 0;
     shard0_cfg.batch_shard_count = 2;
     DatasetLoader::Config shard1_cfg = shard0_cfg;
     shard1_cfg.batch_shard_rank = 1;
-
     DatasetLoader shard0_loader(shard0_cfg);
     DatasetLoader shard1_loader(shard1_cfg);
     shard0_loader.begin_epoch();
     shard1_loader.begin_epoch();
-
     std::vector<uint32_t> sharded_seen;
     while (shard0_loader.next_batch(batch)) {
         sharded_seen.insert(sharded_seen.end(), batch.image_indices, batch.image_indices + batch.num_images);
@@ -403,11 +361,8 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     shard1_loader.synchronize();
     std::sort(sharded_seen.begin(), sharded_seen.end());
     REQUIRE(sharded_seen.size() == static_cast<size_t>(NUM_IMAGES));
-    for (uint32_t i = 0; i < static_cast<uint32_t>(sharded_seen.size()); ++i) {
-        REQUIRE(sharded_seen[i] == i);
-    }
+    for (uint32_t i = 0; i < static_cast<uint32_t>(sharded_seen.size()); ++i) { REQUIRE(sharded_seen[i] == i); }
     printf("Batch sharding: %zu images across %u shards\n", sharded_seen.size(), shard0_cfg.batch_shard_count);
-
     DatasetLoader::Config partial_cfg = direct_cfg;
     partial_cfg.batch_size = 7U;
     DatasetLoader partial_loader(partial_cfg);
@@ -449,8 +404,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     // next deterministic schedule after all physical transfers settle.
     same_seed_a.begin_epoch();
     same_seed_a.begin_epoch();
-    while (same_seed_a.next_batch(batch))
-        same_seed_a.release_batch(batch);
+    while (same_seed_a.next_batch(batch)) same_seed_a.release_batch(batch);
     same_seed_a.synchronize();
     DatasetLoader stopped(direct_cfg);
     stopped.begin_epoch();
@@ -514,7 +468,6 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     REQUIRE_FALSE(never_started.next_batch(batch));
     REQUIRE_THROWS(never_started.begin_epoch());
 }
-
 void test_roundtrip_end_to_end() {
     profile_set_run_label("test_roundtrip");
     const mmltk::testsupport::ScopedTempDir root("mmltk_roundtrip");
@@ -530,11 +483,8 @@ void test_roundtrip_end_to_end() {
                                                         mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
     mmltk::frameworks::gpu::ImageStream owned_stream(context);
     const auto compute_stream = reinterpret_cast<cudaStream_t>(owned_stream.native_handle());
-
     create_synthetic_dataset(fixture);
-
     printf("=== Test dataset: %d images at %dx%d ===\n", NUM_IMAGES, W, H);
-
     CompilerConfig ccfg;
     ccfg.source_dir = dataset_dir_path;
     ccfg.output_dir = compiled_dir_path;
@@ -545,7 +495,6 @@ void test_roundtrip_end_to_end() {
     const DatasetCompilePlan compile_plan = DatasetCompiler::prepare(ccfg, {ccfg.split});
     DatasetCompiler::compile(compile_plan, 0U);
     printf("=== Compiled ===\n");
-
     // Resized compilation, canonical progress, letterboxing, and tiny masks
     // are covered by compile_progress; all transport runs share this artifact.
     const std::string bin_path = compiled_bin_path(fixture);
@@ -563,9 +512,7 @@ void test_roundtrip_end_to_end() {
     }
     printf("=== ALL TESTS PASSED ===\n");
 }
-
 TEST_CASE("compiled dataset round trip", "[backend][data][roundtrip][cuda]") { test_roundtrip_end_to_end(); }
-
 TEST_CASE("compiled source teardown retains one durable authority across replacement", "[data][gpu][custody]") {
     namespace gpu = mmltk::frameworks::gpu;
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
@@ -589,7 +536,6 @@ TEST_CASE("compiled source teardown retains one durable authority across replace
     for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS(CompiledImageStream(config, authority));
     CHECK(authority->fact().occupancy == 1U);
 }
-
 TEST_CASE("perceptual compiler changes shrinking RGB while preserving format catalog and categorical geometry", "[backend][data][compiler][perceptual]") {
     namespace oracle = mmltk::backend::data::test_perceptual;
     mmltk::testsupport::ScopedTempDir root("perceptual-compiled");
@@ -620,16 +566,19 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
         const auto name = image == 0 ? "000001.png" : "000002.png";
         const auto source = expected_nchw_stub((fs::path(config.source_dir) / "train" / name).string(), 65, 49);
         oracle::Image pixels(65, 49, RgbPixelFormat::RGB8);
-        for (unsigned y = 0; y != 49; ++y) for (unsigned x = 0; x != 65; ++x) for (unsigned channel = 0; channel != 3; ++channel)
-            pixels.set(x, y, channel, source[channel * 65U * 49U + y * 65U + x]);
+        for (unsigned y = 0; y != 49; ++y)
+            for (unsigned x = 0; x != 65; ++x)
+                for (unsigned channel = 0; channel != 3; ++channel) pixels.set(x, y, channel, source[channel * 65U * 49U + y * 65U + x]);
         const auto expected = oracle::reference(pixels, geometry.resized_width, geometry.resized_height);
         const auto* actual = selected.image_pixels(image);
-        for (unsigned channel = 0; channel != 3; ++channel) for (unsigned y = 0; y != 31; ++y) for (unsigned x = 0; x != 31; ++x) {
-            double answer = 0;
-            if (x >= geometry.offset_x && x < geometry.offset_x + geometry.resized_width &&
-                y >= geometry.offset_y && y < geometry.offset_y + geometry.resized_height)
-                answer = expected.at(x - geometry.offset_x, y - geometry.offset_y, channel);
-            CHECK(std::abs(actual[channel * 31U * 31U + y * 31U + x] - answer) <= 1.0 / 255 + 1e-6);
-        }
+        for (unsigned channel = 0; channel != 3; ++channel)
+            for (unsigned y = 0; y != 31; ++y)
+                for (unsigned x = 0; x != 31; ++x) {
+                    double answer = 0;
+                    if (x >= geometry.offset_x && x < geometry.offset_x + geometry.resized_width && y >= geometry.offset_y &&
+                        y < geometry.offset_y + geometry.resized_height)
+                        answer = expected.at(x - geometry.offset_x, y - geometry.offset_y, channel);
+                    CHECK(std::abs(actual[channel * 31U * 31U + y * 31U + x] - answer) <= 1.0 / 255 + 1e-6);
+                }
     }
 }

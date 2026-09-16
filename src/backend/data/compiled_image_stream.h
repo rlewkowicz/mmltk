@@ -1,6 +1,5 @@
 #pragma once
 #include "src/backend/data/data_loading_options.h"
-
 #include <cstddef>
 #include <cuda_runtime_api.h>
 #include <cstdint>
@@ -10,13 +9,12 @@
 #include <optional>
 #include "src/frameworks/gpu/device_execution.h"
 #include <string>
-
 #include "src/backend/data/compiled_dataset.h"
 #include "src/common/concurrency/worker_pool.h"
-
-namespace mmltk::frameworks::gpu { class TerminalCudaRetirementOwner; }
+namespace mmltk::frameworks::gpu {
+class TerminalCudaRetirementOwner;
+}
 namespace mmltk::backend::data {
-
 // A system-local physical image loader. Policy owners assign bounded slots and
 // retain them until their consumers finish. No image is copied between device
 // buffers just to adapt a consumer's batch layout.
@@ -65,12 +63,10 @@ class CompiledImageStream final {
         void* context = nullptr;
         void (*complete)(void*, std::size_t, std::exception_ptr) noexcept = nullptr;
     };
-
     explicit CompiledImageStream(Config config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {});
     ~CompiledImageStream();
     CompiledImageStream(const CompiledImageStream&) = delete;
     CompiledImageStream& operator=(const CompiledImageStream&) = delete;
-
     // Capture the actual owner context on its GPU worker, never during Explore model construction.
     void bind_current_context();
     // Retains the actual aggregate containing image allocations and transfer streams.
@@ -121,5 +117,4 @@ class CompiledImageStream final {
     std::unique_ptr<Retention> retention_;
     std::shared_ptr<Impl> impl_;
 };
-
 }  // namespace mmltk::backend::data

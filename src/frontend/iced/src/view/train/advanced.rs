@@ -99,7 +99,9 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<EditSchedul
             crate::generated::edit_workflowstrainrequestgpuaugmentationenabled(draft, value)
         }),
         Message::PerceptualDownscale(value) => model.edit(cadence, |draft| {
-            crate::generated::edit_workflowstrainrequestgpuaugmentationperceptualdownscale(draft, value)
+            crate::generated::edit_workflowstrainrequestgpuaugmentationperceptualdownscale(
+                draft, value,
+            )
         }),
         Message::Ema(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainrequestuseema(draft, value)
@@ -280,22 +282,62 @@ mod tests {
         assert!(!model.draft.as_ref().unwrap().workflows.train.request.useema);
         for enabled in [true, false] {
             update(&mut model, Message::Ema(enabled)).unwrap();
-            assert_eq!(model.draft.as_ref().unwrap().workflows.train.request.useema, enabled);
+            assert_eq!(
+                model.draft.as_ref().unwrap().workflows.train.request.useema,
+                enabled
+            );
         }
     }
 
     #[test]
     fn augmentation_and_perceptual_edits_are_independent() {
         let mut model = installed_settings_model();
-        assert!(model.draft.as_ref().unwrap().workflows.train.request.gpuaugmentation.enabled);
-        assert!(!model.draft.as_ref().unwrap().workflows.train.request.gpuaugmentation.perceptualdownscale);
+        assert!(
+            model
+                .draft
+                .as_ref()
+                .unwrap()
+                .workflows
+                .train
+                .request
+                .gpuaugmentation
+                .enabled
+        );
+        assert!(
+            !model
+                .draft
+                .as_ref()
+                .unwrap()
+                .workflows
+                .train
+                .request
+                .gpuaugmentation
+                .perceptualdownscale
+        );
         update(&mut model, Message::Augmentation(false)).unwrap();
         update(&mut model, Message::PerceptualDownscale(true)).unwrap();
-        let config = &model.draft.as_ref().unwrap().workflows.train.request.gpuaugmentation;
+        let config = &model
+            .draft
+            .as_ref()
+            .unwrap()
+            .workflows
+            .train
+            .request
+            .gpuaugmentation;
         assert!(!config.enabled);
         assert!(config.perceptualdownscale);
         update(&mut model, Message::Augmentation(true)).unwrap();
-        assert!(model.draft.as_ref().unwrap().workflows.train.request.gpuaugmentation.perceptualdownscale);
+        assert!(
+            model
+                .draft
+                .as_ref()
+                .unwrap()
+                .workflows
+                .train
+                .request
+                .gpuaugmentation
+                .perceptualdownscale
+        );
     }
 
     #[test]
@@ -303,17 +345,22 @@ mod tests {
         use crate::generated::FeatureId;
         use crate::view_model::StartInputs;
         let mut model = installed_settings_model();
-        let captured = StartInputs::capture(model.draft.as_ref().unwrap(), FeatureId::Train).unwrap();
+        let captured =
+            StartInputs::capture(model.draft.as_ref().unwrap(), FeatureId::Train).unwrap();
         assert!(captured.matches(model.draft.as_ref().unwrap()));
         update(&mut model, Message::PerceptualDownscale(true)).unwrap();
         assert!(!captured.matches(model.draft.as_ref().unwrap()));
         update(&mut model, Message::PerceptualDownscale(false)).unwrap();
         assert!(captured.matches(model.draft.as_ref().unwrap()));
         crate::view::train::dataset::update(
-            &mut model, crate::view::train::dataset::Message::PerceptualDownscaleChanged(true),
-        ).unwrap();
+            &mut model,
+            crate::view::train::dataset::Message::PerceptualDownscaleChanged(true),
+        )
+        .unwrap();
         assert!(!captured.matches(model.draft.as_ref().unwrap()));
-        let StartInputs::Train(original) = captured else { panic!("train capture expected"); };
+        let StartInputs::Train(original) = captured else {
+            panic!("train capture expected");
+        };
         assert!(!original.compileperceptualdownscale);
         assert!(!original.request.gpuaugmentation.perceptualdownscale);
         assert!(original.request.gpuaugmentation.enabled);

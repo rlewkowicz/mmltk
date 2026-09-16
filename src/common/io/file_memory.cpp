@@ -1,12 +1,10 @@
 #include "src/common/io/file_memory.h"
-
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -18,9 +16,7 @@
 #include <system_error>
 #include <utility>
 #include <vector>
-
 #include "src/common/math/checked_arithmetic.h"
-
 namespace mmltk::common::io {
 UniqueFd::UniqueFd(const int fd) noexcept : fd_(fd) {}
 UniqueFd::~UniqueFd() {
@@ -35,7 +31,6 @@ UniqueFd& UniqueFd::operator=(UniqueFd&& other) noexcept {
     return *this;
 }
 int UniqueFd::get() const noexcept { return fd_; }
-
 std::runtime_error errno_error(const char* action, const std::string& path) {
     const int error = errno;
     std::string message(action);
@@ -92,7 +87,6 @@ void publish_staged_path_atomically(const std::filesystem::path& staging, const 
     std::error_code ignored;
     (void)remove_tree_no_follow(staging, ignored);
 }
-
 FileHandle::FileHandle(const int fd) noexcept : fd_(fd) {}
 FileHandle FileHandle::open_readonly(const std::string& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
@@ -163,7 +157,6 @@ void FileHandle::advise(const std::size_t offset, const std::size_t bytes, const
 void FileHandle::sync_data() const {
     if (::fdatasync(get()) != 0) throw errno_error("fdatasync failed");
 }
-
 MappedByteRegion::~MappedByteRegion() { unmap(); }
 MappedByteRegion::MappedByteRegion(MappedByteRegion&& other) noexcept
     : address_(std::exchange(other.address_, nullptr)), bytes_(std::exchange(other.bytes_, 0)) {}
@@ -203,7 +196,6 @@ void MappedByteRegion::advise_hugepage() const {
 }
 void* MappedByteRegion::address() const noexcept { return address_; }
 std::size_t MappedByteRegion::mapped_bytes() const noexcept { return bytes_; }
-
 std::expected<MappedFile, std::error_code> MappedFile::try_open_readonly(const std::string& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return std::unexpected{std::error_code{errno, std::generic_category()}};
@@ -229,8 +221,7 @@ MappedFile MappedFile::open_readonly_range(const std::string& path, const std::s
     const auto file_bytes = mapped.file_.size();
     if (offset > file_bytes || bytes > file_bytes - offset) throw std::out_of_range("mmap range out of bounds");
     if (bytes == 0) return mapped;
-    void* address = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, mapped.file_.get(),
-                           mmltk::common::math::checked_cast<off_t>(offset, "mmap offset overflow"));
+    void* address = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, mapped.file_.get(), mmltk::common::math::checked_cast<off_t>(offset, "mmap offset overflow"));
     if (address == MAP_FAILED) throw errno_error("mmap failed", path);
     mapped.region_.adopt(address, bytes);
     return mapped;
@@ -240,11 +231,8 @@ std::size_t MappedFile::size() const noexcept { return region_.mapped_bytes(); }
 void MappedFile::advise(const int advice) const { advise_range(0, size(), advice); }
 void MappedFile::advise_range(const std::size_t offset, const std::size_t bytes, const int advice) const {
     if (offset > size() || bytes > size() - offset) throw std::out_of_range("madvise range out of bounds");
-    if (bytes != 0 && ::madvise(static_cast<std::uint8_t*>(region_.address()) + offset, bytes, advice) != 0) {
-        throw errno_error("madvise failed");
-    }
+    if (bytes != 0 && ::madvise(static_cast<std::uint8_t*>(region_.address()) + offset, bytes, advice) != 0) { throw errno_error("madvise failed"); }
 }
-
 void MappedFile::advise_aligned_range(const std::size_t offset, const std::size_t bytes, const int advice) const {
     if (offset > size() || bytes > size() - offset) throw std::out_of_range("aligned madvise range out of bounds");
     if (bytes == 0) return;

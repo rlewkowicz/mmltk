@@ -1,6 +1,5 @@
 module;
 #include <sys/mman.h>
-
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -18,40 +17,28 @@ module;
 #include <system_error>
 #include <utility>
 #include <vector>
-
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/image_resize.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/io/file_memory.h"
-
 module mmltk.backend.imaging.explore.compiled_explore_store;
-
 namespace mmltk::backend::imaging::explore {
-
 namespace {
-
 [[nodiscard]] bool cancellation_requested(const std::atomic<bool>* cancel_requested) noexcept {
     return cancel_requested != nullptr && cancel_requested->load(std::memory_order_relaxed);
 }
-
-[[nodiscard]] bool generation_is_current(const std::uint64_t expected_generation,
-                                         const std::atomic<std::uint64_t>* current_generation) noexcept {
+[[nodiscard]] bool generation_is_current(const std::uint64_t expected_generation, const std::atomic<std::uint64_t>* current_generation) noexcept {
     return current_generation == nullptr || current_generation->load(std::memory_order_acquire) == expected_generation;
 }
-
 void require_not_cancelled(const std::atomic<bool>* cancel_requested) {
     if (cancellation_requested(cancel_requested)) { throw std::runtime_error("dataset explore cancelled"); }
 }
-
 [[nodiscard]] bool class_masks_intersect(const ExploreClassMask& left, const ExploreClassMask& right) noexcept {
     std::uint64_t intersection = 0U;
-    for (std::size_t word = 0U; word < left.size(); ++word) {
-        intersection |= left[word] & right[word];
-    }
+    for (std::size_t word = 0U; word < left.size(); ++word) { intersection |= left[word] & right[word]; }
     return intersection != 0U;
 }
-
 [[nodiscard]] std::uint64_t splitmix64(std::uint64_t& state) noexcept {
     state += 0x9e3779b97f4a7c15ULL;
     std::uint64_t value = state;
@@ -59,14 +46,11 @@ void require_not_cancelled(const std::atomic<bool>* cancel_requested) {
     value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
     return value ^ (value >> 31U);
 }
-
-[[nodiscard]] bool deterministic_shuffle(std::vector<std::uint32_t>& values, const std::uint64_t seed,
-                                         const std::atomic<bool>* cancel_requested, const std::uint64_t expected_generation,
-                                         const std::atomic<std::uint64_t>* current_generation) noexcept {
+[[nodiscard]] bool deterministic_shuffle(std::vector<std::uint32_t>& values, const std::uint64_t seed, const std::atomic<bool>* cancel_requested,
+                                         const std::uint64_t expected_generation, const std::atomic<std::uint64_t>* current_generation) noexcept {
     std::uint64_t state = seed;
     for (std::size_t remaining = values.size(); remaining > 1U; --remaining) {
-        if ((remaining & 4095U) == 0U &&
-            (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation))) {
+        if ((remaining & 4095U) == 0U && (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation))) {
             return false;
         }
         const std::size_t selected = static_cast<std::size_t>(splitmix64(state) % remaining);
@@ -74,11 +58,8 @@ void require_not_cancelled(const std::atomic<bool>* cancel_requested) {
     }
     return !cancellation_requested(cancel_requested) && generation_is_current(expected_generation, current_generation);
 }
-
 }  // namespace
-
-std::vector<ExploreImageSummary> build_explore_summaries(const mmltk::backend::data::CompiledDataset& store,
-                                                         const std::atomic<bool>* cancel_requested,
+std::vector<ExploreImageSummary> build_explore_summaries(const mmltk::backend::data::CompiledDataset& store, const std::atomic<bool>* cancel_requested,
                                                          mmltk::common::concurrency::WorkerPool* workers) {
     const auto image_entries_ = store.image_entries();
     const auto labels_ = store.labels();
@@ -107,7 +88,6 @@ std::vector<ExploreImageSummary> build_explore_summaries(const mmltk::backend::d
     require_not_cancelled(cancel_requested);
     return summaries;
 }
-
 ExploreClassMask explore_class_mask(const std::span<const bool> enabled) noexcept {
     ExploreClassMask mask{};
     const std::size_t count = std::min<std::size_t>(enabled.size(), mmltk::backend::data::MAX_CLASSES);
@@ -116,7 +96,6 @@ ExploreClassMask explore_class_mask(const std::span<const bool> enabled) noexcep
     }
     return mask;
 }
-
 bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries, const ExploreSampleFilter& filter, const bool shuffled,
                            const std::uint64_t shuffle_seed, std::vector<std::uint32_t>& current, std::vector<std::uint32_t>& scratch,
                            const std::atomic<bool>* cancel_requested, const std::uint64_t expected_generation,
@@ -128,15 +107,13 @@ bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries,
     scratch.assign(summaries.size(), kRejected);
     const auto classify = [&](const std::size_t begin, const std::size_t end) {
         for (std::size_t image_index = begin; image_index < end; ++image_index) {
-            if ((image_index & 4095U) == 0U &&
-                (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation)))
+            if ((image_index & 4095U) == 0U && (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation)))
                 return;
             const ExploreImageSummary& summary = summaries[image_index];
             const std::uint64_t compiled_index = image_index;
-            if (compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index ||
-                summary.instance_count < filter.min_instances || summary.instance_count > filter.max_instances ||
-                (filter.require_boxes && summary.instance_count == 0U) || (filter.require_masks && !summary.has_masks) ||
-                (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
+            if (compiled_index < filter.min_compiled_index || compiled_index > filter.max_compiled_index || summary.instance_count < filter.min_instances ||
+                summary.instance_count > filter.max_instances || (filter.require_boxes && summary.instance_count == 0U) ||
+                (filter.require_masks && !summary.has_masks) || (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
                 continue;
             scratch[image_index] = static_cast<std::uint32_t>(image_index);
         }
@@ -148,16 +125,12 @@ bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries,
     if (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation)) { return false; }
     const auto selected_end = std::remove(scratch.begin(), scratch.end(), kRejected);
     scratch.erase(selected_end, scratch.end());
-    if (shuffled && !deterministic_shuffle(scratch, shuffle_seed, cancel_requested, expected_generation, current_generation)) {
-        return false;
-    }
+    if (shuffled && !deterministic_shuffle(scratch, shuffle_seed, cancel_requested, expected_generation, current_generation)) { return false; }
     if (cancellation_requested(cancel_requested) || !generation_is_current(expected_generation, current_generation)) { return false; }
     current.swap(scratch);
     return true;
 }
-
-std::optional<std::uint32_t> adjacent_explore_index(const std::span<const std::uint32_t> order, const std::uint32_t selected,
-                                                    const bool next) noexcept {
+std::optional<std::uint32_t> adjacent_explore_index(const std::span<const std::uint32_t> order, const std::uint32_t selected, const bool next) noexcept {
     if (order.empty()) { return std::nullopt; }
     const auto position = std::find(order.begin(), order.end(), selected);
     if (position == order.end()) { return std::nullopt; }
@@ -167,7 +140,6 @@ std::optional<std::uint32_t> adjacent_explore_index(const std::span<const std::u
     }
     return position == order.begin() ? order.back() : *(position - 1);
 }
-
 std::optional<ExploreAtlasLayout> make_explore_atlas_layout(const std::size_t item_count, const ExploreViewport viewport,
                                                             const std::uint32_t card_extent) noexcept {
     if (item_count == 0U || !viewport.valid() || card_extent == 0U) return std::nullopt;
@@ -182,7 +154,6 @@ std::optional<ExploreAtlasLayout> make_explore_atlas_layout(const std::size_t it
                               .rows = static_cast<std::uint32_t>(rows),
                               .card_extent = card_extent};
 }
-
 std::size_t prioritize_explore_work(const std::span<const std::uint32_t> order, const ExploreViewport viewport,
                                     const std::optional<std::uint32_t> focused_index, const std::uint32_t background_cursor,
                                     const std::span<std::uint32_t> output) noexcept {
@@ -209,5 +180,4 @@ std::size_t prioritize_explore_work(const std::span<const std::uint32_t> order, 
     }
     return written;
 }
-
 }  // namespace mmltk::backend::imaging::explore

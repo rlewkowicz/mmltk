@@ -3,7 +3,6 @@
 module;
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +13,6 @@ module;
 #include <span>
 #include <stdexcept>
 #include <utility>
-
 #include "detail/live_module_dependencies.h"  // IWYU pragma: keep
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
@@ -22,7 +20,6 @@ module;
 #include "src/common/system/time_utils.h"
 #include "src/frameworks/gpu/resource_owner_command_authority.h"
 module mmltk.backend.media.live.live_session_controller;
-
 import mmltk.backend.media.live.live_capture_region;
 import mmltk.backend.media.live.live_frame_id;
 import mmltk.backend.media.live.live_types;
@@ -30,18 +27,15 @@ import mmltk.backend.media.live.manual_overlay_document;
 import mmltk.backend.media.capture.capture_session;
 import mmltk.backend.media.capture.capture_types;
 import mmltk.backend.media.capture.status;
-
 import mmltk.backend.imaging.raster;
-
 #include "detail/live_compositor_owner.h"
 namespace mmltk::backend::media::live {
 namespace raster = mmltk::backend::imaging::raster;
 namespace system = mmltk::common::system;
 namespace gpu = mmltk::frameworks::gpu;
-
 LiveCompositor::LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* analyzer, LiveManualOverlayWorker* manual_overlay,
-                               LiveCompletedFramePublication& publication, const std::uint32_t count, const std::uint32_t width,
-                               const std::uint32_t height, LivePhysicalCudaContext cuda)
+                               LiveCompletedFramePublication& publication, const std::uint32_t count, const std::uint32_t width, const std::uint32_t height,
+                               LivePhysicalCudaContext cuda)
     : fanout_(fanout),
       analyzer_(analyzer),
       manual_overlay_(manual_overlay),
@@ -51,8 +45,7 @@ LiveCompositor::LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* anal
       slot_count_(count),
       width_(width),
       height_(height) {
-    if (count == 0U || width == 0U || height == 0U || !cuda_.valid())
-        throw std::invalid_argument("Live compositor requires fixed CUDA storage");
+    if (count == 0U || width == 0U || height == 0U || !cuda_.valid()) throw std::invalid_argument("Live compositor requires fixed CUDA storage");
     try {
         auto scope = cuda_.scope();
         if (!scope) throw std::runtime_error("enter Live compositor CUDA scope");
@@ -64,11 +57,11 @@ LiveCompositor::LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* anal
                 throw std::runtime_error("create Live compositor stream");
             if (scope.Record(cudaEventCreateWithFlags(&slot.ready, cudaEventDisableTiming)) != cudaSuccess)
                 throw std::runtime_error("create Live compositor event");
-            if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.rgba), &slot.rgba_pitch, static_cast<std::size_t>(width) * 4U,
-                                             height)) != cudaSuccess)
+            if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.rgba), &slot.rgba_pitch, static_cast<std::size_t>(width) * 4U, height)) !=
+                cudaSuccess)
                 throw std::runtime_error("allocate Live composite slot");
-            if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.overlay), &slot.overlay_pitch,
-                                             static_cast<std::size_t>(width) * 4U, height)) != cudaSuccess)
+            if (scope.Record(cudaMallocPitch(reinterpret_cast<void**>(&slot.overlay), &slot.overlay_pitch, static_cast<std::size_t>(width) * 4U, height)) !=
+                cudaSuccess)
                 // CLEANUP-IGNORE: This compositor retains disjoint physical slots and owns its own admission and
                 // teardown lifecycle.
                 throw std::runtime_error("allocate Live overlay slot");
@@ -78,13 +71,9 @@ LiveCompositor::LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* anal
         throw;
     }
 }
-
 LiveCompositor::~LiveCompositor() { destroy(); }
-
 void LiveCompositor::start() noexcept { running_.store(true, std::memory_order_release); }
-
 void LiveCompositor::close_admission() noexcept { running_.store(false, std::memory_order_release); }
-
 void LiveCompositor::ScrubLogicalProduct(CompositeSlot& slot) noexcept {
     slot.metadata = {};
     slot.revision = 0U;
@@ -93,11 +82,9 @@ void LiveCompositor::ScrubLogicalProduct(CompositeSlot& slot) noexcept {
     slot.manual_overlay_slot.reset();
     slot.producer_complete.store(false, std::memory_order_relaxed);
 }
-
 void LiveCompositor::publish_slot(CompositeSlot& slot, const SlotState published) noexcept {
     publish_live_owner_slot(slot.state, published, [&slot] noexcept { ScrubLogicalProduct(slot); });
 }
-
 void LiveCompositor::stop() noexcept {
     close_admission();
     if (slots_ == nullptr) return;
@@ -114,9 +101,7 @@ void LiveCompositor::stop() noexcept {
     }
     publication_.clear();
 }
-
 LiveCompositor::CompositeSlot* LiveCompositor::reserve() noexcept { return reserve_live_slot(slots_.get(), slot_count_).slot; }
-
 bool LiveCompositor::process_latest() {
     if (!running_.load(std::memory_order_acquire)) return false;
     DeviceFrameView source{};
@@ -128,7 +113,6 @@ bool LiveCompositor::process_latest() {
         dropped_.fetch_add(1U, std::memory_order_relaxed);
         return true;
     }
-
     LiveAnalysisOverlayProjection analysis{};
     OverlayView manual_overlay{};
     auto scope = cuda_.scope();
@@ -139,21 +123,19 @@ bool LiveCompositor::process_latest() {
     }
     cudaError_t status = scope.Record(cudaStreamWaitEvent(slot->stream, source.ready, 0U));
     if (status == cudaSuccess) {
-        const raster::CopyBgrToRgbaWork copy{
-            .source_bgr = {reinterpret_cast<const std::uint8_t*>(source.pixels), source.pitch_bytes, static_cast<int>(source.width),
-                           static_cast<int>(source.height)},
-            .target_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch,
-                                                       static_cast<int>(source.width), static_cast<int>(source.height)),
-            .stream = slot->stream};
+        const raster::CopyBgrToRgbaWork copy{.source_bgr = {reinterpret_cast<const std::uint8_t*>(source.pixels), source.pitch_bytes,
+                                                            static_cast<int>(source.width), static_cast<int>(source.height)},
+                                             .target_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch,
+                                                                                        static_cast<int>(source.width), static_cast<int>(source.height)),
+                                             .stream = slot->stream};
         status = scope.Record(static_cast<cudaError_t>(raster::copy_bgr_to_rgba(copy)));
     }
-
     if (status == cudaSuccess && analyzer_ != nullptr && analyzer_->try_acquire(source.frame, &analysis)) {
         slot->analysis_slot = analysis.slot;
         status = scope.Record(cudaStreamWaitEvent(slot->stream, reinterpret_cast<cudaEvent_t>(analysis.completion.event), 0U));
         if (status == cudaSuccess)
-            status = scope.Record(cudaMemset2DAsync(reinterpret_cast<void*>(slot->overlay), slot->overlay_pitch, 0,
-                                                    static_cast<std::size_t>(source.width) * 4U, source.height, slot->stream));
+            status = scope.Record(cudaMemset2DAsync(reinterpret_cast<void*>(slot->overlay), slot->overlay_pitch, 0, static_cast<std::size_t>(source.width) * 4U,
+                                                    source.height, slot->stream));
         for (const auto& annotation : analysis.annotations) {
             if (status != cudaSuccess || annotation.value_count == 0U) continue;
             const raster::InstanceOverlayRgbaWork overlay{
@@ -169,16 +151,14 @@ bool LiveCompositor::process_latest() {
             status = scope.Record(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(overlay)));
         }
         if (status == cudaSuccess) {
-            const raster::CompositeRgbaWork composite{
-                .base_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch,
-                                                         static_cast<int>(source.width), static_cast<int>(source.height)),
-                .overlay_rgba = {reinterpret_cast<const std::uint8_t*>(slot->overlay), slot->overlay_pitch, static_cast<int>(source.width),
-                                 static_cast<int>(source.height)},
-                .stream = slot->stream};
+            const raster::CompositeRgbaWork composite{.base_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch,
+                                                                                               static_cast<int>(source.width), static_cast<int>(source.height)),
+                                                      .overlay_rgba = {reinterpret_cast<const std::uint8_t*>(slot->overlay), slot->overlay_pitch,
+                                                                       static_cast<int>(source.width), static_cast<int>(source.height)},
+                                                      .stream = slot->stream};
             status = scope.Record(static_cast<cudaError_t>(raster::composite_rgba(composite)));
         }
     }
-
     if (status == cudaSuccess && manual_overlay_ != nullptr && manual_overlay_->try_acquire_latest(&manual_overlay)) {
         if (manual_overlay.has_content) {
             const std::uint64_t right = static_cast<std::uint64_t>(source.region.x) + source.width;
@@ -189,14 +169,13 @@ bool LiveCompositor::process_latest() {
                 status = scope.Record(cudaStreamWaitEvent(slot->stream, manual_overlay.ready, 0U));
             }
             if (status == cudaSuccess) {
-                const CUdeviceptr manual_region = manual_overlay.rgba +
-                                                  static_cast<std::size_t>(source.region.y) * manual_overlay.pitch_bytes +
+                const CUdeviceptr manual_region = manual_overlay.rgba + static_cast<std::size_t>(source.region.y) * manual_overlay.pitch_bytes +
                                                   static_cast<std::size_t>(source.region.x) * 4U;
                 const raster::CompositeRgbaWork composite{
-                    .base_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch,
-                                                             static_cast<int>(source.width), static_cast<int>(source.height)),
-                    .overlay_rgba = {reinterpret_cast<const std::uint8_t*>(manual_region), manual_overlay.pitch_bytes,
-                                     static_cast<int>(source.width), static_cast<int>(source.height)},
+                    .base_rgba = raster::pitched_rgba_target(reinterpret_cast<std::uint8_t*>(slot->rgba), slot->rgba_pitch, static_cast<int>(source.width),
+                                                             static_cast<int>(source.height)),
+                    .overlay_rgba = {reinterpret_cast<const std::uint8_t*>(manual_region), manual_overlay.pitch_bytes, static_cast<int>(source.width),
+                                     static_cast<int>(source.height)},
                     .stream = slot->stream};
                 status = scope.Record(static_cast<cudaError_t>(raster::composite_rgba(composite)));
             }
@@ -206,7 +185,6 @@ bool LiveCompositor::process_latest() {
             manual_overlay = {};
         }
     }
-
     if (status == cudaSuccess) {
         slot->source_slot = source.slot;
         slot->metadata = DeviceFrameMetadata::From(source);
@@ -214,7 +192,6 @@ bool LiveCompositor::process_latest() {
     }
     if (status == cudaSuccess) status = scope.Record(cudaLaunchHostFunc(slot->stream, ProducerComplete, slot));
     if (status == cudaSuccess) return true;
-
     const bool synchronized = scope.Record(cudaStreamSynchronize(slot->stream)) == cudaSuccess;
     if (slot->analysis_slot.has_value() && analyzer_ != nullptr) {
         if (synchronized)
@@ -235,13 +212,11 @@ bool LiveCompositor::process_latest() {
     dropped_.fetch_add(1U, std::memory_order_relaxed);
     return false;
 }
-
 void CUDART_CB LiveCompositor::ProducerComplete(void* context) noexcept {
     auto& slot = *static_cast<CompositeSlot*>(context);
     slot.producer_complete.store(true, std::memory_order_release);
     slot.owner->completion_signal_.notify();
 }
-
 bool LiveCompositor::drain_completions() {
     bool progressed = false;
     for (std::uint32_t index = 0U; index < slot_count_; ++index) {
@@ -252,7 +227,6 @@ bool LiveCompositor::drain_completions() {
     }
     return progressed;
 }
-
 void LiveCompositor::complete(CompositeSlot& slot) noexcept {
     fanout_.release_composite(slot.source_slot, nullptr, nullptr);
     if (slot.analysis_slot.has_value() && analyzer_ != nullptr) {
@@ -270,22 +244,18 @@ void LiveCompositor::complete(CompositeSlot& slot) noexcept {
     slot.metadata.ready_ns = system::steady_clock_now_ns();
     slot.revision = revision_.fetch_add(1U, std::memory_order_acq_rel) + 1U;
     publish_live_slot_state(slot.state, SlotState::Published);
-    publication_.publish(
-        PhysicalFrameRevision{slot.revision, slot.metadata.frame, slot.index, reinterpret_cast<std::uintptr_t>(slot.ready)});
+    publication_.publish(PhysicalFrameRevision{slot.revision, slot.metadata.frame, slot.index, reinterpret_cast<std::uintptr_t>(slot.ready)});
     frames_.fetch_add(1U, std::memory_order_relaxed);
     revision_signal_.notify();
 }
-
 bool LiveCompositor::try_acquire(const PhysicalFrameRevision revision, LiveCompositeOutputLease* output, void* callback_owner,
-                                 const LiveCompositeOutputLease::CompleteCallback on_complete,
-                                 const LiveCompositeOutputLease::AbandonCallback abandon) {
-    if (output == nullptr || static_cast<bool>(*output) || callback_owner == nullptr || on_complete == nullptr || abandon == nullptr ||
-        !revision.valid() || revision.slot >= slot_count_)
+                                 const LiveCompositeOutputLease::CompleteCallback on_complete, const LiveCompositeOutputLease::AbandonCallback abandon) {
+    if (output == nullptr || static_cast<bool>(*output) || callback_owner == nullptr || on_complete == nullptr || abandon == nullptr || !revision.valid() ||
+        revision.slot >= slot_count_)
         return false;
     CompositeSlot& slot = slots_[revision.slot];
     if (!transition_slot_state(slot.state, SlotState::Published, SlotState::Acquired)) return false;
-    if (slot.revision != revision.revision || slot.metadata.frame != revision.frame ||
-        reinterpret_cast<std::uintptr_t>(slot.ready) != revision.ready_event) {
+    if (slot.revision != revision.revision || slot.metadata.frame != revision.frame || reinterpret_cast<std::uintptr_t>(slot.ready) != revision.ready_event) {
         publish_live_slot_state(slot.state, SlotState::Published);
         return false;
     }
@@ -299,11 +269,8 @@ bool LiveCompositor::try_acquire(const PhysicalFrameRevision revision, LiveCompo
                                                revision);
     return true;
 }
-
 void LiveCompositor::complete_output(const PhysicalFrameRevision frame_revision) noexcept { finish_output(frame_revision, true); }
-
 void LiveCompositor::abandon_output(const PhysicalFrameRevision frame_revision) noexcept { finish_output(frame_revision, false); }
-
 void LiveCompositor::finish_output(const PhysicalFrameRevision frame_revision, const bool completed) noexcept {
     if (!completed) close_admission();
     if (frame_revision.slot >= slot_count_) {
@@ -337,30 +304,24 @@ void LiveCompositor::finish_output(const PhysicalFrameRevision frame_revision, c
         publish_slot(slot, SlotState::Terminal);
     }
 }
-
 bool LiveCompositor::settled() const noexcept {
     for (std::uint32_t index = 0U; index < slot_count_; ++index)
         if (!slot_state_is(slots_[index].state, SlotState::Free) && !slot_state_is(slots_[index].state, SlotState::Terminal)) return false;
     return true;
 }
-
 void LiveCompositor::set_revision_listener(std::function<void()> listener) { revision_signal_.set_listener(std::move(listener)); }
-
 void LiveCompositor::set_completion_listener(std::function<void()> listener) { completion_signal_.set_listener(std::move(listener)); }
-
 std::optional<PhysicalFrameRevision> LiveCompositor::newest_revision() const noexcept {
     const PhysicalFrameRevision revision = publication_.snapshot();
     if (!revision.valid()) return std::nullopt;
     return revision;
 }
-
 LiveCompositorTelemetry LiveCompositor::status() const noexcept {
     return {.running = running_.load(std::memory_order_acquire),
             .frames_composited = frames_.load(std::memory_order_relaxed),
             .frames_dropped = dropped_.load(std::memory_order_relaxed),
             .front_revision = revision_.load(std::memory_order_relaxed)};
 }
-
 void LiveCompositor::destroy() noexcept {
     if (slots_ == nullptr) return;
     close_admission();

@@ -1,7 +1,5 @@
 #pragma once
-
 #include <sys/types.h>
-
 #include <cstdint>
 #include <cstddef>
 #include <functional>
@@ -13,15 +11,12 @@
 #include <string>
 #include <variant>
 #include <vector>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/frameworks/gpu/image_buffer.h"
-
 namespace mmltk::controller {
-
 struct VisualSourceReader final {
     PresentationSourceIdentity source{};
     std::function<VisualSourceObservation()> observe{};
@@ -43,10 +38,8 @@ struct PresentationCapability final {
     VisualExtent extent{};
     std::uint64_t generation = 0U;
     PresentationCapabilityCondition condition = PresentationCapabilityCondition::Unavailable;
-
     [[nodiscard]] bool valid() const noexcept {
-        return (surface_high != 0U || surface_low != 0U) && extent.valid() && generation != 0U &&
-               condition != PresentationCapabilityCondition::Unavailable;
+        return (surface_high != 0U || surface_low != 0U) && extent.valid() && generation != 0U && condition != PresentationCapabilityCondition::Unavailable;
     }
     bool operator==(const PresentationCapability&) const = default;
 };
@@ -69,16 +62,13 @@ struct PresentationPublication final {
     std::uint64_t timeline_ready = 0U;
     std::uint64_t presentation_revision = 0U;
     std::uint64_t transfer_sequence = 0U;
-
     [[nodiscard]] bool valid() const noexcept {
-        return capability.valid() && capability.condition == PresentationCapabilityCondition::Ready && timeline_ready != 0U &&
-               presentation_revision != 0U;
+        return capability.valid() && capability.condition == PresentationCapabilityCondition::Ready && timeline_ready != 0U && presentation_revision != 0U;
     }
 };
 struct PresentationSubmittedSource final {
     VisualSourceObservation observation{};
     std::uint64_t selection_generation = 0U;
-
     [[nodiscard]] bool valid() const noexcept { return observation.valid() && selection_generation != 0U; }
     bool operator==(const PresentationSubmittedSource&) const = default;
 };
@@ -180,12 +170,11 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     PresentationState snapshot{};
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
 };
-
 class PresentationSystem final {
    public:
     using event_type = std::variant<PresentationCompleted, PresentationCapabilityChanged, PresentationFailed>;
-    PresentationSystem(VisualDeviceSettings, PresentationNativeWriterFactory, std::span<const VisualSourceReader>,
-                       SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
+    PresentationSystem(VisualDeviceSettings, PresentationNativeWriterFactory, std::span<const VisualSourceReader>, SystemEventSink<event_type> = {},
+                       VisualDiagnosticSink = {});
     ~PresentationSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] PresentationState Select(PresentationSourceIdentity);
     void SourceChanged(PresentationSourceIdentity) noexcept;
@@ -203,9 +192,7 @@ class PresentationSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 MMLTK_REFLECT_FIELDS(PresentationCapability)
 MMLTK_REFLECT_FIELDS(PresentationState)
 MMLTK_REFLECT_FIELDS(PresentationFailed)
-
 }  // namespace mmltk::controller

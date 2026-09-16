@@ -1,28 +1,23 @@
 #pragma once
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
-
 #include "live_device_types.h"
 #include "live_state_signal.h"
 #include "overlay_palette.h"
-
 namespace mmltk::backend::media::live {
-
 class LiveManualOverlayWorker final {
    public:
-    LiveManualOverlayWorker(ManualOverlayDocument& document, std::uint32_t slots, std::uint32_t width, std::uint32_t height,
-                            std::uint32_t maximum_instances, LiveManualOverlayUploadLimits upload_limits, LivePhysicalCudaContext cuda);
+    LiveManualOverlayWorker(ManualOverlayDocument& document, std::uint32_t slots, std::uint32_t width, std::uint32_t height, std::uint32_t maximum_instances,
+                            LiveManualOverlayUploadLimits upload_limits, LivePhysicalCudaContext cuda);
     ~LiveManualOverlayWorker();
     LiveManualOverlayWorker(const LiveManualOverlayWorker&) = delete;
     LiveManualOverlayWorker& operator=(const LiveManualOverlayWorker&) = delete;
-
     void start() noexcept;
     void close_admission() noexcept;
     void stop() noexcept;
@@ -38,13 +33,11 @@ class LiveManualOverlayWorker final {
         Refused,
         CudaFailure,
     };
-
     struct UploadStorage final {
         std::unique_ptr<mmltk::frameworks::gpu::PinnedHostBuffer> storage;
         void* host = nullptr;
         CUdeviceptr device = 0U;
     };
-
     struct PackedInstance final {
         std::size_t mask_offset = 0U;
         std::size_t run_value_offset = 0U;
@@ -53,7 +46,6 @@ class LiveManualOverlayWorker final {
         std::size_t edge_value_offset = 0U;
         std::optional<ManualOverlayDeferredMaskProjection> deferred_mask_projection;
     };
-
     struct Slot final {
         std::atomic<std::uint32_t> state{slot_state_value(SlotState::Free)};
         CUdeviceptr rgba = 0U;
@@ -71,13 +63,10 @@ class LiveManualOverlayWorker final {
         std::unique_ptr<PackedInstance[]> packed;
         LiveManualOverlayWorker* owner = nullptr;
     };
-
     struct SlotReservation final {
         Slot* slot = nullptr;
-
         [[nodiscard]] inline explicit operator bool() const noexcept { return slot != nullptr; }
     };
-
     static void CUDART_CB RenderComplete(void* context) noexcept;
     static void ScrubProduct(Slot& slot) noexcept;
     void publish_slot(Slot& slot, SlotState published) noexcept;
@@ -87,7 +76,6 @@ class LiveManualOverlayWorker final {
     [[nodiscard]] bool render_snapshot(const ManualOverlayDocumentSnapshot& snapshot, Slot& slot, std::size_t instance_count);
     void release_upload(UploadStorage& storage) noexcept;
     void destroy() noexcept;
-
     ManualOverlayDocument& document_;
     LivePhysicalCudaContext cuda_{};
     std::unique_ptr<Slot[]> slots_;

@@ -1,14 +1,10 @@
 #include "../detail/exclusive_operation_gate.h"
-
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <semaphore>
 #include <thread>
-
 namespace {
-
 using mmltk::common::concurrency::ExclusiveOperationGate;
-
 TEST_CASE("ExclusiveOperationGate rejects a simultaneous owner", "[common][concurrency][exclusive_operation_gate]") {
     ExclusiveOperationGate gate;
     std::binary_semaphore owner_acquired{0};
@@ -29,5 +25,4 @@ TEST_CASE("ExclusiveOperationGate rejects a simultaneous owner", "[common][concu
     auto next = gate.try_acquire();
     REQUIRE(next);
 }
-
 }  // namespace

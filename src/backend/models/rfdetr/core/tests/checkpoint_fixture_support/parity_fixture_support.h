@@ -1,10 +1,7 @@
 #pragma once
-
 #include <array>
 #include <cstdint>
-
 #include "src/backend/models/rfdetr/core/model_state.h"
-
 namespace at {
 class Tensor;
 }

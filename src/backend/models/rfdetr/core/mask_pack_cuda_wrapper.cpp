@@ -1,13 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
-
 #include <limits>
-
 #include "detail/mask_pack_cuda.h"
-
 import mmltk.backend.imaging.raster;
-
 namespace mmltk::backend::models::rfdetr {
-
 void pack_bool_masks_cuda_into(const torch::Tensor& masks, torch::Tensor& packed_masks) {
     TORCH_CHECK(masks.is_cuda(), "pack_bool_masks_cuda_into requires CUDA masks");
     TORCH_CHECK(packed_masks.is_cuda(), "pack_bool_masks_cuda_into requires CUDA packed_masks");
@@ -19,7 +14,6 @@ void pack_bool_masks_cuda_into(const torch::Tensor& masks, torch::Tensor& packed
                 "pack_bool_masks_cuda_into batch and prediction dimensions must match");
     TORCH_CHECK(masks.is_contiguous(), "pack_bool_masks_cuda_into expects contiguous masks");
     TORCH_CHECK(packed_masks.is_contiguous(), "pack_bool_masks_cuda_into expects contiguous packed_masks");
-
     constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
     const std::int64_t height = masks.size(2);
     const std::int64_t width = masks.size(3);
@@ -40,5 +34,4 @@ void pack_bool_masks_cuda_into(const torch::Tensor& masks, torch::Tensor& packed
     const cudaError_t status = static_cast<cudaError_t>(mmltk::backend::imaging::raster::pack_bool_masks(work));
     TORCH_CHECK(status == cudaSuccess, "pack_bool_masks_cuda_into raster launch failed: ", cudaGetErrorString(status));
 }
-
 }  // namespace mmltk::backend::models::rfdetr

@@ -5,20 +5,14 @@ module;
 #include <memory>
 #include <stdexcept>
 #include <utility>
-
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-
 module mmltk.backend.models.rfdetr.inference.loader;
-
 namespace mmltk::backend::models::rfdetr::inference_detail {
-
 std::unique_ptr<mmltk::backend::data::DatasetLoader> make_loader(const std::filesystem::path& compiled_path, const std::size_t batch_size,
-                                                                 const InferenceExecutionConfig& execution,
-                                                                 const std::size_t prefetch_factor,
+                                                                 const InferenceExecutionConfig& execution, const std::size_t prefetch_factor,
                                                                  std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement) {
-    if (compiled_path.empty() || batch_size == 0 || prefetch_factor == 0 ||
-        prefetch_factor > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    if (compiled_path.empty() || batch_size == 0 || prefetch_factor == 0 || prefetch_factor > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::invalid_argument("invalid RF-DETR inference loader setup");
     }
     mmltk::backend::data::DatasetLoader::Config config;
@@ -33,5 +27,4 @@ std::unique_ptr<mmltk::backend::data::DatasetLoader> make_loader(const std::file
     config.drop_last = false;
     return std::make_unique<mmltk::backend::data::DatasetLoader>(std::move(config), std::move(retirement));
 }
-
 }  // namespace mmltk::backend::models::rfdetr::inference_detail

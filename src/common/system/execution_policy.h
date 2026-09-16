@@ -1,13 +1,10 @@
 #pragma once
-
 #include <cstddef>
 #include <string>
 #include <vector>
 #include "src/common/system/numa_memory.h"
 #include "src/common/system/numa_topology.h"
-
 namespace mmltk::common::system {
-
 struct ExecutionPolicyRequest {
     std::vector<int> cpu_affinity;
     std::string thread_name;
@@ -16,7 +13,6 @@ struct ExecutionPolicyRequest {
     int target_nice = -10;
     bool storage_worker = true;
 };
-
 struct ExecutionPolicySnapshot {
     std::vector<int> affinity;
     int online_cpu_count = 0;
@@ -29,7 +25,6 @@ struct ExecutionPolicySnapshot {
     MemoryPolicy memory_policy;
     std::string thread_name;
 };
-
 class ScopedExecutionPolicy final {
    public:
     explicit ScopedExecutionPolicy(const ExecutionPolicyRequest&);
@@ -45,7 +40,6 @@ class ScopedExecutionPolicy final {
 [[nodiscard]] ExecutionPolicySnapshot apply_process_execution_policy();
 [[nodiscard]] ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest& request);
 [[nodiscard]] ExecutionPolicySnapshot capture_execution_policy_snapshot();
-
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 int clamp_worker_count_to_cpus(int requested_workers, size_t cpu_count, int reserved_cpus = 0, int minimum_workers = 1);
 }  // namespace mmltk::common::system

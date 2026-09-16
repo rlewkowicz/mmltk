@@ -28,28 +28,27 @@ ModelClassDescriptor read_class_descriptor(const std::filesystem::path& path) {
     snapshot.RequireUnchanged(path);
     return descriptor;
 }
-}
+}  // namespace detail
 namespace {
-std::filesystem::path normalized(const std::filesystem::path& path) {
-    return path.empty() ? path : std::filesystem::absolute(path).lexically_normal();
-}
+std::filesystem::path normalized(const std::filesystem::path& path) { return path.empty() ? path : std::filesystem::absolute(path).lexically_normal(); }
 ClassArtifactSnapshot capture(const std::filesystem::path& artifact, const std::filesystem::path& descriptor) {
-    ClassArtifactSnapshot result{.artifact_path = normalized(artifact), .descriptor_path = normalized(descriptor),
-        .artifact = io::FileSnapshot::Read(artifact)};
+    ClassArtifactSnapshot result{
+        .artifact_path = normalized(artifact), .descriptor_path = normalized(descriptor), .artifact = io::FileSnapshot::Read(artifact)};
     const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
     if (std::filesystem::exists(companion)) result.companion = io::FileSnapshot::Read(companion);
     if (!descriptor.empty() && std::filesystem::exists(descriptor)) result.descriptor = io::FileSnapshot::Read(descriptor);
     return result;
 }
-void check_stop(std::stop_token stop) { if (stop.stop_requested()) throw ArtifactPublicationCancelled{}; }
+void check_stop(std::stop_token stop) {
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
 }
+}  // namespace
 ClassArtifactSnapshot ClassArtifactSnapshot::Read(const std::filesystem::path& artifact, const std::filesystem::path& descriptor) {
     const auto lock = detail::lock_class_artifact(artifact, false);
     return capture(artifact, descriptor);
 }
-ClassArtifactAdmission::ClassArtifactAdmission(const std::filesystem::path& artifact,
-    const std::filesystem::path& descriptor, std::shared_ptr<const io::FileDigests> admitted_file,
-    std::stop_token stop, bool include_md5) {
+ClassArtifactAdmission::ClassArtifactAdmission(const std::filesystem::path& artifact, const std::filesystem::path& descriptor,
+                                               std::shared_ptr<const io::FileDigests> admitted_file, std::stop_token stop, bool include_md5) {
     check_stop(stop);
     // Hash outside the bundle lock; snapshot equality rejects a concurrent publication.
     if (!admitted_file) {
@@ -77,9 +76,7 @@ ClassArtifactAdmission::ClassArtifactAdmission(const std::filesystem::path& arti
         throw std::runtime_error("class artifact changed during descriptor admission");
     check_stop(stop);
 }
-std::vector<RfdetrNamedOutputRole> ClassArtifactAdmission::output_roles() const {
-    return class_descriptor_output_roles(descriptors_);
-}
+std::vector<RfdetrNamedOutputRole> ClassArtifactAdmission::output_roles() const { return class_descriptor_output_roles(descriptors_); }
 void ClassArtifactAdmission::RequireUnchanged(std::stop_token stop) const {
     check_stop(stop);
     if (snapshot_ != ClassArtifactSnapshot::Read(snapshot_.artifact_path, snapshot_.descriptor_path))
@@ -91,11 +88,10 @@ bool ClassArtifactAdmission::Matches(const std::filesystem::path& artifact, cons
     if (!current.descriptor_path.empty() && !current.descriptor) throw std::invalid_argument("missing selected class descriptor");
     return snapshot_ == current;
 }
-ModelClassLayout ClassArtifactAdmission::Resolve(std::size_t width, const std::optional<ModelClassLayout>& embedded,
-    std::stop_token stop) const {
+ModelClassLayout ClassArtifactAdmission::Resolve(std::size_t width, const std::optional<ModelClassLayout>& embedded, std::stop_token stop) const {
     check_stop(stop);
     auto result = admit_artifact_class_layout(width, embedded, descriptors_);
     RequireUnchanged(stop);
     return result;
 }
-}
+}  // namespace mmltk::backend::models::rfdetr

@@ -1,6 +1,5 @@
 #pragma once
 #include <cuda_runtime_api.h>
-
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -9,17 +8,14 @@
 #include <optional>
 #include <thread>
 #include <utility>
-
 #include "live_compositor_owner.h"
 #include "live_output_callback_lifetime.h"
 #include "live_physical_retirement.h"
-
 namespace mmltk::backend::media::live {
 class LiveMediaDataPlane::Impl final {
    public:
     explicit Impl(LiveDataPlaneConfig config);
     ~Impl();
-
     // CLEANUP-IGNORE: The private implementation repeats the sealed module facade exactly at its single pimpl boundary.
     [[nodiscard]] mmltk::backend::media::capture::CaptureSessionStartResult start(LiveAnalysisProviderFactory provider_factory);
     // CLEANUP-IGNORE: The private implementation mirrors the public stop-through-observer facade at this pimpl
@@ -39,7 +35,6 @@ class LiveMediaDataPlane::Impl final {
    private:
     enum class PhysicalPhase : std::uint8_t { Idle, Starting, Running, Closing, Terminal };
     enum class RawReadbackPhase : std::uint8_t { Idle, Pending, Active, Delivered };
-
     struct RawReadbackState final {
         RawReadbackPhase phase = RawReadbackPhase::Idle;
         std::optional<LiveRawFrameReadback> request;
@@ -54,13 +49,11 @@ class LiveMediaDataPlane::Impl final {
         ~PhysicalResources();
         PhysicalResources(const PhysicalResources&) = delete;
         PhysicalResources& operator=(const PhysicalResources&) = delete;
-
         [[nodiscard]] mmltk::backend::media::capture::CaptureSessionStartResult start(LiveAnalysisProviderFactory provider_factory);
         void close_admission() noexcept;
         void settle() noexcept;
         [[nodiscard]] bool drain();
         [[nodiscard]] bool settled() const noexcept;
-
         Impl& owner;
         mmltk::frameworks::gpu::ResourceOwnerCommandAuthority commands;
         LivePhysicalCudaContext cuda;
@@ -73,7 +66,6 @@ class LiveMediaDataPlane::Impl final {
         bool started = false;
         bool resources_settled = false;
     };
-
     static LiveDataPlaneConfig Validate(LiveDataPlaneConfig config);
     static void RecordCudaFailure(void* context, cudaError_t failure) noexcept;
     static void CompleteOutput(void* context, PhysicalFrameRevision revision) noexcept;
@@ -92,7 +84,6 @@ class LiveMediaDataPlane::Impl final {
     void publish_start(mmltk::backend::media::capture::CaptureSessionStartResult result) noexcept;
     void publish_revision() noexcept;
     void publish_terminal(std::shared_ptr<const mmltk::backend::media::capture::CaptureStopTerminal> capture_terminal) noexcept;
-
     const LiveDataPlaneConfig config_;
     LiveOutputCallbackLifetime output_callbacks_;
     mutable std::mutex lifecycle_;

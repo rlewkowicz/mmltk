@@ -1,11 +1,7 @@
 #pragma once
-
 namespace mmltk::backend::media::capture {
-
 namespace capture_internal {
-
 using Clock = std::chrono::steady_clock;
-
 enum class CaptureSlotPhase : std::uint8_t {
     kHardwareQueued = 0,
     kReplaceableFilled,
@@ -14,13 +10,10 @@ enum class CaptureSlotPhase : std::uint8_t {
     kRequeuePending,
     kOwnerRetained,
 };
-
 inline constexpr std::uint32_t kBgr3V4l2PixelFormat = V4L2_PIX_FMT_BGR24;
 inline constexpr std::size_t kBgr3BytesPerPixel = 3;
 inline constexpr std::uint32_t kPackedRegionFieldLimit = 0xFFFFU;
-
 inline std::uint32_t CaptureSlotPhaseValue(const CaptureSlotPhase state) { return static_cast<std::uint32_t>(state); }
-
 struct HostBuffer {
     std::unique_ptr<mmltk::frameworks::gpu::PinnedHostBuffer> registered_storage;
     std::unique_ptr<mmltk::common::system::NumaMemory> storage;
@@ -28,7 +21,6 @@ struct HostBuffer {
     std::size_t bytes = 0;
     bool pinned = false;
 };
-
 std::uint64_t NowNs();
 Status MakeStatus(StatusCode code, std::string message);
 Status MakeErrnoStatus(StatusCode code, const char* label);
@@ -40,9 +32,7 @@ Status AllocateHostBuffer(std::size_t bytes, bool pinned, HostBuffer* out);
 Status FreeHostBuffer(HostBuffer* buffer);
 std::uint64_t PackRegion(const CaptureRegion& region);
 CaptureRegion UnpackRegion(std::uint64_t packed);
-
 }  // namespace capture_internal
-
 struct CaptureSession::Impl {
     enum class CaptureReadyResult : std::uint8_t {
         kFrameReady = 0,
@@ -51,25 +41,21 @@ struct CaptureSession::Impl {
         kCameraError,
         kCameraHangup,
     };
-
     enum class DequeueResult : std::uint8_t {
         kDequeued = 0,
         kNotReady,
         kCameraError,
     };
-
     enum class CaptureTeardownDisposition : std::uint8_t {
         kRequeueThenStreamOff,
         kOwnerRetainThenStreamOff,
         kNoStreamOrDeviceLost,
     };
-
     struct CaptureLoopResult {
         CaptureStopKind kind = CaptureStopKind::kRequested;
         Status status{};
         CaptureTeardownDisposition teardown = CaptureTeardownDisposition::kNoStreamOrDeviceLost;
     };
-
     struct HostSlotRuntime {
         std::uint32_t slot_index = 0;
         capture_internal::HostBuffer capture_buffer;
@@ -79,10 +65,8 @@ struct CaptureSession::Impl {
         bool short_frame = false;
         CaptureRegion region{};
     };
-
     explicit Impl(CaptureConfig config_in);
     ~Impl();
-
     CaptureSessionStartResult prepare_start();
     void cancel_prepared_start() noexcept;
     void capture_owner_main();
@@ -145,7 +129,6 @@ struct CaptureSession::Impl {
     void ClearLastError();
     void SetLastError(const std::string& message);
     void NotifyState() const noexcept;
-
     CaptureConfig config;
     const std::uint64_t session_id_;
     int fd_ = -1;
@@ -158,13 +141,11 @@ struct CaptureSession::Impl {
     std::atomic<std::uint32_t> published_width_{0};
     std::atomic<std::uint32_t> published_height_{0};
     std::atomic<std::uint32_t> published_bytes_per_line_{0};
-
     std::vector<std::unique_ptr<HostSlotRuntime>> host_slots_;
     mutable std::mutex error_mutex_;
     std::string last_error_;
     std::atomic<std::shared_ptr<const std::function<void()>>> state_listener_{};
     std::atomic<std::shared_ptr<const std::function<void()>>> filled_frame_listener_{};
-
     std::atomic<bool> running_{false};
     std::atomic<bool> shutdown_{false};
     std::atomic<bool> stop_requested_{false};
@@ -186,7 +167,6 @@ struct CaptureSession::Impl {
     int replaceable_filled_index_ = -1;
     // CLEANUP-IGNORE: The capture completion descriptor and atomic telemetry are unrelated to Explore render-work vectors.
     int completion_event_fd_ = -1;
-
     // CLEANUP-IGNORE: Capture I/O telemetry is unrelated to Explore's typed render-work storage.
     std::atomic<std::uint64_t> queued_v4l2_buffers_{0};
     std::atomic<std::uint64_t> dequeued_v4l2_buffers_{0};
@@ -205,5 +185,4 @@ struct CaptureSession::Impl {
     std::optional<std::uint32_t> last_sequence_;
     std::uint64_t next_frame_id_ = 1;
 };
-
 }  // namespace mmltk::backend::media::capture

@@ -1,29 +1,22 @@
 #pragma once
-
 #include <cstdint>
 #include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
-
 #include "detection_types.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/backend/models/rfdetr/augmentation/augmentation_plan.h"
 #include "torch_api.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 namespace torch_types = mmltk::backend::ml::torch_api;
-
 [[nodiscard]] std::int64_t packed_mask_words_for_shape(int height, int width) noexcept;
 void pack_compiled_rle_pairs(std::span<const mmltk::backend::data::RLEPair> pairs, std::span<std::int64_t> words);
-
 torch_types::DeviceIndex cuda_device_index(int device_id);
 torch_types::Device cuda_device(int device_id);
-
 struct BatchStaticTensors {
     torch_types::Tensor sizes;
     torch_types::Tensor nested_mask;
@@ -31,12 +24,10 @@ struct BatchStaticTensors {
     int image_height = 0;
     int image_width = 0;
     int64_t batch_capacity = 0;
-
     void ensure(int64_t batch_size, int height, int width, int target_device_id);
     [[nodiscard]] torch_types::Tensor sizes_view(int64_t batch_size) const;
     [[nodiscard]] torch_types::Tensor nested_mask_view(int64_t batch_size) const;
 };
-
 struct TargetStagingSlot {
     torch_types::Tensor boxes;
     torch_types::Tensor labels;
@@ -58,7 +49,6 @@ struct TargetStagingSlot {
     int64_t mask_words_per_instance = 0;
     bool copy_pending = false;
 };
-
 // CLEANUP-IGNORE: TargetScratch is mutable GPU-build storage, not a duplicate of the immutable preset catalog row.
 struct TargetScratch {
     // CLEANUP-IGNORE: Scratch construction is intentionally trivial while every tensor retains distinct storage
@@ -77,13 +67,11 @@ struct TargetScratch {
     int mask_height = 0;
     int mask_width = 0;
     int64_t mask_words_per_instance = 0;
-
     ~TargetScratch() noexcept;
     TargetScratch(const TargetScratch&) = delete;
     TargetScratch& operator=(const TargetScratch&) = delete;
     TargetScratch(TargetScratch&&) = delete;
     TargetScratch& operator=(TargetScratch&&) = delete;
-
     void ensure_batch(size_t batch_size, int height, int width, int target_device_id);
     void ensure_instance_capacity(int64_t instances);
     void ensure_packed_mask_capacity(int64_t instances, int height, int width);
@@ -100,7 +88,6 @@ struct TargetScratch {
 
    private:
     void release_copy_resources();
-
     std::vector<TargetStagingSlot> staging_slots_;
     std::size_t next_staging_slot_ = 0;
     std::size_t active_staging_slot_ = 0;
@@ -112,15 +99,12 @@ struct TargetScratch {
     bool copy_pending_ = false;
     bool consumers_pending_ = false;
 };
-
 class TargetConsumerLease final {
    public:
     TargetConsumerLease(TargetScratch& scratch, const PreparedTargets& targets, int device_id);
     ~TargetConsumerLease() noexcept;
-
     TargetConsumerLease(const TargetConsumerLease&) = delete;
     TargetConsumerLease& operator=(const TargetConsumerLease&) = delete;
-
     void handoff();
     void retire();
 
@@ -129,15 +113,12 @@ class TargetConsumerLease final {
     int device_id_;
     bool handed_off_ = false;
 };
-
 class LoaderBatchGuard {
    public:
     LoaderBatchGuard(mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch, int device_id);
     ~LoaderBatchGuard() noexcept;
-
     LoaderBatchGuard(const LoaderBatchGuard&) = delete;
     LoaderBatchGuard& operator=(const LoaderBatchGuard&) = delete;
-
     inline void set_consumer_stream(void* stream) noexcept { consumer_stream_ = stream; }
     void release();
 
@@ -147,24 +128,14 @@ class LoaderBatchGuard {
     int device_id_ = 0;
     void* consumer_stream_ = nullptr;
 };
-
 torch_types::Tensor make_size_tensor(int64_t batch_size, int64_t image_height, int64_t image_width, const torch_types::Device& device);
-
-torch_types::Tensor make_device_batch_tensor(const mmltk::backend::data::Batch& batch, int device_id, int64_t image_height,
-                                             int64_t image_width);
-
+torch_types::Tensor make_device_batch_tensor(const mmltk::backend::data::Batch& batch, int device_id, int64_t image_height, int64_t image_width);
 void validate_feature_active_target(int64_t label, std::span<const float, 4> normalized_cxcywh, int64_t object_classes);
-
-PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int image_height, int image_width, bool include_masks,
-                              bool require_masks, int device_id, TargetScratch& scratch, std::string_view split,
-                              int64_t resolved_query_count, const TrainingSupervisionConfig& supervision, int64_t object_classes,
-                              AugmentationBatchPlan* augmentation_plan = nullptr);
-
+PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int image_height, int image_width, bool include_masks, bool require_masks,
+                              int device_id, TargetScratch& scratch, std::string_view split, int64_t resolved_query_count,
+                              const TrainingSupervisionConfig& supervision, int64_t object_classes, AugmentationBatchPlan* augmentation_plan = nullptr);
 std::string resolve_path(const std::string& path);
-
-mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle,
-                                                               int prefetch_factor, int gather_workers, const std::string& cpu_affinity,
-                                                               int device_id, uint64_t seed, uint32_t batch_shard_rank = 0,
-                                                               uint32_t batch_shard_count = 1);
-
+mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle, int prefetch_factor,
+                                                               int gather_workers, const std::string& cpu_affinity, int device_id, uint64_t seed,
+                                                               uint32_t batch_shard_rank = 0, uint32_t batch_shard_count = 1);
 }  // namespace mmltk::backend::models::rfdetr

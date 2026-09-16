@@ -1,9 +1,6 @@
 #pragma once
-
 #include "src/controller/contracts/workspace_input.h"
-
 #include "src/controller/presentation/visual_source_projection.h"
-
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -18,7 +15,6 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/controller/contracts/explore_filter.h"
@@ -31,21 +27,16 @@
 #include "src/common/system/execution_policy.h"
 #include "src/controller/presentation/visual_document.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-
 namespace mmltk::controller {
-
 namespace services {
 class RuntimeDiagnosticTarget;
 }
-
 class SettingsSystem;
-
 inline constexpr std::size_t kExploreVisibleItemCapacity = 256U;
 inline constexpr std::size_t kExploreLabelCapacity = kExploreVisibleItemCapacity * contracts::kAnnotationObjectCapacity;
 inline constexpr std::size_t kExploreMaximumParallelism = 64U;
 [[nodiscard]] std::size_t normalize_explore_parallelism(std::size_t requested);
 [[nodiscard]] std::size_t normalize_explore_parallelism(std::size_t requested, const mmltk::common::system::ExecutionPlacement&);
-
 enum class ExploreFailureKind : std::uint8_t { None, Operation, RuntimeInitialization, SelectedTransportUnavailable };
 enum class ExploreViewportOutcome : std::uint8_t { Ready, VisibleCapacityExceeded, AtlasExtentExceeded };
 enum class ExploreMode : std::uint8_t { Gallery, Detail };
@@ -61,13 +52,10 @@ struct ExploreViewport final {
         return extent.valid() && row_count != 0U && columns != 0U && extent.width % columns == 0U && extent.height % row_count == 0U &&
                extent.width / columns == extent.height / row_count;
     }
-    [[nodiscard]] bool valid() const noexcept {
-        return square_geometry() && static_cast<std::uint64_t>(row_count) * columns <= kExploreVisibleItemCapacity;
-    }
+    [[nodiscard]] bool valid() const noexcept { return square_geometry() && static_cast<std::uint64_t>(row_count) * columns <= kExploreVisibleItemCapacity; }
 };
 [[nodiscard]] constexpr std::uint32_t explore_atlas_card_extent(const ExploreViewport& viewport) noexcept {
-    return std::max(
-        1U, std::min(viewport.extent.width / std::max(1U, viewport.columns), viewport.extent.height / std::max(1U, viewport.row_count)));
+    return std::max(1U, std::min(viewport.extent.width / std::max(1U, viewport.columns), viewport.extent.height / std::max(1U, viewport.row_count)));
 }
 struct ExploreOpen final {
     ExploreViewport viewport{};
@@ -116,8 +104,7 @@ struct ExploreOrderFacts final {
             digest *= prime;
         }
     };
-    for (const auto compiled_index : visible_indices)
-        append(compiled_index);
+    for (const auto compiled_index : visible_indices) append(compiled_index);
     append(static_cast<std::uint32_t>(visible_indices.size()));
     return digest;
 }
@@ -167,7 +154,6 @@ struct ExploreImageMetadata final {
     contracts::AnnotationSceneContent scene{};
     [[= mmltk::frameworks::reflection::MaxItems{kExploreLabelCapacity}]] std::vector<ExploreLabel> labels{};
 };
-
 struct ExploreSnapshot final {
     std::uint64_t revision = 0U;
     bool busy = false;
@@ -196,7 +182,6 @@ struct ExploreSnapshot final {
     contracts::AnnotationSceneContent scene{};
     [[= mmltk::frameworks::reflection::MaxItems{kExploreLabelCapacity}]] std::vector<ExploreLabel> labels{};
 };
-
 struct ExploreRenderPlan final {
     ExploreViewport viewport{};
     ExploreScrollDirection scroll_direction = ExploreScrollDirection::Forward;
@@ -235,8 +220,7 @@ struct ExploreGalleryPublication final {
 class ExploreDemandCheck final {
    public:
     ExploreDemandCheck() noexcept = default;
-    explicit ExploreDemandCheck(std::shared_ptr<const std::atomic<std::uint64_t>> generation) noexcept
-        : generation_(std::move(generation)) {}
+    explicit ExploreDemandCheck(std::shared_ptr<const std::atomic<std::uint64_t>> generation) noexcept : generation_(std::move(generation)) {}
     [[nodiscard]] bool operator()(std::uint64_t generation) const noexcept {
         return !generation_ || generation_->load(std::memory_order_acquire) == generation;
     }
@@ -267,9 +251,7 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     class GalleryReadySink final {
        public:
         GalleryReadySink() noexcept = default;
-        explicit GalleryReadySink(std::function<void()> callback)
-            : callback_(std::make_shared<const std::function<void()>>(std::move(callback))) {}
-
+        explicit GalleryReadySink(std::function<void()> callback) : callback_(std::make_shared<const std::function<void()>>(std::move(callback))) {}
         [[nodiscard]] explicit operator bool() const noexcept { return callback_ != nullptr; }
         void operator()() const noexcept {
             if (!callback_) return;
@@ -309,18 +291,17 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     virtual void PrepareDetailOutput(mmltk::frameworks::gpu::ImageAllocation) noexcept = 0;
     virtual void PrepareOutputPublication(ExploreOutputChange, ExploreMode = ExploreMode::Gallery) = 0;
     virtual void CommitOutputPublication() noexcept = 0;
-    [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
-        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) {
+    [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation&) {
         return {};
     }
     [[nodiscard]] virtual bool RollbackOutputPublication() noexcept = 0;
     [[nodiscard]] virtual ExploreGalleryPublication BeginGallery(const ExploreRenderPlan&, const ExploreOrderCandidate*, std::size_t,
-                                                                 mmltk::frameworks::gpu::ImagePlaneView,
-                                                                 mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+                                                                 mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
+                                                                 std::uintptr_t) = 0;
     [[nodiscard]] virtual ExploreGalleryPublication AdvanceGallery() = 0;
     [[nodiscard]] virtual bool HasGalleryTiles() const = 0;
-    [[nodiscard]] virtual ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView,
-                                                                        mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
+    [[nodiscard]] virtual ExploreGalleryPublication PublishGalleryTiles(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView,
+                                                                        std::uintptr_t) = 0;
     virtual void RenderDetail(const ExploreRenderPlan&, std::size_t, mmltk::frameworks::gpu::ImagePlaneView,
                               // CLEANUP-IGNORE: Explore rendering and its typed events are distinct from Upscale's snapshot and events.
                               mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
@@ -335,20 +316,16 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
     // CLEANUP-IGNORE: Explore source projection and direct input API retain their own canonical identity; execution is already shared.
 };
-
 class ExploreSystem final {
    public:
     [[= contracts::reflection::direct::InteractionEndpoint{}]] void Input(WorkspaceMouse);
     void SetInputPeer(std::uint64_t);
-
     using visual_source =
-        VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore,
-                               mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
+        VisualSourceProjection<ExploreSnapshot, PresentationSourceKind::Explore, mmltk::frameworks::reflection::member_path<&ExploreSnapshot::frame>,
                                mmltk::frameworks::reflection::member_path<&ExploreSnapshot::revision>, ExploreImageMetadata>;
     using event_type = std::variant<ExploreChanged, ExploreFailed>;
     // CLEANUP-IGNORE: Explore construction retains its own generated system identity and runtime dependencies.
-    ExploreSystem(SettingsSystem&, VisualDeviceSettings, std::size_t nproc, VisualRuntimeFactory, SystemEventSink<event_type> = {},
-                  VisualDiagnosticSink = {});
+    ExploreSystem(SettingsSystem&, VisualDeviceSettings, std::size_t nproc, VisualRuntimeFactory, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
     ~ExploreSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] ExploreSnapshot Open(ExploreOpen);
     [[= contracts::reflection::direct::InteractionEndpoint{true}]] void UpdateViewport(ExploreViewportUpdate);
@@ -382,7 +359,6 @@ class ExploreSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 class ExploreAcceptanceGate final {
    public:
     enum class PublicationStage : std::uint8_t { None, DescriptorsPrepared, ProductPrepared };
@@ -465,15 +441,13 @@ class ExploreAcceptanceGate final {
         std::uint64_t transfer = 0U;
         std::uint64_t publication = 0U;
     };
-
     explicit ExploreAcceptanceGate(int command_descriptor);
     ~ExploreAcceptanceGate();
     ExploreAcceptanceGate(const ExploreAcceptanceGate&) = delete;
     ExploreAcceptanceGate& operator=(const ExploreAcceptanceGate&) = delete;
     void AdvanceGeneration(std::uint64_t generation) noexcept;
     [[nodiscard]] WaitResult AwaitInitialRelease(std::uint64_t generation);
-    [[nodiscard]] WaitResult AwaitHeldCompletion(std::uint64_t generation, std::uint64_t slot, std::uint64_t compiled_index,
-                                                 std::uint64_t staging_bytes);
+    [[nodiscard]] WaitResult AwaitHeldCompletion(std::uint64_t generation, std::uint64_t slot, std::uint64_t compiled_index, std::uint64_t staging_bytes);
     [[nodiscard]] bool ClaimHeldCompletion();
     [[nodiscard]] bool ClaimTerminalReport();
     void Stop() noexcept;
@@ -485,7 +459,6 @@ class ExploreAcceptanceGate final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 struct ExploreNativeConfiguration final {
     std::size_t image_limit = 1'000'000U;
     mmltk::backend::data::DataLoadingOptions loading{};
@@ -496,7 +469,6 @@ struct ExploreNativeConfiguration final {
     VisualDeviceSettings, std::size_t,
     // CLEANUP-IGNORE: This native factory and canonical Explore registrations do not duplicate provider schemas.
     ExploreNativeConfiguration, std::optional<mmltk::frameworks::gpu::DeviceExecution> execution = {});
-
 // CLEANUP-IGNORE: Explore's separately identified canonical types are not Annotation's reflection declarations.
 MMLTK_REFLECT_ENUM(ExploreFailureKind)
 MMLTK_REFLECT_ENUM(ExploreViewportOutcome)
@@ -521,5 +493,4 @@ MMLTK_REFLECT_FIELDS(ExploreImageMetadata)
 MMLTK_REFLECT_FIELDS(ExploreSnapshot)
 MMLTK_REFLECT_FIELDS(ExploreChanged)
 MMLTK_REFLECT_FIELDS(ExploreFailed)
-
 }  // namespace mmltk::controller

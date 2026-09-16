@@ -1,10 +1,8 @@
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
-
 #include <NvInfer.h>
 #include <NvInferVersion.h>
 #include <NvOnnxParser.h>
 #include <cuda_runtime.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -25,19 +23,14 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
 #include "detail/tensorrt_engine_access.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/image_failure.h"
-
 namespace mmltk::backend::ml::runtime {
-
 static_assert(NV_TENSORRT_MAJOR == 11, "mmltk requires TensorRT 11");
-
 namespace {
-
 class EngineErrors final : public nvinfer1::IErrorRecorder {
    public:
     explicit EngineErrors(nvinfer1::ILogger& logger) noexcept : logger_(logger) {}
@@ -91,15 +84,13 @@ class EngineErrors final : public nvinfer1::IErrorRecorder {
         const auto cuda = cudaPeekAtLastError();
         if (cuda != cudaSuccess) {
             const mmltk::frameworks::gpu::CudaError failure(cuda, std::string(operation).c_str());
-            if (failure.shared_failure())
-                throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(std::make_exception_ptr(failure), reported);
+            if (failure.shared_failure()) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(std::make_exception_ptr(failure), reported);
             throw mmltk::frameworks::gpu::ImageFailure(std::make_exception_ptr(failure), reported);
         }
         if (physical) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(reported);
         if (allocation)
             throw mmltk::frameworks::gpu::ImageFailure(
-                std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(cudaErrorMemoryAllocation, std::string(operation).c_str())),
-                reported);
+                std::make_exception_ptr(mmltk::frameworks::gpu::CudaError(cudaErrorMemoryAllocation, std::string(operation).c_str())), reported);
         if (cache && integrity) throw TensorRtCacheIntegrityError(std::string(operation));
         if (reported) std::rethrow_exception(reported);
         throw std::runtime_error(std::string(operation));
@@ -118,7 +109,6 @@ class EngineErrors final : public nvinfer1::IErrorRecorder {
     bool overflow_ = false;
     std::atomic<RefCount> references_{0};
 };
-
 void destroy_builder(nvinfer1::IBuilder* pointer) noexcept { delete pointer; }
 void destroy_network(nvinfer1::INetworkDefinition* pointer) noexcept { delete pointer; }
 void destroy_config(nvinfer1::IBuilderConfig* pointer) noexcept { delete pointer; }
@@ -126,7 +116,6 @@ void destroy_parser(nvonnxparser::IParser* pointer) noexcept { delete pointer; }
 void destroy_runtime(nvinfer1::IRuntime* pointer) noexcept { delete pointer; }
 void destroy_engine(nvinfer1::ICudaEngine* pointer) noexcept { delete pointer; }
 void destroy_host_memory(nvinfer1::IHostMemory* pointer) noexcept { delete pointer; }
-
 using BuilderOwner = std::unique_ptr<nvinfer1::IBuilder, decltype(&destroy_builder)>;
 using NetworkOwner = std::unique_ptr<nvinfer1::INetworkDefinition, decltype(&destroy_network)>;
 using ConfigOwner = std::unique_ptr<nvinfer1::IBuilderConfig, decltype(&destroy_config)>;
@@ -134,28 +123,21 @@ using ParserOwner = std::unique_ptr<nvonnxparser::IParser, decltype(&destroy_par
 using RuntimeOwner = std::unique_ptr<nvinfer1::IRuntime, decltype(&destroy_runtime)>;
 using EngineOwner = std::unique_ptr<nvinfer1::ICudaEngine, decltype(&destroy_engine)>;
 using HostMemoryOwner = std::unique_ptr<nvinfer1::IHostMemory, decltype(&destroy_host_memory)>;
-
 [[nodiscard]] std::string tensor_rt_data_type_name(nvinfer1::DataType data_type);
-
 [[nodiscard]] nvinfer1::ProfilingVerbosity profiling_verbosity(const TensorRtProfilingVerbosity value) noexcept {
     switch (value) {
-        case TensorRtProfilingVerbosity::Detailed:
-            return nvinfer1::ProfilingVerbosity::kDETAILED;
-        case TensorRtProfilingVerbosity::Disabled:
-            return nvinfer1::ProfilingVerbosity::kNONE;
+        case TensorRtProfilingVerbosity::Detailed: return nvinfer1::ProfilingVerbosity::kDETAILED;
+        case TensorRtProfilingVerbosity::Disabled: return nvinfer1::ProfilingVerbosity::kNONE;
         case TensorRtProfilingVerbosity::LayerNames:
-        default:
-            return nvinfer1::ProfilingVerbosity::kLAYER_NAMES_ONLY;
+        default: return nvinfer1::ProfilingVerbosity::kLAYER_NAMES_ONLY;
     }
 }
-
 [[nodiscard]] std::streamsize checked_stream_size(const std::size_t size, const std::string_view context) {
     if (size > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
         throw std::overflow_error(std::string(context) + " exceeds std::streamsize");
     }
     return static_cast<std::streamsize>(size);
 }
-
 [[nodiscard]] std::vector<char> read_binary(const std::filesystem::path& path, const std::string_view context) {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream.is_open()) { throw std::runtime_error(std::string(context) + " failed to open " + path.string()); }
@@ -169,14 +151,12 @@ using HostMemoryOwner = std::unique_ptr<nvinfer1::IHostMemory, decltype(&destroy
     }
     return bytes;
 }
-
 void write_binary(const std::filesystem::path& path, const void* data, const std::size_t size, const std::string_view context) {
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     if (!stream.is_open()) { throw std::runtime_error(std::string(context) + " failed to open " + path.string()); }
     if (size != 0U) { stream.write(static_cast<const char*>(data), checked_stream_size(size, context)); }
     if (!stream) { throw std::runtime_error(std::string(context) + " failed to write " + path.string()); }
 }
-
 [[nodiscard]] std::string format_dimensions(const nvinfer1::Dims& dimensions) {
     std::ostringstream output;
     output << '[';
@@ -187,7 +167,6 @@ void write_binary(const std::filesystem::path& path, const void* data, const std
     output << ']';
     return output.str();
 }
-
 [[nodiscard]] nvinfer1::Dims profile_dimensions(const std::vector<std::int64_t>& values, const std::string_view context) {
     if (values.empty() || values.size() > static_cast<std::size_t>(nvinfer1::Dims::MAX_DIMS)) {
         throw std::invalid_argument(std::string(context) + " has an invalid rank");
@@ -202,16 +181,13 @@ void write_binary(const std::filesystem::path& path, const void* data, const std
     }
     return dimensions;
 }
-
-[[nodiscard]] const nvinfer1::ITensor& profile_input(const nvinfer1::INetworkDefinition& network, const std::string_view name,
-                                                     const std::string_view context) {
+[[nodiscard]] const nvinfer1::ITensor& profile_input(const nvinfer1::INetworkDefinition& network, const std::string_view name, const std::string_view context) {
     for (std::int32_t index = 0; index < network.getNbInputs(); ++index) {
         const nvinfer1::ITensor* input = network.getInput(index);
         if (input != nullptr && input->getName() != nullptr && name == input->getName()) { return *input; }
     }
     throw std::invalid_argument(std::string(context) + " references unknown input " + std::string(name));
 }
-
 void configure_optimization_profiles(nvinfer1::IBuilder& builder, nvinfer1::INetworkDefinition& network, nvinfer1::IBuilderConfig& config,
                                      const TensorRtEngineOptions& options) {
     std::unordered_set<std::string> dynamic_inputs;
@@ -227,12 +203,9 @@ void configure_optimization_profiles(nvinfer1::IBuilder& builder, nvinfer1::INet
         }
     }
     if (options.optimization_profiles.empty()) {
-        if (!dynamic_inputs.empty()) {
-            throw std::invalid_argument(options.context + " requires optimization profiles for every dynamic input");
-        }
+        if (!dynamic_inputs.empty()) { throw std::invalid_argument(options.context + " requires optimization profiles for every dynamic input"); }
         return;
     }
-
     nvinfer1::IOptimizationProfile* profile = builder.createOptimizationProfile();
     if (profile == nullptr) { throw std::runtime_error(options.context + " failed to create an optimization profile"); }
     std::unordered_set<std::string> configured_inputs;
@@ -256,11 +229,9 @@ void configure_optimization_profiles(nvinfer1::IBuilder& builder, nvinfer1::INet
             if (minimum.d[axis] > optimum.d[axis] || optimum.d[axis] > maximum.d[axis]) {
                 throw std::invalid_argument(options.context + " optimization profile ordering is invalid for " + definition.input_name);
             }
-            if (network_dimensions.d[axis] > 0 &&
-                (minimum.d[axis] != network_dimensions.d[axis] || optimum.d[axis] != network_dimensions.d[axis] ||
-                 maximum.d[axis] != network_dimensions.d[axis])) {
-                throw std::invalid_argument(options.context + " optimization profile changes a static dimension for " +
-                                            definition.input_name);
+            if (network_dimensions.d[axis] > 0 && (minimum.d[axis] != network_dimensions.d[axis] || optimum.d[axis] != network_dimensions.d[axis] ||
+                                                   maximum.d[axis] != network_dimensions.d[axis])) {
+                throw std::invalid_argument(options.context + " optimization profile changes a static dimension for " + definition.input_name);
             }
         }
         if (!profile->setDimensions(definition.input_name.c_str(), nvinfer1::OptProfileSelector::kMIN, minimum) ||
@@ -274,17 +245,12 @@ void configure_optimization_profiles(nvinfer1::IBuilder& builder, nvinfer1::INet
             throw std::invalid_argument(options.context + " has no optimization profile for dynamic input " + input_name);
         }
     }
-    if (!profile->isValid() || config.addOptimizationProfile(profile) < 0) {
-        throw std::runtime_error(options.context + " rejected the optimization profile");
-    }
+    if (!profile->isValid() || config.addOptimizationProfile(profile) < 0) { throw std::runtime_error(options.context + " rejected the optimization profile"); }
 }
-
 class Logger final : public nvinfer1::ILogger {
    public:
     Logger(std::string context, std::function<void(std::string_view)> sink) : context_(std::move(context)), sink_(std::move(sink)) {}
-
     void set_threshold(const Severity threshold) noexcept { threshold_.store(static_cast<int>(threshold), std::memory_order_relaxed); }
-
     void log(const Severity severity, const char* message) noexcept override {
         if (severity > static_cast<Severity>(threshold_.load(std::memory_order_relaxed)) || !sink_) { return; }
         try {
@@ -295,18 +261,11 @@ class Logger final : public nvinfer1::ILogger {
             line += ":trt";
             switch (severity) {
                 case Severity::kINTERNAL_ERROR:
-                case Severity::kERROR:
-                    line += ":error";
-                    break;
-                case Severity::kWARNING:
-                    line += ":warn";
-                    break;
-                case Severity::kVERBOSE:
-                    line += ":verbose";
-                    break;
+                case Severity::kERROR: line += ":error"; break;
+                case Severity::kWARNING: line += ":warn"; break;
+                case Severity::kVERBOSE: line += ":verbose"; break;
                 case Severity::kINFO:
-                default:
-                    break;
+                default: break;
             }
             line += "] ";
             line += message != nullptr ? message : "";
@@ -319,12 +278,10 @@ class Logger final : public nvinfer1::ILogger {
     std::function<void(std::string_view)> sink_;
     std::atomic<int> threshold_{static_cast<int>(Severity::kWARNING)};
 };
-
 class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
    public:
     explicit BuildProgressMonitor(std::function<void(std::string_view)> sink, std::function<bool()> continue_build)
         : sink_(std::move(sink)), continue_build_(std::move(continue_build)) {}
-
     void phaseStart(const char* phase_name, const char* parent_phase, const std::int32_t steps) noexcept override {
         if (!sink_) return;
         try {
@@ -340,7 +297,6 @@ class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
             }
         } catch (...) { return; }
     }
-
     bool stepComplete(const char* phase_name, const std::int32_t step) noexcept override {
         try {
             std::lock_guard lock(mutex_);
@@ -355,7 +311,6 @@ class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
         } catch (...) { return should_continue(); }
         return should_continue();
     }
-
     void phaseFinish(const char* phase_name) noexcept override {
         if (!sink_) return;
         try {
@@ -379,14 +334,12 @@ class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
             return false;
         }
     }
-
     std::function<void(std::string_view)> sink_;
     std::function<bool()> continue_build_;
     std::mutex mutex_;
     std::unordered_map<std::string, std::int32_t> phase_steps_;
     std::atomic_bool cancelled_{false};
 };
-
 [[nodiscard]] std::string parser_errors(const nvonnxparser::IParser& parser) {
     std::ostringstream output;
     for (std::int32_t index = 0; index < parser.getNbErrors(); ++index) {
@@ -400,13 +353,10 @@ class BuildProgressMonitor final : public nvinfer1::IProgressMonitor {
     }
     return output.str();
 }
-
 void configure_tf32(nvinfer1::IBuilderConfig& config, const bool allow_tf32) {
     if (!allow_tf32) { config.clearFlag(nvinfer1::BuilderFlag::kTF32); }
 }
-
 }  // namespace
-
 struct TensorRtEngine::Impl {
     explicit Impl(std::filesystem::path path, TensorRtEngineOptions engine_options)
         : model_path(std::move(path)), options(std::move(engine_options)), logger(options.context, options.log), errors(logger) {
@@ -431,11 +381,9 @@ struct TensorRtEngine::Impl {
         cancelled = options.continue_build && !options.continue_build();
         return !cancelled;
     }
-
     void emit(const std::string& message) const {
         if (options.log) { options.log(message); }
     }
-
     void load_engine(const std::vector<char>& bytes) {
         if (bytes.empty()) throw TensorRtCacheIntegrityError(options.context + " empty TensorRT engine");
         if (!admitted()) return;
@@ -446,7 +394,6 @@ struct TensorRtEngine::Impl {
         engine.reset(runtime->deserializeCudaEngine(bytes.data(), bytes.size()));
         errors.Check(engine != nullptr, options.context + " deserialize TensorRT engine", true);
     }
-
     void build_engine() {
         if (!admitted()) return;
         logger.set_threshold(nvinfer1::ILogger::Severity::kVERBOSE);
@@ -466,8 +413,7 @@ struct TensorRtEngine::Impl {
         emit("[trt:build] parsing ONNX " + model_path.string());
         if (!parser->parseFromFile(model_path.string().c_str(), static_cast<int>(nvinfer1::ILogger::Severity::kVERBOSE))) {
             const std::string diagnostics = parser_errors(*parser);
-            throw std::runtime_error(options.context + " failed to parse ONNX" +
-                                     (diagnostics.empty() ? std::string{} : ":\n" + diagnostics));
+            throw std::runtime_error(options.context + " failed to parse ONNX" + (diagnostics.empty() ? std::string{} : ":\n" + diagnostics));
         }
         emit("[trt:build] parsed layers=" + std::to_string(network->getNbLayers()) + " inputs=" + std::to_string(network->getNbInputs()) +
              " outputs=" + std::to_string(network->getNbOutputs()));
@@ -494,8 +440,7 @@ struct TensorRtEngine::Impl {
         configure_tf32(*config, options.allow_tf32);
         if (options.log) {
             emit("[trt:build] precision=model-defined automatic_fp16_lowering=not-applied fp16_permission=" +
-                 std::string(options.allow_fp16 ? "allowed" : "disabled") +
-                 " tf32_permission=" + std::string(options.allow_tf32 ? "allowed" : "disabled"));
+                 std::string(options.allow_fp16 ? "allowed" : "disabled") + " tf32_permission=" + std::string(options.allow_tf32 ? "allowed" : "disabled"));
         }
         emit("[trt:build] building serialized engine");
         if (!admitted()) return;
@@ -509,14 +454,11 @@ struct TensorRtEngine::Impl {
         }
         // Inspect reported failures before cancellation: an OOM/context loss
         // concurrent with withdrawal is not a successful cancellation.
-        if (errors.getNbErrors() != 0 || errors.hasOverflowed() || cuda_status != cudaSuccess)
-            errors.Check(false, options.context + " build TensorRT engine");
+        if (errors.getNbErrors() != 0 || errors.hasOverflowed() || cuda_status != cudaSuccess) errors.Check(false, options.context + " build TensorRT engine");
         if (!admitted()) return;
         if (serialized == nullptr) { throw std::runtime_error(options.context + " TensorRT buildSerializedNetwork failed"); }
         emit("[trt:build] serialized bytes=" + std::to_string(serialized->size()));
-        if (!options.save_engine_path.empty()) {
-            write_binary(options.save_engine_path, serialized->data(), serialized->size(), options.context);
-        }
+        if (!options.save_engine_path.empty()) { write_binary(options.save_engine_path, serialized->data(), serialized->size(), options.context); }
         if (!admitted()) return;
         runtime.reset(nvinfer1::createInferRuntime(logger));
         if (runtime == nullptr) { throw std::runtime_error(options.context + " failed to create TensorRT runtime"); }
@@ -527,7 +469,6 @@ struct TensorRtEngine::Impl {
         emit("[trt:build] engine ready");
         logger.set_threshold(nvinfer1::ILogger::Severity::kWARNING);
     }
-
     std::filesystem::path model_path;
     TensorRtEngineOptions options;
     Logger logger;
@@ -538,65 +479,38 @@ struct TensorRtEngine::Impl {
     bool built_from_onnx = false;
     bool cancelled = false;
 };
-
 TensorRtEngine::TensorRtEngine(const std::filesystem::path& model_path, TensorRtEngineOptions options)
     : impl_(std::make_unique<Impl>(model_path, std::move(options))) {}
-
 TensorRtEngine::~TensorRtEngine() = default;
 TensorRtEngine::TensorRtEngine(TensorRtEngine&&) noexcept = default;
 TensorRtEngine& TensorRtEngine::operator=(TensorRtEngine&&) noexcept = default;
 bool TensorRtEngine::cancelled() const noexcept { return impl_->cancelled; }
-
 std::int32_t TensorRtEngine::device() const noexcept { return impl_->options.device; }
-
 nvinfer1::ICudaEngine& detail::TensorRtEngineAccess::Get(const TensorRtEngine& owner) noexcept { return *owner.impl_->engine; }
-
 const std::filesystem::path& TensorRtEngine::model_path() const noexcept { return impl_->model_path; }
-
 bool TensorRtEngine::built_from_onnx() const noexcept { return impl_->built_from_onnx; }
-
 std::uintptr_t TensorRtEngine::native_engine_handle() const noexcept { return reinterpret_cast<std::uintptr_t>(impl_->engine.get()); }
-
-void TensorRtEngine::CheckOperation(const bool succeeded, const std::string_view operation) const {
-    impl_->errors.Check(succeeded, operation);
-}
-
+void TensorRtEngine::CheckOperation(const bool succeeded, const std::string_view operation) const { impl_->errors.Check(succeeded, operation); }
 void TensorRtEngine::Save(const std::filesystem::path& path) const {
     if (impl_->serialized == nullptr) { throw std::runtime_error(impl_->options.context + " has no serialized engine available to save"); }
     write_binary(path, impl_->serialized->data(), impl_->serialized->size(), impl_->options.context);
 }
-
 namespace {
-
 std::string tensor_rt_data_type_name(const nvinfer1::DataType data_type) {
     switch (data_type) {
-        case nvinfer1::DataType::kFLOAT:
-            return "float32";
-        case nvinfer1::DataType::kHALF:
-            return "float16";
-        case nvinfer1::DataType::kINT8:
-            return "int8";
-        case nvinfer1::DataType::kINT32:
-            return "int32";
-        case nvinfer1::DataType::kBOOL:
-            return "bool";
-        case nvinfer1::DataType::kUINT8:
-            return "uint8";
-        case nvinfer1::DataType::kFP8:
-            return "float8";
-        case nvinfer1::DataType::kBF16:
-            return "bfloat16";
-        case nvinfer1::DataType::kINT64:
-            return "int64";
-        case nvinfer1::DataType::kINT4:
-            return "int4";
-        case nvinfer1::DataType::kFP4:
-            return "float4";
-        default:
-            return "unsupported";
+        case nvinfer1::DataType::kFLOAT: return "float32";
+        case nvinfer1::DataType::kHALF: return "float16";
+        case nvinfer1::DataType::kINT8: return "int8";
+        case nvinfer1::DataType::kINT32: return "int32";
+        case nvinfer1::DataType::kBOOL: return "bool";
+        case nvinfer1::DataType::kUINT8: return "uint8";
+        case nvinfer1::DataType::kFP8: return "float8";
+        case nvinfer1::DataType::kBF16: return "bfloat16";
+        case nvinfer1::DataType::kINT64: return "int64";
+        case nvinfer1::DataType::kINT4: return "int4";
+        case nvinfer1::DataType::kFP4: return "float4";
+        default: return "unsupported";
     }
 }
-
 }  // namespace
-
 }  // namespace mmltk::backend::ml::runtime

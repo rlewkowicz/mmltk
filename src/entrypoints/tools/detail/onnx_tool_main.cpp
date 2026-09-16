@@ -1,16 +1,12 @@
 #include "detail/onnx_tool_main.h"
-
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
-
 import mmltk.common.logging.mmltk_logging;
-
 namespace mmltk::entrypoints::tools {
-
 int run_onnx_tool_main(const int argc, char** argv, const OnnxToolMainConfig& config, const OnnxToolOperation operation) {
     try {
         auto logging_config = mmltk::common::logging::config_from_env(std::string(config.application_name));
@@ -27,9 +23,7 @@ int run_onnx_tool_main(const int argc, char** argv, const OnnxToolMainConfig& co
                 if (++index >= argc) throw std::invalid_argument("logging option requires a value");
                 continue;
             }
-            if (argument.starts_with("--log-level=") || argument.starts_with("--log-file=") || argument.starts_with("--log-dir=")) {
-                continue;
-            }
+            if (argument.starts_with("--log-level=") || argument.starts_with("--log-file=") || argument.starts_with("--log-dir=")) { continue; }
             positionals.push_back(argument);
         }
         if (positionals.size() != 1U) throw std::invalid_argument(std::string(config.usage));
@@ -38,11 +32,9 @@ int run_onnx_tool_main(const int argc, char** argv, const OnnxToolMainConfig& co
         return 0;
     } catch (const std::exception& error) {
         try {
-            mmltk::common::logging::error(config.logger_name,
-                                          [&](auto& logger) { logger.error("{}{}", config.error_prefix, error.what()); });
+            mmltk::common::logging::error(config.logger_name, [&](auto& logger) { logger.error("{}{}", config.error_prefix, error.what()); });
         } catch (...) {}
         return 1;
     }
 }
-
 }  // namespace mmltk::entrypoints::tools

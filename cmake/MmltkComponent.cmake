@@ -33,12 +33,14 @@ function(mmltk_configure_header_isolation target owner)
     mmltk_configure_concrete_target("${target}")
     set_target_properties("${target}" PROPERTIES
         UNITY_BUILD OFF DISABLE_PRECOMPILE_HEADERS ON CXX_SCAN_FOR_MODULES OFF)
-    target_include_directories("${target}" PRIVATE
+    # Preserve the owner's transitive system classifications without creating
+    # library edges from the isolation check back into the product graph. System
+    # metadata can contain entries absent from the actual search list; copy that
+    # list separately so classification does not introduce new search paths.
+    target_include_directories("${target}" SYSTEM PRIVATE
+        "$<TARGET_PROPERTY:${owner},SYSTEM_INCLUDE_DIRECTORIES>")
+    set_property(TARGET "${target}" PROPERTY INCLUDE_DIRECTORIES
         "$<TARGET_PROPERTY:${owner},INCLUDE_DIRECTORIES>")
-    # System classifications are not additional search paths. In particular,
-    # imported dependencies may classify relative install paths here. Copy the
-    # owner's complete search path above, without appending classifications as
-    # directories on the independent header target.
     target_compile_definitions("${target}" PRIVATE
         "$<TARGET_PROPERTY:${owner},COMPILE_DEFINITIONS>")
     target_compile_options("${target}" PRIVATE

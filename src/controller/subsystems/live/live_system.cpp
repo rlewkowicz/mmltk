@@ -3,26 +3,19 @@
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
-
 #include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <utility>
-
 #include "src/controller/contracts/compute.h"
-
 namespace mmltk::controller {
 class LiveSystem::Impl final {
     WorkspaceInput input_;
 
    public:
-    Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events,
-         VisualDiagnosticSink diagnostics)
-        : settings_(settings),
-          events_(std::move(events)),
-          diagnostics_(diagnostics),
-          worker_(std::move(factory), [this](const std::exception_ptr failure) {
+    Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
+        : settings_(settings), events_(std::move(events)), diagnostics_(diagnostics), worker_(std::move(factory), [this](const std::exception_ptr failure) {
               pending_output_ = {};
               const auto reported = mmltk::frameworks::gpu::combine_image_failures(failure, worker_.FinishDeferredRetirement());
               auto detail = visual_failure_detail(reported, "Live GPU worker failed");
@@ -137,9 +130,7 @@ class LiveSystem::Impl final {
 
    private:
     friend class LiveSystem;
-
-    detail::VisualRuntimeOwner::Notification Capture(mmltk::frameworks::gpu::SystemImageRuntime& runtime,
-                                                     const std::stop_token worker_stop) {
+    detail::VisualRuntimeOwner::Notification Capture(mmltk::frameworks::gpu::SystemImageRuntime& runtime, const std::stop_token worker_stop) {
         auto* const algorithm = dynamic_cast<LiveAlgorithm*>(runtime.model());
         if (!algorithm) throw std::runtime_error("Live capture data plane is unavailable");
         std::stop_token run_stop;
@@ -175,12 +166,10 @@ class LiveSystem::Impl final {
         static_cast<void>(runtime.CommitOutput(std::move(candidate)));
         {
             std::scoped_lock lock(mutex_);
-            if (state_.completed_frames == std::numeric_limits<std::uint64_t>::max())
-                throw std::overflow_error("Live completed-frame counter exhausted");
+            if (state_.completed_frames == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("Live completed-frame counter exhausted");
             ++state_.completed_frames;
             AdvanceRevision();
-            state_.frame = {
-                .source = {PresentationSourceKind::Live, 1U}, .extent = request_.extent, .revision = runtime.OutputFacts().revision};
+            state_.frame = {.source = {PresentationSourceKind::Live, 1U}, .extent = request_.extent, .revision = runtime.OutputFacts().revision};
         }
         next_capture_ = std::chrono::steady_clock::now() + cadence_;
         worker_.NotifyContinuationAt(next_capture_);
@@ -192,7 +181,6 @@ class LiveSystem::Impl final {
         });
         return [this] { PublishFrame(); };
     }
-
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const {
         VisualFrame committed;
         {
@@ -202,7 +190,6 @@ class LiveSystem::Impl final {
         }
         return borrow_matching_visual_product(committed, worker_);
     }
-
     VisualDeviceSettings settings_;
     SystemEventSink<event_type> events_;
     VisualDiagnosticSink diagnostics_{};
@@ -216,9 +203,7 @@ class LiveSystem::Impl final {
     mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput pending_output_;
     detail::VisualRuntimeOwner worker_;
 };
-
-LiveSystem::LiveSystem(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events,
-                       VisualDiagnosticSink diagnostics)
+LiveSystem::LiveSystem(const VisualDeviceSettings settings, VisualRuntimeFactory factory, SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
     : impl_(std::make_unique<Impl>(settings, std::move(factory), std::move(events), diagnostics)) {}
 LiveSystem::~LiveSystem() = default;
 LiveSnapshot LiveSystem::Start(const LiveStart request) {
@@ -238,9 +223,7 @@ mmltk::frameworks::gpu::BorrowedImageProductReadView LiveSystem::BorrowFrame() c
 mmltk::frameworks::gpu::BorrowedImageWorkspace LiveSystem::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation LiveSystem::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }
 void LiveSystem::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
-
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 void LiveSystem::Input(WorkspaceMouse mouse) {
     std::scoped_lock lock(impl_->mutex_);

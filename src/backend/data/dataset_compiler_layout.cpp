@@ -1,5 +1,4 @@
 #include <spdlog/spdlog.h>
-
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -12,26 +11,19 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-
 #include "src/backend/data/compiled_format.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
-
 // CLEANUP-IGNORE: This layout implementation imports the concrete data and system owners used by its independent unit.
-
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
-
 #include "detail/dataset_compiler_internal.h"
-
 namespace mmltk::backend::data::compiler_internal {
-
 using mmltk::common::io::FileHandle;
 using mmltk::common::math::checked_cast;
 using mmltk::common::system::clamp_worker_count_to_cpus;
-
 int resolve_num_workers(int configured_workers, const std::span<const int> worker_cpus) {
     if (worker_cpus.empty()) { throw std::runtime_error("dataset compilation requires a non-empty CPU execution domain"); }
     const std::vector<int> allowed(worker_cpus.begin(), worker_cpus.end());
@@ -47,7 +39,6 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
     }
     return static_cast<int>(allowed.size());
 }
-
 FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride) {
     FileLayout layout;
     layout.index_size = static_cast<size_t>(num_images) * sizeof(ImageEntry);
@@ -55,7 +46,6 @@ FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride) {
     layout.pixel_blob_size = static_cast<size_t>(num_images) * image_stride;
     return layout;
 }
-
 void finalize_layout(FileLayout& layout, const LayoutFinalizeInputs& inputs) {
     layout.label_block_size = inputs.label_count * sizeof(PackedInstance);
     layout.rle_block_size = inputs.rle_count * sizeof(RLEPair);
@@ -63,15 +53,10 @@ void finalize_layout(FileLayout& layout, const LayoutFinalizeInputs& inputs) {
     layout.rle_offset = layout.label_offset + layout.label_block_size;
     layout.total_size = layout.rle_offset + layout.rle_block_size;
 }
-
 void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride) {
-    for (size_t i = 0; i < index.size(); ++i) {
-        index[i].pixel_offset = pixel_offset + i * image_stride;
-    }
+    for (size_t i = 0; i < index.size(); ++i) { index[i].pixel_offset = pixel_offset + i * image_stride; }
 }
-
-FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered_map<std::string, uint8_t>& class_map,
-                            const FileLayout& layout) {
+FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered_map<std::string, uint8_t>& class_map, const FileLayout& layout) {
     FileHeader header{};
     header.magic = MAGIC;
     header.version = FORMAT_VERSION;
@@ -88,14 +73,12 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered
     header.total_file_size = layout.total_size;
     header.image_stride = inputs.image_stride;
     for (const auto& [name, id] : class_map) {
-        if (id >= header.num_classes || name.empty() || name.size() >= header.class_names[id].size() ||
-            name.find('\0') != std::string::npos)
+        if (id >= header.num_classes || name.empty() || name.size() >= header.class_names[id].size() || name.find('\0') != std::string::npos)
             throw std::runtime_error("invalid compiled class name or index");
         std::memcpy(header.class_names[id].data(), name.data(), name.size());
     }
     return header;
 }
-
 void write_metadata_blocks(const FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
                            mmltk::common::concurrency::CancellationObservation cancel_requested) {
     constexpr size_t kWriteChunkBytes = size_t{16U} * 1024U * 1024U;
@@ -126,5 +109,4 @@ void write_metadata_blocks(const FileHandle& fd, const FileLayout& layout, const
         write_block(label_blocks.rle_pairs.data(), layout.rle_block_size, layout.rle_offset);
     }
 }
-
 }  // namespace mmltk::backend::data::compiler_internal

@@ -11,7 +11,6 @@
 #include <unistd.h>
 #include "src/common/io/json_file.h"
 #include "src/frameworks/serialization/reflected_json.h"
-
 namespace mmltk::backend::models::rfdetr {
 namespace serial = mmltk::frameworks::serialization;
 namespace {
@@ -58,7 +57,6 @@ std::string_view legacy_phase(TrainingPhase phase) {
     throw std::invalid_argument("invalid training phase");
 }
 }  // namespace
-
 struct TrainingTelemetryWriter::Impl final {
     explicit Impl(TrainingRun value) : run(std::move(value)) {
         run.attempt_id = identity();
@@ -84,7 +82,6 @@ struct TrainingTelemetryWriter::Impl final {
     TrainingMetricProgress last_progress;
     bool finished = false;
     std::jthread worker;
-
     void Wake() noexcept {
         wake_generation.fetch_add(1);
         wake_generation.notify_one();
@@ -100,13 +97,14 @@ struct TrainingTelemetryWriter::Impl final {
             // Training has ended. Only this bounded publication lock may wait;
             // serialization, filesystem access and pipe reporting stay on Work.
             std::lock_guard lock(mutex);
-            if (finished || stopping.load()) { Drop(); return; }
+            if (finished || stopping.load()) {
+                Drop();
+                return;
+            }
             if (!bounded_paths(progress)) {
                 Drop();
-                if (progress.checkpoint_path.native().size() > mmltk::frameworks::reflection::kMaximumPathBytes)
-                    progress.checkpoint_path.clear();
-                if (progress.full_checkpoint_path.native().size() > mmltk::frameworks::reflection::kMaximumPathBytes)
-                    progress.full_checkpoint_path.clear();
+                if (progress.checkpoint_path.native().size() > mmltk::frameworks::reflection::kMaximumPathBytes) progress.checkpoint_path.clear();
+                if (progress.full_checkpoint_path.native().size() > mmltk::frameworks::reflection::kMaximumPathBytes) progress.full_checkpoint_path.clear();
                 // Retain every representable fact, but do not emit success or
                 // a results projection for an incomplete terminal payload.
                 progress.phase = TrainingPhase::Error;
@@ -127,7 +125,9 @@ struct TrainingTelemetryWriter::Impl final {
         degraded.store(true);
         {
             std::lock_guard lock(mutex);
-            try { if (error.empty()) error.assign(message.substr(0, 1024)); } catch (...) {}
+            try {
+                if (error.empty()) error.assign(message.substr(0, 1024));
+            } catch (...) {}
         }
         if (!reported_failure) {
             // Product status travels through the already-captured child output.
@@ -152,8 +152,7 @@ struct TrainingTelemetryWriter::Impl final {
                 throw std::runtime_error("selected output history is not associated with the resume checkpoint");
             auto previous = serial::decode_reflected_json<TrainingRun>(read_manifest(manifest), manifest_limits);
             if (previous.format_version != kTrainingRunFormat || previous.run_id.empty() || previous.attempt_id.empty() ||
-                previous.evaluated_weights != run.evaluated_weights ||
-                previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() ||
+                previous.evaluated_weights != run.evaluated_weights || previous.class_layout != run.class_layout || run.source_checkpoint_attempt_id.empty() ||
                 previous.checkpoint_attempt_id != run.source_checkpoint_attempt_id)
                 throw std::runtime_error("resume history has an unsupported or incompatible run format");
             run.run_id = previous.run_id;
@@ -201,14 +200,13 @@ struct TrainingTelemetryWriter::Impl final {
             projection["last_epoch"] = record.progress.epoch;
             projection["history_size"] = completed->history_size;
             const auto& bounds = run.execution.dataset_limits;
-            projection["dataset_max_instances"] = {
-                {"train", bounds.train_max_instances}, {"val", bounds.val_max_instances},
-                {"test", bounds.test_max_instances ? nlohmann::json(*bounds.test_max_instances) : nlohmann::json(nullptr)},
-                {"largest", bounds.largest_max_instances}};
-            projection["query_resolution"] = {
-                {"source", bounds.query_source}, {"resolved", bounds.resolved_num_queries},
-                {"required", bounds.required_num_queries}, {"automatic_query_cap", bounds.automatic_num_queries_cap},
-                {"automatic", bounds.automatic}, {"requested_override", bounds.requested_override}};
+            projection["dataset_max_instances"] = {{"train", bounds.train_max_instances},
+                                                   {"val", bounds.val_max_instances},
+                                                   {"test", bounds.test_max_instances ? nlohmann::json(*bounds.test_max_instances) : nlohmann::json(nullptr)},
+                                                   {"largest", bounds.largest_max_instances}};
+            projection["query_resolution"] = {{"source", bounds.query_source},           {"resolved", bounds.resolved_num_queries},
+                                              {"required", bounds.required_num_queries}, {"automatic_query_cap", bounds.automatic_num_queries_cap},
+                                              {"automatic", bounds.automatic},           {"requested_override", bounds.requested_override}};
             projection["gpu_augmentation"] = serial::reflected_json(run.configuration.gpu_augmentation, scratch, limits);
             projection["test"] = record.progress.test ? serial::reflected_json(*record.progress.test, scratch, limits) : nlohmann::json(nullptr);
             write_file(directory / "results.json", projection);
@@ -216,9 +214,12 @@ struct TrainingTelemetryWriter::Impl final {
     }
     void Work() noexcept {
         bool initialized = false;
-        try { Initialize(); initialized = true; }
-        catch (const std::exception& failure) { Fail(failure.what()); }
-        catch (...) { Fail("cannot initialize training persistence"); }
+        try {
+            Initialize();
+            initialized = true;
+        } catch (const std::exception& failure) { Fail(failure.what()); } catch (...) {
+            Fail("cannot initialize training persistence");
+        }
         for (;;) {
             // Snapshot before examining queues. Atomic wait cannot miss a
             // rejection or Close between the queue check and sleeping.
@@ -237,26 +238,38 @@ struct TrainingTelemetryWriter::Impl final {
                 consider(terminal ? &*terminal : nullptr);
                 if (oldest) {
                     record = std::move(*oldest);
-                    if (live && oldest == &*live) live.reset();
-                    else if (!boundaries.empty() && oldest == &boundaries.front()) boundaries.erase(boundaries.begin());
-                    else if (!epochs.empty() && oldest == &epochs.front()) epochs.erase(epochs.begin());
-                    else { terminal.reset(); completed = std::move(final); }
-                } else stop = stopping.load();
+                    if (live && oldest == &*live)
+                        live.reset();
+                    else if (!boundaries.empty() && oldest == &boundaries.front())
+                        boundaries.erase(boundaries.begin());
+                    else if (!epochs.empty() && oldest == &epochs.front())
+                        epochs.erase(epochs.begin());
+                    else {
+                        terminal.reset();
+                        completed = std::move(final);
+                    }
+                } else
+                    stop = stopping.load();
             }
             // Failure notification precedes even an empty-queue shutdown.
             if (degraded.load() && !reported_failure) Fail("training telemetry is incomplete; history contains gaps");
             if (stop) return;
             if (record && !initialized) Drop();
             if (record && initialized) {
-                try { Persist(std::move(*record), completed); }
-                catch (const std::exception& failure) { Drop(); Fail(failure.what()); }
-                catch (...) { Drop(); Fail("cannot persist training telemetry record"); }
+                try {
+                    Persist(std::move(*record), completed);
+                } catch (const std::exception& failure) {
+                    Drop();
+                    Fail(failure.what());
+                } catch (...) {
+                    Drop();
+                    Fail("cannot persist training telemetry record");
+                }
             }
             if (!record) wake_generation.wait(observed);
         }
     }
 };
-
 TrainingTelemetryWriter::TrainingTelemetryWriter(TrainingRun run) : impl_(std::make_unique<Impl>(std::move(run))) {}
 TrainingTelemetryWriter::~TrainingTelemetryWriter() noexcept {
     if (!impl_->finished && std::uncaught_exceptions() > impl_->uncaught) {
@@ -270,25 +283,36 @@ const std::string& TrainingTelemetryWriter::attempt_id() const noexcept { return
 void TrainingTelemetryWriter::Submit(TrainingMetricProgress progress, TrainingRecordRole role) noexcept {
     const auto next = impl_->sequence.fetch_add(1);
     try {
-        if (!bounded_paths(progress) || (role != TrainingRecordRole::Live && role != TrainingRecordRole::Boundary &&
-                                         role != TrainingRecordRole::Epoch)) { impl_->Drop(); return; }
+        if (!bounded_paths(progress) || (role != TrainingRecordRole::Live && role != TrainingRecordRole::Boundary && role != TrainingRecordRole::Epoch)) {
+            impl_->Drop();
+            return;
+        }
         TrainingRecord record;
         record.sequence = next;
         impl_->last_progress = progress;
         record.role = role;
         record.progress = std::move(progress);
         std::unique_lock lock(impl_->mutex, std::try_to_lock);
-        if (!lock.owns_lock() || impl_->finished || impl_->stopping.load()) { impl_->Drop(); return; }
+        if (!lock.owns_lock() || impl_->finished || impl_->stopping.load()) {
+            impl_->Drop();
+            return;
+        }
         if (role == TrainingRecordRole::Live) {
             if (impl_->live) impl_->Drop();
             record.dropped_before = impl_->dropped.load();
             impl_->live = std::move(record);
         } else if (role == TrainingRecordRole::Epoch) {
-            if (impl_->epochs.size() == epoch_capacity) { impl_->Drop(); return; }
+            if (impl_->epochs.size() == epoch_capacity) {
+                impl_->Drop();
+                return;
+            }
             record.dropped_before = impl_->dropped.load();
             impl_->epochs.push_back(std::move(record));
         } else {
-            if (impl_->boundaries.size() == boundary_capacity) { impl_->Drop(); return; }
+            if (impl_->boundaries.size() == boundary_capacity) {
+                impl_->Drop();
+                return;
+            }
             record.dropped_before = impl_->dropped.load();
             impl_->boundaries.push_back(std::move(record));
         }

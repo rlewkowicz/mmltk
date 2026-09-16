@@ -1,5 +1,4 @@
 #include <cuda_runtime.h>
-
 #include <array>
 #include <charconv>
 #include <chrono>
@@ -8,26 +7,20 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
-
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/dataset_loader.h"
 #include "test_fixture.h"
-
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "src/common/system/execution_policy.h"
 #include "src/frameworks/gpu/cuda_error.h"
-
 using namespace mmltk::backend::data;
 using namespace mmltk::common::logging;
 using namespace mmltk::common::system;
 using mmltk::frameworks::gpu::ensure_cuda_ok;
 using namespace mmltk::backend::data::testsupport;
-
 namespace fs = std::filesystem;
-
 namespace {
-
 [[noreturn]] void usage_error(const char* program) {
     std::fprintf(stderr,
                  "Usage: %s [--keep-artifacts] [--test-dir PATH] [--width N] "
@@ -37,7 +30,6 @@ namespace {
                  program);
     std::exit(1);
 }
-
 int parse_integer(const char* value, const char* program) {
     int parsed = 0;
     const std::string_view text(value);
@@ -45,29 +37,21 @@ int parse_integer(const char* value, const char* program) {
     if (result.ec != std::errc{} || result.ptr != text.data() + text.size()) { usage_error(program); }
     return parsed;
 }
-
 double seconds_since(const std::chrono::steady_clock::time_point start, const std::chrono::steady_clock::time_point end) {
     return std::chrono::duration<double>(end - start).count();
 }
-
 std::string metric_name(const char* label, const char* suffix) { return std::string("benchmark.") + label + "." + suffix; }
-
 void record_duration_metric(const char* label, const char* suffix, const std::chrono::steady_clock::time_point start,
                             const std::chrono::steady_clock::time_point end) {
     profile_record_duration_ns(metric_name(label, suffix).c_str(),
                                static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 }
-
-void record_value_metric(const char* label, const char* suffix, const std::uint64_t value) {
-    profile_add_value(metric_name(label, suffix).c_str(), value);
-}
-
+void record_value_metric(const char* label, const char* suffix, const std::uint64_t value) { profile_add_value(metric_name(label, suffix).c_str(), value); }
 std::string iteration_label(const int repetition) {
     std::array<char, 64> buffer{};
     std::snprintf(buffer.data(), buffer.size(), "backend.data[%02d]", repetition);
     return buffer.data();
 }
-
 struct Options {
     std::string test_dir = "/tmp/mmltk_profile";
     bool keep_artifacts = false;
@@ -81,7 +65,6 @@ struct Options {
     int repetitions = 10;
     int warmup_runs = 1;
 };
-
 Options parse_options(int argc, char** argv) {
     Options opts;
     for (int index = 1; index < argc; ++index) {
@@ -116,30 +99,25 @@ Options parse_options(int argc, char** argv) {
             usage_error(argv[0]);
         }
     }
-
-    if (opts.width <= 0 || opts.height <= 0 || opts.num_images <= 0 || opts.batch_size <= 0 || opts.num_epochs <= 0 ||
-        opts.shuffle_prefetch <= 0 || opts.repetitions <= 0 || opts.warmup_runs < 0) {
+    if (opts.width <= 0 || opts.height <= 0 || opts.num_images <= 0 || opts.batch_size <= 0 || opts.num_epochs <= 0 || opts.shuffle_prefetch <= 0 ||
+        opts.repetitions <= 0 || opts.warmup_runs < 0) {
         std::fprintf(stderr, "numeric options must be positive except warmup-runs, which may be zero\n");
         std::exit(1);
     }
     return opts;
 }
-
 void run_loader_case(const char* label, const DatasetLoader::Config& cfg, int num_epochs, bool overlap_consumer) {
     const auto init_start = std::chrono::steady_clock::now();
     DatasetLoader loader(cfg);
     const auto init_end = std::chrono::steady_clock::now();
-
     std::printf("%s init_sec=%.6f\n", label, seconds_since(init_start, init_end));
     record_duration_metric(label, "init", init_start, init_end);
     record_value_metric(label, "prefetch_factor", static_cast<std::uint64_t>(cfg.prefetch_factor));
-
     cudaStream_t consumer_stream = nullptr;
     if (overlap_consumer) {
         ensure_cuda_ok(cudaSetDevice(cfg.device_id), "cudaSetDevice");
         ensure_cuda_ok(cudaStreamCreateWithFlags(&consumer_stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
     }
-
     for (int epoch = 0; epoch < num_epochs; ++epoch) {
         const auto epoch_start = std::chrono::steady_clock::now();
         loader.begin_epoch();
@@ -149,9 +127,8 @@ void run_loader_case(const char* label, const DatasetLoader::Config& cfg, int nu
             total += batch.num_images;
             if (overlap_consumer) {
                 loader.handoff_batch(batch, consumer_stream);
-                ensure_cuda_ok(
-                    cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * loader.image_stride(), consumer_stream),
-                    "cudaMemsetAsync");
+                ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * loader.image_stride(), consumer_stream),
+                               "cudaMemsetAsync");
                 loader.release_batch(batch, consumer_stream);
             } else {
                 loader.release_batch(batch);
@@ -166,10 +143,8 @@ void run_loader_case(const char* label, const DatasetLoader::Config& cfg, int nu
         record_value_metric(label, "epoch_images", total);
         record_value_metric(label, "epoch_img_per_sec_x100", static_cast<std::uint64_t>((static_cast<double>(total) / secs) * 100.0));
     }
-
     if (consumer_stream) { ensure_cuda_ok(cudaStreamDestroy(consumer_stream), "cudaStreamDestroy"); }
 }
-
 void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
     CompilerConfig ccfg;
     ccfg.source_dir = dataset_dir(fixture);
@@ -178,25 +153,20 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
     ccfg.target_width = static_cast<uint32_t>(fixture.width);
     ccfg.target_height = static_cast<uint32_t>(fixture.height);
     ccfg.num_workers = opts.compile_workers;
-
     const auto compile_start = std::chrono::steady_clock::now();
     const DatasetCompilePlan compile_plan = DatasetCompiler::prepare(ccfg, {ccfg.split});
     DatasetCompiler::compile(compile_plan, 0U);
     const auto compile_end = std::chrono::steady_clock::now();
     const std::string bin_path = compiled_bin_path(fixture);
-
-    std::printf("compile sec=%.6f file_bytes=%zu\n", seconds_since(compile_start, compile_end),
-                static_cast<size_t>(fs::file_size(bin_path)));
+    std::printf("compile sec=%.6f file_bytes=%zu\n", seconds_since(compile_start, compile_end), static_cast<size_t>(fs::file_size(bin_path)));
     record_duration_metric("compile", "total", compile_start, compile_end);
     record_value_metric("compile", "file_bytes", static_cast<std::uint64_t>(fs::file_size(bin_path)));
-
     DatasetLoader::Config sequential_cfg;
     sequential_cfg.compiled_path = bin_path;
     sequential_cfg.batch_size = static_cast<size_t>(opts.batch_size);
     sequential_cfg.shuffle = false;
     sequential_cfg.prefetch_factor = 6;
     run_loader_case("loader_seq", sequential_cfg, opts.num_epochs, false);
-
     DatasetLoader::Config shuffle_cfg = sequential_cfg;
     shuffle_cfg.shuffle = true;
     shuffle_cfg.seed = 7;
@@ -204,9 +174,7 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
     run_loader_case("loader_shuffle", shuffle_cfg, opts.num_epochs, false);
     run_loader_case("loader_shuffle_overlap", shuffle_cfg, opts.num_epochs, true);
 }
-
 }  // namespace
-
 int main(int argc, char** argv) {
     profile_enable();
     profile_set_process_label("profile.backend.data");
@@ -217,31 +185,25 @@ int main(int argc, char** argv) {
             logger.trace(
                 "event=profile.execution_policy executable=mmltk_backend_data_profile_runner online_cpu_count={} "
                 "nice_value={} scheduler_policy={} scheduler_priority={} io_class={} io_priority_data={}",
-                execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy,
-                execution_snapshot.scheduler_priority, execution_snapshot.io_class, execution_snapshot.io_priority_data);
+                execution_snapshot.online_cpu_count, execution_snapshot.nice_value, execution_snapshot.scheduler_policy, execution_snapshot.scheduler_priority,
+                execution_snapshot.io_class, execution_snapshot.io_priority_data);
         });
         const Options opts = parse_options(argc, argv);
-
         const FixtureSpec fixture{
             opts.test_dir, "train", opts.width, opts.height, opts.num_images,
         };
-
         create_synthetic_dataset(fixture);
-
         for (int warmup = 0; warmup < opts.warmup_runs; ++warmup) {
             profile_reset_iteration();
             std::printf("warmup=%d/%d\n", warmup + 1, opts.warmup_runs);
             run_profile_iteration(fixture, opts);
         }
-
         for (int repetition = 0; repetition < opts.repetitions; ++repetition) {
             profile_reset_iteration();
             std::printf("repetition=%d/%d\n", repetition + 1, opts.repetitions);
             run_profile_iteration(fixture, opts);
-
             profile_capture_iteration(iteration_label(repetition + 1).c_str());
         }
-
         profile_flush();
         if (!opts.keep_artifacts) { fs::remove_all(fixture.root_dir); }
         return 0;

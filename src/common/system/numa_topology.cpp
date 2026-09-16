@@ -1,14 +1,11 @@
 #include "src/common/system/numa_topology.h"
-
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <stdexcept>
 #include <utility>
-
 #include "src/common/system/cpu_affinity.h"
-
 namespace mmltk::common::system {
 namespace {
 std::string read(const std::filesystem::path& path) {
@@ -63,13 +60,11 @@ std::vector<int> physical_core_order(const NumaTopology& topology, std::span<con
 ExecutionPlacement resolve_placement(const NumaTopology& topology, int local_node, int requested_node, std::span<const int> eligible) {
     if (requested_node < -1 || local_node < -1) throw std::invalid_argument("invalid NUMA node");
     if (local_node < 0 && topology.nodes.size() == 1) local_node = topology.nodes.front().node;
-    if (requested_node >= 0 && local_node >= 0 && requested_node != local_node)
-        throw std::invalid_argument("numa_node contradicts GPU locality");
+    if (requested_node >= 0 && local_node >= 0 && requested_node != local_node) throw std::invalid_argument("numa_node contradicts GPU locality");
     const int node = requested_node >= 0 ? requested_node : local_node;
     if (node < 0) throw std::invalid_argument("GPU NUMA locality is unknown; select numa_node explicitly");
     const auto memory = std::ranges::find(topology.nodes, node, &MemoryNode::node);
-    if (memory == topology.nodes.end() || memory->bytes == 0 ||
-        std::ranges::find(topology.permitted_nodes, node) == topology.permitted_nodes.end())
+    if (memory == topology.nodes.end() || memory->bytes == 0 || std::ranges::find(topology.permitted_nodes, node) == topology.permitted_nodes.end())
         throw std::invalid_argument("GPU NUMA memory node is unavailable or forbidden");
     std::vector<int> cpus;
     for (const auto& cpu : topology.cpus)

@@ -1,6 +1,5 @@
 #pragma once
 #include "src/backend/data/data_loading_options.h"
-
 #include <cstdint>
 #include <cuda_runtime_api.h>
 #include <memory>
@@ -8,25 +7,24 @@
 #include <optional>
 #include <stop_token>
 #include "src/frameworks/gpu/device_execution.h"
-
 #include "src/backend/data/compiled_dataset.h"
-namespace mmltk::frameworks::gpu { class TerminalCudaRetirementOwner; }
+namespace mmltk::frameworks::gpu {
+class TerminalCudaRetirementOwner;
+}
 namespace mmltk::backend::data {
-
 struct Batch {
-    size_t num_images;
-    const float* device_images;
-    const LabelIndexEntry* label_index;
-    const PackedInstance* labels;
-    const RLEPair* rle_pairs;
-    const uint32_t* image_indices;
-    size_t slot_index;
-    uint64_t lease_id;
+    size_t num_images = 0;
+    const float* device_images = nullptr;
+    const LabelIndexEntry* label_index = nullptr;
+    const PackedInstance* labels = nullptr;
+    const RLEPair* rle_pairs = nullptr;
+    const uint32_t* image_indices = nullptr;
+    size_t slot_index = 0;
+    uint64_t lease_id = 0;
     const void* owner = nullptr;
-    std::weak_ptr<const void> image_custody;
+    std::weak_ptr<const void> image_custody{};
     std::size_t image_capacity_bytes = 0;
 };
-
 class DatasetLoader {
    public:
     struct Config {
@@ -37,21 +35,18 @@ class DatasetLoader {
         int device_id = 0;
         int prefetch_factor = 6;
         int gather_workers = 0;
-        std::string cpu_affinity;
+        std::string cpu_affinity{};
         uint32_t batch_shard_rank = 0;
         uint32_t batch_shard_count = 1;
         bool drop_last = false;
         DataLoadingOptions loading{};
         std::optional<mmltk::frameworks::gpu::DeviceExecution> execution{};
     };
-
     explicit DatasetLoader(const Config& config, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement = {},
                            decltype(&cudaEventRecord) record_consumer = &cudaEventRecord);
     ~DatasetLoader();
-
     DatasetLoader(const DatasetLoader&) = delete;
     DatasetLoader& operator=(const DatasetLoader&) = delete;
-
     void begin_epoch();
     bool next_batch(Batch& out);
     // Cancellation only wakes acquisition; joining and checked-out custody remain with the owner.
@@ -66,7 +61,6 @@ class DatasetLoader {
     void synchronize();
     // Stop/join CPU workers without releasing checked-out GPU storage. Idempotent.
     void stop_workers();
-
     [[nodiscard]] size_t num_images() const;
     [[nodiscard]] size_t num_batches() const;
     [[nodiscard]] uint32_t image_width() const;
@@ -78,7 +72,6 @@ class DatasetLoader {
     [[nodiscard]] size_t image_stride() const;
     [[nodiscard]] size_t num_label_instances() const;
     [[nodiscard]] size_t num_rle_pairs() const;
-
     [[nodiscard]] const float* pixel_blob() const;
     [[nodiscard]] const LabelIndexEntry* label_index() const;
     [[nodiscard]] const PackedInstance* label_data() const;
@@ -90,5 +83,4 @@ class DatasetLoader {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 }  // namespace mmltk::backend::data

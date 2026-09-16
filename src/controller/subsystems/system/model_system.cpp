@@ -1,48 +1,40 @@
 #include "src/controller/subsystems/system/model_system.h"
-
 #include <atomic>
 #include <filesystem>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
-
 #include "src/controller/contracts/compute.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
-
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
-
 namespace mmltk::controller {
-
-ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& key, const std::filesystem::path& custom,
-                                          const int inspection_device, const std::stop_token stop,
-                                          const std::function<void(const contracts::ModelProgress&)>& progress) {
+ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelectionKey& key, const std::filesystem::path& custom, const int inspection_device,
+                                                     const std::stop_token stop, const std::function<void(const contracts::ModelProgress&)>& progress) {
     if (!key.valid()) throw std::invalid_argument("model selection key is invalid");
     std::filesystem::path artifact;
     if (key.source == contracts::ModelSelectionSource::Custom) {
         if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
         progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "Verifying selected model artifact"});
         std::error_code error;
-        if (custom.empty() || !std::filesystem::is_regular_file(custom, error) || error)
-            throw std::runtime_error("selected model artifact is unavailable");
+        if (custom.empty() || !std::filesystem::is_regular_file(custom, error) || error) throw std::runtime_error("selected model artifact is unavailable");
         if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
         artifact = custom;
     } else {
-    auto cancellation = services::ArtifactCancellationSource::Mint();
-    std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
-    // CLEANUP-IGNORE: Artifact weight and dataset progress observers adapt distinct typed service callbacks at their
-    // respective runtime boundaries.
-    const services::ArtifactWeightProgressObserver observer{
-        .context = const_cast<std::function<void(const contracts::ModelProgress&)>*>(&progress),
-        .report = [](void* context, const contracts::ModelProgress& value) noexcept {
-            try {
-                (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
-            } catch (...) {}
-        }};
-    artifact = store_.canonical_weight_path(key.preset, cancellation.second, observer);
+        auto cancellation = services::ArtifactCancellationSource::Mint();
+        std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
+        // CLEANUP-IGNORE: Artifact weight and dataset progress observers adapt distinct typed service callbacks at their
+        // respective runtime boundaries.
+        const services::ArtifactWeightProgressObserver observer{.context = const_cast<std::function<void(const contracts::ModelProgress&)>*>(&progress),
+                                                                .report = [](void* context, const contracts::ModelProgress& value) noexcept {
+                                                                    try {
+                                                                        (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
+                                                                    } catch (...) {}
+                                                                }};
+        artifact = store_.canonical_weight_path(key.preset, cancellation.second, observer);
     }
     if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
     namespace rfdetr = mmltk::backend::models::rfdetr;
@@ -64,19 +56,16 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
     if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
     return {.artifact = artifact.string(), .class_layout = rfdetr::ResolvedClassLayout(std::move(layout)).summary()};
 }
-
 ModelSystem::ModelSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events)
     : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {
     if (!factory_) throw contracts::UnavailableError("model runtime factory is unavailable");
 }
 ModelSystem::~ModelSystem() = default;
-
 direct::LocalRun::Notification ModelSystem::changed(contracts::ModelUiState settled) {
     return [this, settled = std::move(settled)]() mutable noexcept {
         direct::PublishLazyNoexcept(events_, [&] { return event_type{ModelChanged{std::move(settled)}}; });
     };
 }
-
 contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionRequest request) {
     if (!request.valid()) throw contracts::InvalidIntentError("model workflow is invalid");
     {
@@ -128,8 +117,7 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
                     terminal.outcome = contracts::ModelSelectionOutcome::Cancelled;
                 } else {
                     failed = true;
-                    terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected,
-                                .detail = contracts::bounded_model_detail(error.what())};
+                    terminal = {.outcome = contracts::ModelSelectionOutcome::Rejected, .detail = contracts::bounded_model_detail(error.what())};
                 }
             } catch (...) {
                 if (stop.stop_requested()) {
@@ -172,12 +160,10 @@ contracts::ModelUiState ModelSystem::Select(const contracts::ModelSelectionReque
     });
     return snapshot();
 }
-
 contracts::ModelUiState ModelSystem::Stop() noexcept {
     static_cast<void>(run_.Stop());
     std::scoped_lock lock(mutex_);
-    if (state_.active)
-        state_.terminal = {.outcome = contracts::ModelSelectionOutcome::CancellationRequested, .detail = "cancellation requested"};
+    if (state_.active) state_.terminal = {.outcome = contracts::ModelSelectionOutcome::CancellationRequested, .detail = "cancellation requested"};
     return state_;
 }
 void ModelSystem::Shutdown() noexcept {
@@ -202,5 +188,4 @@ void ModelSystem::progress(const contracts::ModelProgress& value) noexcept {
     }
     direct::PublishLazyNoexcept(events_, [&] { return event_type{std::move(event)}; });
 }
-
 }  // namespace mmltk::controller

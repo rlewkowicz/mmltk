@@ -65,16 +65,31 @@ const COMPILE_DATASET: &str = train::COMPILE_DATASET_ID;
 const DATASET_STATUS: &str = train::DATASET_STATUS_ID;
 const DATASET_SOURCE: &str = train::DATASET_SOURCE_ID;
 const COMPILED_DIRECTORY: &str = train::COMPILED_DIRECTORY_ID;
-fn perceptual_control_slot(index: usize) -> usize { [0, 1, 1, 0, 2, 2][index] }
+fn perceptual_control_slot(index: usize) -> usize {
+    [0, 1, 1, 0, 2, 2][index]
+}
 fn perceptual_control_id(index: usize) -> String {
     match perceptual_control_slot(index) {
-        0 => crate::generated::constraint_workflowstrainrequestgpuaugmentationenabled().stable_field_id,
-        1 => crate::generated::constraint_workflowstrainrequestgpuaugmentationperceptualdownscale().stable_field_id,
-        _ => crate::generated::constraint_workflowstraincompileperceptualdownscale().stable_field_id,
-    }.to_string()
+        0 => {
+            crate::generated::constraint_workflowstrainrequestgpuaugmentationenabled()
+                .stable_field_id
+        }
+        1 => {
+            crate::generated::constraint_workflowstrainrequestgpuaugmentationperceptualdownscale()
+                .stable_field_id
+        }
+        _ => {
+            crate::generated::constraint_workflowstraincompileperceptualdownscale().stable_field_id
+        }
+    }
+    .to_string()
 }
 fn perceptual_control_values(train: &crate::generated::TrainViewState) -> [bool; 3] {
-    [train.request.gpuaugmentation.enabled, train.request.gpuaugmentation.perceptualdownscale, train.compileperceptualdownscale]
+    [
+        train.request.gpuaugmentation.enabled,
+        train.request.gpuaugmentation.perceptualdownscale,
+        train.compileperceptualdownscale,
+    ]
 }
 
 const COMPILE_DIMENSIONS: &str = train::COMPILE_DIMENSIONS_ID;
@@ -4083,7 +4098,11 @@ impl Controller {
     fn arm_perceptual_control(&mut self, index: usize) -> Task<RootMessage> {
         self.arm_scrolled(
             perceptual_control_id(index),
-            if perceptual_control_slot(index) == 2 { RelativeOffset::START } else { RelativeOffset::END },
+            if perceptual_control_slot(index) == 2 {
+                RelativeOffset::START
+            } else {
+                RelativeOffset::END
+            },
         )
     }
 
@@ -5223,7 +5242,9 @@ impl Controller {
             }
             Phase::PerceptualControl(index) => {
                 self.phase = Phase::AwaitPerceptualControl(index);
-                if !click(input_bounds) { self.fail("Firefox perceptual control click dispatch failed"); }
+                if !click(input_bounds) {
+                    self.fail("Firefox perceptual control click dispatch failed");
+                }
                 None
             }
             Phase::CompileDimensions => {
@@ -6907,12 +6928,27 @@ impl Controller {
             Phase::PerceptualControl(index) => self.arm_perceptual_control(index),
             Phase::AwaitPerceptualControl(index) => {
                 let mut expected = self.perceptual_baseline;
-                for step in 0..=index { expected[perceptual_control_slot(step)] ^= true; }
-                let Some(snapshot) = settled_settings_snapshot(model, settings, self.settings_revision) else { return Task::none(); };
-                if perceptual_control_values(&snapshot.settingsstate.workflows.train) != expected { return Task::none(); }
+                for step in 0..=index {
+                    expected[perceptual_control_slot(step)] ^= true;
+                }
+                let Some(snapshot) =
+                    settled_settings_snapshot(model, settings, self.settings_revision)
+                else {
+                    return Task::none();
+                };
+                if perceptual_control_values(&snapshot.settingsstate.workflows.train) != expected {
+                    return Task::none();
+                }
                 self.settings_revision = snapshot.revision;
                 if index == 5 {
-                    reporting::emit(|sink| sink.record("integration.perceptual_controls", "train.perceptual", "independent-round-trip", [1.0, 1.0, 1.0, snapshot.revision as f64]));
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.perceptual_controls",
+                            "train.perceptual",
+                            "independent-round-trip",
+                            [1.0, 1.0, 1.0, snapshot.revision as f64],
+                        )
+                    });
                     self.phase = Phase::DatasetSource;
                     self.arm_scrolled(DATASET_SOURCE, RelativeOffset::START)
                 } else {

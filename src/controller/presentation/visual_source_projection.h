@@ -1,20 +1,15 @@
 #pragma once
-
 #include <concepts>
 #include <cstdint>
 #include <type_traits>
-
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/frameworks/reflection/record_projection.h"
-
 namespace mmltk::controller {
-
 struct VisualImageMetadata final {
     VisualFrame frame{};
 };
 MMLTK_REFLECT_FIELDS(VisualImageMetadata)
-
 template <class Snapshot, PresentationSourceKind Kind, auto Frame, auto Revision, class Image = VisualImageMetadata>
 struct VisualSourceProjection final {
     using snapshot_type = Snapshot;
@@ -28,7 +23,6 @@ struct VisualSourceProjection final {
     static constexpr auto kind = Kind;
     static constexpr auto frame = Frame;
     static constexpr auto revision = Revision;
-
     [[nodiscard]] static consteval bool valid() {
         using namespace mmltk::frameworks::reflection;
         if constexpr (!accessor_is_applicable<Snapshot, Frame>() || !accessor_is_applicable<Snapshot, Revision>()) {
@@ -40,11 +34,9 @@ struct VisualSourceProjection final {
             return Kind != PresentationSourceKind::None && presentation_source_session(Kind) != 0U && relation::valid();
         }
     }
-
     using relation = mmltk::frameworks::reflection::StaticMemberRelation<
         Snapshot, VisualSourceObservation, 2U, mmltk::frameworks::reflection::MemberRelationEntry<Frame, &VisualSourceObservation::frame>,
         mmltk::frameworks::reflection::MemberRelationEntry<Revision, &VisualSourceObservation::snapshot_revision>>;
-
     [[nodiscard]] static constexpr VisualSourceObservation Observe(const Snapshot& snapshot) {
         static_assert(valid(), "invalid visual snapshot projection");
         VisualSourceObservation result;
@@ -52,5 +44,4 @@ struct VisualSourceProjection final {
         return result;
     }
 };
-
 }  // namespace mmltk::controller

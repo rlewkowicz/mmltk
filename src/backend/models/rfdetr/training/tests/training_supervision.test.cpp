@@ -1,6 +1,5 @@
 #include <cuda_runtime.h>
 #include <catch2/matchers/catch_matchers.hpp>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -21,7 +20,6 @@
 #include <unordered_map>
 #include <system_error>
 #include <vector>
-
 #include "archive_utils.h"
 #include "catch2_compat.hpp"
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
@@ -45,13 +43,10 @@
 #include "torch_api.h"
 #include "training_supervision.h"
 #include "detection_ops.h"
-
 import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
 import mmltk.backend.models.rfdetr.core.model;
 import mmltk.backend.models.rfdetr.training.checkpoint;
-
 #include "detail/gpu_augment_private.h"
-
 namespace mmltk::backend::models::rfdetr::test_support {
 struct GpuBatchAugmenterTestAccess final {
     static void FailCacheWait(GpuBatchAugmenter& owner) {
@@ -63,23 +58,18 @@ struct GpuBatchAugmenterTestAccess final {
     static std::weak_ptr<const void> Custody(const GpuBatchAugmenter& owner) { return owner.resources_; }
     static auto Fact(const GpuBatchAugmenter& owner) { return owner.retirement_.fact(); }
 };
-}
-
+}  // namespace mmltk::backend::models::rfdetr::test_support
 namespace {
-
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace torch_api = mmltk::backend::ml::torch_api;
-
 [[nodiscard]] c10::cuda::CUDAStream training_test_stream() {
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     return c10::cuda::getStreamFromPool(false, 0);
 }
-
 #if defined(USE_C10D_NCCL)
 class FailingCollectiveWork final : public c10d::Work {
    public:
     explicit FailingCollectiveWork(std::atomic<int>& waits) : c10d::Work(0, c10d::OpType::ALLREDUCE), waits_(&waits) {}
-
     bool wait(std::chrono::milliseconds = kNoTimeout) override {
         ++*waits_;
         throw std::runtime_error("deterministic collective wait failure");
@@ -88,26 +78,20 @@ class FailingCollectiveWork final : public c10d::Work {
    private:
     std::atomic<int>* waits_;
 };
-
 class FailingCollectiveBackend final : public c10d::Backend {
    public:
     FailingCollectiveBackend() : c10d::Backend(0, 2) {}
-
     const std::string getBackendName() const override { return "failing-test-collective"; }
-
     c10::intrusive_ptr<c10d::Work> allreduce(std::vector<at::Tensor>&, const c10d::AllreduceOptions& = c10d::AllreduceOptions()) override {
         ++allreduces;
         return c10::make_intrusive<FailingCollectiveWork>(waits);
     }
-
     void abort() override { ++aborts; }
-
     std::atomic<int> allreduces = 0;
     std::atomic<int> waits = 0;
     std::atomic<int> aborts = 0;
 };
 #endif
-
 rfdetr::NativeRfDetrConfig supervision_config() {
     rfdetr::NativeRfDetrConfig config;
     config.num_classes = 3;
@@ -119,42 +103,35 @@ rfdetr::NativeRfDetrConfig supervision_config() {
     config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
     return config;
 }
-
 void test_training_supervision_runtime_replication_is_one_shot() {
     const auto config = supervision_config();
     rfdetr::TrainingSupervisionImpl source(config, config.num_classes - 1);
     rfdetr::TrainingSupervisionImpl replica(config, config.num_classes - 1);
     source.initialize(71U);
-
     replica.install_replicated_initialized_runtime(config.training_supervision);
     MMLTK_ASSERT(source.initialized());
     MMLTK_ASSERT(replica.initialized());
     REQUIRE_THROWS(replica.install_replicated_initialized_runtime(config.training_supervision));
-
     auto incompatible_config = config;
     incompatible_config.training_supervision.match_free.rho = 0.75F;
     rfdetr::TrainingSupervisionImpl incompatible(incompatible_config, incompatible_config.num_classes - 1);
     REQUIRE_THROWS(incompatible.install_replicated_initialized_runtime(config.training_supervision));
 }
-
 void test_checkpoint_supervision_config_and_deployment_pruning() {
     const auto path = std::filesystem::temp_directory_path() / "mmltk_rfdetr_training_supervision_archive.pt";
     auto config = supervision_config().training_supervision;
     config.denoising.enabled = true;
     config.denoising.groups = 7U;
-
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     readback.Begin();
-    const std::vector<rfdetr::NormalizedModelStateEntry> entries{
-        {"backbone.weight", torch_api::ones({1})},
-        {"training_supervision.query_projection.weight", torch_api::ones({1})}};
+    const std::vector<rfdetr::NormalizedModelStateEntry> entries{{"backbone.weight", torch_api::ones({1})},
+                                                                 {"training_supervision.query_projection.weight", torch_api::ones({1})}};
     rfdetr::detail::reserve_state_archive(entries, readback, 0);
     torch_api::OutputArchive output;
     rfdetr::detail::write_training_supervision_config(output, config);
     rfdetr::detail::write_state_archive(output, "state", entries, readback, 0);
     readback.Complete();
     output.save_to(path.string());
-
     torch_api::InputArchive input;
     input.load_from(path.string());
     MMLTK_ASSERT(rfdetr::detail::read_training_supervision_config(input) == config);
@@ -165,7 +142,6 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     torch_api::InputArchive state;
     input.read("state", state);
     MMLTK_ASSERT(rfdetr::require_int(state, "entry_count") == 1);
-
     torch_api::OutputArchive legacy_output;
     rfdetr::detail::write_training_supervision_config(legacy_output, {});
     rfdetr::detail::write_state_archive(legacy_output, "state", {}, readback, 0);
@@ -173,7 +149,6 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     torch_api::InputArchive legacy_input;
     legacy_input.load_from(path.string());
     MMLTK_ASSERT(rfdetr::detail::read_training_supervision_config(legacy_input) == rfdetr::TrainingSupervisionConfig{});
-
     rfdetr::TrainingSupervisionConfig inactive_nondefault;
     inactive_nondefault.match_free.rho = 0.75F;
     torch_api::OutputArchive inactive_output;
@@ -182,16 +157,13 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     torch_api::InputArchive inactive_input;
     inactive_input.load_from(path.string());
     MMLTK_ASSERT(rfdetr::detail::read_training_supervision_config(inactive_input) == inactive_nondefault);
-
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
 }
-
 void test_feature_active_host_target_invariants() {
     const std::array<float, 4> valid{0.5F, 0.5F, 0.25F, 0.25F};
     rfdetr::validate_feature_active_target(0, valid, 2);
     REQUIRE_THROWS(rfdetr::validate_feature_active_target(2, valid, 2));
-
     auto invalid = valid;
     invalid[2] = 0.0F;
     REQUIRE_THROWS(rfdetr::validate_feature_active_target(0, invalid, 2));
@@ -199,25 +171,21 @@ void test_feature_active_host_target_invariants() {
     invalid[0] = std::numeric_limits<float>::quiet_NaN();
     REQUIRE_THROWS(rfdetr::validate_feature_active_target(0, invalid, 2));
 }
-
 void test_ema_shadow_admission_is_transactional() {
     std::vector<torch_api::Tensor> parameters{torch_api::ones({2, 3}), torch_api::ones({4})};
     rfdetr::ModelEma ema(parameters, 0.99, 100.0);
     const auto original_first = ema.shadow_params().front().clone();
     const auto original_second = ema.shadow_params().back().clone();
-
     std::vector<torch_api::Tensor> malformed{torch_api::full({2, 3}, 7.0F), torch_api::zeros({5})};
     REQUIRE_THROWS(ema.stage_shadow_params(malformed));
     REQUIRE(torch_api::equal(ema.shadow_params().front(), original_first));
     REQUIRE(torch_api::equal(ema.shadow_params().back(), original_second));
-
     std::vector<torch_api::Tensor> valid{torch_api::full({2, 3}, 7.0F), torch_api::full({4}, 9.0F)};
     auto candidate = ema.stage_shadow_params(valid);
     ema.commit_shadow_params(std::move(candidate));
     REQUIRE(torch_api::equal(ema.shadow_params().front(), valid.front()));
     REQUIRE(torch_api::equal(ema.shadow_params().back(), valid.back()));
 }
-
 void test_ema_selection_restores_identity_and_mode() {
     torch::nn::Linear module(3, 2);
     module->train();
@@ -248,7 +216,6 @@ void test_ema_selection_restores_identity_and_mode() {
     malformed.back() = torch_api::full_like(malformed.back(), std::numeric_limits<float>::quiet_NaN());
     REQUIRE_THROWS(rfdetr::ModelEma::from_cpu_shadow(parameters, malformed, 0.5, 0.0));
 }
-
 void test_native_optimizer_late_failure_preserves_live_state() {
     using AdamW = rfdetr::NativeAdamW;
     std::vector<AdamW::Group> groups{{rfdetr::NativeAdamWGroupConfig{0.01, 0.0, false}, {0, 1}}};
@@ -291,13 +258,11 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     torch_api::InputArchive valid;
     valid.load_from(valid_path.string());
     optimizer.load(valid);
-
     const auto malformed_path = root / "malformed.pt";
     write_archive(malformed_path, 7.0F, true);
     torch_api::InputArchive malformed;
     malformed.load_from(malformed_path.string());
     REQUIRE_THROWS(optimizer.load(malformed));
-
     const auto retained_path = root / "retained.pt";
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     readback.Begin();
@@ -315,7 +280,6 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
 }
-
 void test_resume_continuation_manifest_is_exact() {
     rfdetr::validate_resume_continuation_manifest({false, false, std::nullopt, std::nullopt});
     rfdetr::validate_resume_continuation_manifest({true, true, 1024.0, 17});
@@ -326,7 +290,6 @@ void test_resume_continuation_manifest_is_exact() {
     REQUIRE_THROWS(rfdetr::validate_resume_continuation_manifest({false, false, 0.0, 17}));
     REQUIRE_THROWS(rfdetr::validate_resume_continuation_manifest({false, false, std::numeric_limits<double>::infinity(), 17}));
     REQUIRE_THROWS(rfdetr::validate_resume_continuation_manifest({false, false, 1024.0, -1}));
-
     rfdetr::GradScaler scaler(true, 128.0F);
     const auto original_scale = scaler.current_scale();
     const auto original_growth = scaler.growth_tracker();
@@ -334,16 +297,13 @@ void test_resume_continuation_manifest_is_exact() {
     REQUIRE(scaler.current_scale() == original_scale);
     REQUIRE(scaler.growth_tracker() == original_growth);
 }
-
 class TargetConsumerGate final {
    public:
     TargetConsumerGate() = default;
     ~TargetConsumerGate() { release(); }
     TargetConsumerGate(const TargetConsumerGate&) = delete;
     TargetConsumerGate& operator=(const TargetConsumerGate&) = delete;
-
     static void CUDART_CB wait(void* owner) { static_cast<TargetConsumerGate*>(owner)->gate_.acquire(); }
-
     void release() noexcept {
         if (!released_) {
             gate_.release();
@@ -355,7 +315,6 @@ class TargetConsumerGate final {
     std::binary_semaphore gate_{0};
     bool released_ = false;
 };
-
 void test_target_scratch_reuse_waits_for_consumer_retirement() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int device_id = 0;
@@ -363,7 +322,6 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
     scratch.ensure_batch(2, 8, 8, device_id);
     scratch.ensure_instance_capacity(3);
     scratch.ensure_copy_resources(device_id);
-
     const c10::DeviceIndex device_index = device_id;
     c10::cuda::CUDAGuard device_guard(device_index);
     const auto consumer = c10::cuda::getStreamFromPool(false, device_index);
@@ -377,11 +335,9 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
     REQUIRE(cudaEventCreateWithFlags(&replacement_done, cudaEventDisableTiming) == cudaSuccess);
     {
         c10::cuda::CUDAStreamGuard producer_guard(producer);
-        scratch.offsets_gpu.narrow(0, 0, 2).copy_(
-            torch_api::tensor({3, 7}, torch_api::TensorOptions().dtype(torch_api::kInt64).device(torch_api::kCUDA)));
+        scratch.offsets_gpu.narrow(0, 0, 2).copy_(torch_api::tensor({3, 7}, torch_api::TensorOptions().dtype(torch_api::kInt64).device(torch_api::kCUDA)));
         scratch.record_pending_copy_on_stream(scratch.copy_stream_handle());
     }
-
     rfdetr::PreparedTargets published;
     {
         c10::cuda::CUDAStreamGuard producer_guard(producer);
@@ -413,7 +369,6 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
         lease.retire();
     }
     published = {};
-
     scratch.ensure_batch(2, 8, 8, device_id);
     scratch.ensure_copy_resources(device_id);
     {
@@ -427,7 +382,6 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
     REQUIRE(cudaEventSynchronize(replacement_done) == cudaSuccess);
     REQUIRE(torch_api::equal(observed.cpu(), torch_api::tensor({3, 7}, torch_api::TensorOptions().dtype(torch_api::kInt64))));
     REQUIRE(cudaEventDestroy(replacement_done) == cudaSuccess);
-
     rfdetr::PreparedTargets exception_target;
     exception_target.all_boxes = torch_api::ones({1, 4}, torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA));
     try {
@@ -438,7 +392,6 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
     } catch (const std::runtime_error&) {}
     REQUIRE(torch_api::equal(exception_target.all_boxes.cpu(), torch_api::full({1, 4}, 2.0F)));
 }
-
 void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int device_id = 0;
@@ -451,7 +404,6 @@ void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
     TargetConsumerGate gate;
     auto* copy_stream = reinterpret_cast<cudaStream_t>(scratch.copy_stream_handle());
     REQUIRE(cudaLaunchHostFunc(copy_stream, TargetConsumerGate::wait, &gate) == cudaSuccess);
-
     auto& first = scratch.acquire_staging_slot(1, 1, true, 8, 8);
     REQUIRE(first.batch_capacity == 1);
     REQUIRE(first.instance_capacity == 1);
@@ -467,7 +419,6 @@ void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
     REQUIRE(second.mask_height == 16);
     scratch.record_staging_copy_on_stream(scratch.copy_stream_handle());
     REQUIRE_THROWS(scratch.acquire_staging_slot(1, 1, false, 8, 8));
-
     gate.release();
     REQUIRE(cudaStreamSynchronize(copy_stream) == cudaSuccess);
     auto& recycled = scratch.acquire_staging_slot(1, 1, false, 8, 8);
@@ -475,7 +426,6 @@ void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
     REQUIRE(recycled.boxes.data_ptr() == first_boxes);
     scratch.record_staging_copy_on_stream(scratch.copy_stream_handle());
 }
-
 void test_target_scratch_retires_cross_device_events_on_their_owner() {
     if (mmltk::testsupport::checked_cuda_device_count() < 2) { SKIP("Two CUDA devices required; peer coverage remains unverified"); }
     c10::cuda::CUDAGuard ambient_device(static_cast<c10::DeviceIndex>(0));
@@ -486,7 +436,6 @@ void test_target_scratch_retires_cross_device_events_on_their_owner() {
     static_cast<void>(scratch->acquire_staging_slot(1, 1, false, 8, 8));
     scratch->record_staging_copy_on_stream(scratch->copy_stream_handle());
     scratch->record_pending_copy_on_stream(scratch->copy_stream_handle());
-
     scratch->ensure_batch(1, 8, 8, 1);
     scratch->ensure_instance_capacity(1);
     scratch->ensure_copy_resources(1);
@@ -495,14 +444,12 @@ void test_target_scratch_retires_cross_device_events_on_their_owner() {
     scratch->record_staging_copy_on_stream(scratch->copy_stream_handle());
     scratch->record_pending_copy_on_stream(scratch->copy_stream_handle());
     scratch->retire_consumer_on_stream(scratch->copy_stream_handle());
-
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     scratch.reset();
     int ambient_after_destruction = -1;
     REQUIRE(cudaGetDevice(&ambient_after_destruction) == cudaSuccess);
     REQUIRE(ambient_after_destruction == 0);
 }
-
 void test_build_targets_recovers_after_staging_growth_and_failure() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int device_id = 0;
@@ -510,7 +457,6 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
     using mmltk::backend::data::LabelIndexEntry;
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
-
     const std::array indices{std::uint32_t{0}, std::uint32_t{1}};
     const std::array label_index{
         LabelIndexEntry{0, 1, 0},
@@ -536,15 +482,12 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
     rfdetr::TargetScratch scratch(2);
     scratch.ensure_batch(1, 8, 8, device_id);
     scratch.ensure_copy_resources(device_id);
-
     auto first = rfdetr::build_targets(batch(1), 8, 8, true, true, device_id, scratch, "train", 8, supervision, 2);
     auto grown = rfdetr::build_targets(batch(2), 8, 8, true, true, device_id, scratch, "train", 8, supervision, 2);
-
     REQUIRE(first.packed_masks.has_value());
     REQUIRE(grown.packed_masks.has_value());
     REQUIRE(grown.all_boxes.size(0) == 3);
     REQUIRE(grown.packed_masks->bits.size(0) == 3);
-
     scratch.wait_for_pending_copy();
     labels.front().class_id = 2;
     REQUIRE_THROWS_WITH(rfdetr::build_targets(batch(1), 8, 8, true, true, device_id, scratch, "train", 8, supervision, 2),
@@ -558,7 +501,6 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
         REQUIRE(recovered.all_boxes.size(0) == 1);
     }
 }
-
 void test_copy_paste_cache_publication_recovers_without_targets() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
@@ -624,7 +566,6 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
         (void)augmenter.finish_batch(source);
     }
 }
-
 void test_training_adapter_matches_raw_augmentation_executor() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr int height = 8;
@@ -651,10 +592,8 @@ void test_training_adapter_matches_raw_augmentation_executor() {
         c10::cuda::CUDAStream stream;
         std::vector<torch_api::Tensor> tensors;
     };
-    auto source_custody = std::make_shared<PixelCustody>(PixelCustody{
-        source_execution.context, test_stream, {source_pixels, donor_pixels}});
+    auto source_custody = std::make_shared<PixelCustody>(PixelCustody{source_execution.context, test_stream, {source_pixels, donor_pixels}});
     constexpr std::size_t image_bytes = 3U * height * width * sizeof(float);
-
     std::array<mmltk::backend::data::LabelIndexEntry, donor_index + 1U> label_index{};
     label_index[donor_index] = {0U, 1U, 0U};
     constexpr std::array donor_labels{
@@ -686,134 +625,129 @@ void test_training_adapter_matches_raw_augmentation_executor() {
         .image_capacity_bytes = image_bytes,
     };
     auto config = rfdetr::test_support::isolated_augmentation_config(1.0F);
-
-    for (const bool perceptual : {false, true}) for (const bool include_masks : {false, true}) {
-        config.perceptual_downscale = perceptual;
-        rfdetr::test_support::AugmentationExecution execution_adapter(device_id);
-        rfdetr::GpuBatchAugmenter adapter(config, 1, height, width, execution_adapter.context);
-        (void)adapter.run(donor_batch, seed, epoch, rank, sequence - 1U);
-        rfdetr::TargetScratch scratch(1);
-        auto supervision = rfdetr::TrainingSupervisionConfig{};
-        supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-        auto targets = rfdetr::build_targets(donor_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8,
-                                             supervision, 3, &adapter.batch_plan());
-        REQUIRE(adapter.prepare_batch_consumer() != nullptr);
-        REQUIRE(adapter.finish_batch(donor_batch) != nullptr);
-
-        {
-            rfdetr::TargetConsumerLease lease(scratch, targets, device_id);
-            lease.handoff();
-            const auto identity_boxes = targets.all_boxes.cpu();
-            const auto box = identity_boxes.accessor<float, 2>();
-            CHECK(box[0][0] == 0.5F);
-            CHECK(box[0][1] == 0.5F);
-            CHECK(box[0][2] == 1.0F);
-            CHECK(box[0][3] == 1.0F);
-            CHECK(targets.all_area.cpu().item<float>() == static_cast<float>(height * width));
-            std::vector<rfdetr::AugmentationPreviewAnnotation> identity_preview;
-            rfdetr::build_augmentation_preview_annotations(donor_labels, nullptr, nullptr, width, height, identity_preview, donor_rle);
-            REQUIRE(identity_preview.size() == 1);
-            CHECK(identity_preview[0].box_xyxy == std::array<float, 4>{0, 0, 1, 1});
-            CHECK(identity_preview[0].visible_area_pixels == static_cast<float>(height * width));
+    for (const bool perceptual : {false, true})
+        for (const bool include_masks : {false, true}) {
+            config.perceptual_downscale = perceptual;
+            rfdetr::test_support::AugmentationExecution execution_adapter(device_id);
+            rfdetr::GpuBatchAugmenter adapter(config, 1, height, width, execution_adapter.context);
+            (void)adapter.run(donor_batch, seed, epoch, rank, sequence - 1U);
+            rfdetr::TargetScratch scratch(1);
+            auto supervision = rfdetr::TrainingSupervisionConfig{};
+            supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
+            auto targets = rfdetr::build_targets(donor_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision, 3,
+                                                 &adapter.batch_plan());
+            REQUIRE(adapter.prepare_batch_consumer() != nullptr);
+            REQUIRE(adapter.finish_batch(donor_batch) != nullptr);
+            {
+                rfdetr::TargetConsumerLease lease(scratch, targets, device_id);
+                lease.handoff();
+                const auto identity_boxes = targets.all_boxes.cpu();
+                const auto box = identity_boxes.accessor<float, 2>();
+                CHECK(box[0][0] == 0.5F);
+                CHECK(box[0][1] == 0.5F);
+                CHECK(box[0][2] == 1.0F);
+                CHECK(box[0][3] == 1.0F);
+                CHECK(targets.all_area.cpu().item<float>() == static_cast<float>(height * width));
+                std::vector<rfdetr::AugmentationPreviewAnnotation> identity_preview;
+                rfdetr::build_augmentation_preview_annotations(donor_labels, nullptr, nullptr, width, height, identity_preview, donor_rle);
+                REQUIRE(identity_preview.size() == 1);
+                CHECK(identity_preview[0].box_xyxy == std::array<float, 4>{0, 0, 1, 1});
+                CHECK(identity_preview[0].visible_area_pixels == static_cast<float>(height * width));
+            }
+            const torch_api::Tensor adapted = adapter.run(source_batch, seed, epoch, rank, sequence);
+            const rfdetr::AugmentationBatchPlan adapted_plan = adapter.batch_plan();
+            REQUIRE(adapted_plan.images.front().paste_donor_slot == 0);
+            rfdetr::test_support::AugmentationExecution execution_raw(device_id);
+            rfdetr::GpuAugmentationExecutor raw(config, 1U, height, width, execution_raw.context, execution_raw.retirement);
+            auto raw_output = torch_api::empty_like(source_pixels);
+            auto raw_custody = std::make_shared<PixelCustody>(PixelCustody{execution_raw.context, test_stream, {raw_output}});
+            std::array<std::uint64_t, source_indices.size()> keys{};
+            for (std::size_t image = 0U; image < keys.size(); ++image) {
+                keys[image] = rfdetr::training_augmentation_image_key(seed, epoch, rank, sequence, image);
+            }
+            const auto stream = c10::cuda::getCurrentCUDAStream(device_id).stream();
+            const rfdetr::GpuAugmentationBatchView raw_batch{
+                .input = source_pixels.data_ptr<float>(),
+                .output = raw_output.data_ptr<float>(),
+                .image_indices = source_indices,
+                .height = height,
+                .width = width,
+                .input_custody = source_custody,
+                .output_custody = raw_custody,
+                .input_capacity_bytes = image_bytes,
+                .output_capacity_bytes = image_bytes,
+            };
+            const std::array raw_donors{
+                rfdetr::GpuAugmentationDonor{
+                    .label = 2,
+                    .dataset_index = donor_index,
+                    .area = static_cast<float>(height * width),
+                    .box = {0.125F, 0.125F, 0.875F, 0.875F},
+                    .has_mask = true,
+                },
+            };
+            auto donor_mask = torch_api::full({1, 1}, -1, int64_device);
+            auto donor_box = torch_api::tensor({0.125F, 0.125F, 0.875F, 0.875F}, float_device).view({1, 4});
+            raw_custody->tensors.insert(raw_custody->tensors.end(), {donor_pixels, donor_mask, donor_box});
+            const rfdetr::GpuAugmentationDonorBatchView raw_donor_batch{
+                .images = donor_pixels.data_ptr<float>(),
+                .masks = donor_mask.data_ptr<std::int64_t>(),
+                .boxes = donor_box.data_ptr<float>(),
+                .mask_words = 1,
+                .selection = rfdetr::GpuAugmentationDonorSelection::Cached,
+                .image_custody = raw_custody,
+                .image_capacity_bytes = image_bytes,
+            };
+            (void)raw.Run(raw_batch, keys, raw_donors, raw_donor_batch, stream);
+            REQUIRE(torch_api::equal(adapted, raw_output));
+            auto raw_image_plan = raw.plan().images.front();
+            raw_image_plan.paste_support = adapted_plan.images.front().paste_support;
+            raw_image_plan.paste_support_count = adapted_plan.images.front().paste_support_count;
+            CAPTURE(include_masks, adapted_plan.images.front().paste_source_area, raw_image_plan.paste_source_area);
+            CHECK(adapted_plan.images.front() == raw_image_plan);
+            CHECK(raw.plan().images.front().paste_source_box == raw_donors.front().box);
+            CHECK(raw.plan().images.front().paste_label == raw_donors.front().label);
+            REQUIRE(adapted_plan.images.front().paste_support_count == donor_rle.size());
+            CHECK(adapted_plan.images.front().paste_masked);
+            std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
+            rfdetr::build_augmentation_preview_annotations({}, &donor_labels.front(), &adapted_plan.images.front(), width, height, preview);
+            auto pasted_targets = rfdetr::build_targets(source_batch, width, height, include_masks, include_masks, device_id, scratch, "train", 8, supervision,
+                                                        3, &adapter.batch_plan());
+            REQUIRE(adapter.prepare_batch_consumer() != nullptr);
+            REQUIRE(adapter.finish_batch(source_batch) != nullptr);
+            rfdetr::TargetConsumerLease pasted_lease(scratch, pasted_targets, device_id);
+            pasted_lease.handoff();
+            REQUIRE(pasted_targets.all_boxes.size(0) == 1);
+            REQUIRE(preview.size() == 1);
+            if (!include_masks) {
+                // Positive red values identify the bright donor in the normalized image.
+                const auto image_cpu = adapted.cpu();
+                const auto pixels = image_cpu.accessor<float, 4>();
+                int xmin = width, ymin = height, xmax = -1, ymax = -1, count = 0;
+                for (int y = 0; y < height; ++y)
+                    for (int x = 0; x < width; ++x) {
+                        if (pixels[0][0][y][x] <= 0) continue;
+                        ++count;
+                        xmin = std::min(xmin, x);
+                        ymin = std::min(ymin, y);
+                        xmax = std::max(xmax, x);
+                        ymax = std::max(ymax, y);
+                    }
+                REQUIRE(count > 0);
+                const std::array<float, 4> footprint{static_cast<float>(xmin) / width, static_cast<float>(ymin) / height, static_cast<float>(xmax + 1) / width,
+                                                     static_cast<float>(ymax + 1) / height};
+                CHECK(preview[0].box_xyxy == footprint);
+                CHECK(preview[0].visible_area_pixels == static_cast<float>(count));
+                const auto target_boxes = pasted_targets.all_boxes.cpu();
+                const auto box = target_boxes.accessor<float, 2>();
+                CHECK(box[0][0] == (footprint[0] + footprint[2]) / 2);
+                CHECK(box[0][1] == (footprint[1] + footprint[3]) / 2);
+                CHECK(box[0][2] == footprint[2] - footprint[0]);
+                CHECK(box[0][3] == footprint[3] - footprint[1]);
+                CHECK(pasted_targets.all_area.cpu().item<float>() == static_cast<float>(count));
+            }
         }
-        const torch_api::Tensor adapted = adapter.run(source_batch, seed, epoch, rank, sequence);
-        const rfdetr::AugmentationBatchPlan adapted_plan = adapter.batch_plan();
-        REQUIRE(adapted_plan.images.front().paste_donor_slot == 0);
-
-        rfdetr::test_support::AugmentationExecution execution_raw(device_id);
-
-        rfdetr::GpuAugmentationExecutor raw(config, 1U, height, width, execution_raw.context, execution_raw.retirement);
-        auto raw_output = torch_api::empty_like(source_pixels);
-        auto raw_custody = std::make_shared<PixelCustody>(PixelCustody{
-            execution_raw.context, test_stream, {raw_output}});
-        std::array<std::uint64_t, source_indices.size()> keys{};
-        for (std::size_t image = 0U; image < keys.size(); ++image) {
-            keys[image] = rfdetr::training_augmentation_image_key(seed, epoch, rank, sequence, image);
-        }
-        const auto stream = c10::cuda::getCurrentCUDAStream(device_id).stream();
-        const rfdetr::GpuAugmentationBatchView raw_batch{
-            .input = source_pixels.data_ptr<float>(),
-            .output = raw_output.data_ptr<float>(),
-            .image_indices = source_indices,
-            .height = height,
-            .width = width,
-            .input_custody = source_custody,
-            .output_custody = raw_custody,
-            .input_capacity_bytes = image_bytes,
-            .output_capacity_bytes = image_bytes,
-        };
-        const std::array raw_donors{
-            rfdetr::GpuAugmentationDonor{
-                .label = 2,
-                .dataset_index = donor_index,
-                .area = static_cast<float>(height * width),
-                .box = {0.125F, 0.125F, 0.875F, 0.875F},
-                .has_mask = true,
-            },
-        };
-        auto donor_mask = torch_api::full({1, 1}, -1, int64_device);
-        auto donor_box = torch_api::tensor({0.125F, 0.125F, 0.875F, 0.875F}, float_device).view({1, 4});
-        raw_custody->tensors.insert(raw_custody->tensors.end(), {donor_pixels, donor_mask, donor_box});
-        const rfdetr::GpuAugmentationDonorBatchView raw_donor_batch{
-            .images = donor_pixels.data_ptr<float>(),
-            .masks = donor_mask.data_ptr<std::int64_t>(),
-            .boxes = donor_box.data_ptr<float>(),
-            .mask_words = 1,
-            .selection = rfdetr::GpuAugmentationDonorSelection::Cached,
-            .image_custody = raw_custody,
-            .image_capacity_bytes = image_bytes,
-        };
-        (void)raw.Run(raw_batch, keys, raw_donors, raw_donor_batch, stream);
-        REQUIRE(torch_api::equal(adapted, raw_output));
-        auto raw_image_plan = raw.plan().images.front();
-        raw_image_plan.paste_support = adapted_plan.images.front().paste_support;
-        raw_image_plan.paste_support_count = adapted_plan.images.front().paste_support_count;
-        CAPTURE(include_masks, adapted_plan.images.front().paste_source_area, raw_image_plan.paste_source_area);
-        CHECK(adapted_plan.images.front() == raw_image_plan);
-        CHECK(raw.plan().images.front().paste_source_box == raw_donors.front().box);
-        CHECK(raw.plan().images.front().paste_label == raw_donors.front().label);
-        REQUIRE(adapted_plan.images.front().paste_support_count == donor_rle.size());
-        CHECK(adapted_plan.images.front().paste_masked);
-        std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
-        rfdetr::build_augmentation_preview_annotations({}, &donor_labels.front(), &adapted_plan.images.front(), width, height, preview);
-        auto pasted_targets = rfdetr::build_targets(source_batch, width, height, include_masks, include_masks, device_id, scratch, "train",
-                                                    8, supervision, 3, &adapter.batch_plan());
-        REQUIRE(adapter.prepare_batch_consumer() != nullptr);
-        REQUIRE(adapter.finish_batch(source_batch) != nullptr);
-        rfdetr::TargetConsumerLease pasted_lease(scratch, pasted_targets, device_id);
-        pasted_lease.handoff();
-        REQUIRE(pasted_targets.all_boxes.size(0) == 1);
-        REQUIRE(preview.size() == 1);
-        if (!include_masks) {
-            // Positive red values identify the bright donor in the normalized image.
-            const auto image_cpu = adapted.cpu();
-            const auto pixels = image_cpu.accessor<float, 4>();
-            int xmin = width, ymin = height, xmax = -1, ymax = -1, count = 0;
-            for (int y = 0; y < height; ++y)
-                for (int x = 0; x < width; ++x) {
-                    if (pixels[0][0][y][x] <= 0) continue;
-                    ++count;
-                    xmin = std::min(xmin, x);
-                    ymin = std::min(ymin, y);
-                    xmax = std::max(xmax, x);
-                    ymax = std::max(ymax, y);
-                }
-            REQUIRE(count > 0);
-            const std::array<float, 4> footprint{static_cast<float>(xmin) / width, static_cast<float>(ymin) / height,
-                                                 static_cast<float>(xmax + 1) / width, static_cast<float>(ymax + 1) / height};
-            CHECK(preview[0].box_xyxy == footprint);
-            CHECK(preview[0].visible_area_pixels == static_cast<float>(count));
-            const auto target_boxes = pasted_targets.all_boxes.cpu();
-            const auto box = target_boxes.accessor<float, 2>();
-            CHECK(box[0][0] == (footprint[0] + footprint[2]) / 2);
-            CHECK(box[0][1] == (footprint[1] + footprint[3]) / 2);
-            CHECK(box[0][2] == footprint[2] - footprint[0]);
-            CHECK(box[0][3] == footprint[3] - footprint[1]);
-            CHECK(pasted_targets.all_area.cpu().item<float>() == static_cast<float>(count));
-        }
-    }
 }
-
 void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std::span<const std::uint64_t> support_by_class,
                               const std::vector<rfdetr::AugmentationPreviewAnnotation>& preview, const torch_api::Tensor& points) {
     const auto boxes = targets.all_boxes.cpu(), areas = targets.all_area.cpu(), ids = targets.all_labels.cpu();
@@ -825,10 +759,9 @@ void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std:
     REQUIRE(preview.size() == static_cast<std::size_t>(expected_count));
     torch_api::Tensor sampled;
     if (targets.packed_masks && expected_count != 0)
-        sampled =
-            rfdetr::sample_target_masks(*targets.packed_masks, torch_api::arange(expected_count, points.options().dtype(torch_api::kInt64)),
-                                        points, "ring support")
-                .cpu();
+        sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch_api::arange(expected_count, points.options().dtype(torch_api::kInt64)), points,
+                                              "ring support")
+                      .cpu();
     for (std::int64_t i = 0; i < expected_count; ++i) {
         REQUIRE(id[i] >= 0);
         REQUIRE(static_cast<std::size_t>(id[i]) < support_by_class.size());
@@ -852,12 +785,11 @@ void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std:
         CHECK(box[i][3] == static_cast<float>(y1 - y0) / 8.F);
         const auto& annotation = preview[static_cast<std::size_t>(i)];
         CHECK(annotation.class_id == id[i]);
-        CHECK(annotation.box_xyxy == std::array<float, 4>{static_cast<float>(x0) / 8.F, static_cast<float>(y0) / 8.F,
-                                                          static_cast<float>(x1) / 8.F, static_cast<float>(y1) / 8.F});
+        CHECK(annotation.box_xyxy ==
+              std::array<float, 4>{static_cast<float>(x0) / 8.F, static_cast<float>(y0) / 8.F, static_cast<float>(x1) / 8.F, static_cast<float>(y1) / 8.F});
         CHECK(annotation.visible_area_pixels == static_cast<float>(count));
     }
 }
-
 void test_copy_paste_ring_support_and_cache_cycles() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
@@ -909,8 +841,8 @@ void test_copy_paste_ring_support_and_cache_cycles() {
         rfdetr::GpuBatchAugmenter augmenter(config, 1, 8, 8, execution_augmenter.context);
         rfdetr::TargetScratch scratch(1);
         const auto consume_cached_batch = [&] {
-            auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16,
-                                                 rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
+            auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8,
+                                                 &augmenter.batch_plan());
             (void)augmenter.prepare_batch_consumer();
             (void)augmenter.finish_batch(batch);
             rfdetr::TargetConsumerLease lease(scratch, targets, 0);
@@ -949,17 +881,15 @@ void test_copy_paste_ring_support_and_cache_cycles() {
                 for (int x = 0; x < 8; ++x) {
                     const bool pasted = (footprint & (1ULL << (y * 8 + x))) != 0;
                     const std::array means{.485F, .456F, .406F}, deviations{.229F, .224F, .225F};
-                    for (int c = 0; c < 3; ++c)
-                        CHECK(std::abs(rgb[0][c][y][x] - ((pasted ? .9F : .1F) - means[c]) / deviations[c]) < 1.e-5F);
+                    for (int c = 0; c < 3; ++c) CHECK(std::abs(rgb[0][c][y][x] - ((pasted ? .9F : .1F) - means[c]) / deviations[c]) < 1.e-5F);
                 }
-            auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16,
-                                                 rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
+            auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8,
+                                                 &augmenter.batch_plan());
             std::array<std::uint64_t, 8> expected{};
             expected[7] = footprint;
             const auto sources = cycle == 3 ? std::span{labels.data(), dot_runs.size()} : std::span<PackedInstance>{};
             if (cycle == 3)
-                for (std::size_t i = 0; i < dot_runs.size(); ++i)
-                    expected[i] = (((1ULL << dot_runs[i].length) - 1) << dot_runs[i].start) & ~footprint;
+                for (std::size_t i = 0; i < dot_runs.size(); ++i) expected[i] = (((1ULL << dot_runs[i].length) - 1) << dot_runs[i].start) & ~footprint;
             std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
             rfdetr::build_augmentation_preview_annotations(sources, &labels.back(), &plan, 8, 8, preview, runs);
             // Targets are complete before cache publication as well as after it.
@@ -992,8 +922,8 @@ void test_copy_paste_ring_support_and_cache_cycles() {
             batch.image_indices = donor_index.data();
             batch.device_images = donor_pixels.data_ptr<float>();
             (void)augmenter.run(batch, 127, 0, 0, 6);
-            auto replacement = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16,
-                                                     rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
+            auto replacement =
+                rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
             (void)augmenter.prepare_batch_consumer();
             (void)augmenter.finish_batch(batch);
             {
@@ -1016,8 +946,8 @@ void test_copy_paste_ring_support_and_cache_cycles() {
                     if (present) expected[7] |= 1ULL << (y * 8 + x);
                     CHECK((rgb[0][0][y][x] > 0) == present);
                 }
-            auto targets = rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8,
-                                                 &augmenter.batch_plan());
+            auto targets =
+                rfdetr::build_targets(batch, 8, 8, false, false, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &augmenter.batch_plan());
             std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
             rfdetr::build_augmentation_preview_annotations({}, &labels.back(), &box_plan, 8, 8, preview);
             (void)augmenter.prepare_batch_consumer();
@@ -1043,10 +973,8 @@ void test_copy_paste_ring_support_and_cache_cycles() {
         image.paste_support_count = ring_runs.size();
         batch.image_indices = source_index.data();
         std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
-        rfdetr::build_augmentation_preview_annotations(std::span{labels.data(), dot_runs.size()}, &labels.back(), &image, 8, 8, preview,
-                                                       runs);
-        auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16,
-                                             rfdetr::TrainingSupervisionConfig{}, 8, &plan);
+        rfdetr::build_augmentation_preview_annotations(std::span{labels.data(), dot_runs.size()}, &labels.back(), &image, 8, 8, preview, runs);
+        auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 16, rfdetr::TrainingSupervisionConfig{}, 8, &plan);
         rfdetr::TargetConsumerLease lease(scratch, targets, 0);
         lease.handoff();
         std::array<std::uint64_t, 8> expected{};
@@ -1056,13 +984,11 @@ void test_copy_paste_ring_support_and_cache_cycles() {
         check_copy_paste_targets(targets, expected, preview, points);
         CHECK(targets.packed_masks.has_value() == include_masks);
         lease.retire();
-
         // The first source lies in the ring's hole and survives its pasted donor:
         // augmentation grows one admitted target into two with one ordinary query.
         const std::array<mmltk::backend::data::LabelIndexEntry, 1> one_source{{{0, 1, 0}}};
         batch.label_index = one_source.data();
-        auto grown = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 1,
-                                           rfdetr::TrainingSupervisionConfig{}, 8, &plan);
+        auto grown = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 1, rfdetr::TrainingSupervisionConfig{}, 8, &plan);
         rfdetr::TargetConsumerLease grown_lease(scratch, grown, 0);
         grown_lease.handoff();
         REQUIRE(grown.counts == std::vector<int64_t>{2});
@@ -1070,7 +996,6 @@ void test_copy_paste_ring_support_and_cache_cycles() {
         batch.label_index = entries.data();
     }
 }
-
 void test_native_augmentation_preview_target_support_parity() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
@@ -1109,8 +1034,8 @@ void test_native_augmentation_preview_target_support_parity() {
             std::vector<rfdetr::AugmentationPreviewAnnotation> preview;
             rfdetr::build_augmentation_preview_annotations(std::span{&source, 1U}, &donor, &image, 8, 8, preview, runs);
             rfdetr::TargetScratch scratch(1);
-            auto targets = rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 8,
-                                                 rfdetr::TrainingSupervisionConfig{}, 5, &plan);
+            auto targets =
+                rfdetr::build_targets(batch, 8, 8, include_masks, include_masks, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 5, &plan);
             rfdetr::TargetConsumerLease lease(scratch, targets, 0);
             lease.handoff();
             REQUIRE(targets.all_boxes.size(0) == static_cast<std::int64_t>(preview.size()));
@@ -1134,7 +1059,6 @@ void test_native_augmentation_preview_target_support_parity() {
             CHECK(preview.empty() == erase_all);
         }
 }
-
 void test_tiny_mask_training_outer_edges() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
@@ -1167,8 +1091,7 @@ void test_tiny_mask_training_outer_edges() {
                 const bool present = edges[0] < edges[2] && edges[1] < edges[3];
                 const std::array<float, 4> expected{float(edges[0]) / 8, float(edges[1]) / 4, float(edges[2]) / 8, float(edges[3]) / 4};
                 rfdetr::TargetScratch scratch(1);
-                auto targets =
-                    rfdetr::build_targets(batch, 4, 8, masks, masks, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 1, &plan);
+                auto targets = rfdetr::build_targets(batch, 4, 8, masks, masks, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 1, &plan);
                 rfdetr::TargetConsumerLease lease(scratch, targets, 0);
                 lease.handoff();
                 REQUIRE(targets.all_boxes.size(0) == (present ? 1 : 0));
@@ -1182,7 +1105,6 @@ void test_tiny_mask_training_outer_edges() {
             }
     }
 }
-
 void test_training_mask_targets_follow_spatial_image_erasure() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     constexpr std::size_t count = 64U;
@@ -1214,8 +1136,7 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
     rfdetr::TargetScratch scratch(count);
     auto supervision = rfdetr::TrainingSupervisionConfig{};
     supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
-    auto targets =
-        rfdetr::build_targets(batch, extent, extent, true, true, 0, scratch, "train", 8, supervision, 1, &augmenter.batch_plan());
+    auto targets = rfdetr::build_targets(batch, extent, extent, true, true, 0, scratch, "train", 8, supervision, 1, &augmenter.batch_plan());
     REQUIRE(augmenter.prepare_batch_consumer() != nullptr);
     REQUIRE(augmenter.finish_batch(batch) != nullptr);
     rfdetr::TargetConsumerLease lease(scratch, targets, 0);
@@ -1230,19 +1151,17 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
         }
     }
     const auto points = torch_api::tensor(centers, floats).view({1, extent * extent, 2});
-    const auto sampled = rfdetr::sample_target_masks(
-        *targets.packed_masks, torch_api::arange(static_cast<int64_t>(count), floats.dtype(torch_api::kInt64)), points, "training erasure");
+    const auto sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch_api::arange(static_cast<int64_t>(count), floats.dtype(torch_api::kInt64)),
+                                                     points, "training erasure");
     const auto visible = image.ne(0.0F).any(1).reshape({static_cast<int64_t>(count), extent * extent});
     REQUIRE(torch_api::equal(sampled.to(torch_api::kBool), visible));
     CHECK(visible.any().item<bool>());
     CHECK(visible.logical_not().any().item<bool>());
 }
-
 void test_parallel_wave_drains_failures_and_cancellation() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     const rfdetr::DistributedContext distributed;
     const auto device = rfdetr::cuda_device(0);
-
     std::atomic<int> prepublication_drained = 0;
     {
         rfdetr::ParallelTrainingWave<int> wave(2, true, 0, distributed);
@@ -1269,7 +1188,6 @@ void test_parallel_wave_drains_failures_and_cancellation() {
         REQUIRE_THROWS(wave.settle(device, [](int&) {}));
     }
     REQUIRE(prepublication_drained.load() == 2);
-
 #if defined(USE_C10D_NCCL)
     std::atomic<int> collective_failure_drained = 0;
     std::latch both_published(2);
@@ -1304,7 +1222,6 @@ void test_parallel_wave_drains_failures_and_cancellation() {
     REQUIRE(failing_backend->waits.load() == 1);
     REQUIRE(failing_backend->aborts.load() == 1);
 #endif
-
     std::atomic<int> cancellation_drained = 0;
     {
         rfdetr::ParallelTrainingWave<int> wave(2, true, 0, distributed);
@@ -1323,7 +1240,6 @@ void test_parallel_wave_drains_failures_and_cancellation() {
         }
     }
     REQUIRE(cancellation_drained.load() == 2);
-
     std::atomic<int> inactive_drained = 0;
     {
         rfdetr::ParallelTrainingWave<int> wave(2, false, 0, distributed);
@@ -1339,13 +1255,11 @@ void test_parallel_wave_drains_failures_and_cancellation() {
     }
     REQUIRE(inactive_drained.load() == 2);
 }
-
 void test_all_supervision_routes_execute_fixture_backed_training() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
     const auto root = std::filesystem::temp_directory_path() / "mmltk_rfdetr_supervision_routes";
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
-
     mmltk::backend::data::testsupport::FixtureSpec fixture;
     fixture.root_dir = root.string();
     fixture.width = 64;
@@ -1353,8 +1267,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     fixture.num_images = 12;
     mmltk::backend::data::testsupport::create_synthetic_dataset(fixture);
     {
-        const auto annotated =
-            std::filesystem::path(mmltk::backend::data::testsupport::dataset_dir(fixture)) / fixture.split / "000011.jsonl";
+        const auto annotated = std::filesystem::path(mmltk::backend::data::testsupport::dataset_dir(fixture)) / fixture.split / "000011.jsonl";
         std::ifstream input(annotated);
         std::string annotation;
         REQUIRE(static_cast<bool>(std::getline(input, annotation)));
@@ -1373,8 +1286,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
         }
     }
     {
-        const auto second_annotated =
-            std::filesystem::path(mmltk::backend::data::testsupport::dataset_dir(fixture)) / fixture.split / "000012.jsonl";
+        const auto second_annotated = std::filesystem::path(mmltk::backend::data::testsupport::dataset_dir(fixture)) / fixture.split / "000012.jsonl";
         std::ofstream clear_annotations(second_annotated, std::ios::trunc);
         REQUIRE(clear_annotations.good());
     }
@@ -1386,7 +1298,6 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     compiler.target_height = 64;
     const auto compile_plan = mmltk::backend::data::DatasetCompiler::prepare(compiler, {fixture.split});
     mmltk::backend::data::DatasetCompiler::compile(compile_plan, 0U);
-
     auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
     config.resolution = 64;
     config.num_classes = 2;
@@ -1406,7 +1317,6 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     rfdetr::detail::model_state_owner(checkpoint).entries = rfdetr::testsupport::clone_normalized_model_state(seed_module);
     const auto weights = root / "seed.pt";
     rfdetr::save_native_checkpoint(weights, checkpoint);
-
     const std::array routes{
         rfdetr::TrainingSupervisionConfig{},
         [] {
@@ -1439,9 +1349,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
         const auto sample = samples / ("epoch_" + std::to_string(epoch.epoch + 1) + ".png");
         // A completed run has flushed a real PNG with the compiled image geometry.
         // The final test must not publish an additional sample.
-        const std::array<unsigned char, 24> expected_header{
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
-            0, 0, 0, 64, 0, 0, 0, 64};
+        const std::array<unsigned char, 24> expected_header{137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 64, 0, 0, 0, 64};
         std::array<unsigned char, 24> header{};
         std::ifstream image(sample, std::ios::binary);
         REQUIRE(image.read(reinterpret_cast<char*>(header.data()), header.size()).good());
@@ -1480,9 +1388,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                 request.gpu_augmentation.enabled = true;
                 request.gpu_augmentation.copy_paste_probability = 1.0F;
             }
-            if (route_index == 0 && lanes == 2) {
-                request.gpu_augmentation = rfdetr::test_support::isolated_augmentation_config(1.0F);
-            }
+            if (route_index == 0 && lanes == 2) { request.gpu_augmentation = rfdetr::test_support::isolated_augmentation_config(1.0F); }
             request.training_supervision = routes[route_index];
             const auto result = rfdetr::run_training(request);
             require_selected_evaluation(request, result);
@@ -1497,7 +1403,6 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             REQUIRE(result.history.front().val_loss.has_value());
             REQUIRE(result.best_checkpoint_path.has_value());
             REQUIRE_FALSE(rfdetr::inspect_training_checkpoint(*result.best_checkpoint_path).resumable);
-
             auto deployment_config = result.artifacts.config;
             deployment_config.training_supervision = {};
             rfdetr::NativeRfDetrModel deployment_model(deployment_config, rfdetr::testsupport::synthetic_training_layout(deployment_config.num_classes - 1));
@@ -1547,12 +1452,11 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                     rfdetr::testsupport::copy_checkpoint_archive(source, incomplete, missing);
                     reject_checkpoint(incomplete, missing);
                 }
-                const std::array<std::pair<const char*, torch_api::IValue>, 4> invalid{{
-                    {"epoch", std::string("wrong-type")},
-                    {"grad_scaler_scale", 0.0},
-                    {"lr_drop", int64_t{inspection.configuration->lr_drop + 1}},
-                    {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}
-                }};
+                const std::array<std::pair<const char*, torch_api::IValue>, 4> invalid{
+                    {{"epoch", std::string("wrong-type")},
+                     {"grad_scaler_scale", 0.0},
+                     {"lr_drop", int64_t{inspection.configuration->lr_drop + 1}},
+                     {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}}};
                 for (const auto& [key, value] : invalid) {
                     torch_api::InputArchive source;
                     source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
@@ -1595,7 +1499,6 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             }
         }
     }
-
 #if defined(USE_C10D_NCCL)
     if (mmltk::testsupport::checked_cuda_device_count() >= 2) {
         for (std::size_t route_index = 0; route_index < routes.size(); ++route_index) {
@@ -1641,49 +1544,30 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
         }
     }
 #endif
-
     std::filesystem::remove_all(root, ignored);
 }
-
 }  // namespace
-
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_training_supervision_runtime_replication_is_one_shot);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_checkpoint_supervision_config_and_deployment_pruning);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_training_supervision_runtime_replication_is_one_shot);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_checkpoint_supervision_config_and_deployment_pruning);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_feature_active_host_target_invariants);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_ema_shadow_admission_is_transactional);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_native_optimizer_late_failure_preserves_live_state);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_native_optimizer_late_failure_preserves_live_state);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_resume_continuation_manifest_is_exact);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_target_scratch_reuse_waits_for_consumer_retirement);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_target_staging_ring_recycles_completed_slots_without_host_wait);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_target_scratch_retires_cross_device_events_on_their_owner);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_build_targets_recovers_after_staging_growth_and_failure);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_training_adapter_matches_raw_augmentation_executor);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_training_mask_targets_follow_spatial_image_erasure);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_parallel_wave_drains_failures_and_cancellation);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]",
-                         test_all_supervision_routes_execute_fixture_backed_training);
-
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_target_scratch_reuse_waits_for_consumer_retirement);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_target_staging_ring_recycles_completed_slots_without_host_wait);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_target_scratch_retires_cross_device_events_on_their_owner);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_build_targets_recovers_after_staging_growth_and_failure);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_training_adapter_matches_raw_augmentation_executor);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_training_mask_targets_follow_spatial_image_erasure);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_parallel_wave_drains_failures_and_cancellation);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_all_supervision_routes_execute_fixture_backed_training);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][augmentation][support]", test_native_augmentation_preview_target_support_parity);
-
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][augmentation][support]", test_tiny_mask_training_outer_edges);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][copy_paste]", test_copy_paste_ring_support_and_cache_cycles);
-
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][copy_paste]",
-                         test_copy_paste_cache_publication_recovers_without_targets);
-
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][copy_paste]", test_copy_paste_cache_publication_recovers_without_targets);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][ema]", test_ema_selection_restores_identity_and_mode);
-
-TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads", "[model][rfdetr][training][augmentation][perceptual][cuda]") {
+TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads",
+          "[model][rfdetr][training][augmentation][perceptual][cuda]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Torch resampling custody unexecuted");
     const auto stream = training_test_stream();
     c10::cuda::CUDAStreamGuard stream_guard(stream);
@@ -1694,69 +1578,77 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
         torch_api::Tensor input, output;
     };
     auto images = std::make_shared<TensorImages>(TensorImages{execution.context, stream,
-        torch_api::full({20,3,9,9}, .25F, torch_api::TensorOptions().device(torch_api::kCUDA)),
-        torch_api::full({20,3,9,9}, -.75F, torch_api::TensorOptions().device(torch_api::kCUDA))});
+                                                              torch_api::full({20, 3, 9, 9}, .25F, torch_api::TensorOptions().device(torch_api::kCUDA)),
+                                                              torch_api::full({20, 3, 9, 9}, -.75F, torch_api::TensorOptions().device(torch_api::kCUDA))});
     auto config = rfdetr::test_support::isolated_augmentation_config();
     config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
     config.perceptual_downscale = true;
     rfdetr::GpuAugmentationExecutor executor(config, 20, 9, 9, execution.context, execution.retirement);
-    std::array<std::uint32_t,20> indices{};
-    std::array<std::uint64_t,20> keys{};
+    std::array<std::uint32_t, 20> indices{};
+    std::array<std::uint64_t, 20> keys{};
     for (std::size_t i = 0; i != keys.size(); ++i) keys[i] = i + 1;
-    rfdetr::GpuAugmentationBatchView batch{.input=images->input.data_ptr<float>(), .output=images->output.data_ptr<float>(),
-        .image_indices=indices, .height=9, .width=9, .output_domain=rfdetr::GpuAugmentationOutputDomain::UnitRgb,
-        .input_custody=images, .output_custody=images,
-        .input_capacity_bytes=static_cast<std::size_t>(images->input.numel())*sizeof(float)-1,
-        .output_capacity_bytes=static_cast<std::size_t>(images->output.numel())*sizeof(float)};
+    rfdetr::GpuAugmentationBatchView batch{.input = images->input.data_ptr<float>(),
+                                           .output = images->output.data_ptr<float>(),
+                                           .image_indices = indices,
+                                           .height = 9,
+                                           .width = 9,
+                                           .output_domain = rfdetr::GpuAugmentationOutputDomain::UnitRgb,
+                                           .input_custody = images,
+                                           .output_custody = images,
+                                           .input_capacity_bytes = static_cast<std::size_t>(images->input.numel()) * sizeof(float) - 1,
+                                           .output_capacity_bytes = static_cast<std::size_t>(images->output.numel()) * sizeof(float)};
     REQUIRE_THROWS(executor.Run(batch, keys, {}, {}, stream.stream()));
     CHECK(images->output.eq(-.75F).all().item<bool>());
     ++batch.input_capacity_bytes;
     (void)executor.Run(batch, keys, {}, {}, stream.stream());
     std::weak_ptr<TensorImages> weak = images;
-    batch.input_custody.reset(); batch.output_custody.reset(); images.reset();
+    batch.input_custody.reset();
+    batch.output_custody.reset();
+    images.reset();
     REQUIRE_FALSE(weak.expired());
     executor.Finish();
     CHECK(weak.expired());
 }
-
 TEST_CASE("training cache failed settlement retains tensors stream and source and refuses another batch", "[model][rfdetr][augmentation][cuda][custody]") {
-    if (mmltk::testsupport::checked_cuda_device_count()==0) SKIP("CUDA unavailable; cache settlement case unexecuted");
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; cache settlement case unexecuted");
     c10::cuda::CUDAStreamGuard guard(training_test_stream());
     rfdetr::test_support::AugmentationExecution execution;
-    const auto config=rfdetr::test_support::isolated_augmentation_config(1.F);
-    using Access=rfdetr::test_support::GpuBatchAugmenterTestAccess;
-    for (int failure_path=0;failure_path<3;++failure_path) {
+    const auto config = rfdetr::test_support::isolated_augmentation_config(1.F);
+    using Access = rfdetr::test_support::GpuBatchAugmenterTestAccess;
+    for (int failure_path = 0; failure_path < 3; ++failure_path) {
         std::weak_ptr<const void> retained, retained_source;
         {
-            rfdetr::GpuBatchAugmenter owner(config,1,4,4,execution.context);
-            retained=Access::Custody(owner);
-            auto pixels=std::make_shared<torch_api::Tensor>(torch_api::full({1,3,4,4},.25F,
-                torch_api::TensorOptions().device(torch_api::kCUDA)));
-            retained_source=pixels;
-            std::array<std::uint32_t,1> indices{0};
-            mmltk::backend::data::Batch batch{.num_images=1,.device_images=pixels->data_ptr<float>(),
-                .image_indices=indices.data(),.image_custody=pixels,.image_capacity_bytes=48U*sizeof(float)};
-            if (failure_path==0) {
+            rfdetr::GpuBatchAugmenter owner(config, 1, 4, 4, execution.context);
+            retained = Access::Custody(owner);
+            auto pixels = std::make_shared<torch_api::Tensor>(torch_api::full({1, 3, 4, 4}, .25F, torch_api::TensorOptions().device(torch_api::kCUDA)));
+            retained_source = pixels;
+            std::array<std::uint32_t, 1> indices{0};
+            mmltk::backend::data::Batch batch{.num_images = 1,
+                                              .device_images = pixels->data_ptr<float>(),
+                                              .image_indices = indices.data(),
+                                              .image_custody = pixels,
+                                              .image_capacity_bytes = 48U * sizeof(float)};
+            if (failure_path == 0) {
                 Access::FailCacheWait(owner);
                 REQUIRE_THROWS(owner.reconfigure(config));
             } else {
-                (void)owner.run(batch,1,0,0,0);
+                (void)owner.run(batch, 1, 0, 0, 0);
                 (void)owner.prepare_batch_consumer();
-                if (failure_path==1) {
-                    owner.batch_plan().images[0].cache_source_ordinal=0;
+                if (failure_path == 1) {
+                    owner.batch_plan().images[0].cache_source_ordinal = 0;
                     Access::FailCacheWait(owner);
                     REQUIRE_THROWS_WITH(owner.finish_batch(batch), "donor cache replacement requires source labels and identities");
                 } else {
                     (void)owner.finish_batch(batch);
-                    (void)owner.run(batch,1,0,0,1);
+                    (void)owner.run(batch, 1, 0, 0, 1);
                     (void)owner.prepare_batch_consumer();
                     Access::FailUploadWait(owner);
                     REQUIRE_THROWS(owner.finish_batch(batch));
                 }
             }
             CHECK(Access::Fact(owner).terminal);
-            CHECK(Access::Fact(owner).first_failure==cudaErrorLaunchFailure);
-            REQUIRE_THROWS(owner.run({},1,0,0,0));
+            CHECK(Access::Fact(owner).first_failure == cudaErrorLaunchFailure);
+            REQUIRE_THROWS(owner.run({}, 1, 0, 0, 0));
             REQUIRE_THROWS(owner.reconfigure(config));
             REQUIRE_THROWS(owner.finish_batch({}));
             REQUIRE_THROWS(owner.prepare_batch_consumer());
@@ -1764,9 +1656,9 @@ TEST_CASE("training cache failed settlement retains tensors stream and source an
             REQUIRE_THROWS(owner.enabled());
             pixels.reset();
             CHECK_FALSE(retained.expired());
-            if (failure_path!=0) CHECK_FALSE(retained_source.expired());
+            if (failure_path != 0) CHECK_FALSE(retained_source.expired());
         }
         CHECK_FALSE(retained.expired());
-        if (failure_path!=0) CHECK_FALSE(retained_source.expired());
+        if (failure_path != 0) CHECK_FALSE(retained_source.expired());
     }
 }

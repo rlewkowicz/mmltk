@@ -1,12 +1,10 @@
 #pragma once
-
 #include <cuda.h>
 #include <cstddef>
 #include <memory>
 #include <span>
 #include <stop_token>
 #include <stdexcept>
-
 namespace mmltk::frameworks::gpu {
 class GdrTransportUnavailable final : public std::runtime_error {
    public:
@@ -15,7 +13,6 @@ class GdrTransportUnavailable final : public std::runtime_error {
 namespace detail {
 class GdrBufferBackend;
 }
-
 // Construct on the actual GPU owner's current context. That context must outlive
 // the buffer and every read lease. Each buffer is an independent writable slot.
 // The owning system serializes buffer control calls and joins CPU writers before
@@ -50,7 +47,6 @@ class GdrMappedBuffer final {
         std::shared_ptr<Storage> storage_;
         bool recorded_ = false;
     };
-
     explicit GdrMappedBuffer(CUcontext owner, std::size_t consumer_stream_capacity = 1);
     GdrMappedBuffer(CUcontext owner, std::size_t consumer_stream_capacity, std::shared_ptr<detail::GdrBufferBackend>);
     ~GdrMappedBuffer() noexcept;

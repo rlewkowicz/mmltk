@@ -11,7 +11,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 namespace {
 namespace r = mmltk::backend::models::rfdetr;
 void test_telemetry_persistence_failure_is_nonfatal() {
@@ -45,8 +44,8 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
     std::string line;
     std::optional<r::TrainingRecord> previous;
     while (std::getline(stream, line)) {
-        auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line,
-            {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+        auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
+            line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
         if (previous) REQUIRE(record.sequence > previous->sequence);
         previous = std::move(record);
     }
@@ -55,10 +54,9 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
     REQUIRE(previous->sequence == 4096);
     REQUIRE(previous->dropped_before == writer.persistence().dropped_records);
 }
-}
+}  // namespace
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_telemetry_persistence_failure_is_nonfatal);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_telemetry_pressure_preserves_a_terminal_boundary);
-
 namespace {
 // The writer's actual Initialize open blocks on this FIFO until Release. No
 // sleeps, scheduler assumptions or production-only persistence hooks are used.
@@ -74,7 +72,7 @@ class HeldHistory final {
     void Drain() {
         if (drained_) return;
         const int stream = ::open(path_.c_str(), O_RDWR | O_CLOEXEC);
-        if (stream < 0) std::terminate(); // fixture cannot leave its writer blocked
+        if (stream < 0) std::terminate();  // fixture cannot leave its writer blocked
         std::jthread reader([&] {
             std::array<char, 4096> bytes{};
             for (;;) {
@@ -96,6 +94,7 @@ class HeldHistory final {
     }
     std::unique_ptr<r::TrainingTelemetryWriter> writer;
     std::string history;
+
    private:
     std::filesystem::path path_;
     bool drained_ = false;
@@ -108,12 +107,16 @@ class PersistenceNotice final {
         if (saved_ < 0 || output < 0 || ::dup2(output, STDERR_FILENO) < 0) std::terminate();
         ::close(output);
     }
-    ~PersistenceNotice() { ::dup2(saved_, STDERR_FILENO); ::close(saved_); }
+    ~PersistenceNotice() {
+        ::dup2(saved_, STDERR_FILENO);
+        ::close(saved_);
+    }
     bool observed() const {
         std::ifstream stream(path_);
         const std::string text{std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>{}};
         return text.find(r::kTrainingPersistenceFailureLine) != std::string::npos;
     }
+
    private:
     std::filesystem::path path_;
     int saved_ = -1;
@@ -133,15 +136,16 @@ void test_telemetry_boundary_pressure_reserves_epoch_and_terminal() {
     progress.phase = r::TrainingPhase::EpochComplete;
     progress.full_checkpoint_path = temp.path() / "checkpoint.pt";
     held.writer->Submit(progress, r::TrainingRecordRole::Epoch);
-    held.writer->Submit(progress, r::TrainingRecordRole::Boundary); // still full
+    held.writer->Submit(progress, r::TrainingRecordRole::Boundary);  // still full
     progress.phase = r::TrainingPhase::Completed;
     held.writer->Finish(progress, {});
     held.Drain();
     std::istringstream stream(held.history);
     std::string line;
     std::vector<r::TrainingRecord> records;
-    while (std::getline(stream, line)) records.push_back(mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line,
-        {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32}));
+    while (std::getline(stream, line))
+        records.push_back(mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
+            line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32}));
     REQUIRE(records.size() > 2);
     for (std::size_t index = 1; index < records.size(); ++index) REQUIRE(records[index].sequence > records[index - 1].sequence);
     for (std::size_t index = 0; index + 2 < records.size(); ++index) {
@@ -170,8 +174,8 @@ void test_invalid_terminal_has_truthful_degraded_custody_and_notice() {
     progress.full_checkpoint_path = temp.path() / "checkpoint.pt";
     held.writer->Finish(progress, {});
     held.Drain();
-    const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(held.history,
-        {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+    const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
+        held.history, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
     REQUIRE(record.role == r::TrainingRecordRole::Terminal);
     REQUIRE(record.progress.phase == r::TrainingPhase::Error);
     REQUIRE(record.progress.checkpoint_path.empty());
@@ -213,8 +217,7 @@ void test_telemetry_distinct_heads_drain_by_sequence() {
     HeldHistory held(temp.path());
     r::TrainingMetricProgress progress;
     progress.phase = r::TrainingPhase::Train;
-    for (const auto role : {r::TrainingRecordRole::Boundary, r::TrainingRecordRole::Epoch,
-                            r::TrainingRecordRole::Live, r::TrainingRecordRole::Boundary})
+    for (const auto role : {r::TrainingRecordRole::Boundary, r::TrainingRecordRole::Epoch, r::TrainingRecordRole::Live, r::TrainingRecordRole::Boundary})
         held.writer->Submit(progress, role);
     progress.phase = r::TrainingPhase::Completed;
     held.writer->Finish(progress, {});
@@ -223,16 +226,15 @@ void test_telemetry_distinct_heads_drain_by_sequence() {
     std::string line;
     std::uint64_t sequence = 0;
     while (std::getline(stream, line)) {
-        const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(line,
-            {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+        const auto record = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
+            line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
         REQUIRE(record.sequence == sequence++);
         REQUIRE(record.dropped_before == 0);
     }
     REQUIRE(sequence == 5);
     REQUIRE_FALSE(held.writer->persistence().degraded);
 }
-
-}
+}  // namespace
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_telemetry_boundary_pressure_reserves_epoch_and_terminal);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_invalid_terminal_has_truthful_degraded_custody_and_notice);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_rejected_only_submission_notifies_before_empty_close);

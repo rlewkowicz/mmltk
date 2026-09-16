@@ -1,5 +1,4 @@
 #pragma once
-
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -22,45 +21,34 @@
 #include <utility>
 #include <variant>
 #include <vector>
-
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/frameworks/serialization/cbor_field_annotations.h"
 #include "src/frameworks/serialization/cbor_wire.h"
 namespace mmltk::frameworks::reflection {
-
 template <>
 struct LeafPolicy<mmltk::frameworks::serialization::wire::Value> {
     static constexpr bool bounded_dynamic = true;
 };
-
 template <>
 struct LeafPolicy<mmltk::frameworks::serialization::wire::FlatValue> {
     static constexpr bool bounded_dynamic = true;
 };
-
 }  // namespace mmltk::frameworks::reflection
-
 namespace mmltk::frameworks::serialization::implementation {
-
 class FixedCborEncoder;
-
 namespace detail {
-
 struct VariantEnvelope final {
     static constexpr std::string_view kind_key = "kind";
     static constexpr std::string_view payload_key = "payload";
     static constexpr std::size_t field_count = 2U;
 };
-
 using mmltk::frameworks::reflection::materialized_field_policies;
 using mmltk::frameworks::reflection::OptionalValueT;
 using mmltk::frameworks::reflection::RemoveCvRef;
-
 template <class T>
 concept HasDeclarations = requires { materialized_field_policies(std::type_identity<RemoveCvRef<T>>{}); };
-
 template <class T>
 struct IsOptional : std::false_type {};
 template <class T>
@@ -69,7 +57,6 @@ struct IsOptional<std::optional<T>> : std::true_type {
 };
 template <class T>
 inline constexpr bool kIsOptional = IsOptional<RemoveCvRef<T>>::value;
-
 template <class T>
 struct IsVector : std::false_type {};
 template <class T, class Allocator>
@@ -78,7 +65,6 @@ struct IsVector<std::vector<T, Allocator>> : std::true_type {
 };
 template <class T>
 inline constexpr bool kIsVector = IsVector<RemoveCvRef<T>>::value;
-
 template <class T>
 struct IsArray : std::false_type {};
 template <class T, std::size_t Count>
@@ -88,7 +74,6 @@ struct IsArray<std::array<T, Count>> : std::true_type {
 };
 template <class T>
 inline constexpr bool kIsArray = IsArray<RemoveCvRef<T>>::value;
-
 template <class T>
 struct IsSpan : std::false_type {};
 template <class T, std::size_t Count>
@@ -100,7 +85,6 @@ struct IsSpan<std::span<T, Count>> : std::true_type {
 };
 template <class T>
 inline constexpr bool kIsSpan = IsSpan<RemoveCvRef<T>>::value;
-
 template <class T>
 struct IsInplaceVector : std::false_type {};
 template <class T, std::size_t Count>
@@ -110,31 +94,25 @@ struct IsInplaceVector<std::inplace_vector<T, Count>> : std::true_type {
 };
 template <class T>
 inline constexpr bool kIsInplaceVector = IsInplaceVector<RemoveCvRef<T>>::value;
-
 template <class T>
 inline constexpr bool kIsSequence = kIsVector<T> || kIsArray<T> || kIsSpan<T> || kIsInplaceVector<T>;
-
 template <class T>
 using SequenceElementT = typename std::conditional_t<
     kIsVector<RemoveCvRef<T>>, IsVector<RemoveCvRef<T>>,
     std::conditional_t<kIsArray<RemoveCvRef<T>>, IsArray<RemoveCvRef<T>>,
                        std::conditional_t<kIsSpan<RemoveCvRef<T>>, IsSpan<RemoveCvRef<T>>, IsInplaceVector<RemoveCvRef<T>>>>>::value_type;
-
 template <class T>
-using NestedValueT =
-    typename std::conditional_t<kIsOptional<RemoveCvRef<T>>, IsOptional<RemoveCvRef<T>>,
-                                std::conditional_t<kIsVector<RemoveCvRef<T>>, IsVector<RemoveCvRef<T>>,
-                                                   std::conditional_t<kIsArray<RemoveCvRef<T>>, IsArray<RemoveCvRef<T>>,
-                                                                      std::conditional_t<kIsSpan<RemoveCvRef<T>>, IsSpan<RemoveCvRef<T>>,
-                                                                                         IsInplaceVector<RemoveCvRef<T>>>>>>::value_type;
-
+using NestedValueT = typename std::conditional_t<
+    kIsOptional<RemoveCvRef<T>>, IsOptional<RemoveCvRef<T>>,
+    std::conditional_t<kIsVector<RemoveCvRef<T>>, IsVector<RemoveCvRef<T>>,
+                       std::conditional_t<kIsArray<RemoveCvRef<T>>, IsArray<RemoveCvRef<T>>,
+                                          std::conditional_t<kIsSpan<RemoveCvRef<T>>, IsSpan<RemoveCvRef<T>>, IsInplaceVector<RemoveCvRef<T>>>>>>::value_type;
 template <class T>
 struct IsVariant : std::false_type {};
 template <class... T>
 struct IsVariant<std::variant<T...>> : std::true_type {};
 template <class T>
 inline constexpr bool kIsVariant = IsVariant<RemoveCvRef<T>>::value;
-
 template <class... Types>
 struct UniqueTypes : std::true_type {};
 template <class First, class... Rest>
@@ -143,16 +121,13 @@ template <class T>
 inline constexpr bool kUniqueVariantAlternatives = []<class... Alternatives>(std::type_identity<std::variant<Alternatives...>>) {
     return UniqueTypes<Alternatives...>::value;
 }(std::type_identity<RemoveCvRef<T>>{});
-
 template <class T>
 inline constexpr bool kByteSequence = mmltk::frameworks::reflection::kByteSequence<T>;
-
 template <class T>
 inline constexpr bool kFlatScalar =
-    std::is_same_v<RemoveCvRef<T>, std::string> || std::is_same_v<RemoveCvRef<T>, wire::ByteBuffer> ||
-    std::is_same_v<RemoveCvRef<T>, std::monostate> || std::is_same_v<RemoveCvRef<T>, bool> ||
-    std::is_same_v<RemoveCvRef<T>, std::int64_t> || std::is_same_v<RemoveCvRef<T>, std::uint64_t> || std::is_same_v<RemoveCvRef<T>, double>;
-
+    std::is_same_v<RemoveCvRef<T>, std::string> || std::is_same_v<RemoveCvRef<T>, wire::ByteBuffer> || std::is_same_v<RemoveCvRef<T>, std::monostate> ||
+    std::is_same_v<RemoveCvRef<T>, bool> || std::is_same_v<RemoveCvRef<T>, std::int64_t> || std::is_same_v<RemoveCvRef<T>, std::uint64_t> ||
+    std::is_same_v<RemoveCvRef<T>, double>;
 template <class Byte>
 [[nodiscard]] constexpr std::byte to_wire_byte(const Byte value) noexcept {
     if constexpr (std::is_same_v<RemoveCvRef<Byte>, std::byte>) {
@@ -161,7 +136,6 @@ template <class Byte>
         return static_cast<std::byte>(static_cast<unsigned char>(value));
     }
 }
-
 template <class Byte>
 [[nodiscard]] constexpr Byte from_wire_byte(const std::byte value) noexcept {
     if constexpr (std::is_same_v<RemoveCvRef<Byte>, std::byte>) {
@@ -170,36 +144,29 @@ template <class Byte>
         return static_cast<Byte>(std::to_integer<std::uint8_t>(value));
     }
 }
-
 [[nodiscard]] wire::EncodeError encode_error(wire::ErrorCode code);
 [[nodiscard]] wire::DecodeError decode_error(wire::ErrorCode code);
 void prepend_path(wire::Error& error, std::string_view component);
-
 template <class T>
 [[nodiscard]] consteval decltype(auto) declarations() {
     return mmltk::frameworks::reflection::field_declarations<T>();
 }
-
 template <class T, class Visitor>
 constexpr void visit_bases(Visitor&& visitor) {
     mmltk::frameworks::reflection::visit_materialized_bases<T>(std::forward<Visitor>(visitor));
 }
-
 template <class T, class Visitor>
 constexpr void visit_members(Visitor&& visitor) {
     mmltk::frameworks::reflection::visit_materialized_members<T>(std::forward<Visitor>(visitor));
 }
-
 template <class T>
 [[nodiscard]] consteval auto enumerators() {
     return mmltk::frameworks::reflection::enum_entries<T>();
 }
-
 template <class T>
 [[nodiscard]] consteval bool supported_type();
 template <class T>
 [[nodiscard]] consteval std::string_view static_variant_name();
-
 template <class Variant>
 [[nodiscard]] consteval bool unique_variant_names() {
     return []<class... Alternatives>(std::type_identity<std::variant<Alternatives...>>) consteval {
@@ -212,19 +179,17 @@ template <class Variant>
         return true;
     }(std::type_identity<RemoveCvRef<Variant>>{});
 }
-
 template <class T>
 inline constexpr bool kReflectedObject = [] consteval {
     using U = RemoveCvRef<T>;
-    if constexpr (!std::is_class_v<U> || std::is_same_v<U, wire::Value> || std::is_same_v<U, wire::FlatValue> ||
-                  std::is_same_v<U, std::string> || std::is_same_v<U, std::filesystem::path> || kIsOptional<U> || kIsVector<U> ||
-                  kIsArray<U> || kIsSpan<U> || kIsInplaceVector<U> || kIsVariant<U>) {
+    if constexpr (!std::is_class_v<U> || std::is_same_v<U, wire::Value> || std::is_same_v<U, wire::FlatValue> || std::is_same_v<U, std::string> ||
+                  std::is_same_v<U, std::filesystem::path> || kIsOptional<U> || kIsVector<U> || kIsArray<U> || kIsSpan<U> || kIsInplaceVector<U> ||
+                  kIsVariant<U>) {
         return false;
     } else {
         return std::is_default_constructible_v<U> && HasDeclarations<U>;
     }
 }();
-
 template <class T>
 [[nodiscard]] consteval std::size_t flattened_member_name_count(const std::string_view name) {
     std::size_t count = 0U;
@@ -232,27 +197,21 @@ template <class T>
     visit_members<T>([&]<class Declaration>(const auto& fact) { count += fact.member_name == name ? 1U : 0U; });
     return count;
 }
-
 template <class Root, class Current = Root>
 [[nodiscard]] consteval bool unique_flattened_member_names() {
     bool unique = true;
     visit_bases<Current>([&]<class Base>() { unique = unique && unique_flattened_member_names<Root, Base>(); });
-    visit_members<Current>(
-        [&]<class Declaration>(const auto& fact) { unique = unique && flattened_member_name_count<Root>(fact.member_name) == 1U; });
+    visit_members<Current>([&]<class Declaration>(const auto& fact) { unique = unique && flattened_member_name_count<Root>(fact.member_name) == 1U; });
     return unique;
 }
-
 template <class T>
-inline constexpr bool kByteBoundedMember = std::is_same_v<OptionalValueT<T>, std::string> ||
-                                           std::is_same_v<OptionalValueT<T>, std::filesystem::path> || kByteSequence<OptionalValueT<T>>;
+inline constexpr bool kByteBoundedMember =
+    std::is_same_v<OptionalValueT<T>, std::string> || std::is_same_v<OptionalValueT<T>, std::filesystem::path> || kByteSequence<OptionalValueT<T>>;
 template <class T>
 inline constexpr bool kNeedsByteLimit = kByteBoundedMember<T> && !kIsArray<OptionalValueT<T>>;
-
 template <class T>
-inline constexpr bool kItemBoundedMember =
-    !kByteSequence<OptionalValueT<T>> &&
-    (kIsVector<OptionalValueT<T>> || kIsArray<OptionalValueT<T>> || kIsSpan<OptionalValueT<T>> || kIsInplaceVector<OptionalValueT<T>>);
-
+inline constexpr bool kItemBoundedMember = !kByteSequence<OptionalValueT<T>> && (kIsVector<OptionalValueT<T>> || kIsArray<OptionalValueT<T>> ||
+                                                                                 kIsSpan<OptionalValueT<T>> || kIsInplaceVector<OptionalValueT<T>>);
 template <class Declaration>
 [[nodiscard]] consteval mmltk::frameworks::reflection::FieldConstraint serialized_member_policy() {
     if constexpr (requires { Declaration::pointer; }) {
@@ -261,14 +220,11 @@ template <class Declaration>
         return Declaration::constraint;
     }
 }
-
 template <class Declaration>
 [[nodiscard]] consteval bool has_materialized_policy_only_annotations() {
-    if constexpr (requires { Declaration::pointer; })
-        return mmltk::frameworks::reflection::has_materialized_policy_only_annotations<Declaration::pointer>();
+    if constexpr (requires { Declaration::pointer; }) return mmltk::frameworks::reflection::has_materialized_policy_only_annotations<Declaration::pointer>();
     return true;
 }
-
 template <class Declaration>
 [[nodiscard]] consteval bool serialized_policy_annotations_are_valid() {
     if constexpr (requires { Declaration::pointer; }) {
@@ -277,7 +233,6 @@ template <class Declaration>
         return Declaration::annotations_valid;
     }
 }
-
 template <class Declaration>
 [[nodiscard]] consteval bool valid_member_annotations() {
     using MemberType = typename Declaration::member_type;
@@ -341,7 +296,6 @@ template <class Declaration>
     }
     return valid;
 }
-
 template <class Declaration, class Value>
 [[nodiscard]] bool member_constraints_accept(const Value& member_value) {
     if constexpr (kIsOptional<Value>) {
@@ -374,18 +328,15 @@ template <class Declaration, class Value>
         });
         if constexpr (std::is_same_v<RemoveCvRef<Value>, wire::Value> || std::is_same_v<RemoveCvRef<Value>, wire::FlatValue>) {
             if (dynamic_max_bytes != 0U || dynamic_max_items != 0U) {
-                valid = valid && wire::dynamic_value_within_limits(member_value, {.max_bytes = dynamic_max_bytes,
-                                                                                  .max_items = dynamic_max_items,
-                                                                                  .max_depth = wire::kMaximumNestingDepth});
+                valid = valid && wire::dynamic_value_within_limits(
+                                     member_value, {.max_bytes = dynamic_max_bytes, .max_items = dynamic_max_items, .max_depth = wire::kMaximumNestingDepth});
             }
         }
         return valid;
     }
 }
-
 template <class T>
 [[nodiscard]] consteval bool valid_type_annotations();
-
 template <class T, std::size_t Depth = 0U, class... Active>
 [[nodiscard]] consteval bool valid_type_graph() {
     using U = RemoveCvRef<T>;
@@ -423,12 +374,10 @@ template <class T, std::size_t Depth = 0U, class... Active>
     }
     return supported_type<U>();
 }
-
 template <class T>
 [[nodiscard]] consteval bool valid_type_annotations() {
     return true;
 }
-
 template <class T>
 consteval void audit_object() {
     static_assert(kReflectedObject<T>, "Reflected CBOR objects must be default-constructible reflected classes.");
@@ -441,14 +390,12 @@ consteval void audit_object() {
         static_assert(valid_member_annotations<Declaration>(), "Reflected CBOR member annotations are invalid.");
     });
 }
-
 template <class T>
 [[nodiscard]] consteval bool supported_type() {
     using U = RemoveCvRef<T>;
-    if constexpr (std::is_same_v<U, wire::Value> || std::is_same_v<U, wire::FlatValue> || std::is_same_v<U, std::monostate> ||
-                  std::is_same_v<U, bool> || std::is_same_v<U, std::byte> || std::is_enum_v<U> || std::is_integral_v<U> ||
-                  (std::is_floating_point_v<U> && sizeof(U) <= sizeof(double)) || std::is_same_v<U, std::string> ||
-                  std::is_same_v<U, std::filesystem::path> || kByteSequence<U>) {
+    if constexpr (std::is_same_v<U, wire::Value> || std::is_same_v<U, wire::FlatValue> || std::is_same_v<U, std::monostate> || std::is_same_v<U, bool> ||
+                  std::is_same_v<U, std::byte> || std::is_enum_v<U> || std::is_integral_v<U> || (std::is_floating_point_v<U> && sizeof(U) <= sizeof(double)) ||
+                  std::is_same_v<U, std::string> || std::is_same_v<U, std::filesystem::path> || kByteSequence<U>) {
         return true;
     } else if constexpr (kIsOptional<U> || kIsSequence<U>) {
         return supported_type<NestedValueT<U>>();
@@ -462,42 +409,31 @@ template <class T>
     }
     return false;
 }
-
 template <class T>
 [[nodiscard]] consteval std::string_view static_variant_name() {
     return mmltk::frameworks::reflection::type_name<T>();
 }
-
 template <class T>
 [[nodiscard]] std::string variant_name() {
     return std::string(static_variant_name<T>());
 }
-
 enum class ObjectLayout { Named, Positional };
-
 template <class T>
 [[nodiscard]] consteval std::size_t flattened_member_count();
-
 template <ObjectLayout Layout = ObjectLayout::Named, class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> to_value(const T& value);
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> from_value(const wire::Value& value);
-
 struct OpaqueCborFacade final {
     template <class T>
     [[nodiscard]] static std::expected<wire::Value, wire::EncodeError> EncodeObject(const T& value);
-
     template <class T>
     [[nodiscard]] static std::expected<T, wire::DecodeError> DecodeObject(const wire::Value& value);
-
     template <class T>
     [[nodiscard]] static std::expected<T, wire::DecodeError> DecodeProjectedObject(wire::Reader& reader, std::size_t depth);
-
     template <class T>
     [[nodiscard]] static bool EncodeFixedObject(FixedCborEncoder& writer, const T& value);
 };
-
 template <class Integer>
 [[nodiscard]] std::expected<Integer, wire::DecodeError> decode_integer_scalar(const auto source) {
     static_assert(std::is_integral_v<Integer> && !std::is_same_v<Integer, bool>);
@@ -508,9 +444,7 @@ template <class Integer>
             decoded = source;
         } else {
             static_assert(std::is_same_v<Source, std::uint64_t>);
-            if (source > static_cast<std::uint64_t>(std::numeric_limits<Integer>::max())) {
-                return std::unexpected(decode_error(wire::ErrorCode::Overflow));
-            }
+            if (source > static_cast<std::uint64_t>(std::numeric_limits<Integer>::max())) { return std::unexpected(decode_error(wire::ErrorCode::Overflow)); }
             decoded = static_cast<std::int64_t>(source);
         }
         if (decoded < static_cast<std::int64_t>(std::numeric_limits<Integer>::min()) ||
@@ -527,13 +461,10 @@ template <class Integer>
             if (source < 0) { return std::unexpected(decode_error(wire::ErrorCode::Overflow)); }
             decoded = static_cast<std::uint64_t>(source);
         }
-        if (decoded > static_cast<std::uint64_t>(std::numeric_limits<Integer>::max())) {
-            return std::unexpected(decode_error(wire::ErrorCode::Overflow));
-        }
+        if (decoded > static_cast<std::uint64_t>(std::numeric_limits<Integer>::max())) { return std::unexpected(decode_error(wire::ErrorCode::Overflow)); }
         return static_cast<Integer>(decoded);
     }
 }
-
 template <class Float>
 [[nodiscard]] std::expected<Float, wire::DecodeError> decode_float_scalar(const auto source) {
     static_assert(std::is_floating_point_v<Float>);
@@ -550,7 +481,6 @@ template <class Float>
     }
     return converted;
 }
-
 template <class Number>
 [[nodiscard]] std::expected<Number, wire::DecodeError> decode_number(const wire::Value& value) {
     return std::visit(
@@ -558,8 +488,8 @@ template <class Number>
             using Storage = RemoveCvRef<decltype(storage)>;
             if constexpr ((std::integral<Number> && (std::same_as<Storage, std::int64_t> || std::same_as<Storage, std::uint64_t>))) {
                 return decode_integer_scalar<Number>(storage);
-            } else if constexpr (std::floating_point<Number> && (std::same_as<Storage, double> || std::same_as<Storage, std::int64_t> ||
-                                                                 std::same_as<Storage, std::uint64_t>)) {
+            } else if constexpr (std::floating_point<Number> &&
+                                 (std::same_as<Storage, double> || std::same_as<Storage, std::int64_t> || std::same_as<Storage, std::uint64_t>)) {
                 return decode_float_scalar<Number>(storage);
             } else {
                 return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
@@ -567,7 +497,6 @@ template <class Number>
         },
         value.storage);
 }
-
 template <class T>
 [[nodiscard]] std::expected<void, wire::DecodeError> from_value_into(T& destination, const wire::Value& value) {
     using U = RemoveCvRef<T>;
@@ -577,17 +506,13 @@ template <class T>
             return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
         } else if constexpr (kByteSequence<U>) {
             const auto* bytes = std::get_if<wire::ByteBuffer>(&value.storage);
-            if (bytes == nullptr || bytes->size() != destination.size()) {
-                return std::unexpected(decode_error(wire::ErrorCode::Overflow));
-            }
+            if (bytes == nullptr || bytes->size() != destination.size()) { return std::unexpected(decode_error(wire::ErrorCode::Overflow)); }
             std::transform(bytes->begin(), bytes->end(), destination.begin(),
                            [](const std::byte byte) { return from_wire_byte<std::remove_const_t<Element>>(byte); });
             return {};
         } else {
             const auto* array = std::get_if<wire::Value::Array>(&value.storage);
-            if (array == nullptr || array->size() != destination.size()) {
-                return std::unexpected(decode_error(wire::ErrorCode::Overflow));
-            }
+            if (array == nullptr || array->size() != destination.size()) { return std::unexpected(decode_error(wire::ErrorCode::Overflow)); }
             for (std::size_t index = 0U; index < array->size(); ++index) {
                 auto decoded = from_value<std::remove_const_t<Element>>((*array)[index]);
                 if (!decoded) { return std::unexpected(decoded.error()); }
@@ -602,7 +527,6 @@ template <class T>
         return {};
     }
 }
-
 template <class Declaration, class T>
 [[nodiscard]] std::expected<void, wire::DecodeError> from_member_value_into(T& destination, const wire::Value& value) {
     using U = RemoveCvRef<T>;
@@ -616,8 +540,8 @@ template <class Declaration, class T>
                 return {};
             }
         }
-        auto decoded = wire::FlatValue::from_value(
-            value, {.max_bytes = policy.maximum_bytes, .max_items = policy.maximum_items, .max_depth = wire::kMaximumNestingDepth});
+        auto decoded =
+            wire::FlatValue::from_value(value, {.max_bytes = policy.maximum_bytes, .max_items = policy.maximum_items, .max_depth = wire::kMaximumNestingDepth});
         if (!decoded) { return std::unexpected(decoded.error()); }
         if constexpr (kIsOptional<U>) {
             destination.emplace(std::move(*decoded));
@@ -629,7 +553,6 @@ template <class Declaration, class T>
         return from_value_into(destination, value);
     }
 }
-
 template <class T>
 [[nodiscard]] std::size_t reflected_object_present_count(const T& value) {
     if constexpr (mmltk::frameworks::reflection::kOpaqueRelationStorage<T>) {
@@ -651,7 +574,6 @@ template <class T>
     });
     return present_count;
 }
-
 template <ObjectLayout Layout, class T, class Fields>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
 void append_reflected_object_fields(const T& value, Fields& object, std::optional<wire::EncodeError>& failure) {
@@ -686,7 +608,6 @@ void append_reflected_object_fields(const T& value, Fields& object, std::optiona
         }
     });
 }
-
 template <ObjectLayout Layout, class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> encode_object(const T& value) {
     audit_object<T>();
@@ -704,7 +625,6 @@ template <ObjectLayout Layout, class T>
         return wire::Value(std::move(object));
     }
 }
-
 template <class T>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
 void decode_reflected_object_fields(T& result, const wire::Value::Object& object, std::optional<wire::DecodeError>& failure) {
@@ -718,8 +638,7 @@ void decode_reflected_object_fields(T& result, const wire::Value::Object& object
                 const std::string_view name = fact.member_name;
                 const auto source = std::ranges::find_if(object, [name](const auto& field) { return field.first == name; });
                 if (source != object.end()) {
-                    const auto duplicate =
-                        std::ranges::find_if(std::next(source), object.end(), [name](const auto& field) { return field.first == name; });
+                    const auto duplicate = std::ranges::find_if(std::next(source), object.end(), [name](const auto& field) { return field.first == name; });
                     if (duplicate != object.end()) {
                         failure = decode_error(wire::ErrorCode::DuplicateKey);
                         prepend_path(*failure, name);
@@ -741,7 +660,6 @@ void decode_reflected_object_fields(T& result, const wire::Value::Object& object
         }
     });
 }
-
 template <class T>
 [[nodiscard]] bool reflected_object_has_member(const std::string_view name) {
     bool found = false;
@@ -753,10 +671,8 @@ template <class T>
     });
     return found;
 }
-
 template <class T>
-[[nodiscard]] std::expected<T, wire::DecodeError> finish_decoded_object(T result, const wire::Value::Object& object,
-                                                                        const std::size_t source_index,
+[[nodiscard]] std::expected<T, wire::DecodeError> finish_decoded_object(T result, const wire::Value::Object& object, const std::size_t source_index,
                                                                         std::optional<wire::DecodeError> failure) {
     if (failure) return std::unexpected(std::move(*failure));
     if (source_index != object.size()) {
@@ -766,7 +682,6 @@ template <class T>
     }
     return result;
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode_object(const wire::Value& value) {
     audit_object<T>();
@@ -775,7 +690,6 @@ template <class T>
     } else {
         const auto* object = std::get_if<wire::Value::Object>(&value.storage);
         if (object == nullptr) return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
-
         T result{};
         std::optional<wire::DecodeError> failure;
         decode_reflected_object_fields(result, *object, failure);
@@ -789,69 +703,63 @@ template <class T>
         return result;
     }
 }
-
 template <class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> OpaqueCborFacade::EncodeObject(const T& value) {
     static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<T>);
     wire::Value::Object object;
     object.reserve(declarations<T>().size());
     std::optional<wire::EncodeError> failure;
-    mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(
-        value, [&]<std::meta::info Member>(const auto& member_value) {
-            if (failure) return;
-            constexpr auto policy = mmltk::frameworks::reflection::policy_of<Member>();
-            const auto name = std::define_static_string(std::meta::identifier_of(Member));
-            if (!mmltk::frameworks::reflection::field_value_satisfies(member_value, policy)) {
-                failure = encode_error(wire::ErrorCode::LimitExceeded);
-                prepend_path(*failure, name);
-                return;
-            }
-            auto encoded = to_value(member_value);
-            if (!encoded) {
-                failure = encoded.error();
-                prepend_path(*failure, name);
-                return;
-            }
-            object.emplace_back(std::string(name), std::move(*encoded));
-        });
+    mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(value, [&]<std::meta::info Member>(const auto& member_value) {
+        if (failure) return;
+        constexpr auto policy = mmltk::frameworks::reflection::policy_of<Member>();
+        const auto name = std::define_static_string(std::meta::identifier_of(Member));
+        if (!mmltk::frameworks::reflection::field_value_satisfies(member_value, policy)) {
+            failure = encode_error(wire::ErrorCode::LimitExceeded);
+            prepend_path(*failure, name);
+            return;
+        }
+        auto encoded = to_value(member_value);
+        if (!encoded) {
+            failure = encoded.error();
+            prepend_path(*failure, name);
+            return;
+        }
+        object.emplace_back(std::string(name), std::move(*encoded));
+    });
     return failure ? std::unexpected(std::move(*failure)) : std::expected<wire::Value, wire::EncodeError>(wire::Value(std::move(object)));
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> OpaqueCborFacade::DecodeObject(const wire::Value& value) {
     static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<T>);
     const auto* object = std::get_if<wire::Value::Object>(&value.storage);
     if (object == nullptr) return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
-
     T result{};
     std::size_t source_index = 0U;
     std::optional<wire::DecodeError> failure;
-    mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(
-        result, [&]<std::meta::info Member>(auto& member_value) {
-            if (failure) return;
-            const auto name = std::define_static_string(std::meta::identifier_of(Member));
-            if (source_index >= object->size() || (*object)[source_index].first != name) {
-                failure = decode_error(wire::ErrorCode::UnknownKey);
-                prepend_path(*failure, name);
-                return;
-            }
-            auto decoded = from_value_into(member_value, (*object)[source_index].second);
-            if (!decoded) {
-                failure = decoded.error();
-                prepend_path(*failure, name);
-                return;
-            }
-            constexpr auto policy = mmltk::frameworks::reflection::policy_of<Member>();
-            if (!mmltk::frameworks::reflection::field_value_satisfies(member_value, policy)) {
-                failure = decode_error(wire::ErrorCode::LimitExceeded);
-                prepend_path(*failure, name);
-                return;
-            }
-            ++source_index;
-        });
+    mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(result, [&]<std::meta::info Member>(auto& member_value) {
+        if (failure) return;
+        const auto name = std::define_static_string(std::meta::identifier_of(Member));
+        if (source_index >= object->size() || (*object)[source_index].first != name) {
+            failure = decode_error(wire::ErrorCode::UnknownKey);
+            prepend_path(*failure, name);
+            return;
+        }
+        auto decoded = from_value_into(member_value, (*object)[source_index].second);
+        if (!decoded) {
+            failure = decoded.error();
+            prepend_path(*failure, name);
+            return;
+        }
+        constexpr auto policy = mmltk::frameworks::reflection::policy_of<Member>();
+        if (!mmltk::frameworks::reflection::field_value_satisfies(member_value, policy)) {
+            failure = decode_error(wire::ErrorCode::LimitExceeded);
+            prepend_path(*failure, name);
+            return;
+        }
+        ++source_index;
+    });
     return finish_decoded_object(std::move(result), *object, source_index, std::move(failure));
 }
-
 template <ObjectLayout Layout, class Variant>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> encode_variant(const Variant& value) {
     wire::Value::Object object;
@@ -873,7 +781,6 @@ template <ObjectLayout Layout, class Variant>
     if (failure) { return std::unexpected(std::move(*failure)); }
     return wire::Value(std::move(object));
 }
-
 template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_variant(const wire::Value& value) {
     const auto* object = std::get_if<wire::Value::Object>(&value.storage);
@@ -889,11 +796,10 @@ template <class Variant>
         prepend_path(error, VariantEnvelope::kind_key);
         return std::unexpected(std::move(error));
     }
-
     std::optional<Variant> decoded;
     std::optional<wire::DecodeError> failure;
-    []<class... Alternatives>(std::type_identity<std::variant<Alternatives...>>, const std::string& expected_kind,
-                              const wire::Value& payload, std::optional<Variant>& destination, std::optional<wire::DecodeError>& error) {
+    []<class... Alternatives>(std::type_identity<std::variant<Alternatives...>>, const std::string& expected_kind, const wire::Value& payload,
+                              std::optional<Variant>& destination, std::optional<wire::DecodeError>& error) {
         ((expected_kind == variant_name<Alternatives>() && !destination
               ? [&] {
                     auto alternative = from_value<Alternatives>(payload);
@@ -916,7 +822,6 @@ template <class Variant>
     }
     return std::move(*decoded);
 }
-
 template <ObjectLayout Layout, class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> to_value(const T& value) {
     using U = RemoveCvRef<T>;
@@ -986,7 +891,6 @@ template <ObjectLayout Layout, class T>
         return encode_object<Layout>(value);
     }
 }
-
 // The fixed browser result and contract both need a conservative
 // encoded-byte bound, but neither may grow a second CBOR vocabulary.  Keep
 // this projection beside to_value(): it follows the same reflected type graph
@@ -995,18 +899,13 @@ template <ObjectLayout Layout, class T>
     if (left > std::numeric_limits<std::size_t>::max() - right) { throw "reflected CBOR byte bound overflow"; }
     return left + right;
 }
-
 [[nodiscard]] constexpr std::size_t cbor_size_multiply(const std::size_t left, const std::size_t right) {
     if (left != 0U && right > std::numeric_limits<std::size_t>::max() / left) { throw "reflected CBOR byte bound overflow"; }
     return left * right;
 }
-
 [[nodiscard]] consteval std::size_t cbor_text_size(const std::size_t bytes) { return cbor_size_add(wire::head_size(bytes), bytes); }
-
 [[nodiscard]] consteval std::size_t cbor_byte_string_size(const std::size_t bytes) { return cbor_size_add(wire::head_size(bytes), bytes); }
-
 [[nodiscard]] consteval std::size_t cbor_maximum(const std::size_t left, const std::size_t right) { return left < right ? right : left; }
-
 template <class Declaration, std::size_t mmltk::frameworks::reflection::FieldConstraint::* Bound>
 [[nodiscard]] consteval std::size_t required_member_bound(const char* error) {
     constexpr auto policy = serialized_member_policy<Declaration>();
@@ -1014,32 +913,25 @@ template <class Declaration, std::size_t mmltk::frameworks::reflection::FieldCon
     if (result == 0U) throw error;
     return result;
 }
-
 template <class Declaration>
 [[nodiscard]] consteval std::size_t maximum_member_bytes() {
     return required_member_bound<Declaration, &mmltk::frameworks::reflection::FieldConstraint::maximum_bytes>(
         "reflected CBOR text or dynamic value requires one positive byte bound");
 }
-
 template <class Declaration>
 [[nodiscard]] consteval std::size_t maximum_member_items() {
     return required_member_bound<Declaration, &mmltk::frameworks::reflection::FieldConstraint::maximum_items>(
         "reflected CBOR sequence or dynamic value requires one positive item bound");
 }
-
 template <class Declaration>
 [[nodiscard]] consteval std::size_t maximum_member_items_or_capacity(const std::size_t capacity) {
     constexpr std::size_t declared = serialized_member_policy<Declaration>().maximum_items;
     return declared == 0U || declared > capacity ? capacity : declared;
 }
-
 enum class DynamicValueBound { Full, ExternallyBudgeted };
-
 template <class T, DynamicValueBound Mode = DynamicValueBound::Full>
 [[nodiscard]] consteval std::size_t maximum_cbor_bytes();
-
-[[nodiscard]] consteval std::size_t maximum_dynamic_cbor_bytes(const std::size_t maximum_bytes, const std::size_t maximum_items,
-                                                               const std::size_t depth) {
+[[nodiscard]] consteval std::size_t maximum_dynamic_cbor_bytes(const std::size_t maximum_bytes, const std::size_t maximum_items, const std::size_t depth) {
     const std::size_t scalar = cbor_maximum(9U, cbor_maximum(cbor_text_size(maximum_bytes), cbor_byte_string_size(maximum_bytes)));
     if (depth == wire::kMaximumNestingDepth) { return cbor_maximum(scalar, wire::head_size(0U)); }
     const std::size_t child = maximum_dynamic_cbor_bytes(maximum_bytes, maximum_items, depth + 1U);
@@ -1048,13 +940,11 @@ template <class T, DynamicValueBound Mode = DynamicValueBound::Full>
     const std::size_t object = cbor_size_add(wire::head_size(maximum_items), cbor_size_multiply(maximum_items, object_member));
     return cbor_maximum(scalar, cbor_maximum(array, object));
 }
-
 [[nodiscard]] consteval std::size_t maximum_flat_dynamic_cbor_bytes(const std::size_t maximum_bytes, const std::size_t maximum_items) {
     const std::size_t scalar = cbor_maximum(9U, cbor_maximum(cbor_text_size(maximum_bytes), cbor_byte_string_size(maximum_bytes)));
     const std::size_t array = cbor_size_add(wire::head_size(maximum_items), cbor_size_multiply(maximum_items, scalar));
     return cbor_maximum(scalar, array);
 }
-
 template <class Declaration, class Value, DynamicValueBound Mode = DynamicValueBound::Full>
 [[nodiscard]] consteval std::size_t maximum_member_cbor_bytes() {
     using U = RemoveCvRef<Value>;
@@ -1081,8 +971,7 @@ template <class Declaration, class Value, DynamicValueBound Mode = DynamicValueB
         }
     } else if constexpr (kIsVector<U>) {
         const std::size_t items = maximum_member_items<Declaration>();
-        return cbor_size_add(wire::head_size(items),
-                             cbor_size_multiply(items, maximum_cbor_bytes<typename IsVector<U>::value_type, Mode>()));
+        return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_cbor_bytes<typename IsVector<U>::value_type, Mode>()));
     } else if constexpr (kIsArray<U>) {
         return cbor_size_add(wire::head_size(IsArray<U>::size),
                              cbor_size_multiply(IsArray<U>::size, maximum_cbor_bytes<typename IsArray<U>::value_type, Mode>()));
@@ -1092,28 +981,22 @@ template <class Declaration, class Value, DynamicValueBound Mode = DynamicValueB
                              cbor_size_multiply(items, maximum_cbor_bytes<std::remove_const_t<typename IsSpan<U>::value_type>, Mode>()));
     } else if constexpr (kIsInplaceVector<U>) {
         const std::size_t items = maximum_member_items_or_capacity<Declaration>(IsInplaceVector<U>::capacity);
-        return cbor_size_add(wire::head_size(items),
-                             cbor_size_multiply(items, maximum_cbor_bytes<typename IsInplaceVector<U>::value_type, Mode>()));
+        return cbor_size_add(wire::head_size(items), cbor_size_multiply(items, maximum_cbor_bytes<typename IsInplaceVector<U>::value_type, Mode>()));
     } else {
         return maximum_cbor_bytes<U, Mode>();
     }
 }
-
 template <class T, class Contribution>
 [[nodiscard]] consteval std::size_t reflected_object_member_sum(const Contribution& contribution) {
     std::size_t result = 0U;
     visit_bases<T>([&]<class Base>() { result = cbor_size_add(result, reflected_object_member_sum<Base>(contribution)); });
-    visit_members<T>([&]<class Declaration>(const auto& fact) {
-        result = cbor_size_add(result, contribution.template operator()<T, Declaration>(fact));
-    });
+    visit_members<T>([&]<class Declaration>(const auto& fact) { result = cbor_size_add(result, contribution.template operator()<T, Declaration>(fact)); });
     return result;
 }
-
 template <class T>
 [[nodiscard]] consteval std::size_t maximum_reflected_object_member_count() {
     return reflected_object_member_sum<T>([]<class, class>(const auto&) { return 1U; });
 }
-
 template <class T, DynamicValueBound Mode>
 [[nodiscard]] consteval std::size_t maximum_reflected_object_members_bytes() {
     return reflected_object_member_sum<T>([]<class Owner, class Declaration>(const auto& fact) {
@@ -1121,7 +1004,6 @@ template <class T, DynamicValueBound Mode>
         return cbor_size_add(cbor_text_size(fact.member_name.size()), maximum_member_cbor_bytes<Declaration, Member, Mode>());
     });
 }
-
 template <class Variant, DynamicValueBound Mode>
 [[nodiscard]] consteval std::size_t maximum_variant_cbor_bytes() {
     return []<class... Alternatives>(std::type_identity<std::variant<Alternatives...>>) consteval {
@@ -1135,7 +1017,6 @@ template <class Variant, DynamicValueBound Mode>
                              cbor_size_add(cbor_text_size(std::string_view(VariantEnvelope::payload_key).size()), payload));
     }(std::type_identity<RemoveCvRef<Variant>>{});
 }
-
 template <class T, DynamicValueBound Mode>
 [[nodiscard]] consteval std::size_t maximum_cbor_bytes() {
     using U = RemoveCvRef<T>;
@@ -1158,9 +1039,7 @@ template <class T, DynamicValueBound Mode>
         return sizeof(U) <= sizeof(float) ? 5U : 9U;
     } else if constexpr (std::is_enum_v<U>) {
         std::size_t bytes = 0U;
-        for (const auto& enumerator : enumerators<U>()) {
-            bytes = cbor_maximum(bytes, cbor_text_size(enumerator.name.size()));
-        }
+        for (const auto& enumerator : enumerators<U>()) { bytes = cbor_maximum(bytes, cbor_text_size(enumerator.name.size())); }
         if (bytes == 0U) throw "reflected CBOR enum has no enumerators";
         return bytes;
     } else if constexpr (kIsOptional<U>) {
@@ -1175,18 +1054,15 @@ template <class T, DynamicValueBound Mode>
                                  cbor_size_multiply(IsArray<U>::size, maximum_cbor_bytes<typename IsArray<U>::value_type, Mode>()));
         }
     } else if constexpr (kIsInplaceVector<U>) {
-        return cbor_size_add(
-            wire::head_size(IsInplaceVector<U>::capacity),
-            cbor_size_multiply(IsInplaceVector<U>::capacity, maximum_cbor_bytes<typename IsInplaceVector<U>::value_type, Mode>()));
+        return cbor_size_add(wire::head_size(IsInplaceVector<U>::capacity),
+                             cbor_size_multiply(IsInplaceVector<U>::capacity, maximum_cbor_bytes<typename IsInplaceVector<U>::value_type, Mode>()));
     } else if constexpr (kReflectedObject<U>) {
         audit_object<U>();
-        return cbor_size_add(wire::head_size(maximum_reflected_object_member_count<U>()),
-                             maximum_reflected_object_members_bytes<U, Mode>());
+        return cbor_size_add(wire::head_size(maximum_reflected_object_member_count<U>()), maximum_reflected_object_members_bytes<U, Mode>());
     } else {
         throw "reflected CBOR byte bound needs declaration-owned dynamic limits";
     }
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> from_value(const wire::Value& value) {
     using U = RemoveCvRef<T>;
@@ -1203,8 +1079,7 @@ template <class T>
                                                                      : std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
     } else if constexpr (std::is_same_v<U, bool>) {
         const auto* decoded = std::get_if<bool>(&value.storage);
-        return decoded == nullptr ? std::unexpected(decode_error(wire::ErrorCode::TypeMismatch))
-                                  : std::expected<U, wire::DecodeError>(*decoded);
+        return decoded == nullptr ? std::unexpected(decode_error(wire::ErrorCode::TypeMismatch)) : std::expected<U, wire::DecodeError>(*decoded);
     } else if constexpr (std::is_same_v<U, std::byte>) {
         auto decoded = decode_number<unsigned char>(value);
         return decoded ? std::expected<U, wire::DecodeError>(std::byte(*decoded)) : std::unexpected(decoded.error());
@@ -1214,8 +1089,7 @@ template <class T>
         return decode_number<U>(value);
     } else if constexpr (std::is_same_v<U, std::string>) {
         const auto* decoded = std::get_if<std::string>(&value.storage);
-        return decoded == nullptr ? std::unexpected(decode_error(wire::ErrorCode::TypeMismatch))
-                                  : std::expected<U, wire::DecodeError>(*decoded);
+        return decoded == nullptr ? std::unexpected(decode_error(wire::ErrorCode::TypeMismatch)) : std::expected<U, wire::DecodeError>(*decoded);
     } else if constexpr (std::is_same_v<U, std::filesystem::path>) {
         const auto* decoded = std::get_if<std::string>(&value.storage);
         return decoded == nullptr ? std::unexpected(decode_error(wire::ErrorCode::TypeMismatch))
@@ -1291,26 +1165,21 @@ template <class T>
         return decode_object<U>(value);
     }
 }
-
 struct DecodePathSelector {
     std::string name;
     std::string object_kind;
 };
-
 struct DecodeAllocationLimit {
     std::vector<DecodePathSelector> path;
     std::optional<std::size_t> max_bytes;
     std::optional<std::size_t> max_items;
     bool recursive_dynamic = false;
 };
-
 struct DecodeAllocationLimits {
     std::vector<DecodeAllocationLimit> entries;
 };
-
 template <class T, class... Active>
 void append_decode_allocation_limits(DecodeAllocationLimits& limits, std::vector<DecodePathSelector>& path);
-
 template <class Alternative, class... Active>
 void append_variant_allocation_limits(DecodeAllocationLimits& limits, std::vector<DecodePathSelector>& path) {
     DecodePathSelector selector;
@@ -1319,9 +1188,8 @@ void append_variant_allocation_limits(DecodeAllocationLimits& limits, std::vecto
     path.push_back(std::move(selector));
     DecodeAllocationLimit discriminator_guard;
     discriminator_guard.path = path;
-    if constexpr (std::is_aggregate_v<Alternative> && !std::is_same_v<Alternative, wire::Value> && !kIsArray<Alternative> &&
-                  !kIsVector<Alternative> && !kIsSpan<Alternative> && !kIsInplaceVector<Alternative> && !kIsOptional<Alternative> &&
-                  !kIsVariant<Alternative>) {
+    if constexpr (std::is_aggregate_v<Alternative> && !std::is_same_v<Alternative, wire::Value> && !kIsArray<Alternative> && !kIsVector<Alternative> &&
+                  !kIsSpan<Alternative> && !kIsInplaceVector<Alternative> && !kIsOptional<Alternative> && !kIsVariant<Alternative>) {
         constexpr std::size_t member_count = declarations<Alternative>().size();
         discriminator_guard.max_items = member_count;
     }
@@ -1329,7 +1197,6 @@ void append_variant_allocation_limits(DecodeAllocationLimits& limits, std::vecto
     append_decode_allocation_limits<Alternative, Active...>(limits, path);
     path.pop_back();
 }
-
 template <class Owner, class Declaration, class... Active>
 void append_member_allocation_limits(const std::string_view name, DecodeAllocationLimits& limits, std::vector<DecodePathSelector>& path) {
     using MemberType = typename Declaration::member_type;
@@ -1337,7 +1204,6 @@ void append_member_allocation_limits(const std::string_view name, DecodeAllocati
     DecodePathSelector selector;
     selector.name = name;
     path.push_back(std::move(selector));
-
     DecodeAllocationLimit limit;
     limit.path = path;
     constexpr auto policy = serialized_member_policy<Declaration>();
@@ -1350,16 +1216,13 @@ void append_member_allocation_limits(const std::string_view name, DecodeAllocati
             limit.max_items = limit.max_items ? std::min(*limit.max_items, IsArray<ValueType>::size) : IsArray<ValueType>::size;
         }
     } else if constexpr (kIsInplaceVector<ValueType>) {
-        limit.max_items =
-            limit.max_items ? std::min(*limit.max_items, IsInplaceVector<ValueType>::capacity) : IsInplaceVector<ValueType>::capacity;
+        limit.max_items = limit.max_items ? std::min(*limit.max_items, IsInplaceVector<ValueType>::capacity) : IsInplaceVector<ValueType>::capacity;
     }
     if constexpr (std::is_same_v<ValueType, wire::Value> || std::is_same_v<ValueType, wire::FlatValue>) { limit.recursive_dynamic = true; }
     if (limit.max_bytes || limit.max_items) { limits.entries.push_back(std::move(limit)); }
-
     append_decode_allocation_limits<MemberType, Active...>(limits, path);
     path.pop_back();
 }
-
 template <class T, class... Active>
 void append_decode_allocation_limits(DecodeAllocationLimits& limits, std::vector<DecodePathSelector>& path) {
     using U = RemoveCvRef<T>;
@@ -1373,13 +1236,11 @@ void append_decode_allocation_limits(DecodeAllocationLimits& limits, std::vector
             }(std::type_identity<U>{}, limits, path);
         } else if constexpr (kReflectedObject<U>) {
             visit_bases<U>([&]<class Base>() { append_decode_allocation_limits<Base, Active..., U>(limits, path); });
-            visit_members<U>([&]<class Declaration>(const auto& fact) {
-                append_member_allocation_limits<U, Declaration, Active..., U>(fact.member_name, limits, path);
-            });
+            visit_members<U>(
+                [&]<class Declaration>(const auto& fact) { append_member_allocation_limits<U, Declaration, Active..., U>(fact.member_name, limits, path); });
         }
     }
 }
-
 template <class T>
 [[nodiscard]] const DecodeAllocationLimits& decode_allocation_limits() {
     static const DecodeAllocationLimits limits = [] {
@@ -1390,17 +1251,14 @@ template <class T>
     }();
     return limits;
 }
-
 struct DecodePolicyContext {
     const DecodeAllocationLimits* reflected = nullptr;
     wire::AllocationPolicy upstream{};
 };
-
 [[nodiscard]] bool allocation_path_names_match(const DecodeAllocationLimit& limit, const wire::AllocationRequest& request) noexcept;
 [[nodiscard]] bool allocation_discriminators_match(const DecodeAllocationLimit& limit, const wire::AllocationRequest& request) noexcept;
 [[nodiscard]] bool allocation_limit_accepts(const DecodeAllocationLimit& limit, const wire::AllocationRequest& request) noexcept;
 [[nodiscard]] bool allocation_allowed(const void* raw_context, const wire::AllocationRequest& request) noexcept;
-
 // A FlatValue-bearing root uses the canonical reader as a streaming typed
 // projection. The reader remains the only CBOR parser; this layer supplies
 // reflected member ownership and converts ordinary scalar leaves only after
@@ -1437,13 +1295,10 @@ template <class T, class... Active>
     }
     return false;
 }
-
 template <class T>
 inline constexpr bool kContainsFlatValue = contains_flat_value<T>();
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode_projected(wire::Reader& reader, std::size_t depth);
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> from_projected_scalar(wire::FlatValue scalar) {
     using U = RemoveCvRef<T>;
@@ -1496,14 +1351,12 @@ template <class T>
         return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
     });
 }
-
 template <class T>
 [[nodiscard]] consteval std::size_t flattened_member_count() {
     std::size_t count = declarations<T>().size();
     visit_bases<T>([&]<class Base>() { count += flattened_member_count<Base>(); });
     return count;
 }
-
 template <class T>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
 [[nodiscard]] std::expected<bool, wire::DecodeError> decode_projected_member(T& destination, wire::Reader& reader, const std::size_t depth,
@@ -1540,39 +1393,31 @@ template <class T>
     });
     return failure ? std::unexpected(std::move(*failure)) : std::expected<bool, wire::DecodeError>(matched);
 }
-
 [[nodiscard]] inline wire::DecodeError contextual_key_error(wire::Reader& reader, const wire::ErrorCode code, const std::string_view key) {
     auto error = reader.contextualize(decode_error(code));
     if (!error.path.empty()) error.path.push_back('.');
     error.path.append(key);
     return error;
 }
-
 template <class Seen>
-[[nodiscard]] std::expected<std::string, wire::DecodeError> read_unique_object_key(wire::Reader& reader, const std::size_t depth,
-                                                                                   const Seen& seen) {
+[[nodiscard]] std::expected<std::string, wire::DecodeError> read_unique_object_key(wire::Reader& reader, const std::size_t depth, const Seen& seen) {
     auto key = reader.read_object_key(depth + 1U);
     if (!key) return std::unexpected(key.error());
-    if (std::ranges::find(seen, *key) != seen.end())
-        return std::unexpected(contextual_key_error(reader, wire::ErrorCode::DuplicateKey, *key));
+    if (std::ranges::find(seen, *key) != seen.end()) return std::unexpected(contextual_key_error(reader, wire::ErrorCode::DuplicateKey, *key));
     return key;
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> OpaqueCborFacade::DecodeProjectedObject(wire::Reader& reader, const std::size_t depth) {
     static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<T>);
     auto member_count = reader.begin_object_item(depth);
     if (!member_count) return std::unexpected(member_count.error());
-
     T result{};
     std::inplace_vector<std::string, 1U> seen;
     for (std::size_t index = 0U; index < *member_count; ++index) {
         auto key = read_unique_object_key(reader, depth, seen);
         if (!key) return std::unexpected(key.error());
-
         std::expected<bool, wire::DecodeError> decoded = false;
-        mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(result, [&]<std::meta::info Member>(
-                                                                                                    auto& member_value) {
+        mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(result, [&]<std::meta::info Member>(auto& member_value) {
             const auto member_name = std::define_static_string(std::meta::identifier_of(Member));
             if (!decoded || *decoded || *key != member_name) return;
             using MemberType = RemoveCvRef<decltype(member_value)>;
@@ -1599,7 +1444,6 @@ template <class T>
     }
     return result;
 }
-
 template <class T, class Seen>
 void require_projected_members(wire::Reader& reader, const Seen& seen, std::optional<wire::DecodeError>& failure) {
     visit_bases<T>([&]<class Base>() {
@@ -1615,7 +1459,6 @@ void require_projected_members(wire::Reader& reader, const Seen& seen, std::opti
         }
     });
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode_projected_object(wire::Reader& reader, const std::size_t depth) {
     audit_object<T>();
@@ -1624,7 +1467,6 @@ template <class T>
     } else {
         auto member_count = reader.begin_object_item(depth);
         if (!member_count) return std::unexpected(member_count.error());
-
         T result{};
         std::inplace_vector<std::string, flattened_member_count<T>()> seen;
         for (std::size_t index = 0U; index < *member_count; ++index) {
@@ -1639,14 +1481,12 @@ template <class T>
             if (!*decoded) return std::unexpected(contextual_key_error(reader, wire::ErrorCode::UnknownKey, *key));
             seen.push_back(std::move(*key));
         }
-
         std::optional<wire::DecodeError> missing;
         require_projected_members<T>(reader, seen, missing);
         if (missing) return std::unexpected(std::move(*missing));
         return result;
     }
 }
-
 template <class Sequence>
 [[nodiscard]] std::expected<Sequence, wire::DecodeError> decode_projected_sequence(wire::Reader& reader, const std::size_t depth) {
     using U = RemoveCvRef<Sequence>;
@@ -1677,7 +1517,6 @@ template <class Sequence>
         return result;
     }
 }
-
 [[nodiscard]] inline std::expected<void, wire::DecodeError> require_variant_key(wire::Reader& reader, const std::size_t depth,
                                                                                 const std::string_view expected) {
     auto key = reader.read_object_key(depth);
@@ -1688,7 +1527,6 @@ template <class Sequence>
     error.path.append(expected);
     return std::unexpected(std::move(error));
 }
-
 template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_projected_variant(wire::Reader& reader, const std::size_t depth) {
     auto member_count = reader.begin_object_item(depth);
@@ -1696,7 +1534,6 @@ template <class Variant>
     if (*member_count != VariantEnvelope::field_count) { return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch)); }
     auto kind_key = require_variant_key(reader, depth + 1U, VariantEnvelope::kind_key);
     if (!kind_key) return std::unexpected(kind_key.error());
-
     std::string kind;
     {
         auto scope = reader.enter_path(VariantEnvelope::kind_key);
@@ -1706,17 +1543,14 @@ template <class Variant>
         if (!converted) { return std::unexpected(reader.contextualize(converted.error())); }
         kind = std::move(*converted);
     }
-
     auto payload_key = require_variant_key(reader, depth + 1U, VariantEnvelope::payload_key);
     if (!payload_key) return std::unexpected(payload_key.error());
-
     std::optional<Variant> result;
     std::optional<wire::DecodeError> failure;
     {
         auto scope = reader.enter_path(VariantEnvelope::payload_key);
         []<class... Alternatives>(std::type_identity<std::variant<Alternatives...>>, const std::string& expected_kind, wire::Reader& source,
-                                  const std::size_t item_depth, std::optional<Variant>& destination,
-                                  std::optional<wire::DecodeError>& error) {
+                                  const std::size_t item_depth, std::optional<Variant>& destination, std::optional<wire::DecodeError>& error) {
             ((expected_kind == variant_name<Alternatives>() && !destination
                   ? [&] {
                         auto decoded = decode_projected<Alternatives>(source, item_depth + 1U);
@@ -1733,7 +1567,6 @@ template <class Variant>
     if (!result) return std::unexpected(contextual_key_error(reader, wire::ErrorCode::UnknownKey, VariantEnvelope::kind_key));
     return std::move(*result);
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode_projected(wire::Reader& reader, const std::size_t depth) {
     using U = RemoveCvRef<T>;
@@ -1766,9 +1599,7 @@ template <class T>
         return decoded ? from_projected_scalar<U>(std::move(*decoded)) : std::unexpected(decoded.error());
     }
 }
-
 }  // namespace detail
-
 class FixedCborEncoder final {
    public:
     explicit FixedCborEncoder(std::span<std::byte> destination) noexcept;
@@ -1797,17 +1628,13 @@ class FixedCborEncoder final {
     [[nodiscard]] bool append(std::span<const std::byte> value) noexcept;
     [[nodiscard]] bool head(std::uint8_t major, std::uint64_t value) noexcept;
     [[nodiscard]] bool big_endian(std::uint64_t value, std::size_t bytes) noexcept;
-
     std::span<std::byte> destination_{};
     std::size_t position_ = 0U;
     bool capacity_exceeded_ = false;
 };
-
 namespace detail {
-
 template <class T>
 [[nodiscard]] bool encode_fixed_projection(FixedCborEncoder& writer, const T& value);
-
 template <class T>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
 [[nodiscard]] bool encode_fixed_object_fields(FixedCborEncoder& writer, const T& value) {
@@ -1821,28 +1648,24 @@ template <class T>
             bool present = true;
             if constexpr (kIsOptional<Member>) present = (value.*member).has_value();
             if (present)
-                valid = member_constraints_accept<Declaration>(value.*member) && writer.text(fact.member_name) &&
-                        encode_fixed_projection(writer, value.*member);
+                valid =
+                    member_constraints_accept<Declaration>(value.*member) && writer.text(fact.member_name) && encode_fixed_projection(writer, value.*member);
         }
     });
     return valid;
 }
-
 template <class T>
 [[nodiscard]] bool OpaqueCborFacade::EncodeFixedObject(FixedCborEncoder& writer, const T& value) {
     static_assert(mmltk::frameworks::reflection::kOpaqueRelationStorage<T>);
     bool valid = writer.object(declarations<T>().size());
-    mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(
-        value, [&]<std::meta::info Member>(const auto& member_value) {
-            if (!valid) return;
-            const auto name = std::define_static_string(std::meta::identifier_of(Member));
-            valid =
-                mmltk::frameworks::reflection::field_value_satisfies(member_value, mmltk::frameworks::reflection::policy_of<Member>()) &&
-                writer.text(name) && encode_fixed_projection(writer, member_value);
-        });
+    mmltk::frameworks::reflection::detail::OpaqueRelationStorageAccess::VisitMember(value, [&]<std::meta::info Member>(const auto& member_value) {
+        if (!valid) return;
+        const auto name = std::define_static_string(std::meta::identifier_of(Member));
+        valid = mmltk::frameworks::reflection::field_value_satisfies(member_value, mmltk::frameworks::reflection::policy_of<Member>()) && writer.text(name) &&
+                encode_fixed_projection(writer, member_value);
+    });
     return valid;
 }
-
 template <class T>
 [[nodiscard]] bool encode_fixed_projection(FixedCborEncoder& writer, const T& value) {
     using U = RemoveCvRef<T>;
@@ -1909,8 +1732,8 @@ template <class T>
         return std::visit(
             [&writer](const auto& alternative) {
                 return writer.object(VariantEnvelope::field_count) && writer.text(VariantEnvelope::kind_key) &&
-                       writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) &&
-                       writer.text(VariantEnvelope::payload_key) && encode_fixed_projection(writer, alternative);
+                       writer.text(static_variant_name<RemoveCvRef<decltype(alternative)>>()) && writer.text(VariantEnvelope::payload_key) &&
+                       encode_fixed_projection(writer, alternative);
             },
             value);
     } else if constexpr (kIsArray<U> || kIsVector<U> || kIsSpan<U> || kIsInplaceVector<U>) {
@@ -1927,37 +1750,30 @@ template <class T>
         }
     }
 }
-
 }  // namespace detail
-
 template <class T>
 [[nodiscard]] bool encode_fixed(FixedCborEncoder& writer, const T& value) {
     return detail::encode_fixed_projection(writer, value);
 }
-
 template <class T>
 [[nodiscard]] std::expected<void, wire::EncodeError> encode(const T& value, wire::ByteBuffer& destination, const wire::Limits limits) {
     auto encoded = detail::to_value(value);
     if (!encoded) { return std::unexpected(encoded.error()); }
     return wire::encode(*encoded, destination, limits);
 }
-
 template <class T>
-[[nodiscard]] std::expected<std::size_t, wire::EncodeError> encode(const T& value, const std::span<std::byte> destination,
-                                                                   const wire::Limits limits) {
+[[nodiscard]] std::expected<std::size_t, wire::EncodeError> encode(const T& value, const std::span<std::byte> destination, const wire::Limits limits) {
     if (destination.size() > limits.max_bytes) return std::unexpected(detail::encode_error(wire::ErrorCode::LimitExceeded));
     FixedCborEncoder writer(destination);
     if (!encode_fixed(writer, value)) return std::unexpected(detail::encode_error(writer.error()));
     return writer.size();
 }
-
 template <class T>
 [[nodiscard]] std::expected<std::size_t, wire::EncodeError> measure(const T& value, const wire::Limits limits) {
     auto encoded = detail::to_value(value);
     if (!encoded) { return std::unexpected(encoded.error()); }
     return wire::CountingEncoder(limits).measure(*encoded);
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode(const wire::ByteSegments bytes, const wire::Limits limits) {
     const detail::DecodePolicyContext context{
@@ -1977,35 +1793,28 @@ template <class T>
     if (!decoded) { return std::unexpected(decoded.error()); }
     return detail::from_value<T>(*decoded);
 }
-
 template <class T>
 [[nodiscard]] std::expected<void, wire::DecodeError> decode_into(T& destination, const wire::Value& value) {
     return detail::from_value_into(destination, value);
 }
-
 template <class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> reflected_value(const T& value) {
     return detail::to_value(value);
 }
-
 template <class T>
 inline constexpr bool reflected_byte_sequence = detail::kByteSequence<T>;
-
 template <class T>
 [[nodiscard]] consteval std::size_t reflected_maximum_cbor_bytes() {
     return detail::maximum_cbor_bytes<T>();
 }
-
 template <class T>
 [[nodiscard]] std::string reflected_schema_type_name() {
     return std::string(mmltk::frameworks::reflection::type_name<T>());
 }
-
 // Positional projection for schema-agreed interaction records. Scalars use the
 // canonical Reader/encoder; structure and validation derive from declarations.
 namespace compact_detail {
 enum class Shape { Unsupported, Scalar, Optional, Sequence, Enum, Variant, Object };
-
 template <class T>
 inline constexpr Shape shape = [] consteval {
     using U = std::remove_cvref_t<T>;
@@ -2013,8 +1822,7 @@ inline constexpr Shape shape = [] consteval {
         return Shape::Scalar;
     } else if constexpr (std::same_as<U, float> || std::same_as<U, double>) {
         return Shape::Scalar;
-    } else if constexpr (detail::kByteSequence<U> || std::same_as<U, std::monostate> ||
-                         mmltk::frameworks::reflection::kOpaqueRelationStorage<U>) {
+    } else if constexpr (detail::kByteSequence<U> || std::same_as<U, std::monostate> || mmltk::frameworks::reflection::kOpaqueRelationStorage<U>) {
         return Shape::Unsupported;
     } else if constexpr (std::is_enum_v<U>) {
         return detail::enumerators<U>().empty() || shape<std::underlying_type_t<U>> != Shape::Scalar ? Shape::Unsupported : Shape::Enum;
@@ -2029,14 +1837,12 @@ inline constexpr Shape shape = [] consteval {
     } else if constexpr (detail::kReflectedObject<U>) {
         bool supported = true;
         detail::visit_bases<U>([&]<class Base>() { supported = supported && shape<Base> == Shape::Object; });
-        detail::visit_members<U>([&]<class Declaration>(const auto&) {
-            supported = supported && shape<typename Declaration::member_type> != Shape::Unsupported;
-        });
+        detail::visit_members<U>(
+            [&]<class Declaration>(const auto&) { supported = supported && shape<typename Declaration::member_type> != Shape::Unsupported; });
         return supported ? Shape::Object : Shape::Unsupported;
     }
     return Shape::Unsupported;
 }();
-
 template <class T>
 [[nodiscard]] consteval std::size_t maximum_bytes() {
     static_assert(shape<T> != Shape::Unsupported, "unsupported compact wire projection");
@@ -2049,8 +1855,7 @@ template <class T>
             else
                 return detail::IsInplaceVector<T>::capacity;
         }();
-        return detail::cbor_size_add(wire::head_size(count),
-                                     detail::cbor_size_multiply(count, maximum_bytes<detail::SequenceElementT<T>>()));
+        return detail::cbor_size_add(wire::head_size(count), detail::cbor_size_multiply(count, maximum_bytes<detail::SequenceElementT<T>>()));
     } else if constexpr (shape<T> == Shape::Enum) {
         std::size_t result = 0U;
         for (const auto enumerator : detail::enumerators<T>()) {
@@ -2072,15 +1877,13 @@ template <class T>
         }(std::type_identity<T>{});
     } else if constexpr (shape<T> == Shape::Object) {
         detail::audit_object<T>();
-        return detail::cbor_size_add(wire::head_size(detail::flattened_member_count<T>()),
-                                     detail::reflected_object_member_sum<T>([]<class, class Declaration>(const auto&) {
-                                         return maximum_bytes<typename Declaration::member_type>();
-                                     }));
+        return detail::cbor_size_add(
+            wire::head_size(detail::flattened_member_count<T>()),
+            detail::reflected_object_member_sum<T>([]<class, class Declaration>(const auto&) { return maximum_bytes<typename Declaration::member_type>(); }));
     } else {
         return detail::maximum_cbor_bytes<T>();
     }
 }
-
 template <class T, class Visitor>
 void visit_fields(T& value, Visitor& visitor) {
     using U = std::remove_cvref_t<T>;
@@ -2088,8 +1891,7 @@ void visit_fields(T& value, Visitor& visitor) {
         using QualifiedBase = std::conditional_t<std::is_const_v<T>, const Base, Base>;
         visit_fields(static_cast<QualifiedBase&>(value), visitor);
     });
-    detail::visit_members<U>(
-        [&]<class Declaration>(const auto&) { visitor.template operator()<Declaration>(value.*Declaration::pointer); });
+    detail::visit_members<U>([&]<class Declaration>(const auto&) { visitor.template operator()<Declaration>(value.*Declaration::pointer); });
 }
 template <class T>
 [[nodiscard]] bool encode(FixedCborEncoder& writer, const T& value) {
@@ -2176,5 +1978,4 @@ template <class T>
     }
 }
 }  // namespace compact_detail
-
 }  // namespace mmltk::frameworks::serialization::implementation

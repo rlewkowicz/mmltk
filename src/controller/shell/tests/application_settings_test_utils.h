@@ -1,11 +1,8 @@
 #pragma once
-
 #include <concepts>
 #include <filesystem>
 #include <utility>
-
 namespace mmltk::controller::shell::testsupport {
-
 template <std::invocable Factory>
 [[nodiscard]] auto make_train_settings(const std::filesystem::path& source, const std::filesystem::path& compiled, Factory&& factory) {
     auto settings = std::forward<Factory>(factory)();
@@ -19,5 +16,4 @@ template <std::invocable Factory>
     train.request.resolution = 16;
     return settings;
 }
-
 }  // namespace mmltk::controller::shell::testsupport

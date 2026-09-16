@@ -1,5 +1,4 @@
 #include "detail/model_ema.h"
-
 #include <ATen/ops/_foreach_add.h>
 #include <ATen/ops/_foreach_mul.h>
 #include <algorithm>
@@ -8,17 +7,12 @@
 #include <iterator>
 #include <stdexcept>
 #include <utility>
-
 #include "src/backend/ml/cuda/tensor_readback.h"
-
 namespace mmltk::backend::models::rfdetr {
 namespace torch_cuda = mmltk::backend::ml::cuda;
-
-ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, const double decay, const double tau)
-    : decay_(decay), tau_(tau), source_(parameters) {
+ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, const double decay, const double tau) : decay_(decay), tau_(tau), source_(parameters) {
     shadow_.reserve(parameters.size());
-    for (const auto& parameter : parameters)
-        shadow_.push_back(parameter.detach().clone());
+    for (const auto& parameter : parameters) shadow_.push_back(parameter.detach().clone());
 }
 void ModelEma::update(const int64_t step) {
     if (selected_) throw std::logic_error("cannot update selected EMA weights");
@@ -31,23 +25,18 @@ void ModelEma::update(const int64_t step) {
 }
 ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, ShadowCandidate candidate, double decay, double tau)
     : decay_(decay), tau_(tau), source_(parameters), shadow_(std::move(candidate.tensors)) {}
-
-void ModelEma::validate_cpu_shadow(const std::vector<torch::Tensor>& parameters,
-                                  const std::vector<torch::Tensor>& cpu_shadow) {
+void ModelEma::validate_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow) {
     if (parameters.size() != cpu_shadow.size()) throw std::invalid_argument("EMA CPU inventory differs from active parameters");
     // Validate the entire CPU inventory before any device allocation or copy.
     for (std::size_t index = 0; index < parameters.size(); ++index) {
         const auto& source = cpu_shadow[index];
         const auto& destination = parameters[index];
-        if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() ||
-            source.sizes() != destination.sizes() || source.scalar_type() != destination.scalar_type() ||
-            source.layout() != destination.layout() || !torch::isfinite(source).all().item<bool>())
+        if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() || source.sizes() != destination.sizes() ||
+            source.scalar_type() != destination.scalar_type() || source.layout() != destination.layout() || !torch::isfinite(source).all().item<bool>())
             throw std::invalid_argument("EMA CPU tensor differs from its active parameter");
     }
 }
-
-ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters,
-                                  const std::vector<torch::Tensor>& cpu_shadow, double decay, double tau) {
+ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow, double decay, double tau) {
     validate_cpu_shadow(parameters, cpu_shadow);
     ShadowCandidate candidate;
     candidate.tensors.reserve(parameters.size());
@@ -55,9 +44,7 @@ ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters,
         candidate.tensors.push_back(cpu_shadow[index].to(parameters[index].device(), cpu_shadow[index].scalar_type(), false, true));
     return ModelEma(parameters, std::move(candidate), decay, tau);
 }
-
-ModelEma::Selection::Selection(ModelEma& owner, torch::nn::Module& module)
-    : owner_(&owner), module_(&module), training_(module.is_training()) {
+ModelEma::Selection::Selection(ModelEma& owner, torch::nn::Module& module) : owner_(&owner), module_(&module), training_(module.is_training()) {
     if (owner.selected_) throw std::logic_error("EMA weights already selected");
     torch::NoGradGuard guard;
     if (owner.backup_.empty()) {
@@ -72,7 +59,9 @@ ModelEma::Selection::Selection(ModelEma& owner, torch::nn::Module& module)
         owner.copy_to(owner.source_);
     } catch (...) {
         const auto failure = std::current_exception();
-        try { restore(); } catch (...) {}
+        try {
+            restore();
+        } catch (...) {}
         std::rethrow_exception(failure);
     }
 }
@@ -87,22 +76,24 @@ void ModelEma::Selection::restore() {
 ModelEma::Selection::~Selection() noexcept {
     // Explicit normal-path restoration propagates failure. During unwinding,
     // preserve the original error and leave admission sealed by selected_.
-    try { restore(); } catch (...) {}
+    try {
+        restore();
+    } catch (...) {}
 }
 const std::vector<torch::Tensor>& ModelEma::shadow_params() const noexcept { return shadow_; }
 ModelEma::ShadowCandidate ModelEma::stage_shadow_params(const std::vector<torch::Tensor>& parameters) const {
-    if (parameters.size() != shadow_.size()) {
-        throw std::runtime_error("RF-DETR EMA state does not match the active parameter inventory");
-    }
-    struct DeviceChecks { torch::Device device; std::vector<torch::Tensor> finite; };
+    if (parameters.size() != shadow_.size()) { throw std::runtime_error("RF-DETR EMA state does not match the active parameter inventory"); }
+    struct DeviceChecks {
+        torch::Device device;
+        std::vector<torch::Tensor> finite;
+    };
     std::vector<DeviceChecks> checks;
     // Validate the complete structural inventory before allocating candidates.
     for (std::size_t index = 0; index < parameters.size(); ++index) {
         const auto& parameter = parameters[index];
         const auto& destination = shadow_[index];
-        if (!parameter.defined() || !parameter.is_floating_point() || parameter.sizes() != destination.sizes() ||
-            parameter.device() != destination.device() || parameter.scalar_type() != destination.scalar_type() ||
-            parameter.layout() != destination.layout())
+        if (!parameter.defined() || !parameter.is_floating_point() || parameter.sizes() != destination.sizes() || parameter.device() != destination.device() ||
+            parameter.scalar_type() != destination.scalar_type() || parameter.layout() != destination.layout())
             throw std::runtime_error("RF-DETR EMA tensor does not match its active parameter");
         auto group = std::ranges::find(checks, parameter.device(), &DeviceChecks::device);
         if (group == checks.end()) {
@@ -120,8 +111,7 @@ ModelEma::ShadowCandidate ModelEma::stage_shadow_params(const std::vector<torch:
     for (std::size_t index = 0; index < packets.size(); ++index) (void)readback.Stage(index);
     readback.Complete();
     for (std::size_t index = 0; index < packets.size(); ++index)
-        if (!readback.Stage(index).all().item<bool>())
-            throw std::runtime_error("RF-DETR EMA tensor does not match its active parameter");
+        if (!readback.Stage(index).all().item<bool>()) throw std::runtime_error("RF-DETR EMA tensor does not match its active parameter");
     readback.Release();
     ShadowCandidate candidate;
     candidate.tensors.reserve(parameters.size());
@@ -132,7 +122,6 @@ void ModelEma::commit_shadow_params(ShadowCandidate candidate) noexcept { shadow
 void ModelEma::load_shadow_params(const std::vector<torch::Tensor>& parameters) { commit_shadow_params(stage_shadow_params(parameters)); }
 void ModelEma::copy_to(std::vector<torch::Tensor>& parameters) const {
     torch::NoGradGuard guard;
-    for (size_t index = 0; index < std::min(shadow_.size(), parameters.size()); ++index)
-        parameters[index].copy_(shadow_[index]);
+    for (size_t index = 0; index < std::min(shadow_.size(), parameters.size()); ++index) parameters[index].copy_(shadow_[index]);
 }
 }  // namespace mmltk::backend::models::rfdetr

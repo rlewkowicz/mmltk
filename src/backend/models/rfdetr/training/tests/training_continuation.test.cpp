@@ -3,18 +3,15 @@
 #include <string>
 #include <vector>
 #include <utility>
-
 #include "catch2_compat.hpp"
 #include "archive_utils.h"
 #include "detail/checkpoint_private.h"
 #include "detail/model_ema.h"
 #include "detail/training_continuation.h"
 #include "training_continuation_fixture.h"
-
 namespace {
 namespace r = mmltk::backend::models::rfdetr;
 namespace api = mmltk::backend::ml::torch_api;
-
 r::TrainRequest saved_request() {
     r::TrainRequest request;
     request.train_compiled_path = "train.bin";
@@ -24,11 +21,10 @@ r::TrainRequest saved_request() {
     request.gpu_augmentation.perceptual_downscale = true;
     return request;
 }
-
 api::InputArchive continuation_fixture(const r::TrainRequest& request) {
     api::OutputArchive output;
-    r::detail::write_training_continuation(output, request, {0, -std::numeric_limits<double>::infinity(),
-        -std::numeric_limits<double>::infinity(), 1024.0, 17, "attempt", "original.json"});
+    r::detail::write_training_continuation(
+        output, request, {0, -std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(), 1024.0, 17, "attempt", "original.json"});
     api::OutputArchive optimizer;
     r::write_int(optimizer, "fixture", 1);
     output.write("optimizer", optimizer);
@@ -39,7 +35,6 @@ api::InputArchive continuation_fixture(const r::TrainRequest& request) {
     }
     return r::testsupport::checkpoint_input(output);
 }
-
 void test_current_continuation_required_fields() {
     auto source = continuation_fixture(saved_request());
     const auto loaded = r::detail::read_training_continuation(source);
@@ -75,22 +70,27 @@ void test_current_continuation_required_fields() {
     auto input = r::testsupport::checkpoint_input(weights);
     REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
-
 void test_current_continuation_scalar_boundaries() {
-    const std::array<std::pair<std::string, api::IValue>, 19> invalid{{
-        {"epoch", int64_t{-1}}, {"epoch", int64_t{std::numeric_limits<int>::max()}},
-        {"grad_scaler_scale", 0.0}, {"grad_scaler_scale", std::numeric_limits<double>::infinity()},
-        {"grad_scaler_growth_tracker", int64_t{-1}},
-        {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
-        {"best_regular_metric", std::numeric_limits<double>::quiet_NaN()},
-        {"best_ema_metric", std::numeric_limits<double>::quiet_NaN()},
-        {"training_attempt_id", std::string{}}, {"training_attempt_id", std::string(65, 'a')},
-        {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')},
-        {"warmup_epochs", 0.25}, {"warmup_momentum", 0.25}, {"lr_min_factor", 0.25},
-        {"lr_drop", int64_t{7}}, {"lr_scheduler", std::string("cosine")},
-        {"gpu_augment_perceptual_downscale", false},
-        {"optimizer_kind", std::string("invalid")}, {"gpu_augment_geometry_probability", 0.125}
-    }};
+    const std::array<std::pair<std::string, api::IValue>, 19> invalid{
+        {{"epoch", int64_t{-1}},
+         {"epoch", int64_t{std::numeric_limits<int>::max()}},
+         {"grad_scaler_scale", 0.0},
+         {"grad_scaler_scale", std::numeric_limits<double>::infinity()},
+         {"grad_scaler_growth_tracker", int64_t{-1}},
+         {"grad_scaler_growth_tracker", int64_t{std::numeric_limits<int>::max()} + 1},
+         {"best_regular_metric", std::numeric_limits<double>::quiet_NaN()},
+         {"best_ema_metric", std::numeric_limits<double>::quiet_NaN()},
+         {"training_attempt_id", std::string{}},
+         {"training_attempt_id", std::string(65, 'a')},
+         {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'a')},
+         {"warmup_epochs", 0.25},
+         {"warmup_momentum", 0.25},
+         {"lr_min_factor", 0.25},
+         {"lr_drop", int64_t{7}},
+         {"lr_scheduler", std::string("cosine")},
+         {"gpu_augment_perceptual_downscale", false},
+         {"optimizer_kind", std::string("invalid")},
+         {"gpu_augment_geometry_probability", 0.125}}};
     for (const auto& [key, value] : invalid) {
         auto source = continuation_fixture(saved_request());
         api::OutputArchive output;
@@ -116,7 +116,6 @@ void test_current_continuation_scalar_boundaries() {
     r::testsupport::copy_checkpoint_archive(supervised_source, missing_supervision, "training_supervision_config_cbor");
     auto missing_input = r::testsupport::checkpoint_input(missing_supervision);
     REQUIRE_THROWS(r::detail::read_training_continuation(missing_input));
-
     for (auto optimizer : {r::TrainOptimizerKind::AdamW, r::TrainOptimizerKind::Muon}) {
         for (bool ema : {false, true}) {
             auto request = saved_request();
@@ -144,7 +143,6 @@ void test_current_continuation_scalar_boundaries() {
         }
     }
 }
-
 void test_ordered_cpu_ema_admission() {
     const std::vector<std::string> names{"first", "second"};
     const std::vector<api::Tensor> parameters{api::ones({2, 3}), api::zeros({4})};
@@ -177,11 +175,11 @@ void test_ordered_cpu_ema_admission() {
         if (fault == 0) {
             const auto shadow = r::detail::read_ema_shadow_archive(input, names);
             REQUIRE_NOTHROW(r::ModelEma::validate_cpu_shadow(parameters, shadow));
-        } else REQUIRE_THROWS(r::detail::read_ema_shadow_archive(input, names));
+        } else
+            REQUIRE_THROWS(r::detail::read_ema_shadow_archive(input, names));
     }
 }
 }  // namespace
-
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][continuation]", test_current_continuation_required_fields);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][continuation]", test_current_continuation_scalar_boundaries);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][continuation][ema]", test_ordered_cpu_ema_admission);

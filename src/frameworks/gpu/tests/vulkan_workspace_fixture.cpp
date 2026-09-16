@@ -1,12 +1,10 @@
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
-
 #include <vulkan/vulkan.h>
 #include <cuda.h>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
-
 namespace mmltk::frameworks::gpu::test_support {
 namespace {
 void Check(VkResult status) {
@@ -64,8 +62,7 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
     std::vector<VkQueueFamilyProperties> families(count);
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &count, families.data());
     std::uint32_t family = 0U;
-    while (family < count && !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT))
-        ++family;
+    while (family < count && !(families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT)) ++family;
     if (family == count) throw std::runtime_error("Vulkan fixture graphics queue unavailable");
     const float priority = 1.0F;
     const char* extension = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
@@ -122,8 +119,7 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
     vkGetPhysicalDeviceMemoryProperties(physical, &memory_properties);
     std::uint32_t type = 0U;
     while (type < memory_properties.memoryTypeCount &&
-           (!(requirements.memoryTypeBits & (1U << type)) ||
-            !(memory_properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+           (!(requirements.memoryTypeBits & (1U << type)) || !(memory_properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
         ++type;
     if (type == memory_properties.memoryTypeCount) throw std::runtime_error("Vulkan fixture memory type unavailable");
     VkMemoryDedicatedAllocateInfo dedicated{};
@@ -178,15 +174,13 @@ VulkanWorkspaceFixture::VulkanWorkspaceFixture(int ordinal, std::uint32_t width,
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = state.image;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0U, 1U, 0U, 1U};
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U,
-                         &barrier);
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &barrier);
     barrier.srcAccessMask = barrier.dstAccessMask;
     barrier.dstAccessMask = 0U;
     barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     barrier.srcQueueFamilyIndex = family;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
-    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0U, 0U, nullptr, 0U, nullptr,
-                         1U, &barrier);
+    vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0U, 0U, nullptr, 0U, nullptr, 1U, &barrier);
     Check(vkEndCommandBuffer(command));
     VkQueue queue;
     vkGetDeviceQueue(state.device, family, 0U, &queue);

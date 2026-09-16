@@ -3,7 +3,6 @@
 module;
 #include <NvInfer.h>
 #include <cuda_runtime.h>
-
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -13,7 +12,6 @@ module;
 #include <stdexcept>
 #include <string>
 #include <vector>
-
 #include "detail/image_upscaler_cuda.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
@@ -21,37 +19,25 @@ module;
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "upscale_execution.h"
-
 module mmltk.backend.imaging.upscale.image_upscaler;
-
 import mmltk.common.logging.mmltk_logging;
-
 #include "detail/image_upscaler_internal.h"
 #include "detail/image_upscaler_request_tile.h"
-
 namespace mmltk::backend::imaging::upscale {
-
 using mmltk::frameworks::gpu::ensure_cuda_ok;
-
 namespace {
-
 constexpr std::size_t kLaneCount = 2U;
-
 [[nodiscard]] nvinfer1::ICudaEngine& native_engine(const TensorRtEngine& owner) noexcept {
     return *reinterpret_cast<nvinfer1::ICudaEngine*>(owner.native_engine_handle());
 }
-
 class TensorRtExecutionContextDestroy final {
    public:
     void operator()(nvinfer1::IExecutionContext* pointer) const noexcept { delete pointer; }
 };
-
 using TensorRtExecutionContext = std::unique_ptr<nvinfer1::IExecutionContext, TensorRtExecutionContextDestroy>;
-
 [[nodiscard]] TensorRtExecutionContext make_tensor_rt_context(nvinfer1::ICudaEngine& engine) {
     return TensorRtExecutionContext{engine.createExecutionContext()};
 }
-
 struct TensorRtTileLane {
     TensorRtExecutionContext context;
     UpscalerFloatBuffer input;
@@ -61,16 +47,13 @@ struct TensorRtTileLane {
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
     bool submitted = false;
-
     TensorRtTileLane() = default;
     TensorRtTileLane(const TensorRtTileLane&) = delete;
     TensorRtTileLane& operator=(const TensorRtTileLane&) = delete;
-
     ~TensorRtTileLane() {
         if (context || graph_exec != nullptr || graph != nullptr || completion != nullptr || stream != nullptr) std::terminate();
     }
 };
-
 [[nodiscard]] bool shape_matches(const nvinfer1::Dims& actual, const std::array<std::int64_t, 4U>& expected) {
     if (actual.nbDims != static_cast<std::int32_t>(expected.size())) { return false; }
     for (std::int32_t axis = 0; axis < actual.nbDims; ++axis) {
@@ -78,9 +61,7 @@ struct TensorRtTileLane {
     }
     return true;
 }
-
-class TensorRtImageUpscalerRuntime final
-    : public TiledImageUpscalerRuntimeAdapter<TensorRtImageUpscalerRuntime, ImageUpscalerBackend::TensorRt> {
+class TensorRtImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapter<TensorRtImageUpscalerRuntime, ImageUpscalerBackend::TensorRt> {
    public:
     [[nodiscard]] bool graph_replay() const noexcept override {
         return std::ranges::all_of(lanes_, [](const auto& lane) { return lane.graph_exec != nullptr; });
@@ -92,7 +73,6 @@ class TensorRtImageUpscalerRuntime final
         if (engine_ == nullptr) { throw std::invalid_argument("TensorRT Image upscaler requires an engine"); }
         validate_engine();
     }
-
     ImageUpscalerOutcome ActivateBackend(ImageUpscalerCurrent current) {
         if (!current()) return ImageUpscalerOutcome::Cancelled;
         const auto& descriptor = this->descriptor();
@@ -118,14 +98,12 @@ class TensorRtImageUpscalerRuntime final
         });
         return ImageUpscalerOutcome::Completed;
     }
-
     ~TensorRtImageUpscalerRuntime() override {
         if (source_ready_ != nullptr || engine_) std::terminate();
     }
 
    private:
     friend class TiledImageUpscalerRuntimeAdapter<TensorRtImageUpscalerRuntime, ImageUpscalerBackend::TensorRt>;
-
     [[nodiscard]] cudaError_t SettleBackend() noexcept {
         // Activation is sequential. The newest initialized lane is the only
         // lane that can still own thread-local capture, which must end before
@@ -134,7 +112,6 @@ class TensorRtImageUpscalerRuntime final
             cleanup_.Record(settle_upscaler_stream(lane->stream, lane->graph), "settle TensorRT lane");
         return cleanup_.status();
     }
-
     [[nodiscard]] cudaError_t ReleaseBackend() noexcept {
         bool settled = true;
         for (TensorRtTileLane& lane : lanes_) {
@@ -177,7 +154,6 @@ class TensorRtImageUpscalerRuntime final
         if (cleanup_.status() == cudaSuccess) engine_.reset();
         return cleanup_.status();
     }
-
     void validate_engine() const {
         constexpr std::array<std::int64_t, 4U> input_shape{1, 3, kImageUpscalerInputExtent, kImageUpscalerInputExtent};
         constexpr std::array<std::int64_t, 4U> output_shape{1, 3, kImageUpscalerOutputExtent, kImageUpscalerOutputExtent};
@@ -188,23 +164,20 @@ class TensorRtImageUpscalerRuntime final
             engine.getTensorDataType(descriptor().output_name) != nvinfer1::DataType::kFLOAT ||
             !shape_matches(engine.getTensorShape(descriptor().input_name), input_shape) ||
             !shape_matches(engine.getTensorShape(descriptor().output_name), output_shape)) {
-            throw mmltk::backend::ml::runtime::TensorRtCacheIntegrityError(
-                std::string(descriptor().label) + " TensorRT engine does not match the fixed FP32 boundary contract");
+            throw mmltk::backend::ml::runtime::TensorRtCacheIntegrityError(std::string(descriptor().label) +
+                                                                           " TensorRT engine does not match the fixed FP32 boundary contract");
         }
     }
-
     ImageUpscalerOutcome initialize_lane(TensorRtTileLane& lane, ImageUpscalerCurrent current) {
         if (!current()) return ImageUpscalerOutcome::Cancelled;
         lane.context = make_tensor_rt_context(native_engine(*engine_));
         engine_->CheckOperation(lane.context != nullptr, "create TensorRT upscaler execution context");
         Checkpoint(ImageUpscalerExecutionStage::ContextCreated);
         if (!current()) return ImageUpscalerOutcome::Cancelled;
-        lane.input.ensure(checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U),
-                          "cudaMalloc for TensorRT upscaler input");
+        lane.input.ensure(checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U), "cudaMalloc for TensorRT upscaler input");
         Checkpoint(ImageUpscalerExecutionStage::BuffersAllocated);
         if (!current()) return ImageUpscalerOutcome::Cancelled;
-        lane.output.ensure(checked_upscaler_elements(kImageUpscalerOutputExtent, kImageUpscalerOutputExtent, 3U),
-                           "cudaMalloc for TensorRT upscaler output");
+        lane.output.ensure(checked_upscaler_elements(kImageUpscalerOutputExtent, kImageUpscalerOutputExtent, 3U), "cudaMalloc for TensorRT upscaler output");
         Checkpoint(ImageUpscalerExecutionStage::BuffersAllocated);
         if (!current()) return ImageUpscalerOutcome::Cancelled;
         ensure_cuda_ok(cudaStreamCreateWithFlags(&lane.stream, cudaStreamNonBlocking), "cudaStreamCreate for TensorRT upscaler lane");
@@ -213,9 +186,7 @@ class TensorRtImageUpscalerRuntime final
         ensure_cuda_ok(cudaEventCreateWithFlags(&lane.completion, cudaEventDisableTiming), "cudaEventCreate for TensorRT upscaler lane");
         Checkpoint(ImageUpscalerExecutionStage::EventCreated);
         if (!current()) return ImageUpscalerOutcome::Cancelled;
-
-        const nvinfer1::Dims4 input_shape{1, 3, static_cast<std::int32_t>(kImageUpscalerInputExtent),
-                                          static_cast<std::int32_t>(kImageUpscalerInputExtent)};
+        const nvinfer1::Dims4 input_shape{1, 3, static_cast<std::int32_t>(kImageUpscalerInputExtent), static_cast<std::int32_t>(kImageUpscalerInputExtent)};
         if (!lane.context->setInputShape(descriptor().input_name, input_shape) ||
             !lane.context->setInputTensorAddress(descriptor().input_name, lane.input.data())) {
             engine_->CheckOperation(false, "configure TensorRT upscaler input");
@@ -229,8 +200,7 @@ class TensorRtImageUpscalerRuntime final
         }
         if (!current()) return ImageUpscalerOutcome::Cancelled;
         ensure_cuda_ok(cudaMemsetAsync(lane.input.data(), 0,
-                                       checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U) * sizeof(float),
-                                       lane.stream),
+                                       checked_upscaler_elements(kImageUpscalerInputExtent, kImageUpscalerInputExtent, 3U) * sizeof(float), lane.stream),
                        "initialize TensorRT warm input");
         Checkpoint(ImageUpscalerExecutionStage::WarmInputSubmitted);
         if (!current()) return ImageUpscalerOutcome::Cancelled;
@@ -272,13 +242,11 @@ class TensorRtImageUpscalerRuntime final
         lane.graph_exec = nullptr;
         return ImageUpscalerOutcome::Completed;
     }
-
     void await_lane(TensorRtTileLane& lane) {
         if (!lane.submitted) { return; }
         ensure_cuda_ok(cudaStreamWaitEvent(lane.stream, lane.completion, 0U), "cudaStreamWaitEvent for TensorRT image upscaler lane reuse");
         lane.submitted = false;
     }
-
     void publish_lanes(const cudaStream_t consumer_stream) {
         cudaError_t first_error = cudaSuccess;
         for (TensorRtTileLane& lane : lanes_) {
@@ -288,15 +256,13 @@ class TensorRtImageUpscalerRuntime final
         }
         ensure_cuda_ok(first_error, "cudaStreamWaitEvent for TensorRT upscaler completion");
     }
-
     void wait_lanes_for_source() {
         for (TensorRtTileLane& lane : lanes_) {
             ensure_cuda_ok(cudaStreamWaitEvent(lane.stream, source_ready_, 0U), "cudaStreamWaitEvent for TensorRT upscaler source");
         }
     }
-
-    [[nodiscard]] bool submit_tiles(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream,
-                                    const std::uint32_t restored_width, const std::uint32_t restored_height) {
+    [[nodiscard]] bool submit_tiles(const ImageUpscalerRequest& request, const cudaStream_t consumer_stream, const std::uint32_t restored_width,
+                                    const std::uint32_t restored_height) {
         if (!request.current()) return false;
         ensure_cuda_ok(cudaEventRecord(source_ready_, consumer_stream), "cudaEventRecord for TensorRT upscaler source");
         wait_lanes_for_source();
@@ -304,9 +270,7 @@ class TensorRtImageUpscalerRuntime final
         publish_lanes(consumer_stream);
         return completed;
     }
-
-    [[nodiscard]] bool submit_tiles_after_source(const ImageUpscalerRequest& request, const std::uint32_t restored_width,
-                                                 const std::uint32_t restored_height) {
+    [[nodiscard]] bool submit_tiles_after_source(const ImageUpscalerRequest& request, const std::uint32_t restored_width, const std::uint32_t restored_height) {
         const std::uint32_t core_extent = kImageUpscalerInputExtent - descriptor().halo * 2U;
         std::size_t dispatch = 0U;
         for (std::uint32_t y = 0U; y < request.crop_height; y += core_extent) {
@@ -314,8 +278,8 @@ class TensorRtImageUpscalerRuntime final
                 if (!request.current()) return false;
                 TensorRtTileLane& lane = lanes_[dispatch % lanes_.size()];
                 await_lane(lane);
-                const image_upscaler_cuda::Tile tile = image_upscaler_cuda::prepare_request_tile(
-                    request, x, y, core_extent, descriptor().kind, descriptor().halo, lane.input.data(), lane.stream);
+                const image_upscaler_cuda::Tile tile =
+                    image_upscaler_cuda::prepare_request_tile(request, x, y, core_extent, descriptor().kind, descriptor().halo, lane.input.data(), lane.stream);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch TensorRT upscaler tile preparation");
                 Checkpoint(ImageUpscalerExecutionStage::TilePrepared);
                 if (!request.current()) return false;
@@ -325,8 +289,8 @@ class TensorRtImageUpscalerRuntime final
                     engine_->CheckOperation(false, "TensorRT upscaler enqueue failed");
                 }
                 if (!request.current()) return false;
-                image_upscaler_cuda::stitch_request_tile(lane.output.data(), tile, descriptor().kind, descriptor().halo, request,
-                                                         restored_width, restored_height, lane.stream);
+                image_upscaler_cuda::stitch_request_tile(lane.output.data(), tile, descriptor().kind, descriptor().halo, request, restored_width,
+                                                         restored_height, lane.stream);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch TensorRT upscaler tile composition");
                 ensure_cuda_ok(cudaEventRecord(lane.completion, lane.stream), "cudaEventRecord for TensorRT upscaler tile");
                 lane.submitted = true;
@@ -335,19 +299,14 @@ class TensorRtImageUpscalerRuntime final
         }
         return true;
     }
-
     std::unique_ptr<TensorRtEngine> engine_;
     UpscalerCleanup cleanup_;
     std::array<TensorRtTileLane, kLaneCount> lanes_;
     cudaEvent_t source_ready_ = nullptr;
 };
-
 }  // namespace
-
-std::shared_ptr<ImageUpscalerRuntime> make_tensorrt_upscaler_runtime(const ImageUpscalerDescriptor& descriptor,
-                                                                     std::unique_ptr<TensorRtEngine> engine, const int device_id,
-                                                                     const ImageUpscalerExecutionCheckpoint& checkpoint) {
+std::shared_ptr<ImageUpscalerRuntime> make_tensorrt_upscaler_runtime(const ImageUpscalerDescriptor& descriptor, std::unique_ptr<TensorRtEngine> engine,
+                                                                     const int device_id, const ImageUpscalerExecutionCheckpoint& checkpoint) {
     return std::make_shared<TensorRtImageUpscalerRuntime>(descriptor, std::move(engine), device_id, checkpoint);
 }
-
 }  // namespace mmltk::backend::imaging::upscale

@@ -1,18 +1,14 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <type_traits>
-
 // Canonical frozen import ABI. The native generator projects data-only Rust
 // records, integer wire fields, enum values, and every size/alignment/offset
 // assertion into the build-owned graphics artifact consumed by Firefox.
 // kAbiVersion changes only when layout or opcode meaning changes.
 namespace mmltk::controller::presentation::detail::workspace_surface_import {
-
 inline constexpr std::uint32_t kAbiVersion = 14U;
-
 // The underlying type is the wire type: the Rust half of this record declares
 // `u32` fields, and the static assertions below are what keep the two frozen
 // layouts identical, so this may not shrink to fit its value set.
@@ -59,7 +55,6 @@ enum class Opcode : std::uint32_t {
     // native withdraws the arena and advertises a replacement independently.
     BindingRetired = 14U,
 };
-
 // Why the shell produced no texture. These describe what happened in the shell,
 // not what the host should do about it.
 // The underlying type is the wire type: the Rust half of this record declares
@@ -74,10 +69,8 @@ enum class FailureCode : std::uint32_t {
     // `stride` and `size` describe the required pitch and allocation size.
     Layout = 4U,
 };
-
 // Firefox exports linear Vulkan images for native pitched CUDA views.
 inline constexpr std::uint64_t kModifierLinear = 0U;
-
 inline constexpr std::size_t kAllocateFrameEdgeDescriptor = 0U;
 inline constexpr std::size_t kAllocateFrameSignalDescriptor = 1U;
 inline constexpr std::size_t kAllocateAccessDescriptor = 2U;
@@ -85,7 +78,6 @@ inline constexpr std::uint32_t kAllocateDescriptorCount = 3U;
 inline constexpr std::size_t kReadyMemoryDescriptor = 0U;
 inline constexpr std::size_t kReadyTimelineDescriptor = 1U;
 inline constexpr std::uint32_t kReadyDescriptorCount = 2U;
-
 struct Record {
     std::uint32_t abi_version = kAbiVersion;
     Opcode opcode = Opcode::Allocate;
@@ -118,7 +110,6 @@ struct Record {
     std::uint64_t direct_sampling = 0U;
     constexpr bool operator==(const Record&) const noexcept = default;
 };
-
 static_assert(std::is_standard_layout_v<Record>);
 static_assert(std::is_trivially_copyable_v<Record>);
 static_assert(alignof(Record) == 8U);
@@ -138,7 +129,6 @@ static_assert(offsetof(Record, presentation_revision) == 64U);
 static_assert(kAllocateAccessDescriptor < kAllocateDescriptorCount);
 static_assert(kReadyTimelineDescriptor < kReadyDescriptorCount);
 static_assert(kReadyMemoryDescriptor != kReadyTimelineDescriptor);
-
 // A plain packet lets either native boundary validate the complete normative
 // layout without importing the other language's declaration.
 struct LayoutPacket {
@@ -151,60 +141,50 @@ struct LayoutPacket {
     std::uint32_t capability_offset = offsetof(Record, id_high);
     std::uint32_t presentation_revision_offset = offsetof(Record, presentation_revision);
 };
-
 static_assert(std::is_standard_layout_v<LayoutPacket>);
 static_assert(std::is_trivially_copyable_v<LayoutPacket>);
-
 [[nodiscard]] inline constexpr LayoutPacket layout_packet() noexcept { return {}; }
-
 [[nodiscard]] inline constexpr bool valid(const LayoutPacket& packet) noexcept {
     const LayoutPacket expected{};
-    return packet.abi_version == expected.abi_version && packet.record_size == expected.record_size &&
-           packet.record_alignment == expected.record_alignment && packet.allocate_descriptor_count == expected.allocate_descriptor_count &&
-           packet.ready_descriptor_count == expected.ready_descriptor_count && packet.opcode_offset == expected.opcode_offset &&
-           packet.capability_offset == expected.capability_offset &&
+    return packet.abi_version == expected.abi_version && packet.record_size == expected.record_size && packet.record_alignment == expected.record_alignment &&
+           packet.allocate_descriptor_count == expected.allocate_descriptor_count && packet.ready_descriptor_count == expected.ready_descriptor_count &&
+           packet.opcode_offset == expected.opcode_offset && packet.capability_offset == expected.capability_offset &&
            packet.presentation_revision_offset == expected.presentation_revision_offset;
 }
-
 // How many descriptors an opcode carries. A record that arrives with a
 // different count is a framing violation on either side.
 [[nodiscard]] inline constexpr std::uint32_t descriptor_count(const Opcode opcode) noexcept {
     if (opcode == Opcode::Allocate) { return kAllocateDescriptorCount; }
     return opcode == Opcode::Ready ? kReadyDescriptorCount : 0U;
 }
-
 [[nodiscard]] inline bool valid(const Record& record) noexcept {
     const bool known = record.opcode == Opcode::Allocate || record.opcode == Opcode::Drop || record.opcode == Opcode::Ready ||
                        record.opcode == Opcode::Failed || record.opcode == Opcode::Available || record.opcode == Opcode::Presented ||
                        record.opcode == Opcode::Completed || record.opcode == Opcode::Retired || record.opcode == Opcode::Arena ||
                        record.opcode == Opcode::ArenaReady || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired ||
                        record.opcode == Opcode::ReleaseSubmitted || record.opcode == Opcode::BindingRetired;
-    if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear ||
-        record.descriptors != descriptor_count(record.opcode) || (record.id_high == 0U && record.id_low == 0U)) {
+    if (!known || record.abi_version != kAbiVersion || record.modifier != kModifierLinear || record.descriptors != descriptor_count(record.opcode) ||
+        (record.id_high == 0U && record.id_low == 0U)) {
         return false;
     }
     const bool empty_extent = record.width == 0U && record.height == 0U && record.stride == 0U && record.size == 0U;
     bool uuid_valid = false;
-    for (const auto byte : record.device_uuid)
-        uuid_valid = uuid_valid || byte != 0U;
+    for (const auto byte : record.device_uuid) uuid_valid = uuid_valid || byte != 0U;
     const bool empty_layout =
         record.arena_high == 0U && record.arena_low == 0U && record.allocation_identity == 0U && record.device_incarnation == 0U &&
-        (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired ||
-         record.opcode == Opcode::ReleaseSubmitted) &&
+        (record.offset == 0U || record.opcode == Opcode::ReadSettled || record.opcode == Opcode::Acquired || record.opcode == Opcode::ReleaseSubmitted) &&
         record.alignment == 0U && !uuid_valid && record.dedicated == 0U && record.memory_type_bits == 0U && record.direct_sampling == 0U;
-    if (record.opcode != Opcode::Allocate && record.opcode != Opcode::Ready && record.opcode != Opcode::ArenaReady && !empty_layout)
-        return false;
-    const bool layout_valid =
-        record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
-        record.offset <= record.size && record.stride != 0U && record.height <= (record.size - record.offset) / record.stride &&
-        record.alignment != 0U && (record.alignment & (record.alignment - 1U)) == 0U &&
-        record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) && record.device_incarnation != 0U &&
-        uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U && record.direct_sampling <= 1U;
+    if (record.opcode != Opcode::Allocate && record.opcode != Opcode::Ready && record.opcode != Opcode::ArenaReady && !empty_layout) return false;
+    const bool layout_valid = record.width != 0U && record.height != 0U && record.stride >= static_cast<std::uint64_t>(record.width) * 4U &&
+                              record.offset <= record.size && record.stride != 0U && record.height <= (record.size - record.offset) / record.stride &&
+                              record.alignment != 0U && (record.alignment & (record.alignment - 1U)) == 0U &&
+                              record.size <= static_cast<std::uint64_t>(std::numeric_limits<std::ptrdiff_t>::max()) && record.device_incarnation != 0U &&
+                              uuid_valid && record.dedicated <= 1U && record.memory_type_bits != 0U && record.direct_sampling <= 1U;
     switch (record.opcode) {
         case Opcode::Ready:
         case Opcode::Allocate: {
-            return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) &&
-                   record.code == 0U && record.modifier == kModifierLinear && record.presentation_revision == 0U;
+            return layout_valid && record.allocation_identity != 0U && (record.arena_high != 0U || record.arena_low != 0U) && record.code == 0U &&
+                   record.modifier == kModifierLinear && record.presentation_revision == 0U;
         }
         case Opcode::Arena:
             return record.width != 0U && record.height != 0U && record.stride == 0U && record.size == 0U && record.code == 0U &&
@@ -215,28 +195,25 @@ static_assert(std::is_trivially_copyable_v<LayoutPacket>);
         case Opcode::ReadSettled:
         case Opcode::Acquired:
         case Opcode::ReleaseSubmitted:
-            return record.offset != 0U && record.width == 0U && record.height == 0U && record.code == 0U &&
-                   (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
+            return record.offset != 0U && record.width == 0U && record.height == 0U && record.code == 0U && (record.stride != 0U || record.size != 0U) &&
+                   record.presentation_revision != 0U;
         case Opcode::Drop:
         case Opcode::Retired:
-        case Opcode::BindingRetired:
-            return empty_extent && record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;
+        case Opcode::BindingRetired: return empty_extent && record.modifier == kModifierLinear && record.code == 0U && record.presentation_revision == 0U;
         case Opcode::Available:
         case Opcode::Presented:
         case Opcode::Completed:
-            return record.width == 0U && record.height == 0U && record.modifier == kModifierLinear && record.code >= 1U &&
-                   record.code <= 2U && (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
+            return record.width == 0U && record.height == 0U && record.modifier == kModifierLinear && record.code >= 1U && record.code <= 2U &&
+                   (record.stride != 0U || record.size != 0U) && record.presentation_revision != 0U;
         case Opcode::Failed: {
             const auto failure = static_cast<FailureCode>(record.code);
-            const bool known_failure = failure == FailureCode::NotAdmitted || failure == FailureCode::UnsupportedDescriptor ||
-                                       failure == FailureCode::Import || failure == FailureCode::Layout;
+            const bool known_failure = failure == FailureCode::NotAdmitted || failure == FailureCode::UnsupportedDescriptor || failure == FailureCode::Import ||
+                                       failure == FailureCode::Layout;
             const bool layout = failure == FailureCode::Layout;
-            return known_failure && record.width == 0U && record.height == 0U && record.modifier == kModifierLinear &&
-                   record.presentation_revision == 0U &&
+            return known_failure && record.width == 0U && record.height == 0U && record.modifier == kModifierLinear && record.presentation_revision == 0U &&
                    (layout ? record.stride != 0U && record.size != 0U : record.stride == 0U && record.size == 0U);
         }
     }
     return false;
 }
-
 }  // namespace mmltk::controller::presentation::detail::workspace_surface_import

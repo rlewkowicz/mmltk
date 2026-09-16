@@ -62,10 +62,12 @@ class PredictionPlayback final {
         }
         return false;
     }
+
    private:
     void PauseLocked(bool value, Clock::time_point now) {
         if (paused_ == value) return;
-        if (value) pause_started_ = now;
+        if (value)
+            pause_started_ = now;
         else if (deadline_) {
             const auto elapsed = now - pause_started_;
             if (elapsed < Clock::duration::zero() || elapsed >= Clock::time_point::max() - *deadline_)
@@ -80,8 +82,7 @@ class PredictionPlayback final {
         auto next_deadline = now;
         auto next_fallback = fallback_seconds_;
         if (!deadline_) {
-            if (!advances_source && (!std::isfinite(fps) || fps <= 0.0))
-                throw std::runtime_error("video has no usable presentation timing");
+            if (!advances_source && (!std::isfinite(fps) || fps <= 0.0)) throw std::runtime_error("video has no usable presentation timing");
         } else {
             auto seconds = Interval(previous_, timestamp, fps);
             if (advances_source && previous_ && std::isfinite(*timestamp - *previous_)) {
@@ -91,8 +92,7 @@ class PredictionPlayback final {
                 seconds = std::max(0.0, seconds - fallback_seconds_);
             } else if (previous_ && !advances_source) {
                 next_fallback += seconds;
-                if (!std::isfinite(next_fallback))
-                    throw std::runtime_error("video fallback duration exceeds the playback clock");
+                if (!std::isfinite(next_fallback)) throw std::runtime_error("video fallback duration exceeds the playback clock");
             }
             // Late inference rebases only the wall-clock deadline. Its delay,
             // like a pause, is not source time credited against recovered PTS.
@@ -112,4 +112,4 @@ class PredictionPlayback final {
     Clock::time_point pause_started_{};
     bool paused_ = false;
 };
-}
+}  // namespace mmltk::controller::detail

@@ -1,5 +1,4 @@
 #pragma once
-
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -11,19 +10,14 @@
 #include <vector>
 #include "src/common/system/numa_topology.h"
 #include "src/common/system/execution_policy.h"
-
 namespace mmltk::common::concurrency {
-
 class WorkerPool final {
    public:
-    WorkerPool(size_t worker_count, std::vector<int> cpu_affinity = {}, std::string thread_name_prefix = "fastworker",
-               std::size_t queued_capacity = 0U, const mmltk::common::system::ExecutionPlacement* placement = nullptr,
-               bool storage_worker = true);
+    WorkerPool(size_t worker_count, std::vector<int> cpu_affinity = {}, std::string thread_name_prefix = "fastworker", std::size_t queued_capacity = 0U,
+               const mmltk::common::system::ExecutionPlacement* placement = nullptr, bool storage_worker = true);
     ~WorkerPool();
-
     WorkerPool(const WorkerPool&) = delete;
     WorkerPool& operator=(const WorkerPool&) = delete;
-
     [[nodiscard]] size_t size() const noexcept;
     // Stable index within this pool; callable only by one of its workers.
     [[nodiscard]] std::size_t current_worker_index() const;
@@ -36,21 +30,17 @@ class WorkerPool final {
     void enqueue_detached(std::function<void()> task);
     // Borrowed records have no type-erasure allocation; owner outlives wait_idle/shutdown.
     void enqueue_borrowed(void* context, std::size_t index, void (*call)(void*, std::size_t));
-
     template <typename Func>
     auto enqueue(Func&& func) -> std::future<typename std::invoke_result_t<Func>>;
-
     template <typename Index, typename Func>
     void parallel_for(Index begin, Index end, int max_workers, Func&& func);
 
    private:
     void shutdown() noexcept;
     [[nodiscard]] bool running_on_worker_thread() const noexcept;
-
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 template <typename Func>
 auto WorkerPool::enqueue(Func&& func) -> std::future<typename std::invoke_result_t<Func>> {
     using Result = typename std::invoke_result_t<Func>;
@@ -59,7 +49,6 @@ auto WorkerPool::enqueue(Func&& func) -> std::future<typename std::invoke_result
     enqueue_detached([task]() { (*task)(); });
     return future;
 }
-
 template <typename Index, typename Func>
 void WorkerPool::parallel_for(Index begin, Index end, int max_workers, Func&& func) {
     static_assert(std::is_integral_v<Index>, "parallel_for index type must be integral");
@@ -68,7 +57,6 @@ void WorkerPool::parallel_for(Index begin, Index end, int max_workers, Func&& fu
         func(begin, end);
         return;
     }
-
     const Index total = end - begin;
     const int pool_workers = static_cast<int>(size());
     if (pool_workers <= 0) {
@@ -99,5 +87,4 @@ void WorkerPool::parallel_for(Index begin, Index end, int max_workers, Func&& fu
     }
     if (failure) std::rethrow_exception(failure);
 }
-
 }  // namespace mmltk::common::concurrency

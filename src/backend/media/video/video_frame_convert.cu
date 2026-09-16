@@ -4,7 +4,7 @@
 namespace mmltk::backend::media::video {
 namespace {
 __device__ float sample(VideoPlane plane, unsigned x, unsigned y) {
-    const auto* address = plane.data + y * plane.pitch + x * plane.step + plane.offset;
+    const auto* address = plane.data + y * plane.pitch + static_cast<std::size_t>(x) * plane.step + plane.offset;
     const auto value = plane.depth + plane.shift > 8 ? *reinterpret_cast<const std::uint16_t*>(address) : *address;
     return static_cast<float>(value >> plane.shift) / static_cast<float>((1U << plane.depth) - 1U);
 }
@@ -30,9 +30,20 @@ __global__ void convert(VideoColorConversion input, unsigned width, unsigned hei
         }
         unsigned target_x = x, target_y = y, target_width = width;
         switch (input.clockwise_quarters) {
-            case 1U: target_x = height - 1U - y; target_y = x; target_width = height; break;
-            case 2U: target_x = width - 1U - x; target_y = height - 1U - y; break;
-            case 3U: target_x = y; target_y = width - 1U - x; target_width = height; break;
+            case 1U:
+                target_x = height - 1U - y;
+                target_y = x;
+                target_width = height;
+                break;
+            case 2U:
+                target_x = width - 1U - x;
+                target_y = height - 1U - y;
+                break;
+            case 3U:
+                target_x = y;
+                target_y = width - 1U - x;
+                target_width = height;
+                break;
             default: break;
         }
         const auto offset = static_cast<std::size_t>(target_y) * target_width + target_x;
@@ -42,10 +53,9 @@ __global__ void convert(VideoColorConversion input, unsigned width, unsigned hei
         target[2U * plane + offset] = fminf(1.0F, fmaxf(0.0F, third));
     }
 }
-}
-int convert_video_chw(VideoColorConversion input, std::uint32_t width, std::uint32_t height, float* target, std::uintptr_t stream) noexcept {
-    convert<<<dim3((width + 15U) / 16U, std::min((height + 15U) / 16U, 65535U)), dim3(16, 16), 0,
-              reinterpret_cast<cudaStream_t>(stream)>>>(input, width, height, target);
+}  // namespace
+int convert_video_chw(VideoColorConversion input, std::uint32_t width, std::uint32_t height, float* target, cudaStream_t stream) noexcept {
+    convert<<<dim3((width + 15U) / 16U, std::min((height + 15U) / 16U, 65535U)), dim3(16, 16), 0, stream>>>(input, width, height, target);
     return cudaGetLastError();
 }
-}
+}  // namespace mmltk::backend::media::video

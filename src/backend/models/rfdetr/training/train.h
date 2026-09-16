@@ -1,16 +1,12 @@
 #pragma once
-
 #include <filesystem>
 #include <optional>
 #include <inplace_vector>
 #include <cstdint>
-
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 struct TrainEpochSummary {
     int epoch = 0;
     double train_loss = 0.0;
@@ -18,7 +14,6 @@ struct TrainEpochSummary {
     EvalSummary val_summary;
     bool evaluated_ema = false;
 };
-
 struct TrainRunResult {
     ResolvedModelArtifacts artifacts;
     GpuAugmentationConfig gpu_augmentation;
@@ -34,9 +29,7 @@ struct TrainRunResult {
     std::inplace_vector<TrainEpochSummary, 32> history;
     std::optional<EvalSummary> test_summary;
 };
-
 [[nodiscard]] TrainRequest finalize_train_request(TrainRequest request);
 TrainRunResult run_training(const TrainRequest& request);
 void print_training_summary(const TrainRequest& request, const TrainRunResult& result);
-
 }  // namespace mmltk::backend::models::rfdetr

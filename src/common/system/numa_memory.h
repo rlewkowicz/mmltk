@@ -1,9 +1,7 @@
 #pragma once
-
 #include <cstddef>
 #include <memory_resource>
 #include <vector>
-
 namespace mmltk::common::system {
 struct MemoryPolicy final {
     int mode = 0;

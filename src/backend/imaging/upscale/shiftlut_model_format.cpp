@@ -1,13 +1,10 @@
 #include "detail/shiftlut_model_format.h"
-
 #include <bit>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-
 namespace mmltk::backend::imaging::upscale::shiftlut {
-
 void validate_tables(std::span<const std::byte> bytes) {
     static_assert(std::endian::native == std::endian::little);
     static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559);
@@ -20,5 +17,4 @@ void validate_tables(std::span<const std::byte> bytes) {
             throw std::invalid_argument("invalid ShiftLUT shift");
     }
 }
-
 }  // namespace mmltk::backend::imaging::upscale::shiftlut

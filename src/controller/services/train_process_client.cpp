@@ -1,6 +1,5 @@
 #include "src/controller/services/train_process_client.h"
 #include "src/frameworks/serialization/reflected_json.h"
-
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -11,7 +10,6 @@
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -29,21 +27,16 @@
 #include <system_error>
 #include <utility>
 #include <vector>
-
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/common/io/event_fd.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/services/train_command.h"
 #include "src/frameworks/process/subprocess_utils.h"
-
 namespace mmltk::controller::services {
 namespace {
-
 constexpr std::size_t kProgressDocumentLimit = 2U * mmltk::backend::models::rfdetr::kTrainingRecordBytes;
 constexpr std::size_t kProgressEdgeReadBudget = std::size_t{16U} * 1024U;
-
 [[nodiscard]] std::string bounded_error(std::string value) { return mmltk::controller::contracts::bounded_compute_error(std::move(value)); }
-
 void validate_progress_fields(const std::string& status, const std::string& checkpoint) {
     if (!mmltk::controller::contracts::valid_compute_text(status, mmltk::controller::contracts::kComputeStatusCapacity)) {
         throw std::runtime_error("train progress status exceeds fixed capacity");
@@ -52,19 +45,16 @@ void validate_progress_fields(const std::string& status, const std::string& chec
         throw std::runtime_error("train checkpoint path exceeds fixed capacity");
     }
 }
-
 [[nodiscard]] int event_descriptor() {
     const int descriptor = ::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK);
     if (descriptor < 0) throw std::system_error(errno, std::generic_category(), "failed to create train control eventfd");
     return descriptor;
 }
-
 [[nodiscard]] int timer_descriptor() {
     const int descriptor = ::timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (descriptor < 0) throw std::system_error(errno, std::generic_category(), "failed to create train escalation timerfd");
     return descriptor;
 }
-
 [[nodiscard]] int lifecycle_descriptor(const int timer) {
     const int descriptor = ::epoll_create1(EPOLL_CLOEXEC);
     if (descriptor < 0) throw std::system_error(errno, std::generic_category(), "failed to create train lifecycle epoll fd");
@@ -74,11 +64,9 @@ void validate_progress_fields(const std::string& status, const std::string& chec
     ::close(descriptor);
     throw std::system_error(error, std::generic_category(), "failed to register train escalation timer");
 }
-
 void signal_group(const pid_t group, const int signal) noexcept {
     if (group > 0 && ::kill(-group, signal) != 0 && errno != ESRCH) return;
 }
-
 void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_value) {
     const auto delay = std::chrono::duration_cast<std::chrono::nanoseconds>(delay_value).count();
     const itimerspec timer{.it_interval = {}, .it_value = {.tv_sec = delay / 1'000'000'000LL, .tv_nsec = delay % 1'000'000'000LL}};
@@ -86,7 +74,6 @@ void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_
         throw std::system_error(errno, std::generic_category(), "failed to arm train escalation timerfd");
     }
 }
-
 [[nodiscard]] int progress_descriptor(const std::filesystem::path& directory, int& watch) {
     const int descriptor = ::inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
     if (descriptor < 0) throw std::system_error(errno, std::generic_category(), "failed to create train progress inotify fd");
@@ -96,7 +83,6 @@ void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_
     ::close(descriptor);
     throw std::system_error(error, std::generic_category(), "failed to register train progress watch");
 }
-
 [[nodiscard]] std::string bounded_file(const std::filesystem::path& path) {
     std::error_code error;
     const auto size = std::filesystem::file_size(path, error);
@@ -109,7 +95,6 @@ void arm_escalation(const int descriptor, const std::chrono::milliseconds delay_
     result.resize(static_cast<std::size_t>(input.gcount()));
     return result;
 }
-
 template <class T>
 void read_json_value(const nlohmann::json& object, const char* key, T& value) {
     const auto found = object.find(key);
@@ -118,7 +103,6 @@ void read_json_value(const nlohmann::json& object, const char* key, T& value) {
         value = found->get<T>();
     } catch (const nlohmann::json::exception&) {}
 }
-
 [[nodiscard]] bool consume_progress_edges(const int descriptor, const int watch) {
     std::array<char, 4096U> buffer{};
     std::size_t consumed = 0U;
@@ -143,9 +127,7 @@ void read_json_value(const nlohmann::json& object, const char* key, T& value) {
     }
     return relevant;
 }
-
 }  // namespace
-
 bool TrainProcessClient::State::tracks(const pid_t candidate) const noexcept {
     return std::ranges::any_of(group_members, [candidate](const GroupMember& member) { return member.pid == candidate; });
 }
@@ -219,26 +201,20 @@ bool TrainProcessClient::State::consume_lifecycle() {
                 escalated = true;
                 continue;
             }
-            const auto found =
-                std::ranges::find_if(group_members, [id](const GroupMember& member) { return member.pid == static_cast<pid_t>(id); });
+            const auto found = std::ranges::find_if(group_members, [id](const GroupMember& member) { return member.pid == static_cast<pid_t>(id); });
             if (found != group_members.end()) group_members.erase(found);
         }
     }
     if (group_tracking && group_members.empty()) refresh_group_members();
     return escalated;
 }
-
 TrainProcessClient::TrainProcessClient() noexcept = default;
 TrainProcessClient::TrainProcessClient(State state) noexcept : state_(std::move(state)) {}
 TrainProcessClient::~TrainProcessClient() noexcept { force_reap(); }
 TrainProcessClient::TrainProcessClient(TrainProcessClient&&) noexcept = default;
-
-TrainProcessClient TrainProcessClient::launch(const mmltk::backend::models::rfdetr::TrainRequest& request,
-                                              const std::filesystem::path& cli_path, const std::string_view fallback_preset_name,
-                                              const TrainProcessOptions options) {
-    if (options.escalation_delay <= std::chrono::milliseconds::zero()) {
-        throw std::invalid_argument("train escalation delay must be positive");
-    }
+TrainProcessClient TrainProcessClient::launch(const mmltk::backend::models::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
+                                              const std::string_view fallback_preset_name, const TrainProcessOptions options) {
+    if (options.escalation_delay <= std::chrono::milliseconds::zero()) { throw std::invalid_argument("train escalation delay must be positive"); }
     std::filesystem::create_directories(request.output_dir);
     std::error_code cleanup_error;
     std::filesystem::remove(request.output_dir / "progress.json", cleanup_error);
@@ -282,7 +258,6 @@ TrainProcessClient TrainProcessClient::launch(const mmltk::backend::models::rfde
         throw;
     }
 }
-
 bool TrainProcessClient::active() const noexcept { return state_ && !state_->terminal_consumed; }
 std::int32_t TrainProcessClient::process_group_id() const noexcept { return state_ ? state_->group : -1; }
 int TrainProcessClient::stdout_fd() const noexcept { return state_ ? state_->stdout_fd.get() : -1; }
@@ -291,14 +266,12 @@ int TrainProcessClient::setup_error_fd() const noexcept { return state_ ? state_
 int TrainProcessClient::progress_fd() const noexcept { return state_ ? state_->progress_fd.get() : -1; }
 int TrainProcessClient::control_fd() const noexcept { return state_ ? state_->control_fd.get() : -1; }
 int TrainProcessClient::escalation_fd() const noexcept { return state_ ? state_->lifecycle_fd.get() : -1; }
-
 bool TrainProcessClient::request_stop(const bool force) noexcept {
     if (!active()) return false;
     state_->stop_requested = true;
     state_->force_requested = state_->force_requested || force;
     return mmltk::common::io::signal_event_fd(state_->control_fd.get());
 }
-
 bool TrainProcessClient::consume_stop_request() {
     if (!active()) return false;
     mmltk::common::io::drain_event_fd(state_->control_fd.get());
@@ -312,12 +285,10 @@ bool TrainProcessClient::consume_stop_request() {
     arm_escalation(state_->escalation_fd.get(), state_->escalation_delay);
     return true;
 }
-
 bool TrainProcessClient::consume_escalation() {
     if (!active()) return false;
     return state_->consume_lifecycle();
 }
-
 std::size_t TrainProcessClient::consume_output(std::string& output, const std::size_t budget, const std::size_t retention_limit) {
     std::size_t read = 0U;
     if (!state_ || state_->stdout_fd.get() < 0 || budget == 0U) return read;
@@ -328,16 +299,17 @@ std::size_t TrainProcessClient::consume_output(std::string& output, const std::s
             constexpr auto marker = mmltk::backend::models::rfdetr::kTrainingPersistenceFailureLine;
             for (std::size_t index = 0; index < static_cast<std::size_t>(count); ++index) {
                 const char byte = bytes[index];
-                if (byte == marker[state_->persistence_marker]) ++state_->persistence_marker;
-                else state_->persistence_marker = byte == marker.front() ? 1 : 0;
+                if (byte == marker[state_->persistence_marker])
+                    ++state_->persistence_marker;
+                else
+                    state_->persistence_marker = byte == marker.front() ? 1 : 0;
                 if (state_->persistence_marker == marker.size()) {
                     state_->persistence_marker = 0;
                     state_->persistence_failed = true;
                     state_->status_dirty = true;
                 }
             }
-            if (output.size() < retention_limit)
-                output.append(bytes.data(), std::min(static_cast<std::size_t>(count), retention_limit - output.size()));
+            if (output.size() < retention_limit) output.append(bytes.data(), std::min(static_cast<std::size_t>(count), retention_limit - output.size()));
             read += static_cast<std::size_t>(count);
             continue;
         }
@@ -351,7 +323,6 @@ std::size_t TrainProcessClient::consume_output(std::string& output, const std::s
     }
     return read;
 }
-
 std::optional<TrainProcessProgress> TrainProcessClient::consume_progress() {
     if (!active()) return std::nullopt;
     const bool changed = consume_progress_edges(state_->progress_fd.get(), state_->progress_watch);
@@ -359,10 +330,8 @@ std::optional<TrainProcessProgress> TrainProcessClient::consume_progress() {
     state_->status_dirty = false;
     return read_progress();
 }
-
 std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
-    if (state_->progress_sequence == std::numeric_limits<std::uint64_t>::max())
-        throw std::runtime_error("train progress sequence exhausted");
+    if (state_->progress_sequence == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("train progress sequence exhausted");
     const auto progress = nlohmann::json::parse(bounded_file(state_->output_directory / "progress.json"), nullptr, false);
     const auto result = nlohmann::json::parse(bounded_file(state_->output_directory / "results.json"), nullptr, false);
     if (!progress.is_object() && !result.is_object() && !state_->persistence_failed) return std::nullopt;
@@ -404,22 +373,19 @@ std::optional<TrainProcessProgress> TrainProcessClient::read_progress() {
     std::uint64_t dropped_records = 0;
     if (progress.is_object()) read_json_value(progress, "dropped_records", dropped_records);
     ++state_->progress_sequence;
-    return TrainProcessProgress{
-        .progress = {.sequence = state_->progress_sequence, .completed = completed, .total = total, .status = std::move(status)},
-        .checkpoint_path = std::move(checkpoint),
-        .metrics = std::move(metrics),
-        .persistence = {.degraded = state_->persistence_failed, .dropped_records = dropped_records,
-                        .error = state_->persistence_failed ? "Training metric persistence is incomplete" : ""}};
+    return TrainProcessProgress{.progress = {.sequence = state_->progress_sequence, .completed = completed, .total = total, .status = std::move(status)},
+                                .checkpoint_path = std::move(checkpoint),
+                                .metrics = std::move(metrics),
+                                .persistence = {.degraded = state_->persistence_failed,
+                                                .dropped_records = dropped_records,
+                                                .error = state_->persistence_failed ? "Training metric persistence is incomplete" : ""}};
 }
-
 std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* retained_output) {
     if (!active()) return std::nullopt;
     int status = 0;
     if (!state_->reaped) {
         pid_t result;
-        do {
-            result = ::waitpid(state_->pid, &status, WNOHANG);
-        } while (result < 0 && errno == EINTR);
+        do { result = ::waitpid(state_->pid, &status, WNOHANG); } while (result < 0 && errno == EINTR);
         if (result == 0) return std::nullopt;
         if (result != state_->pid) throw std::system_error(errno, std::generic_category(), "failed to reap train process");
         state_->reaped = true;
@@ -468,7 +434,6 @@ std::optional<TrainProcessExit> TrainProcessClient::consume_exit(std::string* re
     state_->lifecycle_fd.reset();
     return exit;
 }
-
 TrainProcessRunResult TrainProcessClient::Run(TrainProcessStopToken token, const TrainProcessProgressObserver progress) {
     if (!active()) throw std::logic_error("cannot run an inactive train process");
     mmltk::common::io::ScopedFd stop_fd(token.release());
@@ -479,7 +444,6 @@ TrainProcessRunResult TrainProcessClient::Run(TrainProcessStopToken token, const
             if (terminal->final_progress) progress(*terminal->final_progress);
             return {.terminal = std::move(*terminal), .output = std::move(output)};
         }
-
         std::array<pollfd, 6U> ready{{
             {.fd = stdout_fd(), .events = POLLIN, .revents = 0},
             {.fd = pid_fd(), .events = POLLIN, .revents = 0},
@@ -489,16 +453,12 @@ TrainProcessRunResult TrainProcessClient::Run(TrainProcessStopToken token, const
             {.fd = stop_fd.get(), .events = POLLIN, .revents = 0},
         }};
         int count;
-        do {
-            count = ::poll(ready.data(), static_cast<nfds_t>(ready.size()), -1);
-        } while (count < 0 && errno == EINTR);
+        do { count = ::poll(ready.data(), static_cast<nfds_t>(ready.size()), -1); } while (count < 0 && errno == EINTR);
         if (count < 0) throw std::system_error(errno, std::generic_category(), "failed to wait for train process readiness");
         for (const pollfd& descriptor : ready) {
             if ((descriptor.revents & POLLNVAL) != 0) { throw std::runtime_error("train readiness source became invalid"); }
         }
-        if ((ready[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-            consume_output(output, kTrainProcessReadBudget, kTrainProcessReadBudget);
-        }
+        if ((ready[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) { consume_output(output, kTrainProcessReadBudget, kTrainProcessReadBudget); }
         if ((ready[3].revents & POLLIN) != 0) static_cast<void>(consume_stop_request());
         if ((ready[4].revents & POLLIN) != 0) static_cast<void>(consume_escalation());
         if ((ready[5].revents & POLLIN) != 0) {
@@ -507,7 +467,6 @@ TrainProcessRunResult TrainProcessClient::Run(TrainProcessStopToken token, const
         }
     }
 }
-
 void TrainProcessClient::force_reap() noexcept {
     if (!active()) return;
     signal_group(state_->group, SIGKILL);
@@ -517,9 +476,7 @@ void TrainProcessClient::force_reap() noexcept {
         while (!state_->group_quiesced) {
             pollfd ready{.fd = state_->lifecycle_fd.get(), .events = POLLIN, .revents = 0};
             int result;
-            do {
-                result = ::poll(&ready, 1U, -1);
-            } while (result < 0 && errno == EINTR);
+            do { result = ::poll(&ready, 1U, -1); } while (result < 0 && errno == EINTR);
             if (result <= 0) std::terminate();
             static_cast<void>(state_->consume_lifecycle());
         }
@@ -528,5 +485,4 @@ void TrainProcessClient::force_reap() noexcept {
     state_->progress_fd.reset();
     state_.reset();
 }
-
 }  // namespace mmltk::controller::services

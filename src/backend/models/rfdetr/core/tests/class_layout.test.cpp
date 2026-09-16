@@ -24,8 +24,8 @@ TEST_CASE("Declared background can occupy each physical position", "[rfdetr][lay
         record.no_object = r::NoObjectEncoding::ExplicitBackground;
         unsigned foreground = 0;
         for (unsigned slot = 0; slot < 3; ++slot)
-            record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt} :
-                r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
+            record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt}
+                                                    : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
         const r::ResolvedClassLayout layout(record);
         CHECK(layout.eligible_slots().size() == 2);
         CHECK(layout.eligible_slots()[0] != background);

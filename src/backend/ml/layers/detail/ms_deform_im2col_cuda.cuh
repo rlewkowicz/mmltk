@@ -8,22 +8,15 @@
 * Copyright (c) 2018 Microsoft
 **************************************************************************
 */
-
 #include <ATen/cuda/Atomic.cuh>
 #include <algorithm>
 #include <cstdint>
-
 namespace mmltk::backend::ml::layers {
-
 #define MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(i, n)                                                                                \
     for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < static_cast<std::int64_t>(n); \
          i += static_cast<std::int64_t>(blockDim.x) * gridDim.x)
-
 inline constexpr int kMsDeformAttnCudaThreads = 1024;
-inline int ms_deform_attn_cuda_blocks(const int N, const int num_threads) {
-    return N / num_threads + static_cast<int>(N % num_threads != 0);
-}
-
+inline int ms_deform_attn_cuda_blocks(const int N, const int num_threads) { return N / num_threads + static_cast<int>(N % num_threads != 0); }
 template <typename scalar_t>
 struct BilinearSampleGeometry {
     int height = 0;
@@ -46,11 +39,9 @@ struct BilinearSampleGeometry {
     scalar_t w3 = 0;
     scalar_t w4 = 0;
 };
-
 template <typename scalar_t>
-__device__ BilinearSampleGeometry<scalar_t> make_bilinear_sample_geometry(const int height, const int width, const int nheads,
-                                                                          const int channels, const scalar_t h, const scalar_t w,
-                                                                          const int m, const int c) {
+__device__ BilinearSampleGeometry<scalar_t> make_bilinear_sample_geometry(const int height, const int width, const int nheads, const int channels,
+                                                                          const scalar_t h, const scalar_t w, const int m, const int c) {
     BilinearSampleGeometry<scalar_t> geometry;
     geometry.height = height;
     geometry.width = width;
@@ -62,7 +53,6 @@ __device__ BilinearSampleGeometry<scalar_t> make_bilinear_sample_geometry(const 
     geometry.lw = w - geometry.w_low;
     geometry.hh = 1 - geometry.lh;
     geometry.hw = 1 - geometry.lw;
-
     const int w_stride = nheads * channels;
     const int h_stride = width * w_stride;
     geometry.h_low_ptr_offset = geometry.h_low * h_stride;
@@ -76,7 +66,6 @@ __device__ BilinearSampleGeometry<scalar_t> make_bilinear_sample_geometry(const 
     geometry.w4 = geometry.lh * geometry.lw;
     return geometry;
 }
-
 template <typename scalar_t, typename CornerPolicy>
 __device__ scalar_t ms_deform_attn_apply_bilinear_corners(const scalar_t* bottom_data, const BilinearSampleGeometry<scalar_t>& geometry,
                                                           CornerPolicy&& policy) {
@@ -107,14 +96,11 @@ __device__ scalar_t ms_deform_attn_apply_bilinear_corners(const scalar_t* bottom
     }
     return policy.finish(value);
 }
-
 template <typename scalar_t>
 struct BilinearForwardPolicy {
     __device__ void corner(int, int, scalar_t, scalar_t, const BilinearSampleGeometry<scalar_t>&) const {}
-
     __device__ scalar_t finish(const scalar_t value) const { return value; }
 };
-
 template <typename scalar_t, typename AccumulationPolicy>
 struct BilinearBackwardPolicy {
     BilinearSampleGeometry<scalar_t> geometry{};
@@ -126,7 +112,6 @@ struct BilinearBackwardPolicy {
     scalar_t grad_h_weight = 0;
     scalar_t grad_w_weight = 0;
     AccumulationPolicy accumulation_policy{};
-
     __device__ void corner(int corner_index, int ptr, scalar_t weight, scalar_t corner_value, const BilinearSampleGeometry<scalar_t>&) {
         switch (corner_index) {
             case 0:
@@ -148,25 +133,20 @@ struct BilinearBackwardPolicy {
         }
         gpuAtomicAdd(grad_value + ptr, weight * top_grad_value);
     }
-
     __device__ scalar_t finish(const scalar_t value) {
-        accumulation_policy.template store<scalar_t>(
-            grad_sampling_loc, grad_attn_weight,
-            {grad_h_weight, grad_w_weight, top_grad, top_grad_value, value, geometry.height, geometry.width});
+        accumulation_policy.template store<scalar_t>(grad_sampling_loc, grad_attn_weight,
+                                                     {grad_h_weight, grad_w_weight, top_grad, top_grad_value, value, geometry.height, geometry.width});
         return value;
     }
 };
-
 template <typename ValueT>
 struct BilinearDirectStoreOp {
     __device__ void operator()(ValueT* destination, const ValueT value) const { *destination = value; }
 };
-
 template <typename ValueT>
 struct BilinearAtomicStoreOp {
     __device__ void operator()(ValueT* destination, const ValueT value) const { gpuAtomicAdd(destination, value); }
 };
-
 template <typename ValueT, typename StoreOp>
 struct BilinearAccumulatorValues {
     ValueT grad_h_weight;
@@ -177,7 +157,6 @@ struct BilinearAccumulatorValues {
     int height_value;
     int width_value;
 };
-
 template <typename ValueT, typename StoreOp>
 __device__ void store_bilinear_accumulator_values(const StoreOp& store_op, ValueT* grad_sampling_loc, ValueT* grad_attn_weight,
                                                   const BilinearAccumulatorValues<ValueT, StoreOp>& values) {
@@ -185,23 +164,18 @@ __device__ void store_bilinear_accumulator_values(const StoreOp& store_op, Value
     store_op(grad_sampling_loc, values.width_value * values.grad_w_weight * values.top_grad_value);
     store_op(grad_sampling_loc + 1, values.height_value * values.grad_h_weight * values.top_grad_value);
 }
-
 template <template <typename> class StoreOp>
 struct BilinearAccumulatorPolicy {
     template <typename ValueT>
-    __device__ void store(ValueT* grad_sampling_loc, ValueT* grad_attn_weight,
-                          const BilinearAccumulatorValues<ValueT, StoreOp<ValueT>>& values) const {
+    __device__ void store(ValueT* grad_sampling_loc, ValueT* grad_attn_weight, const BilinearAccumulatorValues<ValueT, StoreOp<ValueT>>& values) const {
         store_bilinear_accumulator_values(StoreOp<ValueT>{}, grad_sampling_loc, grad_attn_weight, values);
     }
 };
-
 using BilinearDirectAccumulatorPolicy = BilinearAccumulatorPolicy<BilinearDirectStoreOp>;
 using BilinearAtomicAccumulatorPolicy = BilinearAccumulatorPolicy<BilinearAtomicStoreOp>;
-
 template <typename scalar_t, typename AccumulationPolicy>
-__device__ void ms_deform_attn_bilinear_backward(const scalar_t* bottom_data, const BilinearSampleGeometry<scalar_t>& geometry,
-                                                 const scalar_t top_grad, const scalar_t attn_weight, scalar_t* grad_value,
-                                                 scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight,
+__device__ void ms_deform_attn_bilinear_backward(const scalar_t* bottom_data, const BilinearSampleGeometry<scalar_t>& geometry, const scalar_t top_grad,
+                                                 const scalar_t attn_weight, scalar_t* grad_value, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight,
                                                  const AccumulationPolicy& accumulation_policy) {
     const scalar_t top_grad_value = top_grad * attn_weight;
     BilinearBackwardPolicy<scalar_t, AccumulationPolicy> policy{
@@ -209,32 +183,25 @@ __device__ void ms_deform_attn_bilinear_backward(const scalar_t* bottom_data, co
     };
     (void)ms_deform_attn_apply_bilinear_corners(bottom_data, geometry, policy);
 }
-
 template <typename scalar_t, typename AccumulationPolicy>
-__device__ void ms_deform_attn_col2im_bilinear(const scalar_t* bottom_data, const int height, const int width, const int nheads,
-                                               const int channels, const scalar_t h, const scalar_t w, const int m, const int c,
-                                               const scalar_t top_grad, const scalar_t attn_weight, scalar_t* grad_value,
-                                               scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight,
+__device__ void ms_deform_attn_col2im_bilinear(const scalar_t* bottom_data, const int height, const int width, const int nheads, const int channels,
+                                               const scalar_t h, const scalar_t w, const int m, const int c, const scalar_t top_grad,
+                                               const scalar_t attn_weight, scalar_t* grad_value, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight,
                                                const AccumulationPolicy& accumulation_policy) {
     const BilinearSampleGeometry<scalar_t> geometry = make_bilinear_sample_geometry(height, width, nheads, channels, h, w, m, c);
-    ms_deform_attn_bilinear_backward(bottom_data, geometry, top_grad, attn_weight, grad_value, grad_sampling_loc, grad_attn_weight,
-                                     accumulation_policy);
+    ms_deform_attn_bilinear_backward(bottom_data, geometry, top_grad, attn_weight, grad_value, grad_sampling_loc, grad_attn_weight, accumulation_policy);
 }
-
 template <typename scalar_t>
-__device__ scalar_t ms_deform_attn_im2col_bilinear(const scalar_t*& bottom_data, const int& height, const int& width, const int& nheads,
-                                                   const int& channels, const scalar_t& h, const scalar_t& w, const int& m, const int& c) {
+__device__ scalar_t ms_deform_attn_im2col_bilinear(const scalar_t*& bottom_data, const int& height, const int& width, const int& nheads, const int& channels,
+                                                   const scalar_t& h, const scalar_t& w, const int& m, const int& c) {
     const BilinearSampleGeometry<scalar_t> geometry = make_bilinear_sample_geometry(height, width, nheads, channels, h, w, m, c);
     return ms_deform_attn_apply_bilinear_corners(bottom_data, geometry, BilinearForwardPolicy<scalar_t>{});
 }
-
 template <typename scalar_t, typename SizeT>
 struct SharedLinearGradientReduction {
     SizeT thread_count = 0;
-
     __device__ void operator()(scalar_t* cache_grad_sampling_loc, scalar_t* cache_grad_attn_weight, const unsigned int tid) const {
         if (tid != 0) { return; }
-
         scalar_t grad_w = cache_grad_sampling_loc[0];
         scalar_t grad_h = cache_grad_sampling_loc[1];
         scalar_t grad_a = cache_grad_attn_weight[0];
@@ -245,17 +212,14 @@ struct SharedLinearGradientReduction {
             grad_a += cache_grad_attn_weight[lane];
             sid += 2;
         }
-
         cache_grad_sampling_loc[0] = grad_w;
         cache_grad_sampling_loc[1] = grad_h;
         cache_grad_attn_weight[0] = grad_a;
     }
 };
-
 template <typename scalar_t, typename SizeT>
 struct SharedTreeGradientReduction {
     SizeT thread_count = 0;
-
     __device__ void operator()(scalar_t* cache_grad_sampling_loc, scalar_t* cache_grad_attn_weight, const unsigned int tid) const {
         for (SizeT s = thread_count / 2; s > 0; s >>= 1) {
             if (tid < s) {
@@ -269,11 +233,9 @@ struct SharedTreeGradientReduction {
         }
     }
 };
-
 template <typename scalar_t, typename SizeT>
 struct SharedTreeGradientReductionV2 {
     SizeT thread_count = 0;
-
     __device__ void operator()(scalar_t* cache_grad_sampling_loc, scalar_t* cache_grad_attn_weight, const unsigned int tid) const {
         for (SizeT s = thread_count / 2, spre = thread_count; s > 0; s >>= 1, spre >>= 1) {
             if (tid < s) {
@@ -292,7 +254,6 @@ struct SharedTreeGradientReductionV2 {
         }
     }
 };
-
 template <typename scalar_t, typename StoreOp>
 struct GradientStore {
     __device__ void operator()(scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight, const scalar_t* cache_grad_sampling_loc,
@@ -303,13 +264,10 @@ struct GradientStore {
         store_op(grad_attn_weight, cache_grad_attn_weight[0]);
     }
 };
-
 template <typename scalar_t>
 using DirectGradientStore = GradientStore<scalar_t, BilinearDirectStoreOp<scalar_t>>;
-
 template <typename scalar_t>
 using AtomicGradientStore = GradientStore<scalar_t, BilinearAtomicStoreOp<scalar_t>>;
-
 template <typename scalar_t>
 struct MsDeformableCol2ImPointArgs {
     const scalar_t* data_value_ptr = nullptr;
@@ -327,36 +285,31 @@ struct MsDeformableCol2ImPointArgs {
     scalar_t* grad_sampling_loc = nullptr;
     scalar_t* grad_attn_weight = nullptr;
 };
-
 template <typename scalar_t, typename AccumulationPolicy>
 __device__ inline void ms_deformable_col2im_apply_point(const MsDeformableCol2ImPointArgs<scalar_t>& point, scalar_t* grad_sampling_loc,
                                                         scalar_t* grad_attn_weight, const AccumulationPolicy& accumulation_policy) {
     const scalar_t h_im = point.loc_h * point.spatial_h - 0.5;
     const scalar_t w_im = point.loc_w * point.spatial_w - 0.5;
     if (h_im > -1 && w_im > -1 && h_im < point.spatial_h && w_im < point.spatial_w) {
-        ms_deform_attn_col2im_bilinear(point.data_value_ptr, point.spatial_h, point.spatial_w, point.num_heads, point.channels, h_im, w_im,
-                                       point.m_col, point.c_col, point.top_grad, point.weight, point.grad_value_ptr, grad_sampling_loc,
-                                       grad_attn_weight, accumulation_policy);
+        ms_deform_attn_col2im_bilinear(point.data_value_ptr, point.spatial_h, point.spatial_w, point.num_heads, point.channels, h_im, w_im, point.m_col,
+                                       point.c_col, point.top_grad, point.weight, point.grad_value_ptr, grad_sampling_loc, grad_attn_weight,
+                                       accumulation_policy);
     }
 }
-
 template <typename scalar_t, typename ReductionFn, typename StoreFn>
-__device__ inline void ms_deformable_col2im_reduce_point(const MsDeformableCol2ImPointArgs<scalar_t>& point,
-                                                         scalar_t* cache_grad_sampling_loc, scalar_t* cache_grad_attn_weight,
-                                                         const unsigned int tid, const ReductionFn& reduction_fn, const StoreFn& store_fn) {
+__device__ inline void ms_deformable_col2im_reduce_point(const MsDeformableCol2ImPointArgs<scalar_t>& point, scalar_t* cache_grad_sampling_loc,
+                                                         scalar_t* cache_grad_attn_weight, const unsigned int tid, const ReductionFn& reduction_fn,
+                                                         const StoreFn& store_fn) {
     *(cache_grad_sampling_loc + (tid << 1)) = 0;
     *(cache_grad_sampling_loc + ((tid << 1) + 1)) = 0;
     *(cache_grad_attn_weight + tid) = 0;
-    ms_deformable_col2im_apply_point(point, cache_grad_sampling_loc + (tid << 1), cache_grad_attn_weight + tid,
-                                     BilinearDirectAccumulatorPolicy{});
-
+    ms_deformable_col2im_apply_point(point, cache_grad_sampling_loc + (tid << 1), cache_grad_attn_weight + tid, BilinearDirectAccumulatorPolicy{});
     __syncthreads();
     reduction_fn(cache_grad_sampling_loc, cache_grad_attn_weight, tid);
     __syncthreads();
     if (tid == 0) { store_fn(point.grad_sampling_loc, point.grad_attn_weight, cache_grad_sampling_loc, cache_grad_attn_weight); }
     __syncthreads();
 }
-
 template <typename scalar_t, typename ReductionFn, typename StoreFn>
 struct SharedMemoryCol2ImPointReducer {
     scalar_t* cache_grad_sampling_loc = nullptr;
@@ -364,27 +317,22 @@ struct SharedMemoryCol2ImPointReducer {
     unsigned int tid = 0;
     ReductionFn reduction{};
     StoreFn store{};
-
     __device__ void operator()(const MsDeformableCol2ImPointArgs<scalar_t>& point) const {
         ms_deformable_col2im_reduce_point(point, cache_grad_sampling_loc, cache_grad_attn_weight, tid, reduction, store);
     }
 };
-
 template <typename scalar_t>
 struct GlobalMemoryCol2ImPointReducer {
     __device__ void operator()(const MsDeformableCol2ImPointArgs<scalar_t>& point) const {
         ms_deformable_col2im_apply_point(point, point.grad_sampling_loc, point.grad_attn_weight, BilinearAtomicAccumulatorPolicy{});
     }
 };
-
 template <typename scalar_t, typename PointReducer>
 __device__ inline void ms_deformable_col2im_kernel_body(const int index, const scalar_t* grad_col, const scalar_t* data_value,
-                                                        const ms_deform_attn_launch::DeviceLayout& data_layout,
-                                                        const scalar_t* data_sampling_loc, const scalar_t* data_attn_weight,
-                                                        const int spatial_size, const int num_heads, const int channels,
-                                                        const int num_levels, const int num_query, const int num_point,
-                                                        scalar_t* grad_value, scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight,
-                                                        const PointReducer& point_reducer) {
+                                                        const ms_deform_attn_launch::DeviceLayout& data_layout, const scalar_t* data_sampling_loc,
+                                                        const scalar_t* data_attn_weight, const int spatial_size, const int num_heads, const int channels,
+                                                        const int num_levels, const int num_query, const int num_point, scalar_t* grad_value,
+                                                        scalar_t* grad_sampling_loc, scalar_t* grad_attn_weight, const PointReducer& point_reducer) {
     int temp = index;
     const int c_col = temp % channels;
     temp /= channels;
@@ -393,16 +341,13 @@ __device__ inline void ms_deformable_col2im_kernel_body(const int index, const s
     temp /= num_heads;
     temp /= num_query;
     const int b_col = temp;
-
     const scalar_t top_grad = grad_col[index];
-
     int data_weight_ptr = sampling_index * num_levels * num_point;
     int data_loc_w_ptr = data_weight_ptr << 1;
     grad_sampling_loc += data_weight_ptr << 1;
     grad_attn_weight += data_weight_ptr;
     const int qid_stride = num_heads * channels;
     const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
-
     for (int l_col = 0; l_col < num_levels; ++l_col) {
         const int level_start_id = static_cast<int>(data_layout.level_start_index[l_col]);
         const int spatial_h = data_layout.spatial_shapes[l_col][0];
@@ -410,14 +355,12 @@ __device__ inline void ms_deformable_col2im_kernel_body(const int index, const s
         const int value_ptr_offset = data_value_ptr_init_offset + level_start_id * qid_stride;
         const scalar_t* data_value_ptr = data_value + value_ptr_offset;
         scalar_t* grad_value_ptr = grad_value + value_ptr_offset;
-
         for (int p_col = 0; p_col < num_point; ++p_col) {
             const scalar_t loc_w = data_sampling_loc[data_loc_w_ptr];
             const scalar_t loc_h = data_sampling_loc[data_loc_w_ptr + 1];
             const scalar_t weight = data_attn_weight[data_weight_ptr];
-            point_reducer(MsDeformableCol2ImPointArgs<scalar_t>{data_value_ptr, spatial_h, spatial_w, num_heads, channels, loc_w, loc_h,
-                                                                m_col, c_col, top_grad, weight, grad_value_ptr, grad_sampling_loc,
-                                                                grad_attn_weight});
+            point_reducer(MsDeformableCol2ImPointArgs<scalar_t>{data_value_ptr, spatial_h, spatial_w, num_heads, channels, loc_w, loc_h, m_col, c_col, top_grad,
+                                                                weight, grad_value_ptr, grad_sampling_loc, grad_attn_weight});
             ++data_weight_ptr;
             data_loc_w_ptr += 2;
             ++grad_attn_weight;
@@ -425,18 +368,13 @@ __device__ inline void ms_deformable_col2im_kernel_body(const int index, const s
         }
     }
 }
-
-#define MMLTK_ML_LAYERS_DEFORM_COMMON_INPUT_PARAMS(scalar_t)                                                                     \
-    const scalar_t *data_value, const ms_deform_attn_launch::DeviceLayout data_layout, const scalar_t *data_sampling_loc,        \
-        const scalar_t *data_attn_weight, const int batch_size, const int spatial_size, const int num_heads, const int channels, \
-        const int num_levels, const int num_query, const int num_point
-
+#define MMLTK_ML_LAYERS_DEFORM_COMMON_INPUT_PARAMS(scalar_t)                                                                                                \
+    const scalar_t *data_value, const ms_deform_attn_launch::DeviceLayout data_layout, const scalar_t *data_sampling_loc, const scalar_t *data_attn_weight, \
+        const int batch_size, const int spatial_size, const int num_heads, const int channels, const int num_levels, const int num_query, const int num_point
 #define MMLTK_ML_LAYERS_DEFORM_IM2COL_PARAMS(scalar_t) MMLTK_ML_LAYERS_DEFORM_COMMON_INPUT_PARAMS(scalar_t), scalar_t* data_col
-
 #define MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)                                                                                 \
     const scalar_t *grad_col, MMLTK_ML_LAYERS_DEFORM_COMMON_INPUT_PARAMS(scalar_t), scalar_t *grad_value, scalar_t *grad_sampling_loc, \
         scalar_t *grad_attn_weight
-
 template <typename scalar_t>
 __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEFORM_IM2COL_PARAMS(scalar_t)) {
     MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(index, n) {
@@ -448,14 +386,12 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEF
         _temp /= num_heads;
         _temp /= num_query;
         const int b_col = _temp;
-
         scalar_t* data_col_ptr = data_col + index;
         int data_weight_ptr = sampling_index * num_levels * num_point;
         int data_loc_w_ptr = data_weight_ptr << 1;
         const int qid_stride = num_heads * channels;
         const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
         scalar_t col = 0;
-
         for (int l_col = 0; l_col < num_levels; ++l_col) {
             const int level_start_id = static_cast<int>(data_layout.level_start_index[l_col]);
             const int spatial_h = data_layout.spatial_shapes[l_col][0];
@@ -465,16 +401,11 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEF
                 const scalar_t loc_w = data_sampling_loc[data_loc_w_ptr];
                 const scalar_t loc_h = data_sampling_loc[data_loc_w_ptr + 1];
                 const scalar_t weight = data_attn_weight[data_weight_ptr];
-
                 const scalar_t h_im = loc_h * spatial_h - 0.5;
                 const scalar_t w_im = loc_w * spatial_w - 0.5;
-
                 if (h_im > -1 && w_im > -1 && h_im < spatial_h && w_im < spatial_w) {
-                    col += ms_deform_attn_im2col_bilinear(data_value_ptr, spatial_h, spatial_w, num_heads, channels, h_im, w_im, m_col,
-                                                          c_col) *
-                           weight;
+                    col += ms_deform_attn_im2col_bilinear(data_value_ptr, spatial_h, spatial_w, num_heads, channels, h_im, w_im, m_col, c_col) * weight;
                 }
-
                 data_weight_ptr += 1;
                 data_loc_w_ptr += 2;
             }
@@ -482,64 +413,53 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n, MMLTK_ML_LAYERS_DEF
         *data_col_ptr = col;
     }
 }
-
-#define MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY(cache_grad_sampling_loc_expr, cache_grad_attn_weight_expr, reduction_count_expr,    \
-                                                  reduction_type_expr, store_type_expr)                                               \
-    const unsigned int tid = threadIdx.x;                                                                                             \
-    ms_deformable_col2im_kernel_body(                                                                                                 \
-        index, grad_col, data_value, data_layout, data_sampling_loc, data_attn_weight, spatial_size, num_heads, channels, num_levels, \
-        num_query, num_point, grad_value, grad_sampling_loc, grad_attn_weight,                                                        \
-        SharedMemoryCol2ImPointReducer<scalar_t, reduction_type_expr<scalar_t, unsigned int>, store_type_expr<scalar_t>>{             \
-            cache_grad_sampling_loc_expr, cache_grad_attn_weight_expr, tid,                                                           \
-            reduction_type_expr<scalar_t, unsigned int>{reduction_count_expr}, store_type_expr<scalar_t>{}})
-
-#define MMLTK_ML_LAYERS_DEFINE_STATIC_SHM_COL2IM_KERNEL(kernel_name, reduction_type, store_type)                                  \
-    template <typename scalar_t, unsigned int blockSize>                                                                          \
-    __global__ void kernel_name(const int n, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {                                    \
-        MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(index, n) {                                                                              \
-            __shared__ scalar_t cache_grad_sampling_loc[blockSize * 2];                                                           \
-            __shared__ scalar_t cache_grad_attn_weight[blockSize];                                                                \
-            MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY(cache_grad_sampling_loc, cache_grad_attn_weight, blockSize, reduction_type, \
-                                                      store_type);                                                                \
-        }                                                                                                                         \
+#define MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY(cache_grad_sampling_loc_expr, cache_grad_attn_weight_expr, reduction_count_expr, reduction_type_expr, \
+                                                  store_type_expr)                                                                                      \
+    const unsigned int tid = threadIdx.x;                                                                                                               \
+    ms_deformable_col2im_kernel_body(index, grad_col, data_value, data_layout, data_sampling_loc, data_attn_weight, spatial_size, num_heads, channels,  \
+                                     num_levels, num_query, num_point, grad_value, grad_sampling_loc, grad_attn_weight,                                 \
+                                     SharedMemoryCol2ImPointReducer<scalar_t, reduction_type_expr<scalar_t, unsigned int>, store_type_expr<scalar_t>>{  \
+                                         cache_grad_sampling_loc_expr, cache_grad_attn_weight_expr, tid,                                                \
+                                         reduction_type_expr<scalar_t, unsigned int>{reduction_count_expr}, store_type_expr<scalar_t>{}})
+#define MMLTK_ML_LAYERS_DEFINE_STATIC_SHM_COL2IM_KERNEL(kernel_name, reduction_type, store_type)                                               \
+    template <typename scalar_t, unsigned int blockSize>                                                                                       \
+    __global__ void kernel_name(const int n, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {                                                 \
+        MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(index, n) {                                                                                           \
+            __shared__ scalar_t cache_grad_sampling_loc[blockSize * 2];                                                                        \
+            __shared__ scalar_t cache_grad_attn_weight[blockSize];                                                                             \
+            MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY(cache_grad_sampling_loc, cache_grad_attn_weight, blockSize, reduction_type, store_type); \
+        }                                                                                                                                      \
     }
-
-#define MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL(kernel_name, reduction_type, store_type)                         \
-    template <typename scalar_t>                                                                                          \
-    __global__ void kernel_name(const int n, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {                            \
-        MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(index, n) {                                                                      \
-            extern __shared__ int shared_storage[];                                                                       \
-            scalar_t* cache_grad_sampling_loc = reinterpret_cast<scalar_t*>(shared_storage);                              \
-            scalar_t* cache_grad_attn_weight = cache_grad_sampling_loc + 2 * blockDim.x;                                  \
-            MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY(cache_grad_sampling_loc, cache_grad_attn_weight,                    \
-                                                      static_cast<unsigned int>(blockDim.x), reduction_type, store_type); \
-        }                                                                                                                 \
+#define MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL(kernel_name, reduction_type, store_type)                                                             \
+    template <typename scalar_t>                                                                                                                              \
+    __global__ void kernel_name(const int n, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {                                                                \
+        MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(index, n) {                                                                                                          \
+            extern __shared__ int shared_storage[];                                                                                                           \
+            scalar_t* cache_grad_sampling_loc = reinterpret_cast<scalar_t*>(shared_storage);                                                                  \
+            scalar_t* cache_grad_attn_weight = cache_grad_sampling_loc + 2 * blockDim.x;                                                                      \
+            MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY(cache_grad_sampling_loc, cache_grad_attn_weight, static_cast<unsigned int>(blockDim.x), reduction_type, \
+                                                      store_type);                                                                                            \
+        }                                                                                                                                                     \
     }
-
-MMLTK_ML_LAYERS_DEFINE_STATIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_blocksize_aware_reduce_v1,
-                                                SharedLinearGradientReduction, DirectGradientStore);
+MMLTK_ML_LAYERS_DEFINE_STATIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_blocksize_aware_reduce_v1, SharedLinearGradientReduction,
+                                                DirectGradientStore);
 MMLTK_ML_LAYERS_DEFINE_STATIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_blocksize_aware_reduce_v2, SharedTreeGradientReduction,
                                                 DirectGradientStore);
-MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_reduce_v1, SharedLinearGradientReduction,
-                                                 DirectGradientStore);
-MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_reduce_v2, SharedTreeGradientReductionV2,
-                                                 DirectGradientStore);
+MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_reduce_v1, SharedLinearGradientReduction, DirectGradientStore);
+MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_reduce_v2, SharedTreeGradientReductionV2, DirectGradientStore);
 MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL(ms_deformable_col2im_gpu_kernel_shm_reduce_v2_multi_blocks, SharedTreeGradientReductionV2,
                                                  AtomicGradientStore);
-
 #undef MMLTK_ML_LAYERS_DEFINE_DYNAMIC_SHM_COL2IM_KERNEL
 #undef MMLTK_ML_LAYERS_DEFINE_STATIC_SHM_COL2IM_KERNEL
 #undef MMLTK_ML_LAYERS_SHARED_COL2IM_KERNEL_BODY
-
 template <typename scalar_t>
 __global__ void ms_deformable_col2im_gpu_kernel_gm(const int n, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {
     MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP(index, n) {
-        ms_deformable_col2im_kernel_body(index, grad_col, data_value, data_layout, data_sampling_loc, data_attn_weight, spatial_size,
-                                         num_heads, channels, num_levels, num_query, num_point, grad_value, grad_sampling_loc,
-                                         grad_attn_weight, GlobalMemoryCol2ImPointReducer<scalar_t>{});
+        ms_deformable_col2im_kernel_body(index, grad_col, data_value, data_layout, data_sampling_loc, data_attn_weight, spatial_size, num_heads, channels,
+                                         num_levels, num_query, num_point, grad_value, grad_sampling_loc, grad_attn_weight,
+                                         GlobalMemoryCol2ImPointReducer<scalar_t>{});
     }
 }
-
 template <typename scalar_t>
 struct MsDeformableCol2ImLaunchArgs {
     const scalar_t* grad_col = nullptr;
@@ -558,73 +478,56 @@ struct MsDeformableCol2ImLaunchArgs {
     scalar_t* grad_value = nullptr;
     scalar_t* grad_sampling_loc = nullptr;
     scalar_t* grad_attn_weight = nullptr;
-
     int num_kernels() const { return batch_size * num_query * num_heads * channels; }
 };
-
-#define MMLTK_ML_LAYERS_COL2IM_KERNEL_ARGS(args)                                                                                          \
-    (args).num_kernels(), (args).grad_col, (args).data_value, (args).data_layout, (args).data_sampling_loc, (args).data_attn_weight,      \
-        (args).batch_size, (args).spatial_size, (args).num_heads, (args).channels, (args).num_levels, (args).num_query, (args).num_point, \
-        (args).grad_value, (args).grad_sampling_loc, (args).grad_attn_weight
-
+#define MMLTK_ML_LAYERS_COL2IM_KERNEL_ARGS(args)                                                                                                        \
+    (args).num_kernels(), (args).grad_col, (args).data_value, (args).data_layout, (args).data_sampling_loc, (args).data_attn_weight, (args).batch_size, \
+        (args).spatial_size, (args).num_heads, (args).channels, (args).num_levels, (args).num_query, (args).num_point, (args).grad_value,               \
+        (args).grad_sampling_loc, (args).grad_attn_weight
 template <typename scalar_t>
 inline int ms_deformable_col2im_dynamic_shared_bytes(const MsDeformableCol2ImLaunchArgs<scalar_t>& args) {
     return args.num_threads * 3 * sizeof(scalar_t);
 }
-
 #define MMLTK_ML_LAYERS_COL2IM_LAUNCH_CONFIG(args, shared_bytes, stream) \
     ms_deform_attn_cuda_blocks((args).num_kernels(), (args).num_threads), (args).num_threads, (shared_bytes), (stream)
-
 #define MMLTK_ML_LAYERS_LAUNCH_COL2IM_KERNEL_1(args, stream, shared_bytes, kernel) \
     kernel<scalar_t><<<MMLTK_ML_LAYERS_COL2IM_LAUNCH_CONFIG(args, shared_bytes, stream)>>>(MMLTK_ML_LAYERS_COL2IM_KERNEL_ARGS(args))
-
 #define MMLTK_ML_LAYERS_LAUNCH_COL2IM_KERNEL_2(args, stream, shared_bytes, kernel, block_size) \
-    kernel<scalar_t, block_size>                                                               \
-        <<<MMLTK_ML_LAYERS_COL2IM_LAUNCH_CONFIG(args, shared_bytes, stream)>>>(MMLTK_ML_LAYERS_COL2IM_KERNEL_ARGS(args))
-
+    kernel<scalar_t, block_size><<<MMLTK_ML_LAYERS_COL2IM_LAUNCH_CONFIG(args, shared_bytes, stream)>>>(MMLTK_ML_LAYERS_COL2IM_KERNEL_ARGS(args))
 template <typename scalar_t>
 void ms_deformable_im2col_cuda(cudaStream_t stream, MMLTK_ML_LAYERS_DEFORM_IM2COL_PARAMS(scalar_t)) {
     const int num_kernels = batch_size * num_query * num_heads * channels;
     const int num_threads = kMsDeformAttnCudaThreads;
     ms_deformable_im2col_gpu_kernel<scalar_t><<<ms_deform_attn_cuda_blocks(num_kernels, num_threads), num_threads, 0, stream>>>(
-        num_kernels, data_value, data_layout, data_sampling_loc, data_attn_weight, batch_size, spatial_size, num_heads, channels,
-        num_levels, num_query, num_point, data_col);
+        num_kernels, data_value, data_layout, data_sampling_loc, data_attn_weight, batch_size, spatial_size, num_heads, channels, num_levels, num_query,
+        num_point, data_col);
 }
-
 #define MMLTK_ML_LAYERS_DEFINE_COL2IM_BLOCKSIZE_AWARE_LAUNCHER(launcher_name, kernel_name)               \
     template <typename scalar_t, unsigned int blockSize>                                                 \
     inline void launcher_name(const MsDeformableCol2ImLaunchArgs<scalar_t>& args, cudaStream_t stream) { \
         MMLTK_ML_LAYERS_LAUNCH_COL2IM_KERNEL_2(args, stream, 0, kernel_name, blockSize);                 \
     }
-
 #define MMLTK_ML_LAYERS_DEFINE_COL2IM_DYNAMIC_LAUNCHER(launcher_name, kernel_name, shared_bytes_expr)    \
     template <typename scalar_t>                                                                         \
     inline void launcher_name(const MsDeformableCol2ImLaunchArgs<scalar_t>& args, cudaStream_t stream) { \
         MMLTK_ML_LAYERS_LAUNCH_COL2IM_KERNEL_1(args, stream, shared_bytes_expr, kernel_name);            \
     }
-
 MMLTK_ML_LAYERS_DEFINE_COL2IM_BLOCKSIZE_AWARE_LAUNCHER(launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v1,
                                                        ms_deformable_col2im_gpu_kernel_shm_blocksize_aware_reduce_v1);
 MMLTK_ML_LAYERS_DEFINE_COL2IM_BLOCKSIZE_AWARE_LAUNCHER(launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2,
                                                        ms_deformable_col2im_gpu_kernel_shm_blocksize_aware_reduce_v2);
-MMLTK_ML_LAYERS_DEFINE_COL2IM_DYNAMIC_LAUNCHER(launch_ms_deformable_col2im_cuda_shm_reduce_v1,
-                                               ms_deformable_col2im_gpu_kernel_shm_reduce_v1,
+MMLTK_ML_LAYERS_DEFINE_COL2IM_DYNAMIC_LAUNCHER(launch_ms_deformable_col2im_cuda_shm_reduce_v1, ms_deformable_col2im_gpu_kernel_shm_reduce_v1,
                                                ms_deformable_col2im_dynamic_shared_bytes(args));
-MMLTK_ML_LAYERS_DEFINE_COL2IM_DYNAMIC_LAUNCHER(launch_ms_deformable_col2im_cuda_shm_reduce_v2,
-                                               ms_deformable_col2im_gpu_kernel_shm_reduce_v2,
+MMLTK_ML_LAYERS_DEFINE_COL2IM_DYNAMIC_LAUNCHER(launch_ms_deformable_col2im_cuda_shm_reduce_v2, ms_deformable_col2im_gpu_kernel_shm_reduce_v2,
                                                ms_deformable_col2im_dynamic_shared_bytes(args));
 MMLTK_ML_LAYERS_DEFINE_COL2IM_DYNAMIC_LAUNCHER(launch_ms_deformable_col2im_cuda_shm_reduce_v2_multi_blocks,
-                                               ms_deformable_col2im_gpu_kernel_shm_reduce_v2_multi_blocks,
-                                               ms_deformable_col2im_dynamic_shared_bytes(args));
-
+                                               ms_deformable_col2im_gpu_kernel_shm_reduce_v2_multi_blocks, ms_deformable_col2im_dynamic_shared_bytes(args));
 template <typename scalar_t>
 inline void launch_ms_deformable_col2im_cuda_gm(const MsDeformableCol2ImLaunchArgs<scalar_t>& args, cudaStream_t stream) {
     MMLTK_ML_LAYERS_LAUNCH_COL2IM_KERNEL_1(args, stream, 0, ms_deformable_col2im_gpu_kernel_gm);
 }
-
 #undef MMLTK_ML_LAYERS_DEFINE_COL2IM_DYNAMIC_LAUNCHER
 #undef MMLTK_ML_LAYERS_DEFINE_COL2IM_BLOCKSIZE_AWARE_LAUNCHER
-
 template <typename scalar_t>
 inline void launch_ms_deformable_col2im_cuda_large_channels(const MsDeformableCol2ImLaunchArgs<scalar_t>& args, cudaStream_t stream) {
     if ((args.channels & 1023) == 0) {
@@ -633,7 +536,6 @@ inline void launch_ms_deformable_col2im_cuda_large_channels(const MsDeformableCo
         launch_ms_deformable_col2im_cuda_gm(args, stream);
     }
 }
-
 template <typename scalar_t>
 inline void launch_ms_deformable_col2im_cuda_dynamic_reduce(const MsDeformableCol2ImLaunchArgs<scalar_t>& args, cudaStream_t stream) {
     if (args.channels < 64) {
@@ -642,12 +544,8 @@ inline void launch_ms_deformable_col2im_cuda_dynamic_reduce(const MsDeformableCo
         launch_ms_deformable_col2im_cuda_shm_reduce_v2(args, stream);
     }
 }
-
 #define MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(block_size, launcher) \
-    case block_size:                                               \
-        launcher<scalar_t, block_size>(args, stream);              \
-        break
-
+    case block_size: launcher<scalar_t, block_size>(args, stream); break
 #define MMLTK_ML_LAYERS_DISPATCH_COL2IM_SPECIALIZED_CASES_V1()                                                \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(1, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v1);  \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(2, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v1);  \
@@ -655,14 +553,12 @@ inline void launch_ms_deformable_col2im_cuda_dynamic_reduce(const MsDeformableCo
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(8, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v1);  \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(16, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v1); \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(32, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v1)
-
 #define MMLTK_ML_LAYERS_DISPATCH_COL2IM_SPECIALIZED_CASES_V2()                                                 \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(64, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2);  \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(128, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2); \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(256, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2); \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(512, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2); \
     MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE(1024, launch_ms_deformable_col2im_cuda_shm_blocksize_aware_reduce_v2)
-
 template <typename scalar_t>
 void ms_deformable_col2im_cuda(cudaStream_t stream, MMLTK_ML_LAYERS_DEFORM_COL2IM_PARAMS(scalar_t)) {
     const int num_threads = (channels > kMsDeformAttnCudaThreads) ? kMsDeformAttnCudaThreads : channels;
@@ -674,16 +570,12 @@ void ms_deformable_col2im_cuda(cudaStream_t stream, MMLTK_ML_LAYERS_DEFORM_COL2I
         launch_ms_deformable_col2im_cuda_large_channels(args, stream);
         return;
     }
-
     switch (args.channels) {
         MMLTK_ML_LAYERS_DISPATCH_COL2IM_SPECIALIZED_CASES_V1();
         MMLTK_ML_LAYERS_DISPATCH_COL2IM_SPECIALIZED_CASES_V2();
-        default:
-            launch_ms_deformable_col2im_cuda_dynamic_reduce(args, stream);
-            break;
+        default: launch_ms_deformable_col2im_cuda_dynamic_reduce(args, stream); break;
     }
 }
-
 #undef MMLTK_ML_LAYERS_DISPATCH_COL2IM_SPECIALIZED_CASES_V2
 #undef MMLTK_ML_LAYERS_DISPATCH_COL2IM_SPECIALIZED_CASES_V1
 #undef MMLTK_ML_LAYERS_DISPATCH_COL2IM_CASE
@@ -695,5 +587,4 @@ void ms_deformable_col2im_cuda(cudaStream_t stream, MMLTK_ML_LAYERS_DEFORM_COL2I
 #undef MMLTK_ML_LAYERS_DEFORM_IM2COL_PARAMS
 #undef MMLTK_ML_LAYERS_DEFORM_COMMON_INPUT_PARAMS
 #undef MMLTK_ML_LAYERS_CUDA_KERNEL_LOOP
-
 }  // namespace mmltk::backend::ml::layers

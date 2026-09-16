@@ -1,5 +1,4 @@
 #pragma once
-
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -8,18 +7,15 @@
 #include <string>
 #include <utility>
 #include <variant>
-
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/model.h"
 #include "src/controller/services/artifact_store.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/local_run.h"
 #include "src/controller/subsystems/system/system_events.h"
-
 // CLEANUP-IGNORE: Model events form a canonical reflected vocabulary distinct from Dataset artifact progress and
 // terminal facts.
 namespace mmltk::controller {
-
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] ModelProgressChanged final {
     std::uint64_t generation = 0U;
     bool active = false;
@@ -29,31 +25,28 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Tra
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] ModelChanged final {
     contracts::ModelUiState snapshot{};
 };
-
 struct ModelArtifactAdmission final {
     std::string artifact;
-    mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout;
+    mmltk::backend::models::rfdetr::ModelClassLayoutSummary class_layout{};
 };
 class ModelRuntime {
    public:
     virtual ~ModelRuntime() = default;
-    [[nodiscard]] virtual ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token,
-                                              const std::function<void(const contracts::ModelProgress&)>&) = 0;
+    [[nodiscard]] virtual ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device,
+                                                         std::stop_token, const std::function<void(const contracts::ModelProgress&)>&) = 0;
 };
-
 class ArtifactModelRuntime final : public ModelRuntime {
    public:
     ArtifactModelRuntime() = default;
     explicit ArtifactModelRuntime(services::ArtifactStore store) : store_(std::move(store)) {}
     [[nodiscard]] ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path&, int inspection_device, std::stop_token,
-                                      const std::function<void(const contracts::ModelProgress&)>&) override;
+                                                 const std::function<void(const contracts::ModelProgress&)>&) override;
 
    private:
     // CLEANUP-IGNORE: The model runtime owns an artifact store, while the dataset runtime additionally owns typed
     // compiler diagnostics; merging the sealed runtimes would erase their domain boundaries.
     services::ArtifactStore store_;
 };
-
 class ModelSystem final {
    public:
     using event_type = std::variant<ModelProgressChanged, ModelChanged>;
@@ -71,7 +64,6 @@ class ModelSystem final {
    private:
     void progress(const contracts::ModelProgress&) noexcept;
     [[nodiscard]] direct::LocalRun::Notification changed(contracts::ModelUiState);
-
     SettingsSystem& settings_;
     RuntimeFactory factory_;
     SystemEventSink<event_type> events_;
@@ -80,8 +72,6 @@ class ModelSystem final {
     std::unique_ptr<ModelRuntime> runtime_;
     direct::LocalRun run_;
 };
-
 MMLTK_REFLECT_FIELDS(ModelProgressChanged)
 MMLTK_REFLECT_FIELDS(ModelChanged)
-
 }  // namespace mmltk::controller

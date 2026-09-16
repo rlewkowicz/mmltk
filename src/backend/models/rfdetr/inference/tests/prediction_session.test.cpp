@@ -5,7 +5,6 @@
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include <catch2/catch_test_macros.hpp>
 #include <onnx/onnx_pb.h>
 #include <cuda_runtime_api.h>
 #include <nlohmann/json.hpp>
@@ -25,6 +24,7 @@
 #include "src/backend/models/rfdetr/inference/inference_preprocessor.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
+#include "catch2_compat.hpp"
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.model_export;
 namespace rfdetr = mmltk::backend::models::rfdetr;
@@ -38,11 +38,11 @@ TEST_CASE("compiled preprocessing preserves unit-range float CHW channels", "[mo
     const auto address = preprocessor.Run(batch).data_ptr();
     REQUIRE(preprocessor.Run(batch).data_ptr() == address);
     CHECK(address == batch.device_images);
-    rfdetr::InferenceBatchPreprocessor half(1, 1, 2, 0, tensor::kHalf);
-    REQUIRE(tensor::equal(half.Run(batch).reshape({6}).to(tensor::kFloat).to(tensor::kCPU), source.to(tensor::kCPU)));
-    const auto half_address = half.Run(batch).data_ptr();
+    rfdetr::InferenceBatchPreprocessor half_precision(1, 1, 2, 0, tensor::kHalf);
+    REQUIRE(tensor::equal(half_precision.Run(batch).reshape({6}).to(tensor::kFloat).to(tensor::kCPU), source.to(tensor::kCPU)));
+    const auto half_address = half_precision.Run(batch).data_ptr();
     CHECK(half_address != batch.device_images);
-    CHECK(half.Run(batch).data_ptr() == half_address);
+    CHECK(half_precision.Run(batch).data_ptr() == half_address);
     auto invalid = batch;
     invalid.num_images = 2U;
     CHECK_THROWS_AS(preprocessor.Run(invalid), std::invalid_argument);
@@ -52,7 +52,10 @@ TEST_CASE("compiled preprocessing preserves unit-range float CHW channels", "[mo
 }
 TEST_CASE("unfinished prediction output preserves the completed file", "[model][rfdetr][prediction_json]") {
     const auto output = std::filesystem::temp_directory_path() / ("prediction-cancel-" + std::to_string(::getpid()) + ".json");
-    { std::ofstream original(output); original << "previous"; }
+    {
+        std::ofstream original(output);
+        original << "previous";
+    }
     rfdetr::PredictRequest request;
     request.output_path = output;
     {
@@ -65,11 +68,9 @@ TEST_CASE("unfinished prediction output preserves the completed file", "[model][
     preserved >> content;
     REQUIRE(content == "previous");
     const auto prefix = output.filename().string() + ".tmp.";
-    for (const auto& entry : std::filesystem::directory_iterator(output.parent_path()))
-        REQUIRE_FALSE(entry.path().filename().string().starts_with(prefix));
+    for (const auto& entry : std::filesystem::directory_iterator(output.parent_path())) REQUIRE_FALSE(entry.path().filename().string().starts_with(prefix));
     std::filesystem::remove(output);
 }
-
 TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "[model][rfdetr][prediction]") {
     rfdetr::PredictRequest request;
     request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
@@ -80,17 +81,18 @@ TEST_CASE("cancelled prediction does not bind an artifact or deliver records", "
     stop.request_stop();
     rfdetr::PredictionSession session;
     bool delivered = false;
-    const auto result = session.RunResolved(request, {}, {.native_handle = 1U, .valid = true}, {
-        .stop = stop.get_token(),
-        .completed = [&](const auto&, auto, const auto&) { delivered = true; },
-    });
+    const auto result = session.RunResolved(request, {}, {.native_handle = 1U, .valid = true},
+                                            {
+                                                .stop = stop.get_token(),
+                                                .completed = [&](const auto&, auto, const auto&) { delivered = true; },
+                                            });
     CHECK(result.cancelled);
     CHECK(result.processed_images == 0U);
     CHECK_FALSE(delivered);
 }
-
 namespace {
-void write_prediction_model(const std::filesystem::path& path, std::int64_t queries = 2, bool include_masks = true, std::optional<rfdetr::ModelClassLayout> layout = {}) {
+void write_prediction_model(const std::filesystem::path& path, std::int64_t queries = 2, bool include_masks = true,
+                            std::optional<rfdetr::ModelClassLayout> layout = {}) {
     namespace onnx = mmltk_onnx;
     onnx::ModelProto model;
     model.set_ir_version(8);
@@ -150,7 +152,7 @@ void write_prediction_model(const std::filesystem::path& path, std::int64_t quer
     std::ofstream file(path, std::ios::binary);
     REQUIRE(model.SerializeToOstream(&file));
 }
-}
+}  // namespace
 TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned pixels", "[model][rfdetr][prediction][gpu]") {
     const auto root = std::filesystem::temp_directory_path() / ("prediction-delivery-" + std::to_string(::getpid()));
     std::filesystem::create_directories(root);
@@ -160,7 +162,11 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     {
         std::ofstream file(image, std::ios::binary);
         file << "P6\n2 2\n255\n";
-        for (int pixel = 0; pixel < 4; ++pixel) { file.put(static_cast<char>(255)); file.put(0); file.put(0); }
+        for (int pixel = 0; pixel < 4; ++pixel) {
+            file.put(static_cast<char>(255));
+            file.put(0);
+            file.put(0);
+        }
     }
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     cudaStream_t stream{};
@@ -200,7 +206,6 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
             retained_owner = pixels.custody;
             retained = pixels.rgb8;
         }
-
     };
     CHECK(session.RunAndWrite(request, command, {.source_pixels = true, .completed = observe}).processed_images == 2U);
     CHECK(identities == std::vector<std::int64_t>{21, 22});
@@ -212,15 +217,24 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     CHECK(original.at("records").at(0).at("detections").at(0).at("label") == "0");
     identities.clear();
     std::stop_source stop;
-    CHECK(session.RunAndWrite(request, command, {.stop = stop.get_token(), .source_pixels = true,
-        .completed = [&](const auto& record, auto source, const auto& annotations) { observe(record, source, annotations); stop.request_stop(); }}).processed_images == 1U);
+    CHECK(session
+              .RunAndWrite(request, command,
+                           {.stop = stop.get_token(),
+                            .source_pixels = true,
+                            .completed =
+                                [&](const auto& record, auto source, const auto& annotations) {
+                                    observe(record, source, annotations);
+                                    stop.request_stop();
+                                }})
+              .processed_images == 1U);
     CHECK(identities == std::vector<std::int64_t>{21});
     std::ifstream preserved(request.output_path);
     CHECK(nlohmann::json::parse(preserved) == original);
-    const auto already_stopped = session.RunAndWrite(request, command, {.stop = stop.get_token(),
-        .begin = [](const auto&) { FAIL("cancelled prediction began execution"); },
-        .completed = [](const auto&, auto, const auto&) { FAIL("cancelled prediction delivered a record"); },
-        .progress = [](auto, auto) { FAIL("cancelled prediction advanced progress"); }});
+    const auto already_stopped = session.RunAndWrite(request, command,
+                                                     {.stop = stop.get_token(),
+                                                      .begin = [](const auto&) { FAIL("cancelled prediction began execution"); },
+                                                      .completed = [](const auto&, auto, const auto&) { FAIL("cancelled prediction delivered a record"); },
+                                                      .progress = [](auto, auto) { FAIL("cancelled prediction advanced progress"); }});
     CHECK(already_stopped.cancelled);
     CHECK(already_stopped.processed_images == 0U);
     std::ifstream still_preserved(request.output_path);
@@ -228,112 +242,156 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     request.include_masks = false;
     request.limit_images = 1;
     const auto without_masks = session.Run(request, command, {.completed = [](const auto& record, auto source, const auto& annotations) {
-        REQUIRE_FALSE(record.detections.empty());
-        CHECK_FALSE(record.detections.front().has_mask);
-        CHECK(annotations.value_count == 0U);
-        CHECK(annotations.boxes_xyxy.address == 0U);
-        CHECK(annotations.class_references.address == 0U);
-        CHECK(annotations.confidences.address == 0U);
-        CHECK(annotations.masks.address == 0U);
-        CHECK(source.chw == nullptr);
-    }});
+                                               REQUIRE_FALSE(record.detections.empty());
+                                               CHECK_FALSE(record.detections.front().has_mask);
+                                               CHECK(annotations.value_count == 0U);
+                                               CHECK(annotations.boxes_xyxy.address == 0U);
+                                               CHECK(annotations.class_references.address == 0U);
+                                               CHECK(annotations.confidences.address == 0U);
+                                               CHECK(annotations.masks.address == 0U);
+                                               CHECK(source.chw == nullptr);
+                                           }});
     CHECK(without_masks.processed_images == 1U);
     CHECK_FALSE(without_masks.cancelled);
     request.limit_images = 3U;
     std::size_t selected_count = 0U;
-    const auto selective = session.Run(request, command, {
-        .demand = [](std::int64_t index) { return rfdetr::PredictionDemand{.source_pixels = index == 1, .encoded_masks = index == 1, .preview_masks = index == 1}; },
-        .completed = [&](const auto& record, auto pixels, const auto& annotations) {
-            const bool selected = record.dataset_index == 1;
-            CHECK(record.detections.front().has_mask == selected);
-            CHECK((pixels.rgb8 != nullptr) == selected);
-            CHECK(annotations.masks_available == selected);
-            selected_count += selected ? 1U : 0U;
-        },
-    });
+    const auto selective =
+        session.Run(request, command,
+                    {
+                        .demand =
+                            [](std::int64_t index) {
+                                return rfdetr::PredictionDemand{.source_pixels = index == 1, .encoded_masks = index == 1, .preview_masks = index == 1};
+                            },
+                        .completed =
+                            [&](const auto& record, auto pixels, const auto& annotations) {
+                                const bool selected = record.dataset_index == 1;
+                                CHECK(record.detections.front().has_mask == selected);
+                                CHECK((pixels.rgb8 != nullptr) == selected);
+                                CHECK(annotations.masks_available == selected);
+                                selected_count += selected ? 1U : 0U;
+                            },
+                    });
     CHECK(selective.processed_images == 3U);
     CHECK(selected_count == 1U);
-    for (const bool encoded : {false, true}) for (const bool gpu_masks : {false, true}) {
-        request.limit_images = 1U;
-        const auto mode = session.Run(request, command, {
-            .demand = [=](auto) { return rfdetr::PredictionDemand{.source_pixels = true, .encoded_masks = encoded, .preview_masks = gpu_masks}; },
-            .completed = [&](const auto& record, auto pixels, const auto& annotations) {
-                REQUIRE(pixels.rgb8);
-                REQUIRE_FALSE(record.detections.empty());
-                CHECK(record.detections.front().has_mask == encoded);
-                CHECK(record.detections.front().mask.runs.empty() == !encoded);
-                CHECK(annotations.masks_available == gpu_masks);
-                CHECK((annotations.masks.address != 0U) == gpu_masks);
-            },
-        });
-        CHECK(mode.processed_images == 1U);
-    }
+    for (const bool encoded : {false, true})
+        for (const bool gpu_masks : {false, true}) {
+            request.limit_images = 1U;
+            const auto mode = session.Run(
+                request, command,
+                {
+                    .demand = [=](auto) { return rfdetr::PredictionDemand{.source_pixels = true, .encoded_masks = encoded, .preview_masks = gpu_masks}; },
+                    .completed =
+                        [&](const auto& record, auto pixels, const auto& annotations) {
+                            REQUIRE(pixels.rgb8);
+                            REQUIRE_FALSE(record.detections.empty());
+                            CHECK(record.detections.front().has_mask == encoded);
+                            CHECK(record.detections.front().mask.runs.empty() == !encoded);
+                            CHECK(annotations.masks_available == gpu_masks);
+                            CHECK((annotations.masks.address != 0U) == gpu_masks);
+                        },
+                });
+            CHECK(mode.processed_images == 1U);
+        }
     request.limit_images = 1U;
     std::size_t preview_refusals = 0U;
-    const auto preview_limited = session.RunAndWrite(request, command, {
-        .source_pixels = true, .maximum_pixel_width = 1U, .maximum_pixel_height = 1U,
-        .completed = [&](const auto& record, auto source, const auto&) {
-            CHECK(source.chw == nullptr);
-            CHECK(record.detections.size() == 2U);
-            ++preview_refusals;
-        },
-    });
+    const auto preview_limited = session.RunAndWrite(request, command,
+                                                     {
+                                                         .source_pixels = true,
+                                                         .maximum_pixel_width = 1U,
+                                                         .maximum_pixel_height = 1U,
+                                                         .completed =
+                                                             [&](const auto& record, auto source, const auto&) {
+                                                                 CHECK(source.chw == nullptr);
+                                                                 CHECK(record.detections.size() == 2U);
+                                                                 ++preview_refusals;
+                                                             },
+                                                     });
     CHECK(preview_refusals == 1U);
     CHECK(preview_limited.processed_images == 1U);
     CHECK_FALSE(preview_limited.cancelled);
     std::ifstream semantic_output(request.output_path);
     CHECK(nlohmann::json::parse(semantic_output).at("records").size() == 1U);
     const auto oversized = root / "oversized.ppm";
-    { std::ofstream file(oversized, std::ios::binary); file << "P6\n3 2\n255\n"; for (int byte = 0; byte < 18; ++byte) file.put(0); }
+    {
+        std::ofstream file(oversized, std::ios::binary);
+        file << "P6\n3 2\n255\n";
+        for (int byte = 0; byte < 18; ++byte) file.put(0);
+    }
     request.limit_images = 0U;
     for (bool reverse : {false, true}) {
         request.image_inputs = {{image, "small", 11}, {oversized, "large", 12}};
         if (reverse) std::reverse(request.image_inputs.begin(), request.image_inputs.end());
         std::vector<std::int64_t> delivered;
-        const auto mixed = session.RunAndWrite(request, command, {.source_pixels = true, .maximum_pixel_width = 2U, .maximum_pixel_height = 2U,
-            .completed = [&](const auto& record, auto current, const auto&) {
-                delivered.push_back(record.image_id);
-                if (record.image_id == 11) { REQUIRE(current.rgb8); CHECK(current.rgb8[0] == 255U); CHECK(current.width == 2U); }
-                else { CHECK(current.chw == nullptr); CHECK(current.rgb8 == nullptr); CHECK(current.width == 0U); CHECK_FALSE(current.preview_failure.empty()); }
-            }});
+        const auto mixed = session.RunAndWrite(
+            request, command,
+            {.source_pixels = true, .maximum_pixel_width = 2U, .maximum_pixel_height = 2U, .completed = [&](const auto& record, auto current, const auto&) {
+                 delivered.push_back(record.image_id);
+                 if (record.image_id == 11) {
+                     REQUIRE(current.rgb8);
+                     CHECK(current.rgb8[0] == 255U);
+                     CHECK(current.width == 2U);
+                 } else {
+                     CHECK(current.chw == nullptr);
+                     CHECK(current.rgb8 == nullptr);
+                     CHECK(current.width == 0U);
+                     CHECK_FALSE(current.preview_failure.empty());
+                 }
+             }});
         CHECK(mixed.processed_images == 2U);
         CHECK(delivered == (reverse ? std::vector<std::int64_t>{12, 11} : std::vector<std::int64_t>{11, 12}));
     }
     request.include_masks = true;
     request.threshold = 0.9999F;
-    CHECK(session.Run(request, command, {.completed = [](const auto& record, auto, const auto& annotations) {
-        CHECK(record.detections.size() == 1U); CHECK(annotations.value_count == 0U); CHECK(annotations.boxes_xyxy.address == 0U); CHECK(record.detections.front().class_reference == 0);
-        CHECK(record.detections.front().has_mask); CHECK(record.detections.front().mask.area > 0U);
-    }}).processed_images == 2U);
-    CHECK(session.Run(request, command, {.source_pixels = true,
-        .completed = [&](const auto& record, auto pixels, const auto& annotations) {
-            REQUIRE(record.detections.size() == 1U);
-            CHECK(annotations.value_count == 1U);
-            REQUIRE(annotations.class_references.address != 0U);
-            REQUIRE(pixels.custody);
-            std::int32_t category = -1;
-            REQUIRE(cudaMemcpyAsync(&category, reinterpret_cast<const void*>(annotations.class_references.address), sizeof(category),
-                cudaMemcpyDeviceToHost, stream) == cudaSuccess);
-            REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-            CHECK(category == record.detections.front().class_reference);
-        }}).processed_images == 2U);
+    const auto mask_only_images = session
+                                      .Run(request, command,
+                                           {.completed =
+                                                [](const auto& record, auto, const auto& annotations) {
+                                                    CHECK(record.detections.size() == 1U);
+                                                    CHECK(annotations.value_count == 0U);
+                                                    CHECK(annotations.boxes_xyxy.address == 0U);
+                                                    CHECK(record.detections.front().class_reference == 0);
+                                                    CHECK(record.detections.front().has_mask);
+                                                    CHECK(record.detections.front().mask.area > 0U);
+                                                }})
+                                      .processed_images;
+    CHECK(mask_only_images == 2U);
+    const auto preview_images = session
+                                    .Run(request, command,
+                                         {.source_pixels = true,
+                                          .completed =
+                                              [&](const auto& record, auto pixels, const auto& annotations) {
+                                                  REQUIRE(record.detections.size() == 1U);
+                                                  CHECK(annotations.value_count == 1U);
+                                                  REQUIRE(annotations.class_references.address != 0U);
+                                                  REQUIRE(pixels.custody);
+                                                  std::int32_t category = -1;
+                                                  REQUIRE(cudaMemcpyAsync(&category, reinterpret_cast<const void*>(annotations.class_references.address),
+                                                                          sizeof(category), cudaMemcpyDeviceToHost, stream) == cudaSuccess);
+                                                  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+                                                  CHECK(category == record.detections.front().class_reference);
+                                              }})
+                                    .processed_images;
+    CHECK(preview_images == 2U);
     CHECK_FALSE(session.HasUnsafeCustody());
     rfdetr::PredictionSession context_poisoned;
-    CHECK_THROWS_AS(context_poisoned.Run(request, command, {.completed = [](const auto&, auto, const auto&) {
-        throw mmltk::frameworks::gpu::CudaContextFailure(true);
-    }}), mmltk::backend::ml::runtime::CudaOperationError);
+    CHECK_THROWS_AS(
+        context_poisoned.Run(request, command, {.completed = [](const auto&, auto, const auto&) { throw mmltk::frameworks::gpu::CudaContextFailure(true); }}),
+        mmltk::backend::ml::runtime::CudaOperationError);
     CHECK(context_poisoned.HasUnsafeCustody());
     bool context_rebound = false;
     CHECK_THROWS_AS(context_poisoned.Run(request, command, {.begin = [&](const auto&) { context_rebound = true; }}),
-        mmltk::backend::ml::runtime::CudaOperationError);
+                    mmltk::backend::ml::runtime::CudaOperationError);
     CHECK_FALSE(context_rebound);
     rfdetr::PredictionSession poisoned;
     CHECK_FALSE(poisoned.HasUnsafeCustody());
     std::ifstream prior_file(request.output_path);
     const auto prior = nlohmann::json::parse(prior_file);
-    CHECK_THROWS_AS(poisoned.RunAndWrite(request, command, {.completed = [](const auto&, auto, const auto&) {
-        throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "unobservable source transaction"};
-    }}), mmltk::backend::ml::runtime::CudaOperationError);
+    CHECK_THROWS_AS(poisoned.RunAndWrite(request, command,
+                                         {.completed =
+                                              [](const auto&, auto, const auto&) {
+                                                  throw mmltk::backend::ml::runtime::CudaOperationError{cudaErrorUnknown, "unobservable source transaction"};
+                                              }}),
+                    mmltk::backend::ml::runtime::CudaOperationError);
     std::ifstream after_failure(request.output_path);
     CHECK(nlohmann::json::parse(after_failure) == prior);
     bool rebound = false;
@@ -343,7 +401,6 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     CHECK(poisoned.Close() != mmltk::backend::ml::runtime::kRuntimeSuccess);
     CHECK(poisoned.HasUnsafeCustody());
 }
-
 TEST_CASE("prediction output commit reports a destination failure and removes temporary data", "[model][rfdetr][prediction_json]") {
     const auto root = std::filesystem::temp_directory_path() / ("prediction-output-failure-" + std::to_string(::getpid()));
     std::filesystem::create_directories(root / "destination");
@@ -358,7 +415,6 @@ TEST_CASE("prediction output commit reports a destination failure and removes te
     CHECK(std::filesystem::is_directory(request.output_path));
     for (const auto& entry : std::filesystem::directory_iterator(root)) CHECK(entry.path() == request.output_path);
 }
-
 TEST_CASE("prediction candidate and mask capacities are checked before allocation", "[model][rfdetr][prediction]") {
     using rfdetr::PredictionCapacity;
     CHECK_THROWS_AS(PredictionCapacity::Resolve(0, 1, 2, 3, 2, 2, false), std::invalid_argument);
@@ -370,8 +426,10 @@ TEST_CASE("prediction candidate and mask capacities are checked before allocatio
     CHECK(full_hd.candidates == 500U);
     CHECK(full_hd.mask_bytes == 1920U * 1080U * sizeof(std::uint8_t));
     CHECK(rfdetr::checked_prediction_extent(500U, full_hd.mask_bytes, rfdetr::kMaximumPredictionTensorBytes) == 1036800000U);
-    CHECK(rfdetr::checked_prediction_extent(1U, rfdetr::kMaximumPredictionTensorBytes, rfdetr::kMaximumPredictionTensorBytes) == rfdetr::kMaximumPredictionTensorBytes);
-    CHECK_THROWS_AS(rfdetr::checked_prediction_extent(1U, rfdetr::kMaximumPredictionTensorBytes + 1U, rfdetr::kMaximumPredictionTensorBytes), std::invalid_argument);
+    CHECK(rfdetr::checked_prediction_extent(1U, rfdetr::kMaximumPredictionTensorBytes, rfdetr::kMaximumPredictionTensorBytes) ==
+          rfdetr::kMaximumPredictionTensorBytes);
+    CHECK_THROWS_AS(rfdetr::checked_prediction_extent(1U, rfdetr::kMaximumPredictionTensorBytes + 1U, rfdetr::kMaximumPredictionTensorBytes),
+                    std::invalid_argument);
     rfdetr::EncodedMask encoded;
     rfdetr::encode_mask_values_into(1U, 4U, encoded, [](auto pixel) { return pixel % 2U == 0U; }, 2U);
     CHECK(encoded.runs.size() == 2U);
@@ -380,7 +438,6 @@ TEST_CASE("prediction candidate and mask capacities are checked before allocatio
     rfdetr::EncodedMask mask;
     CHECK_THROWS_AS(rfdetr::encode_mask_values_into(65536, 65536, mask, [](auto) { return false; }), std::invalid_argument);
 }
-
 TEST_CASE("validation timing counts accepted executions independently of planned images", "[inference]") {
     using namespace mmltk::backend::models::rfdetr;
     ValidationRunResult result;
@@ -400,14 +457,17 @@ TEST_CASE("validation timing counts accepted executions independently of planned
     CHECK(result.total_timing->img_per_s == 4.0);
     CHECK(result.backends.at("onnx").timing.images == 7U);
 }
-
 TEST_CASE("full HD prediction materializes masks only for threshold survivors", "[model][rfdetr][prediction][gpu]") {
     const auto root = std::filesystem::temp_directory_path() / ("prediction-hd-" + std::to_string(::getpid()));
     std::filesystem::create_directories(root);
     const mmltk::testsupport::ScopedTestCleanup files{[&] { std::filesystem::remove_all(root); }};
     const auto image = root / "frame.ppm";
-    { std::ofstream file(image, std::ios::binary); file << "P6\n1920 1080\n255\n";
-      const std::vector<char> rgb(1920U * 1080U * 3U); file.write(rgb.data(), rgb.size()); }
+    {
+        std::ofstream file(image, std::ios::binary);
+        file << "P6\n1920 1080\n255\n";
+        const std::vector<char> rgb(1920U * 1080U * 3U);
+        file.write(rgb.data(), rgb.size());
+    }
     write_prediction_model(root / "model.onnx", 300);
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     cudaStream_t stream{};
@@ -424,21 +484,20 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
     request.max_dets_per_image = 500;
     request.threshold = .5F;
     rfdetr::PredictionSession session;
-    const auto result = session.RunAndWrite(request, {reinterpret_cast<std::uintptr_t>(stream), true}, {
-        .completed = [](const auto& record, auto pixels, const auto& annotations) {
-            REQUIRE(record.detections.size() == 2U);
-            CHECK(record.detections[0].mask.area == 1920U * 1080U);
-            CHECK(record.detections[1].mask.area == 0U);
-            CHECK(annotations.value_count == 0U);
-            CHECK(annotations.boxes_xyxy.address == 0U);
-            CHECK(annotations.class_references.address == 0U);
-            CHECK(annotations.confidences.address == 0U);
-            CHECK(annotations.masks.address == 0U);
-            CHECK(pixels.rgb8 == nullptr);
-        }});
+    const auto result = session.RunAndWrite(request, {reinterpret_cast<std::uintptr_t>(stream), true},
+                                            {.completed = [](const auto& record, auto pixels, const auto& annotations) {
+                                                REQUIRE(record.detections.size() == 2U);
+                                                CHECK(record.detections[0].mask.area == 1920U * 1080U);
+                                                CHECK(record.detections[1].mask.area == 0U);
+                                                CHECK(annotations.value_count == 0U);
+                                                CHECK(annotations.boxes_xyxy.address == 0U);
+                                                CHECK(annotations.class_references.address == 0U);
+                                                CHECK(annotations.confidences.address == 0U);
+                                                CHECK(annotations.masks.address == 0U);
+                                                CHECK(pixels.rgb8 == nullptr);
+                                            }});
     CHECK(result.processed_images == 1U);
 }
-
 TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "[model][rfdetr][prediction][gpu]") {
     namespace runtime = mmltk::backend::ml::runtime;
     const auto root = std::filesystem::temp_directory_path() / ("prediction-bbox-consumer-" + std::to_string(::getpid()));
@@ -457,22 +516,37 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     auto scores = tensor::empty({2}, cuda);
     auto masks = tensor::ones({2, 2, 2}, cuda.dtype(tensor::kUInt8));
     masks.mul_(77);
-    std::array<runtime::AnalysisAnnotationStorage, 1> annotations{{{
-        .source_region = {.width = 2, .height = 2}, .value_capacity = 2,
-        .boxes_xyxy = {.address = reinterpret_cast<std::uintptr_t>(boxes.data_ptr()), .capacity_bytes = 32,
-            .shape = {.rank = 2, .extents = {2, 4}}, .element_type = runtime::AnalysisElementType::Float32},
-        .class_references = {.address = reinterpret_cast<std::uintptr_t>(labels.data_ptr()), .capacity_bytes = 8,
-            .shape = {.rank = 1, .extents = {2}}, .element_type = runtime::AnalysisElementType::Int32},
-        .confidences = {.address = reinterpret_cast<std::uintptr_t>(scores.data_ptr()), .capacity_bytes = 8,
-            .shape = {.rank = 1, .extents = {2}}, .element_type = runtime::AnalysisElementType::Float32},
-        .masks = {.address = reinterpret_cast<std::uintptr_t>(masks.data_ptr()), .capacity_bytes = 8,
-            .shape = {.rank = 3, .extents = {2, 2, 2}}, .element_type = runtime::AnalysisElementType::Uint8}}}};
+    std::array<runtime::AnalysisAnnotationStorage, 1> annotations{{{.source_region = {.width = 2, .height = 2},
+                                                                    .value_capacity = 2,
+                                                                    .boxes_xyxy = {.address = reinterpret_cast<std::uintptr_t>(boxes.data_ptr()),
+                                                                                   .capacity_bytes = 32,
+                                                                                   .shape = {.rank = 2, .extents = {2, 4}},
+                                                                                   .element_type = runtime::AnalysisElementType::Float32},
+                                                                    .class_references = {.address = reinterpret_cast<std::uintptr_t>(labels.data_ptr()),
+                                                                                         .capacity_bytes = 8,
+                                                                                         .shape = {.rank = 1, .extents = {2}},
+                                                                                         .element_type = runtime::AnalysisElementType::Int32},
+                                                                    .confidences = {.address = reinterpret_cast<std::uintptr_t>(scores.data_ptr()),
+                                                                                    .capacity_bytes = 8,
+                                                                                    .shape = {.rank = 1, .extents = {2}},
+                                                                                    .element_type = runtime::AnalysisElementType::Float32},
+                                                                    .masks = {.address = reinterpret_cast<std::uintptr_t>(masks.data_ptr()),
+                                                                              .capacity_bytes = 8,
+                                                                              .shape = {.rank = 3, .extents = {2, 2, 2}},
+                                                                              .element_type = runtime::AnalysisElementType::Uint8}}}};
     rfdetr::ModelArtifactRequest artifacts;
     artifacts.onnx_path = root / "rf-detr-nano.onnx";
-    auto backend = rfdetr::make_rfdetr_runtime_backend({.artifacts = artifacts, .backend = "onnx", .device = 0,
-        .command_stream = {reinterpret_cast<std::uintptr_t>(stream), true}, .static_resolution = 8, .maximum_detections = 2, .allow_fp16 = false});
-    const runtime::RuntimeTensorBuffer input_buffer{.device_data = input.data_ptr(), .capacity_bytes = 3U * 8U * 8U * sizeof(float),
-        .shape = {.rank = 4, .extents = {1, 3, 8, 8}}, .element_type = runtime::RuntimeElementType::Float32};
+    auto backend = rfdetr::make_rfdetr_runtime_backend({.artifacts = artifacts,
+                                                        .backend = "onnx",
+                                                        .device = 0,
+                                                        .command_stream = {reinterpret_cast<std::uintptr_t>(stream), true},
+                                                        .static_resolution = 8,
+                                                        .maximum_detections = 2,
+                                                        .allow_fp16 = false});
+    const runtime::RuntimeTensorBuffer input_buffer{.device_data = input.data_ptr(),
+                                                    .capacity_bytes = 3U * 8U * 8U * sizeof(float),
+                                                    .shape = {.rank = 4, .extents = {1, 3, 8, 8}},
+                                                    .element_type = runtime::RuntimeElementType::Float32};
     const auto run = [&](rfdetr::RfdetrRuntimeBackend& selected, bool include_masks) {
         auto submission = selected.Run(input_buffer, annotations, {}, include_masks);
         selected.ReleaseAfterCompletion(std::move(submission));
@@ -494,8 +568,13 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     CHECK(tensor::equal(masks, produced));
     write_prediction_model(root / "bbox.onnx", 2, false);
     artifacts.onnx_path = root / "bbox.onnx";
-    auto bbox_backend = rfdetr::make_rfdetr_runtime_backend({.artifacts = artifacts, .backend = "onnx", .device = 0,
-        .command_stream = {reinterpret_cast<std::uintptr_t>(stream), true}, .static_resolution = 8, .maximum_detections = 2, .allow_fp16 = false});
+    auto bbox_backend = rfdetr::make_rfdetr_runtime_backend({.artifacts = artifacts,
+                                                             .backend = "onnx",
+                                                             .device = 0,
+                                                             .command_stream = {reinterpret_cast<std::uintptr_t>(stream), true},
+                                                             .static_resolution = 8,
+                                                             .maximum_detections = 2,
+                                                             .allow_fp16 = false});
     annotations[0].masks_available = true;
     run(*bbox_backend, false);
     CHECK_FALSE(annotations[0].masks_available);
@@ -503,7 +582,6 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     CHECK(bbox_backend->Close() == runtime::kRuntimeSuccess);
     CHECK(backend->Close() == runtime::kRuntimeSuccess);
 }
-
 TEST_CASE("encoded mask allowance counts emitted runs across masks", "[model][rfdetr][prediction]") {
     std::size_t remaining = 4U;
     std::array<rfdetr::EncodedMask, 3> masks;
@@ -519,16 +597,15 @@ TEST_CASE("encoded mask allowance counts emitted runs across masks", "[model][rf
     CHECK(remaining == 0U);
     CHECK_THROWS_AS(rfdetr::encode_mask_values_into(1U, 1U, masks[1], [](auto) { return true; }, remaining), std::invalid_argument);
 }
-
 TEST_CASE("mask chunks account for model gather expansion device bools and registered host capacity", "[model][rfdetr][prediction]") {
     using rfdetr::PredictionMaskChunk;
     using rfdetr::SelectedMaskCapacity;
     const auto source_dominant = PredictionMaskChunk::Resolve(100, 1, 1, 1024, 1024, 4);
     CHECK(source_dominant.count == 2U);
     CHECK(source_dominant.capacity.Total() <= source_dominant.retained_limit);
-    const auto half = PredictionMaskChunk::Resolve(100, 1, 1, 1024, 1024, 2);
-    CHECK(half.count == 3U);
-    CHECK(half.capacity.Total() <= half.retained_limit);
+    const auto half_precision = PredictionMaskChunk::Resolve(100, 1, 1, 1024, 1024, 2);
+    CHECK(half_precision.count == 3U);
+    CHECK(half_precision.capacity.Total() <= half_precision.retained_limit);
     const auto model_dominant = PredictionMaskChunk::Resolve(5000, 256, 256, 1, 1, 4);
     CHECK(model_dominant.count == 63U);
     CHECK(model_dominant.capacity.Total() <= model_dominant.retained_limit);
@@ -549,7 +626,6 @@ TEST_CASE("mask chunks account for model gather expansion device bools and regis
     SelectedMaskCapacity overflow{{std::numeric_limits<std::size_t>::max(), 1U, 0U, 0U}};
     CHECK_THROWS_AS(overflow.Total(), std::invalid_argument);
 }
-
 TEST_CASE("selected mask workspace reuses allocation and resets dtype and shape high water", "[model][rfdetr][prediction]") {
     rfdetr::SelectedMaskWorkspace workspace;
     const auto queries = tensor::tensor({0L, 1L}, tensor::TensorOptions().dtype(tensor::kLong)).reshape({1, 2});
@@ -557,7 +633,7 @@ TEST_CASE("selected mask workspace reuses allocation and resets dtype and shape 
     auto masks = workspace.Materialize(logits, queries, 8, 8);
     const auto address = masks.data_ptr();
     CHECK(masks.all().item<bool>());
-    masks = {};
+    masks = tensor::Tensor{};
     CHECK(workspace.Materialize(logits, queries, 8, 8).data_ptr() == address);
     const auto first = workspace.RetainedCapacity(128U);
     CHECK(first.bytes == rfdetr::SelectedMaskCapacity::Resolve(2, 4, 4, 8, 8, 4).bytes);
@@ -567,7 +643,6 @@ TEST_CASE("selected mask workspace reuses allocation and resets dtype and shape 
     workspace.ResetSettled();
     CHECK(workspace.RetainedCapacity(0U).Total() == 0U);
 }
-
 TEST_CASE("raw preparation settles submitted tensor copies and reports unobservable work", "[model][rfdetr][prediction][gpu]") {
     namespace runtime = mmltk::backend::ml::runtime;
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
@@ -585,8 +660,7 @@ TEST_CASE("raw preparation settles submitted tensor copies and reports unobserva
     CHECK_FALSE(raw.available());
     CHECK(annotation.masks.address == 0U);
     CHECK(destination.eq(1).all().item<bool>());
-    rfdetr::PredictionRawPreparation unsafe(true, annotation, failure, stream,
-        +[](cudaStream_t) { return cudaErrorUnknown; });
+    rfdetr::PredictionRawPreparation unsafe(true, annotation, failure, stream, +[](cudaStream_t) { return cudaErrorUnknown; });
     // These are the exact allocations the session retains on the typed failure;
     // no replacement tensor stands in for an in-flight source or destination.
     const auto source_address = source.data_ptr();
@@ -595,7 +669,8 @@ TEST_CASE("raw preparation settles submitted tensor copies and reports unobserva
         destination.copy_(source, true);
         annotation.masks.address = reinterpret_cast<std::uintptr_t>(destination.data_ptr());
         throw std::runtime_error("unobservable dense copy");
-    }), runtime::CudaOperationError);
+    }),
+                    runtime::CudaOperationError);
     CHECK_FALSE(unsafe.available());
     CHECK(annotation.masks.address == 0U);
     CHECK(source.data_ptr() == source_address);
@@ -604,7 +679,6 @@ TEST_CASE("raw preparation settles submitted tensor copies and reports unobserva
     // real work before these test-owned allocations leave scope.
     REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
 }
-
 TEST_CASE("compiled prediction batch unwind closes shared source custody without losing the primary failure", "[model][rfdetr][prediction][gpu][custody]") {
     namespace data = mmltk::backend::data;
     namespace gpu = mmltk::frameworks::gpu;
@@ -626,66 +700,79 @@ TEST_CASE("compiled prediction batch unwind closes shared source custody without
     REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
     const mmltk::testsupport::ScopedTestCleanup destroy{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
     const data::DatasetLoader::Config loading{.compiled_path = data::testsupport::compiled_bin_path(fixture),
-        .batch_size = 1U, .shuffle = false, .prefetch_factor = 2, .gather_workers = 1,
-        .loading = data::data_loading_options(true)};
-    for (const bool unsafe : {false, true}) for (const bool explicit_release : {false, true}) {
-        auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(rfdetr::DatasetBatchLease::kSourceRetirementCapacity);
-        auto loader = std::make_shared<data::DatasetLoader>(loading, authority,
+                                              .batch_size = 1U,
+                                              .shuffle = false,
+                                              .prefetch_factor = 2,
+                                              .gather_workers = 1,
+                                              .loading = data::data_loading_options(true)};
+    for (const bool unsafe : {false, true})
+        for (const bool explicit_release : {false, true}) {
+            auto authority = std::make_shared<gpu::TerminalCudaRetirementOwner>(rfdetr::DatasetBatchLease::kSourceRetirementCapacity);
+            auto loader = std::make_shared<data::DatasetLoader>(loading, authority,
             unsafe ? +[](cudaEvent_t event, cudaStream_t value) -> cudaError_t {
                 const auto recorded = cudaEventRecord(event, value);
                 if (recorded != cudaSuccess) return recorded;
                 const auto status = cudaStreamSynchronize(value);
                 return status == cudaSuccess ? cudaErrorUnknown : status;
             } : &cudaEventRecord);
-        std::weak_ptr<data::DatasetLoader> exact_loader = loader;
-        data::Batch batch{};
-        struct PrimaryFailure final : std::runtime_error { PrimaryFailure() : std::runtime_error("ordinary prediction failure") {} };
-        bool primary_preserved = false;
-        try {
-            rfdetr::DatasetBatchLease transaction(loader, reinterpret_cast<std::uintptr_t>(stream), authority);
-            CHECK_NOTHROW(transaction.Release());
-            CHECK(authority->fact().reservations == 2U);
-            CHECK(authority->admission_open());
-            loader->begin_epoch();
-            REQUIRE(loader->next_batch(batch));
-            transaction.Adopt(batch);
-            loader->wait_batch(batch);
-            if (explicit_release) {
-                if (unsafe) CHECK_THROWS_AS(transaction.Release(), mmltk::backend::ml::runtime::CudaOperationError);
-                else transaction.Release();
+            std::weak_ptr<data::DatasetLoader> exact_loader = loader;
+            data::Batch batch{};
+            struct PrimaryFailure final : std::runtime_error {
+                PrimaryFailure() : std::runtime_error("ordinary prediction failure") {}
+            };
+            bool primary_preserved = false;
+            try {
+                rfdetr::DatasetBatchLease transaction(loader, reinterpret_cast<std::uintptr_t>(stream), authority);
                 CHECK_NOTHROW(transaction.Release());
+                CHECK(authority->fact().reservations == 2U);
+                CHECK(authority->admission_open());
+                loader->begin_epoch();
+                REQUIRE(loader->next_batch(batch));
+                transaction.Adopt(batch);
+                loader->wait_batch(batch);
+                if (explicit_release) {
+                    if (unsafe)
+                        CHECK_THROWS_AS(transaction.Release(), mmltk::backend::ml::runtime::CudaOperationError);
+                    else
+                        transaction.Release();
+                    CHECK_NOTHROW(transaction.Release());
+                }
+                throw PrimaryFailure{};
+            } catch (const PrimaryFailure&) { primary_preserved = true; }
+            REQUIRE(primary_preserved);
+            CHECK(authority->admission_open() == !unsafe);
+            CHECK(authority->fact().occupancy == (unsafe ? 1U : 0U));
+            CHECK(authority->fact().reservations == 1U);         // exact compiled stream still belongs to loader
+            if (unsafe) CHECK_FALSE(loader->next_batch(batch));  // failed release stopped/joined the live source
+            loader->stop_workers();                              // idempotent after failed cleanup; settles normal asynchronous release
+            CHECK_FALSE(loader->next_batch(batch));
+            loader.reset();
+            CHECK(exact_loader.expired() == !unsafe);
+            if (unsafe) {
+                for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
+                    CHECK_FALSE(authority->Reserve());
+                    CHECK_THROWS(data::DatasetLoader(loading, authority));
+                }
+                CHECK(authority->fact().occupancy == 1U);
+                CHECK(authority->fact().reservations == 1U);
+            } else {
+                CHECK(authority->fact().reservations == 0U);
+                data::DatasetLoader restarted(loading, authority);
             }
-            throw PrimaryFailure{};
-        } catch (const PrimaryFailure&) { primary_preserved = true; }
-        REQUIRE(primary_preserved);
-        CHECK(authority->admission_open() == !unsafe);
-        CHECK(authority->fact().occupancy == (unsafe ? 1U : 0U));
-        CHECK(authority->fact().reservations == 1U); // exact compiled stream still belongs to loader
-        if (unsafe) CHECK_FALSE(loader->next_batch(batch)); // failed release stopped/joined the live source
-        loader->stop_workers(); // idempotent after failed cleanup; settles normal asynchronous release
-        CHECK_FALSE(loader->next_batch(batch));
-        loader.reset();
-        CHECK(exact_loader.expired() == !unsafe);
-        if (unsafe) {
-            for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
-                CHECK_FALSE(authority->Reserve());
-                CHECK_THROWS(data::DatasetLoader(loading, authority));
-            }
-            CHECK(authority->fact().occupancy == 1U);
-            CHECK(authority->fact().reservations == 1U);
-        } else {
-            CHECK(authority->fact().reservations == 0U);
-            data::DatasetLoader restarted(loading, authority);
         }
-    }
 }
-
 TEST_CASE("ONNX metadata survives simplification and same-path prediction rebind", "[model][rfdetr][layout][gpu]") {
     namespace catalog = mmltk::backend::data::catalog;
     const auto root = mmltk::testsupport::make_temp_root("prediction-class-rebind");
     const mmltk::testsupport::ScopedTestCleanup files{[&] { std::filesystem::remove_all(root); }};
     const auto model = root / "rf-detr-nano.onnx", image = root / "frame.ppm";
-    { std::ofstream file(image, std::ios::binary); file << "P6\n1 1\n255\n"; file.put(127); file.put(0); file.put(0); }
+    {
+        std::ofstream file(image, std::ios::binary);
+        file << "P6\n1 1\n255\n";
+        file.put(127);
+        file.put(0);
+        file.put(0);
+    }
     write_prediction_model(model);
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     cudaStream_t stream{};
@@ -701,11 +788,16 @@ TEST_CASE("ONNX metadata survives simplification and same-path prediction rebind
     request.image_inputs = {{image, "frame", 7}};
     rfdetr::PredictionSession session;
     const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream), true};
-    CHECK(session.Run(request, command, {.completed = [](const auto& record, auto, const auto&) {
-        REQUIRE(record.detections.size() == 2);
-        CHECK(record.detections[0].class_domain == catalog::ClassReferenceDomain::RawOutputSlot);
-        CHECK(record.detections[0].class_reference == 0);
-    }}).processed_images == 1);
+    const auto raw_images = session
+                                .Run(request, command,
+                                     {.completed =
+                                          [](const auto& record, auto, const auto&) {
+                                              REQUIRE(record.detections.size() == 2);
+                                              CHECK(record.detections[0].class_domain == catalog::ClassReferenceDomain::RawOutputSlot);
+                                              CHECK(record.detections[0].class_reference == 0);
+                                          }})
+                                .processed_images;
+    CHECK(raw_images == 1);
     auto layout = rfdetr::native_training_class_layout(catalog::ClassCatalog({"first", "last"}));
     layout.slots.pop_back();
     layout.slots[0].foreground_index = 1;
@@ -715,35 +807,46 @@ TEST_CASE("ONNX metadata survives simplification and same-path prediction rebind
     CHECK(rfdetr::load_onnx_model_info(model).class_layout == layout);
     rfdetr::simplify_onnx_model_file(model);
     CHECK(rfdetr::load_onnx_model_info(model).class_layout == layout);
-    CHECK(session.Run(request, command, {.completed = [](const auto& record, auto, const auto&) {
-        REQUIRE(record.detections.size() == 2);
-        CHECK(record.detections[0].class_domain == catalog::ClassReferenceDomain::Foreground);
-        CHECK(record.detections[0].class_reference == 1);
-        CHECK(record.detections[1].class_reference == 0);
-        CHECK(record.detections[0].mask.area == 1);
-        CHECK(record.detections[1].mask.area == 0);
-    }}).processed_images == 1);
+    const auto mapped_images = session
+                                   .Run(request, command,
+                                        {.completed =
+                                             [](const auto& record, auto, const auto&) {
+                                                 REQUIRE(record.detections.size() == 2);
+                                                 CHECK(record.detections[0].class_domain == catalog::ClassReferenceDomain::Foreground);
+                                                 CHECK(record.detections[0].class_reference == 1);
+                                                 CHECK(record.detections[1].class_reference == 0);
+                                                 CHECK(record.detections[0].mask.area == 1);
+                                                 CHECK(record.detections[1].mask.area == 0);
+                                             }})
+                                   .processed_images;
+    CHECK(mapped_images == 1);
     CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
 }
-
 TEST_CASE("ONNX output roles accept explicit producer names without shape guessing", "[model][rfdetr][layout][onnx]") {
     namespace onnx = mmltk_onnx;
     const mmltk::testsupport::ScopedTempDir root("rfdetr-named-output-roles");
     const auto path = root.path() / "custom.onnx";
     write_prediction_model(path, 2, false);
     onnx::ModelProto model;
-    { std::ifstream input(path, std::ios::binary); REQUIRE(model.ParseFromIstream(&input)); }
+    {
+        std::ifstream input(path, std::ios::binary);
+        REQUIRE(model.ParseFromIstream(&input));
+    }
     const std::array<std::pair<std::string, std::string>, 2> names{{{"pred_logits", "scores_from_producer"}, {"pred_boxes", "locations_from_producer"}}};
     for (const auto& [from, to] : names) {
-        for (auto& output : *model.mutable_graph()->mutable_output()) if (output.name() == from) output.set_name(to);
+        for (auto& output : *model.mutable_graph()->mutable_output())
+            if (output.name() == from) output.set_name(to);
         for (auto& node : *model.mutable_graph()->mutable_node())
-            for (auto& output : *node.mutable_output()) if (output == from) output = to;
+            for (auto& output : *node.mutable_output())
+                if (output == from) output = to;
     }
-    { std::ofstream output(path, std::ios::binary | std::ios::trunc); REQUIRE(model.SerializeToOstream(&output)); }
+    {
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        REQUIRE(model.SerializeToOstream(&output));
+    }
     CHECK_THROWS(rfdetr::load_onnx_model_info(path));
-    const std::array roles{
-        rfdetr::RfdetrNamedOutputRole{"scores_from_producer", rfdetr::RfdetrOutputRole::Logits},
-        rfdetr::RfdetrNamedOutputRole{"locations_from_producer", rfdetr::RfdetrOutputRole::Boxes}};
+    const std::array roles{rfdetr::RfdetrNamedOutputRole{"scores_from_producer", rfdetr::RfdetrOutputRole::Logits},
+                           rfdetr::RfdetrNamedOutputRole{"locations_from_producer", rfdetr::RfdetrOutputRole::Boxes}};
     const auto admitted = rfdetr::load_onnx_model_info(path, roles);
     CHECK(admitted.num_classes == 2);
     CHECK(admitted.num_queries == 2);
@@ -753,15 +856,17 @@ TEST_CASE("ONNX output roles accept explicit producer names without shape guessi
     layout.slots.pop_back();
     const auto companion = std::filesystem::path(path.string() + ".classes.json");
     namespace io = mmltk::common::io;
-    { std::ofstream output(companion); output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout,
-        std::vector<rfdetr::RfdetrNamedOutputRole>(roles.begin(), roles.end())}); }
+    {
+        std::ofstream output(companion);
+        output << rfdetr::encode_class_descriptor(
+            {1, io::sha256_hex(io::sha256_file(path)), layout, std::vector<rfdetr::RfdetrNamedOutputRole>(roles.begin(), roles.end())});
+    }
     rfdetr::simplify_onnx_model_file(path);
     const auto descriptor = rfdetr::detail::read_class_descriptor(companion);
     CHECK(descriptor.artifact_sha256 == io::sha256_hex(io::sha256_file(path)));
     CHECK(descriptor.layout == layout);
-    CHECK(rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path, descriptor.output_roles)) == descriptor.output_roles);
+    CHECK((rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path, descriptor.output_roles)) == descriptor.output_roles));
 }
-
 TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout and roles", "[model][rfdetr][layout][onnx]") {
     namespace io = mmltk::common::io;
     const mmltk::testsupport::ScopedTempDir root("onnx-companion-simplification");
@@ -773,24 +878,32 @@ TEST_CASE("Same-path ONNX simplification rebinds authoritative companion layout 
     layout.slots[0].foreground_index = 1;
     layout.slots[1].foreground_index = 0;
     const auto roles = rfdetr::rfdetr_output_roles(rfdetr::load_onnx_model_info(path));
-    { std::ofstream output(companion); output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, roles}); }
+    {
+        std::ofstream output(companion);
+        output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, roles});
+    }
     rfdetr::simplify_onnx_model_file(path);
     const auto descriptor = rfdetr::detail::read_class_descriptor(companion);
     CHECK(descriptor.artifact_sha256 == io::sha256_hex(io::sha256_file(path)));
     CHECK(descriptor.layout == layout);
-    CHECK(descriptor.output_roles == roles);
+    CHECK((descriptor.output_roles == roles));
     const auto info = rfdetr::load_onnx_model_info(path, descriptor.output_roles);
     CHECK(rfdetr::ClassArtifactAdmission(path).Resolve(info.num_classes, info.class_layout) == layout);
-    CHECK(rfdetr::rfdetr_output_roles(info) == roles);
+    CHECK((rfdetr::rfdetr_output_roles(info) == roles));
     // Malformed graph serialization must preserve both admitted files on failure.
-    { std::ofstream output(path, std::ios::trunc); output << "not a protobuf"; }
-    { std::ofstream output(companion); output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, roles}); }
+    {
+        std::ofstream output(path, std::ios::trunc);
+        output << "not a protobuf";
+    }
+    {
+        std::ofstream output(companion);
+        output << rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout, roles});
+    }
     const auto old_artifact = io::sha256_file(path), old_companion = io::sha256_file(companion);
     CHECK_THROWS(rfdetr::simplify_onnx_model_file(path));
     CHECK(io::sha256_file(path) == old_artifact);
     CHECK(io::sha256_file(companion) == old_companion);
 }
-
 TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only materialization", "[model][rfdetr][layout][gpu]") {
     namespace data = mmltk::backend::data;
     namespace io = mmltk::common::io;
@@ -799,17 +912,30 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     data::testsupport::create_synthetic_dataset(fixture);
     const auto categories = std::filesystem::path(data::testsupport::dataset_dir(fixture)) / "categories.json";
     nlohmann::json catalog;
-    { std::ifstream input(categories); input >> catalog; }
+    {
+        std::ifstream input(categories);
+        input >> catalog;
+    }
     catalog["classes"].erase(catalog["classes"].begin() + 2, catalog["classes"].end());
     for (int index = 3; index <= fixture.num_images; ++index) {
-        auto filename = std::to_string(index); filename.insert(0U, 6U - filename.size(), '0');
+        auto filename = std::to_string(index);
+        filename.insert(0U, 6U - filename.size(), '0');
         const auto path = std::filesystem::path(data::testsupport::dataset_dir(fixture)) / fixture.split / (filename + ".jsonl");
         nlohmann::json annotation;
-        { std::ifstream input(path); input >> annotation; }
+        {
+            std::ifstream input(path);
+            input >> annotation;
+        }
         annotation["class"] = index % 2 == 0 ? "person" : "ret";
-        { std::ofstream output(path); output << annotation.dump() << '\n'; }
+        {
+            std::ofstream output(path);
+            output << annotation.dump() << '\n';
+        }
     }
-    { std::ofstream output(categories); output << catalog; }
+    {
+        std::ofstream output(categories);
+        output << catalog;
+    }
     data::CompilerConfig config;
     config.source_dir = data::testsupport::dataset_dir(fixture);
     config.output_dir = data::testsupport::compiled_dir(fixture);
@@ -824,7 +950,10 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     layout.slots.pop_back();
     const auto descriptor = root.path() / "selected.classes.json";
     const auto encoded = rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(source)), layout});
-    { std::ofstream output(descriptor); output << encoded; }
+    {
+        std::ofstream output(descriptor);
+        output << encoded;
+    }
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     const auto stream = c10::cuda::getCurrentCUDAStream(0).stream();
     const mmltk::backend::ml::runtime::BorrowedCommandStream command{reinterpret_cast<std::uintptr_t>(stream), true};
@@ -864,17 +993,23 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
         request.limit_images = population;
         std::vector<std::uint32_t> chosen, captured;
         std::size_t selections = 0U;
-        const auto sampled = session.Run(request, command, {
-            .mask_metrics = false,
-            .samples_selected = [&](auto indices, auto) { ++selections; chosen.assign(indices.begin(), indices.end()); },
-            .sample = [&](rfdetr::ValidationSampleView sample) {
-                REQUIRE(sample.pixels.chw);
-                REQUIRE(sample.pixels.custody);
-                CHECK(sample.annotations.class_catalog);
-                CHECK_FALSE(sample.ground_truth.empty());
-                captured.push_back(static_cast<std::uint32_t>(sample.prediction.dataset_index));
-            },
-        });
+        const auto sampled = session.Run(request, command,
+                                         {
+                                             .mask_metrics = false,
+                                             .samples_selected =
+                                                 [&](auto indices, auto) {
+                                                     ++selections;
+                                                     chosen.assign(indices.begin(), indices.end());
+                                                 },
+                                             .sample =
+                                                 [&](rfdetr::ValidationSampleView sample) {
+                                                     REQUIRE(sample.pixels.chw);
+                                                     REQUIRE(sample.pixels.custody);
+                                                     CHECK(sample.annotations.class_catalog);
+                                                     CHECK_FALSE(sample.ground_truth.empty());
+                                                     captured.push_back(static_cast<std::uint32_t>(sample.prediction.dataset_index));
+                                                 },
+                                         });
         CHECK(selections == 1U);
         CHECK(chosen.size() == std::min<std::size_t>(6U, population));
         CHECK(std::ranges::adjacent_find(chosen) == chosen.end());
@@ -885,8 +1020,9 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
         CHECK_FALSE(sampled.backends.at("onnx").details.empty());
     }
     std::stop_source cancelled;
-    const auto partial = session.Run(request, command, {.stop = cancelled.get_token(),
-        .progress = [&](auto processed, auto) { if (processed == 1U) cancelled.request_stop(); }});
+    const auto partial = session.Run(request, command, {.stop = cancelled.get_token(), .progress = [&](auto processed, auto) {
+                                                            if (processed == 1U) cancelled.request_stop();
+                                                        }});
     CHECK(partial.cancelled);
     CHECK(partial.processed_images == 1U);
     CHECK(partial.backends.at("onnx").timing.images == 1U);
@@ -895,21 +1031,29 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     const auto preserved = io::sha256_file(request.save_engine_path);
     auto unrelated = rfdetr::decode_class_descriptor(encoded);
     unrelated.artifact_sha256 = std::string(64, '0');
-    { std::ofstream output(descriptor); output << rfdetr::encode_class_descriptor(unrelated); }
+    {
+        std::ofstream output(descriptor);
+        output << rfdetr::encode_class_descriptor(unrelated);
+    }
     CHECK_THROWS_AS(session.Run(request, command), std::invalid_argument);
     CHECK(io::sha256_file(request.save_engine_path) == preserved);
     CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
 }
-
 TEST_CASE("Stopped synchronous export engine and validation skip production and preserve bundles", "[model][rfdetr][layout][cancellation]") {
     namespace io = mmltk::common::io;
     const mmltk::testsupport::ScopedTempDir root("rfdetr-stopped-producers");
     const auto output = root.path() / "previous.model";
     const auto companion = std::filesystem::path(output.string() + ".classes.json");
     const auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
-    { std::ofstream file(output); file << "previous complete artifact"; }
+    {
+        std::ofstream file(output);
+        file << "previous complete artifact";
+    }
     const auto original = io::sha256_file(output);
-    { std::ofstream file(companion); file << rfdetr::encode_class_descriptor({1, io::sha256_hex(original), layout}); }
+    {
+        std::ofstream file(companion);
+        file << rfdetr::encode_class_descriptor({1, io::sha256_hex(original), layout});
+    }
     const auto original_companion = io::sha256_file(companion);
     std::stop_source source;
     source.request_stop();
@@ -937,7 +1081,6 @@ TEST_CASE("Stopped synchronous export engine and validation skip production and 
     CHECK(io::sha256_file(companion) == original_companion);
     for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
 }
-
 TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[model][rfdetr][layout][onnx]") {
     namespace io = mmltk::common::io;
     const mmltk::testsupport::ScopedTempDir root("onnx-retained-descriptor");
@@ -947,13 +1090,19 @@ TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[m
     auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
     layout.slots.pop_back();
     const auto encoded = rfdetr::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout});
-    { std::ofstream output(companion); output << encoded; }
+    {
+        std::ofstream output(companion);
+        output << encoded;
+    }
     const rfdetr::ClassArtifactAdmission admission(path);
     const auto info = rfdetr::load_onnx_model_info(path, admission.output_roles());
     CHECK(admission.Resolve(info.num_classes, info.class_layout) == layout);
     SECTION("replacement after loading rejects the original parsed facts") {
         const auto replacement = root.path() / "replacement.json";
-        { std::ofstream output(replacement); output << encoded; }
+        {
+            std::ofstream output(replacement);
+            output << encoded;
+        }
         std::filesystem::rename(replacement, companion);
         CHECK_THROWS(admission.Resolve(info.num_classes, info.class_layout));
     }

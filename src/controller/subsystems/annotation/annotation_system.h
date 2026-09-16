@@ -1,8 +1,6 @@
 #pragma once
-
 #include "src/controller/presentation/visual_source_projection.h"
 #include "src/controller/contracts/workspace_input.h"
-
 #include <memory>
 #include <optional>
 #include <cstddef>
@@ -12,7 +10,6 @@
 #include <string>
 #include <string_view>
 #include <variant>
-
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/presentation/visual_system_types.h"
@@ -21,11 +18,8 @@
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/system_image_model.h"
 #include "src/controller/presentation/visual_document.h"
-
 namespace mmltk::controller {
-
 struct AnnotationRenderState;
-
 struct AnnotationPointer final {
     contracts::AnnotationPointerPhase phase = contracts::AnnotationPointerPhase::Begin;
     std::uint64_t interaction_id = 0U;
@@ -39,9 +33,8 @@ struct AnnotationPointer final {
         [[= mmltk::frameworks::reflection::Maximum<std::uint16_t>{contracts::kMaxAnnotationBrushRadius}]] std::uint16_t brush_radius =
             contracts::kDefaultAnnotationBrushRadius;
     [[nodiscard]] bool valid() const noexcept {
-        return mmltk::frameworks::reflection::enum_contains(phase) && interaction_id != 0U && sequence != 0U && target.valid() &&
-               point.finite() && brush_radius >= contracts::kMinAnnotationBrushRadius &&
-               brush_radius <= contracts::kMaxAnnotationBrushRadius;
+        return mmltk::frameworks::reflection::enum_contains(phase) && interaction_id != 0U && sequence != 0U && target.valid() && point.finite() &&
+               brush_radius >= contracts::kMinAnnotationBrushRadius && brush_radius <= contracts::kMaxAnnotationBrushRadius;
     }
 };
 struct AnnotationOpen final {
@@ -102,10 +95,9 @@ struct AnnotationUndoEdit final {};
 struct AnnotationRedoEdit final {};
 struct AnnotationEdit final {
     using variant_type =
-        std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit,
-                     AnnotationCategoryEdit, AnnotationSelectedObjectEdit, AnnotationSplineEdit, AnnotationSplineHandleEdit,
-                     AnnotationSkeletonEdit, AnnotationMaskCleanupEdit, AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit,
-                     AnnotationRedoEdit, AnnotationClassEdit>;
+        std::variant<AnnotationToolEdit, AnnotationSetupEdit, AnnotationHoldEdit, AnnotationSidebarEdit, AnnotationObjectEdit, AnnotationCategoryEdit,
+                     AnnotationSelectedObjectEdit, AnnotationSplineEdit, AnnotationSplineHandleEdit, AnnotationSkeletonEdit, AnnotationMaskCleanupEdit,
+                     AnnotationMaskColorsEdit, AnnotationSceneEdit, AnnotationUndoEdit, AnnotationRedoEdit, AnnotationClassEdit>;
     variant_type value{};
 };
 struct AnnotationEditRequest final {
@@ -113,8 +105,7 @@ struct AnnotationEditRequest final {
 };
 class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
-    [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(
-        const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const {
+    [[nodiscard]] virtual mmltk::frameworks::gpu::ImageWorkspaceCoverage WorkspaceCoverage(const mmltk::frameworks::gpu::ImageWorkspaceObservation&) const {
         return {};
     }
     ~AnnotationAlgorithm() override = default;
@@ -122,9 +113,8 @@ class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
     // Source is the retained immutable document baseline. The algorithm owns
     // allocation-local initialization, damage and reusable raster inputs.
-    virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source,
-                        mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
-                        std::uintptr_t stream) const = 0;
+    virtual void Render(const AnnotationRenderState&, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView clean,
+                        mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t stream) const = 0;
 };
 struct AnnotationRenderedFacts final {
     bool operator==(const AnnotationRenderedFacts&) const = default;
@@ -138,7 +128,6 @@ struct AnnotationImageMetadata final {
     // Opt-in evidence for the exact rendered image; never authorizes input.
     std::optional<AnnotationRenderedFacts> diagnostics{};
 };
-
 struct AnnotationSnapshot final {
     std::uint64_t revision = 0U;
     std::uint64_t ui_revision = 0U;
@@ -172,16 +161,13 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Cri
     // CLEANUP-IGNORE: This critical Annotation detail is a distinct reflected event boundary.
     [[= mmltk::frameworks::reflection::MaxBytes{kVisualFailureByteCapacity}]] std::string detail;
 };
-
 class AnnotationSystem final {
    public:
     using visual_source =
-        VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation,
-                               mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
+        VisualSourceProjection<AnnotationSnapshot, PresentationSourceKind::Annotation, mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::frame>,
                                mmltk::frameworks::reflection::member_path<&AnnotationSnapshot::revision>, AnnotationImageMetadata>;
     using event_type = std::variant<AnnotationChanged, AnnotationFrameChanged, AnnotationFailed>;
-    AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {},
-                     VisualDiagnosticSink = {});
+    AnnotationSystem(VisualDeviceSettings, VisualRuntimeFactory, ExactVisualDocumentBorrower, SystemEventSink<event_type> = {}, VisualDiagnosticSink = {});
     ~AnnotationSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] AnnotationSnapshot Open(AnnotationOpen);
     // CLEANUP-IGNORE: Annotation's pointer/edit/save endpoints are a distinct reflected domain interface.
@@ -208,7 +194,6 @@ class AnnotationSystem final {
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
-
 // CLEANUP-IGNORE: The native factory and following reflection inventory are Annotation's canonical owner-colocated API.
 [[nodiscard]] VisualRuntimeFactory make_native_annotation_runtime_factory(VisualDeviceSettings);
 // CLEANUP-IGNORE: Annotation's canonical field registrations are distinct stable schema identities.
@@ -244,5 +229,4 @@ MMLTK_REFLECT_FIELDS(AnnotationChanged)
 MMLTK_REFLECT_FIELDS(AnnotationFrameState)
 MMLTK_REFLECT_FIELDS(AnnotationFrameChanged)
 MMLTK_REFLECT_FIELDS(AnnotationFailed)
-
 }  // namespace mmltk::controller

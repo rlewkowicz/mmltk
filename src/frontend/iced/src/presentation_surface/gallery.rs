@@ -32,7 +32,7 @@ pub(super) fn valid_layout(snapshot: &ExploreImageMetadata) -> bool {
 }
 
 pub(super) fn matching(frame: Option<FrameReady>) -> Option<Arc<ExploreImageMetadata>> {
-    super::metadata::pending(frame?).and_then(|metadata| metadata.gallery)
+    super::metadata::pending(frame?).and_then(|metadata| metadata.content.gallery().cloned())
 }
 
 pub(crate) fn displayed() -> Option<(Surface, Arc<ExploreImageMetadata>)> {
@@ -155,9 +155,7 @@ mod tests {
             completed: None,
             retained_read: None,
             pending_sample: Some(pending),
-            gallery: None,
-            detail: None,
-            annotation: None,
+            content: metadata::Content::default(),
             placement: placement(&ExploreImageMetadata::from(&snapshot)),
         };
         let mut model = crate::view_model::test_support::bootstrapped();
@@ -186,7 +184,7 @@ mod tests {
         assert!(matching(Some(next)).is_none());
         metadata::install_explore(next, &snapshot);
         assert_eq!(matching(Some(next)).unwrap().viewport.rowcount, 5);
-        assert_eq!(image.gallery.as_ref().unwrap().viewport.rowcount, 4);
+        assert_eq!(image.content.gallery().unwrap().viewport.rowcount, 4);
         super::super::retire_publication(frame);
         drop(image);
         assert!(super::super::test_releases().is_empty());

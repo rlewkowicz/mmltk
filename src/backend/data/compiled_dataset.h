@@ -13,7 +13,6 @@
 #include <memory>
 #include "src/backend/data/image_resize.h"
 #include "src/common/io/file_memory.h"
-
 namespace mmltk::backend::data {
 struct LabelIndexEntry {
     uint32_t label_begin;
@@ -21,12 +20,10 @@ struct LabelIndexEntry {
     uint16_t _pad;
 };
 static_assert(sizeof(LabelIndexEntry) == 8);
-
 struct CompiledImageRead {
     std::uint32_t index = 0;
     std::size_t destination_offset = 0;
 };
-
 class CompiledDataset {
    public:
     enum class AccessPattern : std::uint8_t { Normal, Sequential, Random };
@@ -36,11 +33,8 @@ class CompiledDataset {
     CompiledDataset(CompiledDataset&&) noexcept = default;
     CompiledDataset& operator=(CompiledDataset&&) noexcept = default;
     ~CompiledDataset() = default;
-
     [[nodiscard]] static CompiledDataset open(const std::filesystem::path& path, AccessPattern access = AccessPattern::Random);
-    [[nodiscard]] static std::expected<CompiledDataset, std::error_code> open_source(const std::filesystem::path& path,
-                                                                                     std::size_t image_limit);
-
+    [[nodiscard]] static std::expected<CompiledDataset, std::error_code> open_source(const std::filesystem::path& path, std::size_t image_limit);
     [[nodiscard]] const std::filesystem::path& path() const noexcept;
     [[nodiscard]] const mmltk::backend::data::FileHeader& header() const noexcept;
     [[nodiscard]] std::span<const std::string> class_names() const noexcept;
@@ -49,14 +43,11 @@ class CompiledDataset {
     [[nodiscard]] std::span<const mmltk::backend::data::PackedInstance> labels() const noexcept;
     [[nodiscard]] std::span<const mmltk::backend::data::RLEPair> rle_pairs() const noexcept;
     [[nodiscard]] bool masks_available() const noexcept;
-
     [[nodiscard]] const mmltk::backend::data::ImageEntry& image_entry(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] std::span<const mmltk::backend::data::PackedInstance> image_labels(std::uint32_t compiled_index) const noexcept;
-    [[nodiscard]] std::span<const mmltk::backend::data::RLEPair> instance_rle(
-        const mmltk::backend::data::PackedInstance& instance) const noexcept;
+    [[nodiscard]] std::span<const mmltk::backend::data::RLEPair> instance_rle(const mmltk::backend::data::PackedInstance& instance) const noexcept;
     [[nodiscard]] const float* image_pixels(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] mmltk::backend::data::RgbLetterbox letterbox(std::uint32_t compiled_index) const;
-
     [[nodiscard]] std::span<const LabelIndexEntry> label_index() const noexcept;
     [[nodiscard]] const float* pixel_blob() const noexcept;
     // Called only by image-stream I/O workers. Each advised/populated range is
@@ -66,14 +57,12 @@ class CompiledDataset {
         std::size_t capacity;
         void (*write)(void*, std::size_t, std::span<const std::byte>);
     };
-    [[nodiscard]] bool read_images_to(std::span<const CompiledImageRead>, ImageDestination, const std::atomic<bool>&,
-                                      bool prefault = false) const;
-    [[nodiscard]] bool read_images(std::span<const CompiledImageRead> reads, std::span<std::byte> destination,
-                                   const std::atomic<bool>& cancelled, bool prefault = false) const;
+    [[nodiscard]] bool read_images_to(std::span<const CompiledImageRead>, ImageDestination, const std::atomic<bool>&, bool prefault = false) const;
+    [[nodiscard]] bool read_images(std::span<const CompiledImageRead> reads, std::span<std::byte> destination, const std::atomic<bool>& cancelled,
+                                   bool prefault = false) const;
 
    private:
-    [[nodiscard]] static CompiledDataset open_mapped(const std::filesystem::path&, mmltk::common::io::MappedFile, std::size_t image_limit,
-                                                     AccessPattern);
+    [[nodiscard]] static CompiledDataset open_mapped(const std::filesystem::path&, mmltk::common::io::MappedFile, std::size_t image_limit, AccessPattern);
     std::filesystem::path path_;
     mmltk::common::io::MappedFile mapping_;
     mmltk::backend::data::FileHeader header_{};
@@ -83,5 +72,4 @@ class CompiledDataset {
     std::shared_ptr<const catalog::ClassCatalog> catalog_;
     std::vector<LabelIndexEntry> label_index_;
 };
-
 }  // namespace mmltk::backend::data

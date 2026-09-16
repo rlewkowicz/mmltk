@@ -1,5 +1,4 @@
 #pragma once  // backend.data private implementation boundary
-
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -8,17 +7,13 @@
 #include <optional>
 #include <string>
 #include <vector>
-
 #include "benchmark_cache.h"
-
 namespace mmltk::backend::data::benchmark_internal {
-
 enum class DownloadProgressPhase : std::uint8_t {
     kDownloading,
     kVerifyingCachedArtifact,
     kVerifyingDownloadedArtifact,
 };
-
 struct DownloadRequest {
     std::string artifact_id;
     std::string url;
@@ -28,7 +23,6 @@ struct DownloadRequest {
     std::optional<std::string> expected_sha256;
     std::uint32_t maximum_attempts = 5U;
 };
-
 struct DownloadProgress {
     std::string artifact_id;
     std::uint64_t completed_bytes = 0U;
@@ -38,7 +32,6 @@ struct DownloadProgress {
     bool cache_hit = false;
     DownloadProgressPhase phase = DownloadProgressPhase::kDownloading;
 };
-
 struct DownloadResult {
     std::filesystem::path path;
     std::uint64_t size = 0U;
@@ -50,15 +43,10 @@ struct DownloadResult {
     bool resumed = false;
     bool cache_hit = false;
 };
-
 using DownloadProgressSink = std::function<void(const DownloadProgress&)>;
-
 [[nodiscard]] std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest>& requests, std::size_t maximum_concurrency,
                                                              mmltk::common::concurrency::CancellationObservation cancel_requested,
-                                                             const DownloadProgressSink& progress = {},
-                                                             const BenchmarkTraceSink& trace = {});
-
+                                                             const DownloadProgressSink& progress = {}, const BenchmarkTraceSink& trace = {});
 void invalidate_download_artifact(const DownloadRequest& request, mmltk::common::concurrency::CancellationObservation cancel_requested = {},
                                   const BenchmarkTraceSink& trace = {});
-
 }  // namespace mmltk::backend::data::benchmark_internal

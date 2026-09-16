@@ -247,7 +247,11 @@ impl ApplicationModel {
         &mut self,
         snapshot: PredictSnapshot,
     ) -> Result<Observation, UiError> {
-        merge_predict_snapshot(&mut self.predict_snapshot, &mut self.predict_full_progress, snapshot)
+        merge_predict_snapshot(
+            &mut self.predict_snapshot,
+            &mut self.predict_full_progress,
+            snapshot,
+        )
     }
 
     pub(super) fn install_training_snapshot(
@@ -315,8 +319,11 @@ impl ApplicationModel {
             return Ok(Observation::Stale);
         }
         if progress.revision == installed.revision {
-            if progress.activity != installed.activity || progress.local != installed.local
-                || progress.metrics != installed.metrics || progress.persistence != installed.persistence {
+            if progress.activity != installed.activity
+                || progress.local != installed.local
+                || progress.metrics != installed.metrics
+                || progress.persistence != installed.persistence
+            {
                 return Err(UiError::protocol(
                     "inconsistent Training progress observation revision",
                 ));
@@ -338,7 +345,11 @@ impl ApplicationModel {
                 .training
                 .as_mut()
                 .map(|snapshot| &mut snapshot.local),
-            FeatureId::Validate => self.workflow.validation.as_mut().map(|snapshot| &mut snapshot.operation),
+            FeatureId::Validate => self
+                .workflow
+                .validation
+                .as_mut()
+                .map(|snapshot| &mut snapshot.operation),
             FeatureId::Export => self.workflow.export.as_mut(),
             FeatureId::Predict | FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => None,
         }
@@ -757,13 +768,19 @@ pub(super) fn merge_predict_progress(
     mut incoming: crate::generated::PredictProgressState,
 ) -> Result<Observation, UiError> {
     let Some(installed) = target.as_mut() else {
-        return Err(UiError::protocol("Predict progress arrived before bootstrap"));
+        return Err(UiError::protocol(
+            "Predict progress arrived before bootstrap",
+        ));
     };
-    if incoming.revision < installed.revision { return Ok(Observation::Stale); }
+    if incoming.revision < installed.revision {
+        return Ok(Observation::Stale);
+    }
     if incoming.revision == installed.revision {
         return if incoming == crate::generated::PredictProgressState::from(&*installed) {
             Ok(Observation::Current)
-        } else { Err(UiError::protocol("inconsistent Predict progress revision")) };
+        } else {
+            Err(UiError::protocol("inconsistent Predict progress revision"))
+        };
     }
     let mut operation = installed.operation.clone();
     if merge_compute_state(&mut operation, incoming.operation.clone())? == Observation::Stale {
@@ -786,8 +803,12 @@ pub(super) fn merge_predict_snapshot(
         *target = Some(incoming);
         return Ok(Observation::Installed);
     };
-    let previous_full = full_progress.as_ref().expect("installed Predict full observation");
-    if incoming.revision < previous_full.revision { return Ok(Observation::Stale); }
+    let previous_full = full_progress
+        .as_ref()
+        .expect("installed Predict full observation");
+    if incoming.revision < previous_full.revision {
+        return Ok(Observation::Stale);
+    }
     let latest = PredictProgressState::from(&*installed);
     if incoming.revision == previous_full.revision {
         if full != *previous_full {
@@ -796,10 +817,15 @@ pub(super) fn merge_predict_snapshot(
         // Compare the full image without copying retained labels or mistaking
         // newer scalar observations for a conflicting full snapshot.
         latest.apply_to(&mut incoming);
-        return if incoming == *installed { Ok(Observation::Current) }
-            else { Err(UiError::protocol("inconsistent Predict snapshot revision")) };
+        return if incoming == *installed {
+            Ok(Observation::Current)
+        } else {
+            Err(UiError::protocol("inconsistent Predict snapshot revision"))
+        };
     }
-    if incoming.frame.revision < installed.frame.revision { return Ok(Observation::Stale); }
+    if incoming.frame.revision < installed.frame.revision {
+        return Ok(Observation::Stale);
+    }
     if incoming.frame.revision == installed.frame.revision && incoming.frame != installed.frame {
         return Err(UiError::protocol("inconsistent Predict frame revision"));
     }
@@ -818,6 +844,7 @@ pub(super) fn merge_predict_snapshot(
     Ok(Observation::Installed)
 }
 
+#[cfg(test)]
 pub(crate) fn invalid_visual_frame() -> VisualFrame {
     VisualFrame {
         source: PresentationSourceIdentity {
@@ -924,7 +951,7 @@ mod tests {
 
     #[test]
     fn compute_merge_ignores_stale_activity_after_terminal() {
-        let crate::generated::ApplicationSnapshot::Validation(mut installed) =
+        let crate::generated::ApplicationSnapshot::Validation(installed) =
             crate::generated::application_snapshot_defaults()
                 .unwrap()
                 .into_iter()

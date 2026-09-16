@@ -156,9 +156,11 @@ impl Component {
                     .as_ref()
                     .ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, self.workflow)?;
-                if !compatibility(self.workflow, projection.selection.exportbuildtensorrt)
-                    .any(|row| row.input == value && source_allowed(row, projection.selection.key.source))
-                {
+                if !compatibility(self.workflow, projection.selection.exportbuildtensorrt).any(
+                    |row| {
+                        row.input == value && source_allowed(row, projection.selection.key.source)
+                    },
+                ) {
                     return Err(
                         "Generated catalog rejects this model input for the selected source."
                             .to_owned(),
@@ -173,17 +175,29 @@ impl Component {
                 )?)
             }
             Message::ClassLayoutEdited(value) => {
-                let draft = settings.draft.as_ref().ok_or_else(|| "Model settings are unavailable.".to_owned())?;
+                let draft = settings
+                    .draft
+                    .as_ref()
+                    .ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, self.workflow)?;
-                Outcome::SettingsEdited(settings.edit_fields(EditCadence::Debounced, [(
-                    projection.fields.key_fields.classlayoutpath, crate::generated::SettingsFieldValue::String(value)
-                )])?)
+                Outcome::SettingsEdited(settings.edit_fields(
+                    EditCadence::Debounced,
+                    [(
+                        projection.fields.key_fields.classlayoutpath,
+                        crate::generated::SettingsFieldValue::String(value),
+                    )],
+                )?)
             }
             Message::BrowseClassLayout => {
-                let draft = settings.draft.as_ref().ok_or_else(|| "Model settings are unavailable.".to_owned())?;
+                let draft = settings
+                    .draft
+                    .as_ref()
+                    .ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, self.workflow)?;
                 Outcome::BrowseRequested(crate::generated::FileDialogTarget::SettingsFieldTarget(
-                    crate::generated::SettingsFieldTarget { stableid: projection.fields.key_fields.classlayoutpath }
+                    crate::generated::SettingsFieldTarget {
+                        stableid: projection.fields.key_fields.classlayoutpath,
+                    },
                 ))
             }
             Message::BrowseRequested => {
@@ -244,7 +258,8 @@ impl Component {
                 let projection = projection(draft, FeatureId::Export)?;
                 let input = compatibility(FeatureId::Export, value)
                     .find(|row| {
-                        row.input == projection.selection.key.input && source_allowed(row, projection.selection.key.source)
+                        row.input == projection.selection.key.input
+                            && source_allowed(row, projection.selection.key.source)
                     })
                     .or_else(|| {
                         compatibility(FeatureId::Export, value)
@@ -334,7 +349,9 @@ impl<'a> State<'a> {
             .and_then(|value| custom_compatible_row(value).ok());
         let source = projection
             .as_ref()
-            .map_or(ModelSelectionSource::Canonical, |value| value.selection.key.source);
+            .map_or(ModelSelectionSource::Canonical, |value| {
+                value.selection.key.source
+            });
         let input = projection.as_ref().map_or_else(
             || {
                 if workflow == FeatureId::Export {
@@ -354,13 +371,17 @@ impl<'a> State<'a> {
         let build_tensorrt = projection
             .as_ref()
             .is_some_and(|value| value.selection.exportbuildtensorrt);
-        let preset = projection.as_ref().map(|value| value.selection.key.preset.clone());
+        let preset = projection
+            .as_ref()
+            .map(|value| value.selection.key.preset.clone());
         let artifact_field_id = projection
             .as_ref()
             .and_then(|value| value.artifact_field)
             .or_else(|| train_custom_row.and_then(|row| dialog_for_row(row).ok()))
             .map_or(0, |dialog| dialog.stable_field_id);
-        let class_layout_path = projection.as_ref().map_or_else(String::new, |value| value.selection.key.classlayoutpath.clone());
+        let class_layout_path = projection.as_ref().map_or_else(String::new, |value| {
+            value.selection.key.classlayoutpath.clone()
+        });
         let artifact = projection.map_or_else(String::new, |value| value.selection.artifact);
         Self {
             workflow,
@@ -530,12 +551,23 @@ pub(crate) fn status_presentation(state: Option<&ModelUiState>) -> StatusPresent
         detail: if state.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted {
             let layout = &state.selection.classlayout;
             let meaning = match layout.domain {
-                crate::generated::ClassReferenceDomain::Foreground => format!("{} foreground classes", layout.foregroundcount),
-                crate::generated::ClassReferenceDomain::RawOutputSlot => "Raw output slots; class identity unresolved".to_owned(),
+                crate::generated::ClassReferenceDomain::Foreground => {
+                    format!("{} foreground classes", layout.foregroundcount)
+                }
+                crate::generated::ClassReferenceDomain::RawOutputSlot => {
+                    "Raw output slots; class identity unresolved".to_owned()
+                }
             };
-            format!("{meaning} · {} outputs · {} background · {} unused · {:?}",
-                layout.outputcount, layout.backgroundcount, layout.unusedcount, layout.provenance.origin)
-        } else { state.terminal.detail.clone() },
+            format!(
+                "{meaning} · {} outputs · {} background · {} unused · {:?}",
+                layout.outputcount,
+                layout.backgroundcount,
+                layout.unusedcount,
+                layout.provenance.origin
+            )
+        } else {
+            state.terminal.detail.clone()
+        },
         tone,
     }
 }
@@ -770,8 +802,10 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
         text("Class layout (optional)"),
         iced::widget::text_input("Embedded or companion metadata", &state.class_layout_path)
             .on_input_maybe(state.settings_enabled.then_some(Message::ClassLayoutEdited)),
-        button("Browse class layout").on_press_maybe(state.settings_enabled.then_some(Message::BrowseClassLayout)),
-    ].spacing(super::FIELD_SPACING);
+        button("Browse class layout")
+            .on_press_maybe(state.settings_enabled.then_some(Message::BrowseClassLayout)),
+    ]
+    .spacing(super::FIELD_SPACING);
     let title = card_title(state.workflow);
     let body = if state.workflow == FeatureId::Train {
         column![
@@ -863,7 +897,10 @@ mod tests {
             .unwrap();
         let selected = projection(settings.draft.as_ref().unwrap(), FeatureId::Train).unwrap();
         assert_eq!(selected.selection.key.source, ModelSelectionSource::Custom);
-        assert_eq!(selected.selection.key.input, ModelArtifactInputKind::Weights);
+        assert_eq!(
+            selected.selection.key.input,
+            ModelArtifactInputKind::Weights
+        );
         assert_eq!(selected.selection.artifact, "/tmp/custom.pth");
     }
 
@@ -938,7 +975,10 @@ mod tests {
                     .unwrap();
                 let draft = settings.draft.as_ref().unwrap();
                 let actual = projection(draft, row.workflow).unwrap();
-                assert_eq!((actual.selection.key.source, actual.selection.key.input), (source, row.input));
+                assert_eq!(
+                    (actual.selection.key.source, actual.selection.key.input),
+                    (source, row.input)
+                );
             }
         }
     }
@@ -954,8 +994,9 @@ mod tests {
             .iter()
             .copied()
             .filter(|input| {
-                !compatibility(FeatureId::Train, selected.selection.exportbuildtensorrt)
-                    .any(|row| row.input == *input && source_allowed(row, selected.selection.key.source))
+                !compatibility(FeatureId::Train, selected.selection.exportbuildtensorrt).any(
+                    |row| row.input == *input && source_allowed(row, selected.selection.key.source),
+                )
             })
             .collect::<Vec<_>>();
         assert!(rejected.contains(&ModelArtifactInputKind::None));
@@ -1014,7 +1055,8 @@ mod tests {
             assert_eq!(selected.selection.exportbuildtensorrt, build);
             assert!(
                 compatibility(FeatureId::Export, build)
-                    .any(|row| row.input == selected.selection.key.input && source_allowed(row, selected.selection.key.source))
+                    .any(|row| row.input == selected.selection.key.input
+                        && source_allowed(row, selected.selection.key.source))
             );
         }
     }
@@ -1098,7 +1140,8 @@ mod tests {
         let input_field_id = projection(settings.draft.as_ref().unwrap(), custom.workflow)
             .unwrap()
             .fields
-            .key_fields.input;
+            .key_fields
+            .input;
         crate::generated::apply_settings_field(
             settings.draft.as_mut().unwrap(),
             input_field_id,

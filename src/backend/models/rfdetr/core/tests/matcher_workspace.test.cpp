@@ -13,14 +13,11 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/common/system/execution_policy.h"
-
 using namespace mmltk::backend::models::rfdetr;
 namespace {
 using Indices = std::vector<std::vector<std::pair<at::Tensor, at::Tensor>>>;
 at::Tensor longs(std::initializer_list<std::int64_t> values) { return at::tensor(values, at::TensorOptions().dtype(at::kLong)); }
-Indices assignments() {
-    return {{{longs({2, 0}), longs({1, 0})}, {longs({1}), longs({0})}}, {{longs({0}), longs({1})}, {longs({}), longs({})}}};
-}
+Indices assignments() { return {{{longs({2, 0}), longs({1, 0})}, {longs({1}), longs({0})}}, {{longs({0}), longs({1})}, {longs({}), longs({})}}}; }
 void require_transport(bool h2d, int device) {
     if (h2d) return;
     int mmap = 0;
@@ -28,11 +25,9 @@ void require_transport(bool h2d, int device) {
     if (!(status == CUDA_SUCCESS && mmap) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0)
         SKIP("GDR backend unavailable; assignment transfer and autograd hardware behavior remain unverified");
 }
-
 struct MatcherDeviceScope final {
     explicit MatcherDeviceScope(const int device) : MatcherDeviceScope(device, false, true) {}
     MatcherDeviceScope(const int device, const bool h2d) : MatcherDeviceScope(device, true, h2d) {}
-
     c10::DeviceIndex device_index;
     c10::cuda::CUDAGuard guard;
     mmltk::frameworks::gpu::DeviceExecution execution;
@@ -44,16 +39,13 @@ struct MatcherDeviceScope final {
           guard(device_index),
           execution(select_execution(device, verify_transport, h2d)),
           policy({execution.placement.cpus, {}, 0, execution.placement.numa_node, -10, false}) {}
-
-    [[nodiscard]] static mmltk::frameworks::gpu::DeviceExecution select_execution(const int device, const bool verify_transport,
-                                                                                  const bool h2d) {
+    [[nodiscard]] static mmltk::frameworks::gpu::DeviceExecution select_execution(const int device, const bool verify_transport, const bool h2d) {
         REQUIRE(cudaSetDevice(device) == cudaSuccess);
         if (verify_transport) require_transport(h2d, device);
         return mmltk::frameworks::gpu::test_support::selected_test_device(device, mmltk::common::system::NumaTopology::Capture());
     }
 };
 }  // namespace
-
 TEST_CASE("Matcher assignment CPU projections share one immutable packed set", "[rfdetr][matcher][numa]") {
     const auto topology = mmltk::common::system::NumaTopology::Capture();
     MatcherWorkspace workspace(topology.permitted_nodes.front(), true);
@@ -80,7 +72,6 @@ TEST_CASE("Matcher assignment CPU projections share one immutable packed set", "
     }
     REQUIRE(retained.flatten()[3].item<std::int64_t>() == 31);
 }
-
 TEST_CASE("Rectangular assignment packing uses full target offsets and retained active extents", "[rfdetr][matcher][numa]") {
     const auto topology = mmltk::common::system::NumaTopology::Capture();
     MatcherWorkspace workspace(topology.permitted_nodes.front(), true);
@@ -103,7 +94,6 @@ TEST_CASE("Rectangular assignment packing uses full target offsets and retained 
     REQUIRE(at::equal(packed[0].source.second.narrow(0, 0, 300), rows));
     REQUIRE(at::equal(packed[1].global_targets.narrow(0, 0, 150), shorter_rows));
 }
-
 TEST_CASE("Matcher costs copy only compact active shapes after high-water growth", "[rfdetr][matcher][cuda][numa]") {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) SKIP("CUDA unavailable; active cost transfer remains unverified");
@@ -139,7 +129,6 @@ TEST_CASE("Matcher costs copy only compact active shapes after high-water growth
         }
     }
 }
-
 TEST_CASE("Assignment transports retain autograd indices across overlapping results", "[rfdetr][matcher][cuda][numa]") {
     const bool h2d = GENERATE(true, false);
     int devices = 0;
@@ -182,7 +171,6 @@ TEST_CASE("Assignment transports retain autograd indices across overlapping resu
         REQUIRE(counters.h2d_submissions == (h2d ? 4 : 0));
         REQUIRE(counters.gdr_writes == (h2d ? 0 : 4));
         REQUIRE(counters.storage_growth == warm);
-
         at::Tensor escaped_loss;
         values.grad().zero_();
         try {

@@ -76,7 +76,8 @@ impl Router {
     }
 
     pub fn sync_workflows(&mut self, model: &ApplicationModel) {
-        self.train.sync_metrics(model, self.active == FeatureId::Train);
+        self.train
+            .sync_metrics(model, self.active == FeatureId::Train);
     }
     pub fn install_authoritative_components(&mut self, model: &ApplicationModel) {
         self.explore.rebase(model);

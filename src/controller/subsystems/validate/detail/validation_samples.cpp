@@ -13,7 +13,7 @@ namespace mmltk::controller::detail {
 namespace gpu = mmltk::frameworks::gpu;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 class ValidationSamples::Impl final {
- public:
+   public:
     struct Sample final {
         ValidationSampleMetadata metadata;
         std::uint64_t content_identity = 0U;
@@ -30,14 +30,23 @@ class ValidationSamples::Impl final {
         ValidationOverlays overlays;
     };
     Impl(VisualDeviceSettings visual, std::function<void()> changed, PredictionPreviewPool::TransferOperations transfers)
-        : visual_(visual), changed_(std::move(changed)), transfers_(transfers), worker_([this](auto revisions) {
-            EnsurePool();
-            gpu::SystemImageRuntimeConfig config{.device = visual_.device,
-                .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U,
-                .numa_node = visual_.numa_node, .execution = execution_, .product_revisions = std::move(revisions), .adopted_context = context_};
-            configure_visual_workspace_finalization(config);
-            return std::make_unique<gpu::SystemImageRuntime>(std::move(config));
-        }, [this](std::exception_ptr) { Notify(); }) {
+        : visual_(visual),
+          changed_(std::move(changed)),
+          transfers_(transfers),
+          worker_(
+              [this](auto revisions) {
+                  EnsurePool();
+                  gpu::SystemImageRuntimeConfig config{.device = visual_.device,
+                                                       .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+                                                       .output_buffer_count = 2U,
+                                                       .numa_node = visual_.numa_node,
+                                                       .execution = execution_,
+                                                       .product_revisions = std::move(revisions),
+                                                       .adopted_context = context_};
+                  configure_visual_workspace_finalization(config);
+                  return std::make_unique<gpu::SystemImageRuntime>(std::move(config));
+              },
+              [this](std::exception_ptr) { Notify(); }) {
         if (visual_.valid() && (visual_.maximum_width < 3U || visual_.maximum_height < 2U))
             throw contracts::InvalidIntentError("validation requires at least a 3 by 2 image envelope");
         worker_.RegisterContinuation([this](auto& runtime, auto stop) { return Render(runtime, stop); }, {}, true);
@@ -50,10 +59,15 @@ class ValidationSamples::Impl final {
         if (!visual_.valid()) throw contracts::UnavailableError("validation visual device is unavailable");
         execution_ = resolve_visual_device_execution(visual_);
         context_ = CreatePredictionPreviewContext(*execution_, retirement_);
-        pool_ = std::make_unique<PredictionPreviewPool>(*execution_, *context_,
-            transfers_, retirement_, kRawCapacity);
+        pool_ = std::make_unique<PredictionPreviewPool>(*execution_, *context_, transfers_, retirement_, kRawCapacity);
     }
-    void Notify() noexcept { if (changed_) { try { changed_(); } catch (...) {} } }
+    void Notify() noexcept {
+        if (changed_) {
+            try {
+                changed_();
+            } catch (...) {}
+        }
+    }
     void Begin(std::uint64_t generation, std::span<const std::uint32_t> indices) {
         if (indices.size() > rfdetr::kValidationSampleCapacity) throw contracts::InvalidIntentError("validation sample count exceeds six");
         auto next = std::make_shared<Set>();
@@ -61,7 +75,8 @@ class ValidationSamples::Impl final {
         for (std::size_t index = 0; index < indices.size(); ++index) next->samples[index].metadata.identity = {generation, indices[index]};
         {
             std::scoped_lock lock(mutex_);
-            if (content_frontier_ > std::numeric_limits<std::uint64_t>::max() - (rfdetr::kValidationSampleCapacity + 1U)) throw contracts::FailedError("validation content identities exhausted");
+            if (content_frontier_ > std::numeric_limits<std::uint64_t>::max() - (rfdetr::kValidationSampleCapacity + 1U))
+                throw contracts::FailedError("validation content identities exhausted");
             next->atlas_identity = ++content_frontier_;
             for (auto& sample : next->samples) sample.content_identity = ++content_frontier_;
             current_ = std::move(next);
@@ -77,10 +92,10 @@ class ValidationSamples::Impl final {
         std::shared_ptr<const PredictionPreviewFrame> raw;
         {
             std::scoped_lock lock(pool_mutex_);
-            raw = pool_->Capture(sample.pixels.chw, {sample.pixels.width, sample.pixels.height}, sample.pixels.stream,
-                sample.prediction.detections, sample.annotations, sample.annotations.class_catalog,
-                static_cast<int>(sample.annotations.class_catalog->size()), sample.pixels.rgb8, std::move(sample.pixels.custody),
-                sample.pixels.stop_source, sample.pixels.source_control, sample.ground_truth, true);
+            raw = pool_->Capture(sample.pixels.chw, {sample.pixels.width, sample.pixels.height}, sample.pixels.stream, sample.prediction.detections,
+                                 sample.annotations, sample.annotations.class_catalog, static_cast<int>(sample.annotations.class_catalog->size()),
+                                 sample.pixels.rgb8, std::move(sample.pixels.custody), sample.pixels.stop_source, sample.pixels.source_control,
+                                 sample.ground_truth, true);
         }
         if (!raw) return;
         ValidationSampleMetadata metadata;
@@ -92,7 +107,11 @@ class ValidationSamples::Impl final {
                 const auto category = static_cast<std::size_t>(prediction.class_reference);
                 if (category >= raw->classes().size()) throw std::invalid_argument("validation sample category is absent");
                 metadata.labels.push_back({{{prediction.bbox_xyxy[0], prediction.bbox_xyxy[1]}, {prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]}},
-                    palette[category], static_cast<std::uint32_t>(category), ground_truth, prediction.score, raw->classes()[category]});
+                                           palette[category],
+                                           static_cast<std::uint32_t>(category),
+                                           ground_truth,
+                                           prediction.score,
+                                           raw->classes()[category]});
             }
         };
         labels(raw->predictions(), false);
@@ -124,7 +143,8 @@ class ValidationSamples::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (!displayed_) throw contracts::InvalidIntentError("validation sample is not displayed");
-            const auto found = std::ranges::find_if(displayed_->samples, [&](const auto& sample) { return sample.raw && sample.metadata.identity == identity; });
+            const auto found =
+                std::ranges::find_if(displayed_->samples, [&](const auto& sample) { return sample.raw && sample.metadata.identity == identity; });
             if (found == displayed_->samples.end()) throw contracts::InvalidIntentError("validation sample identity is stale");
             requested_.atlas = displayed_;
             requested_.detail = identity;
@@ -154,7 +174,10 @@ class ValidationSamples::Impl final {
                 requested_.detail.reset();
                 if (image_.detail) {
                     for (const auto& sample : image_.samples)
-                        if (sample.available) { requested_.detail = sample.identity; break; }
+                        if (sample.available) {
+                            requested_.detail = sample.identity;
+                            break;
+                        }
                 }
             }
             if (requested_.atlas) RequestRender();
@@ -181,7 +204,8 @@ class ValidationSamples::Impl final {
                 std::scoped_lock lock(mutex_);
                 set = requested_.atlas;
                 if (!set || !render_requested_) return {};
-                selected = requested_.detail; overlays = requested_.overlays;
+                selected = requested_.detail;
+                overlays = requested_.overlays;
                 *drawing = *set;
                 attempt = request_revision_;
                 render_requested_ = false;
@@ -205,19 +229,22 @@ class ValidationSamples::Impl final {
                 const auto& sample = drawing->samples[index];
                 if (!sample.raw || (selected && sample.metadata.identity != *selected)) continue;
                 auto metadata = sample.metadata;
-                metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height} :
-                    VisualRegion{static_cast<std::uint32_t>(index % 3U) * cell_width, static_cast<std::uint32_t>(index / 3U) * cell_height, cell_width, cell_height};
+                metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height}
+                                         : VisualRegion{static_cast<std::uint32_t>(index % 3U) * cell_width,
+                                                        static_cast<std::uint32_t>(index / 3U) * cell_height, cell_width, cell_height};
                 regions[region_count++] = {sample.raw, metadata.crop};
                 image.samples[index] = std::move(metadata);
             }
-            PredictionPreviewComposition::Draw(runtime, candidate, extent, std::span(regions).first(region_count),
+            PredictionPreviewComposition::Draw(
+                runtime, candidate, extent, std::span(regions).first(region_count),
                 {overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks});
             image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
             static_cast<void>(runtime.CommitOutput(std::move(candidate)));
             return [this, attempt, drawing = std::move(drawing), image = std::move(image)]() mutable {
                 {
                     std::scoped_lock lock(mutex_);
-                    displayed_ = std::move(drawing); image_ = std::move(image);
+                    displayed_ = std::move(drawing);
+                    image_ = std::move(image);
                     if (attempt == request_revision_) dirty_ = false;
                 }
                 Notify();
@@ -227,8 +254,9 @@ class ValidationSamples::Impl final {
             const auto context_failure = gpu::find_image_failure<gpu::CudaContextFailure>(failure);
             bool terminal_context = false;
             if (context_failure) {
-                try { std::rethrow_exception(context_failure); }
-                catch (const gpu::CudaContextFailure& error) { terminal_context = error.terminal(); }
+                try {
+                    std::rethrow_exception(context_failure);
+                } catch (const gpu::CudaContextFailure& error) { terminal_context = error.terminal(); }
             }
             if (terminal_context || !retirement_->admission_open() || gpu::is_image_execution_failure(failure)) {
                 static_cast<void>(runtime.Retire(failure));
@@ -257,11 +285,14 @@ class ValidationSamples::Impl final {
         worker_.StopAndWait();
         {
             std::scoped_lock lock(mutex_);
-            current_.reset(); displayed_.reset(); requested_.atlas.reset();
+            current_.reset();
+            displayed_.reset();
+            requested_.atlas.reset();
         }
         {
             std::scoped_lock lock(pool_mutex_);
-            pool_.reset(); context_.reset();
+            pool_.reset();
+            context_.reset();
         }
         worker_.FinishStoppedRetirement();
     }
@@ -313,9 +344,12 @@ std::optional<ValidationImageMetadata> ValidationSamples::ImageSnapshot(const Vi
     std::scoped_lock lock(impl_->mutex_);
     return impl_->image_.frame == frame ? std::optional{impl_->image_} : std::nullopt;
 }
-gpu::BorrowedImageProductReadView ValidationSamples::BorrowFrame() const { const auto frame = snapshot().frame; return borrow_matching_visual_product(frame, impl_->worker_); }
+gpu::BorrowedImageProductReadView ValidationSamples::BorrowFrame() const {
+    const auto frame = snapshot().frame;
+    return borrow_matching_visual_product(frame, impl_->worker_);
+}
 gpu::BorrowedImageWorkspace ValidationSamples::BorrowWorkspace() const { return impl_->worker_.BorrowWorkspace(); }
 gpu::ImageWorkspaceObservation ValidationSamples::ObserveWorkspace() const { return impl_->worker_.ObserveWorkspace(); }
 void ValidationSamples::RequestWorkspace(VisualWorkspaceRequest request) { impl_->worker_.RequestWorkspace(std::move(request)); }
 void ValidationSamples::Shutdown() noexcept { impl_->Shutdown(); }
-}
+}  // namespace mmltk::controller::detail

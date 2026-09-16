@@ -2,21 +2,17 @@
 #include "detail/shiftlut_lookup_cuda.h"
 #include "detail/shiftlut_model_format.h"
 #include <onnxruntime_cxx_api.h>
-
 #include <array>
 #include <exception>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
 namespace mmltk::backend::imaging::upscale::shiftlut {
 namespace {
-
 void checked(cudaError_t status, const char* context) {
     if (status != cudaSuccess) throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
 }
-
 // ORT destroys kernels only after their session's submitted work has settled.
 // One allocation owns immutable tables followed by both ping-pong stage images.
 class Storage final {
@@ -24,8 +20,7 @@ class Storage final {
     void Install(const float* tables) {
         if (data_ != nullptr) return;
         checked(cudaGetDevice(&device_), "bind ShiftLUT allocation");
-        checked(cudaMalloc(reinterpret_cast<void**>(&data_), resident_bytes(decision_capacity_)),
-                "allocate resident ShiftLUT tables and stages");
+        checked(cudaMalloc(reinterpret_cast<void**>(&data_), resident_bytes(decision_capacity_)), "allocate resident ShiftLUT tables and stages");
         if (allocation_counter_ != nullptr) ++*allocation_counter_;
         checked(cudaMemcpy(data_, tables, kTableBytes, cudaMemcpyHostToDevice), "install immutable ShiftLUT tables");
     }
@@ -44,8 +39,7 @@ class Storage final {
         const auto restored = cudaSetDevice(previous);
         return released == cudaSuccess ? restored : released;
     }
-    Storage(std::size_t decision_capacity, std::uint64_t* allocation_counter)
-        : decision_capacity_(decision_capacity), allocation_counter_(allocation_counter) {
+    Storage(std::size_t decision_capacity, std::uint64_t* allocation_counter) : decision_capacity_(decision_capacity), allocation_counter_(allocation_counter) {
         if (decision_capacity > kMaximumTilePixels) throw std::invalid_argument("invalid ShiftLUT diagnostic capacity");
     }
     Storage(const Storage&) = delete;
@@ -66,7 +60,6 @@ class Storage final {
     int device_ = 0;
     float* data_ = nullptr;
 };
-
 class Kernel final {
    public:
     Kernel(const OrtApi& api, const OrtKernelInfo* info, Storage& storage) : storage_(storage) {
@@ -83,7 +76,6 @@ class Kernel final {
         validate_tables(std::as_bytes(std::span{data, kTableElements}));
         storage_.Install(data);
     }
-
     OrtStatusPtr ComputeV2(OrtKernelContext* raw) noexcept {
         try {
             Ort::KernelContext context{raw};
@@ -92,8 +84,7 @@ class Kernel final {
             std::array<std::int64_t, 4> shape{};
             if (type.GetDimensionsCount() != shape.size()) throw std::invalid_argument("ShiftLUT input must be NCHW");
             Ort::ThrowOnError(Ort::GetApi().GetDimensions(type, shape.data(), shape.size()));
-            if (shape[0] != 1 || shape[1] != kRgbChannels || shape[2] < 1 || shape[3] < 1 || shape[2] > kMaximumTileExtent ||
-                shape[3] > kMaximumTileExtent)
+            if (shape[0] != 1 || shape[1] != kRgbChannels || shape[2] < 1 || shape[3] < 1 || shape[2] > kMaximumTileExtent || shape[3] > kMaximumTileExtent)
                 throw std::invalid_argument("ShiftLUT requires one RGB tile with extent at most 256");
             const auto height = static_cast<std::uint32_t>(shape[2]);
             const auto width = static_cast<std::uint32_t>(shape[3]);
@@ -101,9 +92,8 @@ class Kernel final {
             shape[3] *= kScale;
             auto output = context.GetOutput(0, shape.data(), shape.size());
             auto* first = reinterpret_cast<std::int8_t*>(storage_.data() + kTableElements);
-            checked(enqueue(input.GetTensorData<float>(), storage_.data(), first, first + kScratchElements,
-                            output.GetTensorMutableData<float>(), height, width, static_cast<cudaStream_t>(context.GetGPUComputeStream()),
-                            storage_.Decisions(static_cast<std::size_t>(height) * width)),
+            checked(enqueue(input.GetTensorData<float>(), storage_.data(), first, first + kScratchElements, output.GetTensorMutableData<float>(), height, width,
+                            static_cast<cudaStream_t>(context.GetGPUComputeStream()), storage_.Decisions(static_cast<std::size_t>(height) * width)),
                     "submit ShiftLUT stages");
             return nullptr;
         } catch (const std::exception& error) { return Ort::GetApi().CreateStatus(ORT_RUNTIME_EXCEPTION, error.what()); } catch (...) {
@@ -114,7 +104,6 @@ class Kernel final {
    private:
     Storage& storage_;
 };
-
 struct Operator final : Ort::CustomOpBase<Operator, Kernel, true> {
     explicit Operator(Storage& storage) : storage_(storage) {
         start_ver_ = kVersion;
@@ -139,20 +128,14 @@ struct Operator final : Ort::CustomOpBase<Operator, Kernel, true> {
    private:
     Storage& storage_;
 };
-
 }  // namespace
-
 struct Operators::Impl {
     Storage storage;
     Operator operation{storage};
     Ort::CustomOpDomain domain{kDomain};
-    Impl(std::size_t decision_capacity, std::uint64_t* allocation_counter) : storage(decision_capacity, allocation_counter) {
-        domain.Add(&operation);
-    }
+    Impl(std::size_t decision_capacity, std::uint64_t* allocation_counter) : storage(decision_capacity, allocation_counter) { domain.Add(&operation); }
 };
-
-Operators::Operators(std::size_t decision_capacity, std::uint64_t* allocation_counter)
-    : impl_(std::make_unique<Impl>(decision_capacity, allocation_counter)) {}
+Operators::Operators(std::size_t decision_capacity, std::uint64_t* allocation_counter) : impl_(std::make_unique<Impl>(decision_capacity, allocation_counter)) {}
 Operators::~Operators() = default;
 void Operators::Register(Ort::SessionOptions& options) { options.Add(impl_->domain); }
 cudaError_t Operators::Release() noexcept { return impl_->storage.Release(); }

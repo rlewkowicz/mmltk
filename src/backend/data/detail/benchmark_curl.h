@@ -1,7 +1,5 @@
 #pragma once  // backend.data private implementation boundary
-
 #include <curl/curl.h>
-
 #include <atomic>
 #include <cstddef>
 #include <exception>
@@ -14,11 +12,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
-
 #include "src/common/concurrency/cancellation_observation.h"
-
 namespace mmltk::backend::data::benchmark_internal {
-
 // Every benchmark HTTP transfer targets the same infrastructure, so it shares one hardening policy.
 inline constexpr long kBenchmarkConnectTimeoutSeconds = 30L;
 inline constexpr long kBenchmarkLowSpeedLimitBytes = 1024L;
@@ -27,23 +22,18 @@ inline constexpr const char* kBenchmarkTransferUserAgent = "mmltk/1 benchmark-da
 // Upper bound on how long a transfer loop parks in curl_multi_poll before re-checking its own
 // pending work (retry deadlines, cache writers, cancellation).
 inline constexpr int kBenchmarkTransferPollMilliseconds = 250;
-
 struct CurlEasyDestroy {
     void operator()(CURL* handle) const noexcept;
 };
-
 struct CurlMultiDestroy {
     void operator()(CURLM* handle) const noexcept;
 };
-
 struct CurlHeadersDestroy {
     void operator()(curl_slist* headers) const noexcept;
 };
-
 using CurlEasy = std::unique_ptr<CURL, CurlEasyDestroy>;
 using CurlMulti = std::unique_ptr<CURLM, CurlMultiDestroy>;
 using CurlHeaders = std::unique_ptr<curl_slist, CurlHeadersDestroy>;
-
 // libcurl requires a single process-wide global initialization; the first caller's outcome is
 // shared by every later caller.
 inline void ensure_curl_global_initialized(const char* failure_prefix) {
@@ -52,20 +42,17 @@ inline void ensure_curl_global_initialized(const char* failure_prefix) {
     std::call_once(initialized, [] { status = curl_global_init(CURL_GLOBAL_DEFAULT); });
     if (status != CURLE_OK) { throw std::runtime_error(std::string(failure_prefix) + curl_easy_strerror(status)); }
 }
-
 template <typename Value>
 void set_curl_option_with_prefix(CURL* handle, const CURLoption option, Value value, const char* failure_prefix, const char* description) {
     const CURLcode status = curl_easy_setopt(handle, option, value);
     if (status != CURLE_OK) { throw std::runtime_error(std::string(failure_prefix) + description + ": " + curl_easy_strerror(status)); }
 }
-
 // Computes the byte count of a libcurl callback invocation, rejecting overflowing products.
 [[nodiscard]] inline bool curl_callback_byte_count(const std::size_t size, const std::size_t count, std::size_t& bytes) noexcept {
     if (count != 0U && size > std::numeric_limits<std::size_t>::max() / count) { return false; }
     bytes = size * count;
     return true;
 }
-
 // Shared CURLOPT_WRITEFUNCTION/CURLOPT_HEADERFUNCTION body: recovers the owner from the opaque pointer, resolves
 // the byte count and runs `body(owner, bytes)`. Any escaping exception is parked in the owner's `callback_error`
 // and reported to libcurl as a short write, so nothing unwinds through C. `Owner` must expose a
@@ -82,7 +69,6 @@ std::size_t curl_run_data_callback(const std::size_t size, const std::size_t cou
         return 0U;
     }
 }
-
 // Shared CURLOPT_XFERINFOFUNCTION body: aborts the transfer when the owner's cancel flag is set.
 // Owner must expose a `mmltk::common::concurrency::CancellationObservation cancel_requested` member.
 template <typename Owner>
@@ -90,7 +76,6 @@ int curl_cancel_progress_callback(void* opaque, curl_off_t, curl_off_t, curl_off
     const Owner& owner = *static_cast<const Owner*>(opaque);
     return owner.cancel_requested.requested() ? 1 : 0;
 }
-
 // Shared CURLOPT_HEADERFUNCTION body: materializes the header line, feeds it to the owner's HTTP
 // header state machine and forwards the resulting kind plus the raw line to `owner.on_header(...)`.
 // `Owner` must expose an `http` member with `apply(std::string_view)` and a matching `on_header`.
@@ -102,7 +87,6 @@ std::size_t curl_run_header_callback(char* data, const std::size_t size, const s
         return bytes;
     });
 }
-
 // The baseline every benchmark transfer needs. `owner` is the transfer instance handed back to each
 // libcurl callback; a null `header_callback` leaves header parsing disabled.
 struct CurlTransferSetup {
@@ -114,7 +98,6 @@ struct CurlTransferSetup {
     curl_write_callback header_callback = nullptr;
     curl_xferinfo_callback progress_callback = nullptr;
 };
-
 // Single owner of how a benchmark easy handle is configured: a redirect-following GET with the
 // benchmark user agent, signal suppression, connect and stall timeouts, error reporting, and the
 // owning transfer registered with every callback. Callers add only the options their transfer
@@ -140,7 +123,6 @@ inline void configure_curl_transfer(CURL* handle, const CurlTransferSetup& setup
     set_curl_option_with_prefix(handle, CURLOPT_XFERINFODATA, setup.owner, failure_prefix, "progress callback data");
     set_curl_option_with_prefix(handle, CURLOPT_PRIVATE, setup.owner, failure_prefix, "private transfer data");
 }
-
 // Owns the transfers in flight on a libcurl multi handle. Both benchmark transfer loops drive
 // through this type, so handle registration, completion demultiplexing, polling, abandonment, and
 // multi-API error reporting have one owner; callers keep only their admission and completion policy.
@@ -153,15 +135,10 @@ class CurlMultiTransfers {
         CURL* handle = nullptr;
         CURLcode result = CURLE_OK;
     };
-
     CurlMultiTransfers(CurlMulti multi, std::string label) : multi_(std::move(multi)), label_(std::move(label)) {}
-
     [[nodiscard]] bool empty() const noexcept { return active_.empty(); }
-
     [[nodiscard]] std::size_t size() const noexcept { return active_.size(); }
-
     void reserve(const std::size_t transfers) { active_.reserve(transfers); }
-
     // Registers an already-configured transfer and starts it on the multi handle.
     void add(std::unique_ptr<Transfer> transfer) {
         CURL* handle = transfer->easy.get();
@@ -173,13 +150,11 @@ class CurlMultiTransfers {
             throw std::runtime_error("cannot add " + label_ + ": " + curl_multi_strerror(status));
         }
     }
-
     void perform() {
         int running = 0;
         const CURLMcode status = curl_multi_perform(multi_.get(), &running);
         if (status != CURLM_OK) { throw std::runtime_error(label_ + " loop failed: " + curl_multi_strerror(status)); }
     }
-
     // Detaches the next finished transfer, or reports nothing when none has completed yet.
     [[nodiscard]] std::optional<Completion> next_completed() {
         int remaining = 0;
@@ -194,13 +169,11 @@ class CurlMultiTransfers {
         }
         return std::nullopt;
     }
-
     void poll(const int timeout_milliseconds) {
         int descriptors = 0;
         const CURLMcode status = curl_multi_poll(multi_.get(), nullptr, 0, timeout_milliseconds, &descriptors);
         if (status != CURLM_OK) { throw std::runtime_error(label_ + " poll failed: " + curl_multi_strerror(status)); }
     }
-
     // Detaches every still-running transfer on the failure path, handing each to `release` so the
     // caller can salvage or discard its partial work.
     template <typename Release>
@@ -218,5 +191,4 @@ class CurlMultiTransfers {
     std::string label_;
     std::unordered_map<CURL*, std::unique_ptr<Transfer>> active_;
 };
-
 }  // namespace mmltk::backend::data::benchmark_internal

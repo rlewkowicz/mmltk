@@ -1,16 +1,12 @@
 #pragma once
-
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <vector>
-
 #include "src/controller/contracts/annotation.h"
 #include "src/controller/subsystems/annotation/detail/annotation_mask.h"
-
 namespace mmltk::controller {
-
 struct AnnotationDragPreview final {
     contracts::AnnotationPointerTarget target;
     contracts::AnnotationPoint origin;
@@ -37,10 +33,7 @@ struct AnnotationRenderState final {
     std::uint64_t preview_identity = 0U;
     std::uint64_t generation = 0U;
     std::uint64_t document_epoch = 0U;
-
-    [[nodiscard]] std::size_t ObjectCount() const noexcept {
-        return scene->objects.size() + (preview_object == scene->objects.size() ? 1U : 0U);
-    }
+    [[nodiscard]] std::size_t ObjectCount() const noexcept { return scene->objects.size() + (preview_object == scene->objects.size() ? 1U : 0U); }
     [[nodiscard]] const contracts::AnnotationObject& ObjectAt(const std::size_t index) const {
         if (preview_object != index) return scene->objects.at(index);
         if (!preview_materialized) {
@@ -66,9 +59,7 @@ struct AnnotationRenderState final {
         return bounds.box;
     }
     [[nodiscard]] contracts::AnnotationPoint DrawingPoint(std::size_t index) const {
-        return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::Point
-                   ? drag->point
-                   : DrawingObjectAt(index).point;
+        return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::Point ? drag->point : DrawingObjectAt(index).point;
     }
     [[nodiscard]] contracts::AnnotationSplineKnot DrawingKnot(std::size_t index, std::size_t knot) const {
         auto result = DrawingObjectAt(index).spline_knots[knot];
@@ -76,11 +67,9 @@ struct AnnotationRenderState final {
         return result;
     }
     [[nodiscard]] contracts::AnnotationPoint DrawingNode(std::size_t index, std::size_t node) const {
-        return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::SkeletonNode &&
-                       drag->target.element == node
+        return drag && preview_object == index && drag->target.role == contracts::AnnotationHandleRole::SkeletonNode && drag->target.element == node
                    ? drag->point
                    : DrawingObjectAt(index).skeleton_nodes[node].point;
     }
 };
-
 }  // namespace mmltk::controller

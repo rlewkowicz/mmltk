@@ -1,9 +1,6 @@
 #include "src/frameworks/transport/browser_record_ring.h"
-
 #include <utility>
-
 namespace mmltk::frameworks::transport {
-
 BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record) {
     std::scoped_lock lock(mutex_);
     if (record.state_system != 0U && record.state_event != 0U) {
@@ -21,15 +18,12 @@ BrowserRecordPush BrowserRecordRing::push(BrowserOutputRecord record) {
             break;
         }
     }
-    if (size_ == records_.size()) {
-        return record.priority == BrowserRecordPriority::Transient ? BrowserRecordPush::Dropped : BrowserRecordPush::ClosePeer;
-    }
+    if (size_ == records_.size()) { return record.priority == BrowserRecordPriority::Transient ? BrowserRecordPush::Dropped : BrowserRecordPush::ClosePeer; }
     records_[write_].emplace(std::move(record));
     write_ = (write_ + 1U) % records_.size();
     ++size_;
     return BrowserRecordPush::Enqueued;
 }
-
 std::optional<BrowserOutputRecord> BrowserRecordRing::pop() {
     std::scoped_lock lock(mutex_);
     if (size_ == 0U) return std::nullopt;
@@ -39,21 +33,16 @@ std::optional<BrowserOutputRecord> BrowserRecordRing::pop() {
     --size_;
     return result;
 }
-
 void BrowserRecordRing::clear() noexcept {
     std::scoped_lock lock(mutex_);
-    for (auto& record : records_)
-        record.reset();
+    for (auto& record : records_) record.reset();
     read_ = 0U;
     write_ = 0U;
     size_ = 0U;
 }
-
 std::size_t BrowserRecordRing::size() const noexcept {
     std::scoped_lock lock(mutex_);
     return size_;
 }
-
 bool BrowserRecordRing::empty() const noexcept { return size() == 0U; }
-
 }  // namespace mmltk::frameworks::transport

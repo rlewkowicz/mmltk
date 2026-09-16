@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <concepts>
 #include <cstddef>
@@ -10,51 +9,40 @@
 #include <string_view>
 #include <type_traits>
 #include <variant>
-
 #include "src/frameworks/serialization/cbor_wire.h"
 #include "src/frameworks/serialization/reflected_cbor_detail.h"
 namespace mmltk::frameworks::serialization {
-
 using FixedCborEncoder = implementation::FixedCborEncoder;
-
 // CLEANUP-IGNORE: This public template is the single stable facade over the private reflected-CBOR implementation.
 template <class T>
 [[nodiscard]] bool encode_fixed(FixedCborEncoder& writer, const T& value) {
     return implementation::encode_fixed(writer, value);
 }
-
 template <class T>
 [[nodiscard]] std::expected<void, wire::EncodeError> encode(const T& value, wire::ByteBuffer& destination, const wire::Limits limits) {
     return implementation::encode(value, destination, limits);
 }
-
 template <class T>
-[[nodiscard]] std::expected<std::size_t, wire::EncodeError> encode(const T& value, const std::span<std::byte> destination,
-                                                                   const wire::Limits limits) {
+[[nodiscard]] std::expected<std::size_t, wire::EncodeError> encode(const T& value, const std::span<std::byte> destination, const wire::Limits limits) {
     return implementation::encode(value, destination, limits);
 }
-
 template <class T>
 [[nodiscard]] std::expected<std::size_t, wire::EncodeError> measure(const T& value, const wire::Limits limits) {
     return implementation::measure(value, limits);
 }
-
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> decode(const wire::ByteSegments bytes, const wire::Limits limits) {
     // CLEANUP-IGNORE: Public decode forwards once to the implementation that owns allocation policy and validation.
     return implementation::decode<T>(bytes, limits);
 }
-
 template <class T>
 [[nodiscard]] std::expected<void, wire::DecodeError> decode_into(T& destination, const wire::Value& value) {
     return implementation::decode_into(destination, value);
 }
-
 template <class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> reflected_value(const T& value) {
     return implementation::reflected_value(value);
 }
-
 // Schema-agreed output transport removes repeated member names. Persistence and
 // ordinary named request values retain reflected_value's named representation.
 // Scalars, byte strings, variants and opaque storage preserve canonical policy.
@@ -62,7 +50,6 @@ template <class T>
 [[nodiscard]] std::expected<wire::Value, wire::EncodeError> reflected_transport_value(const T& value) {
     return implementation::detail::to_value<implementation::detail::ObjectLayout::Positional>(value);
 }
-
 using CompactShape = implementation::compact_detail::Shape;
 template <class T>
 inline constexpr CompactShape compact_shape = implementation::compact_detail::shape<T>;
@@ -70,7 +57,6 @@ template <class T>
 [[nodiscard]] consteval std::size_t compact_maximum_cbor_bytes() {
     return implementation::compact_detail::maximum_bytes<T>();
 }
-
 template <class T>
 [[nodiscard]] bool encode_compact(FixedCborEncoder& writer, const T& value) {
     return implementation::compact_detail::encode(writer, value);
@@ -84,13 +70,11 @@ template <class T>
     wire::Reader reader(bytes, limits);
     return implementation::compact_detail::decode(reader, value, 0U) && reader.finish().has_value();
 }
-
 // The named variant vocabulary is structural CBOR policy, shared by generated
 // writers and the borrowed projection. Alternative membership remains exhaustive.
 template <class Variant, class Alternative>
 struct ReflectedVariantEnvelope final {
-    static_assert([]<class... T>(std::type_identity<std::variant<T...>>) { return (std::same_as<Alternative, T> || ...); }(
-                      std::type_identity<Variant>{}),
+    static_assert([]<class... T>(std::type_identity<std::variant<T...>>) { return (std::same_as<Alternative, T> || ...); }(std::type_identity<Variant>{}),
                   "borrowed alternative must belong to its canonical variant");
     static constexpr auto kind_key = implementation::detail::VariantEnvelope::kind_key;
     static constexpr auto payload_key = implementation::detail::VariantEnvelope::payload_key;
@@ -102,7 +86,6 @@ struct ReflectedVariantEnvelope final {
                reader.expect_text_item(1U, payload_key);
     }
 };
-
 template <class Record, auto BytesMember>
 class BorrowedByteRecord final {
     Record record_{};
@@ -148,8 +131,8 @@ class BorrowedByteRecord final {
                 valid = valid && bytes_.second.empty() && bytes_.size() <= policy.maximum_bytes && bytes_.size() >= policy.minimum_bytes &&
                         writer.bytes(bytes_.first);
             } else {
-                valid = valid && d::member_constraints_accept<Declaration>(record_.*Declaration::pointer) &&
-                        encode_compact(writer, record_.*Declaration::pointer);
+                valid =
+                    valid && d::member_constraints_accept<Declaration>(record_.*Declaration::pointer) && encode_compact(writer, record_.*Declaration::pointer);
             }
         });
         return valid;
@@ -167,8 +150,8 @@ class BorrowedByteRecord final {
                 valid = bytes && bytes->size() <= policy.maximum_bytes && bytes->size() >= policy.minimum_bytes;
                 if (valid) bytes_ = *bytes;
             } else {
-                valid = decode_compact_item(record_.*Declaration::pointer, reader, 1U) &&
-                        d::member_constraints_accept<Declaration>(record_.*Declaration::pointer);
+                valid =
+                    decode_compact_item(record_.*Declaration::pointer, reader, 1U) && d::member_constraints_accept<Declaration>(record_.*Declaration::pointer);
             }
         });
         return valid && reader.finish().has_value();
@@ -214,8 +197,7 @@ class BorrowedByteRecord final {
                     }
                 } else {
                     using Field = typename Declaration::member_type;
-                    static_assert(compact_shape<Field> == CompactShape::Scalar,
-                                  "borrowed byte record fields must be scalar or the selected byte field");
+                    static_assert(compact_shape<Field> == CompactShape::Scalar, "borrowed byte record fields must be scalar or the selected byte field");
                     valid = decode_compact_item(record_.*Declaration::pointer, reader, 2U) &&
                             d::member_constraints_accept<Declaration>(record_.*Declaration::pointer);
                 }
@@ -225,33 +207,26 @@ class BorrowedByteRecord final {
         return reader.finish().has_value();
     }
 };
-
 template <class T>
 inline constexpr bool reflected_byte_sequence = implementation::reflected_byte_sequence<T>;
-
 template <class T>
 [[nodiscard]] consteval std::size_t reflected_maximum_cbor_bytes() {
     return implementation::reflected_maximum_cbor_bytes<T>();
 }
-
 template <class T>
 [[nodiscard]] constexpr std::size_t reflected_structural_cbor_bytes(const std::size_t payload_budget = 0U) {
     // The caller admits the sum of complete encoded wire::Value payloads,
     // including their heads and descendants. All other bytes remain structural.
-    constexpr auto structural =
-        implementation::detail::maximum_cbor_bytes<T, implementation::detail::DynamicValueBound::ExternallyBudgeted>();
+    constexpr auto structural = implementation::detail::maximum_cbor_bytes<T, implementation::detail::DynamicValueBound::ExternallyBudgeted>();
     return implementation::detail::cbor_size_add(structural, payload_budget);
 }
-
 template <class T>
 [[nodiscard]] consteval std::size_t reflected_cbor_member_count() {
     implementation::detail::audit_object<T>();
     return implementation::detail::maximum_reflected_object_member_count<T>();
 }
-
 template <class T>
 [[nodiscard]] std::string reflected_schema_type_name() {
     return implementation::reflected_schema_type_name<T>();
 }
-
 }  // namespace mmltk::frameworks::serialization

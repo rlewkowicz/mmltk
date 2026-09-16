@@ -1,7 +1,7 @@
-pub mod overlay_controls;
 pub mod fields;
 pub mod loading;
 pub mod model_card;
+pub mod overlay_controls;
 pub mod progress;
 
 use crate::fluent_theme::Element;

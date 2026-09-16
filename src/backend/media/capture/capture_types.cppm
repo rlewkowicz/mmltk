@@ -1,35 +1,26 @@
 module;
 #include <cstddef>
 #include <cstdint>
-
 export module mmltk.backend.media.capture.capture_types;
-
 export namespace mmltk::backend::media::capture {
-
 struct CaptureRegion final {
     std::uint32_t x = 0U;
     std::uint32_t y = 0U;
     std::uint32_t width = 0U;
     std::uint32_t height = 0U;
-
     [[nodiscard]] bool operator==(const CaptureRegion&) const noexcept = default;
 };
-
 struct CaptureSessionIdentity {
     std::uint64_t session = 0;
     std::uint64_t generation = 0;
-
     [[nodiscard]] bool valid() const noexcept { return session != 0U && generation != 0U; }
-
     [[nodiscard]] bool operator==(const CaptureSessionIdentity&) const noexcept = default;
 };
-
 struct CaptureFormatInfo {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t bytes_per_line = 0;
 };
-
 class FilledCaptureSlotLease final {
    public:
     FilledCaptureSlotLease() = default;
@@ -38,7 +29,6 @@ class FilledCaptureSlotLease final {
     FilledCaptureSlotLease& operator=(const FilledCaptureSlotLease&) = delete;
     FilledCaptureSlotLease(FilledCaptureSlotLease&& other) noexcept;
     FilledCaptureSlotLease& operator=(FilledCaptureSlotLease&& other) noexcept;
-
     [[nodiscard]] bool valid() const noexcept;
     [[nodiscard]] CaptureSessionIdentity identity() const noexcept { return identity_; }
     [[nodiscard]] std::uint32_t slot() const noexcept { return slot_; }
@@ -52,11 +42,9 @@ class FilledCaptureSlotLease final {
     [[nodiscard]] bool short_frame() const noexcept { return short_frame_; }
 
    private:
-    FilledCaptureSlotLease(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data,
-                           std::size_t bytes, std::size_t stride_bytes, std::uint32_t pixel_format, CaptureRegion region,
-                           std::uint64_t capture_ns, bool short_frame) noexcept;
+    FilledCaptureSlotLease(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data, std::size_t bytes,
+                           std::size_t stride_bytes, std::uint32_t pixel_format, CaptureRegion region, std::uint64_t capture_ns, bool short_frame) noexcept;
     void reset() noexcept;
-
     CaptureSessionIdentity identity_{};
     std::uint32_t slot_ = 0;
     std::uint64_t sequence_ = 0;
@@ -67,19 +55,15 @@ class FilledCaptureSlotLease final {
     CaptureRegion region_{};
     std::uint64_t capture_ns_ = 0U;
     bool short_frame_ = false;
-
     friend class FilledCaptureSlotLeaseAuthority;
 };
-
 class FilledCaptureSlotLeaseAuthority final {
    public:
-    [[nodiscard]] static FilledCaptureSlotLease Create(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence,
-                                                       const std::uint8_t* data, std::size_t bytes, std::size_t stride_bytes,
-                                                       std::uint32_t pixel_format, CaptureRegion region, std::uint64_t capture_ns,
-                                                       bool short_frame) noexcept;
+    [[nodiscard]] static FilledCaptureSlotLease Create(CaptureSessionIdentity identity, std::uint32_t slot, std::uint64_t sequence, const std::uint8_t* data,
+                                                       std::size_t bytes, std::size_t stride_bytes, std::uint32_t pixel_format, CaptureRegion region,
+                                                       std::uint64_t capture_ns, bool short_frame) noexcept;
     static void Consume(FilledCaptureSlotLease& lease) noexcept;
 };
-
 struct CaptureStats {
     std::uint64_t queued_v4l2_buffers = 0;
     std::uint64_t dequeued_v4l2_buffers = 0;
@@ -96,5 +80,4 @@ struct CaptureStats {
     std::uint64_t requeue_failures = 0;
     bool running = false;
 };
-
 }  // namespace mmltk::backend::media::capture

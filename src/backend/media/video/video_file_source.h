@@ -10,7 +10,7 @@
 namespace mmltk::frameworks::gpu {
 class TerminalCudaRetirementOwner;
 struct CudaContextApi;
-}
+}  // namespace mmltk::frameworks::gpu
 namespace mmltk::backend::media::video {
 namespace test_support {
 struct VideoFileSourceTestAccess;
@@ -44,10 +44,10 @@ class VideoFileSource final {
     [[nodiscard]] std::optional<VideoFrame> Next();
     [[nodiscard]] double frames_per_second() const noexcept;
     [[nodiscard]] std::uint64_t frame_count() const noexcept;
+
    private:
     VideoFileSource(const std::filesystem::path&, VideoFrameCapacity, int device, std::uintptr_t stream, std::stop_token,
-                    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement,
-                    decltype(&cudaStreamSynchronize) settle,
+                    std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner> retirement, decltype(&cudaStreamSynchronize) settle,
                     mmltk::frameworks::gpu::CudaContextApi context_api);
     struct StorageLimits final {
         explicit StorageLimits(VideoFrameCapacity);
@@ -66,4 +66,4 @@ class VideoFileSource final {
     std::unique_ptr<Owner> owner_;
     friend struct test_support::VideoFileSourceTestAccess;
 };
-}
+}  // namespace mmltk::backend::media::video

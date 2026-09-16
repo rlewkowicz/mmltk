@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -8,13 +7,11 @@
 #include <memory>
 #include <optional>
 #include <stop_token>
-
 #include "src/frameworks/gpu/image_product_pool.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/system_image_model.h"
 #include "src/frameworks/gpu/product_revision_sequence.h"
 #include "src/frameworks/gpu/device_execution.h"
-
 namespace mmltk::frameworks::gpu {
 struct SystemImageRuntimeConfig final {
     int device = -1;
@@ -30,7 +27,6 @@ struct SystemImageRuntimeConfig final {
     std::shared_ptr<ImageProductRevisionSequence> product_revisions{std::make_shared<ImageProductRevisionSequence>()};
     std::optional<DeviceContext> adopted_context{};
 };
-
 class SystemImageRuntime final {
    private:
     struct RetentionControl;
@@ -63,7 +59,6 @@ class SystemImageRuntime final {
         std::exception_ptr failure{};
         UnsafeCustody custody{};
     };
-
     explicit SystemImageRuntime(SystemImageRuntimeConfig);
     ~SystemImageRuntime() noexcept;
     SystemImageRuntime(const SystemImageRuntime&) = delete;
@@ -85,12 +80,10 @@ class SystemImageRuntime final {
     [[nodiscard]] ImageProductPool::Availability ObserveOutputAvailability() const;
     [[nodiscard]] ImageProductPool::Facts OutputFacts() const;
     [[nodiscard]] ImageStorageFootprint OutputStorageFootprint() const;
-    [[nodiscard]] OutputCandidate AcquireOutput(std::stop_token = {}, CompletedOutput baseline = {},
-                                                ImagePlanePreservation = ImagePlanePreservation::All);
+    [[nodiscard]] OutputCandidate AcquireOutput(std::stop_token = {}, CompletedOutput baseline = {}, ImagePlanePreservation = ImagePlanePreservation::All);
     [[nodiscard]] OutputCandidate TryAcquireOutput(CompletedOutput& baseline, ImagePlanePreservation = ImagePlanePreservation::All);
     void Publish(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit);
-    void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit,
-                         ImageSubmission = ImageSubmission::Complete);
+    void PublishRetained(OutputCandidate&, std::uint32_t, std::uint32_t, ImageProductBuffer::ProductSubmit, ImageSubmission = ImageSubmission::Complete);
     // Wake on successful or failed GPU completion. CompleteWork consumes
     // terminal status and establishes physical settlement on the owner.
     void NotifyWorkCompletion(std::function<void()>);
@@ -126,5 +119,4 @@ class SystemImageRuntime final {
     std::shared_ptr<RetentionControl> retention_;
     const std::shared_ptr<ImageProductRevisionSequence> product_revision_sequence_;
 };
-
 }  // namespace mmltk::frameworks::gpu

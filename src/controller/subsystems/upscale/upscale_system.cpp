@@ -4,23 +4,17 @@
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
-
 #include <cuda.h>
-
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
-
 #include "src/common/types/generation.h"
-
 import mmltk.backend.imaging.upscale.image_upscaler;
 import mmltk.backend.imaging.raster;
-
 namespace mmltk::controller {
-
 VisualExtent checked_upscale_output_extent(const VisualExtent source) {
     if (!source.valid() || source.width > std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale ||
         source.height > std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale)
@@ -30,21 +24,16 @@ VisualExtent checked_upscale_output_extent(const VisualExtent source) {
         .height = source.height * kUpscaleOutputScale,
     };
 }
-
 namespace {
-
 namespace native_upscale = mmltk::backend::imaging::upscale;
-
 void rethrow_physical_upscale_failure(const std::exception_ptr& failure) {
     if (mmltk::frameworks::gpu::is_image_execution_failure(failure)) std::rethrow_exception(failure);
     try {
-        if (const auto cuda = mmltk::frameworks::gpu::find_image_failure<mmltk::frameworks::gpu::CudaError>(failure))
-            std::rethrow_exception(cuda);
+        if (const auto cuda = mmltk::frameworks::gpu::find_image_failure<mmltk::frameworks::gpu::CudaError>(failure)) std::rethrow_exception(cuda);
     } catch (const mmltk::frameworks::gpu::CudaError& cuda) {
         if (cuda.shared_failure()) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(failure);
     }
 }
-
 class UpscaleDriverFailure final : public std::runtime_error {
    public:
     UpscaleDriverFailure(const CUresult status, const std::string& detail)
@@ -54,33 +43,27 @@ class UpscaleDriverFailure final : public std::runtime_error {
    private:
     CUresult status_;
 };
-
 void ensure_cuda_driver_ok(const CUresult status, const char* const operation) {
     if (status == CUDA_SUCCESS) return;
     const char* detail = nullptr;
     static_cast<void>(cuGetErrorString(status, &detail));
     const auto failure = UpscaleDriverFailure(status, std::string{operation} + ": " + (detail == nullptr ? "unknown CUDA error" : detail));
-    if (mmltk::frameworks::gpu::cuda_shared_failure(status))
-        throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(std::make_exception_ptr(failure));
+    if (mmltk::frameworks::gpu::cuda_shared_failure(status)) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(std::make_exception_ptr(failure));
     throw failure;
 }
-
 [[nodiscard]] CUcontext stream_context(const std::uintptr_t stream, const char* const operation) {
     CUcontext context = nullptr;
     ensure_cuda_driver_ok(cuStreamGetCtx(reinterpret_cast<CUstream>(stream), &context), operation);
     if (context == nullptr) ensure_cuda_driver_ok(CUDA_ERROR_INVALID_CONTEXT, operation);
     return context;
 }
-
 class UpscaleStreamBridge final {
    public:
     explicit UpscaleStreamBridge(CUcontext context) : context_(context) {}
     void Activate() {
         ensure_cuda_driver_ok(cuCtxSetCurrent(context_), "bind Upscale bridge context");
-        if (source_ready_ == nullptr)
-            ensure_cuda_driver_ok(cuEventCreate(&source_ready_, CU_EVENT_DISABLE_TIMING), "create Upscale source-ready event");
-        if (model_done_ == nullptr)
-            ensure_cuda_driver_ok(cuEventCreate(&model_done_, CU_EVENT_DISABLE_TIMING), "create Upscale model-done event");
+        if (source_ready_ == nullptr) ensure_cuda_driver_ok(cuEventCreate(&source_ready_, CU_EVENT_DISABLE_TIMING), "create Upscale source-ready event");
+        if (model_done_ == nullptr) ensure_cuda_driver_ok(cuEventCreate(&model_done_, CU_EVENT_DISABLE_TIMING), "create Upscale model-done event");
     }
     ~UpscaleStreamBridge() {
         if (model_done_ != nullptr || source_ready_ != nullptr) std::terminate();
@@ -101,21 +84,17 @@ class UpscaleStreamBridge final {
     }
     UpscaleStreamBridge(const UpscaleStreamBridge&) = delete;
     UpscaleStreamBridge& operator=(const UpscaleStreamBridge&) = delete;
-
     void AwaitSource(const std::uintptr_t source_stream, const std::uintptr_t model_stream) const {
         if (source_stream == model_stream) return;
         ensure_cuda_driver_ok(cuCtxSetCurrent(context_), "bind Upscale bridge context");
         ensure_cuda_driver_ok(cuEventRecord(source_ready_, reinterpret_cast<CUstream>(source_stream)), "record Upscale source readiness");
-        ensure_cuda_driver_ok(cuStreamWaitEvent(reinterpret_cast<CUstream>(model_stream), source_ready_, 0U),
-                              "wait for Upscale source readiness");
+        ensure_cuda_driver_ok(cuStreamWaitEvent(reinterpret_cast<CUstream>(model_stream), source_ready_, 0U), "wait for Upscale source readiness");
     }
-
     void JoinModel(const std::uintptr_t source_stream, const std::uintptr_t model_stream) const {
         if (source_stream == model_stream) return;
         ensure_cuda_driver_ok(cuCtxSetCurrent(context_), "bind Upscale bridge context");
         ensure_cuda_driver_ok(cuEventRecord(model_done_, reinterpret_cast<CUstream>(model_stream)), "record Upscale model completion");
-        ensure_cuda_driver_ok(cuStreamWaitEvent(reinterpret_cast<CUstream>(source_stream), model_done_, 0U),
-                              "join Upscale model completion");
+        ensure_cuda_driver_ok(cuStreamWaitEvent(reinterpret_cast<CUstream>(source_stream), model_done_, 0U), "join Upscale model completion");
     }
 
    private:
@@ -123,23 +102,22 @@ class UpscaleStreamBridge final {
     CUevent source_ready_ = nullptr;
     CUevent model_done_ = nullptr;
 };
-
 class NativeUpscaleModel final : public UpscaleAlgorithm {
    public:
     void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
                    const std::uintptr_t stream) override {
         if (!source.valid()) {
-            ensure_cuda_driver_ok(cuMemsetD2D8Async(target.data, target.descriptor.pitch_bytes, 0, target.descriptor.row_bytes(),
-                                                    target.descriptor.height, reinterpret_cast<CUstream>(stream)),
+            ensure_cuda_driver_ok(cuMemsetD2D8Async(target.data, target.descriptor.pitch_bytes, 0, target.descriptor.row_bytes(), target.descriptor.height,
+                                                    reinterpret_cast<CUstream>(stream)),
                                   "clear Upscale absent semantics");
             return;
         }
-        const auto status = mmltk::backend::imaging::raster::scale_rgba_nearest(
-            {reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes, static_cast<int>(source.descriptor.width),
-             static_cast<int>(source.descriptor.height)},
-            {reinterpret_cast<std::uint8_t*>(target.data), target.descriptor.pitch_bytes, static_cast<int>(target.descriptor.width),
-             static_cast<int>(target.descriptor.height)},
-            stream);
+        const auto status =
+            mmltk::backend::imaging::raster::scale_rgba_nearest({reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
+                                                                 static_cast<int>(source.descriptor.width), static_cast<int>(source.descriptor.height)},
+                                                                {reinterpret_cast<std::uint8_t*>(target.data), target.descriptor.pitch_bytes,
+                                                                 static_cast<int>(target.descriptor.width), static_cast<int>(target.descriptor.height)},
+                                                                stream);
         mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(status), "Upscale semantic scaling failed");
     }
     explicit NativeUpscaleModel(const int device, native_upscale::ImageUpscalerExecutionCheckpoint checkpoint)
@@ -188,9 +166,8 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
         auto operation = owner_->client().ClaimOperation();
         return operation && operation.graph_replay(static_cast<native_upscale::ImageUpscalerMode>(kernel));
     }
-    void Run(const UpscaleKernel kernel, const mmltk::frameworks::gpu::ImagePlaneView source,
-             const mmltk::frameworks::gpu::ImagePlaneView target, const std::uintptr_t stream,
-             const std::function<bool()>& current) override {
+    void Run(const UpscaleKernel kernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
+             const std::uintptr_t stream, const std::function<bool()>& current) override {
         if (current && !current()) return;
         const auto source_context = stream_context(stream, "resolve Upscale image-runtime context");
         Activate(source_context);
@@ -221,10 +198,9 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
                 throw native_upscale::ImageUpscalerInitializationFailure(failure);
             }
             stream_bridge_->AwaitSource(stream, model_stream);
-            const auto outcome =
-                operation.run_rgba8(models_[index], mode, reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
-                                    source.descriptor.width, source.descriptor.height, reinterpret_cast<std::uint8_t*>(target.data),
-                                    target.descriptor.pitch_bytes, model_stream, still_current);
+            const auto outcome = operation.run_rgba8(models_[index], mode, reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
+                                                     source.descriptor.width, source.descriptor.height, reinterpret_cast<std::uint8_t*>(target.data),
+                                                     target.descriptor.pitch_bytes, model_stream, still_current);
             stream_bridge_->JoinModel(stream, model_stream);
             if (outcome == native_upscale::ImageUpscalerOutcome::Cancelled) return;
         } catch (const native_upscale::ImageUpscalerUnsettledFailure& failure) {
@@ -238,8 +214,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
             const auto residual = cudaGetLastError();
             if (residual != cudaSuccess) {
                 const mmltk::frameworks::gpu::CudaError cuda(residual, "Upscale settled runtime error");
-                if (cuda.shared_failure())
-                    throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(failure, std::make_exception_ptr(cuda));
+                if (cuda.shared_failure()) throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(failure, std::make_exception_ptr(cuda));
             }
             rethrow_physical_upscale_failure(failure);
             std::rethrow_exception(failure);
@@ -255,7 +230,6 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
         if (!(*created)->Activate()) throw std::runtime_error("failed to activate the Upscale model aggregate");
         owner_ = std::move(*created);
     }
-
     int device_ = -1;
     std::exception_ptr release_failure_;
     std::optional<UpscaleStreamBridge> stream_bridge_;
@@ -263,15 +237,13 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
     native_upscale::ImageUpscalerExecutionCheckpoint checkpoint_;
     std::array<native_upscale::ImageUpscalerModelHandle, 3U> models_{};
 };
-
 }  // namespace
-
 class UpscaleSystem::Impl final {
     WorkspaceInput input_;
 
    public:
-    Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
-         SystemEventSink<event_type> events, VisualDiagnosticSink diagnostics)
+    Impl(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source, SystemEventSink<event_type> events,
+         VisualDiagnosticSink diagnostics)
         : settings_(settings),
           borrow_source_(std::move(borrow_source)),
           events_(std::move(events)),
@@ -307,8 +279,7 @@ class UpscaleSystem::Impl final {
     ~Impl() { Shutdown(); }
     void Warm(const VisualExtent extent) noexcept {
         std::scoped_lock admission_lock(mutex_);
-        if (!extent.valid() || extent.width > settings_.maximum_width / kUpscaleOutputScale ||
-            extent.height > settings_.maximum_height / kUpscaleOutputScale)
+        if (!extent.valid() || extent.width > settings_.maximum_width / kUpscaleOutputScale || extent.height > settings_.maximum_height / kUpscaleOutputScale)
             return;
         if (warm_extent_ == extent && (warm_admitted_ || warm_attempted_)) return;
         warm_extent_ = extent;
@@ -373,13 +344,11 @@ class UpscaleSystem::Impl final {
                     const auto input = runtime.BorrowInput();
                     const auto dimensions = input.plane(0U).plane().descriptor;
                     const auto target = checked_upscale_output_extent({dimensions.width, dimensions.height});
-                    runtime.Publish(candidate, target.width, target.height,
-                                    [model, &input, index, &current](auto clean, auto semantic, auto stream) {
-                                        const auto kernel = static_cast<UpscaleKernel>(index);
-                                        for (unsigned replay = 0U; replay < 3U && current(); ++replay)
-                                            model->Run(kernel, input.plane(0U).plane(), clean, stream, current);
-                                        if (semantic.valid() && current()) model->Semantics({}, semantic, stream);
-                                    });
+                    runtime.Publish(candidate, target.width, target.height, [model, &input, index, &current](auto clean, auto semantic, auto stream) {
+                        const auto kernel = static_cast<UpscaleKernel>(index);
+                        for (unsigned replay = 0U; replay < 3U && current(); ++replay) model->Run(kernel, input.plane(0U).plane(), clean, stream, current);
+                        if (semantic.valid() && current()) model->Semantics({}, semantic, stream);
+                    });
                     warm_span.Finish();
                     graph_replay = model->GraphReplay(static_cast<UpscaleKernel>(index));
                 }
@@ -505,14 +474,13 @@ class UpscaleSystem::Impl final {
                             state_.methods[static_cast<std::size_t>(request.kernel)].failure = request;
                             AdvanceRevision();
                             return [this, request] {
-                                Publish(event_type{UpscaleFailed{snapshot(), "Upscale source is no longer available", request,
-                                                                 UpscaleFailureKind::Unavailable}});
+                                Publish(
+                                    event_type{UpscaleFailed{snapshot(), "Upscale source is no longer available", request, UpscaleFailureKind::Unavailable}});
                             };
                         }
-                        const auto source_descriptor = retained_input ? runtime.BorrowInput().plane(0U).plane().descriptor
-                                                                      : source.pixels.plane(0U).plane().descriptor;
-                        if (source_descriptor.width != request.source.extent.width ||
-                            source_descriptor.height != request.source.extent.height)
+                        const auto source_descriptor =
+                            retained_input ? runtime.BorrowInput().plane(0U).plane().descriptor : source.pixels.plane(0U).plane().descriptor;
+                        if (source_descriptor.width != request.source.extent.width || source_descriptor.height != request.source.extent.height)
                             throw contracts::UnavailableError("Upscale source geometry does not match its frame");
                         auto document = retained_input ? input_document_ : scale_visual_document(source.document, kUpscaleOutputScale);
                         auto image_metadata = retained_input ? input_image_metadata_ : source.image_metadata;
@@ -529,21 +497,20 @@ class UpscaleSystem::Impl final {
                                          .device = settings_.device,
                                          .generation = demand,
                                          .value = request.source.revision,
-                                         .context = {.source = visual_diagnostic_source({.frame = request.source}),
-                                                     .demand = {.demand_generation = demand}}},
+                                         .context = {.source = visual_diagnostic_source({.frame = request.source}), .demand = {.demand_generation = demand}}},
                                         VisualDiagnosticOperation::CopyCompleted);
                                 },
                                 worker_link};
-                            const bool preserve_clean = input_request_ && visual_clean_content_identity(input_request_->source) ==
-                                                                              visual_clean_content_identity(request.source);
+                            const bool preserve_clean =
+                                input_request_ && visual_clean_content_identity(input_request_->source) == visual_clean_content_identity(request.source);
                             if (!current()) return {};
                             input_request_.reset();
                             input_document_.reset();
                             input_image_metadata_.reset();
                             if (!current()) return {};
                             const auto paths = runtime.CopyInputFrom(
-                                std::move(source.pixels),
-                                [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); }, preserve_clean);
+                                std::move(source.pixels), [model](const auto plane, const auto stream) { model->Semantics({}, plane, stream); },
+                                preserve_clean);
                             input_request_ = request;
                             input_document_ = document;
                             input_image_metadata_ = image_metadata;
@@ -564,13 +531,12 @@ class UpscaleSystem::Impl final {
                                 return fact;
                             });
                             diagnostics_.Emit([&] {
-                                return VisualDiagnosticFact{
-                                    .system = contracts::DiagnosticOwner::Upscale,
-                                    .operation = VisualDiagnosticOperation::UpscaleInputAllocation,
-                                    .device = settings_.device,
-                                    .generation = demand,
-                                    .value = plane.data,
-                                    .detail = plane.descriptor.row_bytes() * plane.descriptor.height * copied_planes};
+                                return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
+                                                            .operation = VisualDiagnosticOperation::UpscaleInputAllocation,
+                                                            .device = settings_.device,
+                                                            .generation = demand,
+                                                            .value = plane.data,
+                                                            .detail = plane.descriptor.row_bytes() * plane.descriptor.height * copied_planes};
                             });
                         }
                         Record baseline;
@@ -579,19 +545,17 @@ class UpscaleSystem::Impl final {
                             if (demand != demand_) return {};
                             baseline = records_[static_cast<std::size_t>(request.kernel)];
                             for (auto& record : records_) {
-                                if (visual_clean_content_identity(record.request.source) != visual_clean_content_identity(request.source))
-                                    record = {};
+                                if (visual_clean_content_identity(record.request.source) != visual_clean_content_identity(request.source)) record = {};
                             }
                         }
-                        const bool reuse_clean = baseline.product.valid() && visual_clean_content_identity(baseline.request.source) ==
-                                                                                 visual_clean_content_identity(request.source);
-                        auto output_candidate = AcquireOutput(
-                            runtime, stop, reuse_clean ? baseline.product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{},
-                            mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
+                        const bool reuse_clean =
+                            baseline.product.valid() && visual_clean_content_identity(baseline.request.source) == visual_clean_content_identity(request.source);
+                        auto output_candidate =
+                            AcquireOutput(runtime, stop, reuse_clean ? baseline.product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{},
+                                          mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
                         if (!output_candidate.valid() || !current()) return {};
                         runtime.Publish(output_candidate, target.width, target.height,
-                                        [this, model, &input, request, reuse_clean, demand, stop](const auto output, const auto semantic,
-                                                                                                  const auto stream) {
+                                        [this, model, &input, request, reuse_clean, demand, stop](const auto output, const auto semantic, const auto stream) {
                                             if (diagnostics_.valid())
                                                 diagnostics_.Emit([&] {
                                                     auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleOutputAllocation, demand);
@@ -606,8 +570,7 @@ class UpscaleSystem::Impl final {
                                                 return demand == demand_ && !stop.stop_requested();
                                             };
                                             if (!output_current()) return;
-                                            if (!reuse_clean)
-                                                model->Run(request.kernel, input.plane(0U).plane(), output, stream, output_current);
+                                            if (!reuse_clean) model->Run(request.kernel, input.plane(0U).plane(), output, stream, output_current);
                                             if (!output_current()) return;
                                             model->Semantics(input.plane(1U).plane(), semantic, stream);
                                         });
@@ -632,8 +595,7 @@ class UpscaleSystem::Impl final {
                                 .extent = target,
                                 .revision = record.product.revision(),
                                 .content = {request.source.content.x * kUpscaleOutputScale, request.source.content.y * kUpscaleOutputScale,
-                                            request.source.content.width * kUpscaleOutputScale,
-                                            request.source.content.height * kUpscaleOutputScale},
+                                            request.source.content.width * kUpscaleOutputScale, request.source.content.height * kUpscaleOutputScale},
                                 .clean_revision = clean_revision,
                             };
                             state_.methods[static_cast<std::size_t>(request.kernel)] = {
@@ -675,8 +637,8 @@ class UpscaleSystem::Impl final {
                         {
                             std::scoped_lock lock(mutex_);
                             auto& method = state_.methods[static_cast<std::size_t>(request.kernel)];
-                            const bool initialization = static_cast<bool>(
-                                mmltk::frameworks::gpu::find_image_failure<native_upscale::ImageUpscalerInitializationFailure>(failure));
+                            const bool initialization =
+                                static_cast<bool>(mmltk::frameworks::gpu::find_image_failure<native_upscale::ImageUpscalerInitializationFailure>(failure));
                             if (initialization) {
                                 method.initialization_failed = true;
                                 method.warm = false;
@@ -731,12 +693,11 @@ class UpscaleSystem::Impl final {
         {
             std::scoped_lock lock(mutex_);
             diagnostics_.Emit([&] {
-                return VisualDiagnosticFact{
-                    .system = contracts::DiagnosticOwner::Upscale,
-                    .operation = VisualDiagnosticOperation::UpscaleStopRequested,
-                    .device = settings_.device,
-                    .generation = demand_,
-                    .context = {.observation_revision = state_.revision, .source = visual_diagnostic_source({.frame = state_.input})}};
+                return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Upscale,
+                                            .operation = VisualDiagnosticOperation::UpscaleStopRequested,
+                                            .device = settings_.device,
+                                            .generation = demand_,
+                                            .context = {.observation_revision = state_.revision, .source = visual_diagnostic_source({.frame = state_.input})}};
             });
             ++demand_;
             state_.busy = false;
@@ -774,12 +735,11 @@ class UpscaleSystem::Impl final {
 
    private:
     friend class UpscaleSystem;
-
     [[nodiscard]] VisualDiagnosticFact Diagnostic(const VisualDiagnosticOperation operation, const std::uint64_t demand) const noexcept {
         return {.system = contracts::DiagnosticOwner::Upscale, .operation = operation, .device = settings_.device, .generation = demand};
     }
-    [[nodiscard]] VisualDiagnosticFact RequestDiagnostic(const VisualDiagnosticOperation operation, const UpscaleRequest& request,
-                                                         const std::uint64_t demand, const contracts::DiagnosticLink link) const noexcept {
+    [[nodiscard]] VisualDiagnosticFact RequestDiagnostic(const VisualDiagnosticOperation operation, const UpscaleRequest& request, const std::uint64_t demand,
+                                                         const contracts::DiagnosticLink link) const noexcept {
         auto fact = Diagnostic(operation, demand);
         fact.value = request.source.revision;
         fact.detail = static_cast<std::uint64_t>(request.kernel);
@@ -788,23 +748,19 @@ class UpscaleSystem::Impl final {
         fact.context.link = link;
         return fact;
     }
-
     mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate AcquireOutput(
-        mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::stop_token stop,
-        mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline = {},
+        mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::stop_token stop, mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline = {},
         mmltk::frameworks::gpu::ImagePlanePreservation preservation = mmltk::frameworks::gpu::ImagePlanePreservation::All) {
         services::RuntimeDiagnosticSpan admission{diagnostics_, [&] {
-                                                      return visual_diagnostic_boundary(
-                                                          {.system = contracts::DiagnosticOwner::Upscale,
-                                                           .operation = VisualDiagnosticOperation::UpscaleOutputAdmissionStarted,
-                                                           .device = settings_.device},
-                                                          VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted);
+                                                      return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Upscale,
+                                                                                         .operation = VisualDiagnosticOperation::UpscaleOutputAdmissionStarted,
+                                                                                         .device = settings_.device},
+                                                                                        VisualDiagnosticOperation::UpscaleOutputAdmissionCompleted);
                                                   }};
         auto candidate = runtime.AcquireOutput(stop, std::move(baseline), preservation);
         admission.Finish();
         return candidate;
     }
-
     // CLEANUP-IGNORE: The shared checked-borrow helper owns product validation; this sealed receiver still reads its
     // own typed readiness snapshot under its own mutex.
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const {
@@ -816,7 +772,6 @@ class UpscaleSystem::Impl final {
         }
         return committed.Borrow();
     }
-
     struct Record final {
         UpscaleRequest request{};
         mmltk::frameworks::gpu::ImageProductPool::Product product{};
@@ -824,15 +779,12 @@ class UpscaleSystem::Impl final {
         std::shared_ptr<const VisualDocument> document{};
         std::shared_ptr<const mmltk::frameworks::serialization::wire::Value> image_metadata{};
     };
-    static bool SameSource(const UpscaleRequest& left, const UpscaleRequest& right) {
-        return left.source == right.source && left.document == right.document;
-    }
+    static bool SameSource(const UpscaleRequest& left, const UpscaleRequest& right) { return left.source == right.source && left.document == right.document; }
     void RefreshAvailability(const UpscaleRequest& request) {
         for (std::size_t index = 0U; index < records_.size(); ++index) {
             const auto& record = records_[index];
             auto& method = state_.methods[index];
-            method.available = record.product.valid() && SameSource(record.request, request) &&
-                               record.request.kernel == static_cast<UpscaleKernel>(index) &&
+            method.available = record.product.valid() && SameSource(record.request, request) && record.request.kernel == static_cast<UpscaleKernel>(index) &&
                                record.frame.extent == checked_upscale_output_extent(request.source.extent);
             method.failed = method.failure && SameSource(*method.failure, request);
         }
@@ -848,7 +800,6 @@ class UpscaleSystem::Impl final {
         document_ = record.document;
         state_.scene = std::move(scene);
     }
-
     VisualDeviceSettings settings_;
     ExactVisualDocumentBorrower borrow_source_;
     SystemEventSink<event_type> events_;
@@ -871,7 +822,6 @@ class UpscaleSystem::Impl final {
     std::size_t warm_next_ = 0U;
     detail::VisualRuntimeOwner worker_;
 };
-
 // CLEANUP-IGNORE: The public Upscale facade forwards construction to its one private implementation owner.
 UpscaleSystem::UpscaleSystem(const VisualDeviceSettings settings, VisualRuntimeFactory factory, ExactVisualDocumentBorrower borrow_source,
                              SystemEventSink<event_type> events,
@@ -913,9 +863,7 @@ VisualDocumentRead UpscaleSystem::BorrowDocument(const VisualFrame& frame) const
     }
     return {product.Borrow(), std::move(document)};
 }
-
-VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSettings settings,
-                                                         native_upscale::ImageUpscalerExecutionCheckpoint checkpoint) {
+VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSettings settings, native_upscale::ImageUpscalerExecutionCheckpoint checkpoint) {
     if (!settings.valid()) throw contracts::InvalidIntentError("Upscale device settings are invalid");
     return [settings, execution = resolve_visual_device_execution(settings), checkpoint = std::move(checkpoint)](auto revisions) {
         mmltk::frameworks::gpu::SystemImageRuntimeConfig config{
@@ -933,9 +881,7 @@ VisualRuntimeFactory make_native_upscale_runtime_factory(const VisualDeviceSetti
         return std::make_unique<mmltk::frameworks::gpu::SystemImageRuntime>(std::move(config));
     };
 }
-
 }  // namespace mmltk::controller
-
 namespace mmltk::controller {
 void UpscaleSystem::Input(WorkspaceMouse mouse) {
     std::scoped_lock lock(impl_->mutex_);

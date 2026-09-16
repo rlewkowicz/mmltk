@@ -1,5 +1,4 @@
 #include <unistd.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -16,7 +15,6 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
-
 #include "catch2_compat.hpp"
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/field_policy.h"
@@ -25,36 +23,27 @@
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "subprocess_test_utils.hpp"
 #include "filesystem_test_utils.hpp"
-
 namespace {
-
 thread_local bool g_count_cli_allocations = false;
 thread_local std::size_t g_cli_allocation_count = 0U;
-
 }  // namespace
-
 [[gnu::noinline]] void* operator new(const std::size_t size) {
     if (g_count_cli_allocations) ++g_cli_allocation_count;
     if (void* const allocation = std::malloc(size == 0U ? 1U : size); allocation != nullptr) return allocation;
     throw std::bad_alloc();
 }
-
 [[gnu::noinline]] void* operator new[](const std::size_t size) {
     if (g_count_cli_allocations) ++g_cli_allocation_count;
     if (void* const allocation = std::malloc(size == 0U ? 1U : size); allocation != nullptr) return allocation;
     throw std::bad_alloc();
 }
-
 [[gnu::noinline]] void operator delete(void* const allocation) noexcept { std::free(allocation); }
 [[gnu::noinline]] void operator delete[](void* const allocation) noexcept { std::free(allocation); }
 [[gnu::noinline]] void operator delete(void* const allocation, std::size_t) noexcept { std::free(allocation); }
 [[gnu::noinline]] void operator delete[](void* const allocation, std::size_t) noexcept { std::free(allocation); }
-
 namespace {
-
 using namespace mmltk::testsupport;
 namespace fs = std::filesystem;
-
 fs::path make_temp_dir(const char* label) {
     const fs::path dir = fs::temp_directory_path() / (std::string(label) + "-" + std::to_string(static_cast<long long>(::getpid())));
     std::error_code error;
@@ -62,23 +51,18 @@ fs::path make_temp_dir(const char* label) {
     MMLTK_ASSERT(!error);
     return dir;
 }
-
 void cleanup_temp_dir(const fs::path& dir) {
     std::error_code error;
     fs::remove_all(dir, error);
 }
-
 std::vector<std::string> read_text_lines(const fs::path& path) {
     std::ifstream stream(path);
     MMLTK_ASSERT(stream.is_open());
     std::vector<std::string> lines;
     std::string line;
-    while (std::getline(stream, line)) {
-        lines.push_back(line);
-    }
+    while (std::getline(stream, line)) { lines.push_back(line); }
     return lines;
 }
-
 fs::path locate_repo_wrapper_path() {
     auto find_repo_wrapper = [](fs::path current, const fs::path& cli_path) -> fs::path {
         for (int depth = 0; depth < 8; ++depth) {
@@ -93,33 +77,27 @@ fs::path locate_repo_wrapper_path() {
         }
         return {};
     };
-
     const fs::path cli_path = mmltk_cli_path();
     if (const char* repo_root = std::getenv("MMLTK_REPO_ROOT"); repo_root != nullptr && repo_root[0] != '\0') {
         const fs::path wrapper = find_repo_wrapper(fs::path(repo_root), cli_path);
         if (!wrapper.empty()) { return wrapper; }
     }
-
     {
         const fs::path wrapper = find_repo_wrapper(fs::current_path(), cli_path);
         if (!wrapper.empty()) { return wrapper; }
     }
-
     {
         const fs::path wrapper = find_repo_wrapper(cli_path.parent_path(), cli_path);
         if (!wrapper.empty()) { return wrapper; }
     }
-
     throw std::runtime_error("failed to locate repo-root mmltk wrapper");
 }
-
 fs::path write_fake_docker_script(const fs::path& root) {
     const fs::path bin_dir = root / "bin";
     const fs::path script_path = bin_dir / "docker";
     std::error_code error;
     fs::create_directories(bin_dir, error);
     MMLTK_ASSERT(!error);
-
     std::ofstream stream(script_path, std::ios::trunc);
     MMLTK_ASSERT(stream.is_open());
     stream << "#!/usr/bin/env bash\n"
@@ -179,7 +157,6 @@ fs::path write_fake_docker_script(const fs::path& root) {
     MMLTK_ASSERT(!error);
     return script_path;
 }
-
 std::string prepend_path_env(const fs::path& prefix_dir) {
     std::string value = prefix_dir.string();
     if (const char* current_path = std::getenv("PATH"); current_path != nullptr && current_path[0] != '\0') {
@@ -188,28 +165,21 @@ std::string prepend_path_env(const fs::path& prefix_dir) {
     }
     return value;
 }
-
 void assert_contains_line(const std::vector<std::string>& lines, const std::string& expected) {
     MMLTK_ASSERT(std::find(lines.begin(), lines.end(), expected) != lines.end());
 }
-
 void assert_contains_substring(const std::vector<std::string>& lines, const std::string& expected) {
-    const auto match =
-        std::find_if(lines.begin(), lines.end(), [&](const std::string& line) { return line.find(expected) != std::string::npos; });
+    const auto match = std::find_if(lines.begin(), lines.end(), [&](const std::string& line) { return line.find(expected) != std::string::npos; });
     MMLTK_ASSERT(match != lines.end());
 }
-
 enum class ParserMode : std::uint8_t {
     Fast,
     FullTrace,
 };
-
 struct ParserNestedState {
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]][[= mmltk::frameworks::reflection::Maximum<int>{10}]] int count = 0;
-
     bool operator==(const ParserNestedState&) const = default;
 };
-
 struct ParserRequest {
     ParserNestedState nested;
     [[= mmltk::frameworks::reflection::Minimum<std::uint32_t>{
@@ -222,53 +192,37 @@ struct ParserRequest {
     [[= mmltk::frameworks::reflection::MaxItems{2U}]] std::vector<int> values;
     ParserMode mode = ParserMode::Fast;
     int positional = 0;
-
     bool operator==(const ParserRequest&) const = default;
 };
-
 MMLTK_REFLECT_FIELDS(ParserNestedState)
 MMLTK_REFLECT_FIELDS(ParserRequest)
 MMLTK_REFLECT_ENUM(ParserMode)
-
 struct InheritedCliBase {
-    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{
-        1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
+    [[= mmltk::frameworks::reflection::Minimum<std::int32_t>{1}]][[= mmltk::frameworks::reflection::Maximum<std::int32_t>{9}]] std::int32_t inherited_limit = 4;
 };
-
 struct InheritedCliRequest final : InheritedCliBase {
     [[= mmltk::frameworks::reflection::Minimum<double>{
-        0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]] double derived_ratio =
-        0.5;
+        0.0}]][[= mmltk::frameworks::reflection::Maximum<double>{1.0}]][[= mmltk::frameworks::reflection::Finite{}]] double derived_ratio = 0.5;
     [[= mmltk::frameworks::reflection::MaxBytes{8U}]] std::string boundary_owned;
 };
-
 MMLTK_REFLECT_FIELDS(InheritedCliBase)
 MMLTK_REFLECT_FIELDS(InheritedCliRequest)
-
 inline constexpr std::array kInheritedCliOptions{
-    mmltk::frameworks::reflection::option<InheritedCliRequest, &InheritedCliBase::inherited_limit>("--inherited-limit",
-                                                                                                   "Inherited bounded scalar", "Inherited"),
-    mmltk::frameworks::reflection::option<InheritedCliRequest, &InheritedCliRequest::derived_ratio>("--derived-ratio",
-                                                                                                    "Derived bounded scalar", "Inherited"),
+    mmltk::frameworks::reflection::option<InheritedCliRequest, &InheritedCliBase::inherited_limit>("--inherited-limit", "Inherited bounded scalar",
+                                                                                                   "Inherited"),
+    mmltk::frameworks::reflection::option<InheritedCliRequest, &InheritedCliRequest::derived_ratio>("--derived-ratio", "Derived bounded scalar", "Inherited"),
 };
-
 inline constexpr std::array kInheritedCliExclusions{
-    mmltk::frameworks::reflection::unexposed<InheritedCliRequest, &InheritedCliRequest::boundary_owned>(
-        "the embedding boundary owns this value"),
+    mmltk::frameworks::reflection::unexposed<InheritedCliRequest, &InheritedCliRequest::boundary_owned>("the embedding boundary owns this value"),
 };
-
 static_assert((mmltk::frameworks::reflection::audit_descriptors(kInheritedCliOptions, kInheritedCliExclusions), true));
-
 inline constexpr std::array kParserOptions{
-    mmltk::frameworks::reflection::option<ParserRequest,
-                                          mmltk::frameworks::reflection::member_path<&ParserRequest::nested, &ParserNestedState::count>>(
+    mmltk::frameworks::reflection::option<ParserRequest, mmltk::frameworks::reflection::member_path<&ParserRequest::nested, &ParserNestedState::count>>(
         "--count", "Bounded scalar", "Values", "-c", {}, false, "MMLTK_REFLECTED_CLI_TEST_COUNT"),
-    mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::unsigned_count>("--unsigned-count", "Bounded unsigned scalar",
-                                                                                         "Values"),
+    mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::unsigned_count>("--unsigned-count", "Bounded unsigned scalar", "Values"),
     mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::ratio>("--ratio", "Bounded finite ratio", "Values"),
     mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::label>("--label", "Bounded text", "Values"),
-    mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::enabled>("--enabled", "Boolean flag", "Values", {},
-                                                                                  "--no-enabled"),
+    mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::enabled>("--enabled", "Boolean flag", "Values", {}, "--no-enabled"),
     mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::optional_path>("--path", "Optional path", "Values"),
     mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::values>("--value", "Repeatable value", "Values"),
     mmltk::frameworks::reflection::option<ParserRequest, &ParserRequest::mode>("--mode", "Reflected enum", "Values"),
@@ -280,11 +234,9 @@ static_assert(mmltk::frameworks::reflection::reflected_defaults_are_valid<Parser
 static_assert(mmltk::frameworks::reflection::policy_of_member<&ParserRequest::ratio>().finite);
 static_assert(mmltk::frameworks::reflection::policy_of_member<&ParserRequest::ratio>().minimum == 0.0L);
 static_assert(mmltk::frameworks::reflection::policy_of_member<&ParserRequest::ratio>().maximum == 1.0L);
-
 [[nodiscard]] auto parse_parser_request(const std::span<const std::string_view> arguments) {
     return mmltk::frameworks::reflection::parse<ParserRequest>(arguments, kParserOptions);
 }
-
 void test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_presence() {
     std::vector<std::string_view> declaration_order;
     mmltk::frameworks::reflection::visit_materialized_bases<InheritedCliRequest>([&]<class Base>() {
@@ -296,7 +248,6 @@ void test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_pres
     MMLTK_ASSERT((declaration_order == std::vector<std::string_view>{"inherited_limit", "derived_ratio", "boundary_owned"}));
     MMLTK_ASSERT(kInheritedCliOptions[0].name == "--inherited-limit");
     MMLTK_ASSERT(kInheritedCliOptions[1].name == "--derived-ratio");
-
     constexpr auto inherited_identity =
         mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<InheritedCliRequest, &InheritedCliBase::inherited_limit>();
     constexpr auto derived_identity =
@@ -306,32 +257,27 @@ void test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_pres
     MMLTK_ASSERT(kInheritedCliOptions[0].terminal_member == inherited_identity);
     MMLTK_ASSERT(kInheritedCliOptions[0].terminal_member.name() == "inherited_limit");
     MMLTK_ASSERT(kInheritedCliOptions[1].terminal_member == derived_identity);
-    MMLTK_ASSERT(
-        kInheritedCliExclusions[0].identity ==
-        mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<InheritedCliRequest, &InheritedCliRequest::boundary_owned>());
-
+    MMLTK_ASSERT(kInheritedCliExclusions[0].identity ==
+                 mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<InheritedCliRequest, &InheritedCliRequest::boundary_owned>());
     const auto absent = mmltk::frameworks::reflection::parse<InheritedCliRequest>({}, kInheritedCliOptions);
     MMLTK_ASSERT(absent);
     MMLTK_ASSERT(absent->request.inherited_limit == 4);
     MMLTK_ASSERT(absent->request.derived_ratio == 0.5);
     MMLTK_ASSERT(!absent->presence.test(inherited_index));
     MMLTK_ASSERT(!absent->presence.test(derived_index));
-
-    const auto explicit_nondefault = mmltk::frameworks::reflection::parse<InheritedCliRequest>(
-        std::array<std::string_view, 2U>{"--inherited-limit", "7"}, kInheritedCliOptions);
+    const auto explicit_nondefault =
+        mmltk::frameworks::reflection::parse<InheritedCliRequest>(std::array<std::string_view, 2U>{"--inherited-limit", "7"}, kInheritedCliOptions);
     MMLTK_ASSERT(explicit_nondefault);
     MMLTK_ASSERT(explicit_nondefault->request.inherited_limit == 7);
     MMLTK_ASSERT(explicit_nondefault->presence.test(inherited_index));
     MMLTK_ASSERT(!explicit_nondefault->presence.test(derived_index));
-
-    const auto explicit_default = mmltk::frameworks::reflection::parse<InheritedCliRequest>(
-        std::array<std::string_view, 2U>{"--inherited-limit", "4"}, kInheritedCliOptions);
+    const auto explicit_default =
+        mmltk::frameworks::reflection::parse<InheritedCliRequest>(std::array<std::string_view, 2U>{"--inherited-limit", "4"}, kInheritedCliOptions);
     MMLTK_ASSERT(explicit_default);
     MMLTK_ASSERT(explicit_default->request.inherited_limit == 4);
     MMLTK_ASSERT(explicit_default->presence.test(inherited_index));
     MMLTK_ASSERT(!explicit_default->presence.test(derived_index));
 }
-
 void test_reflected_cli_policy_boundaries_and_diagnostics() {
     struct Case {
         std::array<std::string_view, 3U> arguments;
@@ -350,7 +296,6 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
         MMLTK_ASSERT(parsed.has_value() == test.accepted);
         if (!test.accepted) MMLTK_ASSERT(parsed.error().code == test.error);
     }
-
     struct PolicyCase {
         std::vector<std::string_view> arguments;
         bool accepted;
@@ -375,10 +320,7 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
         PolicyCase{{"--value", "1", "--value", "2", "1"}, true},
         PolicyCase{{"--value", "1", "--value", "2", "--value", "3", "1"}, false},
     };
-    for (const auto& test : policy_cases) {
-        CHECK(parse_parser_request(std::span<const std::string_view>{test.arguments}).has_value() == test.accepted);
-    }
-
+    for (const auto& test : policy_cases) { CHECK(parse_parser_request(std::span<const std::string_view>{test.arguments}).has_value() == test.accepted); }
     struct DirectPolicyCase {
         std::string_view name;
         void (*mutate)(ParserRequest&);
@@ -393,8 +335,7 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
         DirectPolicyCase{"unsigned maximum", [](ParserRequest& value) { value.unsigned_count = 4U; }, true},
         DirectPolicyCase{"unsigned below", [](ParserRequest& value) { value.unsigned_count = 0U; }, false},
         DirectPolicyCase{"unsigned above", [](ParserRequest& value) { value.unsigned_count = 5U; }, false},
-        DirectPolicyCase{"unsigned typed overflow",
-                         [](ParserRequest& value) { value.unsigned_count = std::numeric_limits<std::uint32_t>::max(); }, false},
+        DirectPolicyCase{"unsigned typed overflow", [](ParserRequest& value) { value.unsigned_count = std::numeric_limits<std::uint32_t>::max(); }, false},
         DirectPolicyCase{"float minimum", [](ParserRequest& value) { value.ratio = 0.0; }, true},
         DirectPolicyCase{"float maximum", [](ParserRequest& value) { value.ratio = 1.0; }, true},
         DirectPolicyCase{"float below", [](ParserRequest& value) { value.ratio = -0.0001; }, false},
@@ -403,14 +344,10 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
         DirectPolicyCase{"text maximum", [](ParserRequest& value) { value.label = "1234"; }, true},
         DirectPolicyCase{"text above", [](ParserRequest& value) { value.label = "12345"; }, false},
         DirectPolicyCase{"path maximum",
-                         [](ParserRequest& value) {
-                             value.optional_path = fs::path(std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x'));
-                         },
+                         [](ParserRequest& value) { value.optional_path = fs::path(std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x')); },
                          true},
         DirectPolicyCase{"path above",
-                         [](ParserRequest& value) {
-                             value.optional_path = fs::path(std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x'));
-                         },
+                         [](ParserRequest& value) { value.optional_path = fs::path(std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x')); },
                          false},
         DirectPolicyCase{"container maximum", [](ParserRequest& value) { value.values = {1, 2}; }, true},
         DirectPolicyCase{"container above", [](ParserRequest& value) { value.values = {1, 2, 3}; }, false},
@@ -421,7 +358,6 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
         CAPTURE(test.name);
         CHECK(!mmltk::frameworks::reflection::validate_reflected_fields(direct).has_value() == test.accepted);
     }
-
     const auto unknown = parse_parser_request(std::array<std::string_view, 2U>{"--unknown", "1"});
     MMLTK_ASSERT(!unknown && unknown.error().code == mmltk::frameworks::reflection::ParseErrorCode::UnknownOption);
     const auto duplicate = parse_parser_request(std::array<std::string_view, 5U>{"--count", "1", "--count", "2", "3"});
@@ -435,7 +371,6 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
     const auto nonfinite = mmltk::frameworks::reflection::parse_scalar<double>("nan");
     MMLTK_ASSERT(!nonfinite && nonfinite.error().code == mmltk::frameworks::reflection::ParseErrorCode::InvalidFiniteNumber);
 }
-
 void test_reflected_cli_optional_repeatable_negation_positionals_environment_and_roundtrip() {
     const auto parsed = parse_parser_request(std::array<std::string_view, 13U>{
         "--no-enabled",
@@ -453,7 +388,6 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
         "--not-an-option",
     });
     MMLTK_ASSERT(!parsed && parsed.error().code == mmltk::frameworks::reflection::ParseErrorCode::UnknownOption);
-
     const auto valid = parse_parser_request(std::array<std::string_view, 12U>{
         "--no-enabled",
         "--path",
@@ -475,17 +409,14 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
     MMLTK_ASSERT(valid->request.mode == ParserMode::FullTrace);
     MMLTK_ASSERT(valid->request.nested.count == 7);
     MMLTK_ASSERT(valid->request.positional == -9);
-
     std::vector<std::string> emitted;
     mmltk::frameworks::reflection::emit(emitted, valid->request, kParserOptions);
     std::vector<std::string_view> emitted_views;
     emitted_views.reserve(emitted.size());
-    for (const auto& token : emitted)
-        emitted_views.emplace_back(token);
+    for (const auto& token : emitted) emitted_views.emplace_back(token);
     const auto roundtrip = mmltk::frameworks::reflection::parse<ParserRequest>(emitted_views, kParserOptions);
     MMLTK_ASSERT(roundtrip);
     MMLTK_ASSERT(roundtrip->request == valid->request);
-
     const auto capacity = parse_parser_request(std::array<std::string_view, 8U>{
         "--value",
         "1",
@@ -497,7 +428,6 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
         "0",
     });
     MMLTK_ASSERT(!capacity && capacity.error().code == mmltk::frameworks::reflection::ParseErrorCode::InvalidValue);
-
     MMLTK_ASSERT(::setenv("MMLTK_REFLECTED_CLI_TEST_COUNT", "6", 1) == 0);
     const auto environment = parse_parser_request(std::array<std::string_view, 1U>{"2"});
     const auto command_override = parse_parser_request(std::array<std::string_view, 3U>{"--count", "8", "2"});
@@ -506,12 +436,9 @@ void test_reflected_cli_optional_repeatable_negation_positionals_environment_and
     MMLTK_ASSERT(command_override && command_override->request.nested.count == 8);
     const auto empty_optional = parse_parser_request(std::array<std::string_view, 3U>{"--path=", "--", "1"});
     MMLTK_ASSERT(empty_optional && !empty_optional->request.optional_path.has_value());
-
     const std::string help = mmltk::frameworks::reflection::help("test [options]", "Descriptor help", kParserOptions);
-    for (const auto& option : kParserOptions)
-        MMLTK_ASSERT(help.find(option.name) != std::string::npos);
+    for (const auto& option : kParserOptions) MMLTK_ASSERT(help.find(option.name) != std::string::npos);
 }
-
 void test_reflected_cli_scalar_success_has_no_parser_owned_allocation() {
     constexpr std::array<std::string_view, 6U> arguments{
         "--count", "4", "--enabled", "--mode", "fast", "1",
@@ -523,7 +450,6 @@ void test_reflected_cli_scalar_success_has_no_parser_owned_allocation() {
     MMLTK_ASSERT(parsed);
     MMLTK_ASSERT(g_cli_allocation_count == 0U);
 }
-
 void test_subprocess_capture_keeps_stdout_and_stderr_separate() {
     const SubprocessResult result = run_subprocess_capture_output({
         "/bin/sh",
@@ -536,7 +462,6 @@ void test_subprocess_capture_keeps_stdout_and_stderr_separate() {
     MMLTK_ASSERT(result.output_text.find("stdout-line\n") != std::string::npos);
     MMLTK_ASSERT(result.output_text.find("stderr-line\n") != std::string::npos);
 }
-
 void test_rfdetr_info_forwards_explicit_logging_options() {
     const ScopedTempDir root("mmltk_rfdetr_info_logging");
     const auto missing = root.path() / "missing.onnx";
@@ -580,18 +505,15 @@ void test_rfdetr_info_forwards_explicit_logging_options() {
         }
     }
 }
-
 void test_log_file_flag_creates_requested_log_file() {
     const fs::path temp_dir = make_temp_dir("mmltk-log-file-flag");
     const fs::path log_path = temp_dir / "explicit.log";
-
     const SubprocessResult result = run_subprocess_capture_output({
         mmltk_cli_path(),
         "--log-file",
         log_path.string(),
         "--help",
     });
-
     MMLTK_ASSERT(result.exit_code == 0);
     MMLTK_ASSERT(fs::exists(log_path));
     fs::remove(log_path);
@@ -611,33 +533,27 @@ void test_log_file_flag_creates_requested_log_file() {
     }
     cleanup_temp_dir(temp_dir);
 }
-
 void test_log_dir_flag_creates_default_log_file() {
     const fs::path temp_dir = make_temp_dir("mmltk-log-dir-flag");
-
     const SubprocessResult result = run_subprocess_capture_output({
         mmltk_cli_path(),
         "--log-dir",
         temp_dir.string(),
         "--help",
     });
-
     MMLTK_ASSERT(result.exit_code == 0);
     MMLTK_ASSERT(fs::exists(temp_dir / "mmltk.log"));
     cleanup_temp_dir(temp_dir);
 }
-
 void test_env_log_file_creates_requested_log_file() {
     const fs::path temp_dir = make_temp_dir("mmltk-log-file-env");
     const fs::path log_path = temp_dir / "env.log";
-
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
         "MMLTK_LOG_FILE=" + log_path.string(),
         mmltk_cli_path(),
         "--help",
     });
-
     MMLTK_ASSERT(result.exit_code == 0);
     MMLTK_ASSERT(fs::exists(log_path));
     fs::remove(log_path);
@@ -652,22 +568,18 @@ void test_env_log_file_creates_requested_log_file() {
     }
     cleanup_temp_dir(temp_dir);
 }
-
 void test_env_log_dir_creates_default_log_file() {
     const fs::path temp_dir = make_temp_dir("mmltk-log-dir-env");
-
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
         "MMLTK_LOG_DIR=" + temp_dir.string(),
         mmltk_cli_path(),
         "--help",
     });
-
     MMLTK_ASSERT(result.exit_code == 0);
     MMLTK_ASSERT(fs::exists(temp_dir / "mmltk.log"));
     cleanup_temp_dir(temp_dir);
 }
-
 void test_invalid_log_level_flag_reports_error_on_stderr() {
     const SubprocessResult result = run_subprocess_capture_output({
         mmltk_cli_path(),
@@ -678,7 +590,6 @@ void test_invalid_log_level_flag_reports_error_on_stderr() {
     MMLTK_ASSERT(result.exit_code == 1);
     MMLTK_ASSERT(result.stderr_text.find("invalid MMLTK log level: banana") != std::string::npos);
 }
-
 void test_invalid_log_level_env_reports_error_on_stderr() {
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
@@ -689,7 +600,6 @@ void test_invalid_log_level_env_reports_error_on_stderr() {
     MMLTK_ASSERT(result.exit_code == 1);
     MMLTK_ASSERT(result.stderr_text.find("invalid MMLTK log level: banana") != std::string::npos);
 }
-
 void prepare_fake_docker_state(const fs::path& temp_dir, const fs::path& state_dir) {
     std::error_code error;
     fs::create_directories(state_dir, error);
@@ -698,12 +608,9 @@ void prepare_fake_docker_state(const fs::path& temp_dir, const fs::path& state_d
     const fs::path wrapper = locate_repo_wrapper_path();
     fs::create_directories(temp_dir / "tools");
     fs::copy_file(wrapper, temp_dir / "mmltk", fs::copy_options::overwrite_existing);
-    fs::copy_file(wrapper.parent_path() / "tools/runtime_package.sh", temp_dir / "tools/runtime_package.sh",
-                  fs::copy_options::overwrite_existing);
+    fs::copy_file(wrapper.parent_path() / "tools/runtime_package.sh", temp_dir / "tools/runtime_package.sh", fs::copy_options::overwrite_existing);
 }
-
-std::vector<std::string> capture_wrapper_logging_arguments(const fs::path& temp_dir, const fs::path& state_dir,
-                                                           const std::vector<std::string>& environment,
+std::vector<std::string> capture_wrapper_logging_arguments(const fs::path& temp_dir, const fs::path& state_dir, const std::vector<std::string>& environment,
                                                            const std::vector<std::string>& arguments) {
     fs::remove(state_dir / "exec_count.txt");
     fs::remove_all(temp_dir / ".mmltk-data");
@@ -731,17 +638,14 @@ std::vector<std::string> capture_wrapper_logging_arguments(const fs::path& temp_
     MMLTK_ASSERT(result.exit_code == 0);
     return read_text_lines(state_dir / "exec_1_args.txt");
 }
-
 void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
     const fs::path temp_dir = make_temp_dir("mmltk-wrapper-log-env");
     const fs::path state_dir = temp_dir / "state";
     const fs::path log_path = temp_dir / "wrapper.log";
     const fs::path log_dir = temp_dir / "logs";
     prepare_fake_docker_state(temp_dir, state_dir);
-
     const auto exec_args = capture_wrapper_logging_arguments(
-        temp_dir, state_dir, {"MMLTK_LOG_LEVEL=debug", "MMLTK_LOG_FILE=" + log_path.string(), "MMLTK_LOG_DIR=" + log_dir.string()},
-        {"--help"});
+        temp_dir, state_dir, {"MMLTK_LOG_LEVEL=debug", "MMLTK_LOG_FILE=" + log_path.string(), "MMLTK_LOG_DIR=" + log_dir.string()}, {"--help"});
     assert_contains_line(exec_args, "--env");
     assert_contains_line(exec_args, "MMLTK_LOG_LEVEL=debug");
     assert_contains_line(exec_args, "MMLTK_LOG_FILE=/host" + log_path.string());
@@ -749,32 +653,26 @@ void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
     assert_contains_line(exec_args, "/opt/mmltk/bin/mmltk");
     assert_contains_line(exec_args, "--help");
     MMLTK_ASSERT(!fs::exists(temp_dir / ".mmltk-data/logs"));
-
     const std::string fallback = "MMLTK_LOG_DIR=/host" + (temp_dir / ".mmltk-data/logs").string();
     for (const std::string level : {"", "info", "off", "OFF"}) {
         const auto arguments = capture_wrapper_logging_arguments(
-            temp_dir, state_dir, level.empty() ? std::vector<std::string>{} : std::vector<std::string>{"MMLTK_LOG_LEVEL=" + level},
-            {"--help"});
+            temp_dir, state_dir, level.empty() ? std::vector<std::string>{} : std::vector<std::string>{"MMLTK_LOG_LEVEL=" + level}, {"--help"});
         MMLTK_ASSERT((std::find(arguments.begin(), arguments.end(), fallback) != arguments.end()) == (level == "info"));
         MMLTK_ASSERT(fs::exists(temp_dir / ".mmltk-data/logs") == (level == "info"));
         if (level.empty()) {
-            MMLTK_ASSERT(
-                std::none_of(arguments.begin(), arguments.end(), [](const auto& argument) { return argument.starts_with("MMLTK_LOG_"); }));
+            MMLTK_ASSERT(std::none_of(arguments.begin(), arguments.end(), [](const auto& argument) { return argument.starts_with("MMLTK_LOG_"); }));
         } else {
             assert_contains_line(arguments, "MMLTK_LOG_LEVEL=" + level);
         }
     }
-
     cleanup_temp_dir(temp_dir);
 }
-
 void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
     const fs::path temp_dir = make_temp_dir("mmltk-wrapper-log-cli");
     const fs::path state_dir = temp_dir / "state";
     const fs::path log_path = temp_dir / "explicit.log";
     const fs::path log_dir = temp_dir / "logdir";
     prepare_fake_docker_state(temp_dir, state_dir);
-
     const auto exec_args = capture_wrapper_logging_arguments(
         temp_dir, state_dir, {}, {"--log-level", "trace", "--log-file", log_path.string(), "--log-dir", log_dir.string(), "--help"});
     assert_contains_line(exec_args, "/opt/mmltk/bin/mmltk");
@@ -785,7 +683,6 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
     assert_contains_line(exec_args, "--log-dir");
     assert_contains_line(exec_args, "/host" + log_dir.string());
     assert_contains_line(exec_args, "--help");
-
     struct LoggingCase {
         std::vector<std::string> environment;
         std::vector<std::string> arguments;
@@ -815,18 +712,14 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
         MMLTK_ASSERT((std::find(arguments.begin(), arguments.end(), fallback) != arguments.end()) == logging_case.fallback);
         MMLTK_ASSERT(fs::exists(temp_dir / ".mmltk-data/logs") == logging_case.fallback);
         if (logging_case.invalid_level) {
-            MMLTK_ASSERT(std::none_of(arguments.begin(), arguments.end(),
-                                      [](const auto& argument) { return argument.starts_with("MMLTK_LOG_DIR="); }));
-            for (const auto& entry : logging_case.environment)
-                assert_contains_line(arguments, entry);
+            MMLTK_ASSERT(std::none_of(arguments.begin(), arguments.end(), [](const auto& argument) { return argument.starts_with("MMLTK_LOG_DIR="); }));
+            for (const auto& entry : logging_case.environment) assert_contains_line(arguments, entry);
             MMLTK_ASSERT(arguments.size() >= logging_case.arguments.size());
             MMLTK_ASSERT(std::equal(logging_case.arguments.rbegin(), logging_case.arguments.rend(), arguments.rbegin()));
         }
     }
-
     cleanup_temp_dir(temp_dir);
 }
-
 void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
     const fs::path temp_dir = make_temp_dir("mmltk-wrapper-gui-tmpfs");
     const fs::path state_dir = temp_dir / "state";
@@ -843,7 +736,6 @@ void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
         stream << "fake-wayland-socket";
     }
     write_fake_docker_script(temp_dir);
-
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
         "PATH=" + prepend_path_env(temp_dir / "bin"),
@@ -855,25 +747,19 @@ void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
         locate_repo_wrapper_path().string(),
         "--prepare-gui-container",
     });
-
     INFO("wrapper stdout:\n" << result.stdout_text << "\nwrapper stderr:\n" << result.stderr_text);
     MMLTK_ASSERT(result.exit_code == 0);
     const std::vector<std::string> run_args = read_text_lines(state_dir / "run_args.txt");
-    const std::string expected_tmpfs =
-        "/tmp/mmltk-gui-runtime:rw,mode=700,uid=" + std::to_string(::getuid()) + ",gid=" + std::to_string(::getgid());
+    const std::string expected_tmpfs = "/tmp/mmltk-gui-runtime:rw,mode=700,uid=" + std::to_string(::getuid()) + ",gid=" + std::to_string(::getgid());
     assert_contains_line(run_args, "--tmpfs");
     assert_contains_line(run_args, expected_tmpfs);
     assert_contains_substring(run_args, "com.mmltk.runtime=");
     assert_contains_substring(run_args, "tmpfs=" + expected_tmpfs);
-
     cleanup_temp_dir(temp_dir);
 }
-
 }  // namespace
-
 MMLTK_REGISTER_TEST_CASE("[core][cli][subprocess]", test_subprocess_capture_keeps_stdout_and_stderr_separate);
-MMLTK_REGISTER_TEST_CASE("[core][cli][reflected][inheritance]",
-                         test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_presence);
+MMLTK_REGISTER_TEST_CASE("[core][cli][reflected][inheritance]", test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_presence);
 MMLTK_REGISTER_TEST_CASE("[core][cli][reflected]", test_reflected_cli_policy_boundaries_and_diagnostics);
 MMLTK_REGISTER_TEST_CASE("[core][cli][reflected]", test_reflected_cli_optional_repeatable_negation_positionals_environment_and_roundtrip);
 MMLTK_REGISTER_TEST_CASE("[core][cli][reflected][allocation]", test_reflected_cli_scalar_success_has_no_parser_owned_allocation);
@@ -886,11 +772,9 @@ MMLTK_REGISTER_TEST_CASE("[core][cli][logging]", test_invalid_log_level_env_repo
 MMLTK_REGISTER_TEST_CASE("[core][cli][logging][wrapper]", test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec);
 MMLTK_REGISTER_TEST_CASE("[core][cli][logging][wrapper]", test_wrapper_cli_logging_flags_are_forwarded_to_container_command);
 MMLTK_REGISTER_TEST_CASE("[core][cli][wrapper][gui]", test_wrapper_gui_tmpfs_uses_target_uid_gid);
-
 TEST_CASE("negative reflected flags preserve canonical defaults and round trip polarity", "[cli][reflection]") {
     namespace reflection = mmltk::frameworks::reflection;
-    constexpr std::array descriptors{
-        reflection::negative_flag<ParserRequest, &ParserRequest::enabled>("--disable", "Disable the canonical boolean")};
+    constexpr std::array descriptors{reflection::negative_flag<ParserRequest, &ParserRequest::enabled>("--disable", "Disable the canonical boolean")};
     for (const bool enabled : {false, true}) {
         ParserRequest request{};
         request.enabled = enabled;
@@ -907,9 +791,7 @@ TEST_CASE("negative reflected flags preserve canonical defaults and round trip p
     REQUIRE(parsed);
     CHECK(parsed->request.enabled);
 }
-
 MMLTK_REGISTER_TEST_CASE("[core][cli][logging][rfdetr]", test_rfdetr_info_forwards_explicit_logging_options);
-
 TEST_CASE("RF-DETR help exposes independent augmentation and compiler resampling controls", "[core][cli][rfdetr][perceptual]") {
     for (const auto command : {"train", "compile"}) {
         const auto result = run_subprocess_capture_output({mmltk_cli_path(), "rfdetr", command, "--help"});

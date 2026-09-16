@@ -1,13 +1,10 @@
 #pragma once
-
 #include <cstdint>
 #include <cstddef>
 #include <functional>
 #include <exception>
 #include "src/frameworks/gpu/image_failure.h"
-
 namespace mmltk::backend::imaging::upscale {
-
 enum class ImageUpscalerOutcome : std::uint8_t { Completed, Cancelled };
 // Invocation-scoped view: neither the runtime nor a queued request owns it.
 using ImageUpscalerCurrent = std::function_ref<bool()>;
@@ -36,7 +33,6 @@ class ImageUpscalerInitializationFailure final : public mmltk::frameworks::gpu::
    public:
     using ImageFailure::ImageFailure;
 };
-
 enum class ImageUpscalerExecutionStage : std::uint8_t {
     StreamCreated,
     EventCreated,
@@ -79,5 +75,4 @@ using ImageUpscalerExecutionCheckpoint = std::function<void(ImageUpscalerExecuti
     if (checkpoint) checkpoint(stage);
     return current();
 }
-
 }  // namespace mmltk::backend::imaging::upscale

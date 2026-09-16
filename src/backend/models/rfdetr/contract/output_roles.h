@@ -14,4 +14,4 @@ struct RfdetrNamedOutputRole final {
     auto operator<=>(const RfdetrNamedOutputRole&) const = default;
 };
 MMLTK_REFLECT_FIELDS(RfdetrNamedOutputRole)
-}
+}  // namespace mmltk::backend::models::rfdetr

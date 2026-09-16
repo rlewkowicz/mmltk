@@ -10,7 +10,6 @@
 #include "src/common/system/numa_memory.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-
 namespace mmltk::frameworks::gpu {
 namespace {
 void check(CUresult error, const char* operation) {
@@ -41,14 +40,12 @@ struct PinnedHostBuffer::Retention {
             trace.reset(::open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600));
     }
 };
-PinnedHostBuffer::PinnedHostBuffer(CUcontext context, const mmltk::common::system::ExecutionPlacement& placement, bool portable,
-                                   Register registration)
+PinnedHostBuffer::PinnedHostBuffer(CUcontext context, const mmltk::common::system::ExecutionPlacement& placement, bool portable, Register registration)
     : registration_(registration),
       placement_(placement),
       retention_(std::make_unique<Retention>()),
       state_(std::make_shared<State>(context, placement.numa_node, portable)) {
-    if (!context || !registration || placement.cpus.empty())
-        throw std::invalid_argument("pinned host buffer requires an owning context and placement");
+    if (!context || !registration || placement.cpus.empty()) throw std::invalid_argument("pinned host buffer requires an owning context and placement");
 }
 PinnedHostBuffer::~PinnedHostBuffer() noexcept {
     if (!state_->registered) return;
@@ -91,8 +88,8 @@ void PinnedHostBuffer::log(const char* event, std::size_t active_bytes) const no
                                    "{\"event\":\"%s\",\"owner_context\":%llu,\"node\":%d,\"allocation\":%llu,\"capacity_bytes\":%zu,"
                                    "\"active_bytes\":%zu,\"portable\":%s,\"pages\":\"owned-local-verified\"}\n",
                                    event, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(state_->context)), node(),
-                                   static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(data())), capacity_bytes(),
-                                   active_bytes, state_->portable ? "true" : "false");
+                                   static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(data())), capacity_bytes(), active_bytes,
+                                   state_->portable ? "true" : "false");
     if (size > 0 && static_cast<std::size_t>(size) < sizeof(record)) {
         const auto written = ::write(retention_->trace.get(), record, static_cast<std::size_t>(size));
         (void)written;

@@ -1,15 +1,11 @@
 #include "src/backend/models/rfdetr/inference/evaluation.h"
-
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
-
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
-
 namespace mmltk::backend::models::rfdetr {
-
 EvaluateRequest finalize_evaluate_request(EvaluateRequest request) {
     if (request.compiled_path.empty() || request.selected_input_count() != 1U || request.batch_size == 0U) {
         throw std::invalid_argument("invalid RF-DETR evaluation request");
@@ -17,7 +13,6 @@ EvaluateRequest finalize_evaluate_request(EvaluateRequest request) {
     request.compiled_path = std::filesystem::absolute(request.compiled_path);
     return request;
 }
-
 EvaluationRunResult run_evaluation(const EvaluateRequest& request) {
     const auto options = finalize_evaluate_request(request);
     ValidateRequest validation;
@@ -40,13 +35,13 @@ EvaluationRunResult run_evaluation(const EvaluateRequest& request) {
     result.result = std::move(backend_result);
     return result;
 }
-
 void print_evaluation_summary(const EvaluateRequest&, const EvaluationRunResult& result) {
     std::cout << result.backend_name << ": bbox AP=";
-    if (result.result.summary.bbox.available) std::cout << result.result.summary.bbox.ap;
-    else std::cout << "unavailable";
+    if (result.result.summary.bbox.available)
+        std::cout << result.result.summary.bbox.ap;
+    else
+        std::cout << "unavailable";
     const auto& caps = result.result.summary.bbox.detection_limits;
     std::cout << " model budget=" << result.result.summary.model_detection_budget << " AR caps=" << caps[0] << '/' << caps[1] << '/' << caps[2] << '\n';
 }
-
 }  // namespace mmltk::backend::models::rfdetr

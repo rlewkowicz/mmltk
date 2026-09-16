@@ -1,9 +1,7 @@
 #include "shiftlut_reference.h"
 #include <cuda_runtime.h>
-
 namespace mmltk::backend::imaging::upscale::tests {
 namespace {
-
 // Independent boundary oracle: the full-image normalization expression and
 // per-pixel channel loop from 55ee9927, compiled under the same NVCC policy.
 // It deliberately does not call production tile preparation.
@@ -19,13 +17,9 @@ __global__ void normalize(const std::uint8_t* source, std::size_t pitch, std::ui
         target[static_cast<std::uint64_t>(channel) * count + pixel] = (rgb - mean) / deviation;
     }
 }
-
 }  // namespace
-
-void normalize_reference(const std::uint8_t* source, std::size_t pitch, std::uint32_t width, std::uint32_t height, float* target,
-                         cudaStream_t stream) {
+void normalize_reference(const std::uint8_t* source, std::size_t pitch, std::uint32_t width, std::uint32_t height, float* target, cudaStream_t stream) {
     const auto count = static_cast<std::uint64_t>(width) * height;
     normalize<<<static_cast<unsigned int>((count + 255) / 256), 256, 0, stream>>>(source, pitch, width, height, target);
 }
-
 }  // namespace mmltk::backend::imaging::upscale::tests

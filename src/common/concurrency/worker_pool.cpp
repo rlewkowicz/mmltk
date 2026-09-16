@@ -1,5 +1,4 @@
 #include "src/common/concurrency/worker_pool.h"
-
 #include <algorithm>
 #include <condition_variable>
 #include <cstddef>
@@ -11,12 +10,9 @@
 #include <string>
 #include <thread>
 #include <utility>
-
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
-
 namespace mmltk::common::concurrency {
-
 struct WorkerPool::Impl final {
     mutable std::mutex mutex;
     std::condition_variable work_cv;
@@ -37,20 +33,17 @@ struct WorkerPool::Impl final {
     std::vector<Task> tasks;
     std::size_t task_head = 0U;
     std::size_t task_count = 0U;
-
     void push(Task task) {
         if (task_count == tasks.size()) {
             if (tasks.size() > tasks.max_size() / 2U) throw std::length_error("worker task queue capacity exhausted");
             std::vector<Task> grown(std::max<std::size_t>(1U, tasks.size() * 2U));
-            for (std::size_t index = 0U; index < task_count; ++index)
-                grown[index] = std::move(tasks[(task_head + index) % tasks.size()]);
+            for (std::size_t index = 0U; index < task_count; ++index) grown[index] = std::move(tasks[(task_head + index) % tasks.size()]);
             tasks = std::move(grown);
             task_head = 0U;
         }
         tasks[(task_head + task_count) % tasks.size()] = std::move(task);
         ++task_count;
     }
-
     Task pop() noexcept {
         auto task = std::move(tasks[task_head]);
         task_head = (task_head + 1U) % tasks.size();
@@ -68,24 +61,18 @@ struct WorkerPool::Impl final {
     bool shutdown = false;
     std::exception_ptr startup_error;
 };
-
 namespace {
-
 thread_local const WorkerPool* current_worker_pool = nullptr;
 thread_local std::size_t current_pool_index = 0U;
-
 std::string worker_name_for_index(const std::string& prefix, const std::size_t index) {
     if (prefix.empty()) { return {}; }
     std::string name = prefix + std::to_string(index);
     if (name.size() > 15U) { name.resize(15U); }
     return name;
 }
-
 }  // namespace
-
-WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affinity, std::string thread_name_prefix,
-                       const std::size_t queued_capacity, const mmltk::common::system::ExecutionPlacement* placement,
-                       const bool storage_worker)
+WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affinity, std::string thread_name_prefix, const std::size_t queued_capacity,
+                       const mmltk::common::system::ExecutionPlacement* placement, const bool storage_worker)
     : impl_(std::make_unique<Impl>()) {
     if (worker_count == 0U || worker_count > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("worker_count must be greater than zero");
@@ -98,8 +85,7 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
         impl_->worker_nodes.assign(impl_->cpu_affinity.size(), placement->numa_node);
     } else {
         const auto topology = mmltk::common::system::NumaTopology::Capture();
-        impl_->cpu_affinity =
-            mmltk::common::system::physical_core_order(topology, cpu_affinity.empty() ? topology.permitted_cpus : cpu_affinity);
+        impl_->cpu_affinity = mmltk::common::system::physical_core_order(topology, cpu_affinity.empty() ? topology.permitted_cpus : cpu_affinity);
         for (int cpu : impl_->cpu_affinity) {
             if (std::ranges::find(topology.permitted_cpus, cpu) == topology.permitted_cpus.end())
                 throw std::invalid_argument("worker CPU is outside permitted cpuset");
@@ -108,9 +94,10 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
     }
     impl_->storage_worker = storage_worker;
     impl_->thread_name_prefix = std::move(thread_name_prefix);
-    const auto actual_worker_count = placement ? worker_count
-                                               : static_cast<std::size_t>(mmltk::common::system::clamp_worker_count_to_cpus(
-                                                     static_cast<int>(worker_count), impl_->cpu_affinity.size(), 0, 1));
+    const auto actual_worker_count =
+        placement
+            ? worker_count
+            : static_cast<std::size_t>(mmltk::common::system::clamp_worker_count_to_cpus(static_cast<int>(worker_count), impl_->cpu_affinity.size(), 0, 1));
     impl_->tasks.resize(std::max(queued_capacity, actual_worker_count));
     impl_->workers.reserve(actual_worker_count);
     impl_->policies.resize(actual_worker_count);
@@ -118,15 +105,14 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
         for (std::size_t worker_index = 0U; worker_index < actual_worker_count; ++worker_index) {
             impl_->workers.emplace_back([this, worker_index] {
                 try {
-                    impl_->policies[worker_index] =
-                        mmltk::common::system::apply_worker_execution_policy(mmltk::common::system::ExecutionPolicyRequest{
-                            impl_->cpu_affinity,
-                            worker_name_for_index(impl_->thread_name_prefix, worker_index),
-                            worker_index,
-                            impl_->worker_nodes[worker_index % impl_->worker_nodes.size()],
-                            -10,
-                            impl_->storage_worker,
-                        });
+                    impl_->policies[worker_index] = mmltk::common::system::apply_worker_execution_policy(mmltk::common::system::ExecutionPolicyRequest{
+                        impl_->cpu_affinity,
+                        worker_name_for_index(impl_->thread_name_prefix, worker_index),
+                        worker_index,
+                        impl_->worker_nodes[worker_index % impl_->worker_nodes.size()],
+                        -10,
+                        impl_->storage_worker,
+                    });
                 } catch (...) {
                     std::lock_guard lock(impl_->mutex);
                     if (impl_->startup_error == nullptr) { impl_->startup_error = std::current_exception(); }
@@ -170,8 +156,7 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
                         if (impl_->pending_tasks == 0U) {
                             impl_->shutdown = true;
                             if (impl_->startup_error == nullptr) {
-                                impl_->startup_error =
-                                    std::make_exception_ptr(std::runtime_error("worker pool internal task accounting underflow"));
+                                impl_->startup_error = std::make_exception_ptr(std::runtime_error("worker pool internal task accounting underflow"));
                             }
                             impl_->work_cv.notify_all();
                             impl_->idle_cv.notify_all();
@@ -186,17 +171,14 @@ WorkerPool::WorkerPool(const std::size_t worker_count, std::vector<int> cpu_affi
             });
         }
         std::unique_lock lock(impl_->mutex);
-        impl_->startup_cv.wait(
-            lock, [this, actual_worker_count] { return impl_->started_workers == actual_worker_count || impl_->startup_error != nullptr; });
+        impl_->startup_cv.wait(lock, [this, actual_worker_count] { return impl_->started_workers == actual_worker_count || impl_->startup_error != nullptr; });
         if (impl_->startup_error != nullptr) std::rethrow_exception(impl_->startup_error);
     } catch (...) {
         shutdown();
         throw;
     }
 }
-
 WorkerPool::~WorkerPool() { shutdown(); }
-
 void WorkerPool::shutdown() noexcept {
     {
         std::lock_guard lock(impl_->mutex);
@@ -208,21 +190,17 @@ void WorkerPool::shutdown() noexcept {
     for (auto& worker : impl_->workers)
         if (worker.joinable()) worker.join();
 }
-
 std::size_t WorkerPool::size() const noexcept { return impl_->workers.size(); }
-
 const mmltk::common::system::ExecutionPolicySnapshot& WorkerPool::policy(std::size_t worker) const { return impl_->policies.at(worker); }
 bool WorkerPool::idle() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->pending_tasks == 0U;
 }
-
 void WorkerPool::wait_idle() {
     std::unique_lock lock(impl_->mutex);
     impl_->idle_cv.wait(lock, [this] { return impl_->pending_tasks == 0U || impl_->startup_error != nullptr; });
     if (impl_->startup_error != nullptr) { std::rethrow_exception(impl_->startup_error); }
 }
-
 void WorkerPool::enqueue_detached(std::function<void()> task) {
     {
         std::lock_guard lock(impl_->mutex);
@@ -233,7 +211,6 @@ void WorkerPool::enqueue_detached(std::function<void()> task) {
     }
     impl_->work_cv.notify_one();
 }
-
 void WorkerPool::enqueue_borrowed(void* context, std::size_t index, void (*call)(void*, std::size_t)) {
     if (!call) throw std::invalid_argument("borrowed worker task is empty");
     {
@@ -245,12 +222,9 @@ void WorkerPool::enqueue_borrowed(void* context, std::size_t index, void (*call)
     }
     impl_->work_cv.notify_one();
 }
-
 std::size_t WorkerPool::current_worker_index() const {
     if (!running_on_worker_thread()) throw std::logic_error("worker index requested outside its owning pool");
     return current_pool_index;
 }
-
 bool WorkerPool::running_on_worker_thread() const noexcept { return current_worker_pool == this; }
-
 }  // namespace mmltk::common::concurrency

@@ -1,7 +1,5 @@
 #pragma once
-
 #include <unistd.h>
-
 #include <array>
 #include <cerrno>
 #include <cstddef>
@@ -9,13 +7,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-
 namespace mmltk::controller::services::console_output {
-
 inline void trim_output_tail(std::string& output_tail, std::size_t max_size = 65536) {
     if (output_tail.size() > max_size) { output_tail.erase(0, output_tail.size() - max_size); }
 }
-
 inline void append_console_output(std::string& tail, const std::string_view chunk, std::size_t max_size = 65536) {
     std::size_t index = 0;
     while (index < chunk.size()) {
@@ -51,11 +46,9 @@ inline void append_console_output(std::string& tail, const std::string_view chun
     }
     trim_output_tail(tail, max_size);
 }
-
 inline std::string read_fd(const int fd, const std::string_view error_prefix, const bool nonblocking = false) {
     std::string output;
     if (fd < 0) { return output; }
-
     std::array<char, 4096> buffer{};
     while (true) {
         const ssize_t bytes_read = ::read(fd, buffer.data(), buffer.size());
@@ -70,5 +63,4 @@ inline std::string read_fd(const int fd, const std::string_view error_prefix, co
     }
     return output;
 }
-
 }  // namespace mmltk::controller::services::console_output

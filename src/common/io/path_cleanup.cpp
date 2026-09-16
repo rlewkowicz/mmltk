@@ -2,24 +2,15 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 #include <cerrno>
 #include <filesystem>
 #include <new>
 #include <system_error>
-
 #include "src/common/io/file_memory.h"
-
 namespace mmltk::common::io {
-
 namespace {
-
 void assign_errno(std::error_code& error, const int value = errno) noexcept { error.assign(value, std::generic_category()); }
-
-[[nodiscard]] bool is_dot_entry(const char* name) noexcept {
-    return name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
-}
-
+[[nodiscard]] bool is_dot_entry(const char* name) noexcept { return name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')); }
 [[nodiscard]] bool remove_entry_at(const int parent_fd, const char* name, const dev_t root_device, std::error_code& error) noexcept {
     if (parent_fd < 0) {
         assign_errno(error, EBADF);
@@ -40,7 +31,6 @@ void assign_errno(std::error_code& error, const int value = errno) noexcept { er
         assign_errno(error);
         return false;
     }
-
     const int child_fd = ::openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (child_fd < 0) {
         if (errno == ENOENT) { return true; }
@@ -54,7 +44,6 @@ void assign_errno(std::error_code& error, const int value = errno) noexcept { er
         assign_errno(error, saved_errno);
         return false;
     }
-
     const int directory_fd = ::dirfd(directory);
     if (directory_fd < 0) {
         const int saved_errno = errno;
@@ -74,7 +63,6 @@ void assign_errno(std::error_code& error, const int value = errno) noexcept { er
         assign_errno(error, ESTALE);
         return false;
     }
-
     while (true) {
         errno = 0;
         dirent* entry = ::readdir(directory);
@@ -111,9 +99,7 @@ void assign_errno(std::error_code& error, const int value = errno) noexcept { er
     assign_errno(error);
     return false;
 }
-
 }  // namespace
-
 bool remove_tree_no_follow(const std::filesystem::path& path, std::error_code& error) noexcept {
     error.clear();
     try {
@@ -145,5 +131,4 @@ bool remove_tree_no_follow(const std::filesystem::path& path, std::error_code& e
     } catch (...) { error = std::make_error_code(std::errc::io_error); }
     return false;
 }
-
 }  // namespace mmltk::common::io

@@ -1,5 +1,4 @@
 #pragma once
-
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -10,16 +9,13 @@
 #include <optional>
 #include <stop_token>
 #include <variant>
-
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/product_revision_sequence.h"
 #include "src/frameworks/gpu/system_image_worker.h"
 #include "src/common/system/execution_policy.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/controller/presentation/visual_system_types.h"
-
 namespace mmltk::controller::detail {
-
 class VisualRuntimeOwner final {
    public:
     enum class ActivityStage : std::uint8_t {
@@ -47,12 +43,10 @@ class VisualRuntimeOwner final {
     using Work = std::move_only_function<Notification(Runtime&, std::stop_token)>;
     using FailureSink = std::function<void(std::exception_ptr)>;
     using ActivityObservation = std::move_only_function<void(ActivityStage, std::uint64_t) const noexcept>;
-
     // Claim the active operation's terminal boundary before committing producer
     // state. A winning stop rejects completion; a winning completion makes later
     // stops inert for this operation. Staged work also claims it on return.
     [[nodiscard]] bool TryCompleteActiveWork() noexcept;
-
     VisualRuntimeOwner(RuntimeFactory, FailureSink, ActivityObservation = {});
     ~VisualRuntimeOwner();
     VisualRuntimeOwner(const VisualRuntimeOwner&) = delete;
@@ -71,8 +65,7 @@ class VisualRuntimeOwner final {
     // Arm before testing output writability; disarm clears only availability retries.
     void SetOutputRetry(bool armed) noexcept;
     [[nodiscard]] Runtime::OutputCandidate TryAcquireOutput(
-        Runtime&, Runtime::CompletedOutput&,
-        mmltk::frameworks::gpu::ImagePlanePreservation = mmltk::frameworks::gpu::ImagePlanePreservation::All);
+        Runtime&, Runtime::CompletedOutput&, mmltk::frameworks::gpu::ImagePlanePreservation = mmltk::frameworks::gpu::ImagePlanePreservation::All);
     // Retain the submitted operation and its candidate until owner-thread GPU
     // settlement. Success and execution failure both notify; later GPU work
     // waits for owner-thread failure handling or completion. Input admission
@@ -132,7 +125,6 @@ class VisualRuntimeOwner final {
     void FlushLatest();
     void Observe(ActivityStage, std::uint64_t value = 0U) const noexcept;
     [[nodiscard]] Runtime* RuntimeForWork(std::stop_token worker_stop, std::stop_token operation_stop);
-
     struct OutputWake;
     std::shared_ptr<OutputWake> output_wake_;
     std::shared_ptr<const std::function<void()>> retirement_sink_;
@@ -179,12 +171,7 @@ class VisualRuntimeOwner final {
     bool stopping_ = false;
     mmltk::frameworks::gpu::SystemImageWorker worker_;
 };
-
 }  // namespace mmltk::controller::detail
-
 namespace mmltk::controller {
-
-[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame&,
-                                                                                                  const detail::VisualRuntimeOwner&);
-
+[[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView borrow_matching_visual_product(const VisualFrame&, const detail::VisualRuntimeOwner&);
 }  // namespace mmltk::controller

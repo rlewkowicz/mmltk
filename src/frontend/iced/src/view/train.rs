@@ -5,8 +5,8 @@ use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container, text};
 
 mod advanced;
-pub mod output;
 pub(crate) mod dataset;
+pub mod output;
 
 pub const DATASET_CARD_ID: &str = "train.card.dataset";
 pub const COMPILE_DATASET_ID: &str = "train.compile_dataset";
@@ -67,7 +67,9 @@ impl Component {
         self.model_card = Default::default();
         self.metrics.reset(visible);
     }
-    pub fn sync_metrics(&mut self, model: &ApplicationModel, visible: bool) { self.metrics.rebase(model, visible); }
+    pub fn sync_metrics(&mut self, model: &ApplicationModel, visible: bool) {
+        self.metrics.rebase(model, visible);
+    }
     pub fn rebase(&mut self, model: &ApplicationModel) {
         self.model_card
             .rebase(model, crate::generated::FeatureId::Train);
@@ -110,7 +112,10 @@ impl Component {
                 };
                 Outcome::Model(outcome)
             }
-            Message::Metrics(message) => { self.metrics.update(message); return Ok(None); }
+            Message::Metrics(message) => {
+                self.metrics.update(message);
+                return Ok(None);
+            }
             Message::Output(message) => Outcome::Output(message),
         };
         Ok(Some(outcome))
@@ -180,7 +185,11 @@ impl Component {
                 settings_settled,
             )
             .map(Message::Dataset),
-            text(model.workflow.start_detail(crate::generated::FeatureId::Train)),
+            text(
+                model
+                    .workflow
+                    .start_detail(crate::generated::FeatureId::Train)
+            ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Train,
                 "Start training",
@@ -196,8 +205,10 @@ impl Component {
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
         .into();
-        let chart_width = crate::view::workflow::Composition::new(crate::generated::FeatureId::Train, width).center_width()
-            - 2.0 * crate::view::workflow::CARD_PADDING;
+        let chart_width =
+            crate::view::workflow::Composition::new(crate::generated::FeatureId::Train, width)
+                .center_width()
+                - 2.0 * crate::view::workflow::CARD_PADDING;
         let workspace = self.metrics.view(chart_width).map(Message::Metrics);
         let advanced = crate::view::shared::identified(
             "train.card.advanced",
@@ -264,7 +275,12 @@ impl Component {
             setup,
             workspace,
             advanced,
-            column![output::view(model, settings).map(Message::Output), diagnostics].spacing(crate::view::workflow::SECTION_SPACING).into(),
+            column![
+                output::view(model, settings).map(Message::Output),
+                diagnostics
+            ]
+            .spacing(crate::view::workflow::SECTION_SPACING)
+            .into(),
         )
         .render(width)
     }

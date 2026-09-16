@@ -11,6 +11,7 @@ mmltk_register_public_headers(
     FILES
         serialization.h
         json_scalar.h
+        json_wire.h
         reflected_json.h
         cbor_field_annotations.h
         reflected_cbor.h
@@ -19,13 +20,13 @@ mmltk_register_public_headers(
 mmltk_register_ordinary_sources(
     mmltk_frameworks_serialization
     cbor_wire.cpp
+    json_wire.cpp
     reflected_cbor.cpp)
 target_link_libraries(mmltk_frameworks_serialization
     PUBLIC
         mmltk::common::io
         mmltk::common::types
         mmltk::frameworks::reflection
-    PRIVATE
         nlohmann_json
 )
 

@@ -1,5 +1,4 @@
 #pragma once
-
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -7,16 +6,13 @@
 #include <functional>
 #include <memory>
 #include <string_view>
-
 #include "src/controller/browser/client_record.h"
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/visual_runtime.h"
 #include "src/frameworks/gpu/device_execution.h"
-
 namespace mmltk::controller::shell {
-
 struct ApplicationSystemConfiguration final {
     VisualDeviceSettings base_visual{};
     VisualDeviceSettings output_visual{};
@@ -30,23 +26,17 @@ struct ApplicationSystemConfiguration final {
     services::VastProviderClient provider{};
     std::filesystem::path training_executable{};
 };
-
 [[nodiscard]] std::unique_ptr<ExploreSystem> make_shell_explore_system(SettingsSystem&, const ApplicationSystemConfiguration&,
                                                                        const mmltk::frameworks::gpu::DeviceExecution&,
-                                                                       SystemEventSink<ExploreSystem::event_type> = {},
-                                                                       VisualDiagnosticSink = {});
-
+                                                                       SystemEventSink<ExploreSystem::event_type> = {}, VisualDiagnosticSink = {});
 class ApplicationSystemStorage final {
    public:
     using EventSink = std::function<void(browser::SystemEvent)>;
     using ContinuitySink = std::function<void()>;
-
     ApplicationSystemStorage(ApplicationSystemConfiguration, EventSink, VisualDiagnosticSink = {}, ContinuitySink = {});
     ~ApplicationSystemStorage();
-
     ApplicationSystemStorage(const ApplicationSystemStorage&) = delete;
     ApplicationSystemStorage& operator=(const ApplicationSystemStorage&) = delete;
-
     [[nodiscard]] ApplicationSystems& application_systems() noexcept;
     [[nodiscard]] PresentationSystem& presentation() noexcept;
     [[nodiscard]] FileDialogSystem& file_dialog() noexcept;
@@ -66,7 +56,6 @@ class ApplicationSystemStorage final {
    private:
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowExactFrame(const VisualFrame&) const;
     [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
-
     EventSink events_;
     ContinuitySink continuity_;
     std::atomic<PresentationSystem*> presentation_notifications_{nullptr};
@@ -86,9 +75,7 @@ class ApplicationSystemStorage final {
     std::unique_ptr<PresentationSystem> presentation_;
     ApplicationSystems systems_{};
 };
-
-[[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(
-    ApplicationSystemStorage::EventSink&, UpscaleSystem&, ApplicationSystemStorage::ContinuitySink = {},
-    std::function<void(PresentationSourceIdentity)> = {});
-
+[[nodiscard]] SystemEventSink<ExploreSystem::event_type> make_explore_upscale_event_sink(ApplicationSystemStorage::EventSink&, UpscaleSystem&,
+                                                                                         ApplicationSystemStorage::ContinuitySink = {},
+                                                                                         std::function<void(PresentationSourceIdentity)> = {});
 }  // namespace mmltk::controller::shell

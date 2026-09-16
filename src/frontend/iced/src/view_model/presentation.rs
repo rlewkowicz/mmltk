@@ -1013,8 +1013,15 @@ mod tests {
             box_: crate::generated::AnnotationBox {
                 first: crate::generated::AnnotationPoint { x: 0.0, y: 0.0 },
                 second: crate::generated::AnnotationPoint { x: 4.0, y: 4.0 },
-            }, classreference: 0, classdomain: crate::generated::ClassReferenceDomain::Foreground, confidence: 0.75,
-            color: crate::generated::AnnotationColor { hue: 0.0, saturation: 1.0, value: 1.0 },
+            },
+            classreference: 0,
+            classdomain: crate::generated::ClassReferenceDomain::Foreground,
+            confidence: 0.75,
+            color: crate::generated::AnnotationColor {
+                hue: 0.0,
+                saturation: 1.0,
+                value: 1.0,
+            },
             name: "retained".into(),
         };
         baseline.labels = vec![label; 4096];
@@ -1024,12 +1031,22 @@ mod tests {
         progress.revision = 13;
         progress.operation.progress.sequence = 3;
         progress.operation.progress.completed = 3;
-        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress { snapshot: progress.clone() }));
+        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress {
+            snapshot: progress.clone(),
+        }));
         assert!(model.error.is_none());
-        assert_eq!(model.predict_snapshot.as_ref().unwrap().labels.as_ptr(), pointer);
-        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress { snapshot: progress.clone() }));
+        assert_eq!(
+            model.predict_snapshot.as_ref().unwrap().labels.as_ptr(),
+            pointer
+        );
+        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress {
+            snapshot: progress.clone(),
+        }));
         assert!(model.error.is_none());
-        assert_eq!(model.predict_snapshot.as_ref().unwrap().labels.as_ptr(), pointer);
+        assert_eq!(
+            model.predict_snapshot.as_ref().unwrap().labels.as_ptr(),
+            pointer
+        );
         let mut image = baseline.clone();
         image.revision = 12;
         image.operation.progress.sequence = 2;
@@ -1047,14 +1064,38 @@ mod tests {
         let mut cancellation = image.clone();
         cancellation.revision = 14;
         cancellation.operation.terminal.outcome = ComputeOperationOutcome::CancellationRequested;
-        model.install_predict_snapshot(cancellation.clone()).unwrap();
-        assert_eq!(model.predict_snapshot.as_ref().unwrap().operation.progress.completed, 3);
-        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress { snapshot: progress }));
-        assert_eq!(model.predict_snapshot.as_ref().unwrap().operation.terminal.outcome, ComputeOperationOutcome::CancellationRequested);
+        model
+            .install_predict_snapshot(cancellation.clone())
+            .unwrap();
+        assert_eq!(
+            model
+                .predict_snapshot
+                .as_ref()
+                .unwrap()
+                .operation
+                .progress
+                .completed,
+            3
+        );
+        model.reduce_event(ApplicationEvent::PredictPredictProgress(PredictProgress {
+            snapshot: progress,
+        }));
+        assert_eq!(
+            model
+                .predict_snapshot
+                .as_ref()
+                .unwrap()
+                .operation
+                .terminal
+                .outcome,
+            ComputeOperationOutcome::CancellationRequested
+        );
         cancellation.revision = 15;
         cancellation.operation.active = false;
         cancellation.operation.terminal.outcome = ComputeOperationOutcome::Cancelled;
-        model.install_predict_snapshot(cancellation.clone()).unwrap();
+        model
+            .install_predict_snapshot(cancellation.clone())
+            .unwrap();
         assert_eq!(model.predict_snapshot.as_ref().unwrap().frame, image.frame);
         assert!(model.error.is_none());
         model.peer_disconnected(UiError::transport("reconnect"));
@@ -1062,5 +1103,4 @@ mod tests {
         model.install_predict_snapshot(cancellation).unwrap();
         assert_eq!(model.predict_snapshot.as_ref().unwrap().revision, 15);
     }
-
 }

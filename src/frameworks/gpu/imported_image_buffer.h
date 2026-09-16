@@ -1,5 +1,4 @@
 #pragma once
-
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <cstddef>
@@ -7,16 +6,13 @@
 #include <memory>
 #include <optional>
 #include <string>
-
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-
 namespace mmltk::frameworks::gpu {
 namespace test_support {
 struct ImportedImageBufferTestAccess;
 }
-
 // One independent Vulkan payload. Every native alias shares this owner, including
 // its CUDA context and the unconsumed FD retaining backing after browser exit.
 class ImportedImageBuffer final {
@@ -25,9 +21,7 @@ class ImportedImageBuffer final {
     ~ImportedImageBuffer() noexcept;
     ImportedImageBuffer(const ImportedImageBuffer&) = delete;
     ImportedImageBuffer& operator=(const ImportedImageBuffer&) = delete;
-
-    [[nodiscard]] bool Import(DeviceContext, mmltk::common::io::ScopedFd, const ImageWorkspaceLayout&, std::uint64_t identity,
-                              std::string* error);
+    [[nodiscard]] bool Import(DeviceContext, mmltk::common::io::ScopedFd, const ImageWorkspaceLayout&, std::uint64_t identity, std::string* error);
     [[nodiscard]] cudaError_t Release() noexcept;
     [[nodiscard]] cudaError_t release_failure() const noexcept { return release_failure_; }
     [[nodiscard]] CUdeviceptr data() const noexcept;

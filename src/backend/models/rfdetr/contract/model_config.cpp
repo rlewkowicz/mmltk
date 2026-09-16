@@ -1,5 +1,4 @@
 #include "src/backend/models/rfdetr/contract/model_config.h"
-
 #include <array>
 #include <cctype>
 #include <cstddef>
@@ -7,22 +6,16 @@
 #include <span>
 #include <string>
 #include <string_view>
-
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/weight_catalog.h"
 #include "src/common/types/string_utils.h"
-
 namespace mmltk::backend::models::rfdetr {
-
 namespace {
-
 [[nodiscard]] std::string_view url_basename(const std::string_view url) {
     const std::size_t slash = url.find_last_of('/');
     return slash == std::string_view::npos ? url : url.substr(slash + 1U);
 }
-
 [[nodiscard]] bool is_match_boundary(const char character) { return !std::isalnum(static_cast<unsigned char>(character)); }
-
 [[nodiscard]] bool contains_path_token(const std::string_view normalized_path, const std::string_view candidate) {
     if (candidate.empty() || normalized_path.size() < candidate.size()) return false;
     std::size_t position = normalized_path.find(candidate);
@@ -36,7 +29,6 @@ namespace {
     }
     return false;
 }
-
 void consider_candidate(const PresetCatalogEntry& preset, const std::string_view normalized_path, const std::string_view candidate,
                         const std::size_t base_score, const PresetCatalogEntry*& best, std::size_t& best_score) {
     if (!contains_path_token(normalized_path, candidate)) return;
@@ -46,7 +38,6 @@ void consider_candidate(const PresetCatalogEntry& preset, const std::string_view
         best_score = score;
     }
 }
-
 void consider_known_aliases(const PresetCatalogEntry& preset, const std::string_view normalized_path, const PresetCatalogEntry*& best,
                             std::size_t& best_score) {
     struct Alias final {
@@ -62,18 +53,14 @@ void consider_known_aliases(const PresetCatalogEntry& preset, const std::string_
         if (alias.preset == preset.preset_name) { consider_candidate(preset, normalized_path, alias.path_token, 1400U, best, best_score); }
     }
 }
-
 }  // namespace
-
 std::span<const PresetCatalogEntry> model_presets() noexcept { return kPresetCatalog; }
-
 const PresetCatalogEntry* find_model_preset(const std::string_view preset_name) noexcept {
     for (const auto& preset : kPresetCatalog) {
         if (preset.preset_name == preset_name) return &preset;
     }
     return nullptr;
 }
-
 const PresetCatalogEntry* find_model_preset_by_weight_filename(const std::string_view filename) noexcept {
     const PresetCatalogEntry* match = nullptr;
     for (const auto& preset : kPresetCatalog) {
@@ -86,30 +73,25 @@ const PresetCatalogEntry* find_model_preset_by_weight_filename(const std::string
     }
     return match;
 }
-
 const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::path& path) {
     if (path.empty()) return nullptr;
     if (const auto* preset = find_model_preset_by_weight_filename(path.filename().string())) { return preset; }
-
     const std::string normalized = mmltk::common::types::to_lower(path.lexically_normal().string());
     const PresetCatalogEntry* best = nullptr;
     std::size_t best_score = 0U;
     for (const auto& preset : kPresetCatalog) {
         const std::string weight = mmltk::common::types::to_lower(preset.canonical_weight_filename);
         consider_candidate(preset, normalized, weight, 3000U, best, best_score);
-        consider_candidate(preset, normalized, mmltk::common::types::to_lower(std::filesystem::path(weight).stem().string()), 2900U, best,
-                           best_score);
+        consider_candidate(preset, normalized, mmltk::common::types::to_lower(std::filesystem::path(weight).stem().string()), 2900U, best, best_score);
         consider_candidate(preset, normalized, mmltk::common::types::to_lower(preset.preset_name), 2800U, best, best_score);
         if (preset.preset_name.starts_with("rf-detr-")) {
-            consider_candidate(preset, normalized,
-                               mmltk::common::types::to_lower(preset.preset_name.substr(std::string_view{"rf-detr-"}.size())), 1500U, best,
+            consider_candidate(preset, normalized, mmltk::common::types::to_lower(preset.preset_name.substr(std::string_view{"rf-detr-"}.size())), 1500U, best,
                                best_score);
         }
         consider_known_aliases(preset, normalized, best, best_score);
     }
     return best;
 }
-
 NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
     return {
         .preset_name = std::string(preset.preset_name),
@@ -139,5 +121,4 @@ NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
         .training_supervision = {},
     };
 }
-
 }  // namespace mmltk::backend::models::rfdetr

@@ -2,7 +2,6 @@
 #include <linux/fs.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
@@ -16,25 +15,17 @@
 #include <string>
 #include <string_view>
 #include <vector>
-
 namespace {
-
 constexpr std::string_view kProtocolMarkerPrefix = "MMLTK_HOST_API_PROTOCOL_";
 constexpr std::string_view kWasmSuffix = "_bg.wasm";
-
 [[nodiscard]] bool ascii_digit(const unsigned char byte) { return byte >= '0' && byte <= '9'; }
-
-[[nodiscard]] bool ascii_hex_digit(const unsigned char byte) {
-    return ascii_digit(byte) || (byte >= 'A' && byte <= 'F') || (byte >= 'a' && byte <= 'f');
-}
-
+[[nodiscard]] bool ascii_hex_digit(const unsigned char byte) { return ascii_digit(byte) || (byte >= 'A' && byte <= 'F') || (byte >= 'a' && byte <= 'f'); }
 [[nodiscard]] bool path_exists(const char* path) {
     std::error_code error;
     const bool exists = std::filesystem::exists(path, error);
     if (error) { throw std::filesystem::filesystem_error("failed to inspect browser distribution path", path, error); }
     return exists;
 }
-
 [[nodiscard]] std::string read_protocol_marker(const char* marker_path) {
     std::ifstream input(marker_path, std::ios::binary);
     if (!input) { throw std::runtime_error("could not read generated native protocol marker"); }
@@ -45,12 +36,9 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
     }
     return marker;
 }
-
 [[nodiscard]] bool asset_character(const unsigned char byte) {
-    return ascii_digit(byte) || (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') || byte == '_' || byte == '-' || byte == '.' ||
-           byte == '/';
+    return ascii_digit(byte) || (byte >= 'A' && byte <= 'Z') || (byte >= 'a' && byte <= 'z') || byte == '_' || byte == '-' || byte == '.' || byte == '/';
 }
-
 [[nodiscard]] bool hashed_wasm_name(const std::filesystem::path& path) {
     const std::string filename = path.filename();
     if (!filename.ends_with(kWasmSuffix)) { return false; }
@@ -59,7 +47,6 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
     if (separator == std::string_view::npos || separator == 0U || separator + 9U > prefix.size()) { return false; }
     return std::ranges::all_of(prefix.substr(separator + 1U), ascii_hex_digit);
 }
-
 [[nodiscard]] std::string selected_wasm_reference(const std::string_view index) {
     std::set<std::string> references;
     std::size_t accepted_occurrences = 0U;
@@ -73,7 +60,6 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
             ++cursor;
             continue;
         }
-
         const std::size_t content_begin = cursor + 1U;
         std::size_t content_end = content_begin;
         bool has_escape = false;
@@ -86,7 +72,6 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
             }
         }
         if (content_end == index.size()) { break; }
-
         const std::string_view token = index.substr(content_begin, content_end - content_begin);
         const std::size_t suffix_position = token.find(kWasmSuffix);
         if (suffix_position != std::string_view::npos) {
@@ -99,7 +84,6 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
         }
         cursor = content_end + 1U;
     }
-
     std::size_t suffix_occurrences = 0U;
     for (std::size_t suffix_position = index.find(kWasmSuffix); suffix_position != std::string_view::npos;
          suffix_position = index.find(kWasmSuffix, suffix_position + kWasmSuffix.size())) {
@@ -110,20 +94,16 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
     }
     return *references.begin();
 }
-
 [[nodiscard]] std::filesystem::path admitted_relative_wasm(std::string reference) {
     if (reference.starts_with("//")) { throw std::runtime_error("browser index selects a network-path WebAssembly URL"); }
     if (reference.starts_with('/')) { reference.erase(reference.begin()); }
     const std::filesystem::path relative(reference);
-    if (relative.empty() || relative.is_absolute() || !hashed_wasm_name(relative)) {
-        throw std::runtime_error("browser index has an invalid WebAssembly URL");
-    }
+    if (relative.empty() || relative.is_absolute() || !hashed_wasm_name(relative)) { throw std::runtime_error("browser index has an invalid WebAssembly URL"); }
     for (const auto& component : relative) {
         if (component == "." || component == "..") { throw std::runtime_error("browser index WebAssembly URL escapes its asset root"); }
     }
     return relative.lexically_normal();
 }
-
 [[nodiscard]] bool contained_by(const std::filesystem::path& root, const std::filesystem::path& candidate) {
     auto root_component = root.begin();
     auto candidate_component = candidate.begin();
@@ -133,7 +113,6 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
     }
     return root_component == root.end() && candidate_component != candidate.end();
 }
-
 [[nodiscard]] std::filesystem::path selected_wasm(const std::filesystem::path& asset_root) {
     const std::filesystem::path index_path = asset_root / "index.html";
     std::ifstream input(index_path, std::ios::binary);
@@ -145,7 +124,6 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
     if (selected_status.type() != std::filesystem::file_type::regular) {
         throw std::runtime_error("selected browser WebAssembly entry is not a non-symlink regular file");
     }
-
     std::size_t wasm_count = 0U;
     bool selected_path_found = false;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(asset_root)) {
@@ -154,18 +132,12 @@ constexpr std::string_view kWasmSuffix = "_bg.wasm";
             selected_path_found = selected_path_found || entry.path().lexically_normal() == candidate.lexically_normal();
         }
     }
-    if (wasm_count != 1U || !selected_path_found) {
-        throw std::runtime_error("browser bundle must contain only its selected WebAssembly pathname");
-    }
-
+    if (wasm_count != 1U || !selected_path_found) { throw std::runtime_error("browser bundle must contain only its selected WebAssembly pathname"); }
     const std::filesystem::path canonical_root = std::filesystem::canonical(asset_root);
     const std::filesystem::path canonical_candidate = std::filesystem::canonical(candidate);
-    if (!contained_by(canonical_root, canonical_candidate)) {
-        throw std::runtime_error("selected browser WebAssembly entry resolves outside its asset root");
-    }
+    if (!contained_by(canonical_root, canonical_candidate)) { throw std::runtime_error("selected browser WebAssembly entry resolves outside its asset root"); }
     return canonical_candidate;
 }
-
 void validate_protocol_marker(const char* asset_root, const std::string_view marker) {
     const std::filesystem::path selected = selected_wasm(asset_root);
     std::ifstream input(selected, std::ios::binary);
@@ -177,9 +149,7 @@ void validate_protocol_marker(const char* asset_root, const std::string_view mar
     while ((cursor = std::search(cursor, bytes.end(), kProtocolMarkerPrefix.begin(), kProtocolMarkerPrefix.end())) != bytes.end()) {
         const auto digits_begin = cursor + static_cast<std::ptrdiff_t>(kProtocolMarkerPrefix.size());
         auto digits_end = digits_begin;
-        while (digits_end != bytes.end() && ascii_digit(static_cast<unsigned char>(*digits_end))) {
-            ++digits_end;
-        }
+        while (digits_end != bytes.end() && ascii_digit(static_cast<unsigned char>(*digits_end))) { ++digits_end; }
         if (digits_end != digits_begin) {
             ++marker_count;
             const std::string_view candidate(&*cursor, static_cast<std::size_t>(digits_end - cursor));
@@ -191,28 +161,23 @@ void validate_protocol_marker(const char* asset_root, const std::string_view mar
         throw std::runtime_error("selected browser WebAssembly bundle has an invalid native protocol marker");
     }
 }
-
 void verify(const char* asset_root, const char* protocol_marker_path) {
     if (!path_exists(asset_root) || !std::filesystem::is_directory(asset_root)) {
         throw std::runtime_error("browser distribution is missing or is not a directory");
     }
     validate_protocol_marker(asset_root, read_protocol_marker(protocol_marker_path));
 }
-
 void publish(const char* staged_path, const char* current_path, const char* protocol_marker_path) {
     verify(staged_path, protocol_marker_path);
-
     if (!path_exists(current_path)) {
         if (::rename(staged_path, current_path) != 0) {
             throw std::runtime_error(std::string("initial browser distribution rename failed: ") + std::strerror(errno));
         }
         return;
     }
-
     if (::syscall(SYS_renameat2, AT_FDCWD, staged_path, AT_FDCWD, current_path, RENAME_EXCHANGE) != 0) {
         throw std::runtime_error(std::string("atomic browser distribution exchange failed: ") + std::strerror(errno));
     }
-
     std::error_code cleanup_error;
     std::filesystem::remove_all(staged_path, cleanup_error);
     if (cleanup_error) {
@@ -220,16 +185,13 @@ void publish(const char* staged_path, const char* current_path, const char* prot
                   << cleanup_error.message() << '\n';
     }
 }
-
 }  // namespace
-
 int main(const int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: mmltk-browser-bundle-contract publish STAGED_PATH CURRENT_PATH PROTOCOL_MARKER_FILE\n"
                      "       mmltk-browser-bundle-contract verify ASSET_ROOT PROTOCOL_MARKER_FILE\n";
         return 2;
     }
-
     try {
         const std::string_view mode(argv[1]);
         if (mode == "publish" && argc == 5) {

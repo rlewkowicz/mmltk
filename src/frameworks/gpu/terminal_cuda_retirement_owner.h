@@ -1,7 +1,5 @@
 #pragma once
-
 #include <cuda_runtime_api.h>
-
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -12,12 +10,9 @@
 #include <optional>
 #include <stdexcept>
 #include <utility>
-
 #include "detail/terminal_retirement_storage_limit.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
-
 namespace mmltk::frameworks::gpu {
-
 // Fixed terminal quarantine. Installed CUDA custody is held in
 // manual storage so destroying a terminal shell never runs unsafe CUDA
 // destruction on its destructor thread. Ordinary retryable cleanup stays with
@@ -26,12 +21,10 @@ namespace mmltk::frameworks::gpu {
 class TerminalCudaRetirementOwner final : public TerminalCudaRetirementAuthority {
    public:
     static constexpr std::size_t kMaximumCapacity = detail::TerminalRetirementStorageLimit::kMaximumSlots;
-
     explicit TerminalCudaRetirementOwner(std::size_t capacity);
     TerminalCudaRetirementOwner(const TerminalCudaRetirementOwner&) = delete;
     TerminalCudaRetirementOwner& operator=(const TerminalCudaRetirementOwner&) = delete;
     ~TerminalCudaRetirementOwner() noexcept;
-
     [[nodiscard]] bool admission_open() const noexcept override { return !terminal_.load(std::memory_order_acquire); }
     [[nodiscard]] std::optional<TerminalCudaRetirementLease> Reserve() noexcept override;
     [[nodiscard]] TerminalCudaRetirementFact fact() const noexcept override;
@@ -43,15 +36,10 @@ class TerminalCudaRetirementOwner final : public TerminalCudaRetirementAuthority
         SlotPhase phase = SlotPhase::Free;
         std::uint64_t generation = 0U;
         cudaError_t failure = cudaSuccess;
-
-        [[nodiscard]] TerminalCudaCustody* uninitialized_custody() noexcept {
-            return reinterpret_cast<TerminalCudaCustody*>(custody_storage.data());
-        }
+        [[nodiscard]] TerminalCudaCustody* uninitialized_custody() noexcept { return reinterpret_cast<TerminalCudaCustody*>(custody_storage.data()); }
     };
-
     void Release(std::size_t, std::uint64_t) noexcept override;
     void Install(std::size_t, std::uint64_t, TerminalCudaCustody&&, cudaError_t) noexcept override;
-
     mutable std::mutex mutex_{};
     std::unique_ptr<Slot[]> slots_{};
     std::size_t capacity_ = 0U;
@@ -61,18 +49,14 @@ class TerminalCudaRetirementOwner final : public TerminalCudaRetirementAuthority
     std::uint64_t next_generation_ = 1U;
     cudaError_t first_failure_ = cudaSuccess;
 };
-
 inline TerminalCudaRetirementOwner::TerminalCudaRetirementOwner(const std::size_t capacity)
-    : slots_(capacity == 0U || capacity > kMaximumCapacity ? nullptr : std::make_unique<Slot[]>(capacity)),
-      capacity_(slots_ == nullptr ? 0U : capacity) {
+    : slots_(capacity == 0U || capacity > kMaximumCapacity ? nullptr : std::make_unique<Slot[]>(capacity)), capacity_(slots_ == nullptr ? 0U : capacity) {
     if (slots_ == nullptr) throw std::invalid_argument("terminal CUDA retirement capacity is outside the fixed bound");
 }
-
 inline TerminalCudaRetirementOwner::~TerminalCudaRetirementOwner() noexcept {
     // Reserved slots contain no object. Installed slots deliberately retain a
     // live shared_ptr in manual storage without running its destructor.
 }
-
 inline std::optional<TerminalCudaRetirementLease> TerminalCudaRetirementOwner::Reserve() noexcept {
     if (!admission_open()) return std::nullopt;
     std::lock_guard lock(mutex_);
@@ -89,7 +73,6 @@ inline std::optional<TerminalCudaRetirementLease> TerminalCudaRetirementOwner::R
     }
     return std::nullopt;
 }
-
 inline void TerminalCudaRetirementOwner::Release(const std::size_t index, const std::uint64_t generation) noexcept {
     std::lock_guard lock(mutex_);
     if (index >= capacity_) return;
@@ -99,7 +82,6 @@ inline void TerminalCudaRetirementOwner::Release(const std::size_t index, const 
     slot.failure = cudaSuccess;
     --reservations_;
 }
-
 inline void TerminalCudaRetirementOwner::Install(const std::size_t index, const std::uint64_t generation, TerminalCudaCustody&& custody,
                                                  const cudaError_t failure) noexcept {
     std::lock_guard lock(mutex_);
@@ -116,13 +98,8 @@ inline void TerminalCudaRetirementOwner::Install(const std::size_t index, const 
     if (first_failure_ == cudaSuccess && failure != cudaSuccess) first_failure_ = failure;
     terminal_.store(true, std::memory_order_release);
 }
-
 inline TerminalCudaRetirementFact TerminalCudaRetirementOwner::fact() const noexcept {
     std::lock_guard lock(mutex_);
-    return {.terminal = terminal_.load(std::memory_order_acquire),
-            .occupancy = occupancy_,
-            .reservations = reservations_,
-            .first_failure = first_failure_};
+    return {.terminal = terminal_.load(std::memory_order_acquire), .occupancy = occupancy_, .reservations = reservations_, .first_failure = first_failure_};
 }
-
 }  // namespace mmltk::frameworks::gpu
