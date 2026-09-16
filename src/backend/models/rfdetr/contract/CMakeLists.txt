@@ -62,11 +62,9 @@ function(mmltk_add_backend_models_rfdetr_contract_tests)
             mmltk::frameworks::serialization
     )
     if(BUILD_RFDETR_NATIVE)
-        target_compile_definitions(
+        target_link_libraries(
             mmltk_backend_models_rfdetr_contract_tests PRIVATE
-            MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_entrypoints_cli>")
-        add_dependencies(
-            mmltk_backend_models_rfdetr_contract_tests mmltk_entrypoints_cli)
+            mmltk_entrypoints_cli_test_support)
     endif()
     catch_discover_tests(
         mmltk_backend_models_rfdetr_contract_tests

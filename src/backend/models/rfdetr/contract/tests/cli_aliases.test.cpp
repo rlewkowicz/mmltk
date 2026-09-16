@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 namespace {
 using namespace mmltk::testsupport;

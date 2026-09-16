@@ -103,11 +103,9 @@ target_include_directories(mmltk_acceptance PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
 )
 target_compile_definitions(mmltk_acceptance PRIVATE
-    MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_entrypoints_cli>"
     MMLTK_TEST_MMLTK_GUI_LAUNCHER="/opt/mmltk/bin/mmltk-browser-host"
     MMLTK_TEST_SOURCE_ROOT="${CMAKE_SOURCE_DIR}"
 )
-add_dependencies(mmltk_acceptance mmltk_entrypoints_cli)
 target_link_libraries(mmltk_acceptance PRIVATE
     mmltk_test_support
     mmltk::common::logging

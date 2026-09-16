@@ -678,7 +678,7 @@ void test_ui_settings_round_trip() {
     REQUIRE((saved_explore.at("min_instances") == 2U));
     REQUIRE((saved_explore.at("max_instances") == 17U));
     REQUIRE((saved_explore.at("min_compiled_index") == 11U));
-    REQUIRE((saved_explore.at("max_compiled_index") == 9'001U);
+    REQUIRE((saved_explore.at("max_compiled_index") == 9'001U));
     REQUIRE((saved_explore.at("class_catalog_identity") == 0x9123'4567'89ab'cdefULL));
     REQUIRE((!saved_explore.at("sample_classes").at(7).get<bool>()));
     REQUIRE((!saved_explore.at("overlay_classes").at(9).get<bool>()));
@@ -1230,7 +1230,7 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
     CHECK(filter.filter.minimum_instances == 3U);
     CHECK(filter.filter.maximum_instances == 29U);
     CHECK(filter.filter.minimum_compiled_index == 41U);
-    CHECK(filter.filter.maximum_compiled_index == 4'091U));
+    CHECK(filter.filter.maximum_compiled_index == 4'091U);
     CHECK(filter.filter.order == ExploreOrder::Shuffled);
     CHECK(filter.filter.shuffle_seed == 0x1234'5678U);
     CHECK_FALSE(filter.overlay.show_boxes);

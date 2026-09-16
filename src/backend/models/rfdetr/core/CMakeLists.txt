@@ -237,15 +237,12 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
     target_compile_definitions(mmltk_backend_models_rfdetr_core_tests PRIVATE
         MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
-        target_compile_definitions(
-            mmltk_backend_models_rfdetr_core_tests PRIVATE
-            MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_entrypoints_cli>")
         add_dependencies(
             mmltk_backend_models_rfdetr_core_tests
-            mmltk_entrypoints_cli
             mmltk_entrypoints_tools_onnx_info)
         target_link_libraries(
             mmltk_backend_models_rfdetr_core_tests PRIVATE
+            mmltk_entrypoints_cli_test_support
             mmltk_backend_models_rfdetr_checkpoint_test_support
             mmltk::backend::models::rfdetr::export)
     endif()

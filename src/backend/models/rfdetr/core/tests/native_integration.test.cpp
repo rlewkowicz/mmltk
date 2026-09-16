@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 // Import-bearing support follows every textual standard-library and POSIX test helper.
 #include "asset_cache_support.h"

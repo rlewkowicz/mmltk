@@ -21,6 +21,7 @@
 #include "src/frameworks/reflection/reflected_descriptors.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 namespace {

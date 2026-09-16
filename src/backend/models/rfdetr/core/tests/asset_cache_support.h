@@ -12,6 +12,7 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/model_config.h"

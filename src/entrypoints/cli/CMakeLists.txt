@@ -43,6 +43,19 @@ install(TARGETS mmltk_entrypoints_cli
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
+add_library(mmltk_entrypoints_cli_test_support STATIC EXCLUDE_FROM_ALL)
+mmltk_configure_component(
+    mmltk_entrypoints_cli_test_support PUBLIC_DECLARATIONS)
+mmltk_register_ordinary_sources(
+    mmltk_entrypoints_cli_test_support tests/support/cli_path.cpp)
+mmltk_register_public_headers(mmltk_entrypoints_cli_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/cli_path.h)
+target_compile_definitions(mmltk_entrypoints_cli_test_support PRIVATE
+    MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_entrypoints_cli>")
+add_dependencies(mmltk_entrypoints_cli_test_support mmltk_entrypoints_cli)
+mmltk_register_header_isolation(mmltk_entrypoints_cli_test_support)
+
 function(mmltk_add_entrypoints_cli_tests)
     add_executable(mmltk_entrypoints_cli_tests EXCLUDE_FROM_ALL)
     mmltk_register_retained_module_importers(
@@ -51,15 +64,11 @@ function(mmltk_add_entrypoints_cli_tests)
     )
     mmltk_configure_component(
         mmltk_entrypoints_cli_tests PRIVATE_DECLARATIONS)
-    target_compile_definitions(mmltk_entrypoints_cli_tests PRIVATE
-        MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_entrypoints_cli>"
-    )
     target_link_libraries(mmltk_entrypoints_cli_tests PRIVATE
         mmltk_test_support
+        mmltk_entrypoints_cli_test_support
         mmltk::frameworks::reflection
     )
-    add_dependencies(
-        mmltk_entrypoints_cli_tests mmltk_entrypoints_cli)
     catch_discover_tests(
         mmltk_entrypoints_cli_tests
         TEST_PREFIX "entrypoints::cli::"

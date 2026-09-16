@@ -15,4 +15,5 @@ mmltk_register_public_headers(mmltk_test_support
     profile_runner_common.h
     cli_option_table.h)
 target_link_libraries(mmltk_test_support PUBLIC
-    Catch2::Catch2 mmltk::common::io mmltk::common::logging stb)
+    Catch2::Catch2 CUDA::cudart mmltk::common::io mmltk::common::logging stb)
+mmltk_register_header_isolation(mmltk_test_support)
