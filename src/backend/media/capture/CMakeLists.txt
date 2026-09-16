@@ -29,7 +29,6 @@ target_link_libraries(mmltk_backend_media_capture
     PRIVATE
     CUDA::cudart
     Threads::Threads
-    mmltk::backend::ml::cuda
     mmltk::common::concurrency
     mmltk::common::logging
     mmltk::common::system

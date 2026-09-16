@@ -48,7 +48,6 @@ target_link_libraries(mmltk_backend_media_live
     PRIVATE
         CUDA::cudart
         Threads::Threads
-        nlohmann_json
         mmltk::backend::imaging::raster
         mmltk::common::system
         mmltk::common::types
