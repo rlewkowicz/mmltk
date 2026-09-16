@@ -70,6 +70,7 @@ function(mmltk_add_backend_models_rfdetr_augmentation_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/gpu_augment.test.cpp)
     target_link_libraries(
         mmltk_backend_models_rfdetr_augmentation_tests PRIVATE
+        mmltk_backend_imaging_resample_test_support
         mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk_test_support
         mmltk::backend::models::rfdetr::augmentation

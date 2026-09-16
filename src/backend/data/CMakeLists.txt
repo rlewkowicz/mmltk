@@ -170,6 +170,7 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests
     )
     target_link_libraries(mmltk_backend_data_tests PRIVATE
+        mmltk_backend_imaging_resample_test_support
         mmltk::backend::imaging::resample
         mmltk_test_support
         mmltk::backend::data

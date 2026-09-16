@@ -3,6 +3,7 @@
 #include "detail/benchmark_download.h"
 #include "detail/benchmark_curl.h"
 #include "detail/benchmark_storage.h"
+#include "detail/worker_queue.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <curl/curl.h>
 #include <algorithm>

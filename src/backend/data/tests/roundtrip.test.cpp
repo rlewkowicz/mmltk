@@ -26,7 +26,7 @@
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/backend/data/tests/test_fixture.h"
-#include "perceptual_downscale_reference.h"
+#include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "src/common/system/cpu_affinity.h"
