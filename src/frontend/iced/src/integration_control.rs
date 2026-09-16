@@ -1,6 +1,8 @@
 mod annotation_checks;
 mod annotation_product;
 mod reporting;
+pub(crate) use reporting::metric_projection as report_metric_projection;
+mod workflows;
 use crate::generated::FeatureId;
 use crate::message::Message as RootMessage;
 use crate::view::{annotation, explore, train};
@@ -90,6 +92,25 @@ fn perceptual_control_values(train: &crate::generated::TrainViewState) -> [bool;
         train.request.gpuaugmentation.perceptualdownscale,
         train.compileperceptualdownscale,
     ]
+}
+
+fn advanced_layout_field(index: usize) -> (String, String) {
+    match index {
+        0 => ("workflow.advanced".into(), "container".into()),
+        1..=8 => (advanced_field_id(index - 1), format!("fixed-{}", index - 1)),
+        9 => (train::MATCH_FREE_ASSIGNMENT_ID.into(), "assignment".into()),
+        10 => (
+            crate::generated::constraint_workflowstrainrequesttrainingsupervisiondenoisingenabled()
+                .stable_field_id
+                .to_string(),
+            "dn-toggle".into(),
+        ),
+        11..=13 => (
+            match_free_field_id(index - 11),
+            format!("match-free-{}", index - 11),
+        ),
+        _ => (denoising_field_id(index - 14), format!("dn-{}", index - 14)),
+    }
 }
 
 const COMPILE_DIMENSIONS: &str = train::COMPILE_DIMENSIONS_ID;
@@ -334,6 +355,11 @@ const SIDEBAR_VISIBLE_INSET: f32 = 8.0;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    WorkflowPixels {
+        picture: workflows::Picture,
+        index: u8,
+        outcome: ProbeOutcome,
+    },
     WorkspaceFpsDrawn(reporting::FpsEvidence),
     WorkspaceFpsPixels(FpsPixelOutcome),
     ReportingDisabled,
@@ -1276,6 +1302,15 @@ extern "C" {
 
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClick)]
     fn click_js(x: f64, y: f64) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationWorkflowPixels)]
+    fn workflow_pixels_js(
+        control: &str,
+        css_bounds: &[f64],
+        chart: bool,
+        source: f64,
+        presentation: f64,
+        completed: &wasm_bindgen::JsValue,
+    );
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationClickAfterSurfaceDraw)]
     fn click_after_surface_draw_js(
         x: f64,
@@ -2464,6 +2499,7 @@ enum CopyScaleStage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Phase {
+    Workflows(workflows::Step),
     AwaitWorkspaceFps,
     AwaitWorkspaceFpsPixels,
     RestoreWorkspaceFps,
@@ -2539,6 +2575,7 @@ enum Phase {
     AwaitAdvancedDenoisingDraft,
     AwaitAdvancedDenoisingSnapshot,
     AdvancedDenoising(usize),
+    AdvancedLayout(usize),
     TriggerError,
     AwaitErrorModal,
     ErrorModal,
@@ -2839,7 +2876,8 @@ impl Phase {
     fn deadline_class(&self) -> &'static str {
         match self {
             Self::AwaitBootstrap => "startup",
-            Self::AwaitCompileProgress
+            Self::Workflows(_)
+            | Self::AwaitCompileProgress
             | Self::CompileProgress
             | Self::CompileActionWithProgress
             | Self::AwaitCompileCompletion
@@ -3179,6 +3217,7 @@ impl SessionInputs {
 }
 
 pub struct Controller {
+    workflows: workflows::State,
     reporting: reporting::Owner,
     generation: u64,
     phase: Phase,
@@ -3382,6 +3421,7 @@ impl Controller {
         initialize_driver_js(enabled);
         let generation = if enabled { reset_observer() } else { 0 };
         Self {
+            workflows: workflows::State::default(),
             reporting: reporting::Owner::new(),
             generation,
             phase: if enabled {
@@ -4096,13 +4136,14 @@ impl Controller {
     }
 
     fn arm_perceptual_control(&mut self, index: usize) -> Task<RootMessage> {
-        self.arm_scrolled(
+        if self.location_pending {
+            return Task::none();
+        }
+        self.location_pending = true;
+        reveal_control(
             perceptual_control_id(index),
-            if perceptual_control_slot(index) == 2 {
-                RelativeOffset::START
-            } else {
-                RelativeOffset::END
-            },
+            self.generation,
+            AnnotationReveal::Control,
         )
     }
 
@@ -4412,6 +4453,7 @@ impl Controller {
                                 | Message::NumberPasteDelivered(_)
                                 | Message::NumberPasteRead { .. }
                                 | Message::GalleryMouseDelivered
+                                | Message::WorkflowPixels { .. }
                         ),
                     }
             }
@@ -4439,6 +4481,14 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
+            Message::WorkflowPixels {
+                picture,
+                index,
+                outcome,
+            } => {
+                self.workflow_pixels(picture, index, outcome);
+                return None;
+            }
             Message::ReportingDisabled => {
                 if matches!(
                     self.phase,
@@ -4710,6 +4760,10 @@ impl Controller {
             }
         };
         self.location_pending = false;
+        if matches!(self.phase, Phase::Workflows(_)) {
+            self.workflow_located(&control, bounds);
+            return None;
+        }
         if let Some(probe) = &self.annotation_probe {
             if probe.output.receipt != current_receipt("workflow.visual.workspace") {
                 if self.annotation_pixels_pending == probe.output.receipt {
@@ -4794,6 +4848,7 @@ impl Controller {
                 .stable_field_id
                 .to_string(),
             Phase::AdvancedDenoising(index) => denoising_field_id(index),
+            Phase::AdvancedLayout(index) => advanced_layout_field(index).0,
             Phase::ErrorModal => ERROR_MODAL.to_owned(),
             Phase::ErrorCopy => ERROR_COPY.to_owned(),
             Phase::ErrorDismiss => ERROR_DISMISS.to_owned(),
@@ -5181,6 +5236,14 @@ impl Controller {
             Phase::AdvancedDenoising(index) => {
                 self.phase = if index + 1 < 4 {
                     Phase::AdvancedDenoising(index + 1)
+                } else {
+                    Phase::AdvancedLayout(0)
+                };
+                None
+            }
+            Phase::AdvancedLayout(index) => {
+                self.phase = if index < 17 {
+                    Phase::AdvancedLayout(index + 1)
                 } else {
                     Phase::TriggerError
                 };
@@ -5905,6 +5968,9 @@ impl Controller {
             return Task::none();
         }
         match self.phase.clone() {
+            Phase::Workflows(step) => {
+                self.advance_workflows(step, model, settings, active, surface)
+            }
             Phase::AwaitWorkspaceFps => {
                 if self.workspace_fps_evidence.is_none()
                     || settings.has_local_edits()
@@ -6379,6 +6445,9 @@ impl Controller {
                 });
                 self.reporting
                     .observe(|reporting| reporting.bootstrap(model, settings));
+                if self.viewer_scenario == "workflows" {
+                    return self.advance_to(Phase::Workflows(workflows::Step::Train));
+                }
                 if !self.viewer_scenario.is_empty() {
                     self.phase = Phase::TrainNavigation;
                     return self.arm(crate::view::navigation::stable_id(FeatureId::Train));
@@ -6816,6 +6885,9 @@ impl Controller {
                 }
             }
             Phase::AdvancedDenoising(index) => self.arm(denoising_field_id(index)),
+            // Capture the expanded panel and every field without intervening
+            // scrolling or settings changes so their coordinates are comparable.
+            Phase::AdvancedLayout(index) => self.arm(advanced_layout_field(index).0),
             Phase::TriggerError => {
                 self.phase = Phase::AwaitErrorModal;
                 Task::done(RootMessage::Workspace(crate::view::router::Message::Train(

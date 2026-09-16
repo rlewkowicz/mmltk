@@ -213,7 +213,6 @@ ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& r
     result.input_path = artifact.path;
     result.onnx_path = request.onnx_path;
     result.tensorrt_path = request.tensorrt_path;
-    result.preset_name = request.preset_name;
     result.model_id = artifact.path.stem().string();
     result.artifact_root = artifact.path.parent_path();
     const PresetCatalogEntry* preset = nullptr;
@@ -225,6 +224,7 @@ ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& r
     }
     if (preset == nullptr) { throw std::invalid_argument("unable to infer RF-DETR preset from inference artifact"); }
     result.config = native_config_from_preset(*preset);
+    result.preset_name = result.config.preset_name;
     result.config.resolution = static_cast<int>(resolution);
     result.automatic_num_queries_cap = result.config.num_queries;
     result.source_num_queries = result.config.num_queries;

@@ -71,6 +71,7 @@ TEST_CASE("Output names distinguish four-wide logits from boxes", "[rfdetr][layo
     CHECK(roles.boxes == 0);
     CHECK(info.num_classes == 4);
     info.outputs[0].name = "some_box_tensor";
+    for (auto& output : info.outputs) output.role = r::RfdetrOutputRole::Unspecified;
     CHECK_THROWS(r::validate_rfdetr_output_layout(info));
     info.outputs[0].role = r::RfdetrOutputRole::Boxes;
     CHECK_NOTHROW(r::validate_rfdetr_output_layout(info));

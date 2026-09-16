@@ -414,6 +414,7 @@ pub(crate) struct PickingPass {
 struct PendingReadback {
     // Own the mapped buffer even during pass destruction or map_async unwinding.
     buffer: Buffer,
+    unmap_on_drop: bool,
     settlement: Arc<AtomicBool>,
     instance_id: u64,
     projection: MarkerProjection,
@@ -429,11 +430,22 @@ struct PendingReadback {
     map_status: Arc<Mutex<Option<Result<(), BufferAsyncError>>>>,
 }
 
+impl PendingReadback {
+    fn unmap(&mut self) {
+        let failed = matches!(*self.map_status.lock().unwrap(), Some(Err(_)));
+        if std::mem::replace(&mut self.unmap_on_drop, false) && !failed {
+            // Release the status lock first: cancelling a pending map may invoke
+            // its callback synchronously. Failed maps are already unmapped.
+            self.buffer.unmap();
+        }
+    }
+}
+
 impl Drop for PendingReadback {
     fn drop(&mut self) {
         // No mapped view escapes poll_pending. Unmap also cancels an unfinished
         // callback; WGPU retains submitted device work independently.
-        self.buffer.unmap();
+        self.unmap();
         self.settlement.store(false, Ordering::Release);
     }
 }
@@ -600,6 +612,7 @@ impl PickingPass {
         let status_clone = Arc::clone(&map_status);
         let pending = PendingReadback {
             buffer: buf.clone(),
+            unmap_on_drop: true,
             settlement,
             instance_id,
             projection: req.projection,
@@ -628,7 +641,7 @@ impl PickingPass {
         let pending = self.pending.as_mut().expect("real map admission");
         let delivered = std::mem::replace(&mut pending.map_status, Arc::new(Mutex::new(None)));
         if cancel {
-            pending.buffer.unmap(); // real WGPU cancellation delivers BufferAsyncError
+            pending.unmap(); // real WGPU cancellation delivers BufferAsyncError
         }
         move |pass| {
             let pending = pass.pending.as_mut().expect("not-ready polling retains custody");
@@ -662,15 +675,15 @@ impl PickingPass {
         };
 
         let _ = device.poll(PollType::Poll);
-        let Some(res) = pending.map_status.lock().unwrap().take() else {
+        let Some(mapped) = pending.map_status.lock().unwrap().as_ref().map(Result::is_ok) else {
             return;
         };
 
         let pending = self.pending.take().unwrap();
         let current = pending.projection.same_as(projection)
             && self.id_map_projection.as_ref().is_some_and(|key| key.same_as(&pending.projection));
-        let hit = match res {
-            Ok(()) if current => {
+        let hit = match mapped {
+            true if current => {
                 let slice = pending.buffer.slice(0..pending.needed);
                 let data = slice.get_mapped_range();
                 let best = Self::scan_best_id(
@@ -688,8 +701,15 @@ impl PickingPass {
             }
             // A stale successful mapping still settles physically; never scan or
             // decode its old IDs through the replacement projection's map.
-            Ok(()) | Err(_) => None,
+            true | false => None,
         };
+        if !mapped {
+            // WGPU's failed-map bookkeeping is not reusable without unmap, but
+            // unmapping an already failed buffer is a validation error. Retire
+            // only the failed storage; successful readbacks retain capacity.
+            self.staging = None;
+            self.staging_size = 0;
+        }
 
         let result = current.then(|| GpuPickResult {
             projection: pending.projection.clone(),

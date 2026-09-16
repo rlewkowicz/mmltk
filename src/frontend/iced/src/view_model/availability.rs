@@ -127,19 +127,16 @@ impl ApplicationModel {
                     .as_ref()
                     .map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::ValidationStart,
-                ApplicationIntentEndpoint::ValidationStop,
             ),
             FeatureId::Predict => self.compute_start_available_for(
                 self.predict_snapshot
                     .as_ref()
                     .map(|snapshot| &snapshot.operation),
                 ApplicationIntentEndpoint::PredictStart,
-                ApplicationIntentEndpoint::PredictStop,
             ),
             FeatureId::Export => self.compute_start_available_for(
                 self.workflow.export.as_ref(),
                 ApplicationIntentEndpoint::ExportSystemStart,
-                ApplicationIntentEndpoint::ExportSystemStop,
             ),
             FeatureId::Live | FeatureId::Annotate | FeatureId::Explore => false,
         }
@@ -149,11 +146,9 @@ impl ApplicationModel {
         &self,
         snapshot: Option<&ComputeUiState>,
         start: ApplicationIntentEndpoint,
-        stop: ApplicationIntentEndpoint,
     ) -> bool {
         snapshot.is_some_and(|value| !value.active)
-            && !self.has_pending(start)
-            && !self.has_pending(stop)
+            && !self.has_system_pending(crate::generated::application_intent_system(start))
     }
 
     pub fn compute_stop_available(&self, page: FeatureId) -> bool {
@@ -165,25 +160,22 @@ impl ApplicationModel {
         {
             return true;
         }
-        let (snapshot, start, stop) = match page {
+        let (snapshot, stop) = match page {
             FeatureId::Validate => (
                 self.workflow
                     .validation
                     .as_ref()
                     .map(|snapshot| &snapshot.operation),
-                ApplicationIntentEndpoint::ValidationStart,
                 ApplicationIntentEndpoint::ValidationStop,
             ),
             FeatureId::Predict => (
                 self.predict_snapshot
                     .as_ref()
                     .map(|snapshot| &snapshot.operation),
-                ApplicationIntentEndpoint::PredictStart,
                 ApplicationIntentEndpoint::PredictStop,
             ),
             FeatureId::Export => (
                 self.workflow.export.as_ref(),
-                ApplicationIntentEndpoint::ExportSystemStart,
                 ApplicationIntentEndpoint::ExportSystemStop,
             ),
             _ => return false,
@@ -193,8 +185,18 @@ impl ApplicationModel {
                 value.active
                     && value.terminal.outcome != ComputeOperationOutcome::CancellationRequested
             })
-            && !self.has_pending(start)
-            && !self.has_pending(stop)
+            && !self.has_system_pending(crate::generated::application_intent_system(stop))
+    }
+
+    pub fn predict_pause_available(&self) -> bool {
+        self.connection == ConnectionState::Connected
+            && self.predict_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.video
+                    && snapshot.operation.active
+                    && snapshot.operation.terminal.outcome
+                        != ComputeOperationOutcome::CancellationRequested
+            })
+            && !self.has_system_pending(crate::generated::ApplicationSystem::Predict)
     }
 
     pub fn training_stop_available(&self) -> bool {
@@ -431,6 +433,63 @@ impl ApplicationModel {
 mod tests {
     use super::*;
     use crate::view_model::test_support::*;
+    #[test]
+    fn video_controls_wait_for_the_reply_after_an_earlier_state_event() {
+        let mut model = bootstrapped();
+        let mut snapshot = model.predict_snapshot.clone().unwrap();
+        snapshot.revision += 1;
+        snapshot.operation.generationfrontier += 1;
+        snapshot.operation.terminal.generation = snapshot.operation.generationfrontier;
+        snapshot.operation.active = true;
+        snapshot.operation.terminal.outcome = ComputeOperationOutcome::Running;
+        snapshot.video = true;
+        model.reduce_event(ApplicationEvent::PredictPredictChanged(
+            crate::generated::PredictChanged {
+                snapshot: snapshot.clone(),
+            },
+        ));
+        assert!(model.predict_pause_available());
+        assert!(model.compute_stop_available(FeatureId::Predict));
+        let pending = model
+            .begin_intent(ApplicationIntentEndpoint::PredictPause)
+            .unwrap();
+        snapshot.revision += 1;
+        snapshot.paused = true;
+        model.reduce_event(ApplicationEvent::PredictPredictChanged(
+            crate::generated::PredictChanged {
+                snapshot: snapshot.clone(),
+            },
+        ));
+        assert!(!model.predict_pause_available());
+        assert!(!model.compute_stop_available(FeatureId::Predict));
+        let mut terminal = snapshot.operation.clone();
+        terminal.active = false;
+        assert!(
+            !model.compute_start_available_for(
+                Some(&terminal),
+                ApplicationIntentEndpoint::PredictStart
+            )
+        );
+        model.reduce_reply(pending, Ok(ApplicationReply::PredictPause(snapshot)));
+        assert!(model.predict_pause_available());
+        assert!(model.compute_stop_available(FeatureId::Predict));
+        assert!(
+            model.compute_start_available_for(
+                Some(&terminal),
+                ApplicationIntentEndpoint::PredictStart
+            )
+        );
+        model
+            .predict_snapshot
+            .as_mut()
+            .unwrap()
+            .operation
+            .terminal
+            .outcome = ComputeOperationOutcome::CancellationRequested;
+        assert!(!model.predict_pause_available());
+        model.connection = ConnectionState::Reconnecting;
+        assert!(!model.predict_pause_available());
+    }
     #[test]
     fn installed_cancellation_facts_close_stop_admission() {
         let mut model = bootstrapped();

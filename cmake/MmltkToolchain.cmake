@@ -170,12 +170,12 @@ if(MMLTK_ENABLE_TIME_TRACE)
     endif()
 endif()
 
+set(MMLTK_HOST_SECTION_OPTIONS -ffunction-sections -fdata-sections)
 set(MMLTK_COMMON_HOST_COMPILE_OPTIONS
     -march=native
     -mtune=native
     -fno-semantic-interposition
-    -ffunction-sections
-    -fdata-sections)
+    ${MMLTK_HOST_SECTION_OPTIONS})
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64)$")
     list(APPEND MMLTK_COMMON_HOST_COMPILE_OPTIONS
         -mssse3
@@ -249,16 +249,23 @@ if(MMLTK_TIME_TRACE_FLAGS)
         "${MMLTK_TIME_TRACE_FLAGS}")
 endif()
 
+# CUDA host code shares the ordinary --gc-sections link. A standard-library
+# COMDAT can retain an otherwise unused CUDA archive member after LTO; separate
+# host sections let the linker discard its unrelated functions and references.
+list(JOIN MMLTK_HOST_SECTION_OPTIONS "," MMLTK_CUDA_HOST_SECTION_OPTIONS)
+set(MMLTK_COMMON_CUDA_COMPILE_OPTIONS
+    "-Xcompiler=${MMLTK_CUDA_HOST_SECTION_OPTIONS}"
+    "-Xcompiler=${MMLTK_HOST_LINKER_FLAGS}")
 set(MMLTK_RELEASE_CUDA_COMPILE_OPTIONS
     -O3
     -DNDEBUG
-    "-Xcompiler=${MMLTK_HOST_LINKER_FLAGS}")
+    ${MMLTK_COMMON_CUDA_COMPILE_OPTIONS})
 set(MMLTK_DEV_CUDA_COMPILE_OPTIONS
     -O2
     -g
     -lineinfo
     -Xcompiler=-fno-omit-frame-pointer
-    "-Xcompiler=${MMLTK_HOST_LINKER_FLAGS}")
+    ${MMLTK_COMMON_CUDA_COMPILE_OPTIONS})
 if(MMLTK_TIME_TRACE_FLAGS)
     list(APPEND MMLTK_RELEASE_CUDA_COMPILE_OPTIONS
         "-Xcompiler=${MMLTK_TIME_TRACE_FLAGS}")

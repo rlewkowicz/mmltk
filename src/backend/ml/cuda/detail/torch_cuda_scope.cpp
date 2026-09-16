@@ -3,6 +3,7 @@ module;
 #include <c10/core/InferenceMode.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <stdexcept>
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
@@ -22,6 +23,17 @@ namespace {
     throw std::invalid_argument("invalid LibTorch CUDA precision");
 }
 [[nodiscard]] c10::cuda::CUDAStream torch_stream(const std::uintptr_t stream, const c10::DeviceIndex device_index) {
+    // A same-device CUDAGuard may leave a fresh worker without a driver
+    // context, especially once LibTorch has initialized its stream tables.
+    // Pinned host work needs that context before the first tensor allocation.
+    CUcontext current{};
+    const auto context_status = cuCtxGetCurrent(&current);
+    if (context_status != CUDA_SUCCESS && context_status != CUDA_ERROR_NOT_INITIALIZED)
+        throw std::runtime_error("failed to inspect LibTorch CUDA execution context");
+    if (current == nullptr) {
+        const auto status = cudaSetDevice(device_index);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+    }
     if (stream == 0U) { return c10::cuda::getDefaultCUDAStream(device_index); }
     return c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(stream), device_index);
 }

@@ -2372,10 +2372,10 @@ mod reference_dependency_tests {
 
         // Pass teardown cancels a real pending map before relinquishing redraw
         // custody. Unwinding exercises the same physical RAII abandonment path.
-        for unwind in [false, true] {
+        for (unwind, cancel) in [(false, false), (true, false), (false, true), (true, true)] {
             request(&plot, &mut state);
             renderer.service_picking(plot.instance_id, &device, &queue, &state);
-            let _held = renderer.picking.hold_pending_callback(false);
+            let _held = renderer.picking.hold_pending_callback(cancel);
             let mut replacement = PlotState::default();
             let _ = redraw(&mut plot, &mut replacement);
             renderer.service_picking(plot.instance_id, &device, &queue, &replacement);
@@ -2388,7 +2388,8 @@ mod reference_dependency_tests {
             } else {
                 drop(renderer);
             }
-            assert!(!replacement.picking.has_outstanding_gpu_request());
+            assert!(!replacement.picking.has_outstanding_gpu_request(),
+                "unwind={unwind} cancel={cancel} state={:?}", replacement.picking);
             assert_eq!(redraw(&mut plot, &mut replacement), iced::window::RedrawRequest::Wait);
             state = replacement;
             renderer = PlotRenderer::new(&device, &queue, TextureFormat::Bgra8UnormSrgb);

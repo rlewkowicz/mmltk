@@ -46,7 +46,8 @@ fn label_text<Content>(content: Content, width: f32) -> text::Text<Content> {
 impl CachedLabel {
     fn new(text: String) -> Self {
         let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
-        let paragraph = iced::advanced::graphics::text::Paragraph::with_text(label_text(text.as_str(), width));
+        let paragraph =
+            iced::advanced::graphics::text::Paragraph::with_text(label_text(text.as_str(), width));
         Self {
             text,
             width,

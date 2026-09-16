@@ -400,15 +400,41 @@ void VideoFileSource::State::Open(bool hardware) {
     av_dict_free(&options);
     if (stop.stop_requested()) return;
     check(opened, "open prediction video");
+    const auto log_tracks = [&](const char* phase) {
+        mmltk::common::logging::log_if_enabled("video", spdlog::level::debug, [&](auto& logger) {
+            for (unsigned stream_index = 0; stream_index < format->nb_streams; ++stream_index) {
+                const auto* track = format->streams[stream_index];
+                const auto* parameters = track->codecpar;
+                const auto* matrix = av_packet_side_data_get(parameters->coded_side_data, parameters->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+                const bool has_matrix = matrix && matrix->size == 9U * sizeof(std::int32_t);
+                logger.debug("video source phase={} hardware={} stream={} codec={} width={} height={} frames={} side_data={} display_matrix={} rotation={}",
+                             phase, hardware, stream_index, avcodec_get_name(parameters->codec_id), parameters->width, parameters->height, track->nb_frames,
+                             parameters->nb_coded_side_data, has_matrix,
+                             has_matrix ? av_display_rotation_get(reinterpret_cast<const std::int32_t*>(matrix->data)) : 0.0);
+            }
+        });
+    };
+    log_tracks("opened");
     struct ProbeOptions final {
         std::vector<AVDictionary*> streams;
+        std::vector<AVPacket*> declarations;
         ~ProbeOptions() {
             for (auto*& options : streams) av_dict_free(&options);
+            for (auto*& declaration : declarations) av_packet_free(&declaration);
         }
-    } probe{std::vector<AVDictionary*>(format->nb_streams, nullptr)};
+    } probe{std::vector<AVDictionary*>(format->nb_streams, nullptr), std::vector<AVPacket*>(format->nb_streams, nullptr)};
     for (unsigned stream_index = 0; stream_index < format->nb_streams; ++stream_index) {
         const auto* parameters = format->streams[stream_index]->codecpar;
         if (parameters->codec_type == AVMEDIA_TYPE_VIDEO) limits.Declared(parameters->width, parameters->height);
+        if (parameters->nb_coded_side_data > 0) {
+            auto*& declaration = probe.declarations[stream_index];
+            declaration = av_packet_alloc();
+            if (!declaration) throw std::bad_alloc();
+            AVPacket borrowed{};
+            borrowed.side_data = parameters->coded_side_data;
+            borrowed.side_data_elems = parameters->nb_coded_side_data;
+            check(av_packet_copy_props(declaration, &borrowed), "retain prediction video metadata");
+        }
         check(av_dict_set_int(&probe.streams[stream_index], "max_pixels", static_cast<std::int64_t>(limits.maximum_pixels), 0),
               "bound prediction probe decoder");
     }
@@ -418,9 +444,27 @@ void VideoFileSource::State::Open(bool hardware) {
     // Only the selected codec below may allocate decoded frames, under its limit.
     check(av_opt_set(format, "codec_whitelist", "", 0), "bound prediction stream discovery");
     const auto inspected = avformat_find_stream_info(format, probe.streams.data());
+    log_tracks("inspected");
     if (stop.stop_requested()) return;
     check(inspected, "inspect prediction video");
     if (format->pb && format->pb->error < 0 && format->pb->error != AVERROR_EOF) check(format->pb->error, "read prediction video metadata");
+    // Failed probe-codec admission may clear container side data before FFmpeg
+    // republishes codec parameters. Restore missing declarations without replacing
+    // discovered facts or enabling unbounded probe decoding.
+    for (unsigned stream_index = 0; stream_index < probe.declarations.size(); ++stream_index) {
+        auto* declaration = probe.declarations[stream_index];
+        if (!declaration) continue;
+        auto* parameters = format->streams[stream_index]->codecpar;
+        for (int item = 0; item < declaration->side_data_elems; ++item) {
+            auto& data = declaration->side_data[item];
+            if (av_packet_side_data_get(parameters->coded_side_data, parameters->nb_coded_side_data, data.type)) continue;
+            if (!av_packet_side_data_add(&parameters->coded_side_data, &parameters->nb_coded_side_data, data.type, data.data, data.size, 0))
+                throw std::bad_alloc();
+            data.data = nullptr;
+            data.size = 0U;
+        }
+    }
+    log_tracks("ready");
     const AVCodec* decoder = nullptr;
     video_stream = av_find_best_stream(format, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     check(video_stream, "select prediction video stream");

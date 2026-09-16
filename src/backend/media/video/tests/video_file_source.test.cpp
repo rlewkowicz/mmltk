@@ -130,6 +130,9 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
         REQUIRE(cuCtxGetCurrent(&after) == CUDA_SUCCESS);
         CHECK(after == before);
     }
+    // The foreign context has now retired; explicitly restore this fixture's
+    // stream owner before constructing another decoder.
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
     CHECK(retirement->admission_open());
     CHECK(retirement->fact().reservations == 0U);
     {
@@ -202,6 +205,7 @@ void write_rotated_video(const std::filesystem::path& path, double rotation, int
             const auto status = avcodec_receive_packet(codec, packet);
             if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) break;
             REQUIRE(status >= 0);
+            packet->duration = 1;
             av_packet_rescale_ts(packet, codec->time_base, track->time_base);
             packet->stream_index = track->index;
             REQUIRE(av_interleaved_write_frame(output, packet) >= 0);
@@ -242,8 +246,12 @@ int isolated_process(const std::function<int()>& body) {
     do { waited = ::waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
     return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
-void count_log_dispatch(void* count, int, const char*, va_list) {
-    if (count) ++*static_cast<int*>(count);
+struct LogDispatchCount final {
+    const AVClass* av_class = nullptr;
+    int calls = 0;
+};
+void count_log_dispatch(void* context, int, const char*, va_list) {
+    if (context) ++static_cast<LogDispatchCount*>(context)->calls;
 }
 }  // namespace
 TEST_CASE("video logging disables callback dispatch and preserves independent process state", "[video]") {
@@ -277,15 +285,15 @@ TEST_CASE("video logging disables callback dispatch and preserves independent pr
                       mmltk::backend::media::video::VideoFileSource source("/nonexistent/video-logging", {4U}, 0, 1U, {});
                   } catch (const std::invalid_argument&) { rejected = true; }
                   if (!rejected || av_log_get_level() != AV_LOG_VERBOSE) return 1;
-                  int calls = 0;
-                  av_log(&calls, AV_LOG_TRACE, "invalid path retains callback");
-                  if (calls != 1) return 2;
+                  LogDispatchCount context;
+                  av_log(&context, AV_LOG_TRACE, "invalid path retains callback");
+                  if (context.calls != 1) return 2;
                   Access::ConfigureLogging(&count_log_dispatch);
                   if (av_log_get_level() != admissions[index]) return 3;
-                  calls = 0;
-                  av_log(&calls, AV_LOG_TRACE, "actual callback dispatch");
-                  av_log(&calls, AV_LOG_PANIC, "actual callback dispatch");
-                  if (calls != (levels[index] == spdlog::level::off ? 0 : 2)) return 4;
+                  context.calls = 0;
+                  av_log(&context, AV_LOG_TRACE, "actual callback dispatch");
+                  av_log(&context, AV_LOG_PANIC, "actual callback dispatch");
+                  if (context.calls != (levels[index] == spdlog::level::off ? 0 : 2)) return 4;
                   Access::ConfigureLogging();
                   for (int decoration : {0, AV_LOG_C(134)}) {
                       int suppressed = -1;
@@ -302,9 +310,9 @@ TEST_CASE("video logging disables callback dispatch and preserves independent pr
               });
               if (result != 0) return result;
               if (mmltk::common::logging::level() != spdlog::level::warn || av_log_get_level() != AV_LOG_DEBUG) return 7;
-              int calls = 0;
-              av_log(&calls, AV_LOG_DEBUG, "independent callback retained");
-              return calls == 1 ? 0 : 8;
+              LogDispatchCount context;
+              av_log(&context, AV_LOG_DEBUG, "independent callback retained");
+              return context.calls == 1 ? 0 : 8;
           }) == 0);
     CHECK(mmltk::common::logging::level() == original_application);
     CHECK(av_log_get_level() == original_ffmpeg);
@@ -318,7 +326,8 @@ TEST_CASE("local video display rotations preserve decoded pixels and delayed fra
         const auto path = std::filesystem::temp_directory_path() / ("mmltk-rotated-" + std::to_string(::getpid()) + ".mp4");
         const mmltk::testsupport::ScopedTestCleanup remove{[&] { std::filesystem::remove(path); }};
         write_rotated_video(path, rotation);
-        mmltk::backend::media::video::VideoFileSource source(path, {64U * 32U}, 0, reinterpret_cast<std::uintptr_t>(stream), {});
+        // FFmpeg also applies max_pixels to padded MPEG-4 scratch storage.
+        mmltk::backend::media::video::VideoFileSource source(path, {256U * 256U}, 0, reinterpret_cast<std::uintptr_t>(stream), {});
         std::uint64_t count = 0;
         std::optional<double> previous;
         while (const auto frame = source.Next()) {
@@ -438,12 +447,54 @@ TEST_CASE("video probing discovers late streams and preserves decoded timing fac
     const auto before = reference->nb_streams;
     REQUIRE(avformat_find_stream_info(reference, nullptr) >= 0);
     REQUIRE(reference->nb_streams > before);
-    const auto selected = av_find_best_stream(reference, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    const AVCodec* decoder = nullptr;
+    const auto selected = av_find_best_stream(reference, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
     REQUIRE(selected >= 0);
     const auto* track = reference->streams[selected];
     double rate = av_q2d(track->avg_frame_rate);
     if (!std::isfinite(rate) || rate <= 0.0) rate = av_q2d(track->r_frame_rate);
     REQUIRE(rate > 0.0);
+    auto* codec = avcodec_alloc_context3(decoder);
+    auto* decoded = av_frame_alloc();
+    auto* packet = av_packet_alloc();
+    const mmltk::testsupport::ScopedTestCleanup release_reference{[&] {
+        av_packet_free(&packet);
+        av_frame_free(&decoded);
+        avcodec_free_context(&codec);
+    }};
+    REQUIRE(codec);
+    REQUIRE(decoded);
+    REQUIRE(packet);
+    REQUIRE(avcodec_parameters_to_context(codec, track->codecpar) >= 0);
+    REQUIRE(avcodec_open2(codec, decoder, nullptr) >= 0);
+    std::vector<std::optional<double>> timestamps;
+    const auto receive = [&] {
+        while (true) {
+            const auto status = avcodec_receive_frame(codec, decoded);
+            if (status == AVERROR(EAGAIN) || status == AVERROR_EOF) break;
+            REQUIRE(status >= 0);
+            REQUIRE(timestamps.size() < 5U);
+            if (decoded->best_effort_timestamp == AV_NOPTS_VALUE)
+                timestamps.emplace_back();
+            else
+                timestamps.emplace_back(static_cast<double>(decoded->best_effort_timestamp) * av_q2d(track->time_base));
+            av_frame_unref(decoded);
+        }
+    };
+    while (true) {
+        const auto status = av_read_frame(reference, packet);
+        if (status == AVERROR_EOF) break;
+        REQUIRE(status >= 0);
+        if (packet->stream_index == selected) {
+            REQUIRE(avcodec_send_packet(codec, packet) >= 0);
+            receive();
+        }
+        av_packet_unref(packet);
+    }
+    REQUIRE(avcodec_send_packet(codec, nullptr) >= 0);
+    receive();
+    REQUIRE(timestamps.size() == 5U);
+    REQUIRE(timestamps.front());
     const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-discovery", 0, execution.placement.numa_node, -10, false});
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
@@ -458,8 +509,13 @@ TEST_CASE("video probing discovers late streams and preserves decoded timing fac
         CHECK(frame->index == count++);
         CHECK(frame->width == 64U);
         CHECK(frame->height == 32U);
-        REQUIRE(frame->presentation_seconds);
-        if (previous) CHECK(std::abs(*frame->presentation_seconds - *previous - 1.0 / rate) < 0.001);
+        // MPEG program streams may omit the final delayed frame's timestamp.
+        // Preserve that source fact; playback owns the declared-FPS fallback.
+        REQUIRE(frame->presentation_seconds.has_value() == timestamps.at(frame->index).has_value());
+        if (frame->presentation_seconds) {
+            CHECK(std::abs(*frame->presentation_seconds - *timestamps.at(frame->index)) < 0.001);
+            if (previous) CHECK(std::abs(*frame->presentation_seconds - *previous - 1.0 / rate) < 0.001);
+        }
         previous = frame->presentation_seconds;
         CHECK(std::abs(source.frames_per_second() - rate) < 0.001);
     }

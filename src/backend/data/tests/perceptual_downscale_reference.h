@@ -13,6 +13,13 @@
 #include <limits>
 #include <vector>
 namespace mmltk::backend::data::test_perceptual {
+// Near the variance cutoff, contrast gains can approach 500. Rounding the
+// retained FP32 moments alone can exceed 2e-6 even with exact accumulation and
+// reconstruction. This unit-sRGB allowance is about 0.005 of an 8-bit code;
+// threshold-branch and transfer-function tests retain their tighter bounds.
+inline double reference_tolerance(RgbPixelFormat format) {
+    return format == RgbPixelFormat::PlanarUnitSrgbF32 ? 2e-5 : 1.0 / 255 + 1e-12;
+}
 struct Image {
     RgbImageLayout layout;
     std::vector<float> storage;

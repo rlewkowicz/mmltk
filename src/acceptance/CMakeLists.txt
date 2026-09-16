@@ -172,7 +172,14 @@ if(BUILD_RFDETR_NATIVE)
         mmltk_workspace_wayland_integration PRIVATE_DECLARATIONS)
     mmltk_register_retained_module_importers(
         mmltk_workspace_wayland_integration
-        tests/workspace_wayland_integration.test.cpp)
+        tests/workspace_wayland_integration.test.cpp
+        tests/workflow_wayland_inputs.cpp)
+    mmltk_register_private_headers(
+        mmltk_workspace_wayland_integration
+        tests/workflow_wayland_inputs.h)
+    target_include_directories(mmltk_workspace_wayland_integration PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail
+        ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail)
     target_compile_definitions(mmltk_workspace_wayland_integration PRIVATE
         MMLTK_TEST_MMLTK_GUI_LAUNCHER="/opt/mmltk/bin/mmltk-browser-host")
     target_link_libraries(mmltk_workspace_wayland_integration PRIVATE
@@ -181,6 +188,8 @@ if(BUILD_RFDETR_NATIVE)
         mmltk::common::io
         mmltk::controller::contracts
         mmltk::controller::direct_services
+        mmltk::backend::models::rfdetr::training
+        mmltk::backend::ml::torch_dependencies
         mmltk_backend_data_test_support
         CUDA::cuda_driver
         nlohmann_json)

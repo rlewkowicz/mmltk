@@ -1758,7 +1758,9 @@ fn can_display_pending(frame: FrameReady, has_content: impl Fn(&ImagePublication
             .borrow()
             .as_ref()
             .and_then(|renderer| renderer.imported.as_ref())
-            .is_some_and(|imported| imported.image.retained().is_some() && has_content(&imported.image))
+            .is_some_and(|imported| {
+                imported.image.retained().is_some() && has_content(&imported.image)
+            })
     });
     // An accepted initial offer constructs the first shader owner. Replacements
     // keep the incumbent until their physical read exists.
@@ -5892,7 +5894,9 @@ mod tests {
             crate::generated::PresentationSourceKind::Predict,
         );
         let install = |snapshot: &crate::generated::PredictSnapshot, sequence| {
-            let frame = frame_ready(session, sequence, sequence, 640, 480);
+            let mut frame = frame_ready(session, sequence, sequence, 640, 480);
+            // The completed first image retains its physical read until promotion.
+            frame.slot = u32::from(sequence != 1);
             let mut product = crate::generated::PredictImageMetadata::from(snapshot);
             product.frame = crate::view_model::test_support::visual_frame(
                 crate::generated::PresentationSourceKind::Predict,

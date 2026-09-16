@@ -94,6 +94,7 @@ function(mmltk_add_controller_subsystems_system_tests)
         mmltk::common::io
         mmltk::controller::data_compute_systems
         mmltk::controller::direct_services
+        mmltk::controller::presentation_system
         mmltk_backend_data_test_support
         CUDA::cuda_driver
         Vulkan::Vulkan)

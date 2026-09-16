@@ -1267,50 +1267,88 @@ mod tests {
     }
 
     #[test]
-    fn root_rejects_compute_without_a_current_selection_and_while_active() {
+    fn root_prepares_validation_once_and_preserves_pending_and_active_work() {
         let (mut app, task) = boot();
         drop(task);
         install_default_bootstrap(&mut app);
+        app.workspace.select(FeatureId::Validate);
+        let (connection, mut capture) = Connection::test_channel();
+        app.connection = Some(connection);
 
         drop(app.on_workspace(crate::view::router::Message::Validate(
             crate::view::validate::Message::StartRequested,
         )));
+        assert!(app.model.error.is_none());
+        let crate::transport_connection::CapturedRecord::Intent(prepare) =
+            capture.try_recv().unwrap()
+        else {
+            panic!("expected model preparation");
+        };
         assert_eq!(
-            app.model.error.as_ref().unwrap().kind,
-            crate::view_model::UiErrorKind::InvalidIntent
+            crate::generated::decode_application_intent_endpoint(prepare.endpoint_id),
+            Some(ApplicationIntentEndpoint::ModelSelect)
         );
-        assert_eq!(app.model.pending_count(), 0);
+        let accepted = crate::view_model::test_support::accepted_model_for(
+            &app.model,
+            app.settings.draft().unwrap(),
+            FeatureId::Validate,
+        );
+        app.model.reduce_reply(
+            prepare.correlation,
+            Ok(crate::generated::ApplicationReply::ModelSelect(accepted)),
+        );
+        app.advance_start();
+        let crate::transport_connection::CapturedRecord::Intent(start) =
+            capture.try_recv().unwrap()
+        else {
+            panic!("expected validation start");
+        };
+        assert_eq!(
+            crate::generated::decode_application_intent_endpoint(start.endpoint_id),
+            Some(ApplicationIntentEndpoint::ValidationStart)
+        );
+        drop(app.on_workspace(crate::view::router::Message::Validate(
+            crate::view::validate::Message::StartRequested,
+        )));
+        assert!(capture.try_recv().is_err());
+        assert_eq!(app.model.pending_count(), 1);
 
-        install_current_model_selection(&mut app);
-        let correlation = app
-            .model
-            .begin_intent(ApplicationIntentEndpoint::ValidationStart)
-            .unwrap();
         let mut running = app.model.workflow.validation.clone().unwrap();
         running.operation.generationfrontier += 1;
         running.operation.active = true;
         running.operation.terminal.generation = running.operation.generationfrontier;
         running.operation.terminal.outcome = crate::generated::ComputeOperationOutcome::Running;
         app.model.reduce_reply(
-            correlation,
+            start.correlation,
             Ok(crate::generated::ApplicationReply::ValidationStart(running)),
         );
         drop(app.on_workspace(crate::view::router::Message::Validate(
             crate::view::validate::Message::StartRequested,
         )));
-        assert_eq!(
-            app.model.error.as_ref().unwrap().kind,
-            crate::view_model::UiErrorKind::Busy
+        assert!(app.model.error.is_none());
+        assert!(capture.try_recv().is_err());
+        assert!(
+            app.model
+                .workflow
+                .validation
+                .as_ref()
+                .unwrap()
+                .operation
+                .active
         );
+        assert!(app.model.workflow.pending_start.is_none());
         assert_eq!(app.model.pending_count(), 0);
     }
 
     #[test]
-    fn root_rejects_compute_while_configuration_or_model_selection_is_pending() {
+    fn root_waits_for_validation_settings_and_rejects_export_during_model_selection() {
         let (mut app, task) = boot();
         drop(task);
         install_default_bootstrap(&mut app);
         install_current_model_selection(&mut app);
+        app.workspace.select(FeatureId::Validate);
+        let (connection, mut capture) = Connection::test_channel();
+        app.connection = Some(connection);
 
         let settings = app
             .model
@@ -1319,11 +1357,21 @@ mod tests {
         drop(app.on_workspace(crate::view::router::Message::Validate(
             crate::view::validate::Message::StartRequested,
         )));
+        assert!(app.model.error.is_none());
         assert_eq!(
-            app.model.error.as_ref().unwrap().kind,
-            crate::view_model::UiErrorKind::Busy
+            app.model
+                .workflow
+                .pending_start
+                .as_ref()
+                .unwrap()
+                .preparation,
+            crate::view_model::StartPreparation::Waiting
         );
+        assert!(capture.try_recv().is_err());
         app.model.abandon_intent(settings);
+        assert!(!app.guard_compute_stop(FeatureId::Validate));
+        assert!(app.model.workflow.pending_start.is_none());
+        app.workspace.select(FeatureId::Export);
 
         let receipt = app
             .model
@@ -1342,7 +1390,7 @@ mod tests {
     }
 
     #[test]
-    fn debounced_train_configuration_is_local_and_blocks_settings_consumers() {
+    fn debounced_train_configuration_is_local_and_can_be_settled_by_start() {
         let (mut app, task) = boot();
         drop(task);
         install_default_bootstrap(&mut app);
@@ -1376,7 +1424,7 @@ mod tests {
         assert_eq!(app.model.pending_count(), 0);
         assert!(app.settings_unsettled());
         assert!(
-            !app.settings.draft().is_some_and(|draft| {
+            app.settings.draft().is_some_and(|draft| {
                 app.model.compute_start_available(draft, FeatureId::Train)
             })
         );

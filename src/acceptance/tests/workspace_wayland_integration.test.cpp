@@ -45,6 +45,7 @@
 #include "catch2_compat.hpp"
 #include "filesystem_test_utils.hpp"
 #include "linux_process_test_utils.hpp"
+#include "workflow_wayland_inputs.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/imaging/raster/detail/raster_color.h"
@@ -3667,6 +3668,7 @@ struct BrowserAudit final {
     Bounds error_dismiss;
     Bounds benchmark_override;
     bool perceptual_controls_round_trip = false;
+    Bounds advanced_container;
     std::array<Bounds, 8> advanced_fixed;
     Bounds advanced_assignment;
     std::array<Bounds, 3> advanced_match_free;
@@ -4071,7 +4073,9 @@ struct BrowserAudit final {
                 output[index] = bounds;
                 return true;
             };
-            if (field_detail == "assignment")
+            if (field_detail == "container")
+                advanced_container = bounds;
+            else if (field_detail == "assignment")
                 advanced_assignment = bounds;
             else if (field_detail == "dn-toggle")
                 advanced_denoising_toggle = bounds;
@@ -4766,9 +4770,9 @@ struct BrowserAudit final {
             const Bounds& reference = fields.front();
             for (std::size_t index = 0; index < fields.size(); ++index) {
                 const Bounds& bounds = fields[index];
-                if (std::abs(bounds.y - reference.y) >= 1.0 || std::abs(bounds.width - reference.width) >= 1.0 || bounds.x < train_advanced.x - 1.0 ||
-                    bounds.x + bounds.width > train_advanced.x + train_advanced.width + 1.0 || bounds.y < train_advanced.y - 1.0 ||
-                    bounds.y + bounds.height > train_advanced.y + train_advanced.height + 1.0 ||
+                if (std::abs(bounds.y - reference.y) >= 1.0 || std::abs(bounds.width - reference.width) >= 1.0 || bounds.x < advanced_container.x - 1.0 ||
+                    bounds.x + bounds.width > advanced_container.x + advanced_container.width + 1.0 || bounds.y < advanced_container.y - 1.0 ||
+                    bounds.y + bounds.height > advanced_container.y + advanced_container.height + 1.0 ||
                     (index != 0U && bounds.x < fields[index - 1U].x + fields[index - 1U].width - 1.0)) {
                     return false;
                 }
@@ -4783,15 +4787,15 @@ struct BrowserAudit final {
                                           std::abs(advanced_general.front().width - advanced_match_free.front().width) < 1.0 &&
                                           std::abs(advanced_general.front().width - advanced_denoising.front().width) < 1.0 &&
                                           advanced_optimizer.front().y >= advanced_general.front().y + advanced_general.front().height - 1.0 &&
-                                          advanced_assignment.valid() && advanced_denoising_toggle.valid() && advanced_assignment.x >= train_advanced.x - 1.0 &&
-                                          advanced_assignment.x + advanced_assignment.width <= train_advanced.x + train_advanced.width + 1.0 &&
-                                          advanced_assignment.y >= train_advanced.y - 1.0 &&
-                                          advanced_assignment.y + advanced_assignment.height <= train_advanced.y + train_advanced.height + 1.0 &&
+                                          advanced_assignment.valid() && advanced_denoising_toggle.valid() && advanced_assignment.x >= advanced_container.x - 1.0 &&
+                                          advanced_assignment.x + advanced_assignment.width <= advanced_container.x + advanced_container.width + 1.0 &&
+                                          advanced_assignment.y >= advanced_container.y - 1.0 &&
+                                          advanced_assignment.y + advanced_assignment.height <= advanced_container.y + advanced_container.height + 1.0 &&
                                           advanced_assignment.y >= advanced_optimizer.front().y + advanced_optimizer.front().height - 1.0 &&
-                                          advanced_denoising_toggle.x >= train_advanced.x - 1.0 &&
-                                          advanced_denoising_toggle.x + advanced_denoising_toggle.width <= train_advanced.x + train_advanced.width + 1.0 &&
-                                          advanced_denoising_toggle.y >= train_advanced.y - 1.0 &&
-                                          advanced_denoising_toggle.y + advanced_denoising_toggle.height <= train_advanced.y + train_advanced.height + 1.0 &&
+                                          advanced_denoising_toggle.x >= advanced_container.x - 1.0 &&
+                                          advanced_denoising_toggle.x + advanced_denoising_toggle.width <= advanced_container.x + advanced_container.width + 1.0 &&
+                                          advanced_denoising_toggle.y >= advanced_container.y - 1.0 &&
+                                          advanced_denoising_toggle.y + advanced_denoising_toggle.height <= advanced_container.y + advanced_container.height + 1.0 &&
                                           advanced_match_free.front().y >= advanced_denoising_toggle.y + advanced_denoising_toggle.height - 1.0;
         const bool advanced_compact = [&] {
             const auto compact_row = [](const auto& fields) {
@@ -5341,6 +5345,10 @@ class PreparedWaylandInputs final {
     }
     [[nodiscard]] const auto& square() const noexcept { return square_; }
     [[nodiscard]] const auto& mixed() const noexcept { return mixed_; }
+    [[nodiscard]] const mmltk::testsupport::WorkflowWaylandInputs& workflows() {
+        if (!workflows_) workflows_ = std::make_unique<mmltk::testsupport::WorkflowWaylandInputs>(root_.path() / "workflows");
+        return *workflows_;
+    }
     [[nodiscard]] const auto& probe() {
         using namespace mmltk::backend::data::testsupport;
         if (!std::filesystem::is_regular_file(compiled_bin_path(probe_))) {
@@ -5360,6 +5368,7 @@ class PreparedWaylandInputs final {
     mmltk::backend::data::testsupport::FixtureSpec square_;
     mmltk::backend::data::testsupport::FixtureSpec mixed_;
     mmltk::backend::data::testsupport::FixtureSpec probe_;
+    std::unique_ptr<mmltk::testsupport::WorkflowWaylandInputs> workflows_;
 };
 // One owner retains the process, resources, physical evidence and byte cursors.
 // RunScenario contains domain assertions; Advance is acknowledged only after
@@ -5373,6 +5382,8 @@ class WaylandSession final {
 
    private:
     void AdvanceScenario();
+    void ConsumeRecords(bool final = false);
+    void RunWorkflows();
     std::shared_ptr<PreparedWaylandInputs> inputs_;
     const mmltk::backend::data::testsupport::FixtureSpec& ordinary_fixture_;
     TerminationMode termination;
@@ -5403,6 +5414,8 @@ class WaylandSession final {
     bool frontend_settled_ = false;
     bool pressure_entered_ = false;
     bool browser_failed_ = false;
+    std::set<std::string> workflow_steps_;
+    std::set<std::string> workflow_pixels_;
 };
 WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile,
                                const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault, const bool pixels_enabled,
@@ -5443,6 +5456,7 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
     initial_settings.ui.ui_scale = 1.0F;
     initial_settings.workflows.explore.h2d_dataloader = h2d;
     initial_settings.workflows.train.request.h2d_dataloader = h2d;
+    if (profile_ == "workflows") inputs_->workflows().Configure(initial_settings, working.path());
     std::filesystem::create_directories(working.path() / ".mmltk-data");
     std::ofstream settings_file{working.path() / ".mmltk-data" / "gui.json"};
     REQUIRE(settings_file);
@@ -5457,7 +5471,116 @@ WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, co
     native_cursor_ = std::make_unique<JsonLineCursor>(diagnostics, 0U);
     browser_cursor_ = std::make_unique<JsonLineCursor>(firefox_log, 0U, JsonLineCursor::Format::FirefoxText);
 }
+void WaylandSession::ConsumeRecords(const bool final) {
+    native_cursor_->consume(native, [&](const auto& record) {
+        surface_audit.native(record);
+        pixel_audit.consume(record);
+        report_consumed_record(record, "native");
+    });
+    if (native.firefox_pid > 0) process_->retain_peer(native.firefox_pid);
+    browser_cursor_->consume(
+        browser,
+        [&](const auto& record) {
+            surface_audit.browser(record);
+            pixel_audit.consume(record);
+            browser.atlas_draws.failure.report(acceptance_log, "acceptance.atlas_draw.failed", firefox_log, browser_cursor_->line());
+            browser.owned_atlas_failure.report(acceptance_log, "acceptance.owned_atlas.failed", firefox_log, browser_cursor_->line());
+            const auto event = record.value("event", "");
+            if (event == "integration.workflow.completed") workflow_steps_.insert(record.value("detail", ""));
+            if (event == "integration.workflow.pixels") workflow_pixels_.insert(record.value("detail", ""));
+            report_consumed_record(record, "firefox");
+        },
+        final);
+    browser_failed_ = browser_failed_ || browser.failed_before_termination();
+    for (const auto& [generation, evidence] : browser.gallery_generations) {
+        const auto digest = native.placeholder_digests.find(generation);
+        const auto cardinality = native.placeholder_cardinalities.find(generation);
+        if ((digest != native.placeholder_digests.end() && digest->second != evidence.digest) ||
+            (cardinality != native.placeholder_cardinalities.end() && cardinality->second != evidence.slots.size()))
+            continue;
+        native.join_gallery_publication(generation, evidence.slots);
+    }
+}
+void WaylandSession::RunWorkflows() {
+    auto& process = *process_;
+    arm_timerfd(deadline.get(), kWaylandStartupDeadline, "workflow browser startup");
+    std::size_t progress = 0U;
+    const auto diagnostics_on_exit = [&] {
+        std::cerr << "\nworkflow native log:\n" << read_tail(runtime_log) << "\nworkflow browser log:\n" << read_tail(firefox_log) << std::flush;
+    };
+    for (;;) {
+        ConsumeRecords();
+        if (browser_failed_ || native.failed_before_termination() || !surface_audit.failure.empty()) {
+            diagnostics_on_exit();
+            FAIL("workflow browser reported a product or physical ownership failure");
+        }
+        if (frontend_settled_ && surface_audit.evidence_settled()) break;
+        if (browser.phase_progress_revision != progress) {
+            progress = browser.phase_progress_revision;
+            arm_timerfd(deadline.get(), browser.phase_progress_class == "work" ? kWaylandWorkDeadline : kWaylandInteractionDeadline,
+                        "workflow phase progress");
+        }
+        std::array<pollfd, 4U> waits{{
+            {.fd = process.pidfd(), .events = POLLIN, .revents = 0},
+            {.fd = notifications_->descriptor(), .events = POLLIN, .revents = 0},
+            {.fd = process.control_fd(), .events = POLLIN, .revents = 0},
+            {.fd = deadline.get(), .events = POLLIN, .revents = 0},
+        }};
+        int ready = -1;
+        do { ready = ::poll(waits.data(), waits.size(), -1); } while (ready < 0 && errno == EINTR);
+        REQUIRE(ready >= 0);
+        if (waits[1].revents) notifications_->consume();
+        if (waits[2].revents & POLLIN) {
+            const auto event = process.receive_explore_event();
+            REQUIRE(event.has_value());
+            REQUIRE(event->event == ExploreAcceptanceGate::ControlEvent::Frontend);
+            REQUIRE(event->generation == scenario_sequence_);
+            using Kind = mmltk::controller::contracts::IntegrationControlKind;
+            const auto kind = static_cast<Kind>(event->slot);
+            if (kind == Kind::Settled) {
+                REQUIRE_FALSE(frontend_settled_);
+                frontend_settled_ = true;
+            } else if (kind == Kind::Failed) {
+                INFO(process.frontend_failure());
+                diagnostics_on_exit();
+                FAIL("rendered workflow failed");
+            } else {
+                REQUIRE(kind == Kind::Progress);
+            }
+        }
+        if (waits[0].revents || waits[3].revents) {
+            ConsumeRecords();
+            diagnostics_on_exit();
+            INFO(browser.phase_progress_name);
+            FAIL("rendered workflow exited or exceeded its phase deadline");
+        }
+    }
+    CHECK((workflow_steps_ == std::set<std::string>{"train", "validation", "compiled", "image", "video", "stop", "theme", "narrow"}));
+    CHECK((workflow_pixels_ == std::set<std::string>{"train", "validation", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
+    CHECK_FALSE(surface_audit.surfaces.empty());
+    process.interrupt();
+    arm_timerfd(deadline.get(), kWaylandShutdownDeadline, "workflow shutdown");
+    const auto terminal = await_shutdown(process, deadline.get());
+    REQUIRE(terminal.has_value());
+    ConsumeRecords(true);
+    native_cursor_->finish();
+    INFO(surface_audit.joined_failure());
+    CHECK(surface_audit.joined_failure().empty());
+    CHECK(*terminal == 0);
+    CHECK(native.peer_open_count > 0U);
+    CHECK(native.peer_close_count == native.peer_open_count);
+    CHECK(native.shutdown_requested);
+    CHECK(native.firefox_terminal);
+    CHECK(native.shutdown_complete);
+    CHECK_FALSE(native.shutdown_incomplete);
+    CHECK_FALSE(native.worker_failed);
+    CHECK_FALSE(browser_failed_);
+}
 void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool last, const bool dark, const bool pending_reconstruction) {
+    if (viewer_scenario == "workflows") {
+        RunWorkflows();
+        return;
+    }
     const auto permitted_cpus = permitted_cpu_count();
     const auto& fixture = viewer_scenario == "square" ? inputs_->square() : ordinary_fixture_;
     const auto compiled_directory =
@@ -5465,7 +5588,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     auto& process = *process_;
     auto& notifications = *notifications_;
     auto& native_cursor = *native_cursor_;
-    auto& browser_cursor = *browser_cursor_;
     auto deadline_duration = kWaylandStartupDeadline;
     std::string deadline_stage{"browser startup"};
     const auto arm_acceptance_deadline = [&](const std::chrono::seconds duration, std::string stage) {
@@ -5542,33 +5664,6 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         }
         return;
     }
-    const auto consume_records = [&](const bool final = false) {
-        native_cursor.consume(native, [&](const auto& record) {
-            surface_audit.native(record);
-            pixel_audit.consume(record);
-            report_consumed_record(record, "native");
-        });
-        if (native.firefox_pid > 0) process.retain_peer(native.firefox_pid);
-        browser_cursor.consume(
-            browser,
-            [&](const auto& record) {
-                surface_audit.browser(record);
-                pixel_audit.consume(record);
-                browser.atlas_draws.failure.report(acceptance_log, "acceptance.atlas_draw.failed", firefox_log, browser_cursor.line());
-                browser.owned_atlas_failure.report(acceptance_log, "acceptance.owned_atlas.failed", firefox_log, browser_cursor.line());
-                report_consumed_record(record, "firefox");
-            },
-            final);
-        browser_failed_ = browser_failed_ || browser.failed_before_termination();
-        for (const auto& [generation, evidence] : browser.gallery_generations) {
-            const auto digest = native.placeholder_digests.find(generation);
-            const auto cardinality = native.placeholder_cardinalities.find(generation);
-            if ((digest != native.placeholder_digests.end() && digest->second != evidence.digest) ||
-                (cardinality != native.placeholder_cardinalities.end() && cardinality->second != evidence.slots.size()))
-                continue;
-            native.join_gallery_publication(generation, evidence.slots);
-        }
-    };
     std::size_t observed_phase_progress = 0U;
     std::size_t observed_work_progress = 0U;
     const auto refresh_progress_deadline = [&] {
@@ -5709,7 +5804,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     };
     bool readiness_reached = false;
     for (;;) {
-        consume_records();
+        ConsumeRecords();
         if (!terminal_failure_observed) static_cast<void>(refresh_progress_deadline());
         if (!terminal_failure_observed && frontend_settled_ && !browser_failed_ && !viewer_scenario.empty() && browser.viewer_complete &&
             browser.surface_draws.contains(browser.viewer_presentation) && native.presentation_ready && native.explore_rendered &&
@@ -5826,7 +5921,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
         }
         if ((descriptors[3].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
             static_cast<void>(consume_timerfd(deadline.get()));
-            consume_records();
+            ConsumeRecords();
             if (!terminal_failure_observed && refresh_progress_deadline()) continue;
             if (terminal_failure_observed) {
                 std::cerr << "workspace-wayland terminal failure did not settle within " << deadline_duration.count() << " seconds";
@@ -5955,7 +6050,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             }
         }
         if ((descriptors[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-            consume_records();
+            ConsumeRecords();
             if (terminal_failure_observed) {
                 std::cerr << "workspace-wayland native host settled after a terminal integration failure";
                 record_acceptance_state("acceptance.failure_settlement.completed", true);
@@ -5998,7 +6093,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
                                  : process.active() ? await_shutdown(process, deadline.get())
                                                     : std::optional<int>{process.status()};
     if (!terminal_result) {
-        consume_records();
+        ConsumeRecords();
         std::cerr << "workspace-wayland shutdown made no progress within " << deadline_duration.count() << " seconds"
                   << "\ntermination: " << termination_label(termination) << "\nacceptance blockers: " << blocker_summary();
         record_acceptance_state("acceptance.shutdown.stalled", true);
@@ -6011,7 +6106,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     // Keep the settled prefix fixed through scenario checks and rollover.
     // Later records remain in the retained cursors for the next scenario.
     if (last) {
-        consume_records(true);
+        ConsumeRecords(true);
         native_cursor.finish();
     }
     const std::string native_text = read_tail(diagnostics);
@@ -6464,6 +6559,10 @@ void workspace_wayland_retained() {
     session.RunScenario("copy", false, true);
     session.RunScenario("rapid", true);
 }
+void workspace_wayland_workflows() {
+    WaylandSession session{wayland_inputs(false), TerminationMode::SignalInterrupt, "workflows", true, false, true, {}, false};
+    session.RunScenario("workflows", true);
+}
 void workspace_wayland_dpi() {
     WaylandSession session{wayland_inputs(true), TerminationMode::SignalInterrupt, "dpi", true, true};
     session.RunScenario("copy", false, false, true);
@@ -6646,10 +6745,11 @@ TEST_CASE("browser audit exposes distinct integration phases for progress deadli
     CHECK_FALSE(audit.bounds_valid);
 }
 // Configured inventory: primary + DPI + two destructive terminals + four
-// startup-latched faults + two quiet paths = 10 H2D lifetimes. Optional GDR
+// startup-latched faults + two quiet paths + model workflows = 11 H2D lifetimes. Optional GDR
 // adds one focused lifetime. The former matrix used 23 per transport (46
 // with GDR), recompiling/relaunching ordinary coverage for each case.
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][retained]", workspace_wayland_retained);
+MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][workflows]", workspace_wayland_workflows);
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][dpi]", workspace_wayland_dpi);
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][terminal]", workspace_wayland_terminal);
 MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][probe_recovery]", workspace_wayland_probe_recovery);

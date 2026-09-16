@@ -41,6 +41,21 @@ class TransferTrace final {
    private:
     mmltk::common::io::ScopedFd descriptor_;
 };
+void LogContext(const char* operation, const void* owner, std::uintptr_t context, int device, DeviceContextMode mode) noexcept {
+    const TransferTrace trace;
+    if (!trace.enabled()) return;
+    CUcontext current = nullptr;
+    const auto status = cuCtxGetCurrent(&current);
+    char record[384];
+    const int size = std::snprintf(record, sizeof(record),
+                                   "{\"event\":\"image_context\",\"operation\":\"%s\",\"owner\":%llu,\"context\":%llu,"
+                                   "\"current\":%llu,\"current_status\":%d,\"device\":%d,\"mode\":\"%s\",\"thread\":%d}\n",
+                                   operation, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(owner)),
+                                   static_cast<unsigned long long>(context),
+                                   static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(current)), static_cast<int>(status), device,
+                                   mode == DeviceContextMode::PrimaryInterop ? "primary" : "isolated", static_cast<int>(::gettid()));
+    trace.Write(record, size, sizeof(record));
+}
 void LogStaging(const DeviceContext& receiver, int source_device, std::size_t bytes) noexcept {
     const TransferTrace trace;
     if (!trace.enabled()) return;
@@ -104,8 +119,20 @@ class NativeImageCopyBackend final : public ImageCopyBackend {
         CUcontext context = nullptr;
         if (mode == DeviceContextMode::PrimaryInterop)
             CheckCuda("retain CUDA primary context", cuDevicePrimaryCtxRetain(&context, selected));
-        else
+        else {
             CheckCuda("create CUDA context", cuCtxCreate(&context, nullptr, CU_CTX_SCHED_AUTO, selected));
+            try {
+                // Creation pushes a stack entry, while every ordinary bind
+                // replaces the top. Balance the push before leaving the new
+                // owner current so later retirement cannot expose stale owners.
+                CUcontext created = nullptr;
+                CheckCuda("detach new CUDA context", cuCtxPopCurrent(&created));
+                CheckCuda("bind new CUDA context", cuCtxSetCurrent(context));
+            } catch (...) {
+                static_cast<void>(cuCtxDestroy(context));
+                throw;
+            }
+        }
         return reinterpret_cast<std::uintptr_t>(context);
     }
     void DestroyContext(const int device, const DeviceContextMode mode, const std::uintptr_t context) noexcept override {
@@ -292,8 +319,12 @@ struct DeviceContext::State final {
         }
         context = backend->CreateContext(device, mode);
         if (context == 0U) throw std::runtime_error("image device context creation returned no context");
+        LogContext("created", this, context, device, mode);
     }
-    ~State() { backend->DestroyContext(device, mode, context); }
+    ~State() {
+        LogContext("destroy", this, context, device, mode);
+        backend->DestroyContext(device, mode, context);
+    }
     int device = -1;
     DeviceContextMode mode = DeviceContextMode::Isolated;
     std::shared_ptr<ImageCopyBackend> backend;
@@ -306,7 +337,10 @@ DeviceContext::DeviceContext(const int device, std::shared_ptr<ImageCopyBackend>
 DeviceContext::~DeviceContext() = default;
 int DeviceContext::device() const noexcept { return state_->device; }
 const DeviceExecution* DeviceContext::execution() const noexcept { return state_->execution ? &*state_->execution : nullptr; }
-void DeviceContext::Bind() const { state_->backend->BindContext(state_->context); }
+void DeviceContext::Bind() const {
+    LogContext("bind", state_.get(), state_->context, state_->device, state_->mode);
+    state_->backend->BindContext(state_->context);
+}
 std::uintptr_t DeviceContext::CreateEvent() const {
     const auto event = state_->backend->CreateEvent(state_->context);
     if (event == 0U) throw std::runtime_error("image completion event creation returned no event");

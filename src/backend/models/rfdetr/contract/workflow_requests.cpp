@@ -35,7 +35,7 @@ void validate_predict_request(const PredictRequest& request) {
     const bool video_source =
         request.source_kind == PredictSourceKind::VideoFile && !request.video_path.empty() && request.compiled_path.empty() && request.image_inputs.empty();
     if ((!compiled_source && !image_source && !video_source) || request.output_path.empty() || request.selected_input_count() != 1U) {
-        throw std::runtime_error("rfdetr predict requires compiled input, output, and one model artifact");
+        throw std::runtime_error("rfdetr predict requires exactly one source (compiled dataset, images, or video), an output path, and one model artifact");
     }
 }
 void validate_validate_request(const ValidateRequest& request) {

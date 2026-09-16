@@ -385,6 +385,59 @@ function canvasPixelBounds(canvas, cssBounds, control) {
   return pixels;
 }
 
+export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, source, presentation, completed) {
+  completed = integrationCompletion(completed);
+  const owner = integrationState;
+  if (!owner || !integrationDriver) { completed('failed'); return; }
+  const receipt = chart ? undefined : mmltkIntegrationProbe(control);
+  cssBounds = Array.from(cssBounds);
+  // Widget layout precedes the browser compositor. Sample the completed canvas
+  // after two presentation opportunities, with bounded retries owned by Rust.
+  integrationFrame(() => integrationFrame(() => {
+    if (integrationState !== owner) { completed('invalidated'); return; }
+    if (!chart) {
+      const draw = owner.integrationSurfaceDraws.get(control);
+      if (!probeCurrent(receipt) || !draw || draw.sourceRevision !== source || draw.presentationRevision !== presentation) {
+        completed('invalidated'); return;
+      }
+    }
+    try {
+      const canvas = document.querySelector('canvas');
+      if (!canvas) throw new Error('missing workflow canvas');
+      const [x,y,w,h] = canvasPixelBounds(canvas, cssBounds, control);
+      // The chart's middle strip excludes its legend and vertical axis. Only
+      // saturated curve pixels count; neutral axes, grid and text cannot pass.
+      const left = Math.max(0, Math.ceil(x + w * (chart ? 0.43 : 0.15)));
+      const top = Math.max(0, Math.ceil(y + h * 0.12));
+      const right = Math.min(canvas.width, Math.floor(x + w * (chart ? 0.57 : 0.85)));
+      const bottom = Math.min(canvas.height, Math.floor(y + h * 0.88));
+      if (right <= left || bottom <= top) throw new Error('workflow canvas region is not visible');
+      const snapshot = canvasSnapshot(canvas);
+      const pixels = snapshot.getImageData(left, top, right-left, bottom-top).data;
+      let visible = 0;
+      for (let offset=0; offset<pixels.length; offset+=4) {
+        const r=pixels[offset], g=pixels[offset+1], b=pixels[offset+2];
+        visible += Number(chart ? Math.max(r,g,b)-Math.min(r,g,b)>45 : r+g+b>60);
+      }
+      if (chart && visible < 12) {
+        // Bounded failure evidence from the same CPU snapshot; no second
+        // canvas readback or production rendering dependency.
+        const overview = new OffscreenCanvas(64, 36);
+        const context = overview.getContext('2d');
+        context.drawImage(owner.canvasScratch, x, y, w, h, 0, 0, 64, 36);
+        const rgba = context.getImageData(0, 0, 64, 36).data;
+        report({event: 'integration.workflow.plot_evidence', control,
+          sampled: pixels.length / 4, visible, width: 64, height: 36,
+          rgba_base64: btoa(String.fromCharCode(...rgba))});
+      }
+      completed('observed', pixels.length/4, visible);
+    } catch (error) {
+      report({event:'integration.failure', control, detail:`workflow canvas read: ${error}`});
+      completed('failed');
+    }
+  }));
+}
+
 // The displayed counter is diagnostic evidence, separate from its image receipt.
 // A new meter sample or layout invalidates a pending capture even on retained pixels.
 export function mmltkIntegrationFpsDraw(control, values) {

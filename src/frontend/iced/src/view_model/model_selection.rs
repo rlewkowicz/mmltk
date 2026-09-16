@@ -192,6 +192,7 @@ mod tests {
             .settings_snapshot
             .expect("Settings snapshot")
             .settingsstate;
+        settings.workflows.train.modelinput = ModelArtifactInputKind::None;
         assert!(
             !model_settings_projection(&settings, FeatureId::Train)
                 .expect("Train selection")

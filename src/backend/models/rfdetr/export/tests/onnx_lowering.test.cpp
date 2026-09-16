@@ -1,4 +1,5 @@
 #include "src/backend/ml/cuda/tensor_readback.h"
+#include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/common/system/numa_memory.h"
 #include <ATen/TensorIndexing.h>
 #include <ATen/ops/alias.h>
@@ -11,8 +12,11 @@
 #include <ATen/ops/unbind.h>
 #include <torch/csrc/jit/api/function_impl.h>
 #include <torch/csrc/jit/frontend/tracer.h>
+#define ONNX_NAMESPACE onnx_torch
 #include <torch/csrc/jit/serialization/export.h>
+#undef ONNX_NAMESPACE
 #include <torch/script.h>
+#include <torch/nn/functional/upsampling.h>
 #include <torch/torch.h>
 #include <functional>
 #include <initializer_list>
@@ -260,10 +264,63 @@ MMLTK_ONNX_LOWERING_TEST_CASE(test_lower_slice_and_select_emit_onnx_slice_path) 
     MMLTK_ASSERT(!block_contains_kind(graph->block(), kAtenSlice));
     MMLTK_ASSERT(!block_contains_kind(graph->block(), kAtenSelect));
     MMLTK_ASSERT(block_contains_kind(graph->block(), kOnnxSlice) || block_contains_kind(graph->block(), kOnnxReshape));
+    for (const auto axis : {0, -3}) {
+        auto [parameter_graph, initializers] = trace_unary_graph_with_parameters(
+            torch::zeros({3, 4}), {{"weight", torch::arange(24, torch::kFloat).reshape({2, 3, 4})}},
+            [axis](torch::jit::Module& module, const torch::Tensor& input) { return input + module.attr("weight").toTensor().select(axis, 1); });
+        auto* attribute = find_first_node_kind(parameter_graph->block(), kPrimGetAttr);
+        REQUIRE(attribute != nullptr);
+        attribute->output()->setType(c10::TensorType::get());
+        lower_test_graph(parameter_graph, &initializers);
+        REQUIRE_FALSE(block_contains_kind(parameter_graph->block(), kAtenSelect));
+        const auto* gather = find_first_node_kind(parameter_graph->block(), c10::Symbol::fromQualString("onnx::Gather"));
+        REQUIRE(gather != nullptr);
+        CHECK(gather->i(kAttrAxis) == 0);
+    }
 }
 MMLTK_ONNX_LOWERING_TEST_CASE(test_lower_slice_with_negative_axis_and_step_emits_onnx_slice) {
     lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return input.slice(-1, 0, c10::nullopt, 2); }, {kAtenSlice},
                                 {kOnnxSlice});
+}
+MMLTK_ONNX_LOWERING_TEST_CASE(test_antialiased_bicubic_resize_preserves_torch_values) {
+    namespace F = torch::nn::functional;
+    mmltk::backend::ml::runtime::OnnxEnvironment environment(ORT_LOGGING_LEVEL_ERROR, "resize-lowering");
+    Ort::SessionOptions options;
+    options.SetIntraOpNumThreads(1);
+    options.SetInterOpNumThreads(1);
+    const auto memory = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    auto input = torch::sin(torch::arange(126, torch::kFloat)).reshape({1, 2, 7, 9});
+    for (const auto& size : {std::vector<int64_t>{3, 5}, std::vector<int64_t>{11, 13}, std::vector<int64_t>{1, 1}}) {
+        for (const bool align_corners : {false, true}) {
+            CAPTURE(size, align_corners);
+            const auto interpolate = [&](const torch::Tensor& value) {
+                return F::interpolate(value, F::InterpolateFuncOptions().size(size).mode(torch::kBicubic)
+                                                 .align_corners(align_corners).antialias(true));
+            };
+            auto graph = trace_unary_graph(input, interpolate);
+            if (align_corners) {
+                mmltk::testsupport::expect_runtime_error_contains([&] { lower_test_graph(graph); }, "requires align_corners=false");
+                continue;
+            }
+            lower_test_graph(graph);
+            if (graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) graph->eraseInput(0);
+            graph->inputs().front()->setDebugName("image");
+            graph->outputs().front()->setDebugName("resized");
+            auto exported = torch::jit::export_onnx(graph, {}, 19, {}, false, ::torch::onnx::OperatorExportTypes::ONNX,
+                                                   true, false, {}, true, false, "");
+            const auto bytes = torch::jit::serialize_model_proto_to_string(std::get<0>(exported));
+            Ort::Session session(environment.get(), bytes.data(), bytes.size(), options);
+            auto value = Ort::Value::CreateTensor<float>(memory, input.data_ptr<float>(), input.numel(),
+                                                         input.sizes().data(), input.dim());
+            const char* input_name = "image";
+            const char* output_name = "resized";
+            auto output = session.Run(Ort::RunOptions{}, &input_name, &value, 1, &output_name, 1);
+            const auto expected = interpolate(input);
+            REQUIRE(output.front().GetTensorTypeAndShapeInfo().GetShape() == expected.sizes().vec());
+            const auto actual = torch::from_blob(output.front().GetTensorMutableData<float>(), expected.sizes(), torch::kFloat);
+            CHECK(torch::allclose(actual, expected, 1.0e-5, 1.0e-6));
+        }
+    }
 }
 MMLTK_ONNX_LOWERING_TEST_CASE(test_lower_inference_dropout_removes_dropout_node) {
     lower_unary_graph_and_check(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return torch::dropout(input, 0.1, false); }, {kAtenDropout});

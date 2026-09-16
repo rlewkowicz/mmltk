@@ -45,6 +45,7 @@ if(BUILD_MMLTK_BROWSER_HOST OR BUILD_TESTS)
     )
     set_target_properties(mmltk_entrypoints_desktop_host PROPERTIES
         OUTPUT_NAME "mmltk-browser-host")
+    add_dependencies(mmltk_entrypoints_desktop_host mmltk_entrypoints_cli)
     mmltk_enable_native_runtime_rpath(
         mmltk_entrypoints_desktop_host)
 endif()

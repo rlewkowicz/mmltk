@@ -23,6 +23,7 @@
 #include <string_view>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <vector>
@@ -2907,6 +2908,44 @@ TEST_CASE("adopted image contexts validate complete ownership and retain indepen
     }
     CHECK(backend->contexts_created == 2U);
     CHECK(backend->contexts_destroyed == 2U);
+}
+TEST_CASE("isolated CUDA contexts preserve stack depth across rebinding and retirement", "[gpu][hardware]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    const bool nested = GENERATE(false, true);
+    // A fresh thread gives the driver stack a known empty baseline without
+    // disturbing CUDA state retained by other hardware fixtures.
+    auto observed = std::async(std::launch::async, [nested] {
+        const auto check = [](CUresult status) {
+            if (status != CUDA_SUCCESS) throw std::runtime_error("CUDA context stack operation failed");
+        };
+        DeviceContext caller(0, cuda_image_copy_backend());
+        CUcontext caller_handle = nullptr;
+        check(cuCtxGetCurrent(&caller_handle));
+        if (nested) check(cuCtxPushCurrent(caller_handle));
+        bool created_current = false;
+        {
+            DeviceContext candidate(0, cuda_image_copy_backend());
+            CUcontext current = nullptr;
+            check(cuCtxGetCurrent(&current));
+            created_current = current && current != caller_handle;
+            caller.Bind();
+        }
+        CUcontext current = nullptr;
+        check(cuCtxGetCurrent(&current));
+        const bool caller_current = current == caller_handle;
+        unsigned entries = 0U;
+        while (current && entries < 4U) {
+            CUcontext popped = nullptr;
+            check(cuCtxPopCurrent(&popped));
+            ++entries;
+            check(cuCtxGetCurrent(&current));
+        }
+        return std::tuple{created_current, caller_current, entries, current == nullptr};
+    }).get();
+    CHECK(std::get<0>(observed));
+    CHECK(std::get<1>(observed));
+    CHECK(std::get<2>(observed) == (nested ? 2U : 1U));
+    CHECK(std::get<3>(observed));
 }
 TEST_CASE("canonical adoption validates ownership before changing the caller binding", "[gpu][hardware]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");

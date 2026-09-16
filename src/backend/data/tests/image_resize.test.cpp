@@ -112,11 +112,11 @@ TEST_CASE("perceptual resampling matches independent moments and full-area geome
                 source.fill(pattern);
                 const auto expected = reference(source, dims[2], dims[3], 5);
                 resizer.downscale(source.read(), output.write());
-                REQUIRE(maximum_error(output, expected) <= (format == RgbPixelFormat::PlanarUnitSrgbF32 ? 2e-6 : 1.0 / 255 + 1e-12));
+                REQUIRE(maximum_error(output, expected) <= reference_tolerance(format));
                 REQUIRE(padding_intact(output));
                 const auto retained = output.storage;
                 resizer.downscale(source.read(), output.write());
-                REQUIRE(output.storage == retained);
+                REQUIRE(std::memcmp(output.storage.data(), retained.data(), retained.size() * sizeof(float)) == 0);
             }
 }
 namespace {
@@ -124,7 +124,7 @@ void check_prepared_pixels(perceptual::CpuDownscaler& resizer, const test_percep
     using namespace test_perceptual;
     const auto expected = reference(source, output.layout.width, output.layout.height, 5);
     resizer.run(source.read(), output.write());
-    REQUIRE(maximum_error(output, expected) <= (source.layout.format == RgbPixelFormat::PlanarUnitSrgbF32 ? 2e-6 : 1.0 / 255 + 1e-12));
+    REQUIRE(maximum_error(output, expected) <= reference_tolerance(source.layout.format));
     REQUIRE(padding_intact(output));
     REQUIRE(perceptual::CpuDownscalerTestAccess::prepared(resizer));
 }

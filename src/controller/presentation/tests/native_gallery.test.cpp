@@ -1584,9 +1584,11 @@ TEST_CASE("Gallery suspension failure closes admission and retains its real runt
         plan.augmentation_config.occlusion = {};
         plan.augmentation_config.copy_paste_probability = 0;
         plan.augmentation_config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
+        const std::vector<mmltk::backend::imaging::explore::detail::ExploreRenderClassDescriptorAbi> classes(store->header().num_classes);
         gpu::ImageProductBuffer output(context, gpu::ImageProductLayout::CleanAndSemantic);
         gallery.PrepareOutputPublication(ExploreOutputChange::Initialize, ExploreMode::Detail);
-        output.Publish(*stream, 16U, 16U, [&](auto clean, auto semantic, auto native) { gallery.RenderDetail(plan, store, {}, {}, clean, semantic, native); });
+        output.Publish(*stream, 16U, 16U,
+                       [&](auto clean, auto semantic, auto native) { gallery.RenderDetail(plan, store, {}, classes, clean, semantic, native); });
         gallery.CommitOutputPublication();
         CHECK(gallery.StorageFootprint().augmentation_device_bytes > 0U);
         store.reset();

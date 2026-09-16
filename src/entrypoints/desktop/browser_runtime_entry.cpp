@@ -25,6 +25,7 @@
 #include "src/controller/services/firefox_process_owner.h"
 #include "src/controller/services/diagnostics_client.h"
 #include "src/controller/services/settings_location.h"
+#include "src/controller/services/train_command.h"
 #include "src/controller/shell/application_shell.h"
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::entrypoints::desktop {
@@ -157,6 +158,8 @@ int main(int argc, char** argv) {
         for (int index = 1; index < argc; ++index) arguments.emplace_back(argv[index]);
         auto runtime = parse_browser_runtime_options(arguments);
         mmltk::controller::shell::ApplicationShellConfig config;
+        config.training_executable =
+            mmltk::controller::services::resolve_sibling_mmltk_cli(mmltk::controller::services::current_executable_path());
         const char* const pixel_trace = std::getenv("MMLTK_GUI_PIXEL_TRACE");
         const char* const lifecycle_trace = std::getenv("MMLTK_GUI_TRACE_FILE");
         const bool pixel_probes = pixel_trace != nullptr && std::string_view{pixel_trace} == "1" && lifecycle_trace != nullptr && *lifecycle_trace != '\0';

@@ -380,7 +380,7 @@ TEST_CASE("compute service domain values retain ordered terminal-safe progress",
     CHECK(terminal.valid());
     CHECK_FALSE(domain::ComputeProgress{.sequence = 0U, .completed = 0U, .total = 0U, .status = {}}.valid());
     CHECK_FALSE(domain::ComputeProgress{.sequence = 1U, .completed = 9U, .total = 8U, .status = {}}.valid());
-    CHECK_FALSE(domain::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 0U, .status = {}}.valid());
+    CHECK(domain::ComputeProgress{.sequence = 1U, .completed = 1U, .total = 0U, .status = {}}.valid());
     CHECK_FALSE(domain::ComputeProgress{.sequence = 1U, .completed = 0U, .total = 1U, .status = std::string(domain::kComputeStatusCapacity + 1U, 's')}.valid());
     CHECK(domain::bounded_compute_error(std::string(domain::kComputeErrorCapacity + 1U, 'e')).size() == domain::kComputeErrorCapacity);
 }

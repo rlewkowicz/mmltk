@@ -144,6 +144,7 @@ const c10::Symbol kAtenNewZeros = c10::Symbol::fromQualString("aten::new_zeros")
 const c10::Symbol kAtenNewOnes = c10::Symbol::fromQualString("aten::new_ones");
 const c10::Symbol kAtenUpsampleNearest2d = c10::Symbol::fromQualString("aten::upsample_nearest2d");
 const c10::Symbol kAtenUpsampleBilinear2d = c10::Symbol::fromQualString("aten::upsample_bilinear2d");
+const c10::Symbol kAtenUpsampleBicubic2dAa = c10::Symbol::fromQualString("aten::_upsample_bicubic2d_aa");
 const c10::Symbol kAtenGridSampler = c10::Symbol::fromQualString("aten::grid_sampler");
 const c10::Symbol kAtenScaledDotProductAttention = c10::Symbol::fromQualString("aten::scaled_dot_product_attention");
 const c10::Symbol kPrimNumToTensor = c10::Symbol::fromQualString("prim::NumToTensor");
@@ -216,6 +217,9 @@ const c10::Symbol kAttrMode = c10::Symbol::attr("mode");
 const c10::Symbol kAttrPaddingMode = c10::Symbol::attr("padding_mode");
 const c10::Symbol kAttrCoordinateTransformationMode = c10::Symbol::attr("coordinate_transformation_mode");
 const c10::Symbol kAttrNearestMode = c10::Symbol::attr("nearest_mode");
+const c10::Symbol kAttrAntialias = c10::Symbol::attr("antialias");
+const c10::Symbol kAttrCubicCoeffA = c10::Symbol::attr("cubic_coeff_a");
+const c10::Symbol kAttrExcludeOutside = c10::Symbol::attr("exclude_outside");
 const c10::Symbol kAttrAlignCorners = c10::Symbol::attr("align_corners");
 const c10::Symbol kAttrEpsilon = c10::Symbol::attr("epsilon");
 // NOLINTEND(bugprone-throwing-static-initialization)
@@ -1479,7 +1483,15 @@ auto extract_ranked_axis_args(torch::jit::Node* node, const char* error_context,
     const auto dim = constant_int_value(node->input(1));
     const auto second = read_second(node->input(2));
     if (!input_rank.has_value() || !dim.has_value() || !second.has_value()) {
-        throw_lowering_error(node, std::format("{} parameters must be compile-time constants", error_context));
+        std::vector<std::string> missing;
+        if (!input_rank) missing.emplace_back("input rank");
+        if (!dim) missing.emplace_back("axis");
+        if (!second) missing.emplace_back("operand");
+        const auto* input = node->input(0);
+        throw_lowering_error(node,
+                             std::format("{}; input={}, producer={}, type={}",
+                                         format_missing_parameters(std::format("{} parameters must be compile-time constants", error_context), missing),
+                                         input->debugName(), input->node()->kind().toQualString(), input->type()->str()));
     }
     return RankedAxisArgs<std::remove_cvref_t<decltype(*second)>>{*input_rank, *dim, *second};
 }
@@ -1709,6 +1721,14 @@ void lower_full_node(torch::jit::Node* node) { lower_parameterized_full_node(nod
 void lower_resize_node(torch::jit::Node* node, std::string_view mode) {
     const auto output_sizes = value_tensor_sizes(node->output());
     if (!output_sizes.has_value()) { throw_lowering_error(node, "resize output tensor shape must be statically known"); }
+    bool align_corners = false;
+    if (mode != "nearest" && node->inputs().size() >= 3 && !is_none_value(node->input(2))) {
+        const auto value = constant_bool_value(node->input(2));
+        if (!value.has_value()) { throw_lowering_error(node, "align_corners must be a compile-time constant"); }
+        align_corners = *value;
+    }
+    const bool antialias = node->kind() == kAtenUpsampleBicubic2dAa;
+    if (antialias && align_corners) { throw_lowering_error(node, "antialiased bicubic resize requires align_corners=false"); }
     std::array<torch::jit::Value*, 4> resize_inputs{
         node->input(0),
         create_constant_value(node, make_float_tensor({})),
@@ -1722,13 +1742,14 @@ void lower_resize_node(torch::jit::Node* node, std::string_view mode) {
     if (mode == "nearest") {
         resize->s_(kAttrCoordinateTransformationMode, "asymmetric");
     } else {
-        bool align_corners = false;
-        if (node->kind() == kAtenUpsampleBilinear2d && node->inputs().size() >= 3 && !is_none_value(node->input(2))) {
-            const auto align_corners_value = constant_bool_value(node->input(2));
-            if (!align_corners_value.has_value()) { throw_lowering_error(node, "align_corners must be a compile-time constant"); }
-            align_corners = *align_corners_value;
-        }
         resize->s_(kAttrCoordinateTransformationMode, align_corners ? "align_corners" : "half_pixel");
+        if (antialias) {
+            // PyTorch's antialiased cubic kernel renormalizes its in-bounds
+            // samples and uses the PIL-compatible coefficient.
+            resize->i_(kAttrAntialias, 1);
+            resize->f_(kAttrCubicCoeffA, -0.5);
+            resize->i_(kAttrExcludeOutside, 1);
+        }
     }
     resize->insertBefore(node);
     replace_node_with(node, resize->output());
@@ -1967,6 +1988,7 @@ using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
     NODE(kAtenFull, lower_full_node)                                   \
     RESIZE(kAtenUpsampleNearest2d, "nearest")                          \
     RESIZE(kAtenUpsampleBilinear2d, "linear")                          \
+    RESIZE(kAtenUpsampleBicubic2dAa, "cubic")                          \
     NODE(kAtenGridSampler, lower_grid_sampler_node)                    \
     NODE(kAtenScaledDotProductAttention, lower_scaled_dot_product_attention_node)
 #define MMLTK_LOWER_NODE(key, fn) {key, [](torch::jit::Node* node, const LoweringContext&) { fn(node); }},
@@ -2120,7 +2142,12 @@ class ExportTensorStaging final {
             if (node->kind() == c10::prim::GetAttr && node->outputs().size() == 1 && !node->output()->uses().empty()) {
                 auto local = source;
                 local.graph = node->owningGraph();
-                if (auto tensor = lookup_initializer_tensor(node->output(), local)) initializers.emplace_back(node->output(), Admit(*tensor));
+                if (auto tensor = lookup_initializer_tensor(node->output(), local)) {
+                    // Traced module attributes can retain only generic Tensor
+                    // types. Their admitted tensor already owns exact metadata.
+                    node->output()->inferTypeFrom(*tensor);
+                    initializers.emplace_back(node->output(), Admit(*tensor));
+                }
             }
             auto admit = [&](const at::Tensor& tensor) {
                 Admit(tensor);

@@ -278,6 +278,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
     struct PreparedArtifact final {
         ResolvedInferenceArtifact artifact;
         std::shared_ptr<const mmltk::common::io::FileDigests> file{};
+        std::string preset_name{};
     };
     std::vector<PreparedArtifact> artifacts;
     for (const auto& requested : evaluation_order(options.eval_order)) artifacts.push_back({resolve_inference_artifact(options, requested)});
@@ -354,12 +355,16 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
         build.allow_fp16 = options.allow_fp16;
         if (selected_descriptor && !source_descriptor_matches) build.class_layout_path.clear();
         admit(*consumed_source);
+        if (build.preset_name.empty()) {
+            if (const auto* preset = infer_model_preset_from_path(consumed_source->artifact.path)) build.preset_name = preset->preset_name;
+        }
         build_tensorrt_engine(build, command_stream, consumed_source->artifact.admission, delivery.stop);
         if (delivery.stop.stop_requested()) return {.cancelled = true};
         options.tensorrt_path = std::filesystem::absolute(options.save_engine_path);
         for (auto& prepared : artifacts)
             if (prepared.artifact.compile_onnx_to_tensorrt) {
                 prepared = PreparedArtifact{resolve_inference_artifact(options, "tensorrt")};
+                prepared.preset_name = build.preset_name;
                 if (selected_descriptor) static_cast<void>(file_for(prepared));
             }
     }
@@ -396,6 +401,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
         admit(prepared);
         const auto& artifact = prepared.artifact;
         auto backend_request = options;
+        if (!prepared.preset_name.empty()) backend_request.preset_name = prepared.preset_name;
         if (artifact.admission->descriptor_path().empty()) backend_request.class_layout_path.clear();
         result.eval_order.push_back(artifact.backend_name);
         std::vector<std::optional<AlignmentSample>>* captured_result = nullptr;

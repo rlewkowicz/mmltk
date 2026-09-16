@@ -1580,7 +1580,12 @@ fn update_plot_program<const IS_CANVAS: bool>(
         }
 
         // Refresh hover after data updates when appropriate.
-        maybe_submit_hover_request(widget, state, &mut effects);
+        if let Some(position) = state.available_cursor_local_position_inside(cursor) {
+            state.cursor_position = position;
+            maybe_submit_hover_request(widget, state, &mut effects);
+        } else {
+            clear_hover_effect(widget, state, &mut effects);
+        }
 
         // Data has changed, so we may need to autoscale.
         //

@@ -117,7 +117,8 @@ class OnnxRuntimeBackend final : public RuntimeBackend {
         Ort::AllocatorWithDefaultOptions allocator;
         if (session_->GetInputCount() != 1U) { throw std::runtime_error("runtime backend requires exactly one model input"); }
         const auto input_name = session_->GetInputNameAllocated(0U, allocator);
-        const auto input_type = session_->GetInputTypeInfo(0U).GetTensorTypeAndShapeInfo();
+        const auto input_info = session_->GetInputTypeInfo(0U);
+        const auto input_type = input_info.GetTensorTypeAndShapeInfo();
         info_.model_path = options_.model_path;
         info_.input = RuntimeTensorDescriptor{
             .name = input_name.get(),
@@ -128,7 +129,8 @@ class OnnxRuntimeBackend final : public RuntimeBackend {
         if (info_.output_count > kMaximumRuntimeOutputs) { throw std::runtime_error("model output count exceeds the public runtime bound"); }
         for (std::size_t index = 0U; index < info_.output_count; ++index) {
             const auto name = session_->GetOutputNameAllocated(index, allocator);
-            const auto type = session_->GetOutputTypeInfo(index).GetTensorTypeAndShapeInfo();
+            const auto output_info = session_->GetOutputTypeInfo(index);
+            const auto type = output_info.GetTensorTypeAndShapeInfo();
             info_.outputs[index] = RuntimeTensorDescriptor{
                 .name = name.get(),
                 .shape = runtime_shape(type.GetShape()),

@@ -207,8 +207,9 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
             retained = pixels.rgb8;
         }
     };
-    CHECK(session.RunAndWrite(request, command, {.source_pixels = true, .completed = observe}).processed_images == 2U);
-    CHECK(identities == std::vector<std::int64_t>{21, 22});
+    REQUIRE(session.RunAndWrite(request, command, {.source_pixels = true, .completed = observe}).processed_images == 2U);
+    REQUIRE(identities == std::vector<std::int64_t>{21, 22});
+    REQUIRE(retained != nullptr);
     CHECK(retained[0] == 255U);
     CHECK(retained[1] == 0U);
     std::ifstream completed(request.output_path);
@@ -781,6 +782,7 @@ TEST_CASE("ONNX metadata survives simplification and same-path prediction rebind
     rfdetr::PredictRequest request;
     request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
     request.onnx_path = model;
+    request.output_path = root / "predictions.json";
     request.resolution = 8;
     request.allow_fp16 = false;
     request.include_masks = true;
@@ -975,6 +977,7 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     const auto only = session.Run(request, command);
     CHECK(only.eval_order == std::vector<std::string>{"tensorrt"});
     CHECK(only.processed_images == 1U);
+    CHECK(only.backends.at("tensorrt").artifacts.preset_name == "rf-detr-nano");
     CHECK(only.backends.at("tensorrt").artifacts.class_layout == layout);
     const auto engine_descriptor = rfdetr::detail::read_class_descriptor(request.save_engine_path.string() + ".classes.json");
     CHECK(engine_descriptor.layout == layout);

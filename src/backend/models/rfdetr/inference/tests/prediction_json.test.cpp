@@ -88,7 +88,9 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
     PredictRequest request;
     request.output_path = path;
     PredictionJsonWriter writer(request);
-    writer.Begin({});
+    PredictionRunResult result;
+    result.artifacts.class_layout = unresolved_class_layout(1U);
+    writer.Begin(result);
     PredictionRecord record{.image_id = 9};
     record.detections.push_back({.class_reference = 0, .score = .9F, .has_mask = true});
     encode_mask_values_into(2U, 2U, record.detections.front().mask, [](auto) { return true; });

@@ -2,6 +2,23 @@
 use super::*;
 use std::cell::RefCell;
 
+pub(crate) fn metric_projection(label: &str, positions: &[[f64; 2]]) {
+    emit(|sink| {
+        let finite = |point: &[f64; 2]| point.iter().all(|value| value.is_finite());
+        let points = positions.iter().filter(|point| finite(point)).count();
+        let segments = positions
+            .windows(2)
+            .filter(|pair| finite(&pair[0]) && finite(&pair[1]) && pair[0] != pair[1])
+            .count();
+        sink.record(
+            "integration.metric_projection",
+            "train.metrics.plot",
+            label,
+            [points as f64, segments as f64, positions.len() as f64, 0.0],
+        );
+    });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FpsEvidence {
     pub bounds: Rectangle,
@@ -687,6 +704,9 @@ impl State {
             Phase::AdvancedDenoisingToggle => report_advanced_field(control, "dn-toggle", bounds),
             Phase::AdvancedDenoising(index) => {
                 report_advanced_field(control, &format!("dn-{index}"), bounds)
+            }
+            Phase::AdvancedLayout(index) => {
+                report_advanced_field(control, &advanced_layout_field(index).1, bounds)
             }
             _ => {}
         }

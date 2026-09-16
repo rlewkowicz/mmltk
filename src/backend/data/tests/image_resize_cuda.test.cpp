@@ -183,7 +183,8 @@ TEST_CASE("CUDA perceptual resampling agrees with independent CPU geometry and c
     for (auto format : formats)
         for (const auto& dims : geometries)
             for (unsigned pattern : {0U, 3U, 5U, 6U, 7U}) {
-                INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3]);
+                INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1] << " destination " << dims[2] << "x" << dims[3]
+                               << " pattern " << pattern);
                 Image source(dims[0], dims[1], format, 3), expected(dims[2], dims[3], format, 5);
                 source.fill(pattern);
                 auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(expected.layout);
@@ -191,7 +192,7 @@ TEST_CASE("CUDA perceptual resampling agrees with independent CPU geometry and c
                 resizer.downscale(input->read(), output->write(), fixture.stream, input, output);
                 auto actual = fixture.download(output, fixture.stream);
                 cpu.downscale(source.read(), expected.write());
-                const double tolerance = format == RgbPixelFormat::PlanarUnitSrgbF32 ? 2e-6 : 1.0 / 255 + 1e-12;
+                const double tolerance = reference_tolerance(format);
                 REQUIRE(maximum_error(actual, expected) <= tolerance);
                 REQUIRE(maximum_error(actual, reference(source, dims[2], dims[3])) <= tolerance);
                 REQUIRE(padding_intact(actual));
@@ -369,6 +370,13 @@ TEST_CASE("CUDA perceptual admission proves device intervals and stream identity
     resizer.downscale({pool_pointer, source.layout}, output->write(), fixture.stream, pooled, output);
     resizer.finish();
     REQUIRE(maximum_error(fixture.download(output, fixture.stream), reference(source, 9, 7)) <= 1.0 / 255 + 1e-12);
+    REQUIRE(cuMemGetAddressRange(&allocation_base, &allocation_bytes, reinterpret_cast<CUdeviceptr>(pool_pointer)) == CUDA_SUCCESS);
+    crossing.data = reinterpret_cast<const void*>(allocation_base + allocation_bytes - 1);
+    // Pool ownership admits the real allocation, never its adjacent virtual span.
+    REQUIRE_THROWS_AS(resizer.downscale(crossing, output->write(), fixture.stream, pooled, output), std::invalid_argument);
+    source_subview.data = static_cast<const std::uint8_t*>(pool_pointer) + source_offset;
+    resizer.downscale(source_subview, destination_subview, fixture.stream, pooled, output);
+    resizer.finish();
 }
 TEST_CASE("perceptual completion retains exact custody after failed recording and settlement", "[backend][data][image_resize][perceptual]") {
     FakeCompletion fake;

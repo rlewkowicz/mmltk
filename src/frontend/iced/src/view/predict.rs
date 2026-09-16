@@ -1,7 +1,7 @@
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, column, text};
+use iced::widget::{button, column, container, text};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -92,17 +92,24 @@ impl Component {
                     "Prediction",
                     "Select a compiled dataset, image, or local video file.",
                     column![
-                        button("Compiled dataset").on_press_maybe(
+                        container(button("Compiled dataset").on_press_maybe(
                             settings_edit_available.then_some(Message::SourceChanged(
                                 crate::generated::SourceKind::CompiledDataset
                             ))
-                        ),
-                        button("Single image").on_press_maybe(settings_edit_available.then_some(
-                            Message::SourceChanged(crate::generated::SourceKind::SingleImage)
-                        )),
-                        button("Video file").on_press_maybe(settings_edit_available.then_some(
-                            Message::SourceChanged(crate::generated::SourceKind::VideoFile)
-                        )),
+                        ))
+                        .id("predict.source.compiled"),
+                        container(button("Single image").on_press_maybe(
+                            settings_edit_available.then_some(Message::SourceChanged(
+                                crate::generated::SourceKind::SingleImage
+                            ))
+                        ))
+                        .id("predict.source.image"),
+                        container(button("Video file").on_press_maybe(
+                            settings_edit_available.then_some(Message::SourceChanged(
+                                crate::generated::SourceKind::VideoFile
+                            ))
+                        ))
+                        .id("predict.source.video"),
                         text(draft.map_or("", |value| match value.source.kind {
                             crate::generated::SourceKind::CompiledDataset =>
                                 "Source: compiled dataset",
@@ -216,34 +223,38 @@ impl Component {
                     settings_edit_available,
                     Message::ThresholdChanged,
                 ),
-                button(
-                    if model
-                        .predict_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.paused)
-                    {
-                        "Resume"
-                    } else {
-                        "Pause"
-                    }
+                container(
+                    button(
+                        if model
+                            .predict_snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| snapshot.paused)
+                        {
+                            "Resume"
+                        } else {
+                            "Pause"
+                        }
+                    )
+                    .on_press_maybe(model.predict_pause_available().then(
+                        || {
+                            Message::PauseRequested(
+                                !model
+                                    .predict_snapshot
+                                    .as_ref()
+                                    .is_some_and(|snapshot| snapshot.paused),
+                            )
+                        }
+                    ))
                 )
-                .on_press_maybe(
-                    model
-                        .predict_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.operation.active && snapshot.video)
-                        .then(|| Message::PauseRequested(
-                            !model
-                                .predict_snapshot
-                                .as_ref()
-                                .is_some_and(|snapshot| snapshot.paused)
-                        ))
-                ),
-                button("Stop").on_press_maybe(
-                    model
-                        .compute_stop_available(crate::generated::FeatureId::Predict)
-                        .then_some(Message::StopRequested),
-                ),
+                .id("predict.pause"),
+                container(
+                    button("Stop").on_press_maybe(
+                        model
+                            .compute_stop_available(crate::generated::FeatureId::Predict)
+                            .then_some(Message::StopRequested),
+                    )
+                )
+                .id("predict.stop"),
             ]
             .spacing(crate::view::workflow::FIELD_SPACING),
         );

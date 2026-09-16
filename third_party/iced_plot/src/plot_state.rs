@@ -526,7 +526,7 @@ impl PlotState {
         ))
     }
 
-    fn available_cursor_local_position_inside(&self, cursor: mouse::Cursor) -> Option<Vec2> {
+    pub(crate) fn available_cursor_local_position_inside(&self, cursor: mouse::Cursor) -> Option<Vec2> {
         let position = self.cursor_local_position(cursor, false)?;
         self.point_inside(position.x, position.y)
             .then_some(position)

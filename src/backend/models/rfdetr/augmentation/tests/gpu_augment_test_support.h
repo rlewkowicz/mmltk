@@ -14,7 +14,9 @@ struct GpuAugmentationTestAccess final {
 };
 struct AugmentationExecution final {
     explicit AugmentationExecution(int device = 0)
-        : context(device, mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop) {}
+        : context(device, mmltk::frameworks::gpu::cuda_image_copy_backend(), mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop) {
+        context.Bind();
+    }
     mmltk::frameworks::gpu::DeviceContext context;
     mmltk::frameworks::gpu::TerminalCudaRetirementOwner retirement{8U};
 };

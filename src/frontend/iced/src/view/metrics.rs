@@ -2,7 +2,9 @@
 use crate::fluent_theme::Element;
 use crate::generated::{TrainingRecord, TrainingRecordRole, TrainingScalars, TrainingScalarsField};
 use iced::widget::{button, checkbox, column, container, row, text};
-use iced_plot::{AxisScale, LineStyle, PlotWidget, PlotWidgetBuilder, Series, ShapeId};
+use iced_plot::{
+    AxisScale, LineStyle, MarkerStyle, PlotWidget, PlotWidgetBuilder, Series, ShapeId,
+};
 use std::collections::VecDeque;
 
 const BUCKETS: usize = 128;
@@ -446,6 +448,7 @@ impl Component {
                     previous = Some(point.order);
                 }
             }
+            crate::integration_control::report_metric_projection(&curve.name, positions);
             if let Some(id) = self.shapes[index] {
                 self.plot.set_series_positions(&id, positions);
                 continue;
@@ -461,10 +464,15 @@ impl Component {
                     value: 0.8,
                 },
             );
-            let series =
-                Series::line_only(positions.clone(), LineStyle::solid().with_pixel_width(1.5))
-                    .with_label(curve.name.clone())
-                    .with_color(color);
+            // Coalescing and unavailable intervals can leave isolated samples.
+            // Retained markers keep those observations visible without joining gaps.
+            let series = Series::new(
+                positions.clone(),
+                MarkerStyle::circle(3.0),
+                LineStyle::solid().with_pixel_width(1.5),
+            )
+            .with_label(curve.name.clone())
+            .with_color(color);
             self.shapes[index] = Some(series.id);
             let _ = self.plot.add_series(series);
         }

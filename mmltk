@@ -2636,6 +2636,70 @@ run_gpu_environment_diagnostic() {
     run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}"
 }
 
+run_native_symbols_diagnostic() {
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        printf '%s\n' \
+            'Usage: ./mmltk --diagnose-native-symbols [--match REGEX] [--limit N] ARTIFACT...' \
+            'Inspect repository-relative .a/.o files with the existing development image GCC nm.' \
+            'Read-only JSONL, no builds, pulls, network, or GPU execution; 120-second deadline.'
+        return 0
+    fi
+    (( $# >= 1 )) || die "--diagnose-native-symbols requires repository-relative artifacts"
+    [[ "${repo_root}" != *:* ]] || die "diagnostic repository path cannot contain ':'"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; symbol diagnostic did not start"
+    local diagnostic_image_id diagnostic_container="${container_name}-native-symbols"
+    diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${build_image_name}'"
+    local -a diagnostic_args=(
+        run --rm --init --pull never --name "${diagnostic_container}"
+        --read-only --cap-drop ALL --security-opt no-new-privileges --network none
+        --user "${uid}:${gid}" --workdir /workspace
+        --tmpfs /tmp:rw,nosuid,nodev,size=64m
+        --volume "${repo_root}:/workspace:ro"
+        --entrypoint /usr/bin/timeout
+    )
+    append_wrapper_labels diagnostic_args "diagnose-native-symbols"
+    run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}" \
+        "${diagnostic_image_id}" --signal=KILL 120s /usr/bin/python3 -I -B \
+        /workspace/tools/diagnose_native_symbols.py "$@"
+}
+
+run_native_link_diagnostic() {
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        printf '%s\n' \
+            'Usage: ./mmltk --diagnose-native-link [--linker-directory DIR] [--trace-symbol SYMBOL] TARGET' \
+            'Repeat one cached Release link with saved LTO intermediates and a linker map.' \
+            'Uses the existing development image; repository remains read-only.' \
+            'Artifacts go under build/diagnostics; no image builds, pulls, or network; 120-second deadline.'
+        return 0
+    fi
+    (( $# >= 1 )) || die "--diagnose-native-link requires one native target"
+    [[ "${repo_root}" != *:* ]] || die "diagnostic repository path cannot contain ':'"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker_server_ready || die "docker daemon is unavailable; link diagnostic did not start"
+    local diagnostic_image_id diagnostic_container="${container_name}-native-link" artifact_directory
+    diagnostic_image_id="$(docker image inspect "${build_image_name}" --format '{{.Id}}' 2>/dev/null)" ||
+        die "diagnostic requires existing image '${build_image_name}'"
+    prepare_owned_dirs "${repo_root}/build/diagnostics"
+    artifact_directory="$(mktemp -d "${repo_root}/build/diagnostics/native-link.XXXXXX")"
+    chown "${uid}:${gid}" "${artifact_directory}"
+    local -a diagnostic_args=(
+        run --rm --init --pull never --name "${diagnostic_container}"
+        --read-only --cap-drop ALL --security-opt no-new-privileges --network none
+        --user "${uid}:${gid}" --workdir /workspace
+        --tmpfs /tmp:rw,nosuid,nodev,size=1g
+        --volume "${repo_root}:/workspace:ro"
+        --volume "${artifact_directory}:/diagnostic/output:rw"
+        --entrypoint /usr/bin/timeout
+    )
+    append_wrapper_labels diagnostic_args "diagnose-native-link"
+    log "native link diagnostic artifacts: ${artifact_directory}"
+    run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}" \
+        "${diagnostic_image_id}" --signal=KILL 120s /usr/bin/python3 -I -B \
+        /workspace/tools/diagnose_native_link.py "$@"
+}
+
 run_gpu_program_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
@@ -3400,6 +3464,7 @@ run_tests() {
         local workspace_wayland_inventory=""
         local -a workspace_wayland_expected_cases=(
             workspace_wayland_retained
+            workspace_wayland_workflows
             workspace_wayland_dpi
             workspace_wayland_terminal
             workspace_wayland_probe_recovery
@@ -3575,6 +3640,18 @@ if [[ "${1:-}" == "--diagnose-gpu-program" ]]; then
     exit $?
 fi
 
+if [[ "${1:-}" == "--diagnose-native-symbols" ]]; then
+    invocation_mode="diagnose-native-symbols"
+    run_native_symbols_diagnostic "${@:2}"
+    exit $?
+fi
+
+if [[ "${1:-}" == "--diagnose-native-link" ]]; then
+    invocation_mode="diagnose-native-link"
+    run_native_link_diagnostic "${@:2}"
+    exit $?
+fi
+
 gui_mode=0
 build_mode=0
 build_gui_mode=0
@@ -3735,6 +3812,10 @@ for arg in "${passthrough_args[@]}"; do
         die "--diagnose-gpu-environment must be the standalone operation; use './mmltk --diagnose-gpu-environment --help'"
     [[ "${arg}" != "--diagnose-gpu-program" ]] ||
         die "--diagnose-gpu-program must be the standalone operation; use './mmltk --diagnose-gpu-program --help'"
+    [[ "${arg}" != "--diagnose-native-symbols" ]] ||
+        die "--diagnose-native-symbols must be the standalone operation; use './mmltk --diagnose-native-symbols --help'"
+    [[ "${arg}" != "--diagnose-native-link" ]] ||
+        die "--diagnose-native-link must be the standalone operation; use './mmltk --diagnose-native-link --help'"
 done
 
 parse_test_invocation_args() {

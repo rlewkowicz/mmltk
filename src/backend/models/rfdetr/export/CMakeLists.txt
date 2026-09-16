@@ -158,6 +158,7 @@ function(mmltk_add_backend_models_rfdetr_export_tests)
     target_link_libraries(mmltk_backend_models_rfdetr_export_tests PRIVATE
         mmltk_acceptance_support
         mmltk::backend::models::rfdetr::export
+        mmltk::vendor::onnxruntime
         mmltk::backend::ml::torch_dependencies)
     mmltk_prefer_system_protobuf_headers(
         mmltk_backend_models_rfdetr_export_tests PRIVATE)

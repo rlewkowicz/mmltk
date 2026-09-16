@@ -1254,6 +1254,8 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
     const mmltk::testsupport::ScopedTestCleanup stop{[&] {
         prediction.Shutdown();
         route = nullptr;
+        presentation.BrowserPeerLost();
+        static_cast<void>(presentation.Shutdown());
     }};
     static_cast<void>(presentation.Select(readers[0].source));
     const auto run = [&](bool expect_image) {
@@ -1352,6 +1354,8 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
         after_image->Release();
         prediction.Shutdown();
         route = nullptr;
+        presentation.BrowserPeerLost();
+        static_cast<void>(presentation.Shutdown());
     }};
     static_cast<void>(presentation.Select(readers[0].source));
     static_cast<void>(prediction.Start({}));
@@ -1438,13 +1442,15 @@ TEST_CASE("receiver retirement outlives concurrent preview pool destruction", "[
     decoded.reset();
     pool.reset();  // the receiver transaction, not this replaceable shell, owns the fact
     CHECK(authority->admission_open());
-    CHECK(authority->fact().reservations == 1U);
+    // The source frame and the in-flight composition reserve independent
+    // custody. Terminal composition retains the real frame, including its lease.
+    CHECK(authority->fact().reservations == 2U);
     fault.upload.Release();
     const auto failure = mmltk::testsupport::await_test_future(draw, "receiver completion after pool destruction");
     CHECK(gpu::is_image_execution_failure(failure));
     CHECK_FALSE(authority->admission_open());
     CHECK(authority->fact().occupancy == 1U);
-    CHECK(authority->fact().reservations == 0U);
+    CHECK(authority->fact().reservations == 1U);
     CHECK_FALSE(retained.expired());
     for (unsigned attempt = 0U; attempt < 4U; ++attempt) CHECK_THROWS(detail::PredictionPreviewPool(execution, context, operations, authority));
     CHECK(authority->fact().occupancy == 1U);
@@ -1752,6 +1758,7 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
                                     }
                                     return;
                                 }
+                                if (const auto* changed = std::get_if<TrainingChanged>(&event); changed && changed->snapshot.local.active) return;
                                 terminals.Publish(std::move(event));
                             }};  // CLEANUP-IGNORE: Local training and validation start evidence targets independently typed terminal state.
     static_cast<void>(training.Start({}));
@@ -1912,7 +1919,8 @@ TEST_CASE("training completion releases admission before observer publication re
     const auto release_local = release_local_publication.get_future().share();
     TrainingSystem local{settings, dataset, model, [local_gate] { return std::make_unique<FakeTrainingRuntime>(local_gate, false); },
                          [&](TrainingSystem::event_type event) {
-                             if (!std::holds_alternative<TrainingChanged>(event)) return;
+                             const auto* changed = std::get_if<TrainingChanged>(&event);
+                             if (!changed || changed->snapshot.local.active) return;
                              local_publishing.set_value();
                              release_local.wait();
                          }};
