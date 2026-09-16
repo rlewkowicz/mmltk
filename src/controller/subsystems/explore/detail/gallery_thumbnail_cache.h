@@ -91,6 +91,7 @@ class GalleryThumbnailCache final {
     void CommitUpdate() noexcept;
     void RollbackUpdate() noexcept;
     [[nodiscard]] const Entry& Protected(std::size_t slot) const noexcept;
+    [[nodiscard]] std::uint8_t WritableBank(std::size_t position, const GalleryThumbnailCache* incumbent = nullptr, bool semantic = false) const;
     void Admit(std::span<const std::uint32_t>, std::size_t first);
     [[nodiscard]] std::size_t Position(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] std::size_t MetadataBytes() const noexcept;

@@ -219,4 +219,13 @@ std::size_t GalleryThumbnailCache::MeaningBytes(const GalleryThumbnailCache* oth
     }
     return bytes;
 }
+std::uint8_t GalleryThumbnailCache::WritableBank(std::size_t position, const GalleryThumbnailCache* incumbent, bool semantic) const {
+    const auto slot = Slot(position);
+    if (incumbent && slot < incumbent->size()) {
+        const auto& entry = incumbent->Physical(slot);
+        if (entry.meaning) return 1U - (semantic ? entry.semantic_bank : entry.bank);
+    }
+    const auto& entry = Protected(slot);
+    return entry.meaning ? 1U - (semantic ? entry.semantic_bank : entry.bank) : 0U;
+}
 }  // namespace mmltk::controller::explore_detail

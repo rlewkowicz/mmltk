@@ -18,6 +18,8 @@
 #include "src/backend/imaging/explore/explore_render_storage.h"
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/controller/subsystems/explore/native_explore_storage.h"
+#include "src/controller/subsystems/explore/detail/gallery_descriptor_storage.h"
+#include "src/controller/subsystems/explore/detail/gallery_stream_probe.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 #include "src/backend/imaging/raster/class_palette.h"
 import mmltk.backend.imaging.explore.explore_render_core;
@@ -25,9 +27,38 @@ import mmltk.backend.imaging.explore.compiled_explore_store;
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller::explore_detail {
 struct NativeExploreStorageTestAccess final {
-    [[nodiscard]] static auto Leaves(NativeExploreStorage& storage) {
+    struct Storage final {
+        NativeExploreStorage cache;
+        GalleryDescriptorStorage descriptors;
+        GalleryStreamProbe probes{0, {}, {}};
+        void Bind(mmltk::backend::imaging::explore::ExploreCudaAllocationApi api) noexcept { NativeExploreStorageTestAccess::Bind(*this, api); }
+        [[nodiscard]] NativeExploreStorage::Release ResetChecked() noexcept { return NativeExploreStorageTestAccess::ResetChecked(*this); }
+        [[nodiscard]] bool OwnsAllocation() const noexcept { return NativeExploreStorageTestAccess::OwnsAllocation(*this); }
+    };
+    static void Bind(Storage& storage, mmltk::backend::imaging::explore::ExploreCudaAllocationApi api) noexcept {
+        storage.cache.Bind(api);
+        storage.descriptors.storage_.Bind(api);
+        storage.probes.storage_.Bind(api);
+    }
+    [[nodiscard]] static NativeExploreStorage::Release ResetChecked(Storage& storage) noexcept {
+        auto result = storage.cache.ResetChecked();
+        const auto merge = [&](const auto released) {
+            result.all_released &= released.all_released;
+            if (result.failure == 0) result.failure = released.failure;
+        };
+        merge(storage.descriptors.storage_.ResetChecked());
+        merge(storage.probes.storage_.ResetChecked());
+        return result;
+    }
+    [[nodiscard]] static bool OwnsAllocation(const Storage& storage) noexcept {
+        return storage.cache.OwnsAllocation() || storage.descriptors.storage_.OwnsAllocation() || storage.probes.storage_.OwnsAllocation();
+    }
+    [[nodiscard]] static std::vector<mmltk::backend::imaging::explore::ExploreHighWaterBuffer*> Leaves(Storage& storage) {
         std::vector<mmltk::backend::imaging::explore::ExploreHighWaterBuffer*> leaves;
-        storage.traversal().Visit(storage.buffers_, [&](auto& buffer) { leaves.push_back(&buffer); });
+        const auto append = [&](auto& buffer) { leaves.push_back(&buffer); };
+        storage.cache.storage_.Visit(append);
+        storage.descriptors.storage_.Visit(append);
+        storage.probes.storage_.Visit(append);
         return leaves;
     }
 };
@@ -655,16 +686,15 @@ TEST_CASE("Explore high-water storage preserves every identity after failed rele
     CHECK(probe.live_count == 0U);
 }
 TEST_CASE("Explore fixed storage retries every retained leaf and preserves the first release failure", "[backend][imaging][explore]") {
-    using mmltk::controller::explore_detail::NativeExploreStorage;
     using mmltk::controller::explore_detail::NativeExploreStorageTestAccess;
-    NativeExploreStorage inventory;
+    NativeExploreStorageTestAccess::Storage inventory;
     const auto leaf_count = NativeExploreStorageTestAccess::Leaves(inventory).size();
     REQUIRE(leaf_count == 15U);  // eleven buffers and both two-element caches
     for (std::size_t selected = 0U; selected != leaf_count; ++selected) {
         for (const auto status : {cudaErrorUnknown, cudaErrorContextIsDestroyed}) {
             INFO("leaf=" << selected << " failure=" << static_cast<int>(status));
             HighWaterReleaseProbe probe;
-            NativeExploreStorage storage;
+            NativeExploreStorageTestAccess::Storage storage;
             storage.Bind(probe.api());
             const auto leaves = NativeExploreStorageTestAccess::Leaves(storage);
             for (auto* leaf : leaves) REQUIRE(leaf->ensure_bytes(16U));
