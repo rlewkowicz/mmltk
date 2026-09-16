@@ -3,12 +3,12 @@
 #pragma once
 #include <cuda_runtime_api.h>
 #include <memory>
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::frameworks::gpu {
 class DeviceContext;
 class TerminalCudaRetirementAuthority;
 }  // namespace mmltk::frameworks::gpu
-namespace mmltk::backend::data {
+namespace mmltk::backend::imaging::resample {
 // Single issuing thread, with the supplied DeviceContext bound. Pixels and
 // producer dependencies are supplied by the caller. Both custody arguments
 // retain the exact storage AND its context through completion, including
@@ -38,4 +38,4 @@ class GpuPerceptualDownscaler final {
     std::shared_ptr<Impl> impl_;
     void retire(cudaError_t failure) noexcept;
 };
-}  // namespace mmltk::backend::data
+}  // namespace mmltk::backend::imaging::resample

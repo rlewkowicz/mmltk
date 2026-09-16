@@ -661,7 +661,7 @@ void run_compile(const CompileCliRequest& request) {
                                         [&](auto& current) { current.trace("{{\"event\":\"{}\",\"fields\":{}}}", event, fields); });
             };
         }
-        data::BenchmarkDatasetCompiler::compile(std::move(config));
+        data::compile_benchmark_dataset(std::move(config));
         return;
     }
     data::CompilerConfig config;

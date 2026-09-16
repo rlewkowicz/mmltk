@@ -1,8 +1,7 @@
-module;
+#pragma once
 #include <cstddef>
 #include <cstdint>
-export module mmltk.backend.ml.cuda.cuda_utils;
-export namespace mmltk::backend::ml::cuda {
+namespace mmltk::backend::imaging::raster {
 [[nodiscard]] std::int32_t launch_bgr_split_to_planar_float(const std::uint8_t* src, std::size_t src_pitch_bytes, std::uint32_t src_width,
                                                             std::uint32_t src_height, float* dst, std::uint32_t dst_width, std::uint32_t dst_height,
                                                             std::uintptr_t stream);
@@ -10,4 +9,4 @@ export namespace mmltk::backend::ml::cuda {
                                                                      std::uintptr_t stream);
 [[nodiscard]] const char* validate_bgr_split_to_planar_float_args(std::size_t src_pitch_bytes, std::uint32_t src_width, std::uint32_t src_height,
                                                                   std::uint32_t dst_width, std::uint32_t dst_height, std::uintptr_t stream);
-}  // namespace mmltk::backend::ml::cuda
+}  // namespace mmltk::backend::imaging::raster

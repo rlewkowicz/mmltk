@@ -1,9 +1,10 @@
+#include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include <algorithm>
 #include <cuda.h>
 #include <functional>
-#include "src/backend/data/image_resize_cuda.h"
+#include "src/backend/imaging/resample/image_resize_cuda.h"
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -214,7 +215,7 @@ struct GpuAugmentationExecutor::Impl final {
     struct ReductionHash final {
         std::size_t operator()(ReductionKey value) const noexcept {
             return static_cast<std::size_t>(
-                augmentation_mix64(reinterpret_cast<std::uintptr_t>(value.source) ^ (std::uint64_t(value.width) << 32U) ^ std::uint64_t(value.height)));
+                mmltk::common::math::deterministic_mix64(reinterpret_cast<std::uintptr_t>(value.source) ^ (std::uint64_t(value.width) << 32U) ^ std::uint64_t(value.height)));
         }
     };
     Impl(const GpuAugmentationConfig& input_config, const std::size_t input_capacity, const int input_height, const int input_width,
@@ -340,7 +341,7 @@ struct GpuAugmentationExecutor::Impl final {
     mmltk::frameworks::gpu::TerminalCudaRetirementAuthority& retirement;
     CUcontext native_context = nullptr;
     std::shared_ptr<PreparedStorage> prepared;
-    std::unique_ptr<mmltk::backend::data::GpuPerceptualDownscaler> downscaler;
+    std::unique_ptr<mmltk::backend::imaging::resample::GpuPerceptualDownscaler> downscaler;
     std::vector<Reduction> reductions;
     std::vector<ReductionKey> reduction_keys;
     std::vector<std::size_t> reduction_indices;
@@ -349,7 +350,6 @@ struct GpuAugmentationExecutor::Impl final {
     std::array<std::array<std::shared_ptr<const void>, 3>, kStagingSlots> custody;
     bool prepare_reductions(const GpuAugmentationBatchView& batch, const GpuAugmentationDonorBatchView& donors, const float* input,
                             std::shared_ptr<const void> input_owner, cudaStream_t stream, std::size_t slot, GpuAugmentationExecutor& owner) {
-        using namespace mmltk::backend::data;
         if (!config.perceptual_downscale || !remap) return false;
         const auto image_width = static_cast<float>(width);
         const auto image_height = static_cast<float>(height);
@@ -379,7 +379,7 @@ struct GpuAugmentationExecutor::Impl final {
         if (!prepared) {
             require(capacity <= std::numeric_limits<std::size_t>::max() / 4U, "augmentation reduction index overflows");
             auto candidate_storage = std::make_shared<PreparedStorage>(context, capacity);
-            auto candidate_downscaler = std::make_unique<GpuPerceptualDownscaler>(context, retirement);
+            auto candidate_downscaler = std::make_unique<mmltk::backend::imaging::resample::GpuPerceptualDownscaler>(context, retirement);
             reductions.reserve(capacity * 2U);
             reduction_keys.resize(capacity * 4U);
             reduction_indices.resize(capacity * 4U);
@@ -438,17 +438,17 @@ struct GpuAugmentationExecutor::Impl final {
             downscaler->finish();
             prepared->pixels.ensure(total);
         }
-        const RgbImageLayout source_layout{std::uint32_t(width),
+        const mmltk::backend::imaging::resample::RgbImageLayout source_layout{std::uint32_t(width),
                                            std::uint32_t(height),
                                            std::size_t(width) * sizeof(float),
                                            std::size_t(width) * std::size_t(height) * sizeof(float),
                                            image_bytes,
-                                           RgbPixelFormat::PlanarUnitSrgbF32};
+                                           mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
         for (const auto& reduction : reductions) {
             const auto values = std::size_t(reduction.width) * std::size_t(reduction.height);
-            const RgbImageLayout destination_layout{
+            const mmltk::backend::imaging::resample::RgbImageLayout destination_layout{
                 std::uint32_t(reduction.width), std::uint32_t(reduction.height), std::size_t(reduction.width) * sizeof(float),
-                values * sizeof(float),         values * 3U * sizeof(float),     RgbPixelFormat::PlanarUnitSrgbF32};
+                values * sizeof(float),         values * 3U * sizeof(float),     mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
             downscaler->downscale({reduction.source, source_layout}, {prepared->pixels.data() + reduction.offset, destination_layout}, stream,
                                   reduction.custody, prepared);
         }
@@ -799,10 +799,6 @@ std::size_t GpuAugmentationExecutor::pinned_capacity_bytes() const {
     RequireActive();
     return impl_->staged_slots.bytes() + impl_->staged_keys.bytes() + impl_->staged_paste.bytes() + impl_->staged_parameters.bytes() +
            (impl_->prepared ? impl_->prepared->staged.bytes() : 0U);
-}
-std::uint64_t training_augmentation_image_key(const std::uint64_t seed, const int epoch, const int rank, const std::uint64_t sequence,
-                                              const std::size_t image) noexcept {
-    return augment_math::image_key(seed, epoch, rank, sequence, static_cast<std::int64_t>(image));
 }
 void normalize_gpu_batch(const float* input, void* output, const std::int64_t active_batch_size, const std::int64_t output_batch_size, const int height,
                          const int width, const GpuPreprocessOutputType output_type, cudaStream_t stream) {

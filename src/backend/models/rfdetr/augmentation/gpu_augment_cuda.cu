@@ -1,4 +1,4 @@
-#include "support_sampling.h"
+#include "src/backend/imaging/sampling.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -12,7 +12,6 @@ using mmltk::frameworks::gpu::ensure_cuda_ok;
 namespace {
 constexpr int kThreads = 256;
 using augment_math::clamp01;
-using augment_math::image_key;
 using augment_math::uniform01;
 using enum augment_math::ParameterIndex;
 enum CopyPasteParameterIndex : std::uint8_t {
@@ -195,7 +194,7 @@ __global__ void pointwise_images_kernel(const float* input, float* output, const
     if constexpr (ExplicitKeys) {
         key = image_keys[image];
     } else {
-        key = image_key(seed, epoch, rank, sequence, image);
+        key = training_augmentation_image_key(seed, epoch, rank, sequence, image);
     }
 #pragma unroll
     for (int lane = 0; lane < 4; ++lane) {
@@ -252,8 +251,8 @@ __device__ __forceinline__ float remap_channel(const float* input, const std::in
 __device__ __forceinline__ bool packed_mask_contains(const std::int64_t* packed_masks, const std::int64_t words_per_mask, const int slot, const int height,
                                                      const int width, const float source_x, const float source_y) {
     if (packed_masks == nullptr || source_x < 0.0F || source_x > 1.0F || source_y < 0.0F || source_y > 1.0F) { return false; }
-    const int x = static_cast<int>(augment_math::support_pixel_index(source_x, width));
-    const int y = static_cast<int>(augment_math::support_pixel_index(source_y, height));
+    const int x = static_cast<int>(mmltk::backend::imaging::sampling::support_pixel_index(source_x, width));
+    const int y = static_cast<int>(mmltk::backend::imaging::sampling::support_pixel_index(source_y, height));
     const std::int64_t pixel = static_cast<std::int64_t>(y) * width + x;
     const auto* words = reinterpret_cast<const unsigned long long*>(packed_masks + slot * words_per_mask);
     return ((words[pixel >> 6] >> (pixel & 63)) & 1ULL) != 0ULL;
@@ -319,7 +318,7 @@ __global__ void remap_images_kernel(const float* input, float* output, const flo
     if constexpr (ExplicitKeys) {
         key = image_keys[image];
     } else {
-        key = image_key(seed, epoch, rank, sequence, image);
+        key = training_augmentation_image_key(seed, epoch, rank, sequence, image);
     }
     apply_effects(channels[0], channels[1], channels[2], values, key, pixel_index, output_x, output_y, width, height, output_domain);
 #pragma unroll

@@ -1,3 +1,4 @@
+#include "src/common/math/deterministic_sampling.h"
 #include "detail/benchmark_sampling.h"
 #include <algorithm>
 #include <array>
@@ -52,16 +53,11 @@ struct ShardSummary {
     std::uint64_t images = 0U;
     std::array<std::uint64_t, kClassCount> class_images{};
 };
-[[nodiscard]] std::uint64_t mix64(std::uint64_t value) noexcept {
-    value += 0x9E3779B97F4A7C15ULL;
-    value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
-    value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
-    return value ^ (value >> 31U);
-}
+
 [[nodiscard]] std::uint64_t sampling_hash(const BenchmarkDatasetSource source, const std::uint64_t image_id) noexcept {
     constexpr std::uint64_t kRevisionSeed = 0xC080BA1A6CED0002ULL;
     const std::uint64_t source_seed = static_cast<std::uint64_t>(source) * 0xD6E8FEB86659FD93ULL;
-    return mix64(image_id ^ source_seed ^ kRevisionSeed);
+    return mmltk::common::math::deterministic_mix64(image_id ^ source_seed ^ kRevisionSeed);
 }
 void throw_if_cancelled(mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if (cancel_requested.requested()) { throw std::runtime_error("benchmark dataset compilation cancelled"); }

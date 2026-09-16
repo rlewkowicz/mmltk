@@ -48,7 +48,7 @@
 #include "workflow_wayland_inputs.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/dataset_compiler.h"
-#include "src/backend/imaging/raster/detail/raster_color.h"
+#include "src/backend/imaging/raster/class_palette.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/browser/application_stable_identity.h"
 #include "src/controller/contracts/gui_settings.h"
@@ -4385,7 +4385,7 @@ struct BrowserAudit final {
             const auto found = viewer_label_colors.find(scalar(record, "a"));
             if (found != viewer_label_colors.end() && scalar(record, "b") != 0U) {
                 std::uint8_t red = 0U, green = 0U, blue = 0U;
-                mmltk::backend::imaging::raster::detail::color::class_color(static_cast<int>(scalar(record, "a")), static_cast<int>(scalar(record, "b")), red,
+                mmltk::backend::imaging::raster::color::class_color(static_cast<int>(scalar(record, "a")), static_cast<int>(scalar(record, "b")), red,
                                                                             green, blue);
                 const std::array expected{red, green, blue};
                 for (std::size_t channel = 0U; channel != expected.size(); ++channel)

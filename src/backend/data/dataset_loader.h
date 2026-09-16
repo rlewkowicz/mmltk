@@ -8,6 +8,7 @@
 #include <stop_token>
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/backend/data/compiled_dataset.h"
+#include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::frameworks::gpu {
 class TerminalCudaRetirementOwner;
 }
@@ -77,7 +78,7 @@ class DatasetLoader {
     [[nodiscard]] const PackedInstance* label_data() const;
     [[nodiscard]] const RLEPair* rle_data() const;
     [[nodiscard]] const ImageEntry& image_entry(std::uint32_t index) const;
-    [[nodiscard]] RgbLetterbox letterbox(std::uint32_t index) const;
+    [[nodiscard]] mmltk::backend::imaging::resample::RgbLetterbox letterbox(std::uint32_t index) const;
 
    private:
     struct Impl;

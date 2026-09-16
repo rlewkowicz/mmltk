@@ -1,6 +1,6 @@
 #include "annotation_support.h"
 #include "spatial_erasure.h"
-#include "support_sampling.h"
+#include "src/backend/imaging/sampling.h"
 #include <cmath>
 #include <stdexcept>
 namespace mmltk::backend::models::rfdetr {
@@ -31,8 +31,8 @@ bool contains(const std::array<float, 4>& box, std::span<const mmltk::backend::d
     const float sy = inverse[3] * x + inverse[4] * y + inverse[5];
     if (sx < 0 || sx > 1 || sy < 0 || sy > 1) return false;
     if (runs.empty()) return sx >= box[0] && sx <= box[2] && sy >= box[1] && sy <= box[3];
-    const auto pixel = augment_math::support_pixel_index(sy, height) * width + augment_math::support_pixel_index(sx, width);
-    return augment_math::rle_support_contains(runs.data(), runs.size(), pixel);
+    const auto pixel = mmltk::backend::imaging::sampling::support_pixel_index(sy, height) * width + mmltk::backend::imaging::sampling::support_pixel_index(sx, width);
+    return mmltk::backend::imaging::sampling::rle_support_contains(runs.data(), runs.size(), pixel);
 }
 }  // namespace
 bool augmentation_changes_support(const AugmentationImagePlan* plan) noexcept {

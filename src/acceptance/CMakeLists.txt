@@ -151,6 +151,7 @@ if(BUILD_RFDETR_NATIVE)
     target_compile_definitions(mmltk_workspace_wayland_integration PRIVATE
         MMLTK_TEST_MMLTK_GUI_LAUNCHER="/opt/mmltk/bin/mmltk-browser-host")
     target_link_libraries(mmltk_workspace_wayland_integration PRIVATE
+        mmltk::backend::imaging::primitives
         mmltk_test_support
         mmltk::backend::data
         mmltk::common::io
@@ -175,6 +176,7 @@ mmltk_add_frameworks_gpu_tests()
 mmltk_add_frameworks_process_tests()
 mmltk_add_frameworks_serialization_tests()
 mmltk_add_frameworks_transport_tests()
+mmltk_add_backend_imaging_resample_tests()
 mmltk_add_backend_data_tests()
 mmltk_add_backend_models_rfdetr_contract_tests()
 mmltk_add_backend_models_catalog_tests()
@@ -182,6 +184,7 @@ mmltk_add_entrypoints_cli_tests()
 
 if(BUILD_RFDETR_NATIVE)
     mmltk_add_backend_ml_cuda_tests()
+    mmltk_add_backend_imaging_raster_tests()
     mmltk_add_backend_ml_layers_tests()
     mmltk_add_backend_imaging_annotation_tests()
     mmltk_add_backend_imaging_explore_tests()

@@ -7,6 +7,7 @@ mmltk_configure_component(mmltk_frameworks_gpu PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(mmltk_frameworks_gpu
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        cuda_launch.cuh
         cuda_error.h
         device_execution.h
         pinned_host_buffer.h

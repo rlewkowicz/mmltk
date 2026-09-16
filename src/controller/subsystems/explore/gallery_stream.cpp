@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/controller/subsystems/explore/detail/gallery_atlas.h"
@@ -33,7 +34,7 @@
 #include "src/common/concurrency/worker_pool.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/image_failure.h"
-#include "src/backend/imaging/explore/detail/explore_mask_sample.h"
+#include "src/backend/imaging/explore/mask_sample.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 import mmltk.backend.imaging.explore.compiled_explore_store;
 import mmltk.backend.imaging.explore.explore_render_core;

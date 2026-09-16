@@ -14,7 +14,7 @@
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
-#include "src/backend/imaging/raster/detail/raster_color.h"
+#include "src/backend/imaging/raster/class_palette.h"
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller {
 namespace {
@@ -357,7 +357,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         if (palette_source_ != scene.palette) {
             palette_source_ = scene.palette;
             for (std::size_t index = 0U; index < scene.categories.size(); ++index)
-                raster::detail::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value, palette_[index].r,
+                raster::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value, palette_[index].r,
                                                   palette_[index].g, palette_[index].b);
         }
         for (std::size_t index = 0; index < description.ObjectCount(); ++index) {

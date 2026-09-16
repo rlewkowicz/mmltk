@@ -4,7 +4,7 @@
 #include <span>
 #include <vector>
 #include "src/backend/data/compiled_format.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 namespace mmltk::backend::data::dataset {
 struct MaskDimensions {
     std::uint32_t width = 0U;
@@ -39,5 +39,5 @@ void fill_center_scale_lookup(std::span<std::uint32_t> lookup, std::uint32_t tar
 void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions dimensions, std::vector<std::uint8_t>* dense,
                                 RowMajorMaskBounds* bounds = nullptr);
 [[nodiscard]] EncodedRowMajorMask resize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions source_dimensions, MaskDimensions target_dimensions,
-                                                        const RgbLetterbox& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds = nullptr);
+                                                        const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds = nullptr);
 }  // namespace mmltk::backend::data::dataset

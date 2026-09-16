@@ -34,6 +34,7 @@ target_link_libraries(mmltk_controller_annotation_system
     PRIVATE
         mmltk::controller::visual_runtime
         mmltk::backend::imaging::raster
+        mmltk::backend::imaging::primitives
         stb)
 mmltk_link_declarations(mmltk_controller_annotation_system PUBLIC
     mmltk::controller::visual_runtime)

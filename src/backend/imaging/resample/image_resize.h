@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
-namespace mmltk::backend::data {
+namespace mmltk::backend::imaging::resample {
 enum class RgbPixelFormat : std::uint8_t { RGB8, RGBA8, PlanarUnitSrgbF32 };
 // All strides and capacity are bytes. Float planes are R, G, B, contain unit
 // sRGB (not model-normalized values), and require float alignment. RGBA is
@@ -58,4 +58,4 @@ class RgbImageResizer {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-}  // namespace mmltk::backend::data
+}  // namespace mmltk::backend::imaging::resample

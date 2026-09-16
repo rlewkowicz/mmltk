@@ -71,4 +71,5 @@ struct AnnotationParseOptions {
                                                                                         const BenchmarkTraceSink& trace = {});
 void store_normalized_annotation_index(const std::filesystem::path& path, const NormalizedAnnotationIndex& index,
                                        mmltk::common::concurrency::CancellationObservation cancel_requested, const BenchmarkTraceSink& trace = {});
+[[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationIndex&, std::optional<std::uint16_t> shard = std::nullopt);
 }  // namespace mmltk::backend::data::benchmark_internal

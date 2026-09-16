@@ -1,8 +1,8 @@
 #pragma once
 #include <cuda_runtime.h>
 #include <cmath>
-#include "explore_render_cuda_abi.h"
-#include "src/backend/models/rfdetr/augmentation/support_sampling.h"
+#include "detail/explore_render_cuda_abi.h"
+#include "src/backend/imaging/sampling.h"
 namespace mmltk::backend::imaging::explore::detail {
 [[nodiscard]] __host__ __device__ inline bool sample_annotation_mask(const ExploreRenderRlePairAbi* pairs,
                                                                      const ExploreRenderAnnotationDescriptorAbi& annotation, const std::uint32_t capacity,
@@ -14,7 +14,7 @@ namespace mmltk::backend::imaging::explore::detail {
     const float sx = annotation.inverse[0] * x + annotation.inverse[1] * y + annotation.inverse[2];
     const float sy = annotation.inverse[3] * x + annotation.inverse[4] * y + annotation.inverse[5];
     if (sx < 0.0F || sx > 1.0F || sy < 0.0F || sy > 1.0F) return false;
-    namespace sampling = mmltk::backend::models::rfdetr::augment_math;
+    namespace sampling = mmltk::backend::imaging::sampling;
     const auto pixel = sampling::support_pixel_index(sy, height) * width + sampling::support_pixel_index(sx, width);
     return sampling::rle_support_contains(pairs + annotation.rle_offset, annotation.rle_count, pixel);
 }

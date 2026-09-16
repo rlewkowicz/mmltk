@@ -33,7 +33,7 @@ module;
 #include "postprocess.h"
 #include "scalar_type_utils.h"
 #include "src/backend/data/dataset_loader.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
@@ -656,7 +656,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
     const auto deviation = tensor_api::tensor({0.229F, 0.224F, 0.225F}, device.options()).view({1, 3, 1, 1});
     auto converted =
         backend.input_type() == tensor_api::kFloat ? tensor_api::Tensor{} : tensor_api::empty(host.sizes(), device.options().dtype(backend.input_type()));
-    mmltk::backend::data::RgbImageResizer resizer(1);
+    mmltk::backend::imaging::resample::RgbImageResizer resizer(1);
     std::vector<std::uint8_t> resized(static_cast<std::size_t>(resolution) * resolution * 3U);
     const auto started = std::chrono::steady_clock::now();
     const auto total = options.limit_images == 0U ? options.image_inputs.size() : std::min(options.limit_images, options.image_inputs.size());
@@ -676,7 +676,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
             resizer.resize(pixels, width, height, resized.data(), resolution, resolution);
             input_pixels = resized.data();
         }
-        mmltk::backend::data::rgb_hwc_u8_to_nchw_f32(input_pixels, host.data_ptr<float>(), resolution, resolution);
+        mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(input_pixels, host.data_ptr<float>(), resolution, resolution);
         device.copy_(host, true);
         device.sub_(mean).div_(deviation);
         if (converted.defined()) converted.copy_(device);

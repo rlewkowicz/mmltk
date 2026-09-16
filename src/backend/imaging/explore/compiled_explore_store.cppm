@@ -12,7 +12,7 @@ module;
 #include <system_error>
 #include <vector>
 #include "src/backend/data/compiled_dataset.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/concurrency/worker_pool.h"
 export module mmltk.backend.imaging.explore.compiled_explore_store;

@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include <cuda_runtime.h>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <algorithm>

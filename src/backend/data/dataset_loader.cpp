@@ -363,7 +363,7 @@ const ImageEntry& DatasetLoader::image_entry(std::uint32_t index) const {
     if (index >= num_images()) throw std::out_of_range("dataset image geometry index");
     return impl_->source.image_entry(index);
 }
-RgbLetterbox DatasetLoader::letterbox(std::uint32_t index) const {
+mmltk::backend::imaging::resample::RgbLetterbox DatasetLoader::letterbox(std::uint32_t index) const {
     if (index >= num_images()) throw std::out_of_range("dataset letterbox index");
     return impl_->source.letterbox(index);
 }

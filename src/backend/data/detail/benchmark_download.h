@@ -9,6 +9,7 @@
 #include <vector>
 #include "benchmark_cache.h"
 namespace mmltk::backend::data::benchmark_internal {
+inline constexpr std::uint32_t kMaximumAttempts = 5U;
 enum class DownloadProgressPhase : std::uint8_t {
     kDownloading,
     kVerifyingCachedArtifact,
@@ -21,7 +22,7 @@ struct DownloadRequest {
     std::filesystem::path lock_path;
     std::uint64_t expected_size = 0U;
     std::optional<std::string> expected_sha256;
-    std::uint32_t maximum_attempts = 5U;
+    std::uint32_t maximum_attempts = kMaximumAttempts;
 };
 struct DownloadProgress {
     std::string artifact_id;

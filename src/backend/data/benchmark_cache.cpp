@@ -125,4 +125,9 @@ bool is_safe_cache_component(const std::string_view value) noexcept {
     }
     return true;
 }
+void remove_cache_path(const std::filesystem::path& path) {
+    std::error_code error;
+    (void)std::filesystem::remove(path, error);
+    if (error) { throw std::filesystem::filesystem_error("cannot invalidate cached benchmark image", path, error); }
+}
 }  // namespace mmltk::backend::data::benchmark_internal

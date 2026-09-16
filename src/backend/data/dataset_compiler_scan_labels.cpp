@@ -1,7 +1,7 @@
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 // CLEANUP-IGNORE: This module implementation has an independent global-fragment and import preamble.
 #include <immintrin.h>
 #include <spdlog/spdlog.h>
@@ -345,7 +345,7 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask, uint32_t targ
     if (bounds.has_foreground) { resized.bbox = bounds.bbox(); }
     return resized;
 }
-void clear_mask_letterbox_padding(std::vector<uint8_t>& target_mask, const uint32_t target_width, const uint32_t target_height, const RgbLetterbox& letterbox) {
+void clear_mask_letterbox_padding(std::vector<uint8_t>& target_mask, const uint32_t target_width, const uint32_t target_height, const mmltk::backend::imaging::resample::RgbLetterbox& letterbox) {
     const size_t top_pixels = static_cast<size_t>(letterbox.offset_y) * target_width;
     if (top_pixels != 0U) { std::fill_n(target_mask.data(), top_pixels, uint8_t{0}); }
     const uint32_t right = target_width - letterbox.offset_x - letterbox.resized_width;
@@ -361,7 +361,7 @@ void clear_mask_letterbox_padding(std::vector<uint8_t>& target_mask, const uint3
     if (bottom_pixels != 0U) { std::fill_n(target_mask.data() + static_cast<size_t>(content_end_y) * target_width, bottom_pixels, uint8_t{0}); }
 }
 ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs, const ImageDimensions& source_dims, uint32_t target_width, uint32_t target_height,
-                                  const RgbLetterbox& letterbox, std::vector<uint8_t>& source_mask_scratch, std::vector<uint8_t>& target_mask_scratch,
+                                  const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, std::vector<uint8_t>& source_mask_scratch, std::vector<uint8_t>& target_mask_scratch,
                                   MaskResizeLookup& resize_lookup, MaskBounds* source_bounds) {
     ResizedMask resized;
     if (input_pairs.empty()) { return resized; }
@@ -391,8 +391,8 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
     const uint32_t target_width = config.target_width;
     const uint32_t target_height = config.target_height;
     const bool exact_target = source_dims.width == target_width && source_dims.height == target_height;
-    const RgbLetterbox letterbox = exact_target ? RgbLetterbox{target_width, target_height, 0U, 0U}
-                                                : compute_rgb_letterbox(source_dims.width, source_dims.height, target_width, target_height);
+    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = exact_target ? mmltk::backend::imaging::resample::RgbLetterbox{target_width, target_height, 0U, 0U}
+                                                : mmltk::backend::imaging::resample::compute_rgb_letterbox(source_dims.width, source_dims.height, target_width, target_height);
     const bool needs_resize = !exact_target;
     const bool needs_downscale = source_dims.width > letterbox.resized_width || source_dims.height > letterbox.resized_height;
     if (resize_observation != nullptr) {

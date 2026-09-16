@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Öztireli/Gross (2015) perceptual downscaling; independent oracle provenance in perceptual_downscale_reference.h.
-#include "src/backend/data/image_resize_cuda.h"
-#include "src/backend/data/detail/perceptual_downscale_completion.h"
-#include "src/backend/data/tests/perceptual_downscale_reference.h"
+#include "src/backend/imaging/resample/image_resize_cuda.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_completion.h"
+#include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
@@ -18,7 +18,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
-namespace mmltk::backend::data {
+namespace mmltk::backend::imaging::resample {
 namespace {
 using namespace test_perceptual;
 namespace gpu = frameworks::gpu;
@@ -556,4 +556,4 @@ TEST_CASE("CUDA perceptual resampling retains actual imported Vulkan mapped subv
             for (unsigned channel = 0; channel < 4; ++channel) cropped.set(x, y, channel, source.at(x + 1, y + 1, channel));
     CHECK(maximum_error(fixture.download(destination, fixture.stream), reference(cropped, 9, 7)) <= 1.0 / 255 + 1e-12);
 }
-}  // namespace mmltk::backend::data
+}  // namespace mmltk::backend::imaging::resample

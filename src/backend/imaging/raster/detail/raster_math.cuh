@@ -1,10 +1,8 @@
 #pragma once
 #include <cuda_runtime.h>
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-namespace mmltk::backend::ml::cuda::launch {
-inline constexpr int kDefaultLinearThreads = 256;
+namespace mmltk::backend::imaging::raster::math {
 struct RgbPixelFloat {
     float r = 0.0f;
     float g = 0.0f;
@@ -16,19 +14,6 @@ struct RgbaPixelU8 {
     std::uint8_t b = 0U;
     std::uint8_t a = 0U;
 };
-inline int linear_blocks_for(const int item_count, const int threads = kDefaultLinearThreads) {
-    const int safe_threads = std::max(1, threads);
-    const int safe_items = std::max(0, item_count);
-    return safe_items / safe_threads + static_cast<int>(safe_items % safe_threads != 0);
-}
-inline dim3 make_2d_grid(const int width, const int height, const dim3 block = dim3(16, 16, 1)) {
-    const auto blocks_for = [](const int extent, const unsigned int threads) {
-        const auto safe_extent = static_cast<unsigned int>(std::max(0, extent));
-        const auto safe_threads = std::max(1U, threads);
-        return safe_extent / safe_threads + static_cast<unsigned int>(safe_extent % safe_threads != 0U);
-    };
-    return dim3(blocks_for(width, block.x), blocks_for(height, block.y), 1);
-}
 __device__ __forceinline__ std::uint8_t clamp_to_u8(const float value) { return static_cast<std::uint8_t>(fminf(255.0f, fmaxf(0.0f, value))); }
 __device__ __forceinline__ std::uint8_t* pitched_pixel_ptr(std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y,
                                                            const std::size_t channel_count) {
@@ -132,4 +117,4 @@ __device__ __forceinline__ float point_to_segment_distance_sq(const float px, co
     const float t = fminf(1.0f, fmaxf(0.0f, (apx * abx + apy * aby) / ab_len_sq));
     return point_distance_sq(px, py, ax + abx * t, ay + aby * t);
 }
-}  // namespace mmltk::backend::ml::cuda::launch
+}

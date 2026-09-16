@@ -5,9 +5,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
-#include "src/backend/data/image_resize.h"
-#include "src/backend/data/detail/perceptual_downscale_math.h"
-namespace mmltk::backend::data::perceptual {
+#include "src/backend/imaging/resample/image_resize.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_math.h"
+namespace mmltk::backend::imaging::resample::perceptual {
 void copy_identity(RgbConstImageView source, RgbMutableImageView destination);
 class CpuDownscaler final {
    public:
@@ -42,4 +42,4 @@ class CpuDownscaler final {
     std::array<std::vector<Coefficient>, 2> coefficients_;
     std::array<std::vector<float>, 2> alpha_;
 };
-}  // namespace mmltk::backend::data::perceptual
+}  // namespace mmltk::backend::imaging::resample::perceptual

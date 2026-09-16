@@ -54,8 +54,5 @@ struct BenchmarkCompilerConfig {
     BenchmarkProgressCallback progress;
     BenchmarkTraceCallback trace;
 };
-class BenchmarkDatasetCompiler {
-   public:
-    static void compile(BenchmarkCompilerConfig config);
-};
+void compile_benchmark_dataset(BenchmarkCompilerConfig config);
 }  // namespace mmltk::backend::data

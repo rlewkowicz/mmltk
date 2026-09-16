@@ -119,7 +119,7 @@ class RuntimeArtifactCompilerOperations final : public ArtifactCompilerOperation
         if (trace.report != nullptr) {
             configuration.trace = [trace](const std::string_view event, const std::string_view json_fields) noexcept { trace(event, json_fields); };
         }
-        mmltk::backend::data::BenchmarkDatasetCompiler::compile(std::move(configuration));
+        mmltk::backend::data::compile_benchmark_dataset(std::move(configuration));
     }
     void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, const std::uint32_t resolution,
                            const bool perceptual_downscale, const mmltk::common::concurrency::CancellationObservation cancellation,

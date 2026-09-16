@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <vector>
 #include "src/backend/data/compiled_format.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::dataset {
 using mmltk::common::math::checked_cast;
@@ -64,7 +64,7 @@ void prepare_lookup(const MaskDimensions source, const std::uint32_t width, cons
     fill_center_scale_lookup(scratch->source_x, width, source.width, "scaled mask x overflow");
     fill_center_scale_lookup(scratch->source_y, height, source.height, "scaled mask y overflow");
 }
-void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions, const RgbLetterbox& letterbox) {
+void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions, const mmltk::backend::imaging::resample::RgbLetterbox& letterbox) {
     const std::size_t top = static_cast<std::size_t>(letterbox.offset_y) * dimensions.width;
     std::fill_n(target->data(), top, std::uint8_t{0U});
     const std::uint32_t right = dimensions.width - letterbox.offset_x - letterbox.resized_width;
@@ -152,7 +152,7 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
     }
 }
 EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
-                                          const RgbLetterbox& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds) {
+                                          const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds) {
     if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U ||
         letterbox.offset_x + letterbox.resized_width > target_dimensions.width || letterbox.offset_y + letterbox.resized_height > target_dimensions.height) {
         throw std::invalid_argument("mask resize parameters are invalid");

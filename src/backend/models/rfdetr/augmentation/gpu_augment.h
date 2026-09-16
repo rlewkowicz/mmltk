@@ -62,26 +62,6 @@ struct GpuAugmentationDonorBatchView {
     std::shared_ptr<const void> image_custody;
     std::size_t image_capacity_bytes = 0;
 };
-[[nodiscard]] inline std::uint64_t augmentation_mix64(std::uint64_t value) noexcept {
-    value += 0x9e3779b97f4a7c15ULL;
-    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
-    return value ^ (value >> 31U);
-}
-[[nodiscard]] inline std::uint64_t augmentation_preview_image_key(const std::uint64_t dataset_identity, const std::uint64_t preview_seed,
-                                                                  const std::uint32_t compiled_index) noexcept {
-    return augmentation_mix64(dataset_identity ^ augmentation_mix64(preview_seed) ^ (static_cast<std::uint64_t>(compiled_index) * 0xd2b74407b1ce6e93ULL));
-}
-[[nodiscard]] inline std::uint32_t select_augmentation_preview_donor_image(const std::span<const std::uint32_t> annotated_indices,
-                                                                           const std::uint32_t source_index, const std::uint64_t image_key) noexcept {
-    if (annotated_indices.empty()) { return source_index; }
-    std::size_t position = static_cast<std::size_t>(augmentation_mix64(image_key ^ 0x51ed2705ULL) % annotated_indices.size());
-    if (annotated_indices[position] == source_index && annotated_indices.size() > 1U) { position = (position + 1U) % annotated_indices.size(); }
-    return annotated_indices[position];
-}
-[[nodiscard]] inline std::size_t select_augmentation_preview_donor_instance(const std::size_t instance_count, const std::uint64_t image_key) noexcept {
-    return instance_count == 0U ? 0U : static_cast<std::size_t>(augmentation_mix64(image_key ^ 0xa0761d6478bd642fULL) % instance_count);
-}
 // Owns augmentation planning and the reusable raw-CUDA launch workspace. The
 // caller owns the CUDA context, stream, input, donor, and output storage.
 class GpuAugmentationExecutor final {
@@ -133,5 +113,4 @@ class GpuAugmentationExecutor final {
     std::shared_ptr<Impl> impl_;
     mmltk::frameworks::gpu::TerminalCudaRetirementLease retirement_;
 };
-[[nodiscard]] std::uint64_t training_augmentation_image_key(std::uint64_t seed, int epoch, int rank, std::uint64_t sequence, std::size_t image) noexcept;
 }  // namespace mmltk::backend::models::rfdetr

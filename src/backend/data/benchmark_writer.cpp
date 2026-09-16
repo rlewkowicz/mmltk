@@ -22,7 +22,7 @@
 #include "detail/writable_pixel_range.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
@@ -147,7 +147,7 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
     std::atomic<bool> worker_failed{false};
     const auto decode_worker = [&](int, const int, const int) {
         BenchmarkJpegDecoder jpeg;
-        RgbImageResizer resizer(1, request.perceptual_downscale);
+        mmltk::backend::imaging::resample::RgbImageResizer resizer(1, request.perceptual_downscale);
         std::vector<std::uint8_t> encoded;
         std::vector<std::uint8_t> decoded;
         std::vector<std::uint8_t> cmyk;
@@ -188,7 +188,7 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                     } catch (const std::bad_alloc&) { throw; } catch (const BenchmarkImageReadError&) {
                         throw;
                     } catch (const std::exception& error) { throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what()); }
-                    const RgbLetterbox letterbox = compute_rgb_letterbox(image.source_width, image.source_height, request.resolution, request.resolution);
+                    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(image.source_width, image.source_height, request.resolution, request.resolution);
                     const std::uint8_t* source_pixels = decoded.data();
                     if (image.source_width != letterbox.resized_width || image.source_height != letterbox.resized_height) {
                         resized.resize(checked_rgb_bytes(letterbox.resized_width, letterbox.resized_height));
@@ -200,9 +200,9 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                     float* destination = output_pixels.image(image_index, image_stride);
                     if (letterbox.resized_width == request.resolution && letterbox.resized_height == request.resolution && letterbox.offset_x == 0U &&
                         letterbox.offset_y == 0U) {
-                        rgb_hwc_u8_to_nchw_f32(source_pixels, destination, request.resolution, request.resolution);
+                        mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(source_pixels, destination, request.resolution, request.resolution);
                     } else {
-                        letterboxed_rgb_hwc_u8_to_nchw_f32(source_pixels, destination, letterbox.resized_width, letterbox.resized_height, request.resolution,
+                        mmltk::backend::imaging::resample::letterboxed_rgb_hwc_u8_to_nchw_f32(source_pixels, destination, letterbox.resized_width, letterbox.resized_height, request.resolution,
                                                            request.resolution, letterbox.offset_x, letterbox.offset_y);
                     }
                     if (request.progress) { request.progress(); }
@@ -227,7 +227,7 @@ BenchmarkImageReadError::BenchmarkImageReadError(const std::uint16_t source_inde
 std::uint16_t BenchmarkImageReadError::source_index() const noexcept { return source_index_; }
 std::uint64_t BenchmarkImageReadError::source_image_id() const noexcept { return source_image_id_; }
 PackedInstance benchmark_letterbox_box(const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2,
-                                       const RgbLetterbox& letterbox) {
+                                       const mmltk::backend::imaging::resample::RgbLetterbox& letterbox) {
     if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }
     const auto scaled_coordinate = [](const float value, const std::uint32_t extent, const std::uint32_t offset, const bool round_up,
                                       const char* overflow_message) {

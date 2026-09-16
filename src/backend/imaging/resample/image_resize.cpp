@@ -1,6 +1,6 @@
-#include "src/backend/data/image_resize.h"
-#include "src/backend/data/detail/perceptual_downscale.h"
-#include "src/backend/data/detail/perceptual_downscale_views.h"
+#include "src/backend/imaging/resample/image_resize.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_views.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <immintrin.h>
 #include <algorithm>
@@ -11,7 +11,7 @@
 #include <mutex>
 #include <stdexcept>
 #include "avir.h"
-namespace mmltk::backend::data {  // Canonical backend.data implementation namespace.
+namespace mmltk::backend::imaging::resample {  // Model-independent resampling.
 namespace {
 void warm_up_avir_rgb_resize_path() {
     std::array<std::uint8_t, 12> source{
@@ -211,4 +211,4 @@ void RgbImageResizer::downscale(RgbConstImageView source, RgbMutableImageView de
     if (!impl_->perceptual) impl_->perceptual = std::make_unique<perceptual::CpuDownscaler>();
     impl_->perceptual->run(source, destination);
 }
-}  // namespace mmltk::backend::data
+}  // namespace mmltk::backend::imaging::resample

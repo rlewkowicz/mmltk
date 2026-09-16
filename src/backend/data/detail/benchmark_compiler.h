@@ -9,5 +9,4 @@ namespace mmltk::backend::data::benchmark_internal {
 // and atomically publishes it into the existing staging transaction.
 void publish_benchmark_manifest(const BenchmarkCompilerConfig&, const std::filesystem::path& staging_dir, const std::filesystem::path& cache_root,
                                 nlohmann::json facts, mmltk::common::concurrency::CancellationObservation);
-void compile_benchmark_dataset(BenchmarkCompilerConfig config);
 }  // namespace mmltk::backend::data::benchmark_internal

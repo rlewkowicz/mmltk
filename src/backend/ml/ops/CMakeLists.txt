@@ -14,7 +14,7 @@ target_include_directories(mmltk_backend_ml_ops PRIVATE
 )
 target_link_libraries(mmltk_backend_ml_ops
     PRIVATE
-        mmltk::backend::ml::cuda
+        mmltk::frameworks::gpu
         CUDA::cudart
 )
 mmltk_enable_torch(mmltk_backend_ml_ops PRIVATE)

@@ -2,7 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "detail/explore_render_cuda_launch.h"
-#include "detail/explore_mask_sample.h"
+#include "mask_sample.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
 namespace mmltk::backend::imaging::explore::detail {
 namespace {

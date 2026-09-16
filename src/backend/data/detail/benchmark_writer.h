@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 #include "src/backend/data/compiled_format.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/cancellation_observation.h"
 namespace mmltk::backend::data::benchmark_internal {
 struct CachedImageSource {
@@ -39,7 +39,7 @@ class BenchmarkImageReadError final : public std::runtime_error {
     std::uint16_t source_index_ = 0U;
     std::uint64_t source_image_id_ = 0U;
 };
-[[nodiscard]] PackedInstance benchmark_letterbox_box(std::uint8_t class_id, float x1, float y1, float x2, float y2, const RgbLetterbox& letterbox);
+[[nodiscard]] PackedInstance benchmark_letterbox_box(std::uint8_t class_id, float x1, float y1, float x2, float y2, const mmltk::backend::imaging::resample::RgbLetterbox& letterbox);
 struct BenchmarkWriteProgressEvent final {
     void* context = nullptr;
     void (*image_completed)(void*) = nullptr;

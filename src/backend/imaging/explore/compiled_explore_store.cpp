@@ -1,4 +1,5 @@
 module;
+#include "src/common/math/deterministic_sampling.h"
 #include <sys/mman.h>
 #include <algorithm>
 #include <atomic>
@@ -19,7 +20,7 @@ module;
 #include <vector>
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/compiled_format.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/io/file_memory.h"
 module mmltk.backend.imaging.explore.compiled_explore_store;
@@ -40,11 +41,9 @@ void require_not_cancelled(const std::atomic<bool>* cancel_requested) {
     return intersection != 0U;
 }
 [[nodiscard]] std::uint64_t splitmix64(std::uint64_t& state) noexcept {
+    const auto value = mmltk::common::math::deterministic_mix64(state);
     state += 0x9e3779b97f4a7c15ULL;
-    std::uint64_t value = state;
-    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
-    return value ^ (value >> 31U);
+    return value;
 }
 [[nodiscard]] bool deterministic_shuffle(std::vector<std::uint32_t>& values, const std::uint64_t seed, const std::atomic<bool>* cancel_requested,
                                          const std::uint64_t expected_generation, const std::atomic<std::uint64_t>* current_generation) noexcept {

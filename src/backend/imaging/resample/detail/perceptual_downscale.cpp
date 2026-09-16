@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Öztireli/Gross (2015) perceptual downscaling; provenance in perceptual_downscale_math.h.
-#include "src/backend/data/detail/perceptual_downscale.h"
-#include "src/backend/data/detail/perceptual_downscale_views.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_views.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <algorithm>
 #include <cstring>
 #include <immintrin.h>
 #include <new>
-namespace mmltk::backend::data::perceptual {
+namespace mmltk::backend::imaging::resample::perceptual {
 namespace {
 void vector_add(__m256 value, __m256& sum, __m256& error) {
     const auto adjusted = _mm256_sub_ps(value, error), next = _mm256_add_ps(sum, adjusted);
@@ -207,4 +207,4 @@ void CpuDownscaler::run(RgbConstImageView source, RgbMutableImageView destinatio
             break;
     }
 }
-}  // namespace mmltk::backend::data::perceptual
+}  // namespace mmltk::backend::imaging::resample::perceptual

@@ -3254,6 +3254,8 @@ run_tests() {
     local -a all_native_test_targets=(
         mmltk_acceptance
         mmltk_backend_data_tests
+        mmltk_backend_imaging_resample_tests
+        mmltk_backend_imaging_raster_tests
         mmltk_backend_imaging_annotation_tests
         mmltk_backend_imaging_explore_tests
         mmltk_backend_imaging_upscale_tests
@@ -3336,6 +3338,7 @@ run_tests() {
             targets=(
                 mmltk_acceptance
                 mmltk_backend_data_tests
+                mmltk_backend_imaging_resample_tests
                 mmltk_backend_models_catalog_tests
                 mmltk_common_system_tests
                 mmltk_common_concurrency_tests
@@ -3348,6 +3351,7 @@ run_tests() {
             targets=(
                 mmltk_backend_ml_layers_tests
                 mmltk_backend_ml_cuda_tests
+                mmltk_backend_imaging_raster_tests
                 mmltk_backend_models_rfdetr_contract_tests
                 mmltk_backend_models_rfdetr_core_tests
                 mmltk_backend_models_rfdetr_augmentation_tests

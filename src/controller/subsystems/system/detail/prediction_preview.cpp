@@ -1,5 +1,5 @@
 #include "prediction_preview.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/backend/imaging/raster/chw_image.h"
@@ -456,7 +456,7 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             if (rgb_bytes + gt_bytes != 0U) state.pinned->ensure_bytes(rgb_bytes + gt_bytes);
             if (state.rgb8) {
                 const auto bytes = rgb_bytes;
-                mmltk::backend::data::rgb_hwc_u8_to_nchw_f32(state.rgb8, static_cast<float*>(state.pinned->data()), state.extent.width, state.extent.height);
+                mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(state.rgb8, static_cast<float*>(state.pinned->data()), state.extent.width, state.extent.height);
                 checked(state.upload(data, state.pinned->data(), bytes, cudaMemcpyHostToDevice, cuda_stream));
             }
             const bool scale = clean.descriptor.width != state.extent.width || clean.descriptor.height != state.extent.height;

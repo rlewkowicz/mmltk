@@ -1,3 +1,4 @@
+#include "src/common/math/deterministic_sampling.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <cuda_runtime.h>
 #include <spdlog/spdlog.h>
@@ -136,7 +137,7 @@ void set_packed_mask_range(int64_t* words_data, size_t start, size_t length) {
 bool reservoir_select(const float choice, const std::int64_t candidate_count, const std::int64_t instance_index) {
     if (candidate_count <= 1) { return true; }
     const std::uint64_t key = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(choice));
-    return augmentation_mix64(key ^ (static_cast<std::uint64_t>(instance_index) * 0xd2b74407b1ce6e93ULL)) % static_cast<std::uint64_t>(candidate_count) == 0;
+    return mmltk::common::math::deterministic_mix64(key ^ (static_cast<std::uint64_t>(instance_index) * 0xd2b74407b1ce6e93ULL)) % static_cast<std::uint64_t>(candidate_count) == 0;
 }
 }  // namespace
 torch_types::DeviceIndex cuda_device_index(int device_id) { return torch_cuda::checked_device_index(device_id); }

@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 #include <cmath>
-#include "src/backend/ml/cuda/detail/cuda_launch_common.cuh"
+#include "src/frameworks/gpu/cuda_launch.cuh"
 #include <initializer_list>
 #include <limits>
 namespace mmltk::backend::models::rfdetr {
@@ -174,8 +174,8 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
     c10::cuda::CUDAGuard device_guard(output.device());
     const int64_t total = checked_extent({batch, queries, max_targets}, std::numeric_limits<int>::max(), "matcher detection cost");
     if (total == 0) { return; }
-    const int threads = mmltk::backend::ml::cuda::launch::kDefaultLinearThreads;
-    const int blocks = mmltk::backend::ml::cuda::launch::linear_blocks_for(static_cast<int>(total), threads);
+    const int threads = mmltk::frameworks::gpu::launch::kDefaultLinearThreads;
+    const int blocks = mmltk::frameworks::gpu::launch::linear_blocks_for(static_cast<int>(total), threads);
     AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred_logits.scalar_type(), "pairwise_detection_cost_logits", [&] {
         using Logit = scalar_t;
         AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, pred_boxes.scalar_type(), "pairwise_detection_cost_boxes", [&] {

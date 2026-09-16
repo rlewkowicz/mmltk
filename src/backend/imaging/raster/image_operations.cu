@@ -3,8 +3,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
-#include "detail/cuda_utils_cuda.h"
-namespace mmltk::backend::ml::cuda::detail {
+#include "detail/image_operations_cuda.h"
+namespace mmltk::backend::imaging::raster::detail {
 namespace {
 struct AffineMatrix {
     float value[6];
@@ -140,4 +140,4 @@ cudaError_t launch_bgr_vertical_flip_in_place_pitched(std::uint8_t* buffer, std:
     vertical_flip_in_place_pitched_kernel<<<grid, block, 0, stream>>>(buffer, pitch_bytes, width, height);
     return cudaPeekAtLastError();
 }
-}  // namespace mmltk::backend::ml::cuda::detail
+}  // namespace mmltk::backend::imaging::raster::detail

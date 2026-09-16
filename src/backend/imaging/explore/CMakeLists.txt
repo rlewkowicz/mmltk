@@ -23,16 +23,19 @@ mmltk_register_ordinary_sources(mmltk_backend_imaging_explore
     explore_render_core.cu explore_render_storage.cpp)
 mmltk_register_public_headers(mmltk_backend_imaging_explore
     BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}
-    FILES detail/explore_render_cuda_abi.h detail/explore_mask_sample.h
+    FILES detail/explore_render_cuda_abi.h mask_sample.h
         explore_render_storage.h)
 mmltk_register_private_headers(mmltk_backend_imaging_explore
     detail/explore_render_cuda_launch.h)
 target_link_libraries(mmltk_backend_imaging_explore
     PUBLIC
         mmltk::backend::data
+        mmltk::backend::imaging::primitives
         mmltk::backend::models::rfdetr::augmentation
         CUDA::cudart
     PRIVATE
+        mmltk::common::math
+        mmltk::backend::imaging::resample
         mmltk::common::concurrency
         mmltk::common::io
         mmltk::frameworks::gpu
@@ -59,6 +62,8 @@ function(mmltk_add_backend_imaging_explore_tests)
         mmltk_backend_imaging_explore_test_support PUBLIC
         mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk::backend::data
+        mmltk::backend::imaging::resample
+        mmltk::backend::imaging::primitives
         mmltk_backend_data_test_support
         PRIVATE
         mmltk::backend::imaging::explore
@@ -71,6 +76,7 @@ function(mmltk_add_backend_imaging_explore_tests)
         mmltk_backend_imaging_explore_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/explore_priority.test.cpp)
     target_link_libraries(mmltk_backend_imaging_explore_tests PRIVATE
+        mmltk::backend::imaging::primitives
         mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk_test_support
         mmltk::backend::imaging::explore

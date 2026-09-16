@@ -1,4 +1,4 @@
-#include "src/backend/models/rfdetr/augmentation/support_sampling.h"
+#include "src/backend/imaging/sampling.h"
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
 #include "detail/training_mask_ops_cuda_launch.h"
@@ -8,7 +8,7 @@ namespace {
 constexpr int kCudaThreads = 256;
 int ceil_div(int64_t value, int divisor) { return static_cast<int>((value + divisor - 1) / divisor); }
 __device__ float clamp_coord(float value, float limit) { return fminf(fmaxf(value, 0.0f), limit); }
-__device__ int64_t nearest_grid_sample_index(float coord, int64_t size) { return augment_math::support_pixel_index(coord, size); }
+__device__ int64_t nearest_grid_sample_index(float coord, int64_t size) { return mmltk::backend::imaging::sampling::support_pixel_index(coord, size); }
 __global__ void matcher_point_sample_kernel(const float* input, const float* coords, float* output, int64_t batch_size, int64_t coord_batches, int64_t channels,
                                             int64_t height, int64_t width, int64_t point_count, bool nearest) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;

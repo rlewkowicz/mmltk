@@ -5,7 +5,7 @@
 #include <torch/torch.h>
 #include <cmath>
 #include <cstdint>
-#include "src/backend/ml/cuda/detail/cuda_launch_common.cuh"
+#include "src/frameworks/gpu/cuda_launch.cuh"
 #include <limits>
 #include "detail/box_iou_cuda.h"
 namespace mmltk::backend::ml::ops::detail {
@@ -89,8 +89,8 @@ torch::Tensor pairwise_box_iou_cuda(const torch::Tensor& boxes1, const torch::Te
     auto result = torch::empty({boxes1.size(0), boxes2.size(0)}, boxes1.options());
     if (pair_count == 0) { return result; }
     const int second_count = static_cast<int>(boxes2.size(0));
-    const int threads = mmltk::backend::ml::cuda::launch::kDefaultLinearThreads;
-    const int blocks = mmltk::backend::ml::cuda::launch::linear_blocks_for(static_cast<int>(pair_count), threads);
+    const int threads = mmltk::frameworks::gpu::launch::kDefaultLinearThreads;
+    const int blocks = mmltk::frameworks::gpu::launch::linear_blocks_for(static_cast<int>(pair_count), threads);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     AT_DISPATCH_FLOATING_TYPES(boxes1.scalar_type(), "pairwise_box_iou_cuda", [&] {
         // NOLINTNEXTLINE(bugprone-branch-clone): each branch launches a different CUDA kernel.

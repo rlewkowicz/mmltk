@@ -19,7 +19,7 @@
 #include "src/backend/imaging/explore/detail/explore_render_cuda_abi.h"
 #include "src/controller/subsystems/explore/native_explore_storage.h"
 #include "src/backend/models/rfdetr/augmentation/spatial_erasure.h"
-#include "src/backend/imaging/raster/detail/raster_color.h"
+#include "src/backend/imaging/raster/class_palette.h"
 import mmltk.backend.imaging.explore.explore_render_core;
 import mmltk.backend.imaging.explore.compiled_explore_store;
 import mmltk.backend.imaging.raster;
@@ -35,7 +35,7 @@ struct NativeExploreStorageTestAccess final {
 namespace mmltk::backend::imaging::explore {
 namespace {
 TEST_CASE("Class palettes retain full-catalog hues and cyclic saturation/value dispersion", "[backend][imaging][explore]") {
-    namespace color = mmltk::backend::imaging::raster::detail::color;
+    namespace color = mmltk::backend::imaging::raster::color;
     for (const int count : {1, 2, 12, 13, 14, 255, 256}) {
         for (int index = 0; index < count; ++index) {
             float hue, saturation, value, next_hue, next_saturation, next_value;

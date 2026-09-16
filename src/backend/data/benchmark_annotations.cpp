@@ -1271,4 +1271,12 @@ void store_normalized_annotation_index(const std::filesystem::path& path, const 
         throw;
     }
 }
+[[nodiscard]] std::vector<std::uint64_t> image_ids(const NormalizedAnnotationIndex& index, const std::optional<std::uint16_t> shard) {
+    std::vector<std::uint64_t> ids;
+    ids.reserve(index.images.size());
+    for (const NormalizedImage& image : index.images) {
+        if (!shard || image.source_shard == *shard) { ids.push_back(image.source_image_id); }
+    }
+    return ids;
+}
 }  // namespace mmltk::backend::data::benchmark_internal

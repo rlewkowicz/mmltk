@@ -93,6 +93,7 @@ target_link_libraries(mmltk_controller_contracts
         mmltk::common::types
         mmltk::frameworks::reflection
     PRIVATE
+        mmltk::backend::imaging::primitives
         mmltk::common::io
         mmltk::common::logging
         mmltk::frameworks::serialization

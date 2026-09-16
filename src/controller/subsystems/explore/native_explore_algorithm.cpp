@@ -1,3 +1,4 @@
+#include "src/common/math/deterministic_sampling.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/services/runtime_diagnostics.h"
@@ -38,7 +39,7 @@
 #include "src/common/system/execution_policy.h"
 #include "src/common/io/event_fd.h"
 #include "src/common/io/scoped_fd.h"
-#include "src/backend/imaging/raster/detail/raster_color.h"
+#include "src/backend/imaging/raster/class_palette.h"
 import mmltk.backend.imaging.explore.compiled_explore_store;
 import mmltk.backend.imaging.explore.explore_render_core;
 import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
@@ -519,7 +520,7 @@ namespace rfdetr = mmltk::backend::models::rfdetr;
         mix(summary.instance_count);
         mix(summary.has_masks);
     }
-    return rfdetr::augmentation_mix64(value);
+    return mmltk::common::math::deterministic_mix64(value);
 }
 class NativeExploreAlgorithm final : public ExploreAlgorithm {
     struct DatasetState final {
@@ -578,7 +579,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
             target.length = static_cast<std::uint8_t>(std::min<std::size_t>(name.size(), 31U));
             std::memcpy(target.name, name.data(), target.length);
             target.visible = 1U;
-            mmltk::backend::imaging::raster::detail::color::class_color(static_cast<int>(index), static_cast<int>(classes.size()), target.color[0],
+            mmltk::backend::imaging::raster::color::class_color(static_cast<int>(index), static_cast<int>(classes.size()), target.color[0],
                                                                         target.color[1], target.color[2]);
         }
         ExploreDatasetFacts dataset{

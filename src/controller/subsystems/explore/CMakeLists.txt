@@ -22,9 +22,11 @@ target_link_libraries(mmltk_controller_explore_system
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::common::math
         mmltk::frameworks::serialization
         mmltk::controller::visual_runtime
         mmltk::backend::data
+        mmltk::backend::imaging::primitives
         mmltk::backend::imaging::explore
         mmltk::backend::models::rfdetr::augmentation
         mmltk::common::concurrency

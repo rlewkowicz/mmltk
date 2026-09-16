@@ -537,7 +537,7 @@ TEST_CASE("compiled source teardown retains one durable authority across replace
     CHECK(authority->fact().occupancy == 1U);
 }
 TEST_CASE("perceptual compiler changes shrinking RGB while preserving format catalog and categorical geometry", "[backend][data][compiler][perceptual]") {
-    namespace oracle = mmltk::backend::data::test_perceptual;
+    namespace oracle = mmltk::backend::imaging::resample::test_perceptual;
     mmltk::testsupport::ScopedTempDir root("perceptual-compiled");
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 65, .height = 49, .num_images = 2, .background_images = 0};
     create_synthetic_dataset(fixture);
@@ -561,11 +561,11 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
     CHECK(std::memcmp(ordinary.labels().data(), selected.labels().data(), ordinary.labels().size_bytes()) == 0);
     REQUIRE(ordinary.rle_pairs().size() == selected.rle_pairs().size());
     CHECK(std::memcmp(ordinary.rle_pairs().data(), selected.rle_pairs().data(), ordinary.rle_pairs().size_bytes()) == 0);
-    const auto geometry = compute_rgb_letterbox(65, 49, 31, 31);
+    const auto geometry = mmltk::backend::imaging::resample::compute_rgb_letterbox(65, 49, 31, 31);
     for (std::uint32_t image = 0; image != 2; ++image) {
         const auto name = image == 0 ? "000001.png" : "000002.png";
         const auto source = expected_nchw_stub((fs::path(config.source_dir) / "train" / name).string(), 65, 49);
-        oracle::Image pixels(65, 49, RgbPixelFormat::RGB8);
+        oracle::Image pixels(65, 49, mmltk::backend::imaging::resample::RgbPixelFormat::RGB8);
         for (unsigned y = 0; y != 49; ++y)
             for (unsigned x = 0; x != 65; ++x)
                 for (unsigned channel = 0; channel != 3; ++channel) pixels.set(x, y, channel, source[channel * 65U * 49U + y * 65U + x]);

@@ -13,7 +13,7 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         annotation_support.h
-        support_sampling.h
+        sampling.h
         augmentation_plan.h
         gpu_augment.h
         gpu_augment_cuda.h
@@ -42,10 +42,13 @@ target_link_libraries(
     mmltk_backend_models_rfdetr_augmentation
     PUBLIC
         mmltk::backend::data
+        mmltk::backend::imaging::primitives
+        mmltk::common::math
         mmltk::backend::models::rfdetr::contract
         CUDA::cudart
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::backend::imaging::resample
         CUDA::cuda_driver)
 set_target_properties(mmltk_backend_models_rfdetr_augmentation PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"

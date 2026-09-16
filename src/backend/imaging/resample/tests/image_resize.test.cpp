@@ -1,7 +1,7 @@
-#include "src/backend/data/image_resize.h"
-#include "src/backend/data/tests/perceptual_downscale_reference.h"
-#include "src/backend/data/detail/perceptual_downscale_math.h"
-#include "src/backend/data/detail/perceptual_downscale.h"
+#include "src/backend/imaging/resample/image_resize.h"
+#include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_math.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale.h"
 #include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
@@ -16,7 +16,7 @@
 #include <cstring>
 #include <new>
 #include <utility>
-namespace mmltk::backend::data::perceptual {
+namespace mmltk::backend::imaging::resample::perceptual {
 struct CpuDownscalerTestAccess {
     using Step = CpuDownscaler::PreparationStep;
     using Storage = std::array<std::pair<const void*, std::size_t>, 8>;
@@ -35,8 +35,8 @@ struct CpuDownscalerTestAccess {
                  {owner.alpha_[1].data(), owner.alpha_[1].capacity()}}};
     }
 };
-}  // namespace mmltk::backend::data::perceptual
-using namespace mmltk::backend::data;
+}  // namespace mmltk::backend::imaging::resample::perceptual
+using namespace mmltk::backend::imaging::resample;
 namespace {
 std::vector<uint8_t> make_test_image(int width, int height) {
     std::vector<uint8_t> pixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 3);

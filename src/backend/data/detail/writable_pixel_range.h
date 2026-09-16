@@ -1,7 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
-#include <memory>
+#include "src/common/io/file_memory.h"
 namespace mmltk::backend::data::detail {
 class WritablePixelRange final {
    public:
@@ -14,7 +14,6 @@ class WritablePixelRange final {
     [[nodiscard]] float* image(std::uint32_t image_index, std::size_t image_stride) const noexcept;
 
    private:
-    class Owner;
-    std::unique_ptr<Owner> owner_;
+    mmltk::common::io::MappedByteRegion region_;
 };
 }  // namespace mmltk::backend::data::detail

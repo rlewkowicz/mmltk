@@ -8,7 +8,7 @@
 #include <memory>
 #include <stdexcept>
 #include <utility>
-namespace mmltk::backend::data::perceptual {
+namespace mmltk::backend::imaging::resample::perceptual {
 // Query errors retain their Driver identity. Only documented argument/range
 // failures are recoverable; a prior asynchronous failure can surface here.
 enum class AdmissionQuery : std::uint8_t { Context, Pointer, Range, Stream };
@@ -129,4 +129,4 @@ class CudaDownscaleCompletion final {
     cudaEvent_t latest_ = nullptr;
     cudaStream_t latest_stream_ = nullptr;
 };
-}  // namespace mmltk::backend::data::perceptual
+}  // namespace mmltk::backend::imaging::resample::perceptual

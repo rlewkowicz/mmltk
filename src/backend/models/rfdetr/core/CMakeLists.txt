@@ -136,6 +136,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_core
         mmltk::common::io
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::backend::imaging::primitives
         mmltk::backend::imaging::raster
         mmltk::backend::models::rfdetr::augmentation
         mmltk::backend::ml::layers
@@ -223,6 +224,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/detail
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(mmltk_backend_models_rfdetr_core_tests PRIVATE
+        mmltk::backend::models::rfdetr::augmentation
         mmltk_frameworks_gpu_test_support
         mmltk_test_support
         mmltk::frameworks::serialization

@@ -57,14 +57,16 @@ mmltk_register_public_headers(
         data_loading_options.h
         compiled_file_utils.h
         benchmark_hash.h
-        image_resize.h
-        image_resize_cuda.h)
+)
 mmltk_register_ordinary_sources(mmltk_backend_data
     compiled_dataset.cpp
     benchmark_annotations.cpp
     benchmark_cache.cpp
     benchmark_catalog.cpp
     benchmark_compiler.cpp
+    benchmark_progress.cpp
+    benchmark_storage.cpp
+    open_images_acquisition.cpp
     benchmark_curl.cpp
     benchmark_download.cpp
     benchmark_hash.cpp
@@ -72,9 +74,6 @@ mmltk_register_ordinary_sources(mmltk_backend_data
     benchmark_jpeg.cpp
     benchmark_sampling.cpp
     dataset_compiler_progress.cpp
-    image_resize.cpp
-    detail/perceptual_downscale.cpp
-    detail/perceptual_downscale_views.cpp
     mask_rle_utils.cpp
     staging_file_cleanup.cpp)
 mmltk_register_retained_module_importers(mmltk_backend_data
@@ -86,13 +85,15 @@ mmltk_register_retained_module_importers(mmltk_backend_data
     dataset_compiler_scan_labels.cpp
     dataset_loader.cpp)
 mmltk_register_ordinary_sources(mmltk_backend_data
-    dataset_compiler_cuda_bridge.cpp
     writable_pixel_range.cpp)
 mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_annotations.h
     detail/benchmark_cache.h
     detail/benchmark_catalog.h
     detail/benchmark_compiler.h
+    detail/benchmark_progress.h
+    detail/benchmark_storage.h
+    detail/open_images_acquisition.h
     detail/benchmark_curl.h
     detail/benchmark_download.h
     detail/benchmark_images.h
@@ -100,36 +101,10 @@ mmltk_register_private_headers(mmltk_backend_data
     detail/benchmark_sampling.h
     detail/benchmark_writer.h
     detail/worker_queue.h
-    detail/perceptual_downscale.h
-    detail/perceptual_downscale_views.h
-    detail/perceptual_downscale_math.h
-    detail/perceptual_downscale_completion.h
-    detail/dataset_compiler_cuda.h
-    detail/dataset_compiler_cuda_bridge.h
     detail/dataset_compiler_internal.h
     detail/mask_rle_utils.h
     detail/staging_file_cleanup.h
     detail/writable_pixel_range.h)
-
-if(BUILD_RFDETR_NATIVE)
-    mmltk_register_ordinary_sources(
-        mmltk_backend_data
-        dataset_compiler_cuda.cu
-        image_resize_cuda.cu
-    )
-    target_compile_definitions(mmltk_backend_data PRIVATE
-        MMLTK_DATASET_COMPILER_CUDA=1
-    )
-    set_target_properties(mmltk_backend_data PROPERTIES
-        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    )
-else()
-    target_compile_definitions(mmltk_backend_data PRIVATE
-        MMLTK_DATASET_COMPILER_CUDA=0
-    )
-endif()
 
 target_include_directories(mmltk_backend_data
     PRIVATE
@@ -142,6 +117,7 @@ target_include_directories(mmltk_backend_data SYSTEM PRIVATE
 )
 target_link_libraries(mmltk_backend_data
     PUBLIC
+        mmltk::backend::imaging::resample
         mmltk::backend::data::catalog
         mmltk::common::io
         mmltk::common::math
@@ -155,7 +131,6 @@ target_link_libraries(mmltk_backend_data
         mmltk::common::types
         mmltk::frameworks::gpu
         mmltk::frameworks::process
-        avir
         CURL::libcurl
         LibArchive::LibArchive
         rapidgzip::rapidgzip
@@ -183,20 +158,11 @@ function(mmltk_add_backend_data_tests)
     add_executable(mmltk_backend_data_tests EXCLUDE_FROM_ALL)
     mmltk_register_retained_module_importers(mmltk_backend_data_tests
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/compile_progress.test.cpp
-        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/roundtrip.test.cpp
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/benchmark_dataset.test.cpp)
     mmltk_register_ordinary_sources(mmltk_backend_data_tests
         ${CMAKE_SOURCE_DIR}/src/backend/data/catalog/tests/class_catalog.test.cpp
         ${CMAKE_SOURCE_DIR}/src/common/io/tests/file_digest.test.cpp)
-    mmltk_register_private_headers(mmltk_backend_data_tests
-        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/perceptual_downscale_reference.h)
-    if(BUILD_RFDETR_NATIVE)
-        find_package(Vulkan REQUIRED)
-        mmltk_register_ordinary_sources(mmltk_backend_data_tests
-            ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize_cuda.test.cpp)
-        target_link_libraries(mmltk_backend_data_tests PRIVATE mmltk_frameworks_gpu_hardware_test_support)
-    endif()
     mmltk_configure_component(
         mmltk_backend_data_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_backend_data_tests PRIVATE
@@ -204,6 +170,7 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests
     )
     target_link_libraries(mmltk_backend_data_tests PRIVATE
+        mmltk::backend::imaging::resample
         mmltk_test_support
         mmltk::backend::data
         mmltk::common::concurrency

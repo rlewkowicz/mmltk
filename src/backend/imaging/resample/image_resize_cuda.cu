@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Öztireli/Gross (2015) perceptual downscaling; provenance in detail/perceptual_downscale_math.h.
-#include "src/backend/data/image_resize_cuda.h"
-#include "src/backend/data/detail/perceptual_downscale_views.h"
-#include "src/backend/data/detail/perceptual_downscale_math.h"
-#include "src/backend/data/detail/perceptual_downscale_completion.h"
+#include "src/backend/imaging/resample/image_resize_cuda.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_views.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_math.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_completion.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
@@ -17,7 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-namespace mmltk::backend::data {
+namespace mmltk::backend::imaging::resample {
 namespace {
 using namespace perceptual;
 constexpr unsigned threads = 256;
@@ -396,4 +396,4 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
         std::rethrow_exception(original);
     }
 }
-}  // namespace mmltk::backend::data
+}  // namespace mmltk::backend::imaging::resample

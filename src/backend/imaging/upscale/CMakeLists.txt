@@ -96,6 +96,7 @@ mmltk_link_declarations(mmltk_backend_imaging_upscale PUBLIC
 # The device-only implementation header belongs to NVCC's source set below.
 mmltk_register_header_isolation(mmltk_backend_imaging_upscale)
 mmltk_register_private_headers(mmltk_backend_imaging_upscale
+    detail/image_normalization.cuh
     detail/image_upscaler_nis_device.cuh)
 set_target_properties(mmltk_backend_imaging_upscale PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"

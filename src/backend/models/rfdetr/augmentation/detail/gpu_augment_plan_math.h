@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -9,12 +10,6 @@
 // Sampling preserves the original counter stream; these functions allocate no storage.
 namespace mmltk::backend::models::rfdetr::augment_math {
 inline constexpr float kPi = 3.14159265358979323846F;
-[[nodiscard]] __host__ __device__ __forceinline__ std::uint64_t image_key(const std::uint64_t seed, const int epoch, const int rank,
-                                                                          const std::uint64_t sequence, const std::int64_t image) {
-    return mix64(seed ^ (static_cast<std::uint64_t>(static_cast<std::uint32_t>(epoch)) << 32U) ^
-                 (static_cast<std::uint64_t>(static_cast<std::uint32_t>(rank)) * 0xd2b74407b1ce6e93ULL) ^ (sequence * 0xca5a826395121157ULL) ^
-                 (static_cast<std::uint64_t>(image) * kGoldenRatio));
-}
 [[nodiscard]] __host__ __device__ __forceinline__ float sample_strength(const GpuAugmentationGroupLaunchConfig& group, const std::uint64_t key,
                                                                         std::uint64_t& counter) {
     const float value = uniform01(key, counter++);

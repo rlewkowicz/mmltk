@@ -7,13 +7,13 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #if defined(__CUDACC__)
 #define MMLTK_PERCEPTUAL_HD __host__ __device__
 #else
 #define MMLTK_PERCEPTUAL_HD
 #endif
-namespace mmltk::backend::data::perceptual {
+namespace mmltk::backend::imaging::resample::perceptual {
 inline constexpr float variance_threshold = 1e-6F;
 inline constexpr float low_variance_ratio = 2.0F;
 MMLTK_PERCEPTUAL_HD inline float unit(float value) { return !(value > 0.0F) ? 0.0F : (value < 1.0F ? value : 1.0F); }
@@ -188,5 +188,5 @@ MMLTK_PERCEPTUAL_HD inline void store(RgbMutableImageView view, std::uint32_t x,
     }
     if constexpr (Format == RgbPixelFormat::RGBA8) row[std::size_t(x) * 4 + 3] = static_cast<std::uint8_t>(::lroundf(unit(alpha) * 255.0F));
 }
-}  // namespace mmltk::backend::data::perceptual
+}  // namespace mmltk::backend::imaging::resample::perceptual
 #undef MMLTK_PERCEPTUAL_HD

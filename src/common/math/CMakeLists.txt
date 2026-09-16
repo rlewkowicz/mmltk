@@ -6,6 +6,6 @@ mmltk_configure_component(mmltk_common_math PUBLIC_DECLARATIONS)
 
 mmltk_register_public_headers(mmltk_common_math
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES checked_arithmetic.h
+    FILES checked_arithmetic.h deterministic_sampling.h
 )
 set_target_properties(mmltk_common_math PROPERTIES LINKER_LANGUAGE CXX)

@@ -80,6 +80,7 @@ add_subdirectory(src/frameworks/transport)
 include(MmltkGdrCopy)
 add_subdirectory(src/frameworks/gpu)
 add_subdirectory(src/backend/data/catalog)
+add_subdirectory(src/backend/imaging)
 add_subdirectory(src/backend/data)
 
 if(BUILD_RFDETR_NATIVE)

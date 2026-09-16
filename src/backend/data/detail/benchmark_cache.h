@@ -50,4 +50,5 @@ inline void trace_benchmark_event(const BenchmarkTraceSink& sink, const std::str
     if (!sink) { return; }
     sink(event, std::invoke(std::forward<Builder>(fields)));
 }
+void remove_cache_path(const std::filesystem::path& path);
 }  // namespace mmltk::backend::data::benchmark_internal

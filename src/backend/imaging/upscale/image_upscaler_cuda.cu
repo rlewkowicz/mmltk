@@ -1,3 +1,4 @@
+#include "detail/image_normalization.cuh"
 #include "detail/image_upscaler_cuda.h"
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -6,8 +7,6 @@ namespace mmltk::backend::imaging::upscale::image_upscaler_cuda {
 namespace {
 constexpr std::uint32_t kInputExtent = 256U;
 constexpr std::uint32_t kOutputExtent = kInputExtent * 4U;
-__device__ __forceinline__ float channel_mean(const std::uint32_t channel) { return channel == 0U ? 0.485F : (channel == 1U ? 0.456F : 0.406F); }
-__device__ __forceinline__ float channel_std(const std::uint32_t channel) { return channel == 0U ? 0.229F : (channel == 1U ? 0.224F : 0.225F); }
 __device__ __forceinline__ std::uint32_t reflect_coordinate(const int coordinate, const std::uint32_t extent) {
     if (extent <= 1U) { return 0U; }
     const int period = static_cast<int>((extent - 1U) * 2U);

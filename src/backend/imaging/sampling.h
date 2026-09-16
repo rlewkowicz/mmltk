@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-namespace mmltk::backend::models::rfdetr::augment_math {
+namespace mmltk::backend::imaging::sampling {
 [[nodiscard]] __host__ __device__ inline std::int64_t support_pixel_index(float coordinate, std::int64_t extent) noexcept {
     return static_cast<std::int64_t>(fminf(static_cast<float>(extent - 1), fmaxf(0.0F, nearbyintf(coordinate * static_cast<float>(extent) - 0.5F))));
 }
@@ -19,4 +19,4 @@ template <typename Run>
     }
     return low != 0 && pixel - runs[low - 1].start < runs[low - 1].length;
 }
-}  // namespace mmltk::backend::models::rfdetr::augment_math
+}  // namespace mmltk::backend::imaging::sampling

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
-#include "src/backend/data/detail/perceptual_downscale_views.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_views.h"
 #include "src/common/math/checked_arithmetic.h"
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-namespace mmltk::backend::data::perceptual {
+namespace mmltk::backend::imaging::resample::perceptual {
 IdentityCopyGeometry identity_geometry(const RgbImageLayout& layout) {
     switch (layout.format) {
         case RgbPixelFormat::RGB8: return {common::math::checked_multiply<std::size_t>(layout.width, 3, "perceptual image extent overflow"), 1};
@@ -46,4 +46,4 @@ ValidatedResize validate_pair(RgbConstImageView source, RgbMutableImageView dest
         throw std::invalid_argument("perceptual image input/output storage overlaps");
     return {source_bytes, destination_bytes, identity};
 }
-}  // namespace mmltk::backend::data::perceptual
+}  // namespace mmltk::backend::imaging::resample::perceptual

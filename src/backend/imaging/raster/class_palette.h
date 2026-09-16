@@ -6,7 +6,7 @@
 #else
 #define MMLTK_RASTER_COLOR_INLINE inline
 #endif
-namespace mmltk::backend::imaging::raster::detail::color {
+namespace mmltk::backend::imaging::raster::color {
 [[nodiscard]] MMLTK_RASTER_COLOR_INLINE int safe_class_count(const int num_classes) { return num_classes < 1 ? 1 : num_classes; }
 [[nodiscard]] MMLTK_RASTER_COLOR_INLINE int normalize_label(const int label, const int safe_count) { return (label < 0 || label >= safe_count) ? 0 : label; }
 MMLTK_RASTER_COLOR_INLINE void hsv_to_rgb(const float h, const float s, const float v, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b) {
@@ -60,5 +60,5 @@ MMLTK_RASTER_COLOR_INLINE void class_color(const int label, const int safe_count
     class_hsv(label, safe_count, h, s, v);
     hsv_to_rgb(h, s, v, r, g, b);
 }
-}  // namespace mmltk::backend::imaging::raster::detail::color
+}  // namespace mmltk::backend::imaging::raster::color
 #undef MMLTK_RASTER_COLOR_INLINE

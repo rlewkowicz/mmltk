@@ -7,7 +7,7 @@ module;
 #include <span>
 #include <vector>
 #include "detail/mask_pack_cuda_abi.h"
-#include "detail/raster_color.h"
+#include "class_palette.h"
 #include "detail/raster_cuda_abi.h"
 module mmltk.backend.imaging.raster;
 namespace mmltk::backend::imaging::raster {
@@ -78,13 +78,13 @@ template <typename Pixel>
 }
 }  // namespace
 std::vector<std::uint8_t> category_colors(const std::span<const int> labels, const int category_count) {
-    const int safe_count = detail::color::safe_class_count(category_count);
+    const int safe_count = color::safe_class_count(category_count);
     std::vector<std::uint8_t> colors(labels.size() * 3U, 0U);
     std::vector<std::uint8_t> palette(static_cast<std::size_t>(safe_count) * 3U);
     for (int label = 0; label < safe_count; ++label)
-        detail::color::class_color(label, safe_count, palette[label * 3U], palette[label * 3U + 1U], palette[label * 3U + 2U]);
+        color::class_color(label, safe_count, palette[label * 3U], palette[label * 3U + 1U], palette[label * 3U + 2U]);
     for (std::size_t index = 0; index < labels.size(); ++index) {
-        const int label = detail::color::normalize_label(labels[index], safe_count);
+        const int label = color::normalize_label(labels[index], safe_count);
         for (std::size_t channel = 0U; channel != 3U; ++channel) colors[index * 3U + channel] = palette[static_cast<std::size_t>(label) * 3U + channel];
     }
     return colors;

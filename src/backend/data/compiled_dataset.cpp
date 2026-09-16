@@ -80,9 +80,9 @@ const float* CompiledDataset::image_pixels(const std::uint32_t compiled_index) c
     // cppcheck-suppress invalidPointerCast
     return reinterpret_cast<const float*>(mapping_.data() + entry.pixel_offset);
 }
-mmltk::backend::data::RgbLetterbox CompiledDataset::letterbox(const std::uint32_t compiled_index) const {
+mmltk::backend::imaging::resample::RgbLetterbox CompiledDataset::letterbox(const std::uint32_t compiled_index) const {
     const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
-    return mmltk::backend::data::compute_rgb_letterbox(entry.original_width, entry.original_height, header_.image_width, header_.image_height);
+    return mmltk::backend::imaging::resample::compute_rgb_letterbox(entry.original_width, entry.original_height, header_.image_width, header_.image_height);
 }
 std::span<const LabelIndexEntry> CompiledDataset::label_index() const noexcept { return label_index_; }
 const float* CompiledDataset::pixel_blob() const noexcept { return reinterpret_cast<const float*>(mapping_.data() + header_.pixel_offset); }

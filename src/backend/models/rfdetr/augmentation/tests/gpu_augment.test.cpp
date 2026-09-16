@@ -1,5 +1,6 @@
+#include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
-#include "src/backend/data/tests/perceptual_downscale_reference.h"
+#include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -838,7 +839,7 @@ TEST_CASE("augmentation failed staging finish and reconfigure settlement closes 
     CHECK_FALSE(owner.expired());
     CHECK_FALSE(allocations.expired());
 }
-double sample_reference(const mmltk::backend::data::test_perceptual::Image& image, double x, double y, unsigned channel) {
+double sample_reference(const mmltk::backend::imaging::resample::test_perceptual::Image& image, double x, double y, unsigned channel) {
     constexpr double mean[]{.485, .456, .406};
     if (x < 0 || x > 1 || y < 0 || y > 1) return mean[channel];
     const auto width = image.layout.width, height = image.layout.height;
@@ -855,8 +856,8 @@ TEST_CASE("perceptual augmentation preserves plans and independently remaps mixe
     const auto completion = GENERATE(Completion::Retry, Completion::Finish, Completion::Destroy);
     constexpr int extent = 9;
     constexpr std::size_t count = 64, plane = extent * extent;
-    namespace oracle = mmltk::backend::data::test_perceptual;
-    oracle::Image original(extent, extent, mmltk::backend::data::RgbPixelFormat::PlanarUnitSrgbF32);
+    namespace oracle = mmltk::backend::imaging::resample::test_perceptual;
+    oracle::Image original(extent, extent, mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32);
     original.fill(3);
     std::vector<float> input(count * 3U * plane);
     std::array<std::uint32_t, count> indices{};
@@ -996,10 +997,10 @@ TEST_CASE("perceptual augmentation preserves plans and independently remaps mixe
 }
 TEST_CASE("perceptual donor reductions preserve mask box and class support", "[backend][augmentation][perceptual][cuda]") {
     if (!has_cuda_device()) SKIP("CUDA unavailable; donor acceptance unexecuted");
-    namespace oracle = mmltk::backend::data::test_perceptual;
+    namespace oracle = mmltk::backend::imaging::resample::test_perceptual;
     constexpr std::size_t count = 32;
     constexpr unsigned extent = 4, plane = extent * extent;
-    oracle::Image original(extent, extent, mmltk::backend::data::RgbPixelFormat::PlanarUnitSrgbF32);
+    oracle::Image original(extent, extent, mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32);
     original.fill(3);
     std::array<std::uint32_t, count> indices{};
     std::array<std::uint64_t, count> keys{};

@@ -45,7 +45,7 @@
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_loader.h"
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/io/scoped_fd.h"
@@ -600,7 +600,7 @@ void test_benchmark_cached_image_writer_and_loader() {
     split.name = "validation";
     split.class_names = {"person"};
     split.sources.push_back(CachedImageSource{image_root});
-    const RgbLetterbox letterbox = compute_rgb_letterbox(16U, 8U, kNanoResolution, kNanoResolution);
+    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(16U, 8U, kNanoResolution, kNanoResolution);
     REQUIRE(letterbox.resized_width == kNanoResolution);
     REQUIRE(letterbox.resized_height == 192U);
     REQUIRE(letterbox.offset_x == 0U);
@@ -786,7 +786,7 @@ void test_benchmark_event_cancellation_while_waiting_for_lock_without_progress()
             config.num_workers = 1;
             config.overwrite = true;
             config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Borrow(observed);
-            BenchmarkDatasetCompiler::compile(std::move(config));
+            compile_benchmark_dataset(std::move(config));
         } catch (...) { compile_error = std::current_exception(); }
     });
     const mmltk::testsupport::ScopedTestCleanup cleanup([&] {

@@ -1,4 +1,5 @@
 #pragma once
+#include "image_normalization.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -17,8 +18,6 @@ struct alignas(8) HalfRgba final {
     __half blue;
     __half alpha;
 };
-__device__ __forceinline__ float channel_mean(const std::uint32_t channel) { return channel == 0U ? 0.485F : (channel == 1U ? 0.456F : 0.406F); }
-__device__ __forceinline__ float channel_std(const std::uint32_t channel) { return channel == 0U ? 0.229F : (channel == 1U ? 0.224F : 0.225F); }
 __device__ __forceinline__ std::uint32_t phase(const float source_coordinate) {
     const float fraction = source_coordinate - floorf(source_coordinate);
     return min(kPhaseCount - 1U, static_cast<std::uint32_t>(fraction * static_cast<float>(kPhaseCount)));

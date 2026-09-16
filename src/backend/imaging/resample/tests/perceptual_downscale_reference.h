@@ -3,7 +3,7 @@
 // supplied MIT ssim_perceptual_downscaling.c. Uses direct footprint intersection
 // and direct four-patch reconstruction, not production tables or math helpers.
 #pragma once
-#include "src/backend/data/image_resize.h"
+#include "src/backend/imaging/resample/image_resize.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,7 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <vector>
-namespace mmltk::backend::data::test_perceptual {
+namespace mmltk::backend::imaging::resample::test_perceptual {
 // Near the variance cutoff, contrast gains can approach 500. Rounding the
 // retained FP32 moments alone can exceed 2e-6 even with exact accumulation and
 // reconstruction. This unit-sRGB allowance is about 0.005 of an 8-bit code;
@@ -200,4 +200,4 @@ inline constexpr std::array<std::array<unsigned, 4>, 16> geometries{{{17, 13, 9,
                                                                      {65537, 1, 2, 1},
                                                                      {8193, 3, 17, 1}}};
 inline constexpr std::array<RgbPixelFormat, 3> formats{RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8, RgbPixelFormat::PlanarUnitSrgbF32};
-}  // namespace mmltk::backend::data::test_perceptual
+}  // namespace mmltk::backend::imaging::resample::test_perceptual

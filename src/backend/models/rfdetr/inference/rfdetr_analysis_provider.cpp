@@ -11,13 +11,13 @@ module;
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include "src/backend/imaging/raster/image_operations.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
 module mmltk.backend.models.rfdetr.inference.analysis_provider;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
-import mmltk.backend.ml.cuda.cuda_utils;
 import mmltk.backend.ml.cuda.gpu_quiescence;
 namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
@@ -100,7 +100,7 @@ RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(con
             const runtime::AnalysisRegion& region = request.regions[index];
             const auto* source = reinterpret_cast<const std::uint8_t*>(request.source.pixels.address) +
                                  static_cast<std::size_t>(region.y) * request.source.pitch_bytes + static_cast<std::size_t>(region.x) * request.source.channels;
-            mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::ml::cuda::launch_bgr_split_to_planar_float(
+            mmltk::frameworks::gpu::ensure_cuda_ok(static_cast<cudaError_t>(mmltk::backend::imaging::raster::launch_bgr_split_to_planar_float(
                                                        source, request.source.pitch_bytes, region.width, region.height, input_float[index].data_ptr<float>(),
                                                        impl_->resolution, impl_->resolution, reinterpret_cast<std::uintptr_t>(impl_->stream))),
                                                    "RF-DETR analysis preprocessing");

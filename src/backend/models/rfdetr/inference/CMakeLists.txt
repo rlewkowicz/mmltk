@@ -50,6 +50,8 @@ target_link_libraries(mmltk_backend_models_rfdetr_inference
         mmltk::common::io
         mmltk::backend::media::video
         mmltk::backend::data
+        mmltk::backend::imaging::resample
+        mmltk::backend::imaging::raster
         mmltk::backend::ml::cuda
         mmltk::common::concurrency
         mmltk::common::logging

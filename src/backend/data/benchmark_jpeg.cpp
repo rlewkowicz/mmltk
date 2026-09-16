@@ -1,3 +1,5 @@
+#include <sys/mman.h>
+#include "src/common/io/file_memory.h"
 
 #include "detail/benchmark_jpeg.h"
 #include <turbojpeg.h>
@@ -106,5 +108,54 @@ void BenchmarkJpegDecoder::decode_rgb(const std::span<const std::uint8_t> encode
         throw BenchmarkJpegError(std::string("cannot decode benchmark CMYK JPEG: ") + tjGetErrorStr2(handle_));
     }
     convert_cmyk_to_rgb(*cmyk_scratch, header.inverted_cmyk, *rgb);
+}
+namespace {
+namespace common_io = mmltk::common::io;
+class MappedJpeg {
+   public:
+    explicit MappedJpeg(const std::filesystem::path& path) : file_(common_io::FileHandle::open_readonly(path.string())), size_(file_.size()) {
+        if (size_ == 0U) { throw InvalidJpegError("cached benchmark JPEG is empty"); }
+        data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, file_.get(), 0);
+        if (data_ == MAP_FAILED) {
+            data_ = nullptr;
+            throw common_io::errno_error("cannot map cached benchmark JPEG", path.string());
+        }
+    }
+    ~MappedJpeg() {
+        if (data_ != nullptr) { (void)::munmap(data_, size_); }
+    }
+    MappedJpeg(const MappedJpeg&) = delete;
+    MappedJpeg& operator=(const MappedJpeg&) = delete;
+    [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept { return {static_cast<const std::uint8_t*>(data_), size_}; }
+
+   private:
+    common_io::FileHandle file_;
+    std::size_t size_ = 0U;
+    void* data_ = nullptr;
+};
+[[nodiscard]] static MappedJpeg map_file(const std::filesystem::path& path) { return MappedJpeg(path); }
+
+}
+std::pair<std::uint32_t, std::uint32_t> JpegValidator::read_header(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width,
+                                                                  const std::uint32_t expected_height) {
+    try {
+        const BenchmarkJpegHeader header = decoder_.read_header(encoded, expected_width, expected_height);
+        return {header.width, header.height};
+    } catch (const BenchmarkJpegError& error) { throw InvalidJpegError(error.what()); }
+}
+std::pair<std::uint32_t, std::uint32_t> JpegValidator::validate_file(const std::filesystem::path& path, const std::uint32_t expected_width,
+                                                                    const std::uint32_t expected_height) {
+    const MappedJpeg mapped = map_file(path);
+    return read_header(mapped.bytes(), expected_width, expected_height);
+}
+void JpegValidator::validate_decodable(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width, const std::uint32_t expected_height) {
+    try {
+        const BenchmarkJpegHeader header = decoder_.read_header(encoded, expected_width, expected_height);
+        decoder_.decode_rgb(encoded, header, &decoded_, &cmyk_);
+    } catch (const BenchmarkJpegError& error) { throw InvalidJpegError(std::string("cannot fully decode benchmark JPEG: ") + error.what()); }
+}
+void JpegValidator::validate_decodable_file(const std::filesystem::path& path, const std::uint32_t expected_width, const std::uint32_t expected_height) {
+    const MappedJpeg mapped = map_file(path);
+    validate_decodable(mapped.bytes(), expected_width, expected_height);
 }
 }  // namespace mmltk::backend::data::benchmark_internal
