@@ -8,6 +8,9 @@
   package outputs, generated bindings, caches, and build timing.
 - [Commands](commands.md): wrapper operations, native CLI, desktop options,
   and model tooling.
+- [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
+  training and EMA, checkpoint resume, saved plots, evaluation metrics and
+  samples, and incremental image/video prediction.
 
 ## Architecture and frameworks
 
@@ -22,17 +25,17 @@
 ## Data and backend systems
 
 - [Datasets and compilation](datasets.md): source annotations, the compiled
-  binary format, loading, batch leases, and Explore thumbnail/atlas retention
-  through viewport and augmentation changes.
+  binary format, optional perceptual downscaling, loading, batch leases, and
+  Explore thumbnail/atlas retention through viewport and augmentation changes.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
-  H2D and GDRCopy, Vulkan allocation and CUDA import, provider capture, and
-  capability inspection.
+  H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
+  CUDA import, provider capture, and capability inspection.
 
 ## Engineering, validation, and operations
 
 - [Validation](validation.md): tidy, cleanup, test selection, standalone
-  CUDA/Vulkan diagnostics, rendered layout/input and retained browser acceptance,
-  evidence, and debugging.
+  CUDA/Vulkan and native-link diagnostics, rendered workflow/layout/input and
+  retained browser acceptance, evidence, and debugging.
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,
   input seat, readiness, deadlines, shutdown, and artifacts.
 - [Logging](logging.md): explicit diagnostic activation, pixel probes, artifact

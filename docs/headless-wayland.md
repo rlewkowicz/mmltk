@@ -8,6 +8,7 @@ GPU-rendered Weston output:
 ```sh
 ./mmltk --test workspace-wayland --headless-compositor
 ./mmltk --test workspace-wayland --headless-compositor -- workspace_wayland_retained
+./mmltk --test workspace-wayland --headless-compositor -- workspace_wayland_workflows
 ```
 
 Omit `--headless-compositor` to use the existing visible host Wayland session.
@@ -15,6 +16,13 @@ The headless option creates a cached validation image from the exact packaged
 runtime image. It installs pinned Weston packages, a Wayland inspection client,
 and a validation-only input-seat module compiled in the build image. It does
 not rebuild or replace the packaged application or Firefox.
+
+The [workflow case](validation.md#packaged-wayland-acceptance) runs real local
+training through the packaged sibling CLI, evaluation with six retained
+samples, and compiled/image/video prediction. It requires actual canvas
+observations for charts and image viewers in addition to typed operation
+completion and physical graphics settlement. It uses the same private
+compositor and progress deadlines as other packaged acceptance.
 
 Two focused checks avoid building the native acceptance graph:
 

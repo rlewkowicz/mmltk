@@ -57,6 +57,11 @@ reconstructs its runtime when the relevant saved device, placement, or
 transport configuration changes. GDRCopy selection has no automatic transport
 fallback.
 
+Train, Validate, and Predict hide the H2D/NUMA widgets; their saved settings,
+desktop startup overrides, and native execution remain supported. Explore
+retains its controls. GUI prediction's fixed batch size 1 is independent of
+transport selection.
+
 The GPU framework builds its private static GDRCopy library from
 `third_party/gdrcopy`. Runtime notices install under
 `/opt/mmltk/share/mmltk/licenses/gdrcopy`. It can use an available `/dev/gdrdrv`
@@ -68,6 +73,29 @@ mapped allocation.
 `MMLTK_GDR_TRACE_FILE` enables mapped-buffer JSONL diagnostics and is forwarded
 with host-path rewriting. `MMLTK_NUMA_TRANSFER_TRACE_FILE` provides the separate
 NUMA transfer trace. See [logging](logging.md) for joining captured identities.
+
+## Checkpoint and export readbacks
+
+[TensorReadbackBuffers](../src/backend/ml/cuda/tensor_readback.h) owns reusable
+ordinal-addressed storage for one immutable serialization snapshot. It reserves
+the next complete tensor inventory before staging. CUDA sources use pinned
+GPU-local host storage and per-device streams; copies complete before CPU
+archive or export readers consume them. Those readers release their views
+before storage is reused. Checkpoint saves share the ordinary/EMA snapshot
+across their artifacts; enabled EMA updates themselves stay on the GPU.
+
+The shared [Torch stream boundary](../src/backend/ml/cuda/detail/torch_cuda_scope.cpp)
+establishes a driver context before pinned-host or tensor work on a newly
+started thread, including reuse after Torch's stream tables already exist.
+The [image context owner](../src/frameworks/gpu/image_buffer.cpp) balances
+isolated-context creation's stack entry before ordinary binding and retirement.
+Context identity and physical completion, rather than a reported device index
+alone, govern safe resource use.
+
+Optional perceptual resizing has a separate reusable CUDA owner with explicit
+source/destination custody and bounded workspace. Its color, geometry, and
+CPU/CUDA contracts are documented with
+[dataset resizing](datasets.md#optional-perceptual-downscaling).
 
 ## Shared-workspace interoperability
 

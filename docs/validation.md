@@ -67,7 +67,7 @@ Native selections configure the cached Release graph by default, explicitly
 build selected test targets, and run their executables. Current targets can be
 Ninja no-ops. `--config dev` selects the development graph where supported.
 The browser-app suite owns the GUI graph, direct JavaScript-module tests, and
-its Cargo test target.
+Cargo tests for the browser app and vendored `iced_plot` workspace member.
 
 These are first-party application suites. `browser-runtime` exercises desktop
 startup and process ownership with fixtures; `workspace-wayland` runs the
@@ -82,7 +82,7 @@ packaged application. Neither is a Firefox-specific test runner.
 | `core` | Core acceptance, dataset, model catalog, system/concurrency, CLI, and tool tests |
 | `rfdetr` | Native RF-DETR model, training, inference, export, CUDA, and layer suites |
 | `rfdetr-profile` | Instrumented training profile runner; selects `dev` |
-| `browser-app` | Rust/Iced protocol, state, transport, image-custody, and integration-driver tests, plus direct JavaScript adapter tests |
+| `browser-app` | Rust/Iced protocol, workflow state, plots, transport, image-custody, and integration-driver tests, vendored `iced_plot` tests, plus direct JavaScript adapter tests |
 | `workspace-wayland` | Packaged Firefox/NVIDIA hardware acceptance |
 | `cuda-vulkan` | Standalone CUDA/Vulkan allocation, FD, timeline, pixel, and exporter-exit diagnostic |
 | `headless-compositor` | Real NVIDIA Weston availability and protocol checks |
@@ -164,6 +164,39 @@ always runs in full, even when Cargo receives a test filter.
 `headless-compositor-tool`, `log-query-tool`, and `cleanup-tool` own their
 fixture invocations and reject extra arguments and native test options.
 
+## Native symbol and link diagnostics
+
+```bash
+./mmltk --diagnose-native-symbols --help
+./mmltk --diagnose-native-symbols --match RgbImageResizer --limit 30 \
+  .cache/cmake/release/src/backend/data/libmmltk_backend_data.a
+./mmltk --diagnose-native-link --help
+./mmltk --diagnose-native-link mmltk
+```
+
+These standalone operations require the existing development image and a
+running Docker daemon. Both have a 120-second deadline and use no GPU or
+network; neither builds/pulls an image. Symbol inspection is read-only and uses
+GCC's archive-aware `gcc-nm`. It accepts repository `.a`/`.o` paths, a regular
+expression over symbol records, `--mangled` for linker names, and a bounded
+`--limit` (default 200, range 1–10000). JSONL contains symbol records and a final
+matched/emitted/exit-status summary.
+
+The link diagnostic reads the existing `.cache/cmake/release` Ninja executable
+rule, then repeats that direct GCC link into a unique
+`build/diagnostics/native-link.*` directory. Use the generated executable output
+name, such as `mmltk`, rather than its phony CMake alias. It saves
+`command.json`, `link.map`, `link.d`, the diagnostic executable, and available
+LTO intermediates. The checkout/build graph stays read-only; the packaged
+executable is not replaced or run.
+
+`--trace-symbol SYMBOL` is repeatable and takes mangled names.
+`--linker-directory DIR` selects a repository-contained directory with
+`ld.mold`. This performs real linking, so use it only in the permitted
+validation/diagnosis stage. Sources:
+[diagnose_native_symbols.py](../tools/diagnose_native_symbols.py) and
+[diagnose_native_link.py](../tools/diagnose_native_link.py).
+
 ## Standalone CUDA/Vulkan diagnostic
 
 ```bash
@@ -231,7 +264,7 @@ The private path adds a
 GPU-rendered Weston output and retains the same product assertions.
 Build the package first with `./mmltk --build`.
 
-The wrapper enumerates and verifies the six registered hardware entrypoints
+The wrapper enumerates and verifies the seven registered hardware entrypoints
 before executing the requested selection. Use one comma-separated Catch2
 filter to select alternatives, as above. The executable also contains
 standalone evidence-audit cases.
@@ -239,13 +272,14 @@ standalone evidence-audit cases.
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
 | `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
+| `workspace_wayland_workflows` | One H2D browser: actual Train start and hidden-tab progress, rendered chart data, validation metrics and six sample/detail previews, compiled/image/video prediction, Pause/Resume/EOF/Stop, light/dark and minimum-width chart pixels, then SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: light/dark copy and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
 | `workspace_wayland_quiet` | Two H2D browsers: blocked reads and a completed gesture with diagnostics/reporting/probes inactive |
 | `workspace_wayland_gdr` | One optional GDR browser; unavailable hardware remains an explicit skip |
 
-This is ten required H2D lifetimes and one independently optional GDR lifetime.
+This is eleven required H2D lifetimes and one independently optional GDR lifetime.
 Compatible scenarios reuse a browser; startup-latched DPI, transport, and
 fault settings and destructive exits retain separate lifetimes. Window-close
 coverage enables lifecycle diagnostics with pixel probes off. Quiet coverage
@@ -260,6 +294,18 @@ through normal UI messages, and waits for those operations before reopening.
 It resets scenario-local expectations while retaining physical allocations,
 claims, and release history. The primary compile workflow owns a private
 output directory; other lifetimes reuse prepared source and compiled assets.
+
+The workflow case uses
+[native model/video fixtures](../src/acceptance/tests/workflow_wayland_inputs.cpp)
+and the real packaged desktop's sibling CLI, prediction, and validation systems.
+Its [frontend workflow driver](../src/frontend/iced/src/integration_control/workflows.rs)
+uses normal primary actions and viewers. It separately requires typed terminal
+stages and canvas pixel observations for Train curves, all six thumbnails,
+detail, each prediction source, retained Stop output, and theme/narrow layouts.
+It checks the absence of Train's native image workspace and Train/Validate
+aspect selectors. Sparse chart markers preserve missing intervals; axes and
+legends alone cannot satisfy the curve-pixel assertion. These functional
+checks do not establish numerical overhead or throughput.
 
 Explore acceptance follows actual measured N/N+1/N visible-row changes,
 forward/reverse demand, exact cached cells, and an independently held visible
@@ -349,14 +395,23 @@ sessions retain ordinary clipboard permissions.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, rejection, and cancellation |
+| `mmltk_controller_data_compute_systems_tests` | Start/input admission, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
 | `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Retained thumbnail identity and viewport priority, augmentation refresh with paired meaning, allocation-local atlas rollback, independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, receiver/device transfers, acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, and independent prepared/released artifacts |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
-| `browser-app` | Shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
-| `workspace-wayland` | Actual packaged interaction, integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, rendered pixels, recovery, and shutdown |
+| `browser-app` | Primary-action preparation, retained chart summaries/gaps and plot picking cancellation, validation viewer and video-control admission, shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
+| `workspace-wayland` | Real training/validation/prediction workflows and actual chart/sample/preview pixels, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
+
+RF-DETR backend evidence is separately owned by the core evaluator/matcher/class
+layout cases, training checkpoint/continuation/EMA/telemetry cases, inference
+session/JSON cases, and ML CUDA readback/context cases selected by `--test rfdetr`.
+`mmltk_backend_data_tests` owns the independent CPU/CUDA perceptual-resampling
+and exact compiled-catalog cases selected by `--test core`. These checks cover
+functional values, boundaries, failure, and custody; they do not substitute for
+the real rendered workflow case.
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
 The source/CMake registrations and wrapper inventory define executable

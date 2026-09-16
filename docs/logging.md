@@ -10,6 +10,11 @@ collection, formatting, clock reads, counter updates, and I/O. Application
 state, ordered input, resource custody, and physical completion still work.
 Diagnostic identities never determine their behavior.
 
+Training run history and incomplete-history notices are product output,
+independent of diagnostic activation. `run.json`/`metrics.jsonl`, progress
+projections, and their writer/reader ownership are documented in
+[saved history](rfdetr-workflows.md#saved-history-and-plots).
+
 | Explicit setting | Effect |
 | --- | --- |
 | `MMLTK_LOG_LEVEL`, `MMLTK_LOG_FILE`, `MMLTK_LOG_DIR` | Native application logging to stderr and a rotating file |
@@ -219,6 +224,10 @@ record UI interaction and pixels separately from physical resource custody:
 | `integration.number_replace`, `integration.number_paste`, `integration.number_key_stage` | Synthetic focus, selection, modifier, and key-delivery stages; delivery alone does not prove native persistence |
 | `integration.annotation_layout`, `integration.annotation_reachable`, `integration.annotation_tail` | Shared columns, wide/narrow viewport behavior, fully revealed controls, and long-list final entries |
 | `integration.annotation_pixel` | Native geometry/palette expectation and actual canvas pixel at the current image scale |
+| `integration.workflow.completed` | Typed Train, Validate, compiled/image/video Predict, Stop, theme, and narrow-layout stage completion |
+| `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for chart, validation atlas/detail, and prediction stages; image captures retain the expected source/presentation revisions |
+| `integration.metric_projection` | Finite sample count, connected-segment count, and total projected entries for a Train curve |
+| `integration.workflow.plot_evidence` | On failed curve visibility, a bounded 64×36 RGBA overview from the same captured canvas snapshot |
 
 ```bash
 ./mmltk --logs --family latest-wayland-test \
@@ -227,7 +236,19 @@ record UI interaction and pixels separately from physical resource custody:
 ./mmltk --logs --family latest-wayland-test \
   -q '@event:integration.atlas_resize OR @event=integration.atlas_ready_cell' \
   --format jsonl --limit 40
+./mmltk --logs --family latest-wayland-test \
+  -q '@event:integration.workflow OR @event=integration.metric_projection' \
+  --format jsonl --limit 60
 ```
+
+Workflow chart sampling checks a middle strip away from the legend and vertical
+axis and counts saturated curve pixels. Image sampling requires the current
+draw identity and visible geometry; stale asynchronous captures are retried
+within the driver bound. A typed completion, finite metric, or allocated chart
+buffer does not prove pixels were drawn. The workflow case requires both
+semantic completion and actual canvas observations. A sparse chart can
+legitimately have finite samples but no connected segments when records are
+missing; its markers preserve those observations without joining gaps.
 
 Atlas canvas sampling uses one snapshot of the current canvas. For each ready
 tile, its interior is intersected with the actual draw clip; at most nine

@@ -24,9 +24,12 @@ whose file contains no instance lines. Each selected split must be nonempty.
 
 ## Category table
 
-`categories.json` needs a nonempty `classes` array. IDs must be unique, dense,
-and start at zero or one; names must be unique. The compiler normalizes class
-IDs internally. For example:
+`categories.json` needs a nonempty `classes` array with at most 256 entries.
+IDs must be unique, dense, and start at zero or one; names must be unique,
+nonempty, NUL-free, and at most 31 bytes. The compiler rejects names that would
+require truncation in format 7. It normalizes source IDs into the immutable
+ordered foreground [class catalog](rfdetr-workflows.md#class-identity-and-model-admission).
+For example:
 
 ```json
 {
@@ -210,6 +213,10 @@ Supplying width without height makes the target square. The RF-DETR-specific
 `rfdetr compile` command handles its train/validation dataset preparation;
 consult its own help for model-specific dimensions and options.
 
+`rfdetr compile` accepts `--perceptual-downscale`. The GUI exposes the same
+optional choice with its compilation controls; the root `compile` command
+retains its existing option surface.
+
 To measure actual loading rather than inspect metadata:
 
 ```bash
@@ -219,6 +226,40 @@ To measure actual loading rather than inspect metadata:
 This benchmark reads data and performs loader work.
 `./mmltk --diagnose-io ./compiled/train.bin` is a separate read-only capability
 inspection that does not read dataset contents or benchmark transfers.
+
+## Optional perceptual downscaling
+
+Compilation and GPU augmentation each expose an independent
+`perceptual_downscale` setting, false by default. RF-DETR CLI compilation uses
+`--perceptual-downscale`; training augmentation uses
+`--aug-perceptual-downscale` alongside enabled GPU augmentation. The normal
+resizing path and its pixels remain unchanged when the option is off.
+The option affects shrinking RGB pixels, not categorical masks, boxes, class
+identity, letterbox geometry, or compiled format 7.
+
+[RgbImageResizer](../src/backend/data/image_resize.h) owns CPU execution and
+[GpuPerceptualDownscaler](../src/backend/data/image_resize_cuda.h) owns reusable
+CUDA workspace. Both implement the SSIM local-moment method attributed in
+[perceptual_downscale_math.h](../src/backend/data/detail/perceptual_downscale_math.h).
+They accept checked RGB8, straight-alpha RGBA8, or planar unit-sRGB float views
+with explicit byte strides and capacities. sRGB is decoded once, the filter
+works in linear-light Y/Cb/Cr, and the output is encoded once. RGBA filtering
+uses premultiplied linear color and area-averaged alpha, with safe
+unpremultiplication. Nonfinite/out-of-range float samples clamp deterministically.
+
+The checked downscale operation rejects enlargement and overlapping nonidentity
+views; an identity copy is exact. The ordinary CPU resize entrypoint retains
+its established enlargement path. CUDA callers supply the execution context,
+stream, producer dependencies, and exact source/destination custody. Tables
+and tightly sized working buffers are reused; cross-stream reuse follows GPU
+completion, and capacity pressure is bounded. The augmentation owner prepares
+configuration changes transactionally before admitting the new execution.
+
+Compilation records the selected resampling policy in its benchmark compilation
+facts without changing downloaded source-cache identity. Recompile when changing
+the policy; an existing `.bin` already contains its transformed pixels.
+Perceptual downscaling can emphasize noise and makes no detector-accuracy or
+measured performance claim.
 
 ## Loading a compiled file
 

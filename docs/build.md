@@ -36,6 +36,10 @@ The build publishes the canonical bundle at `build/browser-app/dist`; every
 location. A missing or incompatible bundle fails launch, so rebuild after a
 native contract change.
 
+Desktop startup resolves the native CLI beside `mmltk-browser-host` and gives
+that executable to the training process owner. Keep both installed siblings in
+the package; a browser bundle alone cannot supply local training.
+
 `./mmltk --build-gui` formats/checks the owned Iced frontend and rebuilds only
 the browser bundle in the GUI graph. It can be followed by `--gui` in the same
 invocation. Native host and Firefox changes still require the full
@@ -54,12 +58,20 @@ unsupported-host override. GCC 14 is confined to the GCC 16.2 bootstrap.
 Explicit ONNX, simdjson, and cppcheck source builds use GCC 16.2 while retaining
 their configured language policies. Vendored dependencies keep their own
 policies; Firefox retains its cached Clang toolchain and bootstrap sysroot.
+The owned `third_party/iced_plot` crate supplies retained Train charts through
+the frontend Cargo workspace. Its Rust, manifest, and WGSL sources participate
+in browser bundle invalidation.
 
 [CMakeLists.txt](../CMakeLists.txt) requires exactly CMake 4.4.3.
 [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake) enforces compiler paths
 and versions; [CMakePresets.json](../CMakePresets.json) defines the graphs.
 First-party native links and owned Firefox links use mold; the Iced browser
 artifact targets WebAssembly.
+Ordinary host and CUDA host code use function/data sections for the native
+garbage-collecting link. Release C/C++ uses the configured IPO policy.
+The [native link diagnostics](validation.md#native-symbol-and-link-diagnostics)
+inspect existing objects and repeat one generated link without replacing the
+Release artifact.
 Core compilation uses ccache; Firefox retains its canonical objdir, Cargo
 dependency information, and sccache.
 The container supplies Rust, `wasm32-unknown-unknown`, Trunk, wasm-bindgen,
@@ -110,6 +122,7 @@ These are the default repository-local locations:
 | `.cache/tests/rfdetr` | RF-DETR test assets and derived artifacts |
 | `build/release`, `build/browser-app` | Staged package and canonical browser bundle |
 | `build/validation`, `build/logs` | Acceptance evidence and build/analysis logs |
+| `build/diagnostics` | Wrapper-owned capability, standalone GPU, and native-link diagnostic artifacts |
 
 `MMLTK_CACHE_ROOT` may select a subtree of `.cache`; `MMLTK_RELEASE_STAGE_ROOT`
 must remain below `build`. The wrapper rejects overlapping checkout/cache-root

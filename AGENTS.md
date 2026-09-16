@@ -321,7 +321,7 @@ validation.
 
 - The main agent runs these ordered stages: full tidy, full build, every
   applicable cleanup profile, full tidy, cleanup review/remediation, final full
-  build, focused tests/acceptance, one final tidy and build. Cleanup never
+  build, focused tests/acceptance. Cleanup never
   precedes successful initial tidy/build or follows the final build; tests
   require that final build to pass.
 - Both builds use `./mmltk --build`. Both tidy passes use the complete

@@ -35,6 +35,47 @@ Those lists grow with the page's vertical content; Annotate has no separate
 compact layout or nested inspector, object, or class scroll area. Viewer and
 editor widget identities survive ordinary layout and native-state updates.
 
+## Training, validation, and prediction
+
+Train uses an ordinary retained Iced plot in the center column, fixed to 16:9.
+It has no native GPU image workspace or aspect selector. Its Output card opens
+current-format saved history, pages through records, inspects checkpoints, and
+prepares resume. Advanced includes **Exponential moving average**, disabled by
+default, and separate augmentation/perceptual-downscaling settings. The
+[workflow reference](rfdetr-workflows.md) owns the metric conventions, current
+file formats, and continuation requirements.
+
+Validate preserves the outer setup/status columns and divides the center
+equally between metrics and sample viewing. Its micro atlas always has three
+columns and two rows, with explicit empty cells when fewer samples exist.
+Opening one sample uses its paired displayed identity and the shared
+fit/pan/zoom viewer. Prediction and ground-truth labels are separate local
+controls; their box/mask controls request native recomposition of retained
+samples. Validate has no workspace aspect selector.
+
+Predict offers compiled-dataset, single-image, and local-video inputs, a preview
+threshold, optional output JSON, and video Pause/Resume/Stop. It retains the
+workspace aspect selector. Every GUI prediction request uses batch size 1;
+there is no batch-size field on this page. Train, Validate, and Predict hide
+H2D/NUMA controls while preserving the generated settings and backend support.
+Explore retains its loading controls.
+
+The primary action retains one preparation request across settings settlement,
+model selection/preparation, and native start. Changing its inputs or leaving
+the workflow cancels an unstarted request. Repeated clicks do not create
+duplicate starts. Progress shows the preparation stage and then the owning
+operation's completed work; unknown totals stay indeterminate. Video controls
+use the same pending-system admission as their typed requests, including an
+event arriving before its reply.
+
+The [metrics component](../src/frontend/iced/src/view/metrics.rs) keeps bounded
+extrema-preserving summaries and retained plot/series objects. Navigation keeps
+useful chart state; hidden views do not rebuild geometry. Sequence gaps,
+unavailable values, and new attempts break lines, while isolated points remain
+visible as markers. Vendored
+[plot picking](../third_party/iced_plot/src/picking.rs) bounds pending GPU
+readbacks and settles cancellation without reusing an unsettled mapping.
+
 ## Numeric editing
 
 Application integer inputs omit increment/decrement buttons and ignore wheel
@@ -191,7 +232,7 @@ preview whose bounds truncate to empty integer raster coverage skips just the
 outline; the gesture, mask content, selection, and damage processing remain
 valid.
 
-All five visual systems use the shared
+All six visual producers use the shared
 [VisualRuntimeOwner](../src/controller/presentation/detail/visual_runtime_owner.h).
 Content/input changes, workspace admission, and actual GPU/storage completion
 wake dirty work. Clean and semantic planes, allocation-local damage, geometry,
@@ -220,12 +261,15 @@ Each visual producer owns its raw processing products and display preparation:
 | --- | --- | --- |
 | [Explore](../src/controller/subsystems/explore/native_explore_algorithm.cpp) | Individual thumbnail cache, gallery clean/semantic atlas, and separate detail document/product | Fused clean/semantic finalization; changed atlas regions update the matching workspace |
 | [Annotation](../src/controller/subsystems/annotation/native_annotation_algorithm.cpp) | Receiver-owned clean baseline and clean/semantic output from the input owner's immutable document description | Fused finalization after native raster work |
-| [Predict](../src/controller/subsystems/system/compute_systems.cpp) | Uploaded prediction pixels and a rasterized box plane | Fused finalization in the prediction visual runtime |
+| [Predict](../src/controller/subsystems/system/predict_system.cpp) | Latest prediction pixels with retained boxes, masks, class meaning, and receiver-owned preview storage | Fused finalization in the prediction visual runtime |
+| [Validate](../src/controller/subsystems/validate/detail/validation_samples.cpp) | Up to six selected sample products with prediction/ground-truth meaning and retained atlas/detail selection | Fused composition into reusable atlas/detail output |
 | [Live](../src/controller/subsystems/live/native_live_algorithm.cpp) | Media composite output lease and a clean system output | The existing media receiver copy writes the system output; admitted same-device output uses final workspace storage directly |
 | [Upscale](../src/controller/subsystems/upscale/upscale_system.cpp) | Receiver-owned clean/semantic input, transformed document, and cached derived products | Fused finalization of the selected retained result |
 
 The retained product pool has three slots for Explore, four for Upscale, and
-two each for Annotation, Predict, and Live. These raw pools include inactive
+two each for Annotation, Predict, Validate composition, and Live. Validation's
+selected raw samples have separate custody from its two composed outputs.
+These product pools include inactive
 gallery/detail/derived results. The foreground graphics binding separately owns
 two persistent display buffers. Selection reuses that pair; growth or device
 replacement may temporarily retain old buffers until their readers settle.

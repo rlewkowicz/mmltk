@@ -28,16 +28,21 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
 | `./mmltk --diagnose-gpu-program SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic using existing images |
 | `./mmltk --diagnose-nvidia-payload donor\|development HEADER...` | Inspect public NVIDIA headers and payload selection |
+| `./mmltk --diagnose-native-symbols [OPTIONS] ARTIFACT...` | Inspect cached native `.a`/`.o` symbols with the existing development image |
+| `./mmltk --diagnose-native-link [OPTIONS] TARGET` | Repeat one generated Release link into separate diagnostic storage |
 
 The `|` entries above mean choose one value; they are not shell pipelines.
 Build, test, tidy, cleanup, export, and diagnostics are separate operations.
 Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
-`--diagnose-gpu-environment`, `--diagnose-gpu-program`, or `--cleanup-report`
+`--diagnose-gpu-environment`, `--diagnose-gpu-program`, `--diagnose-native-symbols`,
+`--diagnose-native-link`, or `--cleanup-report`
 first when invoking that standalone operation.
 
 The [validation guide](validation.md#standalone-cudavulkan-diagnostic) owns
 CUDA/Vulkan cases and argument meanings; [logging](logging.md) owns query,
-Vulkan-message, and descriptor-lineage examples.
+Vulkan-message, and descriptor-lineage examples. See
+[native link diagnostics](validation.md#native-symbol-and-link-diagnostics)
+for symbol filters, linker maps, and saved LTO intermediates.
 
 ## Native CLI
 
@@ -51,6 +56,8 @@ wrapper operations. Commands expose their own reflected argument help:
 ./mmltk rfdetr --help
 ./mmltk rfdetr train --help
 ./mmltk rfdetr predict --help
+./mmltk rfdetr evaluate --help
+./mmltk rfdetr validate --help
 ```
 
 The wrapper prevents raw native CLI invocation while its GUI is active,
@@ -74,6 +81,17 @@ For example, with existing input artifacts:
 ```
 
 See [datasets](datasets.md) for compilation and annotation requirements.
+`rfdetr compile --perceptual-downscale` selects optional perceptual shrinking;
+training exposes the independent `--aug-perceptual-downscale` option.
+Training also exposes `--use-ema`/`--no-ema` and `--resume`. Model-input commands
+accept `--class-layout` for a digest-bound class descriptor.
+`rfdetr predict` accepts repeatable `--image` inputs as an alternative to
+`--compiled`, and retains CLI batch-size selection. Local video belongs to the
+GUI prediction workflow. `rfdetr evaluate` selects one backend; `rfdetr validate`
+retains its ordered multi-backend report path. The
+[workflow/artifact reference](rfdetr-workflows.md) explains these distinctions,
+current checkpoints, metrics, and saved history.
+
 The native CLI also accepts `--log-level`, `--log-file`, and `--log-dir`.
 See [logging activation](logging.md#activation-and-quiet-execution), especially
 for ONNX metadata commands whose output requires explicit diagnostics.

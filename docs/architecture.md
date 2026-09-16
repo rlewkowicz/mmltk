@@ -27,10 +27,25 @@ retained modules, links, and tests. Native executable targets install as
 ## Native domain work
 
 `src/controller/subsystems/` contains product systems. Dataset/model and
-compute systems are grouped under `system/`; training, annotation, Explore,
-Live, and Upscale have their own implementation directories. Shared settings,
+prediction systems are grouped under `system/`; training, validation, export,
+annotation, Explore, Live, and Upscale have their own implementation directories. Shared settings,
 file dialogs, external-provider access, Firefox process ownership, and
 diagnostics live under `src/controller/services/`.
+
+| Workflow owner | Implementation and handoff |
+| --- | --- |
+| [TrainingSystem](../src/controller/subsystems/train/training_system.cpp) | Starts the sibling CLI through `TrainProcessClient`, owns run inspection/history through `TrainRunStore`, and admits checkpoint resume |
+| [ValidationSystem](../src/controller/subsystems/validate/validation_system.cpp) | Owns the selected evaluation session, detailed result pages, and retained samples through `ValidationSamples` |
+| [PredictSystem](../src/controller/subsystems/system/predict_system.cpp) | Owns incremental prediction, video playback control, and latest preview products |
+| [ExportSystem](../src/controller/subsystems/export/export_system.cpp) | Owns model export and engine preparation |
+
+[RF-DETR workflows](rfdetr-workflows.md) owns model/class admission, metrics,
+checkpoint and history formats, and prediction behavior. Canonical
+[training](../src/backend/models/rfdetr/contract/training_metrics.h) and
+[evaluation](../src/backend/models/rfdetr/contract/evaluation_metrics.h)
+declarations generate the browser payloads. The backend's
+[catalog](../src/backend/data/catalog/class_catalog.h) supplies immutable class
+identity independently of model execution.
 
 Annotation's [input executor](../src/controller/subsystems/annotation/annotation_system.cpp)
 owns the mutable document and ordered history through
@@ -110,8 +125,12 @@ the shared native queue is
 [src/controller/presentation](../src/controller/presentation) contains native
 source selection, workspace admission/publication, shared visual-worker
 support, and visual diagnostics. Final display products belong to Explore,
-Annotation, Predict, Live, and Upscale. Predict's implementation is in
-[compute_systems.cpp](../src/controller/subsystems/system/compute_systems.cpp).
+Annotation, Predict, Validate, Live, and Upscale. Predict's implementation is in
+[predict_system.cpp](../src/controller/subsystems/system/predict_system.cpp).
+
+Validation adds its own retained atlas/detail producer through
+[validation_samples.cpp](../src/controller/subsystems/validate/detail/validation_samples.cpp).
+Train's charts are ordinary Iced drawing and use no native image workspace.
 
 [VisualRuntimeOwner](../src/controller/presentation/detail/visual_runtime_owner.h)
 runs dirty work and completion continuations on each producer's worker.
@@ -158,6 +177,16 @@ one home. The [logging guide](logging.md) explains diagnostic activation and
 how captures connect these boundaries. Frontend acceptance control lives in
 `integration_control.rs`; its private `integration_control/reporting.rs`
 owns effect-only collection and reporting.
+
+The retained Train plotting component is
+[view/metrics.rs](../src/frontend/iced/src/view/metrics.rs), using the owned
+[iced_plot](../third_party/iced_plot) crate. Validation's
+[results](../src/frontend/iced/src/view/validate/results.rs) and
+[samples](../src/frontend/iced/src/view/validate/samples.rs) components own their
+local UI interactions. The primary-action preparation state belongs to
+[app/workflows.rs](../src/frontend/iced/src/app/workflows.rs); native runtime
+execution remains with each system. The real-model acceptance scenario has its
+own [workflow driver](../src/frontend/iced/src/integration_control/workflows.rs).
 
 ## Tests and vendor changes
 

@@ -6,25 +6,25 @@ product outcomes. Implementation and action plans converge toward it.
 
 ## Application shape
 
-`ApplicationShell` constructs and connects the application:
+The application shell constructs and connects independent product systems:
 
 ```text
-ApplicationShell
-├─ BrowserServer
-├─ SettingsSystem
-├─ FileDialogSystem
-├─ DatasetSystem
-├─ ModelSystem
-├─ TrainingSystem
-├─ ValidationSystem
-├─ ExportSystem
-├─ PredictSystem
-├─ ExploreSystem
-├─ AnnotationSystem
-├─ UpscaleSystem
-├─ LiveSystem
-├─ PresentationSystem
-└─ FirefoxProcessOwner
+Application shell
+├─ Browser server
+├─ Settings
+├─ File dialogs
+├─ Dataset compilation and inspection
+├─ Model selection and preparation
+├─ Training
+├─ Validation
+├─ Export
+├─ Prediction
+├─ Exploration
+├─ Annotation
+├─ Upscaling
+├─ Live capture
+├─ Presentation
+└─ Firefox process ownership
 ```
 
 Each product domain is an independent ordinary C++ system with a cohesive
@@ -39,24 +39,24 @@ bindings project native facts; mutation remains with the owning system.
 
 | Concept | Sole mutable owner |
 | --- | --- |
-| Application construction, connections, and shutdown request | `ApplicationShell` |
-| Local HTTP/WebSocket listener, active peer, transport queues, and backpressure | `BrowserServer` |
-| Application settings and their persistence | `SettingsSystem` |
-| Native file-dialog requests | `FileDialogSystem` |
-| Dataset compilation and artifact inspection | `DatasetSystem` |
-| Model selection, weight acquisition, and preparation | `ModelSystem` |
-| Local and remote training runs | `TrainingSystem` |
-| Validation runs and results | `ValidationSystem` |
-| Model export and engine preparation | `ExportSystem` |
-| Prediction runs and image products | `PredictSystem` |
-| Dataset exploration, preview products, and exploration work | `ExploreSystem` |
-| Editable annotation documents and editing history | `AnnotationSystem` |
-| Upscale work and derived image products | `UpscaleSystem` |
-| Live capture, processing, and image products | `LiveSystem` |
-| Foreground source routing, workspace admission, and graphics connection lifetime | `PresentationSystem` |
+| Application construction, connections, and shutdown request | Application shell |
+| Local HTTP/WebSocket listener, active peer, transport queues, and backpressure | Browser server |
+| Application settings and their persistence | Settings system |
+| Native file-dialog requests | File-dialog system |
+| Dataset compilation and artifact inspection | Dataset system |
+| Model selection, weight acquisition, and preparation | Model system |
+| Local and remote training runs, saved history, and continuation inspection | Training system |
+| Validation runs, metrics, and retained sample products | Validation system |
+| Model export and engine preparation | Export system |
+| Prediction runs and latest image products | Prediction system |
+| Dataset exploration, preview products, and exploration work | Exploration system |
+| Editable annotation documents and editing history | Annotation system |
+| Upscale work and derived image products | Upscale system |
+| Live capture, processing, and image products | Live system |
+| Foreground source routing, workspace admission, and graphics connection lifetime | Presentation system |
 | Navigation, drafts, modal visibility, scroll, selection, and typed event reduction | Rust presentation model and the component owning each UI fact |
 | Widgets, view transforms, styling, image metadata interpretation, and retained redraw images | Owning Rust/Iced components |
-| Firefox process lifetime and Linux process registrations | `FirefoxProcessOwner` |
+| Firefox process lifetime and Linux process registrations | Firefox process owner |
 | Vulkan source images, independent backing allocations, views, external timelines, browser sample storage, graphics queues, swapchain, compositor cadence, and Wayland presentation | Firefox graphics integration |
 
 Each domain system also owns its private workers, GPU resources, models, and
@@ -115,7 +115,7 @@ bindings and codecs. A schema change flows from that declaration through the
 boundary. Ordinary classes retain direct public contracts and private state;
 reflection supplies reusable structural machinery.
 
-At runtime, `BrowserServer` and the Rust presentation model exchange bounded,
+At runtime, the browser server and the Rust presentation model exchange bounded,
 typed CBOR over bidirectional WebSockets bound to the local application
 session. Rust verifies schema agreement before installing current native
 snapshots. Input is fully validated before dispatch. Transport queues and
@@ -141,6 +141,24 @@ dark themes, responsive workspaces, settings, diagnostics, and error surfaces.
 Progress appears with its owning operation or model. Known totals support
 determinate progress; open-ended work exposes stage, activity, and completed
 work. Completion and failure come from typed native results and events.
+
+Training, validation, and prediction start through their primary action,
+including required settings settlement, model preparation, and input inspection.
+Training owns current-format history and validated checkpoint continuation;
+Rust/Iced owns retained charts in a fixed 16:9 center region. Validation owns
+detailed metrics and up to six retained samples from its evaluation pass, with
+paired prediction/ground-truth geometry and a detail viewer. Prediction
+incrementally processes compiled images, ordinary images, and local video,
+retaining the latest completed preview through completion or cancellation.
+GUI prediction uses one image per batch; video has pause, resume, and stop.
+
+Training admits target populations above the model's query count while retaining
+the established assignment and loss semantics. Optional EMA remains GPU-resident;
+each scheduled validation and best-weight decision use one selected weight set.
+Metric publication and persistence progress independently of browser rendering
+and telemetry storage pressure, with incomplete history explicitly visible.
+Optional perceptual downscaling belongs to existing compilation and augmentation
+owners and preserves categorical annotations and their geometric transforms.
 
 Images and their annotation meaning share source identity and geometry through
 preview, augmentation, upscale, and editing. Clean pixels and native semantic
@@ -265,12 +283,11 @@ provenance. Unknown external identities remain visibly raw and cannot enter
 semantic evaluation. Artifact and descriptor identity is checked at admission
 and replacement, never per prediction.
 
-Fresh native training retains sigmoid outputs, one reserved trailing slot, and
-all-negative no-object supervision. Explicit background and unused slots are
-excluded before detection ranking. Fresh transfer maps verified class-dependent
-state by semantic identity while preserving unmatched initialized values; resume
-requires exact layout and state. Training splits share exact ordered catalogs;
-standalone evaluation admits an explicitly verified catalog permutation.
+Fresh transfer maps verified class-dependent state by semantic identity while
+preserving unmatched initialized values; resume requires exact layout and state.
+Training splits share exact ordered catalogs; standalone evaluation admits an
+explicitly verified catalog permutation. Background/no-object meaning belongs
+to the artifact's validated layout and never becomes a foreground detection.
 Prediction, analysis, annotation, and presentation preserve the declared reference
 domain and catalog with their owned data. Mask storage is consumed only when
 the current result explicitly declares masks available.
