@@ -28,15 +28,7 @@ add_library(
 mmltk_configure_component(
     mmltk_backend_models_rfdetr_core PUBLIC_DECLARATIONS)
 
-foreach(_mmltk_rfdetr_core_module IN ITEMS
-        model.cppm
-        artifact_resolution.cppm
-        dataset_limit_resolution.cppm
-        runtime.cppm
-        tool_launch_utils.cppm)
-    mmltk_register_retained_module_providers(
-        mmltk_backend_models_rfdetr_core "${_mmltk_rfdetr_core_module}")
-endforeach()
+mmltk_register_retained_module_providers(mmltk_backend_models_rfdetr_core dataset_limit_resolution.cppm)
 mmltk_register_public_headers(
     mmltk_backend_models_rfdetr_core
     BASE_DIRS ${CMAKE_SOURCE_DIR}
@@ -47,21 +39,23 @@ mmltk_register_public_headers(
         evaluation.h
         evaluator.h
         model_info.h
-        model_state.h)
+        model_state.h
+        model.h
+        model_state_load.h
+        runtime.h
+        detection_types.h
+        detection_ops.h
+        sample_output.h
+        execution_precision.h
+        postprocess.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_core detail/class_artifact_files.h)
 mmltk_register_header_isolation(mmltk_backend_models_rfdetr_core)
-mmltk_register_retained_module_implementation_units(
-    mmltk_backend_models_rfdetr_core
-    artifact_resolution.cpp
-    model.cpp
-    runtime.cpp
-)
+mmltk_register_retained_module_importers(mmltk_backend_models_rfdetr_core model.cpp runtime.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
     artifact_publication.cpp
     class_artifact.cpp
     class_layout.cpp
-    native_library_anchor.cpp
     python_checkpoint_bridge.cpp
     model_state.cpp)
 mmltk_register_retained_module_importers(
@@ -91,21 +85,10 @@ mmltk_register_private_headers(
     detail/traced_loss_cache.h
     detail/detr_matcher_cuda.h
     detail/detection_geometry.h
-    detail/detection_ops.h
-    detail/detection_types.h
-    detail/archive_utils.h
-    detail/draw.h
-    detail/execution_precision.h
     detail/mask_pack_cuda.h
-    detail/model_access.h
-    detail/model_state_access.h
-    detail/model_state_technical.h
     detail/class_tensor_axes.h
-    detail/model_technical.h
     detail/modules_technical.h
-    detail/postprocess.h
     detail/scipy_rectangular_lsap.h
-    detail/scalar_type_utils.h
     detail/training_mask_ops_cuda.h
     detail/training_mask_ops_cuda_launch.h
     detail/training_supervision.h
@@ -122,9 +105,7 @@ endif()
 
 target_include_directories(mmltk_backend_models_rfdetr_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
-    ${CMAKE_SOURCE_DIR}/src/backend/ml/layers/detail
-    ${CMAKE_SOURCE_DIR}/src/backend/ml/ops/detail
+
     ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
 )
 target_link_libraries(mmltk_backend_models_rfdetr_core
@@ -153,7 +134,7 @@ target_link_libraries(mmltk_backend_models_rfdetr_core
         nlohmann_json
         stb
 )
-mmltk_enable_torch(mmltk_backend_models_rfdetr_core PRIVATE)
+mmltk_enable_torch(mmltk_backend_models_rfdetr_core PUBLIC)
 if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
     mmltk_enable_python_checkpoint_loader(
         mmltk_backend_models_rfdetr_core PRIVATE)
@@ -190,8 +171,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
                 ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_fixture_support
             PRIVATE
                 ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
-                ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/detail
-                ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail)
+)
         target_link_libraries(
             mmltk_backend_models_rfdetr_checkpoint_test_support
             PUBLIC
@@ -218,10 +198,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         mmltk_backend_models_rfdetr_core_tests ${sources})
     target_include_directories(mmltk_backend_models_rfdetr_core_tests PRIVATE
         ${CMAKE_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail
+
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/detail
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(mmltk_backend_models_rfdetr_core_tests PRIVATE
         mmltk::backend::models::rfdetr::augmentation

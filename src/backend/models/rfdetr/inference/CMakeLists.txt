@@ -12,7 +12,7 @@ foreach(_mmltk_inference_module IN ITEMS
         rfdetr_analysis_provider.cppm
         rfdetr_runtime_backend.cppm
         predict.cppm
-        validation_support.cppm)
+        inference_loader.cppm)
     mmltk_register_retained_module_providers(
         mmltk_backend_models_rfdetr_inference "${_mmltk_inference_module}")
 endforeach()
@@ -21,7 +21,7 @@ mmltk_register_retained_module_implementation_units(
     rfdetr_analysis_provider.cpp
     rfdetr_runtime_backend.cpp
     predict.cpp
-    validation_support.cpp
+    inference_loader.cpp
 )
 mmltk_register_public_headers(
     mmltk_backend_models_rfdetr_inference
@@ -37,8 +37,7 @@ mmltk_register_retained_module_importers(
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_inference inference_preprocessor.h prediction_capacity.h prediction_raw_preparation.h dataset_batch_lease.h)
 target_include_directories(mmltk_backend_models_rfdetr_inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
-    ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail
+
 )
 target_link_libraries(mmltk_backend_models_rfdetr_inference
     PUBLIC
@@ -77,14 +76,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/class_layout_roundtrip.test.cpp)
     mmltk_configure_component(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE_DECLARATIONS)
-    target_include_directories(
-        mmltk_backend_models_rfdetr_inference_tests PRIVATE
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail)
-    target_include_directories(
-        mmltk_backend_models_rfdetr_inference_tests PRIVATE
-        ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail)
-    target_link_libraries(
+            target_link_libraries(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE
         mmltk_test_support
         mmltk_backend_data_test_support

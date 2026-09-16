@@ -1,3 +1,4 @@
+
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <ATen/Context.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -27,9 +28,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "detection_types.h"
-#include "mask_pack_cuda.h"
-#include "postprocess.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/detail/mask_pack_cuda.h"
+#include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/backend/data/dataset_loader.h"
 #include "detail/evaluation_runtime.h"
 #include "src/common/concurrency/event_cancellation.h"
@@ -37,8 +38,9 @@
 #include "src/common/concurrency/worker_pool.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/frameworks/gpu/cuda_error.h"
-#include "torch_api.h"
-#include "torch_cuda_utils.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
 import mmltk.backend.ml.cuda.gpu_quiescence;
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
@@ -64,7 +66,6 @@ using ::mmltk::backend::ml::cuda::checked_device_index;
 inline constexpr unsigned int kCudaEventDisableTiming = cudaEventDisableTiming;
 }  // namespace mmltk::backend::models::rfdetr::evaluator_detail
 namespace mmltk::backend::models::rfdetr {
-namespace torch_api = mmltk::backend::ml::torch_api;
 using evaluator_detail::checked_device_index;
 using evaluator_detail::cudaError_t;
 using evaluator_detail::cudaEvent_t;
@@ -175,7 +176,7 @@ struct SelectedPredictions {
     std::vector<Prediction> predictions;
     std::vector<int64_t> mask_source_indices;
 };
-SelectedPredictions select_predictions(int image_id, const torch_api::Tensor& scores, const torch_api::Tensor& labels, const torch_api::Tensor& boxes,
+SelectedPredictions select_predictions(int image_id, const torch::Tensor& scores, const torch::Tensor& labels, const torch::Tensor& boxes,
                                        size_t category_count, size_t max_dets_per_image) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_select_predictions{"rfdetr.native.eval.select_predictions"};
     const auto* score_ptr = scores.data_ptr<float>();
@@ -265,9 +266,9 @@ void PinnedBBoxPredictionBuffers::ensure_capacity(int64_t batch_count, int64_t p
     }
     batch_capacity = std::max<int64_t>(batch_capacity, batch_count);
     prediction_capacity = std::max<int64_t>(prediction_capacity, prediction_count);
-    scores_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity}, torch_api::kFloat32);
-    labels_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity}, torch_api::kInt64);
-    boxes_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity, 4}, torch_api::kFloat32);
+    scores_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity}, torch::kFloat32);
+    labels_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity}, torch::kInt64);
+    boxes_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity, 4}, torch::kFloat32);
 }
 void PinnedMaskPredictionBuffers::ensure_capacity(const int64_t batch_count, const int64_t prediction_count, const int64_t batch_capacity,
                                                   const int64_t prediction_capacity, const uint32_t height, const uint32_t width, const int device_id) {
@@ -284,8 +285,8 @@ void PinnedMaskPredictionBuffers::ensure_capacity(const int64_t batch_count, con
     mask_width = width;
     packed_mask_bytes = required_bytes;
     const std::vector<int64_t> packed_shape{batch_capacity, prediction_capacity, packed_mask_bytes};
-    masks_cpu = mmltk::backend::ml::cuda::numa_empty(packed_shape, torch_api::kUInt8, device_id);
-    masks_gpu = torch_api::empty(packed_shape, torch_api::TensorOptions().dtype(torch_api::kUInt8).device(torch_api::kCUDA, device_id));
+    masks_cpu = mmltk::backend::ml::cuda::numa_empty(packed_shape, torch::kUInt8, device_id);
+    masks_gpu = torch::empty(packed_shape, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, device_id));
 }
 void PinnedPredictionBuffers::ensure_ready_event(int device_id) {
     if (ready_event != nullptr && event_device_id == device_id) { return; }
@@ -305,7 +306,7 @@ void PinnedPredictionBuffers::transition(const PredictionSlotState expected, con
     }
 }
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
-StagedPredictionBatch stage_prediction_batch(std::vector<PredictionBatchMetadata> images, PostprocessedBatch batch, size_t category_count,
+StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count,
                                              size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_stage_prediction_batch{"rfdetr.native.eval.stage_prediction_batch"};
     if (!lease.buffers) { throw std::runtime_error("stage_prediction_batch requires a valid prediction buffer lease"); }
@@ -313,6 +314,7 @@ StagedPredictionBatch stage_prediction_batch(std::vector<PredictionBatchMetadata
         batch.boxes.dim() != 3 || batch.boxes.size(2) != 4) {
         throw std::runtime_error("staged prediction tensors must be scores[B,K], labels[B,K], and boxes[B,K,4]");
     }
+    const auto images = std::span{lease.buffers->images};
     const int64_t batch_count = mmltk::common::math::checked_cast<int64_t>(images.size(), "prediction batch size overflow");
     const int64_t prediction_count = batch.scores.size(1);
     if (batch_count <= 0 || batch.size() < batch_count || batch.labels.size(0) < batch_count || batch.labels.size(1) != prediction_count ||
@@ -347,7 +349,7 @@ StagedPredictionBatch stage_prediction_batch(std::vector<PredictionBatchMetadata
             box_view.copy_(batch.boxes.narrow(0, 0, batch_count), true);
         }
         if (batch.masks.has_value()) {
-            const torch_api::Tensor& source_masks = *batch.masks;
+            const torch::Tensor& source_masks = *batch.masks;
             if (source_masks.dim() != 4 || source_masks.size(0) < batch_count || source_masks.size(1) != prediction_count) {
                 throw std::runtime_error("predicted masks must be [batch,num_predictions,height,width]");
             }
@@ -534,8 +536,8 @@ inline int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int
 // Projects a loader batch onto the per-image metadata every prediction and evaluation path consumes.
 // Batch slot -> dataset index -> image id is one mapping; it lives here rather than being rebuilt at
 // each call site.
-std::vector<PredictionBatchMetadata> make_prediction_batch_metadata(const mmltk::backend::data::Batch& batch, const std::vector<int>& image_ids) {
-    std::vector<PredictionBatchMetadata> metadata;
+void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch, const std::vector<int>& image_ids) {
+    metadata.clear();
     metadata.reserve(batch.num_images);
     for (size_t image_index = 0; image_index < batch.num_images; ++image_index) {
         const auto dataset_index = static_cast<int64_t>(batch.image_indices[image_index]);
@@ -545,6 +547,22 @@ std::vector<PredictionBatchMetadata> make_prediction_batch_metadata(const mmltk:
             {},
         });
     }
-    return metadata;
+}
+mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle, int prefetch_factor,
+                                                               int gather_workers, const std::string& cpu_affinity, int device_id, uint64_t seed,
+                                                               uint32_t batch_shard_rank, uint32_t batch_shard_count) {
+    mmltk::backend::data::DatasetLoader::Config config;
+    config.compiled_path = std::filesystem::absolute(std::filesystem::path(compiled_path)).string();
+    config.batch_size = batch_size;
+    config.shuffle = shuffle;
+    config.prefetch_factor = prefetch_factor;
+    config.gather_workers = std::clamp(gather_workers, 1, prefetch_factor);
+    config.cpu_affinity = cpu_affinity;
+    config.device_id = device_id;
+    config.seed = seed;
+    config.batch_shard_rank = batch_shard_rank;
+    config.batch_shard_count = batch_shard_count;
+    config.drop_last = true;
+    return config;
 }
 }  // namespace mmltk::backend::models::rfdetr

@@ -1,4 +1,3 @@
-module;
 #include <ATen/Context.h>
 #include <ATen/Parallel.h>
 #include <atomic>
@@ -14,7 +13,7 @@ module;
 #include "src/common/system/execution_policy.h"
 #include "src/backend/models/rfdetr/core/detail/lsap_scratch.h"
 #include "src/backend/models/rfdetr/core/detail/matcher_workspace.h"
-module mmltk.backend.models.rfdetr.core.runtime;
+#include "runtime.h"
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr {
 namespace {

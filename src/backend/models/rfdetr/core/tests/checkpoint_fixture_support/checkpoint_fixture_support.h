@@ -1,5 +1,8 @@
 #pragma once
 #include <array>
+#include <vector>
+#include <utility>
+#include "src/backend/models/rfdetr/core/model_state.h"
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -7,6 +10,9 @@
 #include <string>
 #include "src/backend/models/rfdetr/core/class_layout.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
+inline void set_synthetic_model_state(DecodedNativeModelState& state, std::vector<NormalizedModelStateEntry> entries) {
+    state.replace_entries(std::move(entries));
+}
 struct ParityFixtureCase;
 // Synthetic fixture vocabulary is explicit test data, never artifact inference.
 [[nodiscard]] inline ModelClassLayout synthetic_training_layout(std::size_t foreground_count) {

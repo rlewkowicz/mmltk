@@ -1,3 +1,6 @@
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include <cuda_runtime.h>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -21,7 +24,7 @@
 #include <unordered_map>
 #include <system_error>
 #include <vector>
-#include "archive_utils.h"
+#include "src/backend/ml/torch/archive.h"
 #include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/cuda_test_utils.hpp"
@@ -35,19 +38,19 @@
 #include "detail/training_continuation.h"
 #include "training_continuation_fixture.h"
 #include "detail/target_builder_private.h"
-#include "model_access.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "model_state_fixture.h"
-#include "model_state_access.h"
+#include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/models/rfdetr/training/train.h"
 #include "src/backend/data/tests/test_fixture.h"
-#include "torch_api.h"
-#include "training_supervision.h"
-#include "detection_ops.h"
-import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
-import mmltk.backend.models.rfdetr.core.model;
-import mmltk.backend.models.rfdetr.training.checkpoint;
+#include <torch/types.h>
+#include <torch/serialize.h>
+#include "src/backend/models/rfdetr/core/detail/training_supervision.h"
+#include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "detail/gpu_augment_private.h"
+import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
+import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace mmltk::backend::models::rfdetr::test_support {
 struct GpuBatchAugmenterTestAccess final {
     static void FailCacheWait(GpuBatchAugmenter& owner) {
@@ -62,7 +65,6 @@ struct GpuBatchAugmenterTestAccess final {
 }  // namespace mmltk::backend::models::rfdetr::test_support
 namespace {
 namespace rfdetr = mmltk::backend::models::rfdetr;
-namespace torch_api = mmltk::backend::ml::torch_api;
 [[nodiscard]] c10::cuda::CUDAStream training_test_stream() {
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     return c10::cuda::getStreamFromPool(false, 0);
@@ -125,37 +127,37 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     config.denoising.groups = 7U;
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     readback.Begin();
-    const std::vector<rfdetr::NormalizedModelStateEntry> entries{{"backbone.weight", torch_api::ones({1})},
-                                                                 {"training_supervision.query_projection.weight", torch_api::ones({1})}};
+    const std::vector<rfdetr::NormalizedModelStateEntry> entries{{"backbone.weight", torch::ones({1})},
+                                                                 {"training_supervision.query_projection.weight", torch::ones({1})}};
     rfdetr::detail::reserve_state_archive(entries, readback, 0);
-    torch_api::OutputArchive output;
+    torch::serialize::OutputArchive output;
     rfdetr::detail::write_training_supervision_config(output, config);
     rfdetr::detail::write_state_archive(output, "state", entries, readback, 0);
     readback.Complete();
     output.save_to(path.string());
-    torch_api::InputArchive input;
+    torch::serialize::InputArchive input;
     input.load_from(path.string());
     REQUIRE((rfdetr::detail::read_training_supervision_config(input) == config));
-    torch_api::InputArchive resume_archive;
-    resume_archive.load_from(path.string(), torch_api::Device(torch_api::kCPU));
+    torch::serialize::InputArchive resume_archive;
+    resume_archive.load_from(path.string(), torch::Device(torch::kCPU));
     rfdetr::detail::require_resume_training_supervision_config(resume_archive, config);
     REQUIRE_THROWS(rfdetr::detail::require_resume_training_supervision_config(resume_archive, rfdetr::TrainingSupervisionConfig{}));
-    torch_api::InputArchive state;
+    torch::serialize::InputArchive state;
     input.read("state", state);
     REQUIRE((rfdetr::require_int(state, "entry_count") == 1));
-    torch_api::OutputArchive legacy_output;
+    torch::serialize::OutputArchive legacy_output;
     rfdetr::detail::write_training_supervision_config(legacy_output, {});
     rfdetr::detail::write_state_archive(legacy_output, "state", {}, readback, 0);
     legacy_output.save_to(path.string());
-    torch_api::InputArchive legacy_input;
+    torch::serialize::InputArchive legacy_input;
     legacy_input.load_from(path.string());
     REQUIRE((rfdetr::detail::read_training_supervision_config(legacy_input) == rfdetr::TrainingSupervisionConfig{}));
     rfdetr::TrainingSupervisionConfig inactive_nondefault;
     inactive_nondefault.match_free.rho = 0.75F;
-    torch_api::OutputArchive inactive_output;
+    torch::serialize::OutputArchive inactive_output;
     rfdetr::detail::write_training_supervision_config(inactive_output, inactive_nondefault);
     inactive_output.save_to(path.string());
-    torch_api::InputArchive inactive_input;
+    torch::serialize::InputArchive inactive_input;
     inactive_input.load_from(path.string());
     REQUIRE((rfdetr::detail::read_training_supervision_config(inactive_input) == inactive_nondefault));
     std::error_code ignored;
@@ -173,24 +175,28 @@ void test_feature_active_host_target_invariants() {
     REQUIRE_THROWS(rfdetr::validate_feature_active_target(0, invalid, 2));
 }
 void test_ema_shadow_admission_is_transactional() {
-    std::vector<torch_api::Tensor> parameters{torch_api::ones({2, 3}), torch_api::ones({4})};
+    std::vector<torch::Tensor> parameters{torch::ones({2, 3}), torch::ones({4})};
     rfdetr::ModelEma ema(parameters, 0.99, 100.0);
     const auto original_first = ema.shadow_params().front().clone();
     const auto original_second = ema.shadow_params().back().clone();
-    std::vector<torch_api::Tensor> malformed{torch_api::full({2, 3}, 7.0F), torch_api::zeros({5})};
+    std::vector<torch::Tensor> malformed{torch::full({2, 3}, 7.0F), torch::zeros({5})};
     REQUIRE_THROWS(ema.stage_shadow_params(malformed));
-    REQUIRE(torch_api::equal(ema.shadow_params().front(), original_first));
-    REQUIRE(torch_api::equal(ema.shadow_params().back(), original_second));
-    std::vector<torch_api::Tensor> valid{torch_api::full({2, 3}, 7.0F), torch_api::full({4}, 9.0F)};
+    REQUIRE(torch::equal(ema.shadow_params().front(), original_first));
+    REQUIRE(torch::equal(ema.shadow_params().back(), original_second));
+    std::vector<torch::Tensor> valid{torch::full({2, 3}, 7.0F), torch::full({4}, 9.0F)};
     auto candidate = ema.stage_shadow_params(valid);
     ema.commit_shadow_params(std::move(candidate));
-    REQUIRE(torch_api::equal(ema.shadow_params().front(), valid.front()));
-    REQUIRE(torch_api::equal(ema.shadow_params().back(), valid.back()));
+    REQUIRE(torch::equal(ema.shadow_params().front(), valid.front()));
+    REQUIRE(torch::equal(ema.shadow_params().back(), valid.back()));
 }
 void test_ema_selection_restores_identity_and_mode() {
-    torch::nn::Linear module(3, 2);
-    module->train();
-    auto parameters = module->parameters();
+    auto config = supervision_config();
+    config.ca_nheads = 2;
+    config.training_supervision = {};
+    rfdetr::NativeRfDetrModel module(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
+    module.train();
+    const auto named = module.named_parameters();
+    std::vector<torch::Tensor> parameters{named["class_embed.weight"], named["class_embed.bias"]};
     rfdetr::ModelEma ema(parameters, 0.5, 0.0);
     auto original = parameters.front().detach().clone();
     auto* identity = parameters.front().unsafeGetTensorImpl();
@@ -202,26 +208,26 @@ void test_ema_selection_restores_identity_and_mode() {
     REQUIRE(ema.completed_updates() == 1);
     const auto ordinary = parameters.front().detach().clone();
     try {
-        rfdetr::ModelEma::Selection selection(ema, *module);
-        module->eval();
+        rfdetr::ModelEma::Selection selection(ema, module);
+        module.eval();
         REQUIRE(parameters.front().unsafeGetTensorImpl() == identity);
-        REQUIRE(torch_api::allclose(parameters.front(), original + 1.0));
+        REQUIRE(torch::allclose(parameters.front(), original + 1.0));
         REQUIRE_THROWS(ema.update());
         REQUIRE(ema.completed_updates() == 1);
         throw std::runtime_error("selected evaluation failed");
     } catch (const std::runtime_error&) {}
-    REQUIRE(module->is_training());
+    REQUIRE(module.is_training());
     REQUIRE(parameters.front().unsafeGetTensorImpl() == identity);
-    REQUIRE(torch_api::equal(parameters.front(), ordinary));
+    REQUIRE(torch::equal(parameters.front(), ordinary));
     auto adopted = rfdetr::ModelEma::from_cpu_shadow(parameters, ema.shadow_params(), 0.5, 0.0, ema.completed_updates());
     REQUIRE(adopted.completed_updates() == ema.completed_updates());
-    REQUIRE(torch_api::equal(adopted.shadow_params().front(), ema.shadow_params().front()));
+    REQUIRE(torch::equal(adopted.shadow_params().front(), ema.shadow_params().front()));
     auto malformed = ema.shadow_params();
-    malformed.back() = torch_api::full_like(malformed.back(), std::numeric_limits<float>::quiet_NaN());
+    malformed.back() = torch::full_like(malformed.back(), std::numeric_limits<float>::quiet_NaN());
     REQUIRE_THROWS(rfdetr::ModelEma::from_cpu_shadow(parameters, malformed, 0.5, 0.0, ema.completed_updates()));
 }
 void test_ema_tau_updates_continue_after_restore() {
-    std::vector<torch_api::Tensor> parameters{torch_api::zeros({2}, torch::kFloat64)};
+    std::vector<torch::Tensor> parameters{torch::zeros({2}, torch::kFloat64)};
     constexpr double base_decay = 0.9;
     constexpr double tau = 3.0;
     rfdetr::ModelEma ema(parameters, base_decay, tau);
@@ -233,7 +239,7 @@ void test_ema_tau_updates_continue_after_restore() {
         expected = decay * expected + (1.0 - decay) * static_cast<double>(next);
         ema.update();
         REQUIRE(ema.completed_updates() == next);
-        REQUIRE(torch_api::allclose(ema.shadow_params().front(), torch_api::full_like(parameters.front(), expected), 1e-12, 1e-12));
+        REQUIRE(torch::allclose(ema.shadow_params().front(), torch::full_like(parameters.front(), expected), 1e-12, 1e-12));
     };
     for (int64_t next = 1; next <= 3; ++next) advance(next);
     auto restored = rfdetr::ModelEma::from_cpu_shadow(parameters, ema.shadow_params(), base_decay, tau, ema.completed_updates());
@@ -243,24 +249,24 @@ void test_ema_tau_updates_continue_after_restore() {
         advance(next);
         restored.update();
         REQUIRE(restored.completed_updates() == next);
-        REQUIRE(torch_api::equal(restored.shadow_params().front(), ema.shadow_params().front()));
+        REQUIRE(torch::equal(restored.shadow_params().front(), ema.shadow_params().front()));
     }
     auto exhausted = rfdetr::ModelEma::from_cpu_shadow(parameters, ema.shadow_params(), base_decay, tau, std::numeric_limits<int64_t>::max() - 1);
     exhausted.update();
     const auto final_shadow = exhausted.shadow_params().front().clone();
     REQUIRE_THROWS(exhausted.update());
     REQUIRE(exhausted.completed_updates() == std::numeric_limits<int64_t>::max());
-    REQUIRE(torch_api::equal(exhausted.shadow_params().front(), final_shadow));
+    REQUIRE(torch::equal(exhausted.shadow_params().front(), final_shadow));
 }
 void test_native_optimizer_late_failure_preserves_live_state() {
     using AdamW = rfdetr::NativeAdamW;
     std::vector<AdamW::Group> groups{{rfdetr::NativeAdamWGroupConfig{0.01, 0.0, false}, {0, 1}}};
-    std::vector<AdamW::NamedParameter> parameters{{"first.weight", torch_api::ones({2})}, {"second.weight", torch_api::ones({2})}};
+    std::vector<AdamW::NamedParameter> parameters{{"first.weight", torch::ones({2})}, {"second.weight", torch::ones({2})}};
     AdamW optimizer(std::move(groups), std::move(parameters), rfdetr::NativeOptimizerBackend::eager);
     const auto root = std::filesystem::temp_directory_path() / "mmltk_rfdetr_optimizer_atomicity";
     std::filesystem::create_directories(root);
     const auto write_archive = [&](const std::filesystem::path& path, const float first_value, const bool malformed_last) {
-        torch_api::OutputArchive archive;
+        torch::serialize::OutputArchive archive;
         rfdetr::write_string(archive, "format", "mmltk.rfdetr.native_adamw");
         rfdetr::write_int(archive, "format_version", 1);
         rfdetr::write_string(archive, "backend", "eager");
@@ -269,7 +275,7 @@ void test_native_optimizer_late_failure_preserves_live_state() {
         rfdetr::write_double(archive, "eps", 1.0e-8);
         rfdetr::write_int(archive, "group_count", 1);
         rfdetr::write_int(archive, "param_count", 2);
-        torch_api::OutputArchive group;
+        torch::serialize::OutputArchive group;
         rfdetr::write_double(group, "lr", 0.01);
         rfdetr::write_double(group, "weight_decay", 0.0);
         rfdetr::write_int(group, "amsgrad", 0);
@@ -278,12 +284,12 @@ void test_native_optimizer_late_failure_preserves_live_state() {
         rfdetr::write_int(group, "param_index_000001", 1);
         archive.write("group_000000", group);
         for (std::size_t index = 0; index < 2; ++index) {
-            torch_api::OutputArchive parameter;
+            torch::serialize::OutputArchive parameter;
             rfdetr::write_string(parameter, "name", index == 0 ? "first.weight" : "second.weight");
-            parameter.write("step", torch_api::tensor(2.0F));
+            parameter.write("step", torch::tensor(2.0F));
             const auto shape = malformed_last && index == 1 ? std::vector<int64_t>{3} : std::vector<int64_t>{2};
-            parameter.write("exp_avg", torch_api::full(shape, index == 0 ? first_value : 4.0F));
-            parameter.write("exp_avg_sq", torch_api::ones(shape));
+            parameter.write("exp_avg", torch::full(shape, index == 0 ? first_value : 4.0F));
+            parameter.write("exp_avg_sq", torch::ones(shape));
             rfdetr::write_int(parameter, "has_max_exp_avg_sq", 0);
             archive.write(rfdetr::archive_entry_name("param", index), parameter);
         }
@@ -291,28 +297,28 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     };
     const auto valid_path = root / "valid.pt";
     write_archive(valid_path, 3.0F, false);
-    torch_api::InputArchive valid;
+    torch::serialize::InputArchive valid;
     valid.load_from(valid_path.string());
     optimizer.load(valid);
     const auto malformed_path = root / "malformed.pt";
     write_archive(malformed_path, 7.0F, true);
-    torch_api::InputArchive malformed;
+    torch::serialize::InputArchive malformed;
     malformed.load_from(malformed_path.string());
     REQUIRE_THROWS(optimizer.load(malformed));
     const auto retained_path = root / "retained.pt";
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     readback.Begin();
     optimizer.reserve_checkpoint(readback, 0);
-    torch_api::OutputArchive retained;
+    torch::serialize::OutputArchive retained;
     optimizer.save(retained, readback, 0);
     readback.Complete();
     retained.save_to(retained_path.string());
-    torch_api::InputArchive retained_input;
+    torch::serialize::InputArchive retained_input;
     retained_input.load_from(retained_path.string());
-    torch_api::InputArchive first_parameter;
+    torch::serialize::InputArchive first_parameter;
     retained_input.read("param_000000", first_parameter);
     const auto retained_average = rfdetr::require_tensor(first_parameter, "exp_avg");
-    REQUIRE(torch_api::equal(retained_average, torch_api::full({2}, 3.0F)));
+    REQUIRE(torch::equal(retained_average, torch::full({2}, 3.0F)));
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
 }
@@ -364,34 +370,34 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
     const auto releaser = c10::cuda::getStreamFromPool(false, device_index);
     REQUIRE(releaser.stream() != consumer.stream());
     const auto producer = c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(scratch.copy_stream_handle()), device_index);
-    auto observed = torch_api::empty({2}, torch_api::TensorOptions().dtype(torch_api::kInt64).device(torch_api::kCUDA));
-    auto gate_word = torch_api::zeros({1}, torch_api::TensorOptions().dtype(torch_api::kInt32).device(torch_api::kCUDA));
+    auto observed = torch::empty({2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA));
+    auto gate_word = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
     cudaEvent_t replacement_done = nullptr;
     REQUIRE(cudaEventCreateWithFlags(&replacement_done, cudaEventDisableTiming) == cudaSuccess);
     {
         c10::cuda::CUDAStreamGuard producer_guard(producer);
-        scratch.offsets_gpu.narrow(0, 0, 2).copy_(torch_api::tensor({3, 7}, torch_api::TensorOptions().dtype(torch_api::kInt64).device(torch_api::kCUDA)));
+        scratch.offsets_gpu.narrow(0, 0, 2).copy_(torch::tensor({3, 7}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA)));
         scratch.record_pending_copy_on_stream(scratch.copy_stream_handle());
     }
     rfdetr::PreparedTargets published;
     {
         c10::cuda::CUDAStreamGuard producer_guard(producer);
-        const auto floating = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA);
-        const auto integer = torch_api::TensorOptions().dtype(torch_api::kInt64).device(torch_api::kCUDA);
-        published.all_image_ids = torch_api::tensor({13, 17}, integer);
-        published.orig_sizes = torch_api::full({2, 2}, 19, integer);
-        published.nested_mask = torch_api::zeros({2, 8, 8}, torch_api::TensorOptions().dtype(torch_api::kBool).device(torch_api::kCUDA));
-        published.all_boxes = torch_api::full({3, 4}, 2.0F, floating);
-        published.all_labels = torch_api::full({3}, 3, integer);
-        published.all_area = torch_api::full({3}, 5.0F, floating);
-        published.all_iscrowd = torch_api::full({3}, 7, integer);
+        const auto floating = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+        const auto integer = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+        published.all_image_ids = torch::tensor({13, 17}, integer);
+        published.orig_sizes = torch::full({2, 2}, 19, integer);
+        published.nested_mask = torch::zeros({2, 8, 8}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA));
+        published.all_boxes = torch::full({3, 4}, 2.0F, floating);
+        published.all_labels = torch::full({3}, 3, integer);
+        published.all_area = torch::full({3}, 5.0F, floating);
+        published.all_iscrowd = torch::full({3}, 7, integer);
         published.target_offsets = scratch.offsets_gpu.narrow(0, 0, 2);
-        published.target_counts = torch_api::tensor({1, 2}, integer);
-        published.target_indices = torch_api::tensor({0, 1, 2}, integer);
+        published.target_counts = torch::tensor({1, 2}, integer);
+        published.target_indices = torch::tensor({0, 1, 2}, integer);
         published.packed_masks = rfdetr::PackedTargetMasks{
-            torch_api::full({3, 1}, 11, integer),    8, 8, torch_api::full({3, 6}, 13.0F, floating), torch_api::full({3}, 17, integer),
-            torch_api::full({3, 6}, 19.0F, floating)};
+            torch::full({3, 1}, 11, integer),    8, 8, torch::full({3, 6}, 13.0F, floating), torch::full({3}, 17, integer),
+            torch::full({3, 6}, 19.0F, floating)};
         scratch.record_pending_copy_on_stream(scratch.copy_stream_handle());
     }
     {
@@ -416,17 +422,17 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
     REQUIRE(cuStreamWriteValue32(reinterpret_cast<CUstream>(releaser.stream()), reinterpret_cast<CUdeviceptr>(gate_word.data_ptr()), 1U,
                                  CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS);
     REQUIRE(cudaEventSynchronize(replacement_done) == cudaSuccess);
-    REQUIRE(torch_api::equal(observed.cpu(), torch_api::tensor({3, 7}, torch_api::TensorOptions().dtype(torch_api::kInt64))));
+    REQUIRE(torch::equal(observed.cpu(), torch::tensor({3, 7}, torch::TensorOptions().dtype(torch::kInt64))));
     REQUIRE(cudaEventDestroy(replacement_done) == cudaSuccess);
     rfdetr::PreparedTargets exception_target;
-    exception_target.all_boxes = torch_api::ones({1, 4}, torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA));
+    exception_target.all_boxes = torch::ones({1, 4}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
     try {
         rfdetr::TargetConsumerLease lease(scratch, exception_target, device_id);
         lease.handoff();
         exception_target.all_boxes.add_(1.0F);
         throw std::runtime_error("exercise target consumer exception retirement");
     } catch (const std::runtime_error&) {}
-    REQUIRE(torch_api::equal(exception_target.all_boxes.cpu(), torch_api::full({1, 4}, 2.0F)));
+    REQUIRE(torch::equal(exception_target.all_boxes.cpu(), torch::full({1, 4}, 2.0F)));
 }
 void test_target_staging_ring_recycles_completed_slots_without_host_wait() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
@@ -545,9 +551,9 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
     const auto config = rfdetr::test_support::isolated_augmentation_config(1);
     rfdetr::test_support::AugmentationExecution execution_augmenter(0);
     rfdetr::GpuBatchAugmenter augmenter(config, 1, 8, 8, execution_augmenter.context);
-    const auto options = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA);
-    const auto donor_pixels = torch_api::full({1, 3, 8, 8}, .9F, options);
-    const auto source_pixels = torch_api::full({1, 3, 8, 8}, .1F, options);
+    const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const auto donor_pixels = torch::full({1, 3, 8, 8}, .9F, options);
+    const auto source_pixels = torch::full({1, 3, 8, 8}, .1F, options);
     constexpr PackedInstance instance{0, 0, 0, 0, 8, 8, 0, 1};
     constexpr RLEPair run{0, 64};
     const std::array<mmltk::backend::data::LabelIndexEntry, 2> entries{{{0, 1, 0}, {0, 0, 0}}};
@@ -618,15 +624,15 @@ void test_training_adapter_matches_raw_augmentation_executor() {
     REQUIRE(cudaSetDevice(device_id) == cudaSuccess);
     const c10::cuda::CUDAStream test_stream = c10::cuda::getStreamFromPool(false, device_id);
     c10::cuda::CUDAStreamGuard test_stream_guard(test_stream);
-    const auto float_device = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA);
-    const auto int64_device = torch_api::TensorOptions().dtype(torch_api::kInt64).device(torch_api::kCUDA);
-    auto source_pixels = torch_api::full({1, 3, height, width}, 0.1F, float_device);
-    auto donor_pixels = torch_api::full({1, 3, height, width}, 0.9F, float_device);
+    const auto float_device = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    const auto int64_device = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+    auto source_pixels = torch::full({1, 3, height, width}, 0.1F, float_device);
+    auto donor_pixels = torch::full({1, 3, height, width}, 0.9F, float_device);
     rfdetr::test_support::AugmentationExecution source_execution(device_id);
     struct PixelCustody final {
         mmltk::frameworks::gpu::DeviceContext context;
         c10::cuda::CUDAStream stream;
-        std::vector<torch_api::Tensor> tensors;
+        std::vector<torch::Tensor> tensors;
     };
     auto source_custody = std::make_shared<PixelCustody>(PixelCustody{source_execution.context, test_stream, {source_pixels, donor_pixels}});
     constexpr std::size_t image_bytes = 3U * height * width * sizeof(float);
@@ -690,12 +696,12 @@ void test_training_adapter_matches_raw_augmentation_executor() {
                 CHECK(identity_preview[0].box_xyxy == std::array<float, 4>{0, 0, 1, 1});
                 CHECK(identity_preview[0].visible_area_pixels == static_cast<float>(height * width));
             }
-            const torch_api::Tensor adapted = adapter.run(source_batch, seed, epoch, rank, sequence);
+            const torch::Tensor adapted = adapter.run(source_batch, seed, epoch, rank, sequence);
             const rfdetr::AugmentationBatchPlan adapted_plan = adapter.batch_plan();
             REQUIRE(adapted_plan.images.front().paste_donor_slot == 0);
             rfdetr::test_support::AugmentationExecution execution_raw(device_id);
             rfdetr::GpuAugmentationExecutor raw(config, 1U, height, width, execution_raw.context, execution_raw.retirement);
-            auto raw_output = torch_api::empty_like(source_pixels);
+            auto raw_output = torch::empty_like(source_pixels);
             auto raw_custody = std::make_shared<PixelCustody>(PixelCustody{execution_raw.context, test_stream, {raw_output}});
             std::array<std::uint64_t, source_indices.size()> keys{};
             for (std::size_t image = 0U; image < keys.size(); ++image) {
@@ -722,8 +728,8 @@ void test_training_adapter_matches_raw_augmentation_executor() {
                     .has_mask = true,
                 },
             };
-            auto donor_mask = torch_api::full({1, 1}, -1, int64_device);
-            auto donor_box = torch_api::tensor({0.125F, 0.125F, 0.875F, 0.875F}, float_device).view({1, 4});
+            auto donor_mask = torch::full({1, 1}, -1, int64_device);
+            auto donor_box = torch::tensor({0.125F, 0.125F, 0.875F, 0.875F}, float_device).view({1, 4});
             raw_custody->tensors.insert(raw_custody->tensors.end(), {donor_pixels, donor_mask, donor_box});
             const rfdetr::GpuAugmentationDonorBatchView raw_donor_batch{
                 .images = donor_pixels.data_ptr<float>(),
@@ -735,7 +741,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
                 .image_capacity_bytes = image_bytes,
             };
             (void)raw.Run(raw_batch, keys, raw_donors, raw_donor_batch, stream);
-            REQUIRE(torch_api::equal(adapted, raw_output));
+            REQUIRE(torch::equal(adapted, raw_output));
             auto raw_image_plan = raw.plan().images.front();
             raw_image_plan.paste_support = adapted_plan.images.front().paste_support;
             raw_image_plan.paste_support_count = adapted_plan.images.front().paste_support_count;
@@ -785,7 +791,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
         }
 }
 void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std::span<const std::uint64_t> support_by_class,
-                              const std::vector<rfdetr::AugmentationPreviewAnnotation>& preview, const torch_api::Tensor& points) {
+                              const std::vector<rfdetr::AugmentationPreviewAnnotation>& preview, const torch::Tensor& points) {
     const auto boxes = targets.all_boxes.cpu(), areas = targets.all_area.cpu(), ids = targets.all_labels.cpu();
     const auto box = boxes.accessor<float, 2>();
     const auto area = areas.accessor<float, 1>();
@@ -793,9 +799,9 @@ void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std:
     const auto expected_count = std::ranges::count_if(support_by_class, [](auto bits) { return bits != 0; });
     REQUIRE(boxes.size(0) == expected_count);
     REQUIRE(preview.size() == static_cast<std::size_t>(expected_count));
-    torch_api::Tensor sampled;
+    torch::Tensor sampled;
     if (targets.packed_masks && expected_count != 0)
-        sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch_api::arange(expected_count, points.options().dtype(torch_api::kInt64)), points,
+        sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(expected_count, points.options().dtype(torch::kInt64)), points,
                                               "ring support")
                       .cpu();
     for (std::int64_t i = 0; i < expected_count; ++i) {
@@ -832,9 +838,9 @@ void test_copy_paste_ring_support_and_cache_cycles() {
     using namespace rfdetr::test_support;
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
-    const auto options = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA);
-    auto source_pixels = torch_api::full({1, 3, 8, 8}, .1F, options);
-    auto donor_pixels = torch_api::full({1, 3, 8, 8}, .9F, options);
+    const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto source_pixels = torch::full({1, 3, 8, 8}, .1F, options);
+    auto donor_pixels = torch::full({1, 3, 8, 8}, .9F, options);
     std::vector<RLEPair> runs(dot_runs.begin(), dot_runs.end());
     runs.insert(runs.end(), ring_runs.begin(), ring_runs.end());
     std::array<PackedInstance, dot_runs.size() + 1> labels{};
@@ -867,8 +873,8 @@ void test_copy_paste_ring_support_and_cache_cycles() {
             centers.push_back((static_cast<float>(x) + .5F) / 8);
             centers.push_back((static_cast<float>(y) + .5F) / 8);
         }
-    const auto points = torch_api::tensor(centers, options).view({1, 64, 2});
-    std::array<torch_api::Tensor, 3> detection_images;
+    const auto points = torch::tensor(centers, options).view({1, 64, 2});
+    std::array<torch::Tensor, 3> detection_images;
     for (const bool include_masks : {false, true}) {
         CAPTURE(include_masks);
         auto config = isolated_augmentation_config(1);
@@ -909,7 +915,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
                 }
             const auto observed = pixels.cpu();
             if (include_masks)
-                REQUIRE(torch_api::equal(observed, detection_images[cycle - 1]));
+                REQUIRE(torch::equal(observed, detection_images[cycle - 1]));
             else
                 detection_images[cycle - 1] = observed;
             const auto rgb = observed.accessor<float, 4>();
@@ -1028,7 +1034,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
         rfdetr::TargetConsumerLease grown_lease(scratch, grown, 0);
         grown_lease.handoff();
         REQUIRE(grown.counts == std::vector<int64_t>{2});
-        REQUIRE(torch_api::equal(grown.all_labels.cpu(), torch_api::tensor({0, 7}, torch_api::TensorOptions().dtype(torch_api::kInt64))));
+        REQUIRE(torch::equal(grown.all_labels.cpu(), torch::tensor({0, 7}, torch::TensorOptions().dtype(torch::kInt64))));
         batch.label_index = entries.data();
     }
 }
@@ -1148,8 +1154,8 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     const c10::cuda::CUDAStream test_stream = c10::cuda::getStreamFromPool(false, 0);
     c10::cuda::CUDAStreamGuard test_stream_guard(test_stream);
-    const auto floats = torch_api::TensorOptions().dtype(torch_api::kFloat32).device(torch_api::kCUDA);
-    auto pixels = torch_api::full({static_cast<int64_t>(count), 3, extent, extent}, 0.9F, floats);
+    const auto floats = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto pixels = torch::full({static_cast<int64_t>(count), 3, extent, extent}, 0.9F, floats);
     std::array<std::uint32_t, count> indices{};
     std::array<mmltk::backend::data::LabelIndexEntry, count> label_index{};
     for (std::size_t image = 0U; image < count; ++image) {
@@ -1186,11 +1192,11 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
             centers.push_back((static_cast<float>(y) + 0.5F) / extent);
         }
     }
-    const auto points = torch_api::tensor(centers, floats).view({1, extent * extent, 2});
-    const auto sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch_api::arange(static_cast<int64_t>(count), floats.dtype(torch_api::kInt64)),
+    const auto points = torch::tensor(centers, floats).view({1, extent * extent, 2});
+    const auto sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(static_cast<int64_t>(count), floats.dtype(torch::kInt64)),
                                                      points, "training erasure");
     const auto visible = image.ne(0.0F).any(1).reshape({static_cast<int64_t>(count), extent * extent});
-    REQUIRE(torch_api::equal(sampled.to(torch_api::kBool), visible));
+    REQUIRE(torch::equal(sampled.to(torch::kBool), visible));
     CHECK(visible.any().item<bool>());
     CHECK(visible.logical_not().any().item<bool>());
 }
@@ -1349,8 +1355,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     checkpoint.metadata.class_layout = seed_model.class_layout()->record();
     checkpoint.metadata.num_queries = config.num_queries;
     checkpoint.metadata.num_select = config.num_select;
-    const auto& seed_module = rfdetr::detail::native_model_owner(seed_model).module();
-    rfdetr::detail::model_state_owner(checkpoint).entries = rfdetr::testsupport::clone_normalized_model_state(seed_module);
+    const auto& seed_module = (seed_model);
+    rfdetr::testsupport::set_synthetic_model_state(checkpoint, rfdetr::testsupport::clone_normalized_model_state(seed_module));
     const auto weights = root / "seed.pt";
     rfdetr::save_native_checkpoint(weights, checkpoint);
     const std::array routes{
@@ -1447,28 +1453,28 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             REQUIRE(deployment_summary.incompatible_names.empty());
             const auto deployment_state = rfdetr::decode_model_state(*result.best_checkpoint_path);
             const auto full_state = rfdetr::decode_model_state(result.checkpoint_path);
-            std::unordered_map<std::string, torch_api::Tensor> expected_best;
-            for (const auto& entry : rfdetr::detail::model_state_owner(full_state).entries) expected_best.emplace(entry.name, entry.tensor);
+            std::unordered_map<std::string, torch::Tensor> expected_best;
+            for (const auto& entry : full_state.entries()) expected_best.emplace(entry.name, entry.tensor);
             if (request.use_ema) {
-                torch_api::InputArchive source, shadows;
-                source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
+                torch::serialize::InputArchive source, shadows;
+                source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
                 source.read("ema_state", shadows);
                 const auto count = rfdetr::require_int(shadows, "entry_count");
                 REQUIRE(count > 0);
                 for (int64_t index = 0; index < count; ++index) {
-                    torch_api::InputArchive entry;
+                    torch::serialize::InputArchive entry;
                     shadows.read(rfdetr::archive_entry_name(static_cast<std::size_t>(index)), entry);
                     expected_best.at(rfdetr::require_string(entry, "name")) = rfdetr::require_tensor(entry, "tensor");
                 }
             }
-            for (const auto& entry : rfdetr::detail::model_state_owner(deployment_state).entries) {
+            for (const auto& entry : deployment_state.entries()) {
                 REQUIRE_FALSE(entry.name.starts_with("training_supervision."));
-                REQUIRE(torch_api::equal(entry.tensor, expected_best.at(entry.name)));
+                REQUIRE(torch::equal(entry.tensor, expected_best.at(entry.name)));
             }
             if ((route_index == 0 && lanes == 1) || request.use_ema) {
                 // These use a genuinely saved checkpoint, not a scalar-only
                 // fixture. Neither entry point may publish a resumed epoch.
-                const auto reject_checkpoint = [&](torch_api::OutputArchive& malformed_archive, std::string_view fault) {
+                const auto reject_checkpoint = [&](torch::serialize::OutputArchive& malformed_archive, std::string_view fault) {
                     const auto malformed = request.output_dir / (std::string("malformed-") + std::string(fault) + ".pt");
                     rfdetr::detail::publish_native_checkpoint_archive(malformed_archive, malformed);
                     REQUIRE_THROWS(rfdetr::inspect_training_checkpoint(malformed));
@@ -1482,34 +1488,34 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                     REQUIRE_FALSE(std::filesystem::exists(rejected.output_dir / "checkpoint_epoch_2.pt"));
                 };
                 for (const auto* missing : {"epoch", "lr_drop", "training_original_descriptor", "grad_scaler_scale", "optimizer"}) {
-                    torch_api::InputArchive source;
-                    source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
-                    torch_api::OutputArchive incomplete;
+                    torch::serialize::InputArchive source;
+                    source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
+                    torch::serialize::OutputArchive incomplete;
                     rfdetr::testsupport::copy_checkpoint_archive(source, incomplete, missing);
                     reject_checkpoint(incomplete, missing);
                 }
-                const std::array<std::pair<const char*, torch_api::IValue>, 4> invalid{
+                const std::array<std::pair<const char*, c10::IValue>, 4> invalid{
                     {{"epoch", std::string("wrong-type")},
                      {"grad_scaler_scale", 0.0},
                      {"lr_drop", int64_t{inspection.configuration->lr_drop + 1}},
                      {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}}};
                 for (const auto& [key, value] : invalid) {
-                    torch_api::InputArchive source;
-                    source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
-                    torch_api::OutputArchive inconsistent;
+                    torch::serialize::InputArchive source;
+                    source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
+                    torch::serialize::OutputArchive inconsistent;
                     rfdetr::testsupport::copy_checkpoint_archive(source, inconsistent, key);
                     inconsistent.write(key, value);
                     reject_checkpoint(inconsistent, std::string("invalid-") + key);
                 }
                 if (request.use_ema) {
-                    torch_api::InputArchive source;
-                    source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
-                    torch_api::OutputArchive malformed;
+                    torch::serialize::InputArchive source;
+                    source.load_from(result.checkpoint_path.string(), torch::Device(torch::kCPU));
+                    torch::serialize::OutputArchive malformed;
                     rfdetr::testsupport::copy_checkpoint_archive(source, malformed, "ema_state");
-                    torch_api::InputArchive shadow, first;
+                    torch::serialize::InputArchive shadow, first;
                     source.read("ema_state", shadow);
                     shadow.read("entry_000000", first);
-                    torch_api::OutputArchive wrong_shadow, wrong_first;
+                    torch::serialize::OutputArchive wrong_shadow, wrong_first;
                     rfdetr::testsupport::copy_checkpoint_archive(shadow, wrong_shadow, "entry_000000");
                     rfdetr::testsupport::copy_checkpoint_archive(first, wrong_first, "name");
                     rfdetr::write_string(wrong_first, "name", "wrong-ordered-parameter");
@@ -1612,11 +1618,11 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
     struct TensorImages final {
         mmltk::frameworks::gpu::DeviceContext context;
         c10::cuda::CUDAStream stream;
-        torch_api::Tensor input, output;
+        torch::Tensor input, output;
     };
     auto images = std::make_shared<TensorImages>(TensorImages{execution.context, stream,
-                                                              torch_api::full({20, 3, 9, 9}, .25F, torch_api::TensorOptions().device(torch_api::kCUDA)),
-                                                              torch_api::full({20, 3, 9, 9}, -.75F, torch_api::TensorOptions().device(torch_api::kCUDA))});
+                                                              torch::full({20, 3, 9, 9}, .25F, torch::TensorOptions().device(torch::kCUDA)),
+                                                              torch::full({20, 3, 9, 9}, -.75F, torch::TensorOptions().device(torch::kCUDA))});
     auto config = rfdetr::test_support::isolated_augmentation_config();
     config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
     config.perceptual_downscale = true;
@@ -1657,7 +1663,7 @@ TEST_CASE("training cache failed settlement retains tensors stream and source an
         {
             rfdetr::GpuBatchAugmenter owner(config, 1, 4, 4, execution.context);
             retained = Access::Custody(owner);
-            auto pixels = std::make_shared<torch_api::Tensor>(torch_api::full({1, 3, 4, 4}, .25F, torch_api::TensorOptions().device(torch_api::kCUDA)));
+            auto pixels = std::make_shared<torch::Tensor>(torch::full({1, 3, 4, 4}, .25F, torch::TensorOptions().device(torch::kCUDA)));
             retained_source = pixels;
             std::array<std::uint32_t, 1> indices{0};
             mmltk::backend::data::Batch batch{.num_images = 1,

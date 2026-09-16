@@ -1,3 +1,5 @@
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
+
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <algorithm>
 #include <cstdint>
@@ -9,14 +11,14 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 #include "src/frameworks/gpu/cuda_error.h"
-#include "torch_api.h"
-#include "torch_cuda_utils.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 // CLEANUP-IGNORE: The augmentation implementation declares its own logging and CUDA module dependencies.
-import mmltk.common.logging.mmltk_logging;
 // CLEANUP-IGNORE: Profiling and CUDA imports are owned directly by this augmentation implementation.
-import mmltk.common.logging.profile_utils;
 #include "detail/gpu_augment_private.h"
 #include "detail/target_builder_private.h"
+import mmltk.common.logging.mmltk_logging;
+import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
 using mmltk::backend::ml::cuda::checked_device_index;
 using mmltk::backend::ml::cuda::current_torch_cuda_stream_object;
@@ -26,14 +28,14 @@ namespace {
 void require(const bool condition, const std::string_view message) {
     if (!condition) { throw std::runtime_error(std::string(message)); }
 }
-[[nodiscard]] std::size_t tensor_bytes(const torch_types::Tensor& tensor) noexcept {
+[[nodiscard]] std::size_t tensor_bytes(const torch::Tensor& tensor) noexcept {
     return tensor.defined() ? static_cast<std::size_t>(tensor.numel()) * tensor.element_size() : 0U;
 }
-GpuPreprocessOutputType preprocess_output_type(const torch_types::ScalarType output_type) {
+GpuPreprocessOutputType preprocess_output_type(const at::ScalarType output_type) {
     switch (output_type) {
-        case torch_types::kFloat: return GpuPreprocessOutputType::Float32;
-        case torch_types::kHalf: return GpuPreprocessOutputType::Float16;
-        case torch_types::kBFloat16: return GpuPreprocessOutputType::BFloat16;
+        case at::kFloat: return GpuPreprocessOutputType::Float32;
+        case at::kHalf: return GpuPreprocessOutputType::Float16;
+        case torch::kBFloat16: return GpuPreprocessOutputType::BFloat16;
         default:
             require(false,
                     "GPU batch preprocessing supports only FP32, FP16, and "
@@ -43,12 +45,12 @@ GpuPreprocessOutputType preprocess_output_type(const torch_types::ScalarType out
 }
 }  // namespace
 GpuBatchPreprocessor::GpuBatchPreprocessor(const std::int64_t batch_capacity, const int height, const int width, const int device_id,
-                                           const torch_types::ScalarType output_type)
+                                           const at::ScalarType output_type)
     : batch_capacity_(batch_capacity), height_(height), width_(width), device_id_(device_id), output_type_(output_type) {
     require(batch_capacity_ > 0 && height_ > 0 && width_ > 0, "invalid GPU preprocessing tensor shape");
     (void)preprocess_output_type(output_type_);
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
-    output_ = torch_types::empty({batch_capacity_, 3, height_, width_}, torch_types::TensorOptions().dtype(output_type_).device(cuda_device(device_id_)));
+    output_ = torch::empty({batch_capacity_, 3, height_, width_}, torch::TensorOptions().dtype(output_type_).device(mmltk::backend::ml::cuda::cuda_device(device_id_)));
     ensure_cuda_ok(cudaEventCreateWithFlags(&consumer_complete_, cudaEventDisableTiming), "cudaEventCreateWithFlags for GPU preprocessing consumer");
 }
 GpuBatchPreprocessor::~GpuBatchPreprocessor() {
@@ -65,7 +67,7 @@ GpuBatchPreprocessor::~GpuBatchPreprocessor() {
         consumer_complete_ = nullptr;
     }
 }
-torch_types::Tensor GpuBatchPreprocessor::run(const mmltk::backend::data::Batch& batch, std::int64_t output_batch_size) {
+torch::Tensor GpuBatchPreprocessor::run(const mmltk::backend::data::Batch& batch, std::int64_t output_batch_size) {
     const auto active_batch_size = static_cast<std::int64_t>(batch.num_images);
     if (output_batch_size == 0) { output_batch_size = active_batch_size; }
     require(active_batch_size > 0 && active_batch_size <= output_batch_size, "GPU preprocessing requires a non-empty active batch within the output batch");
@@ -99,8 +101,8 @@ GpuBatchAugmenter::GpuBatchAugmenter(const GpuAugmentationConfig& config, const 
     require(gpu_augmentation_config_valid(config_), "invalid GPU augmentation configuration");
     require(batch_capacity_ > 0 && height_ > 0 && width_ > 0, "invalid GPU augmentation tensor shape");
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
-    const auto float_options = torch_types::TensorOptions().dtype(torch_types::kFloat32).device(cuda_device(device_id_));
-    resources_->output_ = torch_types::empty({batch_capacity_, 3, height_, width_}, float_options);
+    const auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
+    resources_->output_ = torch::empty({batch_capacity_, 3, height_, width_}, float_options);
     batch_plan_.images.resize(static_cast<std::size_t>(batch_capacity_));
     donor_support_.resize(static_cast<std::size_t>(batch_capacity_));
     donor_metadata_.resize(static_cast<std::size_t>(batch_capacity_));
@@ -123,16 +125,16 @@ void GpuBatchAugmenter::CheckSettlement(const cudaError_t status, const char* de
 void GpuBatchAugmenter::ensure_copy_paste_resources() {
     if (resources_->donor_images_.defined()) { return; }
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
-    const auto float_options = torch_types::TensorOptions().dtype(torch_types::kFloat32).device(cuda_device(device_id_));
-    const auto int64_options = torch_types::TensorOptions().dtype(torch_types::kInt64).device(cuda_device(device_id_));
+    const auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
+    const auto int64_options = torch::TensorOptions().dtype(torch::kInt64).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
     try {
-        resources_->donor_boxes_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, 4}, torch_types::kFloat32, device_id_);
-        resources_->donor_boxes_gpu_ = torch_types::empty({batch_capacity_, 4}, float_options);
-        resources_->replacement_indices_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_}, torch_types::kInt64, device_id_);
-        resources_->replacement_indices_gpu_ = torch_types::empty({batch_capacity_}, int64_options);
+        resources_->donor_boxes_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, 4}, torch::kFloat32, device_id_);
+        resources_->donor_boxes_gpu_ = torch::empty({batch_capacity_, 4}, float_options);
+        resources_->replacement_indices_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_}, torch::kInt64, device_id_);
+        resources_->replacement_indices_gpu_ = torch::empty({batch_capacity_}, int64_options);
         mask_words_ = packed_mask_words_for_shape(height_, width_);
-        resources_->donor_masks_ = torch_types::empty({batch_capacity_, mask_words_}, int64_options);
-        resources_->donor_masks_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, mask_words_}, torch_types::kInt64, device_id_);
+        resources_->donor_masks_ = torch::empty({batch_capacity_, mask_words_}, int64_options);
+        resources_->donor_masks_cpu_ = mmltk::backend::ml::cuda::numa_empty({batch_capacity_, mask_words_}, torch::kInt64, device_id_);
         int least_priority = 0;
         int greatest_priority = 0;
         ensure_cuda_ok(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority), "cudaDeviceGetStreamPriorityRange for donor cache");
@@ -144,7 +146,7 @@ void GpuBatchAugmenter::ensure_copy_paste_resources() {
         ensure_cuda_ok(cudaEventCreateWithFlags(&resources_->cache_ready_, cudaEventDisableTiming), "cudaEventCreateWithFlags for donor cache readiness");
         ensure_cuda_ok(cudaEventCreateWithFlags(&resources_->cache_upload_complete_, cudaEventDisableTiming),
                        "cudaEventCreateWithFlags for donor upload staging");
-        resources_->donor_images_ = torch_types::empty({batch_capacity_, 3, height_, width_}, float_options);
+        resources_->donor_images_ = torch::empty({batch_capacity_, 3, height_, width_}, float_options);
         mmltk::common::logging::trace([&](auto& logger) {
             const std::size_t pinned_host_bytes =
                 tensor_bytes(resources_->donor_boxes_cpu_) + tensor_bytes(resources_->replacement_indices_cpu_) + tensor_bytes(resources_->donor_masks_cpu_);
@@ -160,7 +162,7 @@ void GpuBatchAugmenter::ensure_copy_paste_resources() {
         if (released != cudaSuccess)
             Retire(released);
         else
-            resources_->donor_images_ = torch_types::Tensor{};
+            resources_->donor_images_ = torch::Tensor{};
         throw;
     }
 }
@@ -205,7 +207,7 @@ cudaError_t GpuBatchAugmenter::release_copy_paste_resources() noexcept {
     }
     return cudaSuccess;
 }
-torch_types::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank,
+torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank,
                                            const std::uint64_t sequence) {
     RequireActive();
     require(static_cast<std::int64_t>(batch.num_images) <= batch_capacity_, "GPU augmentation batch exceeds preallocated capacity");

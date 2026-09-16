@@ -3,8 +3,8 @@
 #include <memory>
 #include <utility>
 #include <vector>
-#include "detail/detection_types.h"
-#include "detail/model_technical.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/model.h"
 namespace mmltk::backend::models::rfdetr {
 torch::Tensor inverse_sigmoid(const torch::Tensor& x, double eps = 1e-5);
 class MlpImpl : public torch::nn::Module {

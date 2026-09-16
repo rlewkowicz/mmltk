@@ -6,12 +6,10 @@
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include "src/backend/models/rfdetr/core/detail/model_access.h"
-#include "src/backend/models/rfdetr/core/detail/model_state_access.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/training/tests/model_state_fixture.h"
 #include "src/controller/contracts/gui_settings.h"
-import mmltk.backend.models.rfdetr.core.model;
 import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace mmltk::testsupport {
 namespace data = mmltk::backend::data;
@@ -46,8 +44,8 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
     checkpoint.metadata.class_layout = model.class_layout()->record();
     checkpoint.metadata.num_queries = config.num_queries;
     checkpoint.metadata.num_select = config.num_select;
-    rfdetr::detail::model_state_owner(checkpoint).entries =
-        rfdetr::testsupport::clone_normalized_model_state(rfdetr::detail::native_model_owner(model).module());
+    checkpoint.entries() =
+        rfdetr::testsupport::clone_normalized_model_state((model));
     rfdetr::save_native_checkpoint(weights_, checkpoint);
 
     std::ofstream video{video_, std::ios::binary};

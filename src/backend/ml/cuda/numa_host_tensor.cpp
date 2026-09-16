@@ -1,5 +1,5 @@
 #include "numa_host_tensor.h"
-#include "detail/torch_cuda_utils.h"
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>

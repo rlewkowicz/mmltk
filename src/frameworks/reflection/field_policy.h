@@ -14,8 +14,6 @@
 namespace mmltk::frameworks::reflection {
 inline constexpr std::size_t kMaximumNameBytes = 256U;
 inline constexpr std::size_t kMaximumPathBytes = 4096U;
-inline constexpr std::size_t kMaximumCliImageInputs = 4096U;
-inline constexpr std::size_t kMaximumTrainingDevices = 16U;
 inline constexpr std::size_t kMaximumCpuIdentifiers = 4096U;
 [[nodiscard]] inline bool unique_nonnegative_identifiers(const std::span<const int> identifiers) {
     if (std::ranges::any_of(identifiers, [](const int identifier) { return identifier < 0; })) { return false; }

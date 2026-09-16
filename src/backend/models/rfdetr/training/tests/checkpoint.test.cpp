@@ -1,3 +1,4 @@
+#include <torch/cuda.h>
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
@@ -18,30 +19,27 @@
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "detail/checkpoint_private.h"
-#include "model_state_access.h"
-#include "model_state_technical.h"
-#include "model_access.h"
+#include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "model_state_fixture.h"
-#include "model_technical.h"
 #include "parity_fixture_support.h"
 #include "src/common/io/file_memory.h"
-#include "torch_api.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 #if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
 #undef CHECK
 #endif
 #include <catch2/catch_test_macros.hpp>
 import mmltk.backend.models.rfdetr.training.checkpoint;
 import mmltk.backend.models.rfdetr.model_export;
-import mmltk.backend.models.rfdetr.core.model;
 namespace fs = std::filesystem;
-namespace tensor_api = mmltk::backend::ml::torch_api;
 namespace {
 using namespace mmltk::backend::models::rfdetr::testsupport;
 auto& state_entries(mmltk::backend::models::rfdetr::DecodedNativeModelState& state) {
-    return mmltk::backend::models::rfdetr::detail::model_state_owner(state).entries;
+    return state.entries();
 }
 const auto& state_entries(const mmltk::backend::models::rfdetr::DecodedNativeModelState& state) {
-    return mmltk::backend::models::rfdetr::detail::model_state_owner(state).entries;
+    return state.entries();
 }
 void populate_detection_metadata(mmltk::backend::models::rfdetr::NativeCheckpointMetadata& metadata) {
     std::size_t index = 0;
@@ -80,24 +78,24 @@ const mmltk::backend::models::rfdetr::NormalizedModelStateEntry* find_entry(cons
     }
     return nullptr;
 }
-void write_archive_string(tensor_api::serialize::OutputArchive& archive, const char* key, std::string_view value) {
-    archive.write(key, tensor_api::IValue(std::string(value)));
+void write_archive_string(torch::serialize::OutputArchive& archive, const char* key, std::string_view value) {
+    archive.write(key, c10::IValue(std::string(value)));
 }
-void write_archive_int(tensor_api::serialize::OutputArchive& archive, const char* key, int64_t value) { archive.write(key, tensor_api::IValue(value)); }
+void write_archive_int(torch::serialize::OutputArchive& archive, const char* key, int64_t value) { archive.write(key, c10::IValue(value)); }
 void write_legacy_native_checkpoint(const fs::path& output_path, int version = 1, std::string_view format = "fastloader.rfdetr.native_checkpoint") {
     fs::create_directories(output_path.parent_path());
-    tensor_api::serialize::OutputArchive archive;
+    torch::serialize::OutputArchive archive;
     write_archive_string(archive, "format", format);
     write_archive_int(archive, "format_version", version);
     write_archive_string(archive, "preset_name", "rf-detr-seg-medium");
     write_archive_string(archive, "source_kind", "legacy-native-test");
     write_archive_string(archive, "source_path", output_path.string());
     write_archive_int(archive, "num_classes", 7);
-    tensor_api::serialize::OutputArchive state_archive;
+    torch::serialize::OutputArchive state_archive;
     write_archive_int(state_archive, "entry_count", 1);
-    tensor_api::serialize::OutputArchive entry_archive;
+    torch::serialize::OutputArchive entry_archive;
     write_archive_string(entry_archive, "name", "class_embed.bias");
-    entry_archive.write("tensor", tensor_api::arange(7, tensor_api::TensorOptions().dtype(tensor_api::kFloat32)).contiguous());
+    entry_archive.write("tensor", torch::arange(7, torch::TensorOptions().dtype(torch::kFloat32)).contiguous());
     state_archive.write("entry_000000", entry_archive);
     archive.write("state", state_archive);
     archive.save_to(output_path.string());
@@ -155,7 +153,7 @@ void test_native_checkpoint_roundtrip(const ParityFixtureCase& fixture, const fs
     for (size_t index = 0; index < state_entries(native).size(); ++index) {
         REQUIRE((state_entries(native)[index].name == state_entries(upstream)[index].name));
         if (!compared_tensor && state_entries(native)[index].name == "class_embed.weight") {
-            REQUIRE((tensor_api::equal(state_entries(native)[index].tensor, state_entries(upstream)[index].tensor)));
+            REQUIRE((torch::equal(state_entries(native)[index].tensor, state_entries(upstream)[index].tensor)));
             compared_tensor = true;
         }
     }
@@ -185,15 +183,17 @@ void test_native_checkpoint_tensor_preparation() {
     checkpoint.metadata.num_queries = 1;
     checkpoint.metadata.num_select = 1;
     populate_detection_metadata(checkpoint.metadata);
-    const auto cpu_contiguous = tensor_api::arange(12, tensor_api::TensorOptions().dtype(tensor_api::kFloat32)).view({3, 4}).clone();
+    const auto cpu_contiguous = torch::arange(12, torch::TensorOptions().dtype(torch::kFloat32)).view({3, 4}).clone();
     const auto cpu_non_contiguous = cpu_contiguous.transpose(0, 1);
-    state_entries(checkpoint).push_back({"cpu_contiguous", cpu_contiguous});
-    state_entries(checkpoint).push_back({"cpu_non_contiguous", cpu_non_contiguous});
-    const bool has_cuda = tensor_api::cuda::is_available();
+    std::vector<mmltk::backend::models::rfdetr::NormalizedModelStateEntry> synthetic_entries;
+    synthetic_entries.push_back({"cpu_contiguous", cpu_contiguous});
+    synthetic_entries.push_back({"cpu_non_contiguous", cpu_non_contiguous});
+    const bool has_cuda = torch::cuda::is_available();
     if (has_cuda) {
-        state_entries(checkpoint)
-            .push_back({"cuda_tensor", tensor_api::arange(6, tensor_api::TensorOptions().dtype(tensor_api::kFloat32).device(tensor_api::kCUDA)).view({2, 3})});
+        synthetic_entries
+            .push_back({"cuda_tensor", torch::arange(6, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)).view({2, 3})});
     }
+    set_synthetic_model_state(checkpoint, std::move(synthetic_entries));
     mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
     const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(output_path);
     require_detection_metadata_equal(checkpoint.metadata, loaded.metadata);
@@ -201,19 +201,19 @@ void test_native_checkpoint_tensor_preparation() {
     REQUIRE((loaded_contiguous != nullptr));
     REQUIRE((loaded_contiguous->tensor.device().is_cpu()));
     REQUIRE((loaded_contiguous->tensor.is_contiguous()));
-    REQUIRE((tensor_api::equal(loaded_contiguous->tensor, cpu_contiguous)));
+    REQUIRE((torch::equal(loaded_contiguous->tensor, cpu_contiguous)));
     const auto* loaded_non_contiguous = find_entry(loaded, "cpu_non_contiguous");
     REQUIRE((loaded_non_contiguous != nullptr));
     REQUIRE((loaded_non_contiguous->tensor.device().is_cpu()));
     REQUIRE((loaded_non_contiguous->tensor.is_contiguous()));
-    REQUIRE((tensor_api::equal(loaded_non_contiguous->tensor, cpu_non_contiguous.contiguous())));
+    REQUIRE((torch::equal(loaded_non_contiguous->tensor, cpu_non_contiguous.contiguous())));
     const auto* loaded_cuda = find_entry(loaded, "cuda_tensor");
     REQUIRE(((loaded_cuda != nullptr) == has_cuda));
     if (loaded_cuda != nullptr) {
-        const auto expected = state_entries(checkpoint).back().tensor.detach().to(tensor_api::Device(tensor_api::kCPU)).contiguous();
+        const auto expected = state_entries(checkpoint).back().tensor.detach().to(torch::Device(torch::kCPU)).contiguous();
         REQUIRE((loaded_cuda->tensor.device().is_cpu()));
         REQUIRE((loaded_cuda->tensor.is_contiguous()));
-        REQUIRE((tensor_api::equal(loaded_cuda->tensor, expected)));
+        REQUIRE((torch::equal(loaded_cuda->tensor, expected)));
     }
     checkpoint.metadata.for_each_detection_field([](const char*, auto& field) { field.reset(); });
     mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
@@ -223,13 +223,14 @@ void test_upstream_checkpoint_scalar_type_bridge() {
     const fs::path upstream_path = fixture_root() / "upstream" / "rf-detr-nano-dtype-bridge.pth";
     mmltk::backend::models::rfdetr::DecodedNativeModelState state;
     populate_detection_metadata(state.metadata);
-    auto& entries = state_entries(state);
+    std::vector<mmltk::backend::models::rfdetr::NormalizedModelStateEntry> entries;
     entries = {
-        {"query_feat.weight", tensor_api::ones({4, kParityFixtureHiddenDim}, tensor_api::TensorOptions().dtype(tensor_api::kFloat16))},
-        {"refpoint_embed.weight", tensor_api::zeros({4, 4}, tensor_api::TensorOptions().dtype(tensor_api::kFloat32))},
-        {"class_embed.weight", tensor_api::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim}, tensor_api::TensorOptions().dtype(tensor_api::kFloat32))},
-        {"class_embed.bias", tensor_api::arange(kParityFixtureNumClasses, tensor_api::TensorOptions().dtype(tensor_api::kInt64))},
+        {"query_feat.weight", torch::ones({4, kParityFixtureHiddenDim}, torch::TensorOptions().dtype(torch::kFloat16))},
+        {"refpoint_embed.weight", torch::zeros({4, 4}, torch::TensorOptions().dtype(torch::kFloat32))},
+        {"class_embed.weight", torch::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim}, torch::TensorOptions().dtype(torch::kFloat32))},
+        {"class_embed.bias", torch::arange(kParityFixtureNumClasses, torch::TensorOptions().dtype(torch::kInt64))},
     };
+    set_synthetic_model_state(state, entries);
     mmltk::backend::models::rfdetr::write_upstream_model_state(upstream_path, state);
     const auto checkpoint = mmltk::backend::models::rfdetr::decode_model_state(upstream_path);
     require_detection_metadata_equal(state.metadata, checkpoint.metadata);
@@ -237,26 +238,27 @@ void test_upstream_checkpoint_scalar_type_bridge() {
     const auto* class_bias = find_entry(checkpoint, "class_embed.bias");
     REQUIRE((query_feat != nullptr));
     REQUIRE((class_bias != nullptr));
-    REQUIRE((query_feat->tensor.scalar_type() == tensor_api::kFloat16));
-    REQUIRE((class_bias->tensor.scalar_type() == tensor_api::kInt64));
+    REQUIRE((query_feat->tensor.scalar_type() == torch::kFloat16));
+    REQUIRE((class_bias->tensor.scalar_type() == torch::kInt64));
 }
 void test_cuda_upstream_raw_state_preserves_logical_values() {
-    if (!tensor_api::cuda::is_available()) { SKIP("CUDA unavailable"); }
+    if (!torch::cuda::is_available()) { SKIP("CUDA unavailable"); }
     mmltk::testsupport::ScopedTempDir temp{"mmltk-upstream-cuda-readback"};
     mmltk::backend::models::rfdetr::DecodedNativeModelState state;
-    auto& entries = state_entries(state);
+    std::vector<mmltk::backend::models::rfdetr::NormalizedModelStateEntry> entries;
     entries = {
         {"query_feat.weight",
-         tensor_api::ones({4, kParityFixtureHiddenDim}, tensor_api::TensorOptions().dtype(tensor_api::kFloat16).device(tensor_api::kCUDA))},
-        {"refpoint_embed.weight", tensor_api::zeros({4, 4}, tensor_api::TensorOptions().device(tensor_api::kCUDA))},
-        {"class_embed.weight", tensor_api::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim}, tensor_api::TensorOptions().device(tensor_api::kCUDA))},
-        {"class_embed.bias", tensor_api::arange(kParityFixtureNumClasses, tensor_api::TensorOptions().dtype(tensor_api::kInt64).device(tensor_api::kCUDA))},
-        {"extra_view", tensor_api::arange(12, tensor_api::TensorOptions().dtype(tensor_api::kBFloat16).device(tensor_api::kCUDA)).view({3, 4}).transpose(0, 1)},
-        {"extra_empty", tensor_api::empty({0}, tensor_api::TensorOptions().dtype(tensor_api::kBool))},
+         torch::ones({4, kParityFixtureHiddenDim}, torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA))},
+        {"refpoint_embed.weight", torch::zeros({4, 4}, torch::TensorOptions().device(torch::kCUDA))},
+        {"class_embed.weight", torch::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim}, torch::TensorOptions().device(torch::kCUDA))},
+        {"class_embed.bias", torch::arange(kParityFixtureNumClasses, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA))},
+        {"extra_view", torch::arange(12, torch::TensorOptions().dtype(torch::kBFloat16).device(torch::kCUDA)).view({3, 4}).transpose(0, 1)},
+        {"extra_empty", torch::empty({0}, torch::TensorOptions().dtype(torch::kBool))},
     };
     std::vector<const void*> pointers;
     for (const auto& entry : entries) pointers.push_back(entry.tensor.const_data_ptr());
     const auto path = temp.path() / "rf-detr-nano-readback.pth";
+    set_synthetic_model_state(state, entries);
     mmltk::backend::models::rfdetr::write_upstream_model_state(path, state);
     const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(path);
     for (std::size_t index = 0; index < entries.size(); ++index) {
@@ -265,7 +267,7 @@ void test_cuda_upstream_raw_state_preserves_logical_values() {
         REQUIRE(actual != nullptr);
         REQUIRE(actual->tensor.scalar_type() == expected.tensor.scalar_type());
         REQUIRE(actual->tensor.sizes() == expected.tensor.sizes());
-        REQUIRE(tensor_api::equal(actual->tensor, expected.tensor.cpu()));
+        REQUIRE(torch::equal(actual->tensor, expected.tensor.cpu()));
         REQUIRE(expected.tensor.const_data_ptr() == pointers[index]);
     }
 }
@@ -281,10 +283,10 @@ void test_legacy_native_checkpoint_format_support() {
     }
 }
 auto round_trip_training_supervision_config(const fs::path& path, const mmltk::backend::models::rfdetr::TrainingSupervisionConfig& config) {
-    tensor_api::serialize::OutputArchive output;
+    torch::serialize::OutputArchive output;
     mmltk::backend::models::rfdetr::detail::write_training_supervision_config(output, config);
     output.save_to(path.string());
-    tensor_api::serialize::InputArchive input;
+    torch::serialize::InputArchive input;
     input.load_from(path.string());
     return mmltk::backend::models::rfdetr::detail::read_training_supervision_config(input);
 }
@@ -296,14 +298,14 @@ void test_training_supervision_checkpoint_blob_admission() {
     config.match_free.rho = 0.625F;
     config.denoising.enabled = true;
     REQUIRE((round_trip_training_supervision_config(path, config) == config));
-    tensor_api::serialize::InputArchive input;
+    torch::serialize::InputArchive input;
     input.load_from(path.string());
-    tensor_api::Tensor encoded;
+    torch::Tensor encoded;
     input.read("training_supervision_config_cbor", encoded);
-    tensor_api::serialize::OutputArchive obsolete_key_output;
+    torch::serialize::OutputArchive obsolete_key_output;
     obsolete_key_output.write("training_supervision_config", encoded);
     obsolete_key_output.save_to(path.string());
-    tensor_api::serialize::InputArchive obsolete_key_input;
+    torch::serialize::InputArchive obsolete_key_input;
     obsolete_key_input.load_from(path.string());
     REQUIRE(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(obsolete_key_input) ==
             mmltk::backend::models::rfdetr::TrainingSupervisionConfig{});
@@ -321,52 +323,52 @@ void test_training_supervision_checkpoint_blob_admission() {
         config,
     };
     for (const auto& variant : variants) { REQUIRE(round_trip_training_supervision_config(path, variant) == variant); }
-    tensor_api::serialize::OutputArchive trailing_output;
+    torch::serialize::OutputArchive trailing_output;
     trailing_output.write("training_supervision_config_cbor",
-                          tensor_api::cat({encoded, tensor_api::zeros({1}, tensor_api::TensorOptions().dtype(tensor_api::kUInt8))}));
+                          torch::cat({encoded, torch::zeros({1}, torch::TensorOptions().dtype(torch::kUInt8))}));
     trailing_output.save_to(path.string());
-    tensor_api::serialize::InputArchive trailing_input;
+    torch::serialize::InputArchive trailing_input;
     trailing_input.load_from(path.string());
     REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(trailing_input));
-    tensor_api::serialize::OutputArchive malformed_output;
-    malformed_output.write("training_supervision_config_cbor", tensor_api::zeros({4}));
+    torch::serialize::OutputArchive malformed_output;
+    malformed_output.write("training_supervision_config_cbor", torch::zeros({4}));
     malformed_output.save_to(path.string());
-    tensor_api::serialize::InputArchive malformed_input;
+    torch::serialize::InputArchive malformed_input;
     malformed_input.load_from(path.string());
     REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(malformed_input));
-    tensor_api::serialize::OutputArchive wrong_rank_output;
+    torch::serialize::OutputArchive wrong_rank_output;
     wrong_rank_output.write("training_supervision_config_cbor", encoded.reshape({1, encoded.numel()}));
     wrong_rank_output.save_to(path.string());
-    tensor_api::serialize::InputArchive wrong_rank_input;
+    torch::serialize::InputArchive wrong_rank_input;
     wrong_rank_input.load_from(path.string());
     REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(wrong_rank_input));
-    tensor_api::serialize::OutputArchive truncated_output;
+    torch::serialize::OutputArchive truncated_output;
     truncated_output.write("training_supervision_config_cbor", encoded.narrow(0, 0, encoded.numel() - 1));
     truncated_output.save_to(path.string());
-    tensor_api::serialize::InputArchive truncated_input;
+    torch::serialize::InputArchive truncated_input;
     truncated_input.load_from(path.string());
     REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(truncated_input));
-    if (tensor_api::cuda::is_available()) {
-        tensor_api::serialize::OutputArchive wrong_device_output;
-        wrong_device_output.write("training_supervision_config_cbor", encoded.to(tensor_api::Device(tensor_api::kCUDA)));
+    if (torch::cuda::is_available()) {
+        torch::serialize::OutputArchive wrong_device_output;
+        wrong_device_output.write("training_supervision_config_cbor", encoded.to(torch::Device(torch::kCUDA)));
         wrong_device_output.save_to(path.string());
-        tensor_api::serialize::InputArchive wrong_device_input;
+        torch::serialize::InputArchive wrong_device_input;
         wrong_device_input.load_from(path.string());
         REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(wrong_device_input));
     }
-    tensor_api::serialize::OutputArchive oversized_output;
-    oversized_output.write("training_supervision_config_cbor", tensor_api::zeros({4096}, tensor_api::TensorOptions().dtype(tensor_api::kUInt8)));
+    torch::serialize::OutputArchive oversized_output;
+    oversized_output.write("training_supervision_config_cbor", torch::zeros({4096}, torch::TensorOptions().dtype(torch::kUInt8)));
     oversized_output.save_to(path.string());
-    tensor_api::serialize::InputArchive oversized_input;
+    torch::serialize::InputArchive oversized_input;
     oversized_input.load_from(path.string());
     REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(oversized_input));
     const auto require_raw_cbor_rejected = [&](const std::span<const std::uint8_t> raw) {
-        auto blob = tensor_api::empty({static_cast<std::int64_t>(raw.size())}, tensor_api::TensorOptions().dtype(tensor_api::kUInt8));
+        auto blob = torch::empty({static_cast<std::int64_t>(raw.size())}, torch::TensorOptions().dtype(torch::kUInt8));
         std::memcpy(blob.data_ptr<std::uint8_t>(), raw.data(), raw.size());
-        tensor_api::serialize::OutputArchive raw_output;
+        torch::serialize::OutputArchive raw_output;
         raw_output.write("training_supervision_config_cbor", blob);
         raw_output.save_to(path.string());
-        tensor_api::serialize::InputArchive raw_input;
+        torch::serialize::InputArchive raw_input;
         raw_input.load_from(path.string());
         REQUIRE_THROWS(mmltk::backend::models::rfdetr::detail::read_training_supervision_config(raw_input));
     };
@@ -394,28 +396,28 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
     config.group_detr = 1;
     config.training_supervision.assignment = rfdetr::TrainAssignmentKind::MatchFree;
     rfdetr::NativeRfDetrModel model(config, rfdetr::testsupport::synthetic_training_layout(config.num_classes - 1));
-    auto& module = rfdetr::detail::native_model_owner(model).module();
+    auto& module = (model);
     auto state = clone_normalized_model_state(module);
     REQUIRE_FALSE(state.empty());
     const auto first_before = module.named_parameters(true).begin()->value().detach().clone();
     const auto require_rejected_without_mutation = [&](const std::vector<rfdetr::NormalizedModelStateEntry>& candidate) {
-        REQUIRE_THROWS(rfdetr::detail::native_model_owner(model).load_normalized_state(candidate, true));
-        REQUIRE(tensor_api::equal(module.named_parameters(true).begin()->value(), first_before));
+        REQUIRE_THROWS(model.load_normalized_state(candidate, true));
+        REQUIRE(torch::equal(module.named_parameters(true).begin()->value(), first_before));
     };
     auto duplicate = state;
     duplicate.push_back(duplicate.front());
     require_rejected_without_mutation(duplicate);
     auto missing = state;
-    missing.front().tensor = tensor_api::full_like(missing.front().tensor, 9.0);
+    missing.front().tensor = torch::full_like(missing.front().tensor, 9.0);
     missing.pop_back();
     require_rejected_without_mutation(missing);
     auto valid_candidate_state = state;
-    valid_candidate_state.front().tensor = tensor_api::full_like(valid_candidate_state.front().tensor, 9.0);
+    valid_candidate_state.front().tensor = torch::full_like(valid_candidate_state.front().tensor, 9.0);
     auto candidate =
-        rfdetr::detail::native_model_owner(model).stage_normalized_state(valid_candidate_state, rfdetr::detail::NormalizedModelStateAdmission::Exact);
-    REQUIRE(tensor_api::equal(module.named_parameters(true).begin()->value(), first_before));
-    rfdetr::detail::native_model_owner(model).commit_normalized_state(std::move(candidate));
-    REQUIRE(tensor_api::equal(module.named_parameters(true).begin()->value(), tensor_api::full_like(first_before, 9.0)));
+        model.stage_normalized_state(valid_candidate_state, rfdetr::detail::NormalizedModelStateAdmission::Exact);
+    REQUIRE(torch::equal(module.named_parameters(true).begin()->value(), first_before));
+    model.commit_normalized_state(std::move(candidate));
+    REQUIRE(torch::equal(module.named_parameters(true).begin()->value(), torch::full_like(first_before, 9.0)));
     const auto class_head = std::ranges::find_if(state, [](const rfdetr::NormalizedModelStateEntry& entry) { return entry.name == "class_embed.weight"; });
     REQUIRE(class_head != state.end());
     REQUIRE(class_head->tensor.size(0) > 1);
@@ -427,12 +429,12 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
     REQUIRE(class_head_destination != nullptr);
     const auto class_head_before = class_head_destination->detach().clone();
     REQUIRE_THROWS(
-        rfdetr::detail::native_model_owner(model).stage_normalized_state(mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::Exact));
-    REQUIRE(tensor_api::equal(*class_head_destination, class_head_before));
+        model.stage_normalized_state(mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::Exact));
+    REQUIRE(torch::equal(*class_head_destination, class_head_before));
     const auto source_layout = rfdetr::ResolvedClassLayout(model.class_layout()->record());
-    REQUIRE_THROWS(rfdetr::detail::native_model_owner(model).stage_normalized_state(
+    REQUIRE_THROWS(model.stage_normalized_state(
         mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
-    REQUIRE(tensor_api::equal(*class_head_destination, class_head_before));
+    REQUIRE(torch::equal(*class_head_destination, class_head_before));
 }
 }  // namespace
 void test_checkpoint_roundtrip_and_fixture_loading() {
@@ -473,10 +475,10 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
     config.training_supervision.denoising.enabled = true;
     const r::ResolvedClassLayout source_layout(r::native_training_class_layout(c::ClassCatalog({"a", "b", "c"})));
     r::NativeRfDetrModel model(config, r::native_training_class_layout(c::ClassCatalog({"c", "a", "new"})));
-    auto& owner = r::detail::native_model_owner(model);
+    auto& owner = (model);
     owner.initialize_training_supervision(29);
-    const auto before = r::testsupport::clone_normalized_model_state(owner.module());
-    auto source = r::testsupport::clone_normalized_model_state(owner.module());
+    const auto before = r::testsupport::clone_normalized_model_state(owner);
+    auto source = r::testsupport::clone_normalized_model_state(owner);
     // Independent expected axes cover both classifier owners and distinct
     // supervision coordinates, rather than consulting the production inventory.
     const std::array axes{std::pair{"class_embed.weight", 0},
@@ -490,12 +492,12 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
         REQUIRE(entry != source.end());
         for (std::int64_t row = 0; row < entry->tensor.size(dimension); ++row) entry->tensor.select(dimension, row).fill_(10. + static_cast<double>(row));
     }
-    const auto transfer = [&](r::detail::NativeModelTechnicalOwner& destination) {
+    const auto transfer = [&](r::NativeRfDetrModel& destination) {
         const auto random_before = at::detail::getDefaultCPUGenerator().get_state();
         auto candidate = destination.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout);
         destination.commit_normalized_state(std::move(candidate));
-        CHECK(tensor_api::equal(random_before, at::detail::getDefaultCPUGenerator().get_state()));
-        return destination.module().named_parameters(true);
+        CHECK(torch::equal(random_before, at::detail::getDefaultCPUGenerator().get_state()));
+        return destination.named_parameters(true);
     };
     const auto after = transfer(owner);
     for (const auto& [name, dimension] : axes) {
@@ -503,31 +505,31 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
         REQUIRE(actual);
         const auto seeded = std::ranges::find(before, name, &r::NormalizedModelStateEntry::name);
         REQUIRE(seeded != before.end());
-        CHECK(tensor_api::equal(actual->select(dimension, 0), tensor_api::full_like(actual->select(dimension, 0), 12.)));
-        CHECK(tensor_api::equal(actual->select(dimension, 1), tensor_api::full_like(actual->select(dimension, 1), 10.)));
-        CHECK(tensor_api::equal(actual->select(dimension, 2), seeded->tensor.select(dimension, 2)));
+        CHECK(torch::equal(actual->select(dimension, 0), torch::full_like(actual->select(dimension, 0), 12.)));
+        CHECK(torch::equal(actual->select(dimension, 1), torch::full_like(actual->select(dimension, 1), 10.)));
+        CHECK(torch::equal(actual->select(dimension, 2), seeded->tensor.select(dimension, 2)));
         if (dimension == 1) {
             for (std::int64_t box = 3; box < 7; ++box)
-                CHECK(tensor_api::equal(actual->select(1, box), tensor_api::full_like(actual->select(1, box), 10. + static_cast<double>(box))));
+                CHECK(torch::equal(actual->select(1, box), torch::full_like(actual->select(1, box), 10. + static_cast<double>(box))));
         } else if (actual->size(0) == 4) {
-            CHECK(tensor_api::equal(actual->select(0, 3), seeded->tensor.select(0, 3)));
+            CHECK(torch::equal(actual->select(0, 3), seeded->tensor.select(0, 3)));
         }
     }
-    const auto admitted = r::testsupport::clone_normalized_model_state(owner.module());
+    const auto admitted = r::testsupport::clone_normalized_model_state(owner);
     const r::ResolvedClassLayout unknown(r::unresolved_class_layout(4));
     auto unbound = owner.stage_normalized_state(source, r::detail::NormalizedModelStateAdmission::FreshTransfer, &unknown);
     owner.commit_normalized_state(std::move(unbound));
-    const auto retained = owner.module().named_parameters(true);
+    const auto retained = owner.named_parameters(true);
     for (const auto& [name, dimension] : axes) {
         const auto expected = std::ranges::find(admitted, name, &r::NormalizedModelStateEntry::name);
-        CHECK(tensor_api::equal(*retained.find(name), expected->tensor));
+        CHECK(torch::equal(*retained.find(name), expected->tensor));
     }
     config.num_classes = 3;
     for (const bool overlap : {true, false}) {
         r::NativeRfDetrModel smaller(config, r::native_training_class_layout(c::ClassCatalog({overlap ? "b" : "fresh", "new"})));
-        auto& destination = r::detail::native_model_owner(smaller);
+        auto& destination = (smaller);
         destination.initialize_training_supervision(31);
-        const auto seed = r::testsupport::clone_normalized_model_state(destination.module());
+        const auto seed = r::testsupport::clone_normalized_model_state(destination);
         const auto parameters = transfer(destination);
         for (const auto& [name, dimension] : axes) {
             const auto* actual = parameters.find(name);
@@ -535,13 +537,13 @@ TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class i
             REQUIRE(actual);
             REQUIRE(original != seed.end());
             const auto first = actual->select(dimension, 0);
-            CHECK(tensor_api::equal(first, overlap ? tensor_api::full_like(first, 11.) : original->tensor.select(dimension, 0)));
-            CHECK(tensor_api::equal(actual->select(dimension, 1), original->tensor.select(dimension, 1)));
+            CHECK(torch::equal(first, overlap ? torch::full_like(first, 11.) : original->tensor.select(dimension, 0)));
+            CHECK(torch::equal(actual->select(dimension, 1), original->tensor.select(dimension, 1)));
             if (dimension == 1) {
                 for (std::int64_t box = 0; box < 4; ++box)
-                    CHECK(tensor_api::equal(actual->select(1, 2 + box), tensor_api::full_like(actual->select(1, 2 + box), 13. + static_cast<double>(box))));
+                    CHECK(torch::equal(actual->select(1, 2 + box), torch::full_like(actual->select(1, 2 + box), 13. + static_cast<double>(box))));
             } else if (actual->size(0) == 3) {
-                CHECK(tensor_api::equal(actual->select(0, 2), original->tensor.select(0, 2)));
+                CHECK(torch::equal(actual->select(0, 2), original->tensor.select(0, 2)));
             }
         }
     }

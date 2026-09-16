@@ -12,17 +12,17 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-#include "detail/detection_types.h"
-#include "detail/model_technical.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "detail/modules_technical.h"
 #include "src/frameworks/gpu/cuda_device_scope.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-#include "torch_cuda_utils.h"
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
+#include "src/backend/ml/cuda/shared_cuda_event.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 import mmltk.backend.ml.cuda.gpu_quiescence;
-import mmltk.backend.ml.cuda.shared_cuda_event;
 namespace F = torch::nn::functional;
 namespace mmltk::backend::models::rfdetr {
 using mmltk::backend::ml::cuda::checked_device_index;

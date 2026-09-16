@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/contract/capabilities.h"
 #include <cstddef>
 #include <filesystem>
 #include <meta>
@@ -6,14 +7,6 @@
 #include <string_view>
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 namespace mmltk::backend::models::rfdetr {
-struct RfdetrCapabilities final {
-    bool weights;
-    bool onnx;
-    bool tensorrt;
-    bool training;
-    bool live;
-    constexpr bool operator==(const RfdetrCapabilities&) const noexcept = default;
-};
 // This aggregate is the model package's one reflected catalog contribution.
 // Catalog projection inspects this stable value; RF-DETR implementation
 // components consume the same preset/configuration authority.
@@ -21,7 +14,7 @@ struct RfdetrContractContribution final {
     using ArtifactPresetInference = std::string_view (*)(const std::filesystem::path&);
     std::string_view model_id;
     std::string_view display_name;
-    RfdetrCapabilities capabilities;
+    ModelCapabilities capabilities;
     std::span<const PresetCatalogEntry> presets;
     ArtifactPresetInference infer_artifact_preset;
 };

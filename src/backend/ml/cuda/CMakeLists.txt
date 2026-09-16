@@ -10,28 +10,28 @@ mmltk_register_public_headers(
     FILES
         torch_autocast_scope.h
         numa_host_tensor.h
-        tensor_readback.h)
+        tensor_readback.h
+        torch_cuda_utils.h
+        shared_cuda_event.h)
 
 mmltk_register_retained_module_providers(
     mmltk_backend_ml_cuda torch_cuda_scope.cppm)
 foreach(_mmltk_cuda_partition IN ITEMS
-        gpu_quiescence.cppm
-        shared_cuda_event.cppm)
+        gpu_quiescence.cppm)
     mmltk_register_retained_module_providers(
         mmltk_backend_ml_cuda "${_mmltk_cuda_partition}")
 endforeach()
 mmltk_register_retained_module_implementation_units(mmltk_backend_ml_cuda
     gpu_quiescence.cpp
-    shared_cuda_event.cpp
     detail/torch_cuda_scope.cpp
 )
 mmltk_register_ordinary_sources(mmltk_backend_ml_cuda
+    shared_cuda_event.cpp
     numa_host_tensor.cpp
     tensor_readback.cpp
     detail/torch_cuda_utils.cpp)
 mmltk_register_private_headers(mmltk_backend_ml_cuda
-    detail/shared_cuda_event_runtime.inc
-    detail/torch_cuda_utils.h)
+    detail/shared_cuda_event_runtime.inc)
 target_include_directories(mmltk_backend_ml_cuda PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

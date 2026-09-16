@@ -1,3 +1,5 @@
+#include <torch/utils.h>
+
 #include <filesystem>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 // RF-DETR training checkpoint parity coverage.
@@ -9,17 +11,16 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 // Import-bearing support follows every textual standard-library test helper.
 #include "checkpoint_fixture_support.h"
-#include "detection_types.h"
-#include "model_access.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "model_state_fixture.h"
-#include "model_state_access.h"
-#include "model_technical.h"
+#include "src/backend/models/rfdetr/core/model_state.h"
 #include "parity_fixture_support.h"
-#include "torch_api.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace fs = std::filesystem;
 // CLEANUP-IGNORE: The parity fixture's namespace aliases are independent of the optimizer fixture's typed inventory.
-namespace tensor_api = mmltk::backend::ml::torch_api;
 namespace model_detail = mmltk::backend::models::rfdetr::detail;
 // CLEANUP-IGNORE: This checkpoint test names the exact RF-DETR types used by its independent parity oracles.
 namespace {
@@ -42,7 +43,7 @@ NativeRfDetrConfig config_for_fixture(const ParityFixtureCase& fixture) {
     if (preset == nullptr) { throw std::runtime_error(std::string("missing model preset for parity fixture: ") + fixture.preset_name); }
     return native_config_from_preset(*preset);
 }
-std::string shape_string(const tensor_api::Tensor& tensor) {
+std::string shape_string(const torch::Tensor& tensor) {
     std::ostringstream stream;
     stream << "[";
     for (int64_t index = 0; index < tensor.dim(); ++index) {
@@ -58,24 +59,24 @@ void assert_clean_summary(const ModelStateLoadSummary& summary, const std::strin
 }
 void write_module_upstream_checkpoint(const fs::path& path, const NativeRfDetrModel& module) {
     mmltk::backend::models::rfdetr::DecodedNativeModelState state;
-    const auto& technical_module = model_detail::native_model_owner(module).module();
-    model_detail::model_state_owner(state).entries = clone_normalized_model_state(technical_module, true);
+    const auto& technical_module = (module);
+    set_synthetic_model_state(state, clone_normalized_model_state(technical_module, true));
     mmltk::backend::models::rfdetr::write_upstream_model_state(path, state);
 }
-[[nodiscard]] bool same_shape(const tensor_api::Tensor& left, const tensor_api::Tensor& right) {
+[[nodiscard]] bool same_shape(const torch::Tensor& left, const torch::Tensor& right) {
     if (left.dim() != right.dim()) return false;
     for (std::int64_t dimension = 0; dimension < left.dim(); ++dimension) {
         if (left.size(dimension) != right.size(dimension)) return false;
     }
     return true;
 }
-void assert_tensor_bitwise_equal(const tensor_api::Tensor& actual, const tensor_api::Tensor& expected, const std::string& label) {
+void assert_tensor_bitwise_equal(const torch::Tensor& actual, const torch::Tensor& expected, const std::string& label) {
     if (!same_shape(actual, expected)) {
         throw std::runtime_error(label + " shape mismatch: actual=" + shape_string(actual) + " expected=" + shape_string(expected));
     }
     const auto actual_cpu = actual.detach().cpu().contiguous();
     const auto expected_cpu = expected.detach().cpu().to(actual_cpu.scalar_type()).contiguous();
-    if (tensor_api::equal(actual_cpu, expected_cpu)) { return; }
+    if (torch::equal(actual_cpu, expected_cpu)) { return; }
     const auto abs_diff = actual_cpu.sub(expected_cpu).abs();
     const auto max_abs = abs_diff.max().item<double>();
     throw std::runtime_error(label + " differs at the bitwise level: max_abs=" + std::to_string(max_abs));
@@ -103,9 +104,9 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
     const fs::path upstream_path = temp_dir.path() / "weights" / fixture.upstream_filename;
     const fs::path native_path = temp_dir.path() / "weights" / (std::string(fixture.preset_name) + ".native.pt");
     log_fixture_phase("test_rfdetr_checkpoint_parity", index, total, "seed", fixture.preset_name);
-    tensor_api::manual_seed(fixture.query_rows + fixture.input_size);
+    torch::manual_seed(fixture.query_rows + fixture.input_size);
     NativeRfDetrModel seeded_model(config_for_fixture(fixture));
-    model_detail::native_model_owner(seeded_model).module().eval();
+    seeded_model.eval();
     write_module_upstream_checkpoint(upstream_path, seeded_model);
     log_fixture_phase("test_rfdetr_checkpoint_parity", index, total, "normalize", fixture.preset_name);
     const auto normalized = mmltk::backend::models::rfdetr::normalize_checkpoint_to_native(upstream_path, native_path);
@@ -117,12 +118,12 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
     log_fixture_phase("test_rfdetr_checkpoint_parity", index, total, "load", fixture.preset_name);
     assert_clean_summary(mmltk::backend::models::rfdetr::load_model_weights(upstream_model, upstream_path, true), "upstream");
     assert_clean_summary(mmltk::backend::models::rfdetr::load_model_weights(native_model, native_path, true), "native");
-    model_detail::native_model_owner(upstream_model).module().eval();
-    model_detail::native_model_owner(native_model).module().eval();
+    upstream_model.eval();
+    native_model.eval();
     const auto image = make_fixture_image(fixture);
     log_fixture_phase("test_rfdetr_checkpoint_parity", index, total, "forward", fixture.preset_name);
-    const auto upstream_outputs = model_detail::native_model_owner(upstream_model).forward(nested_tensor_from_tensor_list({image.clone()}), true);
-    const auto native_outputs = model_detail::native_model_owner(native_model).forward(nested_tensor_from_tensor_list({image.clone()}), true);
+    const auto upstream_outputs = upstream_model.forward(nested_tensor_from_tensor_list({image.clone()}), true);
+    const auto native_outputs = native_model.forward(nested_tensor_from_tensor_list({image.clone()}), true);
     assert_outputs_bitwise_equal(upstream_outputs, native_outputs, fixture.preset_name);
 }
 }  // namespace

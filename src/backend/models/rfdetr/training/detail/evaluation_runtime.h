@@ -1,5 +1,10 @@
 #pragma once
+#include "src/backend/models/rfdetr/training/train.h"
+#include "src/backend/models/rfdetr/core/runtime.h"
+#include "training_lanes.h"
+#include "training_metrics.h"
 #include <array>
+#include <span>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -17,8 +22,8 @@
 #include <vector>
 #include <cuda_runtime.h>
 #include <torch/types.h>
-#include "src/backend/ml/cuda/detail/torch_cuda_utils.h"
-#include "src/backend/models/rfdetr/core/detail/postprocess.h"
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
+#include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/common/concurrency/worker_pool.h"
 namespace mmltk::backend::data {
@@ -30,7 +35,7 @@ struct PredictionBatchMetadata {
     std::int64_t image_id = 0;
     std::string source_name;
 };
-std::vector<PredictionBatchMetadata> make_prediction_batch_metadata(const mmltk::backend::data::Batch& batch, const std::vector<int>& image_ids);
+void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch, const std::vector<int>& image_ids);
 struct EvaluationRunConfig final {
     EvaluationMetricSet metric_set = EvaluationMetricSet::BBox;
     std::size_t batch_capacity = 1U;
@@ -166,6 +171,7 @@ enum class PredictionSlotState : std::uint8_t {
     CpuMatching,
 };
 struct PinnedPredictionBuffers {
+    std::vector<PredictionBatchMetadata> images;
     PinnedBBoxPredictionBuffers bbox;
     std::optional<PinnedMaskPredictionBuffers> mask;
     cudaEvent_t ready_event = nullptr;
@@ -215,7 +221,7 @@ struct StagedMaskPredictionBatch {
     uint32_t width = 0;
 };
 struct StagedPredictionBatch {
-    std::vector<PredictionBatchMetadata> images;
+    std::span<PredictionBatchMetadata> images;
     StagedBBoxPredictionBatch bbox;
     std::optional<StagedMaskPredictionBatch> mask;
     PostprocessedBatch pending_gpu;
@@ -232,7 +238,7 @@ struct EvaluationPredictionLane {
     std::shared_ptr<PredictionBufferSlotPool> slot_pool;
 };
 using EvaluationLaneWork = std::move_only_function<StagedPredictionBatch(EvaluationPredictionLane&)>;
-StagedPredictionBatch stage_prediction_batch(std::vector<PredictionBatchMetadata> images, PostprocessedBatch batch, size_t category_count,
+StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count,
                                              size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle);
 PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(mmltk::common::concurrency::WorkerPool& cpu_pool, StagedPredictionBatch&& staged,
                                                                  EvaluationProfileRecord* profile = nullptr,
@@ -264,6 +270,7 @@ class TrainingEvaluationRunOwner final {
     void record_model_output(std::string precision, std::string box_precision, std::size_t query_count, std::size_t class_count);
     void record_prediction_transfer(const PostprocessedBatch& processed, std::size_t image_count);
     [[nodiscard]] EvaluationCudaTimingLease acquire_timing();
+    [[nodiscard]] PredictionBufferLease acquire_next_prediction_slot();
     void submit(mmltk::common::concurrency::WorkerPool& lane_pool, EvaluationLaneWork work, EvaluationCudaTimingLease timing);
     void drain_lane(mmltk::common::concurrency::WorkerPool& cpu_pool);
     [[nodiscard]] std::size_t drain_encoding();
@@ -274,4 +281,44 @@ class TrainingEvaluationRunOwner final {
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+struct EvalPassResult {
+    std::optional<double> loss;
+    EvalSummary summary;
+    PhaseTiming timing;
+};
+enum class EvaluationPurpose : std::uint8_t { ScheduledValidation, FinalTest };
+PhaseTiming elapsed_timing(std::chrono::steady_clock::time_point start, std::size_t images);
+class TrainingValidationRuntime final {
+ public:
+    TrainingValidationRuntime(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader,
+                              size_t batch_size, bool enable_loss, EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name,
+                              const bool query_count_automatic);
+    ~TrainingValidationRuntime();
+    void begin_pass() ;
+    torch::Tensor preprocess(const mmltk::backend::data::Batch& batch) ;
+    void record_preprocess_consumer(cudaStream_t stream) ;
+    RuntimeContext& runtime() ;
+    size_t batch_size() const;
+    mmltk::backend::data::DatasetLoader& loader() ;
+    const std::vector<int>& image_ids() const;
+    bool amp_enabled() const noexcept;
+    at::ScalarType inference_dtype() const noexcept;
+    torch::Tensor nested_mask() const;
+    TargetScratch& target_scratch() ;
+    mmltk::common::concurrency::WorkerPool& lane_pool() ;
+    TrainingEvaluationRunOwner& evaluation_run() noexcept;
+    std::string_view split_name() const noexcept;
+    std::size_t detection_limit() const noexcept;
+    bool automatic_detection_limit() const noexcept;
+    bool query_count_automatic() const noexcept;
+ private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRuntime& validation, NativeRfDetrModel& model, TrainingEventOwner& event_owner,
+                              const DetectionConfig& detection_config, bool calculate_loss, EvaluationPurpose purpose, EvaluatedWeights evaluated_weights,
+                              std::optional<int> current_epoch, TrainingMetricHandoff* metrics = nullptr);
+mmltk::backend::data::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle, int prefetch_factor,
+                                                               int gather_workers, const std::string& cpu_affinity, int device_id, uint64_t seed,
+                                                               uint32_t batch_shard_rank = 0, uint32_t batch_shard_count = 1);
 }  // namespace mmltk::backend::models::rfdetr

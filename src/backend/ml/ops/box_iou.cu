@@ -7,8 +7,8 @@
 #include <cstdint>
 #include "src/frameworks/gpu/cuda_launch.cuh"
 #include <limits>
-#include "detail/box_iou_cuda.h"
-namespace mmltk::backend::ml::ops::detail {
+#include "box_iou.h"
+namespace mmltk::backend::ml::ops {
 namespace {
 template <typename T>
 __device__ inline T box_area(const T* box) {
@@ -110,4 +110,4 @@ torch::Tensor box_iou_cuda(const torch::Tensor& boxes1, const torch::Tensor& box
 torch::Tensor generalized_box_iou_cuda(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
     return pairwise_box_iou_cuda(boxes1, boxes2, BoxIouKind::Generalized);
 }
-}  // namespace mmltk::backend::ml::ops::detail
+}  // namespace mmltk::backend::ml::ops

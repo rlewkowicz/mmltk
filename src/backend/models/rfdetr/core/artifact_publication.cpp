@@ -1,3 +1,4 @@
+#include "detail/class_artifact_files.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include <stdexcept>

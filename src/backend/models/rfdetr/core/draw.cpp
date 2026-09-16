@@ -1,5 +1,5 @@
 #include "src/backend/ml/cuda/numa_host_tensor.h"
-#include "detail/draw.h"
+#include "src/backend/models/rfdetr/core/sample_output.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <stb_image_write.h>
@@ -22,10 +22,10 @@
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/cuda_priority.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-#include "torch_cuda_utils.h"
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
+#include "src/backend/ml/cuda/shared_cuda_event.h"
 import mmltk.backend.imaging.raster;
 import mmltk.backend.ml.cuda.gpu_quiescence;
-import mmltk.backend.ml.cuda.shared_cuda_event;
 namespace mmltk::backend::models::rfdetr {
 using mmltk::backend::ml::cuda::get_priority_cuda_stream;
 using mmltk::frameworks::gpu::ensure_cuda_ok;

@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
-#include "detail/model_technical.h"
+#include "src/backend/models/rfdetr/core/model.h"
 namespace mmltk::backend::models::rfdetr {
 NestedTensor NestedTensor::to(const torch::Device& device) const {
     NestedTensor result{tensors.to(device), {}};

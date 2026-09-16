@@ -1,4 +1,5 @@
 module;
+
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -6,39 +7,32 @@ module;
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include "archive_utils.h"
-#include "model_state_technical.h"
-#include "model_technical.h"
-#include "src/backend/models/rfdetr/contract/artifacts.h"
+#include "src/backend/ml/torch/archive.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
-#include "torch_api.h"
+#include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/contract/artifacts.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 #include "detail/checkpoint_private.h"
 module mmltk.backend.models.rfdetr.training.checkpoint;
-import mmltk.backend.models.rfdetr.core.artifact_resolution;
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
-#include "model_access.h"
-#include "model_state_access.h"
 namespace mmltk::backend::models::rfdetr {
-namespace torch_api = mmltk::backend::ml::torch_api;
 namespace {
 [[nodiscard]] std::filesystem::path canonical_checkpoint_path(const std::filesystem::path& checkpoint_path) {
     return std::filesystem::absolute(checkpoint_path).lexically_normal();
 }
 }  // namespace
-ResolvedModelArtifacts resolve_training_artifacts(const std::filesystem::path& weights_path, const std::string_view preset_name, const int resolution) {
-    return resolve_model_artifacts(weights_path, preset_name, resolution);
-}
 ModelStateLoadSummary load_model_weights(NativeRfDetrModel& model, const std::filesystem::path& weights_path, const bool strict) {
     const auto checkpoint = decode_model_state(weights_path);
-    return detail::native_model_owner(model).load_normalized_state(detail::model_state_owner(checkpoint).entries, strict, &checkpoint.metadata.class_layout);
+    return apply_checkpoint_to_module(model, checkpoint, strict);
 }
 ModelStateLoadSummary apply_checkpoint_to_module(NativeRfDetrModel& module, const DecodedNativeModelState& checkpoint, const bool strict) {
-    return detail::native_model_owner(module).load_normalized_state(detail::model_state_owner(checkpoint).entries, strict, &checkpoint.metadata.class_layout);
+    return module.load_normalized_state(checkpoint.entries(), strict, &checkpoint.metadata.class_layout);
 }
 ModelStateLoadSummary apply_checkpoint_to_module(NativeRfDetrModel& module, const std::filesystem::path& checkpoint_path, bool strict) {
     const auto checkpoint = decode_model_state(checkpoint_path);
-    return detail::native_model_owner(module).load_normalized_state(detail::model_state_owner(checkpoint).entries, strict, &checkpoint.metadata.class_layout);
+    return apply_checkpoint_to_module(module, checkpoint, strict);
 }
 namespace {
 void save_checkpoint_state(const std::filesystem::path& checkpoint_path, const DecodedNativeModelState& checkpoint, bool complete,
@@ -49,13 +43,13 @@ void save_checkpoint_state(const std::filesystem::path& checkpoint_path, const D
     validate_decoded_model_state(checkpoint);
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
     readback.Begin();
-    detail::reserve_state_archive(detail::model_state_owner(checkpoint).entries, readback, 0);
-    torch_api::OutputArchive archive;
+    detail::reserve_state_archive(checkpoint.entries(), readback, 0);
+    torch::serialize::OutputArchive archive;
     detail::write_native_checkpoint_metadata(archive, checkpoint.metadata);
     if (complete)
-        detail::write_resume_state_archive(archive, "state", detail::model_state_owner(checkpoint).entries, readback, 0);
+        detail::write_resume_state_archive(archive, "state", checkpoint.entries(), readback, 0);
     else
-        detail::write_state_archive(archive, "state", detail::model_state_owner(checkpoint).entries, readback, 0);
+        detail::write_state_archive(archive, "state", checkpoint.entries(), readback, 0);
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_checkpoint_save_archive_save_to{"rfdetr.checkpoint.save.archive_save_to"};
         readback.Complete();

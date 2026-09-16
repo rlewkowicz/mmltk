@@ -3,7 +3,8 @@
 #include <optional>
 #include <string>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-#include "torch_api.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 namespace mmltk::backend::models::rfdetr {
 struct ResumeContinuationManifest {
     bool ema_requested = false;
@@ -29,12 +30,12 @@ struct TrainingContinuation {
     TrainRequest configuration;
     TrainingContinuationValues values;
 };
-void write_training_configuration(mmltk::backend::ml::torch_api::OutputArchive&, const TrainRequest&);
-[[nodiscard]] TrainRequest read_training_configuration(mmltk::backend::ml::torch_api::InputArchive&);
-void write_training_continuation(mmltk::backend::ml::torch_api::OutputArchive&, const TrainRequest&, const TrainingContinuationValues&);
+void write_training_configuration(torch::serialize::OutputArchive&, const TrainRequest&);
+[[nodiscard]] TrainRequest read_training_configuration(torch::serialize::InputArchive&);
+void write_training_continuation(torch::serialize::OutputArchive&, const TrainRequest&, const TrainingContinuationValues&);
 // Empty only for weights-only archives. Requires complete, consistent scalar
 // continuation; the caller admits the optimizer and ordered EMA tensor state.
-[[nodiscard]] std::optional<TrainingContinuation> read_training_continuation(mmltk::backend::ml::torch_api::InputArchive&);
+[[nodiscard]] std::optional<TrainingContinuation> read_training_continuation(torch::serialize::InputArchive&);
 void require_active_training_continuation(const TrainingContinuation&, const TrainRequest&);
 }  // namespace detail
 }  // namespace mmltk::backend::models::rfdetr

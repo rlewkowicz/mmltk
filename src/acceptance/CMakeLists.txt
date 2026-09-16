@@ -145,10 +145,7 @@ if(BUILD_RFDETR_NATIVE)
     mmltk_register_private_headers(
         mmltk_workspace_wayland_integration
         tests/workflow_wayland_inputs.h)
-    target_include_directories(mmltk_workspace_wayland_integration PRIVATE
-        ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail)
-    target_compile_definitions(mmltk_workspace_wayland_integration PRIVATE
+        target_compile_definitions(mmltk_workspace_wayland_integration PRIVATE
         MMLTK_TEST_MMLTK_GUI_LAUNCHER="/opt/mmltk/bin/mmltk-browser-host")
     target_link_libraries(mmltk_workspace_wayland_integration PRIVATE
         mmltk::backend::imaging::primitives

@@ -11,10 +11,6 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
-#include <catch2/catch_test_macros.hpp>
-import mmltk.backend.models.rfdetr.inference.analysis_provider;
-import mmltk.backend.models.rfdetr.inference.prediction;
-import mmltk.backend.models.rfdetr.inference.runtime_backend;
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 namespace {

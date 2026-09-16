@@ -6,13 +6,14 @@ module;
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <stdexcept>
+#include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 module mmltk.backend.ml.cuda.torch_scope;
 namespace mmltk::backend::ml::cuda {
 namespace {
-[[nodiscard]] c10::DeviceIndex checked_device_index(const std::int32_t device) {
+[[nodiscard]] c10::DeviceIndex execution_device_index(const std::int32_t device) {
     if (device < 0) { throw std::invalid_argument("LibTorch CUDA stream scope requires a valid device"); }
-    return static_cast<c10::DeviceIndex>(device);
+    return checked_device_index(device);
 }
 [[nodiscard]] at::ScalarType scalar_type(const TorchCudaPrecision precision) {
     switch (precision) {
@@ -40,14 +41,14 @@ namespace {
 }  // namespace
 void run_on_torch_cuda_stream(const std::int32_t device, const std::uintptr_t stream, void* const context, const TorchCudaWork work) {
     if (work == nullptr) { throw std::invalid_argument("LibTorch CUDA stream scope requires work"); }
-    const auto device_index = checked_device_index(device);
+    const auto device_index = execution_device_index(device);
     c10::cuda::CUDAGuard device_guard{device_index};
     c10::cuda::CUDAStreamGuard stream_guard{torch_stream(stream, device_index)};
     work(context);
 }
 void run_with_torch_cuda_scope(const TorchCudaExecutionOptions& options, void* const context, const TorchCudaWork work) {
     if (work == nullptr) { throw std::invalid_argument("LibTorch CUDA execution scope requires work"); }
-    const auto device_index = checked_device_index(options.device);
+    const auto device_index = execution_device_index(options.device);
     c10::cuda::CUDAGuard device_guard{device_index};
     c10::cuda::CUDAStreamGuard stream_guard{torch_stream(options.stream, device_index)};
     c10::InferenceMode inference_mode{options.inference_mode};
@@ -55,7 +56,7 @@ void run_with_torch_cuda_scope(const TorchCudaExecutionOptions& options, void* c
     work(context);
 }
 std::uintptr_t current_torch_cuda_stream(const std::int32_t device) {
-    const auto device_index = checked_device_index(device);
+    const auto device_index = execution_device_index(device);
     c10::cuda::CUDAGuard device_guard{device_index};
     return reinterpret_cast<std::uintptr_t>(c10::cuda::getCurrentCUDAStream(device_index).stream());
 }

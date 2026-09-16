@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/model.h"
 #include "detail/model_ema.h"
 #include <ATen/ops/_foreach_add.h>
 #include <ATen/ops/_foreach_mul.h>
@@ -49,7 +50,7 @@ ModelEma ModelEma::from_cpu_shadow(const std::vector<torch::Tensor>& parameters,
         candidate.tensors.push_back(cpu_shadow[index].to(parameters[index].device(), cpu_shadow[index].scalar_type(), false, true));
     return ModelEma(parameters, std::move(candidate), decay, tau, completed_updates);
 }
-ModelEma::Selection::Selection(ModelEma& owner, torch::nn::Module& module) : owner_(&owner), module_(&module), training_(module.is_training()) {
+ModelEma::Selection::Selection(ModelEma& owner, NativeRfDetrModel& module) : owner_(&owner), module_(&module), training_(module.is_training()) {
     if (owner.selected_) throw std::logic_error("EMA weights already selected");
     torch::NoGradGuard guard;
     if (owner.backup_.empty()) {

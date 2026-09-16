@@ -16,8 +16,6 @@
 #include "asset_cache_support.h"
 #include "checkpoint_fixture_support.h"
 #include "src/test_support/filesystem_test_utils.hpp"
-#include "model_state_access.h"
-#include "model_state_technical.h"
 #include "parity_fixture_support.h"
 import mmltk.backend.models.rfdetr.model_export;
 namespace mmltk::backend::models::rfdetr::testsupport {
@@ -65,7 +63,7 @@ void assert_native_checkpoint(const fs::path& path, const char* expected_preset)
     REQUIRE(checkpoint.metadata.num_classes == kParityFixtureNumClasses);
     REQUIRE(checkpoint.metadata.num_queries > 0);
     REQUIRE(checkpoint.metadata.num_select > 0);
-    const auto& entries = mmltk::backend::models::rfdetr::detail::model_state_owner(checkpoint).entries;
+    const auto& entries = checkpoint.entries();
     REQUIRE(!entries.empty());
     bool found_query_feat = false;
     bool found_class_embed = false;
@@ -139,7 +137,9 @@ TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names r
     const r::ResolvedClassLayout semantic(admitted.metadata.class_layout);
     CHECK(semantic.catalog()->names()[79] == "toothbrush");
     CHECK(semantic.class_references().back() == 79);
-    r::detail::model_state_owner(source).entries.push_back({"training_supervision.retained_fixture", torch::ones({1})});
+    auto synthetic_entries = source.consume_entries();
+    synthetic_entries.push_back({"training_supervision.retained_fixture", torch::ones({1})});
+    r::testsupport::set_synthetic_model_state(source, std::move(synthetic_entries));
     source.metadata.class_layout = r::unresolved_class_layout(r::testsupport::kParityFixtureNumClasses);
     source.metadata.class_layout.class_name_evidence.names = {{"background"}, {"person"}, {"person"}};
     const auto ambiguous = directory.path() / "rf-detr-nano.pth";

@@ -5,7 +5,7 @@
 #include <limits>
 #include <string_view>
 #include "src/backend/models/catalog/artifacts.h"
-#include "src/backend/models/catalog/module.h"
+#include "src/backend/models/catalog/model_descriptor.h"
 namespace {
 TEST_CASE("catalog is derived from the RF-DETR contract", "[backend][models][catalog]") {
     using namespace mmltk::backend::models::catalog;

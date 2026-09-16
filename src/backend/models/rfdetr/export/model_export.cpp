@@ -29,15 +29,11 @@ module;
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
-#include "model_technical.h"
+#include "src/backend/models/rfdetr/core/model.h"
 module mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.ml.cuda.torch_scope;
-import mmltk.backend.models.rfdetr.core.model;
 import mmltk.backend.models.rfdetr.model_export.onnx_lowering;
-import :onnx_simplify;
 import mmltk.common.logging.mmltk_logging;
-#include "model_access.h"
-#include "model_state_access.h"
 namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
 namespace torch_cuda = mmltk::backend::ml::cuda;
@@ -95,24 +91,24 @@ void export_model_onnx(NativeRfDetrModel& model, const std::filesystem::path& ou
     ClassArtifactPublication publication(output_path, explicit_descriptor);
     if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     const auto& staged_model = publication.staged_artifact();
-    auto& technical_model = detail::native_model_owner(model);
-    technical_model.module().eval();
+    auto& technical_model = (model);
+    technical_model.eval();
     technical_model.set_force_pytorch_deformable_attn(true);
     const auto restore_attention = [&technical_model] { technical_model.set_force_pytorch_deformable_attn(false); };
     try {
-        const torch::Tensor reference = technical_model.module().parameters().front();
+        const torch::Tensor reference = technical_model.parameters().front();
         const torch::Tensor dummy_pixels = torch::zeros({batch_size, 3, model.config().resolution, model.config().resolution}, reference.options());
         const torch::Tensor dummy_mask = torch::zeros({batch_size, model.config().resolution, model.config().resolution},
                                                       torch::TensorOptions().dtype(torch::kBool).device(reference.device()));
         auto compilation_unit = std::make_shared<torch::jit::CompilationUnit>();
         auto class_type = torch::jit::ClassType::create("__torch__.NativeRfDetrOnnxExport", compilation_unit, true);
         torch::jit::Module export_module(compilation_unit, class_type);
-        for (const auto& parameter : technical_model.module().named_parameters(true)) {
+        for (const auto& parameter : technical_model.named_parameters(true)) {
             std::string name = parameter.key();
             std::replace(name.begin(), name.end(), '.', '_');
             export_module.register_parameter(name, parameter.value(), false);
         }
-        for (const auto& buffer : technical_model.module().named_buffers(true)) {
+        for (const auto& buffer : technical_model.named_buffers(true)) {
             std::string name = buffer.key();
             std::replace(name.begin(), name.end(), '.', '_');
             export_module.register_buffer(name, buffer.value());
@@ -252,9 +248,9 @@ void ExportOnnxSession::State::Run(const ExportOnnxRequest& request, const runti
         auto resolved = resolve_model_state(request.weights_path, request.preset_name, request.resolution, request.class_layout_path, {}, stop);
         if (stop.stop_requested()) return;
         auto next_model = std::make_unique<NativeRfDetrModel>(resolved.artifacts.config, resolved.artifacts.class_layout);
-        auto& technical_model = detail::native_model_owner(*next_model);
-        static_cast<void>(technical_model.load_normalized_state(detail::model_state_owner(resolved.model_state).entries, false));
-        technical_model.module().to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(request.device_id)));
+        auto& technical_model = (*next_model);
+        static_cast<void>(technical_model.load_normalized_state(resolved.model_state.entries(), false));
+        technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(request.device_id)));
         admission = std::move(resolved.model_state.class_artifact);
         model = std::move(next_model);
         weights_path = std::move(next_weights_path);

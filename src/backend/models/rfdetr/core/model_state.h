@@ -13,6 +13,8 @@
 #include "src/backend/models/rfdetr/contract/class_layout.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include <stop_token>
+#include "model_state_load.h"
+#include <torch/serialize/input-archive.h>
 namespace mmltk::backend::models::rfdetr::model_state_detail {
 template <class T>
 inline constexpr bool is_optional = false;
@@ -68,8 +70,14 @@ class DecodedNativeModelState {
     NativeCheckpointMetadata metadata;
     std::shared_ptr<const ClassArtifactAdmission> class_artifact;
     [[nodiscard]] std::size_t tensor_count() const noexcept;
-    [[nodiscard]] void* technical_handle() noexcept;
-    [[nodiscard]] const void* technical_handle() const noexcept;
+    explicit DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries);
+    [[nodiscard]] const std::vector<NormalizedModelStateEntry>& entries() const noexcept;
+    [[nodiscard]] torch::serialize::InputArchive* admitted_archive() const noexcept;
+    void retain_admitted_archive(std::unique_ptr<torch::serialize::InputArchive> archive);
+    [[nodiscard]] std::vector<NormalizedModelStateEntry> consume_entries();
+    void release_admission() noexcept;
+    void replace_entries(std::vector<NormalizedModelStateEntry> entries);
+
 
    private:
     struct Impl;
@@ -90,4 +98,5 @@ void write_upstream_model_state(const std::filesystem::path& checkpoint_path, co
                                                      const std::filesystem::path& class_layout_path = {},
                                                      std::shared_ptr<const ClassArtifactAdmission> admission = {}, std::stop_token stop = {});
 [[nodiscard]] NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArtifacts& artifacts, int64_t num_classes);
+[[nodiscard]] ResolvedModelArtifacts resolve_model_artifacts(const std::filesystem::path& weights_path, std::string_view preset_name, int resolution);
 }  // namespace mmltk::backend::models::rfdetr

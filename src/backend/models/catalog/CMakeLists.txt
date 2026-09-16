@@ -13,15 +13,15 @@ mmltk_register_public_headers(
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
         artifacts.h
-        module.h
+        model_descriptor.h
         model_registry.h)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_catalog
-    module.cpp
     model_registry.cpp
 )
 target_link_libraries(mmltk_backend_models_catalog
     PUBLIC
+        mmltk::backend::models::contract
         mmltk::frameworks::reflection
     PRIVATE
         mmltk::backend::models::rfdetr::contract

@@ -1,6 +1,6 @@
 #pragma once
 #include <algorithm>
-#include "src/backend/models/rfdetr/core/detail/postprocess.h"
+#include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/common/system/numa_memory.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 namespace mmltk::backend::models::rfdetr {

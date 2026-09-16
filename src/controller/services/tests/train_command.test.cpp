@@ -1,3 +1,4 @@
+#include <cmath>
 #include "src/controller/services/train_command.h"
 #include <algorithm>
 #include <charconv>
@@ -12,8 +13,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include "src/test_support/error_expectation_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-#include "src/backend/models/rfdetr/training/train_recipe.h"
 namespace {
+bool train_recipe_value_matches(double lhs, double rhs, double eps = 1.0e-12) { return std::abs(lhs - rhs) <= eps; }
+
 using namespace mmltk::controller::services;
 using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
 template <auto Member>
@@ -203,14 +205,14 @@ void test_supervision_float_arguments_round_trip_at_representable_boundaries() {
     assert_float_flag_round_trip(args, "--dn-size-noise-scale", request.training_supervision.denoising.size_noise_scale);
 }
 void test_muon_recipe_defaults_are_resolved() {
-    const auto recipe = mmltk::backend::models::rfdetr::resolve_train_recipe("rf-detr-seg-medium", mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon);
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr, 2.0e-4)));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr_encoder, 3.0e-4)));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.momentum, 0.9)));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.weight_decay, 5.0e-4)));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.warmup_epochs, 3.0)));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.warmup_momentum, 0.8)));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr_min_factor, 0.01)));
+    const auto recipe = mmltk::backend::models::rfdetr::train_recipe(mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon);
+    REQUIRE((train_recipe_value_matches(recipe.lr, 2.0e-4)));
+    REQUIRE((train_recipe_value_matches(recipe.lr_encoder, 3.0e-4)));
+    REQUIRE((train_recipe_value_matches(recipe.momentum, 0.9)));
+    REQUIRE((train_recipe_value_matches(recipe.weight_decay, 5.0e-4)));
+    REQUIRE((train_recipe_value_matches(recipe.warmup_epochs, 3.0)));
+    REQUIRE((train_recipe_value_matches(recipe.warmup_momentum, 0.8)));
+    REQUIRE((train_recipe_value_matches(recipe.lr_min_factor, 0.01)));
     REQUIRE((recipe.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
 }
 void test_recipe_application_respects_overrides() {
@@ -219,11 +221,11 @@ void test_recipe_application_respects_overrides() {
     mmltk::backend::models::rfdetr::TrainRecipeOverrideState overrides;
     TrainRecipeRelation::template set_override<mmltk::frameworks::reflection::member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr>>(overrides);
     mmltk::backend::models::rfdetr::apply_train_recipe(
-        options, mmltk::backend::models::rfdetr::resolve_train_recipe("rf-detr-medium", mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon), overrides);
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(options.lr, 9.0e-4)));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(options.lr_encoder, 3.0e-4)));
+        options, mmltk::backend::models::rfdetr::train_recipe(mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon), overrides);
+    REQUIRE((train_recipe_value_matches(options.lr, 9.0e-4)));
+    REQUIRE((train_recipe_value_matches(options.lr_encoder, 3.0e-4)));
     REQUIRE((options.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
-    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(options.warmup_momentum, 0.8)));
+    REQUIRE((train_recipe_value_matches(options.warmup_momentum, 0.8)));
 }
 }  // namespace
 TEST_CASE("test_single_device_builds_device_id", "[gui][train_command]") { test_single_device_builds_device_id(); }

@@ -29,12 +29,12 @@ mmltk_register_public_headers(
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_contract
     model_config.cpp
-    rfdetr_module.cpp
     weight_catalog.cpp
     workflow_requests.cpp
 )
 target_link_libraries(mmltk_backend_models_rfdetr_contract
     PUBLIC
+        mmltk::backend::models::contract
         mmltk::backend::data::catalog
         mmltk::frameworks::reflection
     PRIVATE

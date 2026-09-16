@@ -17,8 +17,6 @@ module;
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 module mmltk.backend.models.rfdetr.model_export;
-import :onnx_model_info;
-import :onnx_simplify;
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr {
 namespace {

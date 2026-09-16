@@ -21,11 +21,10 @@ mmltk_register_public_headers(
     mmltk_backend_models_rfdetr_training
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
-        distributed_train_launcher.h
+        training_partition.h
         train.h
         telemetry_writer.h
-        checkpoint.h
-        train_recipe.h)
+        checkpoint.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_training detail/evaluation_runtime.h)
 foreach(_mmltk_training_partition IN ITEMS
         checkpoint.cppm)
@@ -44,10 +43,13 @@ mmltk_register_retained_module_importers(
     gpu_augment.cpp
     native_optimizer.cpp
     target_builder.cpp
-    train.cpp)
+    train.cpp
+    training_lanes.cpp
+    training_snapshot.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
-    distributed_train_launcher.cpp
+    training_partition.cpp
+    training_metrics.cpp
     training_ops.cpp
     training_continuation.cpp
     model_ema.cpp
@@ -61,12 +63,14 @@ mmltk_register_private_headers(
     detail/training_ops_private.h
     detail/training_continuation.h
     detail/model_ema.h
-    detail/checkpoint_private.h)
+    detail/checkpoint_private.h
+    detail/training_lanes.h
+    detail/training_snapshot.h
+    detail/training_metrics.h)
 mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training)
 target_include_directories(mmltk_backend_models_rfdetr_training PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
-    ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail
+
     ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
 )
 target_link_libraries(mmltk_backend_models_rfdetr_training
@@ -119,9 +123,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     target_include_directories(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         ${CMAKE_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail
-        ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail
+
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(
@@ -160,7 +162,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/rfdetr_train_profile_runner.cpp)
     target_include_directories(mmltk_rfdetr_train_profile_runner PRIVATE
         ${CMAKE_SOURCE_DIR}
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail)
+)
     target_link_libraries(mmltk_rfdetr_train_profile_runner PRIVATE
         mmltk::backend::data
         mmltk::backend::models::rfdetr::training

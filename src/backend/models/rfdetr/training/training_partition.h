@@ -10,7 +10,7 @@ struct DistributedTrainingPartition {
     int numa_node = -1;
 };
 void apply_training_partition(TrainRequest&, const DistributedTrainingPartition&);
-// Training owns deterministic device/rank selection. Plan 15 owns command-line
-// projection and Plan 10 owns process creation and request serialization.
+// Training owns deterministic device/rank selection; CLI and service owners
+// retain command-line projection, process creation, and request serialization.
 [[nodiscard]] std::vector<DistributedTrainingPartition> select_distributed_training_partitions(const TrainRequest& request);
 }  // namespace mmltk::backend::models::rfdetr

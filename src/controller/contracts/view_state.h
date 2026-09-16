@@ -15,7 +15,7 @@
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/backend/models/catalog/artifacts.h"
 #include "src/backend/models/catalog/model_registry.h"
-#include "src/backend/models/catalog/module.h"
+#include "src/backend/models/catalog/model_descriptor.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"

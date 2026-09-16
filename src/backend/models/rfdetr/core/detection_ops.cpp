@@ -1,5 +1,5 @@
 #include <cctype>
-#include "detail/detection_ops.h"
+#include "src/backend/models/rfdetr/core/detection_ops.h"
 #include <ATen/TensorIndexing.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -33,14 +33,14 @@
 #include "src/frameworks/gpu/device_execution.h"
 #include <span>
 #include "detail/training_mask_ops_cuda.h"
-import mmltk.common.logging.mmltk_logging;
-import mmltk.common.logging.profile_utils;
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
-import mmltk.backend.ml.cuda.gpu_quiescence;
-import mmltk.backend.models.rfdetr.core.runtime;
+#include "src/backend/models/rfdetr/core/runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
+import mmltk.common.logging.mmltk_logging;
+import mmltk.common.logging.profile_utils;
+import mmltk.backend.ml.cuda.gpu_quiescence;
 namespace F = torch::nn::functional;
 using namespace torch::indexing;
 namespace mmltk::backend::models::rfdetr {

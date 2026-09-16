@@ -1,3 +1,4 @@
+#include "tool_launch.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include <signal.h>
 #include <spdlog/spdlog.h>
@@ -33,15 +34,14 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
-#include "src/backend/models/rfdetr/training/distributed_train_launcher.h"
+#include "src/backend/models/rfdetr/training/training_partition.h"
 #include "src/backend/models/rfdetr/training/train.h"
-#include "src/backend/models/rfdetr/training/train_recipe.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/controller/services/train_command.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
-import mmltk.backend.models.rfdetr.core.tool_launch_utils;
+
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.analysis_provider;
 import mmltk.backend.models.rfdetr.inference.prediction;
@@ -79,7 +79,7 @@ struct NormalizeWeightsRequest final {
 };
 struct PredictCliRequest final {
     rfdetr::PredictRequest request;
-    [[= reflection::MaxItems{reflection::kMaximumCliImageInputs}]] std::vector<std::filesystem::path> image_paths;
+    [[= reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumCliImageInputs}]] std::vector<std::filesystem::path> image_paths;
 };
 struct TrainCliRequest final {
     rfdetr::TrainRequest request;
@@ -238,7 +238,7 @@ inline constexpr std::array kValidateOptions{
 template <auto Member, bool Unique>
 std::expected<void, reflection::ParseError> assign_train_integer_list(TrainCliRequest& state, const std::string_view text, bool,
                                                                       const reflection::FieldConstraint) {
-    std::array<int, reflection::kMaximumTrainingDevices> ids{};
+    std::array<int, mmltk::backend::models::rfdetr::kMaximumTrainingDevices> ids{};
     std::size_t count = 0U;
     std::size_t start = 0U;
     while (start <= text.size()) {
@@ -695,7 +695,7 @@ void run_compile(const CompileCliRequest& request) {
     }
 }
 [[noreturn]] void exec_onnx_info_tool(const std::filesystem::path& model_path, const logging::CliOverrides& logging_options) {
-    const auto tool = rfdetr::resolve_sibling_tool_path("mmltk-rfdetr-onnx-info").string();
+    const auto tool = mmltk::entrypoints::cli::resolve_sibling_tool_path("mmltk-rfdetr-onnx-info").string();
     std::vector<std::string> arguments{tool, model_path.string()};
     if (logging_options.level) {
         const auto level_name = spdlog::level::to_string_view(*logging_options.level);
@@ -703,7 +703,7 @@ void run_compile(const CompileCliRequest& request) {
     }
     if (logging_options.log_file) arguments.push_back("--log-file=" + logging_options.log_file->string());
     if (logging_options.log_dir) arguments.push_back("--log-dir=" + logging_options.log_dir->string());
-    auto argv = rfdetr::make_exec_argv(arguments);
+    auto argv = mmltk::entrypoints::cli::make_exec_argv(arguments);
     ::execv(argv.front(), argv.data());
     throw std::system_error(errno, std::generic_category(), "failed to exec ONNX info helper");
 }

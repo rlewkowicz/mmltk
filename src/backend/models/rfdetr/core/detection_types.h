@@ -1,5 +1,6 @@
 #pragma once
-#include <torch/torch.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <torch/types.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +10,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-#include "torch_api.h"
 namespace mmltk::backend::models::rfdetr {
 using TensorMap = std::map<std::string, torch::Tensor>;
 struct PreparedTarget {

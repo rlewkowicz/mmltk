@@ -1,3 +1,4 @@
+
 #include "detail/training_continuation.h"
 #include <array>
 #include <cmath>
@@ -9,7 +10,7 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
-#include "archive_utils.h"
+#include "src/backend/ml/torch/archive.h"
 #include "detail/checkpoint_private.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
 namespace mmltk::backend::models::rfdetr {
@@ -29,7 +30,6 @@ void validate_resume_continuation_manifest(const ResumeContinuationManifest& man
     }
 }
 namespace detail {
-namespace torch_api = mmltk::backend::ml::torch_api;
 namespace serialization = mmltk::frameworks::serialization;
 namespace {
 // The flat archive contains only this subset of TrainRequest. Its relation to
@@ -89,22 +89,22 @@ auto archive_scalar(const T& value) {
         return value;
 }
 template <class T>
-void write_scalar(torch_api::OutputArchive& archive, const char* key, const T& value) {
+void write_scalar(torch::serialize::OutputArchive& archive, const char* key, const T& value) {
     const auto scalar = archive_scalar(value);
     using Scalar = std::remove_cvref_t<decltype(scalar)>;
     if constexpr (std::is_same_v<Scalar, std::string>)
-        write_string(archive, key, scalar);
+        mmltk::backend::ml::serialization::write_string(archive, key, scalar);
     else if constexpr (std::is_same_v<Scalar, bool>)
-        write_bool(archive, key, scalar);
+        mmltk::backend::ml::serialization::write_bool(archive, key, scalar);
     else if constexpr (std::is_same_v<Scalar, int64_t>)
-        write_int(archive, key, scalar);
+        mmltk::backend::ml::serialization::write_int(archive, key, scalar);
     else
-        write_double(archive, key, scalar);
+        mmltk::backend::ml::serialization::write_double(archive, key, scalar);
 }
 template <class T>
-auto read_scalar(torch_api::InputArchive& archive, const char* key) {
+auto read_scalar(torch::serialize::InputArchive& archive, const char* key) {
     using Scalar = decltype(archive_scalar(T{}));
-    const auto value = read_optional_value<Scalar>(archive, key);
+    const auto value = mmltk::backend::ml::serialization::read_optional_value<Scalar>(archive, key);
     if (!value) throw std::runtime_error(std::string("full training checkpoint is missing ") + key);
     return *value;
 }
@@ -119,10 +119,10 @@ void validate_values(const TrainingContinuationValues& values, bool requested_em
         throw std::runtime_error("invalid original checkpoint descriptor provenance");
     validate_resume_continuation_manifest({requested_ema, present_ema, values.grad_scaler_scale, values.grad_scaler_growth_tracker});
 }
-bool has_continuation_fields(torch_api::InputArchive& archive) {
+bool has_continuation_fields(torch::serialize::InputArchive& archive) {
     bool present = false;
     const auto probe = [&](const char* key, const auto&...) {
-        torch_api::IValue value;
+        c10::IValue value;
         present = archive.try_read(key, value) || present;
     };
     TrainingContinuationValues values;
@@ -137,21 +137,21 @@ bool has_continuation_fields(torch_api::InputArchive& archive) {
     return present;
 }
 }  // namespace
-void write_training_configuration(torch_api::OutputArchive& archive, const TrainRequest& request) {
+void write_training_configuration(torch::serialize::OutputArchive& archive, const TrainRequest& request) {
     constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
     std::vector<std::byte> bytes(capacity);
     const auto encoded = serialization::encode(request, std::span<std::byte>(bytes), {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
     if (!encoded) throw std::runtime_error("training configuration violates its checkpoint schema");
-    auto tensor = torch_api::empty({static_cast<int64_t>(*encoded)}, torch_api::kUInt8);
+    auto tensor = torch::empty({static_cast<int64_t>(*encoded)}, torch::kUInt8);
     std::memcpy(tensor.data_ptr(), bytes.data(), *encoded);
     archive.write("training_configuration_cbor", tensor);
 }
-TrainRequest read_training_configuration(torch_api::InputArchive& archive) {
-    torch_api::Tensor configuration;
+TrainRequest read_training_configuration(torch::serialize::InputArchive& archive) {
+    torch::Tensor configuration;
     if (!archive.try_read("training_configuration_cbor", configuration))
         throw std::runtime_error("full checkpoint is missing current saved training configuration");
     constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
-    if (!configuration.defined() || !configuration.is_cpu() || configuration.scalar_type() != torch_api::kUInt8 || configuration.dim() != 1 ||
+    if (!configuration.defined() || !configuration.is_cpu() || configuration.scalar_type() != torch::kUInt8 || configuration.dim() != 1 ||
         configuration.numel() <= 0 || static_cast<std::size_t>(configuration.numel()) > capacity)
         throw std::runtime_error("invalid checkpoint training configuration");
     configuration = configuration.contiguous();
@@ -162,7 +162,7 @@ TrainRequest read_training_configuration(torch_api::InputArchive& archive) {
     validate_train_request(*request);
     return *request;
 }
-void write_training_continuation(torch_api::OutputArchive& archive, const TrainRequest& request, const TrainingContinuationValues& values) {
+void write_training_continuation(torch::serialize::OutputArchive& archive, const TrainRequest& request, const TrainingContinuationValues& values) {
     validate_train_request(request);
     validate_values(values, request.use_ema, request.use_ema);
     write_training_configuration(archive, request);
@@ -172,8 +172,8 @@ void write_training_continuation(torch_api::OutputArchive& archive, const TrainR
     visit_request_scalars(request, write);
     visit_augmentation_scalars(request.gpu_augmentation, write);
 }
-std::optional<TrainingContinuation> read_training_continuation(torch_api::InputArchive& archive) {
-    torch_api::InputArchive optimizer;
+std::optional<TrainingContinuation> read_training_continuation(torch::serialize::InputArchive& archive) {
+    torch::serialize::InputArchive optimizer;
     if (!archive.try_read("optimizer", optimizer)) {
         if (has_continuation_fields(archive)) throw std::runtime_error("full training checkpoint is missing optimizer continuation");
         return std::nullopt;
@@ -188,9 +188,9 @@ std::optional<TrainingContinuation> read_training_continuation(torch_api::InputA
     visit_request_scalars(result.configuration, require_equal);
     visit_augmentation_scalars(result.configuration.gpu_augmentation, require_equal);
     require_resume_training_supervision_config(archive, result.configuration.training_supervision);
-    torch_api::IValue ema_value;
+    c10::IValue ema_value;
     const bool has_ema = archive.try_read("ema_state", ema_value);
-    torch_api::InputArchive ema;
+    torch::serialize::InputArchive ema;
     if (has_ema && !archive.try_read("ema_state", ema)) throw std::runtime_error("checkpoint EMA continuation is not an archive");
     validate_values(result.values, result.configuration.use_ema, has_ema);
     return result;

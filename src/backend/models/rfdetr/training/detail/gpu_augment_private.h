@@ -5,31 +5,30 @@
 #include <cuda_runtime_api.h>
 #include "src/backend/data/dataset_loader.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
-#include "src/backend/ml/torch/detail/torch_api.h"
+#include <torch/types.h>
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 namespace mmltk::backend::models::rfdetr {
 namespace test_support {
 struct GpuBatchAugmenterTestAccess;
 }
-namespace torch_types = mmltk::backend::ml::torch_api;
 class GpuBatchPreprocessor {
    public:
-    GpuBatchPreprocessor(std::int64_t batch_capacity, int height, int width, int device_id, torch_types::ScalarType output_type);
+    GpuBatchPreprocessor(std::int64_t batch_capacity, int height, int width, int device_id, at::ScalarType output_type);
     ~GpuBatchPreprocessor();
     GpuBatchPreprocessor(const GpuBatchPreprocessor&) = delete;
     GpuBatchPreprocessor& operator=(const GpuBatchPreprocessor&) = delete;
-    [[nodiscard]] torch_types::Tensor run(const mmltk::backend::data::Batch& batch, std::int64_t output_batch_size = 0);
+    [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::int64_t output_batch_size = 0);
     void record_consumer(cudaStream_t stream);
     [[nodiscard]] inline std::int64_t batch_capacity() const noexcept { return batch_capacity_; }
-    [[nodiscard]] inline torch_types::ScalarType output_type() const noexcept { return output_type_; }
+    [[nodiscard]] inline at::ScalarType output_type() const noexcept { return output_type_; }
 
    private:
-    torch_types::Tensor output_;
+    torch::Tensor output_;
     std::int64_t batch_capacity_ = 0;
     int height_ = 0;
     int width_ = 0;
     int device_id_ = -1;
-    torch_types::ScalarType output_type_ = torch_types::kFloat;
+    at::ScalarType output_type_ = at::kFloat;
     cudaEvent_t consumer_complete_ = nullptr;
     bool consumer_pending_ = false;
     bool has_run_ = false;
@@ -41,7 +40,7 @@ class GpuBatchAugmenter {
     GpuBatchAugmenter(const GpuBatchAugmenter&) = delete;
     GpuBatchAugmenter& operator=(const GpuBatchAugmenter&) = delete;
     void reconfigure(const GpuAugmentationConfig& config);
-    [[nodiscard]] torch_types::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence);
+    [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::uint64_t seed, int epoch, int rank, std::uint64_t sequence);
     [[nodiscard]] inline AugmentationBatchPlan& batch_plan() {
         RequireActive();
         return batch_plan_;
@@ -70,14 +69,14 @@ class GpuBatchAugmenter {
     struct Resources final {
         explicit Resources(mmltk::frameworks::gpu::DeviceContext value) : context(std::move(value)) {}
         mmltk::frameworks::gpu::DeviceContext context;
-        torch_types::Tensor output_;
-        torch_types::Tensor donor_images_;
-        torch_types::Tensor donor_masks_;
-        torch_types::Tensor donor_masks_cpu_;
-        torch_types::Tensor donor_boxes_cpu_;
-        torch_types::Tensor donor_boxes_gpu_;
-        torch_types::Tensor replacement_indices_cpu_;
-        torch_types::Tensor replacement_indices_gpu_;
+        torch::Tensor output_;
+        torch::Tensor donor_images_;
+        torch::Tensor donor_masks_;
+        torch::Tensor donor_masks_cpu_;
+        torch::Tensor donor_boxes_cpu_;
+        torch::Tensor donor_boxes_gpu_;
+        torch::Tensor replacement_indices_cpu_;
+        torch::Tensor replacement_indices_gpu_;
         cudaStream_t cache_stream_ = nullptr;
         cudaEvent_t image_read_complete_ = nullptr;
         cudaEvent_t cache_ready_ = nullptr;

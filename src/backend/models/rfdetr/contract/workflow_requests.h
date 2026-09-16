@@ -19,6 +19,9 @@
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 namespace mmltk::backend::models::rfdetr {
+inline constexpr std::size_t kMaximumCliImageInputs = 4096U;
+inline constexpr std::size_t kMaximumTrainingDevices = 16U;
+
 struct ModelArtifactRequest {
     // CLEANUP-IGNORE: Each canonical artifact path carries the same reflected path capacity for generated consumers.
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path weights_path;
@@ -67,7 +70,7 @@ struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
     PredictSourceKind source_kind = PredictSourceKind::CompiledDataset;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path video_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path compiled_path;
-    [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::kMaximumCliImageInputs}]] std::vector<PredictImageInput> image_inputs;
+    [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumCliImageInputs}]] std::vector<PredictImageInput> image_inputs;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_path;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
     [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
@@ -153,7 +156,7 @@ class[[= mmltk::frameworks::reflection::OpaqueRelationStorage{}]] TrainRecipeOve
 struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
     bool operator==(const TrainRequest&) const = default;
     // Rank-ordered overrides correspond exactly to device_ids; -1 selects automatic locality.
-    [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::kMaximumTrainingDevices}]] std::vector<int>
+    [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumTrainingDevices}]] std::vector<int>
         // CLEANUP-IGNORE: The ranked NUMA vector and following Train paths are distinct canonical generated fields.
         numa_nodes;
     // CLEANUP-IGNORE: Training input paths each retain the shared path constraint in the authoritative declaration.
@@ -189,7 +192,7 @@ struct TrainRequest : mmltk::backend::data::DataLoadingOptions {
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lanes = 0;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int resolution = 0;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int device_id = 0;
-    [[= mmltk::frameworks::reflection::MaxItems{mmltk::frameworks::reflection::kMaximumTrainingDevices}]] std::vector<int> device_ids;
+    [[= mmltk::frameworks::reflection::MaxItems{mmltk::backend::models::rfdetr::kMaximumTrainingDevices}]] std::vector<int> device_ids;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int distributed_rank = 0;
     [[= mmltk::frameworks::reflection::Minimum<int>{1}]] int distributed_world_size = 1;
     // CLEANUP-IGNORE: EMA and optimizer fields retain explicit reflected constraints at their canonical declarations.
@@ -367,4 +370,13 @@ void validate_predict_request(const PredictRequest& request);
 void validate_validate_request(const ValidateRequest& request);
 void validate_train_placement(const TrainRequest& request);
 void validate_train_request(const TrainRequest& request);
+inline void apply_train_recipe(TrainRequest& target, const TrainRecipeCatalogEntry& recipe, const TrainRecipeOverrideState& overrides = {}) {
+    using Relation = mmltk::frameworks::reflection::catalog_provider_relation<TrainRecipeCatalog>;
+    Relation::VisitMembers([&]<class Entry>() {
+        if (!Relation::template overridden<Entry::destination>(overrides)) {
+            Entry::transform::apply(mmltk::frameworks::reflection::access<TrainRequest, Entry::destination>(target),
+                                    mmltk::frameworks::reflection::access<const TrainRecipeCatalogEntry, Entry::source>(recipe));
+        }
+    });
+}
 }  // namespace mmltk::backend::models::rfdetr

@@ -18,11 +18,8 @@
 #include <utility>
 #include <vector>
 #include <unordered_set>
-#include "detail/archive_utils.h"
+#include "src/backend/ml/torch/archive.h"
 #include "detail/class_tensor_axes.h"
-#include "detail/model_state_access.h"
-#include "detail/model_state_technical.h"
-#include "detail/model_technical.h"
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
@@ -31,14 +28,22 @@ DecodedNativeModelState decode_upstream_python_model_state(const std::filesystem
 namespace model_state_detail {
 using torch::serialize::InputArchive;
 }
-struct DecodedNativeModelState::Impl final : detail::ModelStateTechnicalOwner {};
+struct DecodedNativeModelState::Impl final {
+    std::vector<NormalizedModelStateEntry> entries;
+    std::unique_ptr<torch::serialize::InputArchive> native_archive;
+};
 DecodedNativeModelState::DecodedNativeModelState() : impl_(std::make_unique<Impl>()) {}
 DecodedNativeModelState::~DecodedNativeModelState() = default;
 DecodedNativeModelState::DecodedNativeModelState(DecodedNativeModelState&&) noexcept = default;
 DecodedNativeModelState& DecodedNativeModelState::operator=(DecodedNativeModelState&&) noexcept = default;
 std::size_t DecodedNativeModelState::tensor_count() const noexcept { return impl_->entries.size(); }
-void* DecodedNativeModelState::technical_handle() noexcept { return impl_.get(); }
-const void* DecodedNativeModelState::technical_handle() const noexcept { return impl_.get(); }
+DecodedNativeModelState::DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries) : DecodedNativeModelState() { impl_->entries = std::move(entries); }
+const std::vector<NormalizedModelStateEntry>& DecodedNativeModelState::entries() const noexcept { return impl_->entries; }
+torch::serialize::InputArchive* DecodedNativeModelState::admitted_archive() const noexcept { return impl_->native_archive.get(); }
+void DecodedNativeModelState::retain_admitted_archive(std::unique_ptr<torch::serialize::InputArchive> archive) { impl_->native_archive = std::move(archive); }
+std::vector<NormalizedModelStateEntry> DecodedNativeModelState::consume_entries() { return std::move(impl_->entries); }
+void DecodedNativeModelState::release_admission() noexcept { impl_->entries.clear(); impl_->native_archive.reset(); }
+void DecodedNativeModelState::replace_entries(std::vector<NormalizedModelStateEntry> entries) { impl_->entries = std::move(entries); }
 namespace {
 [[nodiscard]] std::filesystem::path canonical_path(const std::filesystem::path& path) {
     if (path.empty()) { throw std::runtime_error("RF-DETR checkpoint path must not be empty"); }
@@ -85,7 +90,7 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
         throw std::invalid_argument("checkpoint output width disagrees with its class layout");
     std::unordered_set<std::string_view> names;
     names.reserve(state.tensor_count());
-    for (const auto& entry : detail::model_state_owner(state).entries) {
+    for (const auto& entry : state.entries()) {
         if (entry.name.empty() || entry.name.size() > 4096 || !names.insert(entry.name).second)
             throw std::invalid_argument("checkpoint tensor names must be unique and nonempty");
         const auto axis = detail::class_tensor_shape(entry.name);
@@ -128,42 +133,43 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
     auto admitted_archive = std::make_unique<model_state_detail::InputArchive>();
     auto& archive = *admitted_archive;
     archive.load_from(path, torch::Device(torch::kCPU));
-    if (!supported_format(require_string(archive, "format"))) { throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path); }
-    const auto version = require_int(archive, "format_version");
+    if (!supported_format(mmltk::backend::ml::serialization::require_string(archive, "format"))) { throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path); }
+    const auto version = mmltk::backend::ml::serialization::require_int(archive, "format_version");
     if (version != kNativeCheckpointFormatVersion) {
         throw std::runtime_error("unsupported RF-DETR native checkpoint format version " + std::to_string(version) + ": " + path);
     }
     DecodedNativeModelState result;
     auto& metadata = result.metadata;
-    metadata.preset_name = read_optional_value<std::string>(archive, "preset_name").value_or("");
-    metadata.source_kind = read_optional_value<std::string>(archive, "source_kind").value_or("native");
-    metadata.source_path = read_optional_value<std::string>(archive, "source_path").value_or(path);
-    metadata.num_classes = read_optional_value<int64_t>(archive, "num_classes").value_or(0);
-    metadata.num_queries = require_int(archive, "num_queries");
-    metadata.num_select = require_int(archive, "num_select");
+    metadata.preset_name = mmltk::backend::ml::serialization::read_optional_value<std::string>(archive, "preset_name").value_or("");
+    metadata.source_kind = mmltk::backend::ml::serialization::read_optional_value<std::string>(archive, "source_kind").value_or("native");
+    metadata.source_path = mmltk::backend::ml::serialization::read_optional_value<std::string>(archive, "source_path").value_or(path);
+    metadata.num_classes = mmltk::backend::ml::serialization::read_optional_value<int64_t>(archive, "num_classes").value_or(0);
+    metadata.num_queries = mmltk::backend::ml::serialization::require_int(archive, "num_queries");
+    metadata.num_select = mmltk::backend::ml::serialization::require_int(archive, "num_select");
     validate_queries(metadata, path, true);
-    metadata.class_layout = decode_class_layout(require_string(archive, "class_layout"));
+    metadata.class_layout = decode_class_layout(mmltk::backend::ml::serialization::require_string(archive, "class_layout"));
     if (metadata.num_classes < 0 || static_cast<std::size_t>(metadata.num_classes) != metadata.class_layout.slots.size())
         throw std::runtime_error("native checkpoint output width disagrees with class layout");
     metadata.for_each_detection_field([&archive]<class Name, class Optional>(const Name& name, Optional& field) {
-        field = read_optional_value<typename Optional::value_type>(archive, name);
+        field = mmltk::backend::ml::serialization::read_optional_value<typename Optional::value_type>(archive, name);
     });
     model_state_detail::InputArchive state_archive;
     archive.read("state", state_archive);
-    const auto entry_count = require_int(state_archive, "entry_count");
+    const auto entry_count = mmltk::backend::ml::serialization::require_int(state_archive, "entry_count");
     if (entry_count < 0 || entry_count > 100000) { throw std::runtime_error("RF-DETR checkpoint entry_count is negative: " + path); }
-    auto& entries = detail::model_state_owner(result).entries;
+    std::vector<NormalizedModelStateEntry> entries;
     entries.reserve(static_cast<std::size_t>(entry_count));
     for (int64_t index = 0; index < entry_count; ++index) {
         model_state_detail::InputArchive entry_archive;
-        state_archive.read(archive_entry_name(static_cast<std::size_t>(index)), entry_archive);
+        state_archive.read(mmltk::backend::ml::serialization::archive_entry_name(static_cast<std::size_t>(index)), entry_archive);
         NormalizedModelStateEntry entry;
-        entry.name = require_string(entry_archive, "name");
+        entry.name = mmltk::backend::ml::serialization::require_string(entry_archive, "name");
         entry_archive.read("tensor", entry.tensor);
         entries.push_back(std::move(entry));
     }
+    result.replace_entries(std::move(entries));
     validate_decoded_model_state(result);
-    detail::model_state_owner(result).native_archive = std::move(admitted_archive);
+    result.retain_admitted_archive(std::move(admitted_archive));
     snapshot.RequireUnchanged(canonical);
     return result;
 }
@@ -197,7 +203,7 @@ DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoi
             if (result.metadata.num_queries <= 0) { result.metadata.num_queries = preset->query_count; }
             if (result.metadata.num_select <= 0) { result.metadata.num_select = preset->selected_query_count; }
         }
-        for (const auto& entry : detail::model_state_owner(result).entries) {
+        for (const auto& entry : result.entries()) {
             if (const auto axis = detail::kDecoderClassAxis.Match(entry.name); axis && entry.tensor.defined() && entry.tensor.dim() > axis->dimension) {
                 result.metadata.num_classes = entry.tensor.size(axis->dimension);
                 break;
@@ -291,5 +297,8 @@ NativeCheckpointMetadata make_native_checkpoint_metadata(const ResolvedModelArti
     metadata.num_select = artifacts.config.num_select;
     capture_checkpoint_detection_metadata(metadata, artifacts.config);
     return metadata;
+}
+ResolvedModelArtifacts resolve_model_artifacts(const std::filesystem::path& weights_path, std::string_view preset_name, int resolution) {
+    return resolve_model_state(weights_path, preset_name, resolution).artifacts;
 }
 }  // namespace mmltk::backend::models::rfdetr

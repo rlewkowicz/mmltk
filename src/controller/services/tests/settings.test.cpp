@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -1143,14 +1144,14 @@ void test_gui_json_persistence_enforces_reflected_field_policies() {
                         [](nlohmann::json& document) {
                             auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
                             ids = nlohmann::json::array();
-                            for (std::size_t index = 0U; index < mmltk::frameworks::reflection::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
+                            for (std::size_t index = 0U; index < mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
                         },
                         true, false},
         PersistenceCase{"container outside",
                         [](nlohmann::json& document) {
                             auto& ids = document["workflows"]["train"]["training"]["local_device_ids"];
                             ids = nlohmann::json::array();
-                            for (std::size_t index = 0U; index <= mmltk::frameworks::reflection::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
+                            for (std::size_t index = 0U; index <= mmltk::backend::models::rfdetr::kMaximumTrainingDevices; ++index) { ids.push_back(index); }
                         },
                         false, false},
         PersistenceCase{"container element conversion overflow",

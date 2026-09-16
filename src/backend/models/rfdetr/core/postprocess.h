@@ -5,17 +5,16 @@
 #include <array>
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-#include "detection_geometry.h"
-#include "detection_types.h"
-#include "torch_api.h"
+#include "src/backend/models/rfdetr/core/detail/detection_geometry.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include <torch/types.h>
 namespace mmltk::backend::models::rfdetr {
-namespace postprocess_detail = mmltk::backend::ml::torch_api;
 }
 namespace mmltk::backend::models::rfdetr {
 class ClassPostprocessLane final {
    public:
     explicit ClassPostprocessLane(std::shared_ptr<const ResolvedClassLayout> layout) : layout_(std::move(layout)) { layout_->require_execution(); }
-    void Prepare(const postprocess_detail::Device& device);
+    void Prepare(const torch::Device& device);
     // Borrowed scratch: consume on the prepared stream before the next Gather.
     // Postprocessed final scores/labels/boxes never alias this workspace.
     [[nodiscard]] torch::Tensor Gather(const torch::Tensor& logits);
@@ -25,7 +24,7 @@ class ClassPostprocessLane final {
    private:
     std::shared_ptr<const ResolvedClassLayout> layout_;
     torch::Tensor slots_, references_, gather_;
-    postprocess_detail::CudaStream prepared_stream_ = nullptr;
+    cudaStream_t prepared_stream_ = nullptr;
     bool prefix_identity_ = false;
 };
 // Top-k products retain their originating query until the consumer selects survivors.

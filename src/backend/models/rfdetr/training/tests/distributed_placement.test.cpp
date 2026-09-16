@@ -1,6 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <stdexcept>
-#include "src/backend/models/rfdetr/training/distributed_train_launcher.h"
+#include "src/backend/models/rfdetr/training/training_partition.h"
 #include "src/common/system/numa_topology.h"
 TEST_CASE("Distributed ranks resolve independent known and unknown GPU locality", "[rfdetr][placement][topology]") {
     using namespace mmltk::backend::models::rfdetr;

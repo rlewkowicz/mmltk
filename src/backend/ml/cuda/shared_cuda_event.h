@@ -1,4 +1,4 @@
-module;
+#pragma once
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -6,8 +6,8 @@ module;
 #include <optional>
 #include "src/frameworks/gpu/cuda_device_scope.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
-export module mmltk.backend.ml.cuda.shared_cuda_event;
-export namespace mmltk::backend::ml::cuda {
+
+namespace mmltk::backend::ml::cuda {
 class CudaEventPool final {
    public:
     static constexpr std::size_t max_capacity = 64U;

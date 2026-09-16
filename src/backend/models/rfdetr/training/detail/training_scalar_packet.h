@@ -3,13 +3,13 @@
 #include <cmath>
 #include <meta>
 #include <limits>
-#include "src/backend/ml/torch/detail/torch_api.h"
+#include <torch/types.h>
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 namespace mmltk::backend::models::rfdetr {
 namespace scalar_packet {
 inline constexpr auto members = std::define_static_array(std::meta::nonstatic_data_members_of(^^TrainingScalars, std::meta::access_context::current()));
 inline constexpr std::size_t size = members.size();
-using Tensors = std::array<mmltk::backend::ml::torch_api::Tensor, size>;
+using Tensors = std::array<torch::Tensor, size>;
 template <std::meta::info Member>
 consteval std::size_t index() {
     for (std::size_t i = 0; i < size; ++i)
@@ -17,7 +17,7 @@ consteval std::size_t index() {
     throw "unknown training scalar";
 }
 template <std::meta::info Member>
-void set(Tensors& values, const mmltk::backend::ml::torch_api::Tensor& tensor) {
+void set(Tensors& values, const torch::Tensor& tensor) {
     if (tensor.defined()) values[index<Member>()] = tensor.detach();
 }
 inline TrainingScalars project(const float* values, double count) {

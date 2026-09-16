@@ -90,6 +90,7 @@ if(BUILD_RFDETR_NATIVE)
     add_subdirectory(src/backend/ml/ops)
 endif()
 add_subdirectory(src/backend/ml/runtime)
+add_subdirectory(src/backend/models/contract)
 add_subdirectory(src/backend/models/rfdetr/contract)
 add_subdirectory(src/backend/models/catalog)
 

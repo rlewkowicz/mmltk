@@ -1,3 +1,5 @@
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/common/io/file_digest.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
@@ -28,18 +30,17 @@
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.model_export;
 namespace rfdetr = mmltk::backend::models::rfdetr;
-namespace tensor = mmltk::backend::ml::torch_api;
 TEST_CASE("compiled preprocessing preserves unit-range float CHW channels", "[model][rfdetr][prediction][gpu]") {
-    const auto source = tensor::tensor({0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 0.125F}).to(tensor::kCUDA);
+    const auto source = torch::tensor({0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 0.125F}).to(torch::kCUDA);
     const mmltk::backend::data::Batch batch{.num_images = 1U, .device_images = source.data_ptr<float>()};
-    rfdetr::InferenceBatchPreprocessor preprocessor(1, 1, 2, 0, tensor::kFloat);
-    const auto result = preprocessor.Run(batch).reshape({6}).to(tensor::kCPU);
-    REQUIRE(tensor::equal(result, source.to(tensor::kCPU)));
+    rfdetr::InferenceBatchPreprocessor preprocessor(1, 1, 2, 0, at::kFloat);
+    const auto result = preprocessor.Run(batch).reshape({6}).to(torch::kCPU);
+    REQUIRE(torch::equal(result, source.to(torch::kCPU)));
     const auto address = preprocessor.Run(batch).data_ptr();
     REQUIRE(preprocessor.Run(batch).data_ptr() == address);
     CHECK(address == batch.device_images);
-    rfdetr::InferenceBatchPreprocessor half_precision(1, 1, 2, 0, tensor::kHalf);
-    REQUIRE(tensor::equal(half_precision.Run(batch).reshape({6}).to(tensor::kFloat).to(tensor::kCPU), source.to(tensor::kCPU)));
+    rfdetr::InferenceBatchPreprocessor half_precision(1, 1, 2, 0, at::kHalf);
+    REQUIRE(torch::equal(half_precision.Run(batch).reshape({6}).to(at::kFloat).to(torch::kCPU), source.to(torch::kCPU)));
     const auto half_address = half_precision.Run(batch).data_ptr();
     CHECK(half_address != batch.device_images);
     CHECK(half_precision.Run(batch).data_ptr() == half_address);
@@ -510,12 +511,12 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
     const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, 0));
-    const auto cuda = tensor::TensorOptions().device(tensor::kCUDA).dtype(tensor::kFloat);
-    auto input = tensor::zeros({1, 3, 8, 8}, cuda);
-    auto boxes = tensor::empty({2, 4}, cuda);
-    auto labels = tensor::empty({2}, cuda.dtype(tensor::kInt));
-    auto scores = tensor::empty({2}, cuda);
-    auto masks = tensor::ones({2, 2, 2}, cuda.dtype(tensor::kUInt8));
+    const auto cuda = torch::TensorOptions().device(torch::kCUDA).dtype(at::kFloat);
+    auto input = torch::zeros({1, 3, 8, 8}, cuda);
+    auto boxes = torch::empty({2, 4}, cuda);
+    auto labels = torch::empty({2}, cuda.dtype(at::kInt));
+    auto scores = torch::empty({2}, cuda);
+    auto masks = torch::ones({2, 2, 2}, cuda.dtype(torch::kUInt8));
     masks.mul_(77);
     std::array<runtime::AnalysisAnnotationStorage, 1> annotations{{{.source_region = {.width = 2, .height = 2},
                                                                     .value_capacity = 2,
@@ -566,7 +567,7 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     const auto produced = masks.clone();
     run(*backend, false);
     CHECK_FALSE(annotations[0].masks_available);
-    CHECK(tensor::equal(masks, produced));
+    CHECK(torch::equal(masks, produced));
     write_prediction_model(root / "bbox.onnx", 2, false);
     artifacts.onnx_path = root / "bbox.onnx";
     auto bbox_backend = rfdetr::make_rfdetr_runtime_backend({.artifacts = artifacts,
@@ -579,7 +580,7 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     annotations[0].masks_available = true;
     run(*bbox_backend, false);
     CHECK_FALSE(annotations[0].masks_available);
-    CHECK(tensor::equal(masks, produced));
+    CHECK(torch::equal(masks, produced));
     CHECK(bbox_backend->Close() == runtime::kRuntimeSuccess);
     CHECK(backend->Close() == runtime::kRuntimeSuccess);
 }
@@ -629,16 +630,16 @@ TEST_CASE("mask chunks account for model gather expansion device bools and regis
 }
 TEST_CASE("selected mask workspace reuses allocation and resets dtype and shape high water", "[model][rfdetr][prediction]") {
     rfdetr::SelectedMaskWorkspace workspace;
-    const auto queries = tensor::tensor({0L, 1L}, tensor::TensorOptions().dtype(tensor::kLong)).reshape({1, 2});
-    auto logits = tensor::ones({1, 2, 4, 4});
+    const auto queries = torch::tensor({0L, 1L}, torch::TensorOptions().dtype(at::kLong)).reshape({1, 2});
+    auto logits = torch::ones({1, 2, 4, 4});
     auto masks = workspace.Materialize(logits, queries, 8, 8);
     const auto address = masks.data_ptr();
     CHECK(masks.all().item<bool>());
-    masks = tensor::Tensor{};
+    masks = torch::Tensor{};
     CHECK(workspace.Materialize(logits, queries, 8, 8).data_ptr() == address);
     const auto first = workspace.RetainedCapacity(128U);
     CHECK(first.bytes == rfdetr::SelectedMaskCapacity::Resolve(2, 4, 4, 8, 8, 4).bytes);
-    logits = -tensor::ones({1, 2, 8, 8}, tensor::TensorOptions().dtype(tensor::kHalf));
+    logits = -torch::ones({1, 2, 8, 8}, torch::TensorOptions().dtype(at::kHalf));
     CHECK_FALSE(workspace.Materialize(logits, queries, 4, 4).any().item<bool>());
     CHECK(workspace.RetainedCapacity(32U).bytes == rfdetr::SelectedMaskCapacity::Resolve(2, 8, 8, 4, 4, 2).bytes);
     workspace.ResetSettled();
@@ -648,8 +649,8 @@ TEST_CASE("raw preparation settles submitted tensor copies and reports unobserva
     namespace runtime = mmltk::backend::ml::runtime;
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
     const auto stream = c10::cuda::getCurrentCUDAStream(0).stream();
-    const auto source = tensor::ones({2, 2}, tensor::TensorOptions().device(tensor::kCUDA));
-    auto destination = tensor::zeros_like(source);
+    const auto source = torch::ones({2, 2}, torch::TensorOptions().device(torch::kCUDA));
+    auto destination = torch::zeros_like(source);
     runtime::AnalysisAnnotationStorage annotation;
     std::string failure;
     rfdetr::PredictionRawPreparation raw(true, annotation, failure, stream);

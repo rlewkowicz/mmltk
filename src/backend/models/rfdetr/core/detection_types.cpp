@@ -1,15 +1,15 @@
-#include "detail/detection_types.h"
+
+#include "src/backend/models/rfdetr/core/detection_types.h"
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 namespace mmltk::backend::models::rfdetr {
-namespace tensor_api = mmltk::backend::ml::torch_api;
-void assert_inference_output_dtype(const tensor_api::Tensor& pred_logits, const tensor_api::Tensor& pred_boxes, const tensor_api::ScalarType expected_dtype,
+void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, const at::ScalarType expected_dtype,
                                    const char* context) {
     if (!pred_logits.defined() || !pred_boxes.defined()) { throw std::runtime_error(std::string(context) + " returned undefined detection outputs"); }
     if (pred_logits.scalar_type() != expected_dtype) { throw std::runtime_error(std::string(context) + " returned logits with the wrong element type"); }
     const bool valid_box_dtype =
-        pred_boxes.scalar_type() == expected_dtype || (expected_dtype != tensor_api::kFloat && pred_boxes.scalar_type() == tensor_api::kFloat);
+        pred_boxes.scalar_type() == expected_dtype || (expected_dtype != at::kFloat && pred_boxes.scalar_type() == at::kFloat);
     if (!valid_box_dtype) { throw std::runtime_error(std::string(context) + " returned boxes with the wrong element type"); }
 }
 void populate_default_detection_weight_dict(DetectionConfig& config) {

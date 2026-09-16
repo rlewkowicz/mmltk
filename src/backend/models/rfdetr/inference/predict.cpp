@@ -1,4 +1,6 @@
 module;
+#include <c10/cuda/CUDAGuard.h>
+#include <ATen/cuda/CUDAContext.h>
 #include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
@@ -26,12 +28,12 @@ module;
 #include <string>
 #include <utility>
 #include <vector>
-#include "detection_types.h"
-#include "draw.h"
-#include "execution_precision.h"
-#include "model_technical.h"
-#include "postprocess.h"
-#include "scalar_type_utils.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/sample_output.h"
+#include "src/backend/models/rfdetr/core/execution_precision.h"
+#include "src/backend/models/rfdetr/core/model.h"
+#include "src/backend/models/rfdetr/core/postprocess.h"
+#include "src/backend/ml/torch/scalar_type.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
@@ -51,22 +53,19 @@ module;
 #include "src/backend/media/video/video_file_source.h"
 #include <ATen/ops/upsample_bilinear2d.h>
 #include <ATen/ops/index_select.h>
-#include "torch_api.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 // CLEANUP-IGNORE: This module declaration terminates Prediction's private global fragment.
+#include "src/backend/models/rfdetr/core/model_state.h" // CLEANUP-IGNORE: Prediction directly imports its concrete RF-DETR implementation owners.
+#include "src/backend/models/rfdetr/core/runtime.h"
 module mmltk.backend.models.rfdetr.inference.prediction;
 // CLEANUP-IGNORE: This inference implementation imports the concrete owners used by its typed prediction boundary.
 import mmltk.backend.ml.cuda.torch_scope;
-import mmltk.backend.models.rfdetr.core.artifact_resolution; // CLEANUP-IGNORE: Prediction directly imports its concrete RF-DETR implementation owners.
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution;
-import mmltk.backend.models.rfdetr.core.runtime;
-import mmltk.backend.models.rfdetr.core.tool_launch_utils;
-import mmltk.backend.models.rfdetr.core.model;
+
 import mmltk.backend.models.rfdetr.inference.loader;
-#include "model_access.h"
-#include "model_state_access.h"
 namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
-namespace tensor_api = mmltk::backend::ml::torch_api;
 namespace torch_cuda = mmltk::backend::ml::cuda;
 namespace {
 void finish_prediction_run(PredictionRunResult& result, const std::chrono::steady_clock::time_point started) noexcept {
@@ -122,12 +121,12 @@ void finish_prediction_run(PredictionRunResult& result, const std::chrono::stead
     if (!record.source_name.empty()) { payload["source_name"] = record.source_name; }
     return payload;
 }
-[[nodiscard]] runtime::RuntimeElementType runtime_type(const tensor_api::ScalarType type) {
-    if (type == tensor_api::kFloat) { return runtime::RuntimeElementType::Float32; }
-    if (type == tensor_api::kHalf) { return runtime::RuntimeElementType::Float16; }
+[[nodiscard]] runtime::RuntimeElementType runtime_type(const at::ScalarType type) {
+    if (type == at::kFloat) { return runtime::RuntimeElementType::Float32; }
+    if (type == at::kHalf) { return runtime::RuntimeElementType::Float16; }
     throw std::invalid_argument("RF-DETR input must be float16 or float32");
 }
-[[nodiscard]] runtime::RuntimeTensorBuffer input_buffer(const tensor_api::Tensor& input) {
+[[nodiscard]] runtime::RuntimeTensorBuffer input_buffer(const torch::Tensor& input) {
     runtime::RuntimeShape shape{.rank = static_cast<std::uint8_t>(input.dim())};
     if (input.dim() > static_cast<std::int64_t>(runtime::kMaximumRuntimeRank)) { throw std::invalid_argument("RF-DETR input rank exceeds runtime bound"); }
     for (std::int64_t index = 0; index < input.dim(); ++index) { shape.extents[static_cast<std::size_t>(index)] = input.size(index); }
@@ -139,11 +138,11 @@ void finish_prediction_run(PredictionRunResult& result, const std::chrono::stead
     };
 }
 struct AnnotationBatch final {
-    tensor_api::Tensor boxes;
-    tensor_api::Tensor labels;
-    tensor_api::Tensor scores;
-    tensor_api::Tensor masks;
-    tensor_api::Tensor compact_boxes, compact_labels, compact_scores;
+    torch::Tensor boxes;
+    torch::Tensor labels;
+    torch::Tensor scores;
+    torch::Tensor masks;
+    torch::Tensor compact_boxes, compact_labels, compact_scores;
     std::vector<runtime::AnalysisAnnotationStorage> storage;
     std::vector<PostprocessedSelection> selections;
     std::vector<RfdetrMaskSelection> runtime_selections;
@@ -170,16 +169,16 @@ class PredictionBackend final {
                                                               artifacts_.config.resolution, artifacts_.config.resolution, false));
                 native_ = std::make_unique<NativeRfDetrModel>(artifacts_.config, artifacts_.class_layout);
                 class_postprocess_ = std::make_unique<ClassPostprocessLane>(native_->class_layout());
-                class_postprocess_->Prepare(tensor_api::Device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(device_)));
-                auto& technical_model = detail::native_model_owner(*native_);
-                static_cast<void>(technical_model.load_normalized_state(detail::model_state_owner(resolved.model_state).entries, false));
-                technical_model.module().to(tensor_api::Device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(device_)));
-                technical_model.module().eval();
+                class_postprocess_->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
+                auto& technical_model = (*native_);
+                static_cast<void>(technical_model.load_normalized_state(resolved.model_state.entries(), false));
+                technical_model.to(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_)));
+                technical_model.eval();
                 native_precision_ = options.allow_fp16 ? torch_cuda::preferred_torch_cuda_precision(device_) : torch_cuda::TorchCudaPrecision::Float32;
                 switch (native_precision_) {
-                    case torch_cuda::TorchCudaPrecision::Float32: native_input_type_ = tensor_api::kFloat; break;
-                    case torch_cuda::TorchCudaPrecision::Float16: native_input_type_ = tensor_api::kHalf; break;
-                    case torch_cuda::TorchCudaPrecision::BFloat16: native_input_type_ = tensor_api::kBFloat16; break;
+                    case torch_cuda::TorchCudaPrecision::Float32: native_input_type_ = at::kFloat; break;
+                    case torch_cuda::TorchCudaPrecision::Float16: native_input_type_ = at::kHalf; break;
+                    case torch_cuda::TorchCudaPrecision::BFloat16: native_input_type_ = torch::kBFloat16; break;
                 }
                 native_autocast_enabled_ = options.allow_fp16;
                 resolution_ = static_cast<std::uint32_t>(artifacts_.config.resolution);
@@ -218,9 +217,9 @@ class PredictionBackend final {
     [[nodiscard]] const std::shared_ptr<const ClassArtifactAdmission>& class_artifact() const noexcept { return artifact_.admission; }
     [[nodiscard]] const std::string& name() const noexcept { return artifact_.backend_name; }
     [[nodiscard]] std::uint32_t resolution() const noexcept { return resolution_; }
-    [[nodiscard]] tensor_api::ScalarType input_type() const noexcept {
-        if (runtime_ && runtime_->model_info().input.element_type == runtime::RuntimeElementType::Float16) { return tensor_api::kHalf; }
-        return native_ ? native_input_type_ : tensor_api::kFloat;
+    [[nodiscard]] at::ScalarType input_type() const noexcept {
+        if (runtime_ && runtime_->model_info().input.element_type == runtime::RuntimeElementType::Float16) { return at::kHalf; }
+        return native_ ? native_input_type_ : at::kFloat;
     }
     [[nodiscard]] bool has_masks() const noexcept { return native_ ? artifacts_.config.segmentation : runtime_->has_masks(); }
     [[nodiscard]] std::size_t capacity(std::size_t batch, std::uint32_t width, std::uint32_t height, bool masks) const {
@@ -232,7 +231,7 @@ class PredictionBackend final {
     [[nodiscard]] const std::shared_ptr<const ResolvedClassLayout>& class_layout() const noexcept {
         return native_ ? native_->class_layout() : runtime_->class_layout();
     }
-    void Execute(const tensor_api::Tensor& input, AnnotationBatch& annotations) {
+    void Execute(const torch::Tensor& input, AnnotationBatch& annotations) {
         if (runtime_) {
             auto submission = runtime_->Run(input_buffer(input), annotations.storage, annotations.runtime_selections, annotations.want_masks);
             runtime_->ReleaseAfterCompletion(std::move(submission));
@@ -242,22 +241,22 @@ class PredictionBackend final {
                     annotations.selections[index] = {};
                     continue;
                 }
-                const auto view = [&](const runtime::RuntimeTensorBuffer& buffer, tensor_api::ScalarType type) {
-                    return tensor_api::from_blob(buffer.device_data, tensor_api::IntArrayRef(buffer.shape.extents.data(), buffer.shape.rank),
+                const auto view = [&](const runtime::RuntimeTensorBuffer& buffer, at::ScalarType type) {
+                    return torch::from_blob(buffer.device_data, at::IntArrayRef(buffer.shape.extents.data(), buffer.shape.rank),
                                                  input.options().dtype(type));
                 };
                 auto& destination = annotations.selections[index];
-                destination = {.query_indices = view(selected.query_indices, tensor_api::kLong)};
+                destination = {.query_indices = view(selected.query_indices, at::kLong)};
                 if (annotations.want_masks && selected.mask_logits)
                     destination.mask_logits =
                         view(*selected.mask_logits,
-                             selected.mask_logits->element_type == runtime::RuntimeElementType::Float16 ? tensor_api::kHalf : tensor_api::kFloat);
+                             selected.mask_logits->element_type == runtime::RuntimeElementType::Float16 ? at::kHalf : at::kFloat);
             }
             return;
         }
         struct NativeCall final {
             PredictionBackend* owner;
-            const tensor_api::Tensor* input;
+            const torch::Tensor* input;
             AnnotationBatch* annotations;
         } call{this, &input, &annotations};
         torch_cuda::run_with_torch_cuda_scope({.device = device_,
@@ -288,9 +287,9 @@ class PredictionBackend final {
     }
 
    private:
-    void ExecuteNative(const tensor_api::Tensor& input, AnnotationBatch& annotations) {
-        auto mask = tensor_api::zeros({input.size(0), input.size(2), input.size(3)}, input.options().dtype(tensor_api::kBool));
-        const ModelOutputs outputs = detail::native_model_owner(*native_).forward(NestedTensor{input, std::move(mask)}, annotations.want_masks);
+    void ExecuteNative(const torch::Tensor& input, AnnotationBatch& annotations) {
+        auto mask = torch::zeros({input.size(0), input.size(2), input.size(3)}, input.options().dtype(torch::kBool));
+        const ModelOutputs outputs = (*native_).forward(NestedTensor{input, std::move(mask)}, annotations.want_masks);
         assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, native_input_type_, "native RF-DETR inference");
         for (std::size_t index = 0U; index < annotations.storage.size(); ++index) {
             auto& storage = annotations.storage[index];
@@ -314,9 +313,9 @@ class PredictionBackend final {
                 },
                 storage.source_region.height, storage.source_region.width, static_cast<std::int64_t>(count), annotations.want_masks, class_postprocess_.get());
             const auto active = static_cast<std::int64_t>(count);
-            annotations.boxes[index].narrow(0, 0, active).copy_(processed.boxes[0].to(tensor_api::kFloat));
-            annotations.labels[index].narrow(0, 0, active).copy_(processed.labels[0].to(tensor_api::kInt));
-            annotations.scores[index].narrow(0, 0, active).copy_(processed.scores[0].to(tensor_api::kFloat));
+            annotations.boxes[index].narrow(0, 0, active).copy_(processed.boxes[0].to(at::kFloat));
+            annotations.labels[index].narrow(0, 0, active).copy_(processed.labels[0].to(at::kInt));
+            annotations.scores[index].narrow(0, 0, active).copy_(processed.scores[0].to(at::kFloat));
             annotations.selections[index] = processed;
             storage.value_count = count;
             storage.class_catalog = native_->class_layout()->catalog();
@@ -332,24 +331,24 @@ class PredictionBackend final {
     std::uint32_t resolution_ = 0U;
     int device_ = 0;
     runtime::BorrowedCommandStream command_stream_{};
-    tensor_api::ScalarType native_input_type_ = tensor_api::kFloat;
+    at::ScalarType native_input_type_ = at::kFloat;
     torch_cuda::TorchCudaPrecision native_precision_ = torch_cuda::TorchCudaPrecision::Float32;
     bool native_autocast_enabled_ = false;
 };
 void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t capacity, std::uint32_t width, std::uint32_t height, int device, bool masks,
                          bool raw_preview) {
-    const auto cuda = tensor_api::TensorOptions().device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(device));
-    const auto resize = [&](tensor_api::Tensor& tensor, tensor_api::IntArrayRef shape, tensor_api::ScalarType type) {
+    const auto cuda = torch::TensorOptions().device(torch::kCUDA, static_cast<c10::DeviceIndex>(device));
+    const auto resize = [&](torch::Tensor& tensor, at::IntArrayRef shape, at::ScalarType type) {
         if (!tensor.defined() || tensor.get_device() != device)
-            tensor = tensor_api::empty(shape, cuda.dtype(type));
+            tensor = torch::empty(shape, cuda.dtype(type));
         else
             tensor.resize_(shape);
     };
     const auto count = static_cast<std::int64_t>(batch);
     const auto limit = static_cast<std::int64_t>(std::max<std::size_t>(capacity, 1U));
-    resize(result.boxes, {count, limit, 4}, tensor_api::kFloat);
-    resize(result.labels, {count, limit}, tensor_api::kInt);
-    resize(result.scores, {count, limit}, tensor_api::kFloat);
+    resize(result.boxes, {count, limit, 4}, at::kFloat);
+    resize(result.labels, {count, limit}, at::kInt);
+    resize(result.scores, {count, limit}, at::kFloat);
     result.want_masks = masks;
     result.raw_preview = raw_preview;
     result.preview_failure.clear();
@@ -388,23 +387,23 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
 struct PredictionReadback final {
     explicit PredictionReadback(int device) : boxes(device), labels(device), scores(device), masks(device), indices(device) {}
     void Read(const AnnotationBatch& batch) {
-        box_values = boxes.view(batch.boxes.sizes(), tensor_api::kFloat);
-        label_values = labels.view(batch.labels.sizes(), tensor_api::kInt);
-        score_values = scores.view(batch.scores.sizes(), tensor_api::kFloat);
+        box_values = boxes.view(batch.boxes.sizes(), at::kFloat);
+        label_values = labels.view(batch.labels.sizes(), at::kInt);
+        score_values = scores.view(batch.scores.sizes(), at::kFloat);
         box_values.copy_(batch.boxes, true);
         label_values.copy_(batch.labels, true);
         score_values.copy_(batch.scores, true);
         const auto stream = c10::cuda::getCurrentCUDAStream(batch.boxes.get_device());
         const auto status = cudaStreamSynchronize(stream.stream());
         if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction readback completion"};
-        index_values = indices.view(batch.labels.sizes(), tensor_api::kLong);
+        index_values = indices.view(batch.labels.sizes(), at::kLong);
     }
     mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks, indices;
-    tensor_api::Tensor device_indices, selected_queries;
+    torch::Tensor device_indices, selected_queries;
     SelectedMaskWorkspace mask_workspace;
-    tensor_api::Tensor box_values, label_values, score_values, mask_values, index_values;
+    torch::Tensor box_values, label_values, score_values, mask_values, index_values;
 };
-void execute_prediction_batch(const PredictRequest& options, PredictionBackend& backend, const tensor_api::Tensor& input, std::size_t batch_size,
+void execute_prediction_batch(const PredictRequest& options, PredictionBackend& backend, const torch::Tensor& input, std::size_t batch_size,
                               std::uint32_t width, std::uint32_t height, const PredictionDelivery& delivery, AnnotationBatch& annotations,
                               PredictionReadback& readback, std::span<const std::uint32_t> indices = {}, std::int64_t first_index = 0) {
     annotations.demand.resize(batch_size);
@@ -424,7 +423,7 @@ void execute_prediction_batch(const PredictRequest& options, PredictionBackend& 
     if (annotations.storage.front().value_capacity != 0U) readback.Read(annotations);
 }
 struct PredictionSourceStorage final {
-    std::array<tensor_api::Tensor, 11U> products;
+    std::array<torch::Tensor, 11U> products;
     std::shared_ptr<void> backend_masks;
     std::shared_ptr<void> source;
 };
@@ -442,7 +441,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
             pixels.custody = std::make_shared<PredictionSourceStorage>(
                 PredictionSourceStorage{{annotations.boxes, annotations.labels, annotations.scores, annotations.masks, annotations.compact_boxes,
                                          annotations.compact_labels, annotations.compact_scores, readback.device_indices, readback.index_values,
-                                         annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(tensor_api::Tensor{})},
+                                         annotations.selections[index].query_indices, annotations.selections[index].mask_logits.value_or(torch::Tensor{})},
                                         annotations.runtime_selections[index].custody,
                                         std::move(source)});
         } catch (...) { pixels = {.preview_failure = "Prediction source custody allocation failed"}; }
@@ -504,7 +503,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
     PredictionRawPreparation preview(batch.raw_preview, annotation, batch.preview_failure, stream);
     const auto upload_survivors = [&] {
         if (!storage.device_indices.defined())
-            storage.device_indices = tensor_api::empty({active}, cuda);
+            storage.device_indices = torch::empty({active}, cuda);
         else
             storage.device_indices.resize_({active});
         storage.device_indices.copy_(selected_indices, true);
@@ -518,8 +517,8 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         annotation.masks = {};
         annotation.value_count = result.size();
         // Reused compact buffers pair the callback metadata with precisely these survivors.
-        const auto compact = [&](tensor_api::Tensor& destination, const tensor_api::Tensor& candidates) {
-            if (!destination.defined()) destination = tensor_api::empty({0}, candidates.options());
+        const auto compact = [&](torch::Tensor& destination, const torch::Tensor& candidates) {
+            if (!destination.defined()) destination = torch::empty({0}, candidates.options());
             if (candidates.dim() == 2)
                 destination.resize_({active, candidates.size(1)});
             else
@@ -547,7 +546,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
                 std::forward<decltype(work)>(work)();
         };
         if (!selection.mask_logits) throw std::runtime_error("RF-DETR requested mask output is absent");
-        if (!storage.selected_queries.defined()) storage.selected_queries = tensor_api::empty({0}, cuda);
+        if (!storage.selected_queries.defined()) storage.selected_queries = torch::empty({0}, cuda);
         storage.selected_queries.resize_({1, active});
         at::index_select_out(storage.selected_queries, selection.query_indices, 1, storage.device_indices);
         const auto width = source_region.width;
@@ -563,7 +562,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
             // Encoded-mask reads completed their host visibility wait; preview-only
             // work has no pinned view. GPU scratch reuse stays on the inference
             // stream. Drop retained storage when mixed shapes exceed the budget.
-            storage.mask_values = tensor_api::Tensor{};
+            storage.mask_values = torch::Tensor{};
             const auto released = storage.masks.ReleaseSettled();
             if (released != CUDA_SUCCESS) throw std::runtime_error("prediction mask scratch is still borrowed");
             storage.mask_workspace.ResetSettled();
@@ -572,7 +571,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
             raw_mask_work([&] {
                 static_cast<void>(checked_prediction_extent(result.size(), pixels, kMaximumPredictionTensorBytes));
                 if (!batch.masks.defined())
-                    batch.masks = tensor_api::empty({active, height, width}, batch.boxes.options().dtype(tensor_api::kUInt8));
+                    batch.masks = torch::empty({active, height, width}, batch.boxes.options().dtype(torch::kUInt8));
                 else
                     batch.masks.resize_({active, height, width});
             });
@@ -584,8 +583,8 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
                 *selection.mask_logits, storage.selected_queries.narrow(1, static_cast<std::int64_t>(start), chunk), height, width)[0];
             if (batch.preview_masks) raw_mask_work([&] { batch.masks.narrow(0, static_cast<std::int64_t>(start), chunk).copy_(masks); });
             if (!batch.encoded_masks) continue;
-            storage.mask_values = tensor_api::Tensor{};
-            storage.mask_values = storage.masks.view(masks.sizes(), tensor_api::kBool);
+            storage.mask_values = torch::Tensor{};
+            storage.mask_values = storage.masks.view(masks.sizes(), torch::kBool);
             storage.mask_values.copy_(masks, true);
             const auto status = cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(batch.boxes.get_device()).stream());
             if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction mask chunk completion"};
@@ -649,13 +648,13 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
                                                        const runtime::BorrowedCommandStream command_stream, PredictionRunResult result,
                                                        PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery) {
     const auto resolution = static_cast<int>(backend.resolution());
-    auto host = mmltk::backend::ml::cuda::numa_empty({1, 3, resolution, resolution}, tensor_api::kFloat, options.device_id);
-    auto device = tensor_api::empty(
-        host.sizes(), tensor_api::TensorOptions().dtype(tensor_api::kFloat).device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(options.device_id)));
-    const auto mean = tensor_api::tensor({0.485F, 0.456F, 0.406F}, device.options()).view({1, 3, 1, 1});
-    const auto deviation = tensor_api::tensor({0.229F, 0.224F, 0.225F}, device.options()).view({1, 3, 1, 1});
+    auto host = mmltk::backend::ml::cuda::numa_empty({1, 3, resolution, resolution}, at::kFloat, options.device_id);
+    auto device = torch::empty(
+        host.sizes(), torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, static_cast<c10::DeviceIndex>(options.device_id)));
+    const auto mean = torch::tensor({0.485F, 0.456F, 0.406F}, device.options()).view({1, 3, 1, 1});
+    const auto deviation = torch::tensor({0.229F, 0.224F, 0.225F}, device.options()).view({1, 3, 1, 1});
     auto converted =
-        backend.input_type() == tensor_api::kFloat ? tensor_api::Tensor{} : tensor_api::empty(host.sizes(), device.options().dtype(backend.input_type()));
+        backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(host.sizes(), device.options().dtype(backend.input_type()));
     mmltk::backend::imaging::resample::RgbImageResizer resizer(1);
     std::vector<std::uint8_t> resized(static_cast<std::size_t>(resolution) * resolution * 3U);
     const auto started = std::chrono::steady_clock::now();
@@ -708,13 +707,13 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
     auto source = std::make_shared<mmltk::backend::media::video::VideoFileSource>(options.video_path, capacity, options.device_id, command_stream.native_handle,
                                                                                   delivery.stop, source_retirement);
     if (delivery.begin) delivery.begin(result);
-    const auto cuda = tensor_api::TensorOptions().dtype(tensor_api::kFloat).device(tensor_api::kCUDA, options.device_id);
-    const auto mean = tensor_api::tensor({0.485F, 0.456F, 0.406F}, cuda).view({1, 3, 1, 1});
-    const auto deviation = tensor_api::tensor({0.229F, 0.224F, 0.225F}, cuda).view({1, 3, 1, 1});
+    const auto cuda = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, options.device_id);
+    const auto mean = torch::tensor({0.485F, 0.456F, 0.406F}, cuda).view({1, 3, 1, 1});
+    const auto deviation = torch::tensor({0.229F, 0.224F, 0.225F}, cuda).view({1, 3, 1, 1});
     const auto resolution = static_cast<std::int64_t>(backend.resolution());
-    auto normalized = tensor_api::empty({1, 3, resolution, resolution}, cuda);
+    auto normalized = torch::empty({1, 3, resolution, resolution}, cuda);
     auto converted =
-        backend.input_type() == tensor_api::kFloat ? tensor_api::Tensor{} : tensor_api::empty(normalized.sizes(), cuda.dtype(backend.input_type()));
+        backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(normalized.sizes(), cuda.dtype(backend.input_type()));
     while (!delivery.stop.stop_requested() && (options.limit_images == 0U || result.processed_images < options.limit_images)) {
         auto frame = source->Next();
         if (!frame) break;
@@ -723,7 +722,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
         if (delivery.decoded) delivery.decoded(frame->index + 1U, total >= frame->index + 1U ? total : 0U);
         if (delivery.before_frame && !delivery.before_frame(frame->presentation_seconds, source->frames_per_second())) break;
         const std::array<std::int64_t, 4> shape{1, 3, frame->height, frame->width};
-        auto input = tensor_api::from_blob(const_cast<float*>(frame->chw), tensor_api::IntArrayRef{shape}, cuda);
+        auto input = torch::from_blob(const_cast<float*>(frame->chw), at::IntArrayRef{shape}, cuda);
         at::upsample_bilinear2d_out(normalized, input, {resolution, resolution}, false);
         normalized.sub_(mean).div_(deviation);
         if (converted.defined()) converted.copy_(normalized);

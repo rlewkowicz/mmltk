@@ -2,7 +2,7 @@
 #include <filesystem>
 #include <span>
 #include <string_view>
-#include "src/backend/models/catalog/module.h"
+#include "src/backend/models/catalog/model_descriptor.h"
 namespace mmltk::backend::models::catalog {
 // CLEANUP-IGNORE: Registry lookup functions are a projected catalog API, not duplicate model-configuration fields.
 [[nodiscard]] std::span<const ModelDescriptor> models() noexcept;

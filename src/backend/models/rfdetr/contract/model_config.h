@@ -95,4 +95,9 @@ struct NativeRfDetrConfig {
 [[nodiscard]] const PresetCatalogEntry* find_model_preset_by_weight_filename(std::string_view filename) noexcept;
 [[nodiscard]] const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::path& path);
 [[nodiscard]] NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset);
+inline std::string infer_train_recipe_preset_name_from_path(const std::filesystem::path& path) {
+    if (path.empty()) { return {}; }
+    if (const auto* preset = infer_model_preset_from_path(path)) { return std::string(preset->preset_name); }
+    return {};
+}
 }  // namespace mmltk::backend::models::rfdetr

@@ -1,9 +1,9 @@
 #pragma once
-#include <torch/torch.h>
+#include <torch/types.h>
 #include <functional>
 #include <utility>
 #include <vector>
-#include "detection_types.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
 namespace mmltk::backend::models::rfdetr {
 using AllReduceTensorFn = std::function<void(torch::Tensor&)>;
 [[nodiscard]] torch::Tensor cardinality_error(const torch::Tensor& logits, const torch::Tensor& target_counts);

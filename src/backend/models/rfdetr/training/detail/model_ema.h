@@ -1,8 +1,9 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/model.h"
 #include <cstddef>
 #include <cstdint>
 #include <vector>
-#include <torch/torch.h>
+#include <torch/types.h>
 namespace mmltk::backend::models::rfdetr {
 class ModelEma final {
    public:
@@ -19,7 +20,7 @@ class ModelEma final {
                                                   double tau, int64_t completed_updates);
     class Selection final {
        public:
-        Selection(ModelEma&, torch::nn::Module&);
+        Selection(ModelEma&, NativeRfDetrModel&);
         ~Selection() noexcept;
         Selection(const Selection&) = delete;
         Selection& operator=(const Selection&) = delete;
@@ -27,7 +28,7 @@ class ModelEma final {
 
        private:
         ModelEma* owner_;
-        torch::nn::Module* module_;
+        NativeRfDetrModel* module_;
         bool training_;
     };
     [[nodiscard]] const std::vector<torch::Tensor>& shadow_params() const noexcept;

@@ -99,12 +99,10 @@ mmltk_configure_component(
     mmltk_backend_ml_torch PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(
     mmltk_backend_ml_torch
-    BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/detail
-    FILES detail/torch_api.h)
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES archive.h scalar_type.h)
 mmltk_register_ordinary_sources(
-    mmltk_backend_ml_torch torch.cpp)
-target_include_directories(mmltk_backend_ml_torch PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/detail)
+    mmltk_backend_ml_torch torch_toolchain_check.cpp)
 target_link_libraries(mmltk_backend_ml_torch
     PUBLIC
         mmltk::backend::ml::torch_dependencies

@@ -19,10 +19,8 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include "detail/model_state_access.h"
-#include "detail/model_state_technical.h"
-#include "detail/scalar_type_utils.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
+#include "src/backend/ml/torch/scalar_type.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/frameworks/process/subprocess_utils.h"
@@ -200,7 +198,7 @@ DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_p
     if (found == manifest.end() || !found->is_array()) {
         throw std::runtime_error("RF-DETR checkpoint manifest is missing state_dict array: " + manifest_path.string());
     }
-    auto& entries = detail::model_state_owner(checkpoint).entries;
+    std::vector<NormalizedModelStateEntry> entries;
     entries.reserve(found->size());
     for (const auto& entry_json : *found) {
         if (!entry_json.is_object()) { throw std::runtime_error("RF-DETR checkpoint manifest entry is not an object: " + manifest_path.string()); }
@@ -219,7 +217,7 @@ DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_p
             if (!size_json.is_number_integer()) { throw std::runtime_error("RF-DETR checkpoint manifest tensor shape is not integral"); }
             sizes.push_back(size_json.get<int64_t>());
         }
-        const auto scalar_type = scalar_type_from_name(dtype_it->get<std::string>());
+        const auto scalar_type = mmltk::backend::ml::serialization::scalar_type_from_name(dtype_it->get<std::string>());
         torch::Tensor tensor = torch::empty(sizes, torch::TensorOptions().dtype(scalar_type).device(torch::kCPU));
         std::ifstream tensor_stream(tensor_path, std::ios::binary);
         if (!tensor_stream.is_open()) { throw std::runtime_error("failed to open RF-DETR checkpoint tensor payload: " + tensor_path.string()); }
@@ -236,6 +234,7 @@ DecodedNativeModelState load_checkpoint_from_manifest(const fs::path& manifest_p
         });
     }
     if (entries.empty()) { throw std::runtime_error("RF-DETR checkpoint manifest produced an empty state_dict: " + manifest_path.string()); }
+    checkpoint.replace_entries(std::move(entries));
     return checkpoint;
 }
 json manifest_from_model_state(const fs::path& root, const std::vector<NormalizedModelStateEntry>& entries) {
@@ -264,7 +263,7 @@ json manifest_from_model_state(const fs::path& root, const std::vector<Normalize
             write_raw_tensor_file(tensor_path, tensor);
             manifest["state_dict"].push_back({{"name", entries[index].name},
                                               {"tensor_path", fs::relative(tensor_path, root).string()},
-                                              {"dtype", scalar_type_name(tensor.scalar_type())},
+                                              {"dtype", mmltk::backend::ml::serialization::scalar_type_name(tensor.scalar_type())},
                                               {"sizes", tensor.sizes().vec()}});
         }
         readback.Release();
@@ -289,7 +288,7 @@ DecodedNativeModelState decode_upstream_python_model_state(const fs::path& check
     return load_checkpoint_from_manifest(manifest_path);
 }
 void write_upstream_model_state(const fs::path& checkpoint_path, const DecodedNativeModelState& model_state) {
-    const auto& entries = detail::model_state_owner(model_state).entries;
+    const auto& entries = model_state.entries();
     if (entries.empty()) { throw std::invalid_argument("RF-DETR upstream checkpoint model state must not be empty"); }
     ScopedTempDirectory temp_dir("mmltk_rfdetr_save_");
     const fs::path manifest_path = temp_dir.path / "manifest.json";

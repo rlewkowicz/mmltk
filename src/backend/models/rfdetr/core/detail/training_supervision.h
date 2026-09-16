@@ -3,8 +3,8 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include "detection_types.h"
-#include "model_technical.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 namespace mmltk::backend::models::rfdetr {
 inline constexpr float kSparseCorrespondenceEpsilon = 1.0e-8F;

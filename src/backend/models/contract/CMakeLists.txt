@@ -1,0 +1,6 @@
+include(MmltkComponent)
+add_library(mmltk_backend_models_contract STATIC)
+add_library(mmltk::backend::models::contract ALIAS mmltk_backend_models_contract)
+mmltk_configure_component(mmltk_backend_models_contract PUBLIC_DECLARATIONS)
+mmltk_register_public_headers(mmltk_backend_models_contract BASE_DIRS ${CMAKE_SOURCE_DIR} FILES capabilities.h)
+set_target_properties(mmltk_backend_models_contract PROPERTIES LINKER_LANGUAGE CXX)

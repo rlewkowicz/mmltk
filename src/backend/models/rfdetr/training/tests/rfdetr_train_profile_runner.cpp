@@ -1,3 +1,6 @@
+#include <torch/utils.h>
+#include <torch/cuda.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -9,11 +12,11 @@
 #include "src/test_support/profile_runner_common.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/dataset_compiler.h"
-#include "src/backend/ml/torch/detail/torch_api.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-#include "src/backend/models/rfdetr/training/distributed_train_launcher.h"
+#include "src/backend/models/rfdetr/training/training_partition.h"
 #include "src/backend/models/rfdetr/training/train.h"
-#include "src/backend/models/rfdetr/training/train_recipe.h"
 #include "src/common/system/execution_policy.h"
 #include "src/backend/data/tests/test_fixture.h"
 import mmltk.common.logging.mmltk_logging;
@@ -115,7 +118,7 @@ void build_fixture(const Options& options, const FixtureSpec& fixture) {
 }
 void reseed_ambient_torch_rng(const Options& options) {
     const auto seed = static_cast<std::uint64_t>(options.seed);
-    mmltk::backend::ml::torch_api::manual_seed(seed);
+    torch::manual_seed(seed);
     ::torch::cuda::manual_seed_all(seed);
 }
 void reset_cuda_peak(const Options& options) { c10::cuda::CUDACachingAllocator::resetPeakStats(static_cast<c10::DeviceIndex>(options.device_id)); }

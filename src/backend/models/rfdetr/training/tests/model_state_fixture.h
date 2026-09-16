@@ -1,8 +1,8 @@
 #pragma once
+#include "src/backend/models/rfdetr/core/model.h"
 #include <vector>
-#include "model_technical.h"
 namespace mmltk::backend::models::rfdetr::testsupport {
-inline std::vector<NormalizedModelStateEntry> clone_normalized_model_state(const torch::nn::Module& module, const bool copy_to_cpu = false) {
+inline std::vector<NormalizedModelStateEntry> clone_normalized_model_state(const NativeRfDetrModel& module, const bool copy_to_cpu = false) {
     const auto parameters = module.named_parameters(true);
     const auto buffers = module.named_buffers(true);
     std::vector<NormalizedModelStateEntry> state;

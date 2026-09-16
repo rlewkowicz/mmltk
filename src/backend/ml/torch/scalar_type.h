@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-namespace mmltk::backend::models::rfdetr {
+namespace mmltk::backend::ml::serialization {
 inline std::string scalar_type_name(at::ScalarType scalar_type) {
     switch (scalar_type) {
         case at::kFloat: return "float32";
@@ -33,4 +33,4 @@ inline at::ScalarType scalar_type_from_name(std::string_view name) {
     if (name == "int64") return at::kLong;
     throw std::runtime_error(std::format("unsupported scalar type name: {}", name));
 }
-}  // namespace mmltk::backend::models::rfdetr
+}  // namespace mmltk::backend::ml::serialization

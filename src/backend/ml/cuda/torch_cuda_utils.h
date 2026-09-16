@@ -23,4 +23,5 @@ using ::c10::cuda::getStreamFromPool;
 [[nodiscard]] TorchCudaStream get_priority_cuda_stream(int device_id, int priority);
 [[nodiscard]] TorchCudaStream current_torch_cuda_stream_object(TorchDeviceIndex device_index);
 [[nodiscard]] TorchCudaStream external_torch_cuda_stream(std::uintptr_t stream, TorchDeviceIndex device_index);
+[[nodiscard]] inline c10::Device cuda_device(int device_id) { return {c10::kCUDA, checked_device_index(device_id)}; }
 }  // namespace mmltk::backend::ml::cuda

@@ -29,11 +29,10 @@
 #include <vector>
 #include <utility>
 // CLEANUP-IGNORE: Validation directly imports the implementation owners required by its native pipeline.
+#include "src/backend/models/rfdetr/core/runtime.h"
+
 import mmltk.backend.ml.cuda.torch_scope;
-import mmltk.backend.models.rfdetr.core.artifact_resolution;
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution;
-import mmltk.backend.models.rfdetr.core.runtime;
-import mmltk.backend.models.rfdetr.core.tool_launch_utils;
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.inference.loader;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;

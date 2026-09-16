@@ -104,19 +104,11 @@ mmltk_register_retained_module_providers(
     mmltk_backend_models_rfdetr_export export.cppm)
 mmltk_register_retained_module_providers(
     mmltk_backend_models_rfdetr_export onnx_lowering.cppm)
-mmltk_register_retained_module_providers(
-    mmltk_backend_models_rfdetr_export onnx_model_info.cppm)
-mmltk_register_retained_module_providers(
-    mmltk_backend_models_rfdetr_export onnx_simplify.cppm)
 mmltk_register_retained_module_implementation_units(
     mmltk_backend_models_rfdetr_export
     model_export.cpp
     onnx_lowering.cpp
     onnx_model_io.cpp
-)
-target_include_directories(mmltk_backend_models_rfdetr_export
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail
 )
 target_include_directories(mmltk_backend_models_rfdetr_export
     SYSTEM PRIVATE
@@ -154,7 +146,7 @@ function(mmltk_add_backend_models_rfdetr_export_tests)
     target_include_directories(
         mmltk_backend_models_rfdetr_export_tests PRIVATE
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
-        ${CMAKE_SOURCE_DIR}/src/backend/ml/torch/detail)
+)
     target_link_libraries(mmltk_backend_models_rfdetr_export_tests PRIVATE
         mmltk_test_support
         mmltk::backend::models::rfdetr::export

@@ -2,7 +2,7 @@
 #include <ATen/autocast_mode.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <torch/torch.h>
+#include <torch/types.h>
 #include "src/backend/ml/cuda/torch_autocast_scope.h"
 namespace mmltk::backend::models::rfdetr {
 [[nodiscard]] inline at::ScalarType resolve_cuda_autocast_dtype() {

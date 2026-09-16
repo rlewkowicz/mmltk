@@ -1,5 +1,6 @@
-module;
+#pragma once
 #include <memory>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include "src/common/concurrency/event_cancellation.h"
@@ -8,8 +9,8 @@ module;
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/common/system/numa_memory.h"
 #include "src/backend/models/rfdetr/core/detail/runtime_workspace_fwd.h"
-export module mmltk.backend.models.rfdetr.core.runtime;
-export namespace mmltk::backend::models::rfdetr {
+
+namespace mmltk::backend::models::rfdetr {
 struct RuntimeConfig {
     bool h2d_dataloader = true;
     int workers = 0;

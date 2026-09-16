@@ -2,7 +2,7 @@ include(MmltkComponent)
 
 add_library(mmltk_backend_ml_layers STATIC)
 add_library(mmltk::backend::ml::layers ALIAS mmltk_backend_ml_layers)
-mmltk_configure_component(mmltk_backend_ml_layers PRIVATE_DECLARATIONS)
+mmltk_configure_component(mmltk_backend_ml_layers PUBLIC_DECLARATIONS)
 mmltk_register_retained_module_importers(
     mmltk_backend_ml_layers ms_deform_attn_op.cpp)
 mmltk_register_ordinary_sources(mmltk_backend_ml_layers
@@ -14,7 +14,6 @@ mmltk_register_private_headers(mmltk_backend_ml_layers
     detail/ms_deform_attn_cuda.h
     detail/ms_deform_attn_cuda_launch.h
     detail/ms_deform_im2col_cuda.cuh
-    detail/ms_deform_attn.h
 )
 target_include_directories(mmltk_backend_ml_layers PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -24,7 +23,7 @@ target_link_libraries(mmltk_backend_ml_layers
         mmltk::common::logging
         CUDA::cudart
 )
-mmltk_enable_torch(mmltk_backend_ml_layers PRIVATE)
+mmltk_enable_torch(mmltk_backend_ml_layers PUBLIC)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set_source_files_properties(ms_deform_attn_autograd.cpp PROPERTIES
         COMPILE_OPTIONS
@@ -60,3 +59,5 @@ function(mmltk_add_backend_ml_layers_tests)
         ADD_TAGS_AS_LABELS
     )
 endfunction()
+
+mmltk_register_public_headers(mmltk_backend_ml_layers BASE_DIRS ${CMAKE_SOURCE_DIR} FILES ms_deform_attn.h)

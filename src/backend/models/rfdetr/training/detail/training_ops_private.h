@@ -1,6 +1,9 @@
 #pragma once
+#include <numeric>
+#include "src/backend/models/rfdetr/core/model.h"
+#include "training_scalar_packet.h"
 #include <cuda_runtime_api.h>
-#include <torch/torch.h>
+#include <torch/types.h>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +18,7 @@
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #endif
-#include "detection_types.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 namespace mmltk::backend::models::rfdetr {
 struct DistributedContext {
@@ -166,4 +169,76 @@ template <typename OptimizerLike>
 inline void set_optimizer_lrs(OptimizerLike& optimizer, const std::vector<double>& base_lrs, const double scale) {
     optimizer.set_lrs(base_lrs, scale);
 }
+enum class TrainingSupervisionRoute : std::uint8_t {
+    Hungarian,
+    MatchFree,
+    HungarianDenoising,
+    MatchFreeDenoising,
+};
+[[nodiscard]] inline TrainingSupervisionRoute supervision_route(const TrainingSupervisionConfig& config) noexcept {
+    const bool match_free = config.assignment == TrainAssignmentKind::MatchFree;
+    const bool denoising = config.denoising.enabled;
+    if (match_free && denoising) return TrainingSupervisionRoute::MatchFreeDenoising;
+    if (match_free) return TrainingSupervisionRoute::MatchFree;
+    if (denoising) return TrainingSupervisionRoute::HungarianDenoising;
+    return TrainingSupervisionRoute::Hungarian;
+}
+[[nodiscard]] inline bool route_is_active(const TrainingSupervisionRoute route) noexcept { return route != TrainingSupervisionRoute::Hungarian; }
+[[nodiscard]] inline bool route_uses_match_free(const TrainingSupervisionRoute route) noexcept {
+    return route == TrainingSupervisionRoute::MatchFree || route == TrainingSupervisionRoute::MatchFreeDenoising;
+}
+[[nodiscard]] inline bool route_uses_denoising(const TrainingSupervisionRoute route) noexcept {
+    return route == TrainingSupervisionRoute::HungarianDenoising || route == TrainingSupervisionRoute::MatchFreeDenoising;
+}
+class SupervisionTimingLease final {
+   public:
+    enum class Kind : std::uint8_t { Step, Criterion };
+    SupervisionTimingLease(NativeRfDetrModel& owner, const bool active, const Kind kind) : owner_(active ? &owner : nullptr), kind_(kind) {
+        if (owner_ != nullptr) { begin(); }
+    }
+    ~SupervisionTimingLease() noexcept {
+        if (owner_ != nullptr) {
+            try {
+                end();
+            } catch (...) {}
+        }
+    }
+    SupervisionTimingLease(const SupervisionTimingLease&) = delete;
+    SupervisionTimingLease& operator=(const SupervisionTimingLease&) = delete;
+    void finish() {
+        if (owner_ != nullptr) {
+            end();
+            owner_ = nullptr;
+        }
+    }
+
+   private:
+    void begin() {
+        if (kind_ == Kind::Step) {
+            owner_->begin_supervised_step_timing();
+        } else {
+            owner_->begin_criterion_timing();
+        }
+    }
+    void end() {
+        if (kind_ == Kind::Step) {
+            owner_->end_supervised_step_timing();
+        } else {
+            owner_->end_criterion_timing();
+        }
+    }
+    NativeRfDetrModel* owner_;
+    Kind kind_;
+};
+inline int64_t prepared_target_count(const PreparedTargets& targets) { return std::accumulate(targets.counts.begin(), targets.counts.end(), int64_t{0}); }
+struct RoutedTrainingLoss {
+    torch::Tensor total;
+    torch::Tensor classification;
+    torch::Tensor box;
+    TensorMap ordinary_terms;
+    scalar_packet::Tensors scalars;
+};
+torch::Tensor loss_value_or_zero(const TensorMap&, const torch::Device&, std::string_view);
+scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap&, const torch::Tensor&, const torch::Tensor&);
+RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel&, TrainingSupervisionRoute, const ModelOutputs&, const PreparedTargets&, const DeviceLossNormalizer&, const DetectionConfig&);
 }  // namespace mmltk::backend::models::rfdetr

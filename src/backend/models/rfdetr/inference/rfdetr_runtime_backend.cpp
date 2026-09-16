@@ -1,4 +1,5 @@
 module;
+
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "prediction_capacity.h"
@@ -21,41 +22,41 @@ module;
 #include <tuple>
 #include <utility>
 #include <vector>
-#include "detection_types.h"
-#include "draw.h"
-#include "postprocess.h"
+#include "src/backend/models/rfdetr/core/detection_types.h"
+#include "src/backend/models/rfdetr/core/sample_output.h"
+#include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
 #include "src/backend/models/rfdetr/contract/artifacts.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
-#include "torch_api.h"
+#include <torch/types.h>
+#include <torch/serialize.h>
 // CLEANUP-IGNORE: This runtime-backend unit imports the concrete artifact and tensor owners used by its boundary.
+#include "src/backend/models/rfdetr/core/model_state.h"
 module mmltk.backend.models.rfdetr.inference.runtime_backend;
 // CLEANUP-IGNORE: Runtime-backend and validation units import distinct concrete owners at their separate implementation
 // boundaries.
 import mmltk.backend.ml.cuda.torch_scope;
 // CLEANUP-IGNORE: The runtime backend's artifact resolver starts a distinct import suffix from validation
 // orchestration.
-import mmltk.backend.models.rfdetr.core.artifact_resolution;
 import mmltk.backend.models.rfdetr.model_export;
 namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
-namespace tensor_api = mmltk::backend::ml::torch_api;
 namespace {
 [[nodiscard]] std::string normalized_backend_name(std::string name) {
     std::ranges::transform(name, name.begin(), [](const unsigned char value) { return static_cast<char>(std::tolower(value)); });
     return name;
 }
 [[noreturn]] void throw_invalid_artifact_kind() { throw std::invalid_argument("RF-DETR inference artifact discriminator is invalid"); }
-[[nodiscard]] tensor_api::ScalarType torch_type(runtime::RuntimeElementType type) {
+[[nodiscard]] at::ScalarType torch_type(runtime::RuntimeElementType type) {
     switch (type) {
-        case runtime::RuntimeElementType::Float16: return tensor_api::kHalf;
-        case runtime::RuntimeElementType::Float32: return tensor_api::kFloat;
-        case runtime::RuntimeElementType::Int32: return tensor_api::kInt;
-        case runtime::RuntimeElementType::Int64: return tensor_api::kLong;
-        case runtime::RuntimeElementType::Bool: return tensor_api::kBool;
+        case runtime::RuntimeElementType::Float16: return at::kHalf;
+        case runtime::RuntimeElementType::Float32: return at::kFloat;
+        case runtime::RuntimeElementType::Int32: return at::kInt;
+        case runtime::RuntimeElementType::Int64: return at::kLong;
+        case runtime::RuntimeElementType::Bool: return torch::kBool;
     }
     throw std::invalid_argument("unsupported RF-DETR runtime element type");
 }
@@ -232,7 +233,7 @@ ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& r
     return result;
 }
 struct OutputStorage final {
-    std::vector<tensor_api::Tensor> tensors;
+    std::vector<torch::Tensor> tensors;
     std::vector<runtime::RuntimeTensorBuffer> buffers;
 };
 struct RfdetrRuntimeBackend::State final {
@@ -269,7 +270,7 @@ RfdetrRuntimeBackend::RfdetrRuntimeBackend(std::shared_ptr<runtime::RuntimeBacke
     } preparation{state_->classes.get(), lane_->device()};
     mmltk::backend::ml::cuda::run_on_torch_cuda_stream(lane_->device(), lane_->command_stream().native_handle, &preparation, [](void* opaque) {
         auto& call = *static_cast<Preparation*>(opaque);
-        call.classes->Prepare(tensor_api::Device(tensor_api::kCUDA, static_cast<tensor_api::DeviceIndex>(call.device)));
+        call.classes->Prepare(torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(call.device)));
     });
     const auto& model = lane_->model_info();
     auto projected = project_runtime_model(model, backend_name_);
@@ -358,16 +359,16 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                     buffers.size() != owner.model_info().output_count) {
                     throw std::runtime_error("RF-DETR output binding received the wrong lane");
                 }
-                const auto options = tensor_api::TensorOptions().device(tensor_api::kCUDA, device);
+                const auto options = torch::TensorOptions().device(torch::kCUDA, device);
                 for (std::size_t index = 0U; index < buffers.size(); ++index) {
                     runtime::RuntimeShape shape = owner.model_info().outputs[index].shape;
                     shape.extents[0] = call.batch;
                     const auto type = owner.model_info().outputs[index].element_type;
                     const auto count = checked_element_count(shape, element_bytes(type));
-                    const tensor_api::IntArrayRef extents(shape.extents.data(), shape.rank);
+                    const at::IntArrayRef extents(shape.extents.data(), shape.rank);
                     auto& tensor = call.outputs->tensors[index];
                     if (!tensor.defined()) {
-                        tensor = tensor_api::empty(extents, options.dtype(torch_type(type)));
+                        tensor = torch::empty(extents, options.dtype(torch_type(type)));
                     } else {
                         tensor.resize_(extents);
                     }
@@ -437,22 +438,22 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                         } else if (selected.mask_logits)
                             processed.masks = materialize_selected_masks(*selected.mask_logits, selected.query_indices, region.height, region.width);
                         auto scores = processed.scores[0];
-                        auto labels = processed.labels[0].to(tensor_api::kInt);
-                        auto xyxy = processed.boxes[0].to(tensor_api::kFloat);
+                        auto labels = processed.labels[0].to(at::kInt);
+                        auto xyxy = processed.boxes[0].to(at::kFloat);
                         const auto count = static_cast<std::size_t>(scores.size(0));
                         if (count == 0U) continue;
-                        const auto cuda_options = tensor_api::TensorOptions().device(tensor_api::kCUDA, bound_device);
+                        const auto cuda_options = torch::TensorOptions().device(torch::kCUDA, bound_device);
                         const std::array<std::int64_t, 2> boxes_shape{static_cast<std::int64_t>(count), 4};
                         const std::array<std::int64_t, 1> values_shape{static_cast<std::int64_t>(count)};
-                        tensor_api::from_blob(reinterpret_cast<void*>(annotation.boxes_xyxy.address), tensor_api::IntArrayRef{boxes_shape},
-                                              cuda_options.dtype(tensor_api::kFloat))
+                        torch::from_blob(reinterpret_cast<void*>(annotation.boxes_xyxy.address), at::IntArrayRef{boxes_shape},
+                                              cuda_options.dtype(at::kFloat))
                             .copy_(xyxy);
-                        tensor_api::from_blob(reinterpret_cast<void*>(annotation.class_references.address), tensor_api::IntArrayRef{values_shape},
-                                              cuda_options.dtype(tensor_api::kInt))
+                        torch::from_blob(reinterpret_cast<void*>(annotation.class_references.address), at::IntArrayRef{values_shape},
+                                              cuda_options.dtype(at::kInt))
                             .copy_(labels);
-                        tensor_api::from_blob(reinterpret_cast<void*>(annotation.confidences.address), tensor_api::IntArrayRef{values_shape},
-                                              cuda_options.dtype(tensor_api::kFloat))
-                            .copy_(scores.to(tensor_api::kFloat));
+                        torch::from_blob(reinterpret_cast<void*>(annotation.confidences.address), at::IntArrayRef{values_shape},
+                                              cuda_options.dtype(at::kFloat))
+                            .copy_(scores.to(at::kFloat));
                         if (processed.masks && annotation.masks.address != 0U) {
                             const auto bytes = count * region.width * region.height;
                             validate_annotation_buffer(annotation.masks, runtime::AnalysisElementType::Uint8, bytes, 3U,
@@ -460,8 +461,8 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                             if (annotation.masks.shape.extents[1] != region.height || annotation.masks.shape.extents[2] != region.width)
                                 throw std::invalid_argument("RF-DETR mask storage has wrong geometry");
                             const std::array<std::int64_t, 3> mask_shape{static_cast<std::int64_t>(count), region.height, region.width};
-                            tensor_api::from_blob(reinterpret_cast<void*>(annotation.masks.address), tensor_api::IntArrayRef{mask_shape},
-                                                  cuda_options.dtype(tensor_api::kUInt8))
+                            torch::from_blob(reinterpret_cast<void*>(annotation.masks.address), at::IntArrayRef{mask_shape},
+                                                  cuda_options.dtype(torch::kUInt8))
                                 .copy_((*processed.masks)[0]);
                             annotation.masks_available = true;
                         }

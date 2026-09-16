@@ -1,17 +1,17 @@
+
 #include <array>
 #include <limits>
 #include <string>
 #include <vector>
 #include <utility>
 #include <catch2/catch_test_macros.hpp>
-#include "archive_utils.h"
+#include "src/backend/ml/torch/archive.h"
 #include "detail/checkpoint_private.h"
 #include "detail/model_ema.h"
 #include "detail/training_continuation.h"
 #include "training_continuation_fixture.h"
 namespace {
 namespace r = mmltk::backend::models::rfdetr;
-namespace api = mmltk::backend::ml::torch_api;
 r::TrainRequest saved_request() {
     r::TrainRequest request;
     request.train_compiled_path = "train.bin";
@@ -21,8 +21,8 @@ r::TrainRequest saved_request() {
     request.gpu_augmentation.perceptual_downscale = true;
     return request;
 }
-api::InputArchive continuation_fixture(const r::TrainRequest& request) {
-    api::OutputArchive output;
+torch::serialize::InputArchive continuation_fixture(const r::TrainRequest& request) {
+    torch::serialize::OutputArchive output;
     r::detail::write_training_continuation(output, request,
                                            {.epoch = 0,
                                             .best_regular_metric = -std::numeric_limits<double>::infinity(),
@@ -32,11 +32,11 @@ api::InputArchive continuation_fixture(const r::TrainRequest& request) {
                                             .ema_completed_updates = request.use_ema ? 37 : 0,
                                             .training_attempt_id = "attempt",
                                             .training_original_descriptor = "original.json"});
-    api::OutputArchive optimizer;
+    torch::serialize::OutputArchive optimizer;
     r::write_int(optimizer, "fixture", 1);
     output.write("optimizer", optimizer);
     if (request.use_ema) {
-        api::OutputArchive ema;
+        torch::serialize::OutputArchive ema;
         r::write_int(ema, "entry_count", 0);
         output.write("ema_state", ema);
     }
@@ -51,34 +51,34 @@ void test_current_continuation_required_fields() {
     // Every written continuation fact is mandatory except the default supervision
     // blob, whose current format deliberately omits the default value.
     for (const auto& key : source.keys()) {
-        api::OutputArchive incomplete;
+        torch::serialize::OutputArchive incomplete;
         r::testsupport::copy_checkpoint_archive(source, incomplete, key);
         auto input = r::testsupport::checkpoint_input(incomplete);
         INFO(key);
         REQUIRE_THROWS(r::detail::read_training_continuation(input));
     }
     for (const auto& key : source.keys()) {
-        api::OutputArchive malformed;
+        torch::serialize::OutputArchive malformed;
         r::testsupport::copy_checkpoint_archive(source, malformed, key);
-        malformed.write(key, api::IValue(c10::List<int64_t>{}));
+        malformed.write(key, c10::IValue(c10::List<int64_t>{}));
         auto input = r::testsupport::checkpoint_input(malformed);
         INFO(key);
         REQUIRE_THROWS(r::detail::read_training_continuation(input));
     }
     for (const auto* key : {"ema_state", "training_supervision_config_cbor"}) {
-        api::OutputArchive malformed;
+        torch::serialize::OutputArchive malformed;
         r::testsupport::copy_checkpoint_archive(source, malformed);
-        malformed.write(key, api::IValue(int64_t{1}));
+        malformed.write(key, c10::IValue(int64_t{1}));
         auto input = r::testsupport::checkpoint_input(malformed);
         REQUIRE_THROWS(r::detail::read_training_continuation(input));
     }
-    api::OutputArchive weights;
+    torch::serialize::OutputArchive weights;
     r::write_string(weights, "source_kind", "weights-only");
     auto input = r::testsupport::checkpoint_input(weights);
     REQUIRE_FALSE(r::detail::read_training_continuation(input).has_value());
 }
 void test_current_continuation_scalar_boundaries() {
-    const std::array<std::pair<std::string, api::IValue>, 22> invalid{
+    const std::array<std::pair<std::string, c10::IValue>, 22> invalid{
         {{"epoch", int64_t{-1}},
          {"epoch", int64_t{std::numeric_limits<int>::max()}},
          {"grad_scaler_scale", 0.0},
@@ -103,7 +103,7 @@ void test_current_continuation_scalar_boundaries() {
          {"gpu_augment_geometry_probability", 0.125}}};
     for (const auto& [key, value] : invalid) {
         auto source = continuation_fixture(saved_request());
-        api::OutputArchive output;
+        torch::serialize::OutputArchive output;
         r::testsupport::copy_checkpoint_archive(source, output, key);
         output.write(key, value);
         auto input = r::testsupport::checkpoint_input(output);
@@ -112,9 +112,9 @@ void test_current_continuation_scalar_boundaries() {
     }
     for (const auto* key : {"training_configuration_cbor", "training_supervision_config_cbor"}) {
         auto source = continuation_fixture(saved_request());
-        api::OutputArchive output;
+        torch::serialize::OutputArchive output;
         r::testsupport::copy_checkpoint_archive(source, output, key);
-        output.write(key, api::zeros({1024 * 1024}, api::kUInt8));
+        output.write(key, torch::zeros({1024 * 1024}, torch::kUInt8));
         auto input = r::testsupport::checkpoint_input(output);
         REQUIRE_THROWS(r::detail::read_training_continuation(input));
     }
@@ -122,7 +122,7 @@ void test_current_continuation_scalar_boundaries() {
     supervised.training_supervision.denoising.enabled = true;
     auto supervised_source = continuation_fixture(supervised);
     REQUIRE(r::detail::read_training_continuation(supervised_source).has_value());
-    api::OutputArchive missing_supervision;
+    torch::serialize::OutputArchive missing_supervision;
     r::testsupport::copy_checkpoint_archive(supervised_source, missing_supervision, "training_supervision_config_cbor");
     auto missing_input = r::testsupport::checkpoint_input(missing_supervision);
     REQUIRE_THROWS(r::detail::read_training_continuation(missing_input));
@@ -156,33 +156,33 @@ void test_current_continuation_scalar_boundaries() {
 }
 void test_ordered_cpu_ema_admission() {
     const std::vector<std::string> names{"first", "second"};
-    const std::vector<api::Tensor> parameters{api::ones({2, 3}), api::zeros({4})};
+    const std::vector<torch::Tensor> parameters{torch::ones({2, 3}), torch::zeros({4})};
     const auto pointer = parameters.front().data_ptr();
     REQUIRE_NOTHROW(r::ModelEma::validate_cpu_shadow(parameters, parameters));
     for (int fault = 0; fault != 6; ++fault) {
         auto shadow = parameters;
         switch (fault) {
             case 0: shadow.pop_back(); break;
-            case 1: shadow[0] = api::Tensor{}; break;
-            case 2: shadow[0] = api::zeros({3, 2}); break;
+            case 1: shadow[0] = torch::Tensor{}; break;
+            case 2: shadow[0] = torch::zeros({3, 2}); break;
             case 3: shadow[0] = shadow[0].to(torch::kFloat64); break;
-            case 4: shadow[0] = api::full({2, 3}, std::numeric_limits<float>::infinity()); break;
+            case 4: shadow[0] = torch::full({2, 3}, std::numeric_limits<float>::infinity()); break;
             case 5: shadow[0] = shadow[0].to_sparse(); break;
         }
         REQUIRE_THROWS(r::ModelEma::from_cpu_shadow(parameters, shadow, 0.9, 100, 37));
         REQUIRE(parameters.front().data_ptr() == pointer);
-        REQUIRE(api::equal(parameters.front(), api::ones({2, 3})));
+        REQUIRE(torch::equal(parameters.front(), torch::ones({2, 3})));
     }
     for (const auto count : {int64_t{-1}, std::numeric_limits<int64_t>::max()}) {
         REQUIRE_THROWS(r::ModelEma::from_cpu_shadow(parameters, parameters, 0.9, 100, count));
         REQUIRE(parameters.front().data_ptr() == pointer);
-        REQUIRE(api::equal(parameters.front(), api::ones({2, 3})));
+        REQUIRE(torch::equal(parameters.front(), torch::ones({2, 3})));
     }
     for (int fault = 0; fault != 5; ++fault) {
-        api::OutputArchive output;
+        torch::serialize::OutputArchive output;
         r::write_int(output, "entry_count", fault == 1 ? 1 : 2);
         for (std::size_t i = 0; i != names.size(); ++i) {
-            api::OutputArchive entry;
+            torch::serialize::OutputArchive entry;
             r::write_string(entry, "name", names[fault == 2 ? 1 - i : fault == 4 ? 0 : i]);
             if (fault != 3) entry.write("tensor", parameters[i]);
             output.write(r::archive_entry_name(i), entry);
