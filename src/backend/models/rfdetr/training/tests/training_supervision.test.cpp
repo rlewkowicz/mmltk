@@ -16,6 +16,8 @@
 #include <semaphore>
 #include <span>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <system_error>
 #include <vector>
 
@@ -29,6 +31,9 @@
 #include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "detail/native_optimizer_private.h"
 #include "detail/training_ops_private.h"
+#include "detail/model_ema.h"
+#include "detail/training_continuation.h"
+#include "training_continuation_fixture.h"
 #include "detail/target_builder_private.h"
 #include "model_access.h"
 #include "model_state_fixture.h"
@@ -1397,6 +1402,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             request.amp = false;
             request.progress_bar = false;
             request.validation_loss = true;
+            request.optimizer = route_index == 0 && lanes == 1 ? rfdetr::TrainOptimizerKind::Muon : rfdetr::TrainOptimizerKind::AdamW;
             request.use_ema = route_index == routes.size() - 1 && lanes == 2;
             if (route_index == routes.size() - 1 && lanes == 2) {
                 request.gpu_augmentation.enabled = true;
@@ -1416,6 +1422,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             REQUIRE(std::isfinite(result.history.front().train_loss));
             REQUIRE(result.history.front().val_loss.has_value());
             REQUIRE(result.best_checkpoint_path.has_value());
+            REQUIRE_FALSE(rfdetr::inspect_training_checkpoint(*result.best_checkpoint_path).resumable);
 
             auto deployment_config = result.artifacts.config;
             deployment_config.training_supervision = {};
@@ -1427,11 +1434,63 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             for (const auto& entry : rfdetr::detail::model_state_owner(deployment_state).entries) {
                 REQUIRE_FALSE(entry.name.starts_with("training_supervision."));
             }
-            if (request.use_ema) {
+            if ((route_index == 0 && lanes == 1) || request.use_ema) {
+                // These use a genuinely saved checkpoint, not a scalar-only
+                // fixture. Neither entry point may publish a resumed epoch.
+                const auto reject_checkpoint = [&](torch_api::OutputArchive& malformed_archive, std::string_view fault) {
+                    const auto malformed = request.output_dir / (std::string("malformed-") + std::string(fault) + ".pt");
+                    rfdetr::detail::publish_native_checkpoint_archive(malformed_archive, malformed);
+                    REQUIRE_THROWS(rfdetr::inspect_training_checkpoint(malformed));
+                    auto rejected = request;
+                    rejected.weights_path.clear();
+                    rejected.resume_path = malformed;
+                    rejected.output_dir = request.output_dir / (std::string("rejected-") + std::string(fault));
+                    rejected.epochs = 2;
+                    REQUIRE_THROWS(rfdetr::run_training(rejected));
+                    REQUIRE_FALSE(std::filesystem::exists(rejected.output_dir / "checkpoint.pt"));
+                    REQUIRE_FALSE(std::filesystem::exists(rejected.output_dir / "checkpoint_epoch_2.pt"));
+                };
+                for (const auto* missing : {"epoch", "lr_drop", "training_original_descriptor", "grad_scaler_scale", "optimizer"}) {
+                    torch_api::InputArchive source;
+                    source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
+                    torch_api::OutputArchive incomplete;
+                    rfdetr::testsupport::copy_checkpoint_archive(source, incomplete, missing);
+                    reject_checkpoint(incomplete, missing);
+                }
+                const std::array<std::pair<const char*, torch_api::IValue>, 4> invalid{{
+                    {"epoch", std::string("wrong-type")},
+                    {"grad_scaler_scale", 0.0},
+                    {"lr_drop", int64_t{inspection.configuration->lr_drop + 1}},
+                    {"training_original_descriptor", std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1, 'x')}
+                }};
+                for (const auto& [key, value] : invalid) {
+                    torch_api::InputArchive source;
+                    source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
+                    torch_api::OutputArchive inconsistent;
+                    rfdetr::testsupport::copy_checkpoint_archive(source, inconsistent, key);
+                    inconsistent.write(key, value);
+                    reject_checkpoint(inconsistent, std::string("invalid-") + key);
+                }
+                if (request.use_ema) {
+                    torch_api::InputArchive source;
+                    source.load_from(result.checkpoint_path.string(), torch_api::Device(torch_api::kCPU));
+                    torch_api::OutputArchive malformed;
+                    rfdetr::testsupport::copy_checkpoint_archive(source, malformed, "ema_state");
+                    torch_api::InputArchive shadow, first;
+                    source.read("ema_state", shadow);
+                    shadow.read("entry_000000", first);
+                    torch_api::OutputArchive wrong_shadow, wrong_first;
+                    rfdetr::testsupport::copy_checkpoint_archive(shadow, wrong_shadow, "entry_000000");
+                    rfdetr::testsupport::copy_checkpoint_archive(first, wrong_first, "name");
+                    rfdetr::write_string(wrong_first, "name", "wrong-ordered-parameter");
+                    wrong_shadow.write("entry_000000", wrong_first);
+                    malformed.write("ema_state", wrong_shadow);
+                    reject_checkpoint(malformed, "ordered-ema");
+                }
                 auto resume_request = request;
                 resume_request.weights_path.clear();
                 resume_request.resume_path = result.checkpoint_path;
-                resume_request.output_dir = root / "active-resume";
+                resume_request.output_dir = root / (request.use_ema ? "active-ema-resume" : "active-ordinary-resume");
                 resume_request.epochs = 2;
                 const auto resumed = rfdetr::run_training(resume_request);
                 REQUIRE(resumed.history.size() == 1);

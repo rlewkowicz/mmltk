@@ -10,7 +10,6 @@
 #include <future>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -24,15 +23,6 @@
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 
 namespace mmltk::backend::models::rfdetr {
-
-struct ResumeContinuationManifest {
-    bool ema_requested = false;
-    bool ema_present = false;
-    std::optional<double> scaler_scale;
-    std::optional<int64_t> scaler_growth_tracker;
-};
-
-void validate_resume_continuation_manifest(const ResumeContinuationManifest& manifest);
 
 struct DistributedContext {
     bool enabled = false;
@@ -194,52 +184,6 @@ class GradScaler {
     torch::Tensor found_inf_device_;
     torch::Tensor inverse_scale_device_;
     std::vector<torch::Tensor> gradient_scratch_;
-};
-
-class ModelEma {
-   public:
-    struct ShadowCandidate {
-        std::vector<torch::Tensor> tensors;
-    };
-
-    ModelEma(const std::vector<torch::Tensor>& model_params, double decay, double tau);
-    ModelEma(ModelEma&&) noexcept = default;
-    ModelEma& operator=(ModelEma&&) noexcept = default;
-
-    void update(int64_t step);
-
-    [[nodiscard]] static ModelEma from_cpu_shadow(const std::vector<torch::Tensor>& model_params,
-                                                 const std::vector<torch::Tensor>& cpu_shadow, double decay, double tau);
-
-    class Selection final {
-       public:
-        Selection(ModelEma&, torch::nn::Module&);
-        ~Selection() noexcept;
-        Selection(const Selection&) = delete;
-        Selection& operator=(const Selection&) = delete;
-        void restore();
-       private:
-        ModelEma* owner_;
-        torch::nn::Module* module_;
-        bool training_;
-    };
-
-    [[nodiscard]] const std::vector<torch::Tensor>& shadow_params() const noexcept;
-
-    [[nodiscard]] ShadowCandidate stage_shadow_params(const std::vector<torch::Tensor>& shadow_params) const;
-    void commit_shadow_params(ShadowCandidate candidate) noexcept;
-    void load_shadow_params(const std::vector<torch::Tensor>& shadow_params);
-
-    void copy_to(std::vector<torch::Tensor>& model_params) const;
-
-   private:
-    ModelEma(const std::vector<torch::Tensor>&, ShadowCandidate, double, double);
-    double decay_;
-    double tau_;
-    std::vector<torch::Tensor> source_;
-    std::vector<torch::Tensor> shadow_;
-    std::vector<torch::Tensor> backup_;
-    bool selected_ = false;
 };
 
 struct LrScheduleConfig {

@@ -27,7 +27,6 @@ mmltk_register_public_headers(
         checkpoint.h
         train_recipe.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_training detail/evaluation_runtime.h)
-mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training)
 foreach(_mmltk_training_partition IN ITEMS
         checkpoint.cppm)
     mmltk_register_retained_module_providers(
@@ -50,6 +49,8 @@ mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
     distributed_train_launcher.cpp
     training_ops.cpp
+    training_continuation.cpp
+    model_ema.cpp
     telemetry_writer.cpp)
 mmltk_register_private_headers(
     mmltk_backend_models_rfdetr_training
@@ -58,7 +59,10 @@ mmltk_register_private_headers(
     detail/native_optimizer_private.h
     detail/training_scalar_packet.h
     detail/training_ops_private.h
+    detail/training_continuation.h
+    detail/model_ema.h
     detail/checkpoint_private.h)
+mmltk_register_header_isolation(mmltk_backend_models_rfdetr_training)
 target_include_directories(mmltk_backend_models_rfdetr_training PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/src/backend/ml/cuda/detail
@@ -104,13 +108,15 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     mmltk_register_private_headers(
         mmltk_backend_models_rfdetr_training_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_state_fixture.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation_fixture.h
         ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_training_tests ${sources})
     mmltk_register_ordinary_sources(
         mmltk_backend_models_rfdetr_training_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation.test.cpp)
     target_include_directories(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         ${CMAKE_SOURCE_DIR}

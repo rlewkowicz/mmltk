@@ -11,6 +11,8 @@
 #include <fstream>
 #include <iterator>
 #include <span>
+#include <meta>
+#include <type_traits>
 
 #include "catch2_compat.hpp"
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
@@ -45,6 +47,31 @@ auto& state_entries(mmltk::backend::models::rfdetr::DecodedNativeModelState& sta
 
 const auto& state_entries(const mmltk::backend::models::rfdetr::DecodedNativeModelState& state) {
     return mmltk::backend::models::rfdetr::detail::model_state_owner(state).entries;
+}
+
+void populate_detection_metadata(mmltk::backend::models::rfdetr::NativeCheckpointMetadata& metadata) {
+    std::size_t index = 0;
+    metadata.for_each_detection_field([&]<class Optional>(const char*, Optional& field) {
+        using Value = typename Optional::value_type;
+        if constexpr (std::is_same_v<Value, bool>) field = (index % 2) != 0;
+        else if constexpr (std::is_integral_v<Value>) field = 4;
+        else field = 0.25;
+        ++index;
+    });
+    REQUIRE(index == 15);
+}
+
+void require_detection_metadata_equal(const mmltk::backend::models::rfdetr::NativeCheckpointMetadata& expected,
+                                      const mmltk::backend::models::rfdetr::NativeCheckpointMetadata& actual) {
+    using Metadata = mmltk::backend::models::rfdetr::NativeCheckpointMetadata;
+    template for (constexpr auto member : std::define_static_array(
+                      std::meta::nonstatic_data_members_of(^^Metadata, std::meta::access_context::current()))) {
+        using Field = std::remove_cvref_t<decltype(expected.[:member:])>;
+        if constexpr (mmltk::backend::models::rfdetr::model_state_detail::is_optional<Field>) {
+            INFO(std::define_static_string(std::meta::identifier_of(member)));
+            REQUIRE(expected.[:member:] == actual.[:member:]);
+        }
+    }
 }
 
 fs::path fixture_root() { return fs::temp_directory_path() / "mmltk_rfdetr_checkpoint_fixture"; }
@@ -174,6 +201,7 @@ void test_native_golden_fixture_roundtrip(const ParityFixtureCase& fixture) {
     MMLTK_ASSERT(mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path));
 
     const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(output_path);
+    require_detection_metadata_equal(expected.metadata, loaded.metadata);
     assert_matches_native_parity_fixture(loaded, fixture);
 }
 
@@ -189,6 +217,7 @@ void test_native_checkpoint_tensor_preparation() {
     checkpoint.metadata.class_layout = mmltk::backend::models::rfdetr::unresolved_class_layout(1);
     checkpoint.metadata.num_queries = 1;
     checkpoint.metadata.num_select = 1;
+    populate_detection_metadata(checkpoint.metadata);
 
     const auto cpu_contiguous = tensor_api::arange(12, tensor_api::TensorOptions().dtype(tensor_api::kFloat32)).view({3, 4}).clone();
     const auto cpu_non_contiguous = cpu_contiguous.transpose(0, 1);
@@ -204,6 +233,7 @@ void test_native_checkpoint_tensor_preparation() {
 
     mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
     const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(output_path);
+    require_detection_metadata_equal(checkpoint.metadata, loaded.metadata);
 
     const auto* loaded_contiguous = find_entry(loaded, "cpu_contiguous");
     MMLTK_ASSERT(loaded_contiguous != nullptr);
@@ -225,11 +255,15 @@ void test_native_checkpoint_tensor_preparation() {
         MMLTK_ASSERT(loaded_cuda->tensor.is_contiguous());
         MMLTK_ASSERT(tensor_api::equal(loaded_cuda->tensor, expected));
     }
+    checkpoint.metadata.for_each_detection_field([](const char*, auto& field) { field.reset(); });
+    mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
+    require_detection_metadata_equal(checkpoint.metadata, mmltk::backend::models::rfdetr::decode_model_state(output_path).metadata);
 }
 
 void test_upstream_checkpoint_scalar_type_bridge() {
     const fs::path upstream_path = fixture_root() / "upstream" / "rf-detr-nano-dtype-bridge.pth";
     mmltk::backend::models::rfdetr::DecodedNativeModelState state;
+    populate_detection_metadata(state.metadata);
     auto& entries = state_entries(state);
     entries = {
         {"query_feat.weight", tensor_api::ones({4, kParityFixtureHiddenDim}, tensor_api::TensorOptions().dtype(tensor_api::kFloat16))},
@@ -241,6 +275,7 @@ void test_upstream_checkpoint_scalar_type_bridge() {
     mmltk::backend::models::rfdetr::write_upstream_model_state(upstream_path, state);
 
     const auto checkpoint = mmltk::backend::models::rfdetr::decode_model_state(upstream_path);
+    require_detection_metadata_equal(state.metadata, checkpoint.metadata);
     const auto* query_feat = find_entry(checkpoint, "query_feat.weight");
     const auto* class_bias = find_entry(checkpoint, "class_embed.bias");
     MMLTK_ASSERT(query_feat != nullptr);

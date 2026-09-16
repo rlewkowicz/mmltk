@@ -42,6 +42,8 @@
 #include "torch_api.h"
 #include "torch_cuda_utils.h"
 #include "detail/checkpoint_private.h"
+#include "detail/training_continuation.h"
+#include "detail/model_ema.h"
 #if defined(USE_C10D_NCCL)
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
@@ -1009,34 +1011,6 @@ void save_collected_checkpoint(const std::filesystem::path& path, const NativeCh
     save_native_checkpoint(path, checkpoint, explicit_descriptor);
 }
 
-std::vector<NormalizedModelStateEntry> read_state_archive(torch_api::InputArchive& archive, const char* key,
-                                                          const std::span<const std::string> expected_names) {
-    torch_api::InputArchive state_archive;
-    archive.read(key, state_archive);
-    const int64_t entry_count = require_int(state_archive, "entry_count");
-    if (entry_count < 0 || static_cast<std::uint64_t>(entry_count) != expected_names.size()) {
-        throw std::runtime_error("RF-DETR training checkpoint state count does not match the bounded active inventory");
-    }
-
-    std::vector<NormalizedModelStateEntry> state_dict;
-    state_dict.reserve(static_cast<size_t>(entry_count));
-    for (int64_t index = 0; index < entry_count; ++index) {
-        torch_api::InputArchive entry_archive;
-        state_archive.read(archive_entry_name(static_cast<size_t>(index)), entry_archive);
-        torch_api::IValue name_value;
-        entry_archive.read("name", name_value);
-        if (!name_value.isString()) { throw std::runtime_error("RF-DETR training checkpoint state entry name is not a string"); }
-        NormalizedModelStateEntry entry;
-        entry.name = name_value.toStringRef();
-        if (entry.name != expected_names[static_cast<std::size_t>(index)]) {
-            throw std::runtime_error("RF-DETR training checkpoint state names do not match the active inventory");
-        }
-        entry_archive.read("tensor", entry.tensor);
-        state_dict.push_back(std::move(entry));
-    }
-    return state_dict;
-}
-
 NativeCheckpointMetadata checkpoint_metadata(const ResolvedModelArtifacts& artifacts, int64_t num_classes) {
     return make_native_checkpoint_metadata(artifacts, num_classes);
 }
@@ -1054,15 +1028,12 @@ std::unordered_map<std::string, torch_api::Tensor> ema_override_map(const std::v
 }
 
 std::vector<NormalizedModelStateEntry> ema_state_entries(const std::vector<std::string>& param_names, const ModelEma& ema) {
-    const auto overrides = ema_override_map(param_names, ema);
+    const auto& shadows = ema.shadow_params();
+    if (shadows.size() != param_names.size()) throw std::runtime_error("RF-DETR EMA parameter count changed unexpectedly");
     std::vector<NormalizedModelStateEntry> state;
-    state.reserve(overrides.size());
-    for (const auto& item : param_names) {
-        NormalizedModelStateEntry entry;
-        entry.name = item;
-        entry.tensor = overrides.at(item).detach();
-        state.push_back(std::move(entry));
-    }
+    state.reserve(param_names.size());
+    for (std::size_t index = 0; index < param_names.size(); ++index)
+        state.push_back({param_names[index], shadows[index].detach()});
     return state;
 }
 
@@ -1100,10 +1071,9 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
 
     torch_api::OutputArchive archive;
     detail::write_native_checkpoint_metadata(archive, metadata);
-    detail::write_training_configuration(archive, options);
-    write_string(archive, "training_attempt_id", std::string(attempt_id));
-    write_string(archive, "training_original_descriptor", original_descriptor.string());
-    detail::write_training_supervision_config(archive, options.training_supervision);
+    detail::write_training_continuation(archive, options,
+        {epoch, best_regular, best_ema, static_cast<double>(grad_scaler.current_scale()), grad_scaler.growth_tracker(),
+         std::string(attempt_id), original_descriptor.string()});
     optimizer.reserve_checkpoint(readback, model_state.size() + ema_state.size());
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_write_state{"rfdetr.train.save.resume.write_state"};
@@ -1115,7 +1085,6 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_optimizer_state{"rfdetr.train.save.resume.optimizer_state"};
         optimizer.save(optimizer_archive, readback, model_state.size() + ema_state.size());
     }
-    write_string(archive, "optimizer_kind", optimizer.kind_name());
     archive.write("optimizer", optimizer_archive);
 
     if (options.use_ema) {
@@ -1126,32 +1095,6 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
         }
     }
 
-    write_int(archive, "epoch", epoch);
-    write_string(archive, "lr_scheduler", cli_enum_spelling(options.lr_scheduler));
-    write_int(archive, "lr_drop", options.lr_drop);
-    write_double(archive, "warmup_epochs", options.warmup_epochs);
-    write_double(archive, "warmup_momentum", options.warmup_momentum);
-    write_double(archive, "lr_min_factor", options.lr_min_factor);
-    write_bool(archive, "gpu_augment_enabled", options.gpu_augmentation.enabled);
-    const auto write_augmentation_group = [&archive](const char* prefix, const AugmentationGroupConfig& group) {
-        const std::string probability_key = std::string(prefix) + "_probability";
-        const std::string min_strength_key = std::string(prefix) + "_min_strength";
-        const std::string max_strength_key = std::string(prefix) + "_max_strength";
-        write_double(archive, probability_key.c_str(), group.probability);
-        write_double(archive, min_strength_key.c_str(), group.min_strength);
-        write_double(archive, max_strength_key.c_str(), group.max_strength);
-    };
-    write_augmentation_group("gpu_augment_geometry", options.gpu_augmentation.geometry);
-    write_augmentation_group("gpu_augment_resize", options.gpu_augmentation.resize);
-    write_augmentation_group("gpu_augment_color", options.gpu_augmentation.color);
-    write_augmentation_group("gpu_augment_noise", options.gpu_augmentation.noise);
-    write_augmentation_group("gpu_augment_blur", options.gpu_augmentation.blur);
-    write_augmentation_group("gpu_augment_occlusion", options.gpu_augmentation.occlusion);
-    write_double(archive, "gpu_augment_copy_paste_probability", options.gpu_augmentation.copy_paste_probability);
-    write_double(archive, "best_regular_metric", best_regular);
-    write_double(archive, "best_ema_metric", best_ema);
-    write_double(archive, "grad_scaler_scale", static_cast<double>(grad_scaler.current_scale()));
-    write_int(archive, "grad_scaler_growth_tracker", grad_scaler.growth_tracker());
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_train_save_resume_archive_save_to{"rfdetr.train.save.resume.archive_save_to"};
         readback.Complete();
@@ -1159,102 +1102,45 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path, const 
     }
 }
 
-ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, DecodedNativeModelState& admitted, NativeOptimizer& optimizer,
+ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path, DecodedNativeModelState& admitted,
+                                         const detail::TrainingContinuation& continuation, NativeOptimizer& optimizer,
                                          const TrainRequest& options, const std::vector<std::string>& parameter_names,
                                          const std::vector<torch_api::Tensor>& parameters, const bool main_process) {
     auto& retained = detail::model_state_owner(admitted).native_archive;
     if (!retained || !admitted.class_artifact) throw std::invalid_argument("full resume requires an admitted current native archive");
     admitted.class_artifact->RequireUnchanged();
     auto& archive = *retained;
-    const auto saved_configuration = detail::read_training_configuration(archive);
-    if (saved_configuration.use_ema != options.use_ema)
-        throw std::runtime_error("resume EMA selection differs from the saved training configuration");
-
-    if (const auto lr_scheduler = read_optional_value<std::string>(archive, "lr_scheduler");
-        lr_scheduler.has_value() && *lr_scheduler != cli_enum_spelling(options.lr_scheduler)) {
-        throw std::runtime_error("native RF-DETR resume checkpoint lr_scheduler does not match current training options");
-    }
-    if (const auto lr_drop = read_optional_value<int64_t>(archive, "lr_drop"); lr_drop.has_value() && *lr_drop != options.lr_drop) {
-        throw std::runtime_error("native RF-DETR resume checkpoint lr_drop does not match current training options");
-    }
-    if (const auto warmup_epochs = read_optional_value<double>(archive, "warmup_epochs");
-        warmup_epochs.has_value() && *warmup_epochs != options.warmup_epochs) {
-        throw std::runtime_error("native RF-DETR resume checkpoint warmup_epochs does not match current training options");
-    }
-    if (const auto warmup_momentum = read_optional_value<double>(archive, "warmup_momentum");
-        warmup_momentum.has_value() && *warmup_momentum != options.warmup_momentum) {
-        throw std::runtime_error("native RF-DETR resume checkpoint warmup_momentum does not match current training options");
-    }
-    if (const auto lr_min_factor = read_optional_value<double>(archive, "lr_min_factor");
-        lr_min_factor.has_value() && *lr_min_factor != options.lr_min_factor) {
-        throw std::runtime_error("native RF-DETR resume checkpoint lr_min_factor does not match current training options");
-    }
-    const auto optimizer_kind = read_optional_value<std::string>(archive, "optimizer_kind");
-    if (!optimizer_kind.has_value()) {
-        throw std::runtime_error("native RF-DETR resume checkpoint is missing optimizer_kind: " + checkpoint_path.string());
-    }
-    if (*optimizer_kind != optimizer.kind_name()) {
+    if (cli_enum_spelling(continuation.configuration.optimizer) != optimizer.kind_name())
         throw std::runtime_error("native RF-DETR resume checkpoint optimizer_kind does not match current training options");
-    }
-    if (parameter_names.size() != parameters.size()) {
+    if (parameter_names.size() != parameters.size())
         throw std::runtime_error("native RF-DETR active optimizer parameter inventory is inconsistent");
-    }
 
     ResumeState state;
-    state.attempt_id = require_string(archive, "training_attempt_id");
-    if (state.attempt_id.empty() || state.attempt_id.size() > 64) throw std::runtime_error("invalid resume attempt identity");
-    const auto stored_epoch = read_optional_value<int64_t>(archive, "epoch").value_or(-1);
-    if (stored_epoch < -1 || stored_epoch >= static_cast<int64_t>(std::numeric_limits<int>::max())) {
-        throw std::runtime_error("native RF-DETR resume checkpoint epoch is outside the supported range");
-    }
-    state.start_epoch = static_cast<int>(stored_epoch + 1);
-    state.best_regular = read_optional_value<double>(archive, "best_regular_metric").value_or(-std::numeric_limits<double>::infinity());
-    state.best_ema = read_optional_value<double>(archive, "best_ema_metric").value_or(-std::numeric_limits<double>::infinity());
-    if (std::isnan(state.best_regular) || std::isnan(state.best_ema)) {
-        throw std::runtime_error("native RF-DETR resume checkpoint metric state is invalid");
-    }
-    const auto stored_scale = read_optional_value<double>(archive, "grad_scaler_scale");
-    const auto stored_growth = read_optional_value<int64_t>(archive, "grad_scaler_growth_tracker");
-
-    torch_api::InputArchive ema_archive;
-    const bool archive_has_ema = archive.try_read("ema_state", ema_archive);
-    validate_resume_continuation_manifest(ResumeContinuationManifest{options.use_ema, archive_has_ema, stored_scale, stored_growth});
-    std::optional<ModelEma> staged_ema;
-    if (archive_has_ema) {
-        auto ema_state = read_state_archive(archive, "ema_state", parameter_names);
-        std::vector<torch_api::Tensor> cpu_shadow;
-        cpu_shadow.reserve(ema_state.size());
-        for (const auto& entry : ema_state) cpu_shadow.push_back(entry.tensor);
+    state.attempt_id = continuation.values.training_attempt_id;
+    state.start_epoch = static_cast<int>(continuation.values.epoch + 1);
+    state.best_regular = continuation.values.best_regular_metric;
+    state.best_ema = continuation.values.best_ema_metric;
+    if (continuation.configuration.use_ema) {
+        torch_api::InputArchive ema_archive;
+        archive.read("ema_state", ema_archive);
+        const auto cpu_shadow = detail::read_ema_shadow_archive(ema_archive, parameter_names);
         if (main_process) {
-            staged_ema = ModelEma::from_cpu_shadow(parameters, cpu_shadow, options.ema_decay, static_cast<double>(options.ema_tau));
+            // The factory validates the entire CPU inventory once before copies.
+            state.restored_ema = ModelEma::from_cpu_shadow(parameters, cpu_shadow, options.ema_decay, static_cast<double>(options.ema_tau));
         } else {
-            for (std::size_t index = 0; index < cpu_shadow.size(); ++index) {
-                const auto& source = cpu_shadow[index];
-                const auto& destination = parameters[index];
-                if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() ||
-                    source.sizes() != destination.sizes() || source.scalar_type() != destination.scalar_type() ||
-                    source.layout() != destination.layout() || !torch_api::isfinite(source).all().item<bool>())
-                    throw std::runtime_error("native RF-DETR resume EMA tensor does not match the active parameter inventory");
-            }
+            ModelEma::validate_cpu_shadow(parameters, cpu_shadow);
         }
     }
-
     torch_api::InputArchive optimizer_archive;
-    if (!archive.try_read("optimizer", optimizer_archive)) {
-        throw std::runtime_error("native RF-DETR resume checkpoint is missing optimizer state: " + checkpoint_path.string());
-    }
+    archive.read("optimizer", optimizer_archive);
     try {
         state.optimizer_candidate = optimizer.stage_load(optimizer_archive);
     } catch (const std::exception& error) {
         throw std::runtime_error("failed to load native RF-DETR optimizer state from " + checkpoint_path.string() + ": " + error.what());
     }
-
-    if (stored_scale.has_value()) {
-        state.scaler_scale = static_cast<float>(*stored_scale);
-        state.scaler_growth_tracker = static_cast<int>(*stored_growth);
-    }
-    state.restored_ema = std::move(staged_ema);
-
+    state.scaler_scale = static_cast<float>(continuation.values.grad_scaler_scale);
+    state.scaler_growth_tracker = static_cast<int>(continuation.values.grad_scaler_growth_tracker);
+    admitted.class_artifact->RequireUnchanged();
     return state;
 }
 
@@ -1878,13 +1764,15 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     auto admitted = resolve_model_state(artifact_request.weights_path, artifact_request.preset_name, artifact_request.resolution, options.class_layout_path);
     auto artifacts = admitted.artifacts;
     auto original_descriptor = options.class_layout_path;
+    std::optional<detail::TrainingContinuation> continuation;
     if (!options.resume_path.empty()) {
         if (!detail::model_state_owner(admitted.model_state).native_archive) {
             throw std::runtime_error("--resume requires a native RF-DETR .pt checkpoint: " + options.resume_path.string());
         }
-        detail::require_resume_training_supervision_config(*detail::model_state_owner(admitted.model_state).native_archive, options.training_supervision);
-        original_descriptor = read_optional_value<std::string>(*detail::model_state_owner(admitted.model_state).native_archive,
-            "training_original_descriptor").value_or(options.class_layout_path.string());
+        continuation = detail::read_training_continuation(*detail::model_state_owner(admitted.model_state).native_archive);
+        if (!continuation) throw std::runtime_error("--resume requires a full training checkpoint");
+        detail::require_active_training_continuation(*continuation, options);
+        original_descriptor = continuation->values.training_original_descriptor;
     }
     artifacts.config.training_supervision = options.training_supervision;
     dataset_limits.automatic_num_queries_cap =
@@ -2031,7 +1919,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     double best_ema = -std::numeric_limits<double>::infinity();
     if (!options.resume_path.empty()) {
         ResumeState resume_state =
-            load_resume_checkpoint_state(options.resume_path, admitted.model_state, optimizer, options, all_param_names, all_params, main_process);
+            load_resume_checkpoint_state(options.resume_path, admitted.model_state, *continuation, optimizer, options, all_param_names, all_params, main_process);
         if (resume_model_candidate.has_value()) {
             detail::native_model_owner(model).commit_normalized_state(std::move(*resume_model_candidate));
         }
@@ -2049,6 +1937,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         best_ema = resume_state.best_ema;
     }
 
+    continuation.reset();
     detail::model_state_owner(admitted.model_state).entries.clear();
     detail::model_state_owner(admitted.model_state).native_archive.reset();
 

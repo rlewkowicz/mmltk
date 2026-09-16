@@ -357,8 +357,7 @@ void write_upstream_model_state(const fs::path& checkpoint_path, const DecodedNa
         manifest["metadata"]["class_layout"] = json::parse(encode_class_layout(model_state.metadata.class_layout));
     if (model_state.metadata.num_queries > 0) manifest["metadata"]["num_queries"] = model_state.metadata.num_queries;
     if (model_state.metadata.num_select > 0) manifest["metadata"]["num_select"] = model_state.metadata.num_select;
-    auto metadata = model_state.metadata;
-    metadata.for_each_detection_field([&]<class Name, class Optional>(const Name& name, const Optional& field) {
+    model_state.metadata.for_each_detection_field([&]<class Name, class Optional>(const Name& name, const Optional& field) {
         if (field) manifest["metadata"][name] = *field;
     });
     write_json_file(manifest_path, manifest);

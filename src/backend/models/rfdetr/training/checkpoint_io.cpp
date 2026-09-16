@@ -1,8 +1,5 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include <array>
-#include <cmath>
-#include <format>
-#include <limits>
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include <cstring>
 #include <cstdint>
@@ -18,9 +15,11 @@
 #include "detail/checkpoint_private.h"
 #include "checkpoint.h"
 #include "detail/native_optimizer_private.h"
-#include "detail/training_ops_private.h"
+#include "detail/training_continuation.h"
+#include "detail/model_ema.h"
 #include "model_state_access.h"
 #include <unordered_map>
+#include <type_traits>
 
 import mmltk.common.logging.profile_utils;
 
@@ -36,33 +35,6 @@ void publish_native_checkpoint_archive(torch_api::OutputArchive& archive, const 
 }
 
 namespace serialization = mmltk::frameworks::serialization;
-
-void write_training_configuration(torch_api::OutputArchive& archive, const TrainRequest& request) {
-    constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
-    std::vector<std::byte> bytes(capacity);
-    const auto encoded = serialization::encode(request, std::span<std::byte>(bytes), {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
-    if (!encoded) throw std::runtime_error("training configuration violates its checkpoint schema");
-    auto tensor = torch_api::empty({static_cast<int64_t>(*encoded)}, torch_api::kUInt8);
-    std::memcpy(tensor.data_ptr(), bytes.data(), *encoded);
-    archive.write("training_configuration_cbor", tensor);
-}
-
-TrainRequest read_training_configuration(torch_api::InputArchive& archive) {
-    torch_api::Tensor configuration;
-    if (!archive.try_read("training_configuration_cbor", configuration))
-        throw std::runtime_error("full checkpoint is missing current saved training configuration");
-    constexpr auto capacity = serialization::reflected_maximum_cbor_bytes<TrainRequest>();
-    if (!configuration.defined() || !configuration.is_cpu() || configuration.scalar_type() != torch_api::kUInt8 ||
-        configuration.dim() != 1 || configuration.numel() <= 0 || static_cast<std::size_t>(configuration.numel()) > capacity)
-        throw std::runtime_error("invalid checkpoint training configuration");
-    configuration = configuration.contiguous();
-    const auto request = serialization::decode<TrainRequest>(
-        {std::span(reinterpret_cast<const std::byte*>(configuration.const_data_ptr()), static_cast<std::size_t>(configuration.numel())), {}},
-        {.max_bytes = capacity, .max_items = 4096, .max_depth = 32});
-    if (!request) throw std::runtime_error("invalid checkpoint training configuration values");
-    validate_train_request(*request);
-    return *request;
-}
 
 namespace {
 
@@ -114,21 +86,11 @@ void write_native_checkpoint_metadata(torch_api::OutputArchive& archive, const N
     write_int(archive, "num_classes", metadata.num_classes);
     write_int(archive, "num_queries", metadata.num_queries);
     write_int(archive, "num_select", metadata.num_select);
-    write_optional_bool(archive, "sum_group_losses", metadata.sum_group_losses);
-    write_optional_bool(archive, "use_varifocal_loss", metadata.use_varifocal_loss);
-    write_optional_bool(archive, "use_position_supervised_loss", metadata.use_position_supervised_loss);
-    write_optional_bool(archive, "ia_bce_loss", metadata.ia_bce_loss);
-    write_optional_bool(archive, "aux_loss", metadata.aux_loss);
-    write_optional_int(archive, "mask_point_sample_ratio", metadata.mask_point_sample_ratio);
-    write_optional_double(archive, "focal_alpha", metadata.focal_alpha);
-    write_optional_double(archive, "cls_loss_coef", metadata.cls_loss_coef);
-    write_optional_double(archive, "bbox_loss_coef", metadata.bbox_loss_coef);
-    write_optional_double(archive, "giou_loss_coef", metadata.giou_loss_coef);
-    write_optional_double(archive, "mask_ce_loss_coef", metadata.mask_ce_loss_coef);
-    write_optional_double(archive, "mask_dice_loss_coef", metadata.mask_dice_loss_coef);
-    write_optional_double(archive, "set_cost_class", metadata.set_cost_class);
-    write_optional_double(archive, "set_cost_bbox", metadata.set_cost_bbox);
-    write_optional_double(archive, "set_cost_giou", metadata.set_cost_giou);
+    metadata.for_each_detection_field([&]<class Optional>(const char* key, const Optional& value) {
+        if constexpr (std::is_same_v<typename Optional::value_type, bool>) write_optional_bool(archive, key, value);
+        else if constexpr (std::is_same_v<typename Optional::value_type, int64_t>) write_optional_int(archive, key, value);
+        else write_optional_double(archive, key, value);
+    });
 }
 
 void reserve_state_archive(const std::vector<NormalizedModelStateEntry>& entries,
@@ -160,7 +122,12 @@ void write_training_supervision_config(torch_api::OutputArchive& archive, const 
 
 TrainingSupervisionConfig read_training_supervision_config(torch_api::InputArchive& archive) {
     torch_api::Tensor tensor;
-    if (!archive.try_read(kTrainingSupervisionKey, tensor)) { return {}; }
+    if (!archive.try_read(kTrainingSupervisionKey, tensor)) {
+        torch_api::IValue value;
+        if (archive.try_read(kTrainingSupervisionKey, value))
+            throw std::runtime_error("invalid RF-DETR training supervision CBOR blob");
+        return {};
+    }
     if (!tensor.defined() || !tensor.device().is_cpu() || tensor.scalar_type() != torch_api::kUInt8 || tensor.dim() != 1 ||
         tensor.numel() <= 0 || static_cast<std::uint64_t>(tensor.numel()) > kTrainingSupervisionCborCapacity) {
         throw std::runtime_error("invalid RF-DETR training supervision CBOR blob");
@@ -181,12 +148,28 @@ void require_resume_training_supervision_config(torch_api::InputArchive& archive
     }
 }
 
+std::vector<torch_api::Tensor> read_ema_shadow_archive(torch_api::InputArchive& archive,
+                                                       std::span<const std::string> expected_names) {
+    const auto count = require_int(archive, "entry_count");
+    if (count < 0 || static_cast<std::uint64_t>(count) != expected_names.size())
+        throw std::runtime_error("RF-DETR training checkpoint state count does not match the bounded active inventory");
+    std::vector<torch_api::Tensor> shadow;
+    shadow.reserve(expected_names.size());
+    for (std::size_t index = 0; index < expected_names.size(); ++index) {
+        torch_api::InputArchive entry;
+        archive.read(archive_entry_name(index), entry);
+        if (require_string(entry, "name") != expected_names[index])
+            throw std::runtime_error("RF-DETR training checkpoint state names do not match the active inventory");
+        shadow.push_back(require_tensor(entry, "tensor"));
+    }
+    return shadow;
+}
+
 }  // namespace mmltk::backend::models::rfdetr::detail
 
 namespace mmltk::backend::models::rfdetr {
 TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path) {
     namespace torch_api = mmltk::backend::ml::torch_api;
-    namespace serialization = mmltk::frameworks::serialization;
     auto decoded = decode_native_model_state(path);
     if (!decoded.class_artifact) throw std::runtime_error("training checkpoint lacks exact native artifact admission");
     decoded.class_artifact->RequireUnchanged();
@@ -197,55 +180,32 @@ TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path
     result.path = std::filesystem::canonical(path);
     result.class_layout = decoded.metadata.class_layout;
     result.original_weights = decoded.metadata.source_path;
-    torch_api::InputArchive optimizer;
-    if (!archive.try_read("optimizer", optimizer)) {
-        torch_api::Tensor continuation;
-        if (archive.try_read("epoch", continuation) || archive.try_read("training_configuration_cbor", continuation))
-            throw std::runtime_error("full training checkpoint is missing optimizer continuation");
+    const auto continuation = detail::read_training_continuation(archive);
+    if (!continuation) {
         decoded.class_artifact->RequireUnchanged();
         return result;
     }
-    const auto request = detail::read_training_configuration(archive);
-    const auto epoch = require_int(archive, "epoch");
-    if (epoch < 0 || epoch >= std::numeric_limits<int>::max()) throw std::runtime_error("invalid checkpoint epoch");
+    const auto& request = continuation->configuration;
+    torch_api::InputArchive optimizer;
+    archive.read("optimizer", optimizer);
     std::unordered_map<std::string, torch_api::Tensor> tensors;
+    tensors.reserve(state.entries.size());
     for (const auto& entry : state.entries) tensors.emplace(entry.name, entry.tensor);
-    const auto kind = require_string(archive, "optimizer_kind");
-    if (kind != cli_enum_spelling(request.optimizer)) throw std::runtime_error("checkpoint optimizer configuration disagrees");
     const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors) :
                                                                       NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors);
-    torch_api::InputArchive ema;
-    if (archive.try_read("ema_state", ema) != request.use_ema) throw std::runtime_error("checkpoint EMA continuation is incomplete");
     if (request.use_ema) {
-        if (require_int(ema, "entry_count") != static_cast<int64_t>(names.size()))
-            throw std::runtime_error("checkpoint EMA inventory is incomplete");
-        for (std::size_t index = 0; index < names.size(); ++index) {
-            torch_api::InputArchive entry;
-            ema.read(std::format("entry_{:06}", index), entry);
-            auto tensor = require_tensor(entry, "tensor");
-            const auto& parameter = tensors.at(names[index]);
-            if (require_string(entry, "name") != names[index] || !tensor.is_cpu() || !tensor.is_floating_point() ||
-                tensor.layout() != parameter.layout() || tensor.sizes() != parameter.sizes() ||
-                tensor.scalar_type() != parameter.scalar_type() || !torch_api::isfinite(tensor).all().item<bool>())
-                throw std::runtime_error("checkpoint EMA tensor is invalid");
-        }
+        torch_api::InputArchive ema;
+        archive.read("ema_state", ema);
+        const auto shadow = detail::read_ema_shadow_archive(ema, names);
+        std::vector<torch_api::Tensor> parameters;
+        parameters.reserve(names.size());
+        for (const auto& name : names) parameters.push_back(tensors.at(name));
+        ModelEma::validate_cpu_shadow(parameters, shadow);
     }
-    validate_resume_continuation_manifest({request.use_ema, request.use_ema,
-        require_double(archive, "grad_scaler_scale"), require_int(archive, "grad_scaler_growth_tracker")});
-    if (require_string(archive, "lr_scheduler") != cli_enum_spelling(request.lr_scheduler) ||
-        require_int(archive, "lr_drop") != request.lr_drop || require_double(archive, "warmup_epochs") != request.warmup_epochs ||
-        require_double(archive, "warmup_momentum") != request.warmup_momentum || require_double(archive, "lr_min_factor") != request.lr_min_factor)
-        throw std::runtime_error("checkpoint scheduler configuration disagrees");
-    if (std::isnan(require_double(archive, "best_regular_metric")) || std::isnan(require_double(archive, "best_ema_metric")))
-        throw std::runtime_error("checkpoint best metric is invalid");
-    detail::require_resume_training_supervision_config(archive, request.training_supervision);
     decoded.class_artifact->RequireUnchanged();
-    result.original_class_descriptor = require_string(archive, "training_original_descriptor");
-    if (result.original_class_descriptor.native().size() > mmltk::frameworks::reflection::kMaximumPathBytes)
-        throw std::runtime_error("invalid original checkpoint descriptor provenance");
-    result.attempt_id = require_string(archive, "training_attempt_id");
-    if (result.attempt_id.empty() || result.attempt_id.size() > 64) throw std::runtime_error("invalid checkpoint attempt identity");
-    result.epoch = static_cast<int>(epoch);
+    result.original_class_descriptor = continuation->values.training_original_descriptor;
+    result.attempt_id = continuation->values.training_attempt_id;
+    result.epoch = static_cast<int>(continuation->values.epoch);
     result.configuration = request;
     result.evaluated_weights = request.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
     result.resumable = true;

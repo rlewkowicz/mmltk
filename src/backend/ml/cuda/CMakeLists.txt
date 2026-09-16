@@ -47,6 +47,7 @@ target_link_libraries(mmltk_backend_ml_cuda
         CUDA::cudart
 )
 mmltk_enable_torch(mmltk_backend_ml_cuda PRIVATE)
+mmltk_link_declarations(mmltk_backend_ml_cuda PUBLIC mmltk::backend::ml::torch_dependencies)
 set_target_properties(mmltk_backend_ml_cuda PROPERTIES
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -72,7 +73,6 @@ function(mmltk_add_backend_ml_cuda_tests)
         mmltk::backend::ml::cuda
         CUDA::cudart
     )
-    mmltk_enable_torch(mmltk_backend_ml_cuda_tests PRIVATE)
     mmltk_enable_native_runtime_rpath(mmltk_backend_ml_cuda_tests)
     catch_discover_tests(
         mmltk_backend_ml_cuda_tests

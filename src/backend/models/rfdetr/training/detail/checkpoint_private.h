@@ -1,12 +1,13 @@
 #pragma once
 
 #include <filesystem>
+#include <span>
+#include <string>
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include <vector>
 
 #include "model_technical.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
-#include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "torch_api.h"
 
@@ -22,7 +23,7 @@ void write_resume_state_archive(mmltk::backend::ml::torch_api::OutputArchive& ar
 void write_training_supervision_config(mmltk::backend::ml::torch_api::OutputArchive& archive, const TrainingSupervisionConfig& config);
 [[nodiscard]] TrainingSupervisionConfig read_training_supervision_config(mmltk::backend::ml::torch_api::InputArchive& archive);
 void require_resume_training_supervision_config(mmltk::backend::ml::torch_api::InputArchive& archive, const TrainingSupervisionConfig& expected);
-void write_training_configuration(mmltk::backend::ml::torch_api::OutputArchive&, const TrainRequest&);
-[[nodiscard]] TrainRequest read_training_configuration(mmltk::backend::ml::torch_api::InputArchive&);
+[[nodiscard]] std::vector<mmltk::backend::ml::torch_api::Tensor> read_ema_shadow_archive(
+    mmltk::backend::ml::torch_api::InputArchive& ema_archive, std::span<const std::string> expected_names);
 
 }  // namespace mmltk::backend::models::rfdetr::detail

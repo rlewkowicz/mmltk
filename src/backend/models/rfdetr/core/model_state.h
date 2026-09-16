@@ -52,14 +52,14 @@ struct NativeCheckpointMetadata {
     std::optional<double> set_cost_bbox;
     std::optional<double> set_cost_giou;
 
-    template <class Visitor>
-    void for_each_detection_field(Visitor&& visitor) {
+    template <class Self, class Visitor>
+    void for_each_detection_field(this Self&& self, Visitor&& visitor) {
         template for (constexpr auto member : std::define_static_array(
                           std::meta::nonstatic_data_members_of(^^NativeCheckpointMetadata, std::meta::access_context::current()))) {
-            using Field = std::remove_cvref_t<decltype((*this).[:member:])>;
+            using Field = std::remove_cvref_t<decltype(self.[:member:])>;
             if constexpr (model_state_detail::is_optional<Field>) {
                 constexpr auto name = std::define_static_string(std::meta::identifier_of(member));
-                visitor(name, (*this).[:member:]);
+                visitor(name, self.[:member:]);
             }
         }
     }

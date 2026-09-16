@@ -1,3 +1,12 @@
+#pragma once
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+#include <cuda_runtime_api.h>
+
+#include "src/backend/data/dataset_loader.h"
+#include "src/backend/ml/torch/detail/torch_api.h"
 #include "src/backend/models/rfdetr/augmentation/gpu_augment.h"
 
 namespace mmltk::backend::models::rfdetr {
