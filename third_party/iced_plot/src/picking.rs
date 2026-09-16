@@ -1,14 +1,14 @@
 //! Implements picking for the plot widget.
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, Ordering}},
 };
 
 use glam::{DVec2, Vec2};
 use iced::Rectangle;
 use iced::wgpu::*;
 
-use crate::{Point, PointId, Size, camera::Camera, plot_state::SeriesSpan};
+use crate::{Point, PointId, Size, camera::Camera, plot_state::{ProjectionOrigin, SeriesSpan}};
 
 /// Threshold for number of points above which GPU picking is used instead of CPU picking.
 pub(crate) const CPU_PICK_THRESHOLD: usize = 5000;
@@ -23,8 +23,11 @@ fn cpu_picking_required(force: bool, points: usize, series: &[SeriesSpan]) -> bo
 // ---- API to the plot widget ----
 
 /// Tracks CPU/GPU picking state for a plot widget.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct PickingState {
+    projection: MarkerProjection,
+    // Shared with the retained pass, independent of this projection's sequences.
+    settlement: Option<Arc<AtomicBool>>,
     /// Last hover hit, if any.
     pub(crate) last_hover_cache: Option<PointId>,
 
@@ -57,17 +60,50 @@ pub(crate) enum GpuResultEvent {
 }
 
 impl PickingState {
+    pub(crate) fn new(origin: ProjectionOrigin, generation: u64) -> Self {
+        Self {
+            projection: MarkerProjection { origin, generation },
+            settlement: None,
+            last_hover_cache: None,
+            pending_gpu_pick_seq: None,
+            pick_seq: 0,
+            pick_result_seq: 0,
+        }
+    }
+
+    pub(crate) fn projection(&self) -> &MarkerProjection {
+        &self.projection
+    }
+
+    /// A rebuilt marker projection invalidates both cached and asynchronous hits.
+    /// Existing registry storage is reused; CPU-only plots create no entry.
+    pub(crate) fn reproject(&mut self, instance_id: u64, generation: u64) {
+        self.projection.generation = generation;
+        self.last_hover_cache = None;
+        self.pending_gpu_pick_seq = None;
+        self.pick_seq = 0;
+        self.pick_result_seq = 0;
+        self.settlement = None;
+        if let Some(registry) = REGISTRY.get()
+            && let Some(entry) = registry.lock().unwrap().get_mut(&instance_id)
+        {
+            entry.activate(&self.projection);
+            self.settlement = Some(Arc::clone(&entry.settlement));
+        }
+    }
+
     fn submit_gpu_request(&mut self, instance_id: u64, cursor: Vec2, radius_px: f32) {
         self.pick_seq = self.pick_seq.wrapping_add(1);
-        submit_request(
+        self.settlement = Some(submit_request(
             instance_id,
             GpuPickRequest {
+                projection: self.projection.clone(),
                 cursor_x: cursor.x,
                 cursor_y: cursor.y,
                 radius_px,
                 seq: self.pick_seq,
             },
-        );
+        ));
     }
 
     /// Request hover picking for the current cursor position.
@@ -145,7 +181,7 @@ impl PickingState {
         instance_id: u64,
         valid_point_id: impl Fn(&PointId) -> bool,
     ) -> Option<GpuResultEvent> {
-        let res = take_result(instance_id)?;
+        let res = take_result(instance_id, &self.projection)?;
         if res.seq <= self.pick_result_seq {
             return None;
         }
@@ -174,6 +210,7 @@ impl PickingState {
 
     pub(crate) fn has_outstanding_gpu_request(&self) -> bool {
         self.pick_seq > self.pick_result_seq
+            || self.settlement.as_ref().is_some_and(|pending| pending.load(Ordering::Acquire))
     }
 }
 
@@ -260,24 +297,54 @@ fn cpu_pick_hit(
 
 // ---- GPU picking ----
 
-#[derive(Debug, Clone, Copy)]
+/// Strong ownership identity plus the marker generation within that tree state.
+#[derive(Debug, Clone)]
+pub(crate) struct MarkerProjection {
+    origin: ProjectionOrigin,
+    generation: u64,
+}
+
+impl MarkerProjection {
+    fn same_as(&self, other: &Self) -> bool {
+        self.generation == other.generation && self.origin.same_as(&other.origin)
+    }
+}
+
+#[derive(Debug, Clone)]
 struct GpuPickRequest {
+    projection: MarkerProjection,
     pub cursor_x: f32,  // logical px in widget local coordinates
     pub cursor_y: f32,  // logical px in widget local coordinates
     pub radius_px: f32, // logical px
-    pub seq: u64,       // monotonically increasing sequence
+    pub seq: u64,       // monotonically increasing within this projection
 }
 
 #[derive(Debug, Clone)]
 struct GpuPickResult {
+    projection: MarkerProjection,
     pub seq: u64,
     pub hit: Option<PointId>,
 }
 
-#[derive(Default)]
 struct InstanceEntry {
+    projection: MarkerProjection,
+    settlement: Arc<AtomicBool>,
     latest_req: Option<GpuPickRequest>,
     latest_res: Option<GpuPickResult>,
+}
+
+impl InstanceEntry {
+    fn new(projection: MarkerProjection) -> Self {
+        Self { projection, settlement: Arc::new(AtomicBool::new(false)), latest_req: None, latest_res: None }
+    }
+
+    fn activate(&mut self, projection: &MarkerProjection) {
+        if !self.projection.same_as(projection) {
+            self.projection = projection.clone();
+            self.latest_req = None;
+            self.latest_res = None;
+        }
+    }
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<u64, InstanceEntry>>> = OnceLock::new();
@@ -286,28 +353,35 @@ fn registry() -> &'static Mutex<HashMap<u64, InstanceEntry>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn submit_request(instance_id: u64, req: GpuPickRequest) {
+fn submit_request(instance_id: u64, req: GpuPickRequest) -> Arc<AtomicBool> {
     let mut map = registry().lock().unwrap();
-    let entry = map.entry(instance_id).or_default();
+    let entry = map.entry(instance_id)
+        .or_insert_with(|| InstanceEntry::new(req.projection.clone()));
+    entry.activate(&req.projection);
     // Replace if newer
-    if entry.latest_req.map(|r| r.seq < req.seq).unwrap_or(true) {
+    if entry.latest_req.as_ref().is_none_or(|r| r.seq < req.seq) {
         entry.latest_req = Some(req);
     }
+    Arc::clone(&entry.settlement)
 }
 
-fn take_result(instance_id: u64) -> Option<GpuPickResult> {
+fn take_result(instance_id: u64, projection: &MarkerProjection) -> Option<GpuPickResult> {
     let mut map = registry().lock().unwrap();
-    map.get_mut(&instance_id).and_then(|e| e.latest_res.take())
+    let entry = map.get_mut(&instance_id)?;
+    entry.projection.same_as(projection).then(|| entry.latest_res.take()).flatten()
 }
 
-fn take_latest_request(instance_id: u64) -> Option<GpuPickRequest> {
+fn take_latest_request(instance_id: u64, projection: &MarkerProjection) -> Option<(GpuPickRequest, Arc<AtomicBool>)> {
     let mut map = registry().lock().unwrap();
-    map.get_mut(&instance_id).and_then(|e| e.latest_req.take())
+    let entry = map.get_mut(&instance_id)?;
+    if !entry.projection.same_as(projection) { return None; }
+    entry.latest_req.take().map(|request| (request, Arc::clone(&entry.settlement)))
 }
 
 fn publish_result(instance_id: u64, res: GpuPickResult) {
     let mut map = registry().lock().unwrap();
-    let entry = map.entry(instance_id).or_default();
+    let Some(entry) = map.get_mut(&instance_id) else { return };
+    if !entry.projection.same_as(&res.projection) { return; }
     if entry.latest_res.as_ref().is_none_or(|r| r.seq < res.seq) {
         entry.latest_res = Some(res);
     }
@@ -326,18 +400,23 @@ pub(crate) struct PickingPass {
     // Pipeline for rendering marker IDs
     pipeline: Option<RenderPipeline>,
 
-    // Temporary staging buffer for readback (sync for now; tiny region)
+    // Reusable staging buffer; a pending asynchronous map settles before reuse.
     staging: Option<Buffer>,
     staging_size: u64,
 
     // Mapping from instance_id (draw instance) -> (span_index, local_pt_index)
     id_map: Vec<(u32, u32)>,
+    id_map_projection: Option<MarkerProjection>,
 
     pending: Option<PendingReadback>,
 }
 
 struct PendingReadback {
+    // Own the mapped buffer even during pass destruction or map_async unwinding.
+    buffer: Buffer,
+    settlement: Arc<AtomicBool>,
     instance_id: u64,
+    projection: MarkerProjection,
     seq: u64,
     needed: u64,
     bytes_per_row: u32,
@@ -348,6 +427,15 @@ struct PendingReadback {
     cx: u32,
     cy: u32,
     map_status: Arc<Mutex<Option<Result<(), BufferAsyncError>>>>,
+}
+
+impl Drop for PendingReadback {
+    fn drop(&mut self) {
+        // No mapped view escapes poll_pending. Unmap also cancels an unfinished
+        // callback; WGPU retains submitted device work independently.
+        self.buffer.unmap();
+        self.settlement.store(false, Ordering::Release);
+    }
 }
 
 impl Default for PickingPass {
@@ -362,6 +450,7 @@ impl Default for PickingPass {
             staging: None,
             staging_size: 0,
             id_map: Vec::new(),
+            id_map_projection: None,
             pending: None,
         }
     }
@@ -381,25 +470,28 @@ impl PickingPass {
         camera_bgl: &BindGroupLayout,
         marker_vb: Option<&Buffer>,
         marker_instances: u32,
-        points: &[Point],
+        projection: &MarkerProjection,
         series: &[SeriesSpan],
     ) {
-        self.poll_pending(device, points, series);
+        self.poll_pending(device, projection, series);
 
         if self.pending.is_some() {
             return;
         }
 
         // Take the latest request, if any
-        let req = match take_latest_request(instance_id) {
+        let (req, settlement) = match take_latest_request(instance_id, projection) {
             Some(r) => r,
             None => return,
         };
 
-        if marker_vb.is_none() || marker_instances == 0 {
+        if marker_vb.is_none() || marker_instances == 0
+            || !self.id_map_projection.as_ref().is_some_and(|key| key.same_as(projection))
+        {
             publish_result(
                 instance_id,
                 GpuPickResult {
+                    projection: req.projection,
                     seq: req.seq,
                     hit: None,
                 },
@@ -504,15 +596,13 @@ impl PickingPass {
         queue.submit(std::iter::once(encoder.finish()));
 
         let buf = self.staging.as_ref().unwrap();
-        let slice = buf.slice(0..needed);
         let map_status = Arc::new(Mutex::new(None));
         let status_clone = Arc::clone(&map_status);
-        slice.map_async(MapMode::Read, move |res| {
-            *status_clone.lock().unwrap() = Some(res);
-        });
-
-        self.pending = Some(PendingReadback {
+        let pending = PendingReadback {
+            buffer: buf.clone(),
+            settlement,
             instance_id,
+            projection: req.projection,
             seq: req.seq,
             needed,
             bytes_per_row,
@@ -523,7 +613,29 @@ impl PickingPass {
             cx,
             cy,
             map_status,
+        };
+        // Resource creation and submission above cannot strand this fact. From
+        // here the local RAII owner covers both map_async failure and pass drop.
+        pending.settlement.store(true, Ordering::Release);
+        pending.buffer.slice(0..needed).map_async(MapMode::Read, move |res| {
+            *status_clone.lock().unwrap() = Some(res);
         });
+        self.pending = Some(pending);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_pending_callback(&mut self, cancel: bool) -> impl FnOnce(&mut Self) + use<> {
+        let pending = self.pending.as_mut().expect("real map admission");
+        let delivered = std::mem::replace(&mut pending.map_status, Arc::new(Mutex::new(None)));
+        if cancel {
+            pending.buffer.unmap(); // real WGPU cancellation delivers BufferAsyncError
+        }
+        move |pass| {
+            let pending = pass.pending.as_mut().expect("not-ready polling retains custody");
+            assert!(pending.map_status.lock().unwrap().is_none());
+            assert_eq!(delivered.lock().unwrap().as_ref().expect("real callback readiness").is_err(), cancel);
+            pending.map_status = delivered;
+        }
     }
 
     pub(crate) fn set_view(&mut self, w: u32, h: u32, scale: f32) {
@@ -534,11 +646,17 @@ impl PickingPass {
 
     pub(crate) fn take_id_map(&mut self) -> Vec<(u32, u32)> { std::mem::take(&mut self.id_map) }
 
-    pub(crate) fn set_id_map(&mut self, map: Vec<(u32, u32)>) {
+    pub(crate) fn set_id_map(&mut self, map: Vec<(u32, u32)>, projection: &MarkerProjection) {
         self.id_map = map;
+        self.id_map_projection = Some(projection.clone());
     }
 
-    fn poll_pending(&mut self, device: &Device, points: &[Point], series: &[SeriesSpan]) {
+    pub(crate) fn clear_id_map(&mut self, projection: &MarkerProjection) {
+        self.id_map.clear();
+        self.id_map_projection = Some(projection.clone());
+    }
+
+    fn poll_pending(&mut self, device: &Device, projection: &MarkerProjection, series: &[SeriesSpan]) {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
@@ -548,10 +666,12 @@ impl PickingPass {
             return;
         };
 
+        let pending = self.pending.take().unwrap();
+        let current = pending.projection.same_as(projection)
+            && self.id_map_projection.as_ref().is_some_and(|key| key.same_as(&pending.projection));
         let hit = match res {
-            Ok(()) => {
-                let buf = self.staging.as_ref().unwrap();
-                let slice = buf.slice(0..pending.needed);
+            Ok(()) if current => {
+                let slice = pending.buffer.slice(0..pending.needed);
                 let data = slice.get_mapped_range();
                 let best = Self::scan_best_id(
                     &data,
@@ -564,26 +684,23 @@ impl PickingPass {
                     pending.cy,
                 );
                 drop(data);
-                buf.unmap();
-                best.and_then(|(id, _)| self.decode_id_to_hit(id, points, series))
+                best.and_then(|(id, _)| self.decode_id_to_hit(id, series))
             }
-            Err(_) => {
-                if let Some(buf) = self.staging.as_ref() {
-                    buf.unmap();
-                }
-                None
-            }
+            // A stale successful mapping still settles physically; never scan or
+            // decode its old IDs through the replacement projection's map.
+            Ok(()) | Err(_) => None,
         };
 
-        publish_result(
-            pending.instance_id,
-            GpuPickResult {
-                seq: pending.seq,
-                hit,
-            },
-        );
-
-        self.pending = None;
+        let result = current.then(|| GpuPickResult {
+            projection: pending.projection.clone(),
+            seq: pending.seq,
+            hit,
+        });
+        let instance_id = pending.instance_id;
+        drop(pending); // mapped access has ended; unmap before clearing redraw custody
+        if let Some(result) = result {
+            publish_result(instance_id, result);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -757,7 +874,6 @@ impl PickingPass {
     fn decode_id_to_hit(
         &self,
         id: u32,
-        _points: &[Point],
         series: &[SeriesSpan],
     ) -> Option<PointId> {
         // IDs are 1-based instance index
@@ -813,11 +929,103 @@ mod tests {
         state.bounds = Rectangle { x: 0.0, y: 0.0, width: 100.0, height: 100.0 };
         state.camera = Camera { position: DVec2::ZERO, half_extents: DVec2::ONE, render_offset: DVec2::ZERO };
         state.rebuild_from_widget(&plot);
-        let mut picking = super::PickingState::default();
+        let mut picking = state.picking.clone();
         let hit = picking.request_hover(1, Vec2::new(50.0, 50.0), 8.0, false,
             &state.points, &state.series, &state.camera, &state.bounds, |_| true);
         assert!(matches!(hit, super::HoverRequest::CpuHit(point) if point.series_id == id));
         assert!(!picking.has_outstanding_gpu_request());
+    }
+
+    #[test]
+    fn registry_rejects_old_origins_and_generations_without_consuming_new_requests() {
+        use super::*;
+
+        let series = crate::Series::markers_only(
+            vec![[0.0, 0.0]; CPU_PICK_THRESHOLD + 1],
+            crate::MarkerStyle::default(),
+        );
+        let id = series.id;
+        let mut plot = crate::PlotWidgetBuilder::new().add_series(series).build().unwrap();
+        let mut old = crate::plot_state::PlotState::default();
+        old.rebuild_from_widget(&plot);
+        old.picking.submit_gpu_request(plot.instance_id, Vec2::ZERO, 8.0);
+        let (pending, _) = take_latest_request(plot.instance_id, old.picking.projection()).unwrap();
+
+        let mut replacement = crate::plot_state::PlotState::default();
+        replacement.rebuild_from_widget(&plot);
+        replacement.picking.submit_gpu_request(plot.instance_id, Vec2::ZERO, 8.0);
+        assert_eq!(pending.seq, replacement.picking.pick_seq);
+        assert_eq!(old.markers_version, replacement.markers_version);
+        let hit = PointId { series_id: id, point_index: 0 };
+        publish_result(plot.instance_id, GpuPickResult {
+            projection: pending.projection.clone(), seq: pending.seq, hit: Some(hit),
+        });
+        assert!(replacement.picking.consume_gpu_result(plot.instance_id, |_| true).is_none());
+        assert!(replacement.picking.has_outstanding_gpu_request());
+        assert!(take_latest_request(plot.instance_id, &pending.projection).is_none());
+        let (current, _) = take_latest_request(plot.instance_id, replacement.picking.projection()).unwrap();
+        publish_result(plot.instance_id, GpuPickResult {
+            projection: current.projection.clone(), seq: current.seq, hit: Some(hit),
+        });
+        assert!(old.picking.consume_gpu_result(plot.instance_id, |_| true).is_none());
+        // A late old completion cannot overwrite even an already-published result.
+        publish_result(plot.instance_id, GpuPickResult {
+            projection: pending.projection, seq: u64::MAX, hit: None,
+        });
+        assert!(matches!(replacement.picking.consume_gpu_result(plot.instance_id, |_| true),
+            Some(GpuResultEvent::Hover(point)) if point == hit));
+        assert!(!replacement.picking.has_outstanding_gpu_request());
+
+        // One state can also rebuild its marker generation while work is pending.
+        replacement.picking.submit_gpu_request(plot.instance_id, Vec2::ZERO, 8.0);
+        let (previous_generation, _) = take_latest_request(plot.instance_id, replacement.picking.projection()).unwrap();
+        plot.set_series_positions(&id, &[]);
+        replacement.rebuild_from_widget(&plot);
+        assert!(replacement.points.is_empty());
+        assert!(!replacement.picking.has_outstanding_gpu_request());
+        assert!(replacement.picking.last_hover_cache.is_none());
+        publish_result(plot.instance_id, GpuPickResult {
+            projection: previous_generation.projection,
+            seq: previous_generation.seq,
+            hit: Some(hit),
+        });
+        assert!(replacement.picking.consume_gpu_result(plot.instance_id, |_| true).is_none());
+        let unchanged = replacement.clone();
+        assert!(replacement.picking.projection().same_as(unchanged.picking.projection()));
+        assert!(!replacement.picking.projection().same_as(old.picking.projection()));
+    }
+
+    #[test]
+    fn current_generation_preserves_click_interpretation_and_request_coalescing() {
+        use super::*;
+
+        let series = crate::Series::markers_only(
+            vec![[0.0, 0.0]; CPU_PICK_THRESHOLD + 1],
+            crate::MarkerStyle::default(),
+        );
+        let id = series.id;
+        let plot = crate::PlotWidgetBuilder::new().add_series(series).build().unwrap();
+        let mut state = crate::plot_state::PlotState::default();
+        state.rebuild_from_widget(&plot);
+        assert!(plot.pick_hit(&mut state).is_none());
+        let (request, _) = take_latest_request(plot.instance_id, state.picking.projection()).unwrap();
+        let hit = PointId { series_id: id, point_index: 3 };
+        publish_result(plot.instance_id, GpuPickResult {
+            projection: request.projection.clone(), seq: request.seq, hit: Some(hit),
+        });
+        assert!(matches!(state.picking.consume_gpu_result(plot.instance_id, |_| true),
+            Some(GpuResultEvent::Pick(point)) if point == hit));
+        assert!(!state.picking.has_outstanding_gpu_request());
+        state.picking.submit_gpu_request(plot.instance_id, Vec2::new(1.0, 2.0), 8.0);
+        state.picking.submit_gpu_request(plot.instance_id, Vec2::new(3.0, 4.0), 8.0);
+        let (newest, _) = take_latest_request(plot.instance_id, state.picking.projection()).unwrap();
+        assert_eq!(newest.seq, 3);
+        assert_eq!((newest.cursor_x, newest.cursor_y), (3.0, 4.0));
+        assert!(take_latest_request(plot.instance_id, state.picking.projection()).is_none());
+        publish_result(plot.instance_id, GpuPickResult {
+            projection: newest.projection, seq: newest.seq, hit: None,
+        });
+        assert!(matches!(state.picking.consume_gpu_result(plot.instance_id, |_| true), Some(GpuResultEvent::HoverMiss)));
     }
 
     #[test]

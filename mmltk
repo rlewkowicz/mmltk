@@ -2175,7 +2175,7 @@ run_release_ninja() {
          /workspace/tools/run_traced_command.sh cargo_fmt_iced_aw \
              cargo fmt --manifest-path /workspace/third_party/iced_aw/Cargo.toml
          /workspace/tools/run_traced_command.sh cargo_fmt_frontend_iced \
-             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml
+             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml --package mmltk-browser-app
          /workspace/tools/configure_cmake_graph.sh \
              release "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/release" \
              -DBUILD_MMLTK_BROWSER_HOST=ON \
@@ -2496,7 +2496,7 @@ run_gui_build() {
          /workspace/tools/run_traced_command.sh cargo_fmt_iced_aw \
              cargo fmt --manifest-path /workspace/third_party/iced_aw/Cargo.toml
          /workspace/tools/run_traced_command.sh cargo_fmt_frontend_iced \
-             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml
+             cargo fmt --manifest-path /workspace/src/frontend/iced/Cargo.toml --package mmltk-browser-app
          cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \
              --parallel "${MMLTK_JOBS}" --target mmltk_frontend_iced_check
          cmake --build "${MMLTK_CONTAINER_CACHE_ROOT}/cmake/gui" \

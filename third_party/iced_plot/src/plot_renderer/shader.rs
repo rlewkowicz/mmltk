@@ -6,7 +6,7 @@ use super::{
 use crate::LineStyle;
 use crate::picking::PickingPass;
 use crate::transform::data_value_to_plot_with_axis_range;
-use crate::{LineType, Size, camera::CameraUniform, grid::Grid, plot_state::PlotState};
+use crate::{LineType, Size, camera::CameraUniform, grid::Grid, plot_state::{PlotState, ProjectionOrigin}};
 use iced::widget::shader::Viewport;
 use iced::{Rectangle, wgpu::*};
 
@@ -211,24 +211,78 @@ impl BufferCache {
     }
 }
 
-/// Tracks version numbers to detect changes
-struct VersionTracker {
+/// Retained dependencies of the uploaded buffers, including the owner of local counters.
+struct BufferDependencies {
+    origin: Option<ProjectionOrigin>,
     markers: u64,
     fills: u64,
     lines: u64,
     highlight: u64,
     render_offset: glam::DVec2,
+    reference: Option<ReferenceKey>,
+    crosshair: Option<(bool, glam::Vec2)>,
+    selection: Option<(bool, bool, glam::Vec2, glam::Vec2)>,
 }
 
-impl VersionTracker {
+#[derive(Debug, Default, PartialEq)]
+struct BufferChanges {
+    markers: bool,
+    fills: bool,
+    lines: bool,
+    reference: bool,
+    highlight: bool,
+    selection: bool,
+    crosshair: bool,
+}
+
+impl BufferDependencies {
     fn new() -> Self {
         Self {
+            origin: None,
             markers: 0,
             fills: 0,
             lines: 0,
             highlight: 0,
             render_offset: glam::DVec2::ZERO,
+            reference: None,
+            crosshair: None,
+            selection: None,
         }
+    }
+
+    fn changes(&self, state: &PlotState, reference: ReferenceKey, geometry_changed: bool) -> BufferChanges {
+        let origin_changed = self.origin.as_ref().is_none_or(|origin| !origin.same_as(state.origin()));
+        let offset_changed = self.render_offset != state.camera.render_offset;
+        let axes_changed = self.reference.is_none_or(|previous|
+            previous.x_axis != reference.x_axis || previous.y_axis != reference.y_axis);
+        BufferChanges {
+            markers: origin_changed || offset_changed || self.markers != state.markers_version,
+            fills: origin_changed || offset_changed || self.fills != state.fills_version,
+            lines: origin_changed || offset_changed || self.lines != state.lines_version,
+            reference: origin_changed || self.reference != Some(reference),
+            highlight: origin_changed || geometry_changed || axes_changed || self.highlight != state.highlight_version,
+            selection: geometry_changed || self.selection != Some(Self::selection(state)),
+            crosshair: geometry_changed || self.crosshair != Some((state.crosshairs_enabled, state.crosshairs_position)),
+        }
+    }
+
+    fn selection(state: &PlotState) -> (bool, bool, glam::Vec2, glam::Vec2) {
+        (state.selection.active, state.selection.moved, state.selection.start, state.selection.end)
+    }
+
+    /// Commit only after the renderer has refreshed every affected buffer.
+    fn synchronized(&mut self, state: &PlotState, reference: ReferenceKey) {
+        if self.origin.as_ref().is_none_or(|origin| !origin.same_as(state.origin())) {
+            self.origin = Some(state.origin().clone());
+        }
+        self.markers = state.markers_version;
+        self.fills = state.fills_version;
+        self.lines = state.lines_version;
+        self.highlight = state.highlight_version;
+        self.render_offset = state.camera.render_offset;
+        self.reference = Some(reference);
+        self.selection = Some(Self::selection(state));
+        self.crosshair = Some((state.crosshairs_enabled, state.crosshairs_position));
     }
 }
 
@@ -308,7 +362,7 @@ pub struct PlotRenderer {
     // Caches
     pipelines: PipelineCache,
     buffers: BufferCache,
-    versions: VersionTracker,
+    dependencies: BufferDependencies,
     // Support objects
     grid: Grid,
     picking: PickingPass,
@@ -317,9 +371,6 @@ pub struct PlotRenderer {
     bounds_h: u32,
     bounds: Rectangle,
     prepared: Option<(crate::camera::Camera, u32, u32, f32)>,
-    reference_key: Option<ReferenceKey>,
-    crosshair: Option<(bool, glam::Vec2)>,
-    selection_key: Option<(bool, bool, glam::Vec2, glam::Vec2)>,
     scratch: VertexWriter,
     float_scratch: Vec<f32>,
     marker_scratch: VertexWriter,
@@ -406,14 +457,14 @@ impl PlotRenderer {
             msaa_targets: None,
             pipelines: PipelineCache::new(),
             buffers: BufferCache::new(),
-            versions: VersionTracker::new(),
+            dependencies: BufferDependencies::new(),
             grid: Grid::default(),
             picking: PickingPass::default(),
             bounds_w: 0,
             bounds_h: 0,
             bounds: Rectangle::default(),
             scale_factor: 1.0,
-            prepared: None, reference_key: None, crosshair: None, selection_key: None,
+            prepared: None,
             float_scratch: Vec::new(), marker_scratch: VertexWriter::new(),
             scratch: VertexWriter::new(), poly_positions: Vec::new(),
             poly_distances: Vec::new(), poly_colors: Vec::new(),
@@ -557,53 +608,33 @@ impl PlotRenderer {
     }
 
     fn sync(&mut self, device: &Device, queue: &Queue, state: &PlotState, geometry_changed: bool) {
-        // Check if render offset changed - if so, we need to rebuild vertex buffers
-        // since positions are stored relative to render_offset
-        let offset_changed = self.versions.render_offset != state.camera.render_offset;
-
-        if state.markers_version != self.versions.markers || offset_changed {
+        let reference = ReferenceKey::new(state, self.bounds_w, self.bounds_h, self.scale_factor);
+        let changes = self.dependencies.changes(state, reference, geometry_changed);
+        if changes.markers {
             self.rebuild_markers(device, queue, state);
-            self.versions.markers = state.markers_version;
         }
-        if state.fills_version != self.versions.fills || offset_changed {
+        if changes.fills {
             self.rebuild_fills(device, queue, state);
-            self.versions.fills = state.fills_version;
         }
-        if state.lines_version != self.versions.lines || offset_changed {
+        if changes.lines {
             self.rebuild_lines(device, queue, state);
-            self.versions.lines = state.lines_version;
         }
-
-        let reference_key = ReferenceKey::new(state, self.bounds_w, self.bounds_h, self.scale_factor);
-        if self.reference_key != Some(reference_key) {
+        if changes.reference {
             self.rebuild_reflines(device, queue, state);
-            self.reference_key = Some(reference_key);
         }
-
-        // Update cached render offset
-        self.versions.render_offset = state.camera.render_offset;
-
         // Selection uploads follow its actual geometry and interaction dependencies.
-        let selection = (state.selection.active, state.selection.moved, state.selection.start, state.selection.end);
-        if geometry_changed || self.selection_key != Some(selection) {
+        if changes.selection {
             self.rebuild_selection(device, queue, state);
-            self.selection_key = Some(selection);
         }
-
-        // Hover/pick highlight mask boxes are baked in clip space, so they must be rebuilt
-        // whenever the camera or viewport changes (zoom/pan/resize), not only when the
-        // highlighted points change.
-        if state.highlight_version != self.versions.highlight || geometry_changed {
+        // Highlights also consume camera/viewport and axis transforms.
+        if changes.highlight {
             self.rebuild_highlight(device, queue, state);
-            self.versions.highlight = state.highlight_version;
         }
-
         // Unchanged crosshairs reuse their retained buffer.
-        let crosshair = (state.crosshairs_enabled, state.crosshairs_position);
-        if geometry_changed || self.crosshair != Some(crosshair) {
+        if changes.crosshair {
             self.rebuild_crosshairs(device, queue, state);
-            self.crosshair = Some(crosshair);
         }
+        self.dependencies.synchronized(state, reference);
     }
 
     /// Prepare the renderer for a new frame given the viewport and current plot state.
@@ -680,7 +711,7 @@ impl PlotRenderer {
             &self.camera_bgl,
             marker_buffer,
             marker_instances,
-            &state.points,
+            state.picking.projection(),
             &state.series,
         );
     }
@@ -1127,6 +1158,7 @@ impl PlotRenderer {
 
         if marker_series_count == 0 {
             VertexBuffer::clear(&mut self.buffers.markers);
+            self.picking.clear_id_map(state.picking.projection());
             return;
         }
 
@@ -1191,7 +1223,7 @@ impl PlotRenderer {
         }
 
         // Update picking id map
-        self.picking.set_id_map(id_map);
+        self.picking.set_id_map(id_map, state.picking.projection());
         self.marker_scratch = writer;
     }
 
@@ -1991,6 +2023,391 @@ fn line_width_params(width: Size) -> (f32, u32) {
 #[cfg(test)]
 mod reference_dependency_tests {
     use super::*;
+    use crate::{Fill, HLine, MarkerStyle, PlotWidget, PlotWidgetBuilder, PointId, Series, VLine};
+    use crate::plot_widget::HighlightPoint;
+
+    fn project(plot: &PlotWidget) -> PlotState {
+        let mut state = PlotState::default();
+        update_projection(plot, &mut state);
+        state
+    }
+
+    fn update_projection(plot: &PlotWidget, state: &mut PlotState) {
+        let _ = iced::widget::shader::Program::update(
+            plot,
+            state,
+            &iced::Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now())),
+            Rectangle::with_size(iced::Size::new(640.0, 360.0)),
+            iced::mouse::Cursor::Unavailable,
+        );
+    }
+
+    fn reference(state: &PlotState) -> ReferenceKey {
+        ReferenceKey::new(state, 640, 360, 1.0)
+    }
+
+    fn populated_plot() -> (PlotWidget, crate::ShapeId, VLine, HLine) {
+        let mut plot = PlotWidgetBuilder::new().build().unwrap();
+        let series = Series::new(
+            vec![[0.0, 0.0], [1.0, 0.25], [2.0, 1.0]],
+            MarkerStyle::default(),
+            LineStyle::solid(),
+        );
+        let id = series.id;
+        plot.add_series(series).unwrap();
+        let vertical = VLine::new(0.5);
+        let horizontal = HLine::new(0.0);
+        plot.add_vline(vertical.clone());
+        plot.add_hline(horizontal.clone());
+        plot.add_fill(Fill::new(id, horizontal.id)).unwrap();
+        plot.picked_points.insert(PointId { series_id: id, point_index: 1 }, (
+            HighlightPoint {
+                x: 1.0, y: 0.25, transform: Default::default(), color: iced::Color::BLACK,
+                marker_style: Some(MarkerStyle::default()), mask_padding: Some(2.0),
+            }, None,
+        ));
+        (plot, id, vertical, horizontal)
+    }
+
+    fn assert_projection_refresh(changes: &BufferChanges) {
+        assert!(changes.markers);
+        assert!(changes.lines);
+        assert!(changes.fills);
+        assert!(changes.reference);
+        assert!(changes.highlight);
+    }
+
+    #[test]
+    fn retained_buffers_refresh_real_remounts_with_equal_counters_and_extrema() {
+        let (mut plot, id, mut vertical, mut horizontal) = populated_plot();
+        let instance = plot.instance_id;
+        let mut dependencies = BufferDependencies::new();
+        let mut previous = project(&plot);
+        assert_projection_refresh(&dependencies.changes(&previous, reference(&previous), true));
+        dependencies.synchronized(&previous, reference(&previous));
+
+        for interior in [0.75, 0.125, 0.625] {
+            plot.set_series_positions(&id, &[[0.0, 0.0], [1.0, interior], [2.0, 1.0]]);
+            vertical.x = interior;
+            horizontal.y = interior * 0.1;
+            plot.add_vline(vertical.clone());
+            plot.add_hline(horizontal.clone());
+            plot.picked_points.values_mut().next().unwrap().0.y = interior;
+            let replacement = project(&plot);
+            assert_eq!(plot.instance_id, instance);
+            assert_eq!(previous.data_min, replacement.data_min);
+            assert_eq!(previous.data_max, replacement.data_max);
+            assert_eq!(previous.camera, replacement.camera);
+            assert_eq!(previous.bounds, replacement.bounds);
+            assert_eq!(previous.markers_version, replacement.markers_version);
+            assert_eq!(previous.lines_version, replacement.lines_version);
+            assert_eq!(previous.fills_version, replacement.fills_version);
+            assert_eq!(previous.reference_version, replacement.reference_version);
+            assert_eq!(previous.highlight_version, replacement.highlight_version);
+            assert_ne!(previous.points[1].position, replacement.points[1].position);
+            assert_ne!(previous.fills[0].vertices, replacement.fills[0].vertices);
+            assert_ne!(previous.vlines[0].x, replacement.vlines[0].x);
+            assert_ne!(previous.hlines[0].y, replacement.hlines[0].y);
+            assert_ne!(previous.highlighted_points, replacement.highlighted_points);
+            let changes = dependencies.changes(&replacement, reference(&replacement), false);
+            assert_projection_refresh(&changes);
+            // These buffers depend on actual interaction geometry, not local counters.
+            assert!(!changes.selection);
+            assert!(!changes.crosshair);
+            dependencies.synchronized(&replacement, reference(&replacement));
+            drop(previous);
+            let shallow = replacement.clone();
+            assert_eq!(dependencies.changes(&shallow, reference(&shallow), false), BufferChanges::default());
+            assert_eq!(dependencies.changes(&replacement, reference(&replacement), false), BufferChanges::default());
+            previous = replacement;
+        }
+
+        // The cached origin stays owned even after every tree/draw state is gone.
+        let retained = previous.origin().clone();
+        drop(previous);
+        assert!(dependencies.origin.as_ref().unwrap().same_as(&retained));
+        let replacement = project(&plot);
+        assert!(!retained.same_as(replacement.origin()));
+        assert_projection_refresh(&dependencies.changes(&replacement, reference(&replacement), false));
+    }
+
+    #[test]
+    fn empty_remount_requests_every_projection_clear_then_reuses_it() {
+        let (mut plot, id, vertical, horizontal) = populated_plot();
+        let populated = project(&plot);
+        let mut dependencies = BufferDependencies::new();
+        dependencies.synchronized(&populated, reference(&populated));
+        plot.set_series_positions(&id, &[]);
+        plot.update(crate::PlotUiMessage::ToggleSeriesVisibility(vertical.id));
+        plot.update(crate::PlotUiMessage::ToggleSeriesVisibility(horizontal.id));
+        plot.picked_points.clear();
+        // Preserve the actual widget's saved view, as navigation does.
+        plot.camera_bounds = Some((populated.camera, populated.bounds));
+        let empty = project(&plot);
+        assert_eq!(empty.camera, populated.camera);
+        assert_eq!(empty.lines_version, populated.lines_version);
+        assert_eq!(empty.reference_version, populated.reference_version);
+        assert!(empty.points.is_empty());
+        assert!(empty.series.is_empty());
+        assert!(empty.fills.is_empty());
+        assert!(empty.vlines.is_empty() && empty.hlines.is_empty());
+        assert!(empty.highlighted_points.is_empty());
+        // Each true branch runs the existing count/segment clearing path in sync.
+        assert_projection_refresh(&dependencies.changes(&empty, reference(&empty), false));
+        dependencies.synchronized(&empty, reference(&empty));
+        assert_eq!(dependencies.changes(&empty, reference(&empty), false), BufferChanges::default());
+        let another_empty = project(&plot);
+        assert_projection_refresh(&dependencies.changes(&another_empty, reference(&another_empty), false));
+    }
+
+    #[test]
+    fn synchronized_projection_preserves_independent_geometry_dependencies() {
+        let (mut plot, id, mut vertical, _) = populated_plot();
+        let mut state = project(&plot);
+        let mut dependencies = BufferDependencies::new();
+        dependencies.synchronized(&state, reference(&state));
+        vertical.label = Some("label only".into());
+        plot.add_vline(vertical);
+        update_projection(&plot, &mut state);
+        assert_eq!(dependencies.changes(&state, reference(&state), false), BufferChanges::default());
+        plot.set_series_positions(&id, &[[0.0, 0.0], [1.0, 0.5], [2.0, 1.0]]);
+        update_projection(&plot, &mut state);
+        let changes = dependencies.changes(&state, reference(&state), false);
+        assert!(changes.markers && changes.lines && changes.fills);
+        assert!(!changes.reference && !changes.highlight);
+        dependencies.synchronized(&state, reference(&state));
+
+        state.selection.active = true;
+        state.selection.moved = true;
+        state.selection.end = glam::Vec2::new(10.0, 20.0);
+        state.crosshairs_enabled = true;
+        state.crosshairs_position = glam::Vec2::new(20.0, 30.0);
+        let changes = dependencies.changes(&state, reference(&state), false);
+        assert_eq!(changes, BufferChanges { selection: true, crosshair: true, ..Default::default() });
+        dependencies.synchronized(&state, reference(&state));
+        for (width, height, scale) in [(800, 360, 1.0), (640, 480, 1.0), (640, 360, 2.0)] {
+            let changes = dependencies.changes(&state, ReferenceKey::new(&state, width, height, scale), true);
+            assert!(changes.reference && changes.highlight && changes.selection && changes.crosshair);
+            assert!(!changes.markers && !changes.lines && !changes.fills);
+        }
+        state.camera.position.x += 1.0;
+        let changes = dependencies.changes(&state, reference(&state), true);
+        assert!(changes.reference && changes.highlight && changes.selection && changes.crosshair);
+        dependencies.synchronized(&state, reference(&state));
+        state.camera.render_offset.x += 1.0;
+        assert_projection_refresh(&dependencies.changes(&state, reference(&state), true));
+        dependencies.synchronized(&state, reference(&state));
+        state.x_axis_scale = crate::AxisScale::Log { base: 10.0 };
+        let changes = dependencies.changes(&state, reference(&state), false);
+        assert!(changes.reference && changes.highlight);
+        assert!(!changes.markers && !changes.lines && !changes.fills);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn gpu_picking_settles_old_maps_before_servicing_remounted_or_rebuilt_markers() {
+        use crate::picking::{CPU_PICK_THRESHOLD, GpuResultEvent, HoverRequest};
+
+        fn request(plot: &PlotWidget, state: &mut PlotState) {
+            let cursor = glam::Vec2::new(
+                crate::plot_widget::world_to_screen_position_x(1.0, &state.camera, &state.bounds).unwrap(),
+                crate::plot_widget::world_to_screen_position_y(1.0, &state.camera, &state.bounds).unwrap(),
+            );
+            assert!(matches!(state.picking.request_hover(
+                plot.instance_id, cursor, 8.0, false, &state.points, &state.series,
+                &state.camera, &state.bounds, |_| true,
+            ), HoverRequest::RequestedGpu));
+        }
+
+        fn settle(device: &Device) {
+            device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(5)),
+            }).expect("GPU picking callback must settle");
+        }
+
+        fn redraw(plot: &mut PlotWidget, state: &mut PlotState) -> iced::window::RedrawRequest {
+            let action = iced::widget::shader::Program::update(
+                plot, state,
+                &iced::Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now())),
+                Rectangle::with_size(iced::Size::new(640.0, 360.0)),
+                iced::mouse::Cursor::Unavailable,
+            );
+            let Some(action) = action else { return iced::window::RedrawRequest::Wait; };
+            let (message, redraw, _) = action.into_inner();
+            if let Some(message) = message {
+                assert!(message.get_hover_pick_event().is_none(), "stale maps publish no UI event");
+                plot.update(message);
+            }
+            redraw
+        }
+
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::VULKAN,
+            ..Default::default()
+        });
+        let adapter = iced::futures::executor::block_on(instance.request_adapter(&Default::default()))
+            .expect("browser-app picking acceptance requires the container Vulkan adapter");
+        let (device, queue) = iced::futures::executor::block_on(adapter.request_device(&Default::default()))
+            .expect("GPU picking test device");
+        let count = CPU_PICK_THRESHOLD + 1;
+        let mut points = vec![[0.0, 0.0]; count];
+        points[count - 1] = [1.0, 1.0];
+        let series = Series::markers_only(points.clone(), MarkerStyle::default());
+        let id = series.id;
+        let mut plot = PlotWidgetBuilder::new().add_series(series).build().unwrap();
+        let mut state = project(&plot);
+        let viewport = Viewport::with_physical_size(iced::Size::new(640, 360), 1.0);
+        let mut renderer = PlotRenderer::new(&device, &queue, TextureFormat::Bgra8UnormSrgb);
+        renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+        let marker_capacity = renderer.buffers.markers.as_ref().unwrap().buffer.size();
+        request(&plot, &mut state);
+        renderer.service_picking(plot.instance_id, &device, &queue, &state);
+
+        for (visit, selected) in [count - 2, count - 1, count - 3].into_iter().enumerate() {
+            points.fill([0.0, 0.0]);
+            points[selected] = [1.0, 1.0];
+            plot.set_series_positions(&id, &points);
+            if visit < 2 {
+                let replacement = project(&plot);
+                assert_eq!(state.markers_version, replacement.markers_version);
+                assert_eq!(state.camera, replacement.camera);
+                state = replacement;
+            } else {
+                // The same tree can change marker generation while a map is pending.
+                update_projection(&plot, &mut state);
+            }
+            request(&plot, &mut state);
+            renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+            settle(&device);
+            renderer.service_picking(plot.instance_id, &device, &queue, &state);
+            assert!(state.picking.consume_gpu_result(plot.instance_id, |_| true).is_none());
+            assert!(state.picking.has_outstanding_gpu_request());
+            // Successful reuse requires the stale mapping to have been unmapped.
+            settle(&device);
+            renderer.service_picking(plot.instance_id, &device, &queue, &state);
+            assert!(matches!(state.picking.consume_gpu_result(plot.instance_id, |_| true),
+                Some(GpuResultEvent::Hover(point)) if point.series_id == id && point.point_index == selected));
+            assert!(!state.picking.has_outstanding_gpu_request());
+            assert_eq!(renderer.buffers.markers.as_ref().unwrap().buffer.size(), marker_capacity);
+            let shallow = state.clone();
+            assert_eq!(renderer.dependencies.changes(&shallow, reference(&shallow), false), BufferChanges::default());
+            request(&plot, &mut state);
+            renderer.service_picking(plot.instance_id, &device, &queue, &state);
+        }
+
+        plot.camera_bounds = Some((state.camera, state.bounds));
+        plot.set_series_positions(&id, &[]);
+        state = project(&plot);
+        renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+        settle(&device);
+        renderer.service_picking(plot.instance_id, &device, &queue, &state);
+        assert!(state.picking.consume_gpu_result(plot.instance_id, |_| true).is_none());
+        assert_eq!(renderer.buffers.markers.as_ref().unwrap().vertex_count, 0);
+        assert_eq!(renderer.buffers.markers.as_ref().unwrap().buffer.size(), marker_capacity);
+
+        // Refill after the empty visit proves the previous mapping did not strand staging.
+        plot.set_series_positions(&id, &points);
+        state = project(&plot);
+        request(&plot, &mut state);
+        renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+        renderer.service_picking(plot.instance_id, &device, &queue, &state);
+        settle(&device);
+        renderer.service_picking(plot.instance_id, &device, &queue, &state);
+        assert!(matches!(state.picking.consume_gpu_result(plot.instance_id, |_| true),
+            Some(GpuResultEvent::Hover(point)) if point.series_id == id && point.point_index == count - 3));
+
+        // Empty, below-threshold and disabled replacements must schedule physical
+        // settlement themselves even though none has a logical GPU request.
+        for mode in 0..3 {
+            for cancel in [false, true] {
+                plot.controls = crate::controls::PlotControls::default();
+                plot.set_highlight_on_hover(true);
+                plot.set_series_positions(&id, &points);
+                state = PlotState::default();
+                let _ = redraw(&mut plot, &mut state);
+                renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+                request(&plot, &mut state);
+                renderer.service_picking(plot.instance_id, &device, &queue, &state);
+                // Hold delivery of the actual map callback, so the first real
+                // PollType::Poll sees None on every adapter, including fast ones.
+                let release = renderer.picking.hold_pending_callback(cancel);
+                match mode {
+                    0 => plot.set_series_positions(&id, &[]),
+                    1 => plot.set_series_positions(&id, &[[0.0, 0.0], [1.0, 1.0]]),
+                    _ => {
+                        plot.set_highlight_on_hover(false);
+                        plot.controls.unbind_click(iced::mouse::Button::Left);
+                    }
+                }
+                state = PlotState::default();
+                let _ = redraw(&mut plot, &mut state); // apply normal projection/UI publication
+                renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+                renderer.service_picking(plot.instance_id, &device, &queue, &state);
+                assert!(state.picking.has_outstanding_gpu_request());
+                assert_eq!(redraw(&mut plot, &mut state), iced::window::RedrawRequest::NextFrame);
+                assert!(state.picking.consume_gpu_result(plot.instance_id, |_| true).is_none());
+                // Readiness is made deterministic only AFTER ordinary update has
+                // requested the service frame; no manually assumed redraw drives it.
+                settle(&device);
+                release(&mut renderer.picking);
+                renderer.service_picking(plot.instance_id, &device, &queue, &state);
+                assert!(!state.picking.has_outstanding_gpu_request());
+                assert_eq!(redraw(&mut plot, &mut state), iced::window::RedrawRequest::Wait);
+                assert!(state.picking.consume_gpu_result(plot.instance_id, |_| true).is_none());
+                assert_eq!(renderer.buffers.markers.as_ref().unwrap().buffer.size(), marker_capacity);
+            }
+        }
+
+        // A current cancellation publishes its ordinary miss, then becomes idle.
+        plot.controls = crate::controls::PlotControls::default();
+        plot.set_highlight_on_hover(true);
+        state = PlotState::default();
+        let _ = redraw(&mut plot, &mut state);
+        request(&plot, &mut state);
+        renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+        renderer.service_picking(plot.instance_id, &device, &queue, &state);
+        let release = renderer.picking.hold_pending_callback(true);
+        renderer.service_picking(plot.instance_id, &device, &queue, &state);
+        assert_eq!(redraw(&mut plot, &mut state), iced::window::RedrawRequest::NextFrame);
+        settle(&device);
+        release(&mut renderer.picking);
+        renderer.service_picking(plot.instance_id, &device, &queue, &state);
+        assert!(matches!(state.picking.consume_gpu_result(plot.instance_id, |_| true), Some(GpuResultEvent::HoverMiss)));
+        assert_eq!(redraw(&mut plot, &mut state), iced::window::RedrawRequest::Wait);
+
+        // Pass teardown cancels a real pending map before relinquishing redraw
+        // custody. Unwinding exercises the same physical RAII abandonment path.
+        for unwind in [false, true] {
+            request(&plot, &mut state);
+            renderer.service_picking(plot.instance_id, &device, &queue, &state);
+            let _held = renderer.picking.hold_pending_callback(false);
+            let mut replacement = PlotState::default();
+            let _ = redraw(&mut plot, &mut replacement);
+            renderer.service_picking(plot.instance_id, &device, &queue, &replacement);
+            assert_eq!(redraw(&mut plot, &mut replacement), iced::window::RedrawRequest::NextFrame);
+            if unwind {
+                assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _owner = renderer;
+                    panic!("abandon admitted map during renderer failure");
+                })).is_err());
+            } else {
+                drop(renderer);
+            }
+            assert!(!replacement.picking.has_outstanding_gpu_request());
+            assert_eq!(redraw(&mut plot, &mut replacement), iced::window::RedrawRequest::Wait);
+            state = replacement;
+            renderer = PlotRenderer::new(&device, &queue, TextureFormat::Bgra8UnormSrgb);
+            // Missing renderer geometry declines the request before any physical
+            // admission. It must publish the ordinary miss without setting custody.
+            request(&plot, &mut state);
+            renderer.service_picking(plot.instance_id, &device, &queue, &state);
+            assert!(matches!(state.picking.consume_gpu_result(plot.instance_id, |_| true), Some(GpuResultEvent::HoverMiss)));
+            assert_eq!(redraw(&mut plot, &mut state), iced::window::RedrawRequest::Wait);
+            renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
+        }
+    }
+
     #[test]
     fn reference_upload_key_tracks_content_camera_viewport_and_axes_only() {
         let mut state = PlotState::default();

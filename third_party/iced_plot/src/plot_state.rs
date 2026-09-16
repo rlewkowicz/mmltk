@@ -19,12 +19,24 @@ use crate::{
     transform::{data_point_to_plot_with_transform, data_value_to_plot_with_axis_range},
 };
 
+/// Ownership identity for one tree state's local projection counters.
+/// Renderers retain this allocation, preventing address reuse while cached.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProjectionOrigin(Arc<()>);
+
+impl ProjectionOrigin {
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 #[derive(Clone)]
 /// PlotState is a projection of the widget configuration, data, and interaction state.
 /// It holds the GPU-ready data needed for rendering the plot.
 ///
 /// Not part of the public API, but pub visibility is required for the shader implementation.
 pub struct PlotState {
+    origin: ProjectionOrigin,
     // Immutable shared data to allow cheap shallow clones.
     pub(crate) points: Arc<[Point]>,       // vertex/instance data
     pub(crate) point_colors: Arc<[Color]>, // per-point colors (matches points)
@@ -89,7 +101,10 @@ pub struct PlotState {
 
 impl Default for PlotState {
     fn default() -> Self {
+        let origin = ProjectionOrigin::default();
         Self {
+            picking: PickingState::new(origin.clone(), 1),
+            origin,
             data_src_version: 0,
             source_instance_id: None,
             points: Arc::new([]),
@@ -129,7 +144,6 @@ impl Default for PlotState {
             hover_enabled: true,
             pick_enabled: true,
             hover_radius_px: 8.0,
-            picking: PickingState::default(),
             crosshairs_enabled: false,
             crosshairs_position: Vec2::ZERO,
             x_axis_formatter: None,
@@ -146,6 +160,10 @@ impl Default for PlotState {
 }
 
 impl PlotState {
+    pub(crate) fn origin(&self) -> &ProjectionOrigin {
+        &self.origin
+    }
+
     /// Sync hover/pick highlight overlay points from the widget without rebuilding plot geometry.
     ///
     /// Returns true if the overlay data changed.
@@ -354,6 +372,7 @@ impl PlotState {
         // Force GPU buffers to rebuild only when data actually changes
         // (not when only hover/pick changes - that's tracked by highlight_version)
         self.markers_version = self.markers_version.wrapping_add(1);
+        self.picking.reproject(widget.instance_id, self.markers_version);
         self.lines_version = self.lines_version.wrapping_add(1);
         self.fills_version = self.fills_version.wrapping_add(1);
     }

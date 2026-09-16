@@ -170,12 +170,15 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             ${_mmltk_frontend_environment}
             "${MMLTK_CARGO_EXECUTABLE}" fmt
             --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+            --package mmltk-browser-app
             --
             --check
         COMMAND "${CMAKE_COMMAND}" -E env
             ${_mmltk_frontend_environment}
             "${MMLTK_CARGO_EXECUTABLE}" test
             --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+            --package mmltk-browser-app
+            --package iced_plot
             --locked
             --frozen
             --no-run
@@ -195,6 +198,8 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             ${_mmltk_frontend_environment}
             "${MMLTK_CARGO_EXECUTABLE}" test
             --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+            --package mmltk-browser-app
+            --package iced_plot
             --locked
             --frozen
             ${MMLTK_ICED_TEST_ARGUMENTS}

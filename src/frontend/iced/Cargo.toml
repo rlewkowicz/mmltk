@@ -5,6 +5,11 @@ edition = "2024"
 rust-version = "1.92"
 publish = false
 
+[workspace]
+members = [".", "../../../third_party/iced_plot"]
+default-members = ["."]
+resolver = "3"
+
 [lib]
 path = "src/lib.rs"
 test = true

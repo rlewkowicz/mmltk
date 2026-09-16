@@ -1737,7 +1737,7 @@ fn update_plot_program<const IS_CANVAS: bool>(
         invalidation.overlay_layer();
     }
 
-    // If we have an outstanding GPU pick request, keep drawing until the result arrives.
+    // Keep servicing both current logical requests and retained maps from an old projection.
     if !IS_CANVAS {
         effects.needs_redraw |= state.picking.has_outstanding_gpu_request();
     }
@@ -2119,6 +2119,33 @@ pub(crate) fn world_to_screen_position_y(
 #[cfg(test)]
 mod retained_data_tests {
     use super::*;
+    #[test]
+    fn shader_draw_shares_tree_projection_origin_but_remount_does_not() {
+        use iced::widget::shader::Program;
+
+        let mut plot = crate::PlotWidgetBuilder::new().build().unwrap();
+        plot.add_series(Series::line_only(
+            vec![[0.0, 0.0], [1.0, 0.25], [2.0, 1.0]],
+            crate::LineStyle::solid(),
+        )).unwrap();
+        let bounds = Rectangle::with_size(iced::Size::new(640.0, 360.0));
+        let event = iced::Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now()));
+        let mut state = PlotState::default();
+        let _ = Program::update(&plot, &mut state, &event, bounds, mouse::Cursor::Unavailable);
+        let first = Program::draw(&plot, &state, mouse::Cursor::Unavailable, bounds);
+        let _ = Program::update(&plot, &mut state, &event, bounds, mouse::Cursor::Unavailable);
+        let redraw = Program::draw(&plot, &state, mouse::Cursor::Unavailable, bounds);
+        assert!(first.plot_widget.origin().same_as(redraw.plot_widget.origin()));
+        assert!(Arc::ptr_eq(&first.plot_widget.points, &redraw.plot_widget.points));
+        assert_eq!(first.plot_widget.lines_version, redraw.plot_widget.lines_version);
+        let mut remounted = PlotState::default();
+        let _ = Program::update(&plot, &mut remounted, &event, bounds, mouse::Cursor::Unavailable);
+        let replacement = Program::draw(&plot, &remounted, mouse::Cursor::Unavailable, bounds);
+        assert_eq!(first.instance_id, replacement.instance_id);
+        assert_eq!(first.plot_widget.lines_version, replacement.plot_widget.lines_version);
+        assert!(!first.plot_widget.origin().same_as(replacement.plot_widget.origin()));
+    }
+
     #[test]
     fn replacement_points_reuse_storage_and_the_plot_instance() {
         let mut plot = crate::PlotWidgetBuilder::new().build().unwrap();
