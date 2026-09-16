@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-namespace mmltk::controller::services::console_output {
+namespace mmltk::testsupport::console_output {
 inline void trim_output_tail(std::string& output_tail, std::size_t max_size = 65536) {
     if (output_tail.size() > max_size) { output_tail.erase(0, output_tail.size() - max_size); }
 }
@@ -63,4 +63,4 @@ inline std::string read_fd(const int fd, const std::string_view error_prefix, co
     }
     return output;
 }
-}  // namespace mmltk::controller::services::console_output
+}  // namespace mmltk::testsupport::console_output

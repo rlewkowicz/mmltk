@@ -11,7 +11,6 @@
 #include <vector>
 #include "src/backend/models/rfdetr/contract/cli.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-#include "src/common/system/runtime_paths.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 namespace mmltk::controller::services {
 namespace {
@@ -179,7 +178,6 @@ std::vector<std::string> build_train_command_arguments(const mmltk::backend::mod
     }
     return arguments;
 }
-std::filesystem::path current_executable_path() { return mmltk::common::system::runtime_paths::current_executable_path(); }
 std::filesystem::path resolve_sibling_mmltk_cli(const std::filesystem::path& executable_path) {
     const std::filesystem::path cli_path = executable_path.parent_path() / "mmltk";
     if (!std::filesystem::exists(cli_path)) { throw std::runtime_error("failed to locate sibling mmltk next to mmltk-browser-host: " + cli_path.string()); }

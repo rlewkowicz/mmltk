@@ -9,8 +9,8 @@
 #include <variant>
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/model_selection.h"
-#include "src/controller/services/persistence_storage.h"
-#include "src/controller/subsystems/system/local_run.h"
+#include "src/controller/services/settings_store.h"
+#include "src/controller/runtime/local_run.h"
 namespace mmltk::controller {
 void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::TrainRequest request, const std::filesystem::path& checkpoint) {
     services::SettingsMutationResult result;
@@ -142,8 +142,8 @@ services::SettingsMutationResult SettingsSystem::Load(services::SettingsLocation
             terminal_ = {services::SettingsTerminal::Rejected, state_.revision, "invalid settings location"};
             result = terminal_;
         } else {
-            auto loaded = services::load_persistence_settings(location);
-            const auto* value = services::view_persistence_settings(loaded.settings);
+            auto loaded = services::SettingsStore::load(location.value());
+            const auto* value = loaded.settings.get();
             std::scoped_lock lock(mutex_);
             if (candidate_version_ == std::numeric_limits<std::uint64_t>::max()) {
                 loaded_ = false;
@@ -244,7 +244,7 @@ services::SettingsMutationResult SettingsSystem::persist(contracts::GuiSettingsS
         result = terminal_;
     }
     if (revision == 0) return result;
-    const auto saved = services::save_persistence_settings(location, services::make_persistence_settings_snapshot(candidate), revision);
+    const auto saved = services::SettingsStore::save(location.value(), candidate, revision);
     {
         std::scoped_lock lock(mutex_);
         if (!saved.succeeded() || saved.revision != revision) {
@@ -314,8 +314,7 @@ ExploreSettingsCandidate SettingsSystem::explore_settings_candidate() const {
         .show_original_dimensions = settings.workflows.explore.show_original_dimensions,
     };
 }
-void SettingsSystem::persist_explore_candidate(const ExploreSettingsCandidate& installed, const std::function_ref<void(contracts::GuiSettingsState&)> mutate,
-                                               const std::string_view invalid_detail, const bool preserve_retry_on_failure) {
+ExploreSettingsCandidate SettingsSystem::Update(const ExploreSettingsCandidate& installed, const ExploreSettingsEdit& edit) {
     services::SettingsMutationResult result;
     {
         std::scoped_lock mutation_lock(mutation_mutex_);
@@ -326,51 +325,21 @@ void SettingsSystem::persist_explore_candidate(const ExploreSettingsCandidate& i
             if (installed.version != candidate_version_) throw contracts::BusyError("Explore settings candidate is stale");
             candidate = retryable_ ? retry_snapshot_ : state_.settings_state;
         }
-        mutate(candidate);
-        if (!contracts::gui_settings_valid(candidate)) throw contracts::InvalidIntentError(std::string(invalid_detail));
-        result = persist(std::move(candidate), preserve_retry_on_failure);
+        if (edit.class_catalog_identity && !edit.preferences) throw contracts::InvalidIntentError("Explore preferences are invalid");
+        if (edit.preferences) install_explore_preferences(candidate.workflows.explore, *edit.preferences);
+        if (edit.augmentation_enabled) candidate.workflows.train.visualize_augmentation_in_explore = *edit.augmentation_enabled;
+        if (edit.show_original_dimensions) candidate.workflows.explore.show_original_dimensions = *edit.show_original_dimensions;
+        if (edit.class_catalog_identity) candidate.workflows.explore.class_catalog_identity = *edit.class_catalog_identity;
+        if (!contracts::gui_settings_valid(candidate)) {
+            const auto detail = edit.class_catalog_identity ? "Explore preferences are invalid"
+                : edit.preferences ? (edit.augmentation_enabled ? "Explore product preferences are invalid" : "Explore filter preferences are invalid")
+                : edit.show_original_dimensions ? "Explore detail settings are invalid" : "Explore augmentation settings are invalid";
+            throw contracts::InvalidIntentError(detail);
+        }
+        result = persist(std::move(candidate), edit.class_catalog_identity.has_value());
     }
     publish(result);
     if (!result.applied()) throw contracts::FailedError(result.detail);
-}
-ExploreSettingsCandidate SettingsSystem::persist_explore_augmentation(const ExploreSettingsCandidate& installed, const bool enabled) {
-    persist_explore_candidate(
-        installed, [enabled](auto& candidate) { candidate.workflows.train.visualize_augmentation_in_explore = enabled; },
-        "Explore augmentation settings are invalid");
     return explore_settings_candidate();
-}
-ExploreSettingsCandidate SettingsSystem::persist_explore_detail(const ExploreSettingsCandidate& installed, const bool show_original_dimensions) {
-    persist_explore_candidate(
-        installed, [show_original_dimensions](auto& candidate) { candidate.workflows.explore.show_original_dimensions = show_original_dimensions; },
-        "Explore detail settings are invalid");
-    return explore_settings_candidate();
-}
-ExploreSettingsCandidate SettingsSystem::persist_explore_product(const ExploreSettingsCandidate& installed, const ExploreFilterUpdate& policy,
-                                                                 const bool augmentation_enabled) {
-    persist_explore_candidate(
-        installed,
-        [&](auto& candidate) {
-            install_explore_preferences(candidate.workflows.explore, policy);
-            candidate.workflows.train.visualize_augmentation_in_explore = augmentation_enabled;
-        },
-        "Explore product preferences are invalid");
-    return explore_settings_candidate();
-}
-ExploreSettingsCandidate SettingsSystem::persist_explore_filter(const ExploreSettingsCandidate& installed, const ExploreFilterUpdate& request) {
-    persist_explore_candidate(
-        installed, [&request](auto& candidate) { install_explore_preferences(candidate.workflows.explore, request); },
-        "Explore filter preferences are invalid");
-    return explore_settings_candidate();
-}
-void SettingsSystem::persist_explore_class_catalog(const ExploreSettingsCandidate& settings_candidate, const ExploreClassCatalogIdentity identity,
-                                                   const ExploreFilterUpdate& preferences) {
-    persist_explore_candidate(
-        settings_candidate,
-        [&preferences, identity](auto& candidate) {
-            auto& explore = candidate.workflows.explore;
-            install_explore_preferences(explore, preferences);
-            explore.class_catalog_identity = identity;
-        },
-        "Explore preferences are invalid", true);
 }
 }  // namespace mmltk::controller

@@ -1,7 +1,7 @@
 #pragma once
 #include "prediction_test_support.h"
 #include "src/controller/contracts/default_state.h"
-#include "src/controller/services/persistence_storage.h"
+#include "src/controller/services/settings_store.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/subsystems/system/dataset_system.h"
@@ -50,7 +50,7 @@ namespace mmltk::controller::test_support {
     settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Onnx;
     REQUIRE(contracts::gui_settings_valid(settings));
     const services::SettingsLocation location{(root / "settings.json").string()};
-    REQUIRE(services::save_persistence_settings(location, services::make_persistence_settings_snapshot(std::move(settings)), 1U).succeeded());
+    REQUIRE(services::SettingsStore::save(location.value(), settings, 1U).succeeded());
     return location;
 }
 [[nodiscard]] inline contracts::ArtifactSplitFact split(const std::filesystem::path& path) {

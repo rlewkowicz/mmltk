@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include "src/controller/contracts/visual_source.h"
-#include "src/controller/contracts/annotation.h"
+#include "src/controller/contracts/annotation_limits.h"
 namespace mmltk::controller {
 enum class WorkspaceMouseKind : std::uint8_t { Motion, Press, Release, Wheel, Enter, Leave, Cancel };
 enum class WorkspaceWheelUnit : std::uint8_t { Lines, Pixels };

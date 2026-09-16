@@ -110,6 +110,7 @@ if(BUILD_RFDETR_NATIVE)
 endif()
 
 add_subdirectory(src/controller/contracts)
+add_subdirectory(src/controller/runtime)
 add_subdirectory(src/controller/services)
 
 if(BUILD_RFDETR_NATIVE)

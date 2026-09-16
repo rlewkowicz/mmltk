@@ -15,9 +15,8 @@
 #include "src/controller/services/train_process_client.h"
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 #include "src/controller/subsystems/system/dataset_system.h"
-#include "src/controller/subsystems/system/local_run.h"
+#include "src/controller/runtime/local_run.h"
 #include "src/controller/subsystems/system/model_system.h"
-#include "src/controller/subsystems/system/system_events.h"
 namespace mmltk::controller {
 class TrainingRuntime {
    public:

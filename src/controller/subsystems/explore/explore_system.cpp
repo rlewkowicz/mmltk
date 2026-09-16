@@ -1,6 +1,6 @@
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/explore/explore_system.h"
-#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
@@ -282,8 +282,8 @@ class ExploreSystem::Impl final {
                             runtime, algorithm, std::move(*rendered), std::move(settled),
                             [&] {
                                 if (catalog_changed) {
-                                    settings_system_.persist_explore_class_catalog(settings_candidate, catalog_identity, preferences);
-                                    settings_candidate = settings_system_.explore_settings_candidate();
+                                    settings_candidate = settings_system_.Update(
+                                        settings_candidate, {.preferences = preferences, .class_catalog_identity = catalog_identity});
                                 } else if (settings_system_.explore_settings_candidate().version != settings_candidate.version) {
                                     throw contracts::BusyError("Explore settings candidate is stale");
                                 }
@@ -383,7 +383,7 @@ class ExploreSystem::Impl final {
                 state.selected_image.reset();
             },
             [this, request](const ExploreSettingsCandidate& installed) -> std::optional<ExploreSettingsCandidate> {
-                return settings_system_.persist_explore_filter(installed, request);
+                return settings_system_.Update(installed, {.preferences = request});
             },
             seed, request.overlay, "Explore filter candidate failed");
     }
@@ -412,7 +412,7 @@ class ExploreSystem::Impl final {
     [[nodiscard]] ExploreSnapshot UpdateAugmentation(const ExploreAugmentationUpdate request) {
         return UpdateRenderSetting(
             [request](ExploreSnapshot& state) { state.augmentation.enabled = request.enabled; },
-            [this, request](const ExploreSettingsCandidate& candidate) { return settings_system_.persist_explore_augmentation(candidate, request.enabled); });
+            [this, request](const ExploreSettingsCandidate& candidate) { return settings_system_.Update(candidate, {.augmentation_enabled = request.enabled}); });
     }
     [[nodiscard]] ExploreSnapshot UpdateOverlay(const ExploreOverlay request) {
         std::unique_lock transaction(desired_admission_mutex_);
@@ -435,7 +435,7 @@ class ExploreSystem::Impl final {
             transaction.unlock();
             return QueueDesired([&](ExploreSnapshot& desired) { desired.overlay = request; }, 0, true);
         }
-        auto refreshed = settings_system_.persist_explore_product(settings_system_.explore_settings_candidate(), *label_only, augmentation);
+        auto refreshed = settings_system_.Update(settings_system_.explore_settings_candidate(), {.preferences = *label_only, .augmentation_enabled = augmentation});
         return InstallRetainedSetting(transaction, std::move(refreshed), [&](auto& target) { target.overlay.show_labels = request.show_labels; });
     }
     [[nodiscard]] ExploreSnapshot RerollAugmentation() {
@@ -448,7 +448,7 @@ class ExploreSystem::Impl final {
     }
     [[nodiscard]] ExploreSnapshot UpdateDetail(const ExploreDetailUpdate request) {
         std::unique_lock transaction(desired_admission_mutex_);
-        auto refreshed = settings_system_.persist_explore_detail(settings_system_.explore_settings_candidate(), request.show_original_dimensions);
+        auto refreshed = settings_system_.Update(settings_system_.explore_settings_candidate(), {.show_original_dimensions = request.show_original_dimensions});
         return InstallRetainedSetting(transaction, std::move(refreshed),
                                       [&](auto& target) { target.detail.show_original_dimensions = request.show_original_dimensions; });
     }
@@ -835,7 +835,7 @@ class ExploreSystem::Impl final {
                 runtime, algorithm, std::move(*rendered), std::move(settled),
                 [&] {
                     if (settings && persist)
-                        settings = settings_system_.persist_explore_product(*settings, policy, augmentation);
+                        settings = settings_system_.Update(*settings, {.preferences = policy, .augmentation_enabled = augmentation});
                     else if (settings && settings_system_.explore_settings_candidate().version != settings->version)
                         throw contracts::BusyError("Explore settings candidate is stale");
                 },

@@ -1,3 +1,4 @@
+#include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/browser/application_workspace_abi_emitter.h"
 #include "src/controller/browser/application_materializer.h"
@@ -924,7 +925,7 @@ TEST_CASE("native application schema flattens inherited request and settings dec
     };
     std::vector<SettingsFact> settings;
     bool inherited_settings_owner = false;
-    ApplicationSchema<InheritedSystems>::VisitSettingsLeaves<InheritedSettings>(
+    VisitSettingsLeaves<InheritedSettings>(
         [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
             settings.push_back({std::string(field.path), field.stable_id, field.mutable_leaf});
             if constexpr (std::same_as<Owner, InheritedSettingsBase>) {
@@ -948,7 +949,7 @@ TEST_CASE("native application schema flattens inherited request and settings dec
     CHECK(settings[2].mutable_leaf);
     CHECK(inherited_settings_owner);
     std::uint64_t direct_settings_id = 0U;
-    ApplicationSchema<InheritedSystems>::VisitSettingsLeaves<DirectInheritanceSettings>(
+    VisitSettingsLeaves<DirectInheritanceSettings>(
         [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
             if (field.path == "inherited_limit") direct_settings_id = field.stable_id;
         });
@@ -1071,7 +1072,7 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
             constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Entry::source>();
             constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<contracts::ModelSelectionKey, Entry::destination>();
             std::size_t matches = 0U;
-            ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitSettingsLeaves<contracts::GuiSettingsState>(
+            VisitSettingsLeaves<contracts::GuiSettingsState>(
                 [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
                     if (field.path == source.view()) {
                         ++matches;
@@ -1089,7 +1090,7 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
         ++row_index;
         if (!compatibility.custom_allowed) return;
         std::size_t leaf_matches = 0U;
-        ApplicationSchema<mmltk::controller::ApplicationSystems>::VisitSettingsLeaves<contracts::GuiSettingsState>(
+        VisitSettingsLeaves<contracts::GuiSettingsState>(
             [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
                 if (field.path == typed_path.view()) {
                     ++leaf_matches;

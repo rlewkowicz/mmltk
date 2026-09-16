@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <sstream>
@@ -13,7 +14,6 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-#include "detail/command_arguments.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/controller/services/vast_client.h"
@@ -151,11 +151,17 @@ VastInstanceInfo vast_instance_from_json(const json& payload) {
     instance.duration_seconds = json_number_or_default(payload, "duration");
     return instance;
 }
-void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const std::string& value) { append_command_option(args, name, value); }
-void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const std::optional<double>& value) {
-    append_command_option(args, name, value);
+void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const std::string& value) {
+    if (value.empty()) return;
+    args.emplace_back(name);
+    args.emplace_back(value);
 }
-void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const bool enabled) { append_command_flag(args, name, enabled); }
+void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const std::optional<double>& value) {
+    if (!value) return;
+    args.emplace_back(name);
+    args.push_back(std::to_string(*value));
+}
+void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const bool enabled) { if (enabled) args.emplace_back(name); }
 void require_vast_api_key(const VastBridgeConfig& config, const std::string_view context) {
     if (config.api_key.empty()) { throw std::runtime_error(std::string(context) + " requires --vast-api-key or VAST_API_KEY"); }
 }

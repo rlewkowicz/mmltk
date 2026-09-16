@@ -1,5 +1,8 @@
 #include "src/controller/services/settings_store.h"
 #include <cstdint>
+#include <exception>
+#include <memory>
+#include <utility>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -22,6 +25,22 @@ namespace mmltk::controller::services {
 namespace common_io = mmltk::common::io;
 namespace contracts = mmltk::controller::contracts;
 namespace {
+class SettingsStoreError final : public std::runtime_error {
+   public:
+    SettingsStoreError(SettingsStoreWriteStage value, std::string message) : std::runtime_error(std::move(message)), stage(value) {}
+    const SettingsStoreWriteStage stage;
+};
+struct StoredSettings final {
+    contracts::GuiSettingsState settings{};
+    std::uint64_t revision_frontier = 0U;
+};
+[[nodiscard]] std::string bounded_detail(const std::exception& error) {
+    constexpr std::size_t kMaximumDetailBytes = 256U;
+    std::string detail = error.what();
+    if (detail.size() > kMaximumDetailBytes) detail.resize(kMaximumDetailBytes);
+    return detail;
+}
+void save_record(const std::filesystem::path&, const contracts::GuiSettingsState&, std::uint64_t);
 [[nodiscard]] SettingsStoreWriteStage settings_write_stage(const common_io::JsonWriteStage stage) noexcept {
     switch (stage) {
         case common_io::JsonWriteStage::kOpen: return SettingsStoreWriteStage::Open;
@@ -52,8 +71,7 @@ constexpr std::string_view kRevisionField{"settings_revision"};
     }
     return revision.get<std::uint64_t>();
 }
-}  // namespace
-StoredSettings SettingsStore::load(const std::filesystem::path& path) {
+StoredSettings load_record(const std::filesystem::path& path) {
     contracts::GuiSettingsState state = contracts::default_gui_settings_state();
     nlohmann::json normalized;
     std::error_code exists_error;
@@ -66,10 +84,10 @@ StoredSettings SettingsStore::load(const std::filesystem::path& path) {
     const bool settings_repair = loaded && contracts::snapshot_gui_settings(state) != normalized;
     const bool revision_repair = loaded && raw_revision.has_value() && !normalized_has_revision;
     const StoredSettings record{.settings = state, .revision_frontier = revision};
-    if ((loaded && (settings_repair || revision_repair)) || (!loaded && existed)) save(path, record.settings, record.revision_frontier);
+    if ((loaded && (settings_repair || revision_repair)) || (!loaded && existed)) save_record(path, record.settings, record.revision_frontier);
     return record;
 }
-void SettingsStore::save(const std::filesystem::path& path, const contracts::GuiSettingsState& settings, const std::uint64_t revision_frontier) {
+void save_record(const std::filesystem::path& path, const contracts::GuiSettingsState& settings, const std::uint64_t revision_frontier) {
     if (!contracts::gui_settings_valid(settings)) {
         throw SettingsStoreError{SettingsStoreWriteStage::Validation, "refusing to persist invalid typed GUI settings"};
     }
@@ -90,5 +108,34 @@ void SettingsStore::save(const std::filesystem::path& path, const contracts::Gui
         throw SettingsStoreError{settings_write_stage(*failure),
                                  "failed to persist GUI settings `" + path.string() + "` at stage " + std::string(common_io::to_string(*failure))};
     }
+}
+}  // namespace
+PersistenceLoadResult SettingsStore::load(const std::string_view location) noexcept {
+    try {
+        const std::filesystem::path path{location};
+        auto record = load_record(path);
+        return {.terminal = PersistenceTerminal::Succeeded,
+                .settings = std::make_unique<contracts::GuiSettingsState>(std::move(record.settings)),
+                .revision_frontier = record.revision_frontier};
+    } catch (const SettingsStoreError& error) {
+        return {.detail = bounded_detail(error), .stage = error.stage};
+    } catch (const std::exception& error) {
+        return {.detail = bounded_detail(error)};
+    } catch (...) { return {.detail = "settings load failed"}; }
+}
+PersistenceSaveResult SettingsStore::save(const std::string_view location, const contracts::GuiSettingsState& settings,
+                                         const std::uint64_t revision) noexcept {
+    try {
+        const std::filesystem::path path{location};
+        const auto current = load_record(path);
+        if (revision <= current.revision_frontier)
+            return {.revision = revision, .detail = "settings revision is not newer than durable frontier"};
+        save_record(path, settings, revision);
+        return {.terminal = PersistenceTerminal::Succeeded, .revision = revision};
+    } catch (const SettingsStoreError& error) {
+        return {.revision = revision, .detail = bounded_detail(error), .stage = error.stage};
+    } catch (const std::exception& error) {
+        return {.revision = revision, .detail = bounded_detail(error)};
+    } catch (...) { return {.revision = revision, .detail = "settings save failed"}; }
 }
 }  // namespace mmltk::controller::services

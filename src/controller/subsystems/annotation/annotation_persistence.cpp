@@ -5,38 +5,30 @@
 #include <unistd.h>
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cstddef>
 #include <span>
 #include <vector>
-#include "src/controller/subsystems/annotation/detail/annotation_atomic_save.h"
+#include <charconv>
+#include <system_error>
+#include "src/common/io/scoped_fd.h"
+#include "src/common/io/noexcept_io.h"
 namespace mmltk::controller::subsystems::annotation {
 namespace {
 class PosixAtomicSaveBackend final {
    public:
     [[nodiscard]] bool open_exclusive(const std::string_view path) noexcept {
         return with_path(path, [this](const char* value) noexcept {
-            descriptor_ = ::open(value, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
-            return descriptor_ >= 0;
+            descriptor_.reset(::open(value, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR));
+            return descriptor_.get() >= 0;
         });
     }
     [[nodiscard]] bool write_all(const std::span<const std::byte> bytes) noexcept {
-        std::size_t offset = 0U;
-        while (offset < bytes.size()) {
-            const auto written = ::write(descriptor_, bytes.data() + offset, bytes.size() - offset);
-            if (written > 0)
-                offset += static_cast<std::size_t>(written);
-            else if (written < 0 && errno == EINTR)
-                continue;
-            else
-                return false;
-        }
-        return true;
+        return mmltk::common::io::try_write_all_noexcept(descriptor_.get(),
+            {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
     }
-    [[nodiscard]] bool sync_file() noexcept { return ::fsync(descriptor_) == 0; }
+    [[nodiscard]] bool sync_file() noexcept { return ::fsync(descriptor_.get()) == 0; }
     [[nodiscard]] bool close_file() noexcept {
-        const bool closed = ::close(descriptor_) == 0;
-        descriptor_ = -1;
+        const bool closed = ::close(descriptor_.release()) == 0;
         return closed;
     }
     [[nodiscard]] bool rename_file(const std::string_view from, const std::string_view to) noexcept {
@@ -75,15 +67,42 @@ class PosixAtomicSaveBackend final {
         std::copy(second.begin(), second.end(), second_storage.begin());
         return operation(first_storage.data(), second_storage.data());
     }
-    int descriptor_ = -1;
+    mmltk::common::io::ScopedFd descriptor_;
 };
+[[nodiscard]] DocumentSaveEffect atomic_save(const std::span<const std::byte> bytes, const std::string_view destination,
+                                            const std::uint64_t document_revision, const std::uint64_t generation) noexcept {
+    PosixAtomicSaveBackend backend;
+    if (bytes.empty() || destination.empty() || generation == 0U) return DocumentSaveEffect::NotApplied;
+    constexpr std::string_view marker{".mmltk-annotation-"};
+    constexpr std::string_view suffix{".tmp"};
+    std::array<char, domain::kWorkspacePathCapacity + marker.size() + 2U * 24U + suffix.size() + 2U> temporary{};
+    if (destination.size() >= temporary.size()) return DocumentSaveEffect::NotApplied;
+    auto* cursor = std::copy(destination.begin(), destination.end(), temporary.begin());
+    cursor = std::copy(marker.begin(), marker.end(), cursor);
+    const auto [revision_end, revision_error] = std::to_chars(cursor, temporary.data() + temporary.size() - suffix.size() - 1U, document_revision);
+    if (revision_error != std::errc{}) return DocumentSaveEffect::NotApplied;
+    *revision_end = '-';
+    const auto [generation_end, generation_error] = std::to_chars(revision_end + 1, temporary.data() + temporary.size() - suffix.size() - 1U, generation);
+    if (generation_error != std::errc{}) return DocumentSaveEffect::NotApplied;
+    cursor = std::copy(suffix.begin(), suffix.end(), generation_end);
+    const std::string_view temporary_path{temporary.data(), static_cast<std::size_t>(cursor - temporary.data())};
+    if (!backend.open_exclusive(temporary_path)) return DocumentSaveEffect::NotApplied;
+    const bool written = backend.write_all(bytes);
+    const bool synced = written && backend.sync_file();
+    const bool closed = backend.close_file();
+    const bool prepared = written && synced && closed;
+    if (!prepared || !backend.rename_file(temporary_path, destination)) {
+        backend.remove_file(temporary_path);
+        return DocumentSaveEffect::NotApplied;
+    }
+    return backend.sync_parent(destination) ? DocumentSaveEffect::Committed : DocumentSaveEffect::Uncertain;
+}
 }  // namespace
 DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& state, const std::string_view destination,
                                             const std::uint64_t generation) noexcept {
     if (!state.valid() || destination.empty() || generation == 0U) return DocumentSaveEffect::NotApplied;
     std::vector<std::byte> bytes;
     if (!domain::encode_annotation_persistence(state, bytes)) return DocumentSaveEffect::NotApplied;
-    PosixAtomicSaveBackend backend;
     try {
         std::filesystem::path path{destination};
         std::error_code error;
@@ -99,7 +118,7 @@ DocumentSaveEffect save_annotation_document(const domain::AnnotationUiState& sta
             }
             path /= "annotation-" + std::to_string(identity) + ".cbor";
         }
-        return annotation_persistence::AtomicSave(backend, bytes, path.string(), state.document_revision, generation);
+        return atomic_save(bytes, path.string(), state.document_revision, generation);
     } catch (...) { return DocumentSaveEffect::NotApplied; }
 }
 }  // namespace mmltk::controller::subsystems::annotation

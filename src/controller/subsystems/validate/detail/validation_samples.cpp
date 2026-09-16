@@ -1,6 +1,7 @@
+#include "src/controller/presentation/annotation_palette.h"
 #include "validation_samples.h"
 #include "src/controller/subsystems/system/detail/prediction_preview.h"
-#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include <algorithm>
 #include <array>
@@ -101,7 +102,7 @@ class ValidationSamples::Impl final {
         ValidationSampleMetadata metadata;
         metadata.available = true;
         metadata.original_extent = {sample.pixels.width, sample.pixels.height};
-        const auto palette = contracts::annotation_class_palette(raw->classes().size());
+        const auto palette = mmltk::controller::annotation_class_palette(raw->classes().size());
         const auto labels = [&](std::span<const rfdetr::Prediction> predictions, bool ground_truth) {
             for (const auto& prediction : predictions) {
                 const auto category = static_cast<std::size_t>(prediction.class_reference);

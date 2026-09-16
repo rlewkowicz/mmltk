@@ -1,4 +1,4 @@
-#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_runtime_owner.h"
 #include <algorithm>
 #include <stdexcept>
 #include <utility>

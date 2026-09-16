@@ -59,7 +59,7 @@
 #include "src/controller/subsystems/live/live_receiver_copy.h"
 #include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/common/types/generation.h"
-#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/controller/presentation/detail/native_presentation_writer_test_access.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
@@ -2478,7 +2478,7 @@ void persist_explore_catalog(SettingsSystem& settings, const ExploreClassCatalog
     auto preferences = candidate.preferences.policy;
     preferences.filter.class_selection = {};
     preferences.overlay.class_selection = {};
-    settings.persist_explore_class_catalog(candidate, identity, preferences);
+    static_cast<void>(settings.Update(candidate, {.preferences = preferences, .class_catalog_identity = identity}));
 }
 void queue_failed_explore_overlay_update(LoadedSettings& settings) {
     settings.BreakPersistence();
@@ -3700,9 +3700,7 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
     LoadedSettings settings{[settings_events](SettingsSystem::event_type) { settings_events->fetch_add(1U, std::memory_order_acq_rel); }};
     persist_explore_catalog(settings.system(), test_explore_catalog_identity());
     const auto initial_events = settings_events->load(std::memory_order_acquire);
-    (void)settings.system().persist_explore_filter(
-        settings.system().explore_settings_candidate(),
-        {
+    (void)settings.system().Update(settings.system().explore_settings_candidate(), {.preferences = mmltk::controller::ExploreFilterUpdate{
             .filter =
                 {
                     .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
@@ -3715,7 +3713,7 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
                     .require_boxes = true,
                 },
             .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}}, .show_boxes = false, .show_masks = true},
-        });
+        }});
     CHECK(settings_events->load(std::memory_order_acquire) == initial_events + 1U);
     auto backend = std::make_shared<FakeImageBackend>();
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
@@ -4089,7 +4087,7 @@ TEST_CASE("Explore normalizes saved dataset policy locally and projects every cl
             },
         .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {9U}}},
     };
-    (void)settings.system().persist_explore_filter(settings.system().explore_settings_candidate(), saved);
+    (void)settings.system().Update(settings.system().explore_settings_candidate(), {.preferences = saved});
     const auto saved_revision = settings.system().snapshot().revision;
     auto backend = std::make_shared<FakeImageBackend>();
     ExploreScenario scenario{settings, backend};
@@ -4583,10 +4581,9 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
     auto gate = std::make_shared<ExploreRenderGate>();
     auto entered = gate->entered.get_future();
     LoadedSettings settings;
-    (void)settings.system().persist_explore_filter(settings.system().explore_settings_candidate(),
-                                                   {
+    (void)settings.system().Update(settings.system().explore_settings_candidate(), {.preferences = mmltk::controller::ExploreFilterUpdate{
                                                        .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 17U},
-                                                   });
+                                                   }});
     ExploreScenario scenario{settings, backend,
                              [observed_nproc, commits, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate, commits); }};
     auto& explore = scenario.system();
@@ -4616,10 +4613,9 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
         auto entered = gate->entered.get_future();
         auto commits = std::make_shared<std::atomic_uint64_t>(0U);
         LoadedSettings settings;
-        (void)settings.system().persist_explore_filter(settings.system().explore_settings_candidate(),
-                                                       {
+        (void)settings.system().Update(settings.system().explore_settings_candidate(), {.preferences = mmltk::controller::ExploreFilterUpdate{
                                                            .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 19U},
-                                                       });
+                                                       }});
         ExploreScenario scenario{settings, backend, ExploreScenario::GateAfterRender(gate, commits)};
         auto& explore = scenario.system();
         auto settle_explore = settle_explore_on_exit(explore, gate->release);

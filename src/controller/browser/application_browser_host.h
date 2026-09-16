@@ -1,4 +1,5 @@
 #pragma once
+#include "src/controller/contracts/application_systems.h"
 #include <memory>
 #include "src/controller/browser/client_record.h"
 #include "src/controller/services/runtime_diagnostics.h"

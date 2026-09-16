@@ -43,7 +43,7 @@
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/model_selection.h"
 #include "src/controller/services/file_dialog_system.h"
-#include "src/controller/services/persistence_storage.h"
+#include "src/controller/services/settings_store.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/validate/validation_system.h"
 #include "src/controller/subsystems/export/export_system.h"
@@ -52,7 +52,7 @@
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/subsystems/system/compute_runtime.h"
 #include "src/controller/subsystems/system/dataset_system.h"
-#include "src/controller/subsystems/system/local_run.h"
+#include "src/controller/runtime/local_run.h"
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/train/training_system.h"
 #include "src/frameworks/gpu/image_buffer.h"
@@ -884,7 +884,7 @@ TEST_CASE("Explore catalog identity changes only through successful catalog pers
     CHECK(settings.snapshot() == before);
     constexpr ExploreClassCatalogIdentity identity = 0x9123'4567'89ab'cdefULL;
     const auto candidate = settings.explore_settings_candidate();
-    settings.persist_explore_class_catalog(candidate, identity, candidate.preferences.policy);
+    static_cast<void>(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = identity}));
     CHECK(settings.snapshot().settings_state.workflows.explore.class_catalog_identity == identity);
     SettingsSystem reloaded;
     REQUIRE(reloaded.Load(location).applied());
@@ -899,7 +899,7 @@ TEST_CASE("successful Explore catalog persistence includes a pending Settings re
     REQUIRE(std::filesystem::remove(root / "settings.json"));
     constexpr ExploreClassCatalogIdentity identity = 0x1234'5678U;
     const auto candidate = settings.explore_settings_candidate();
-    settings.persist_explore_class_catalog(candidate, identity, candidate.preferences.policy);
+    static_cast<void>(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = identity}));
     const auto committed = settings.snapshot();
     CHECK(committed.settings_state.ui.dark_mode);
     CHECK(committed.settings_state.workflows.explore.class_catalog_identity == identity);
@@ -915,7 +915,7 @@ TEST_CASE("failed Explore catalog persistence preserves the exact pending Settin
     queue_failed_dark_mode_update(settings, root);
     constexpr ExploreClassCatalogIdentity rejected_identity = 0x8765'4321U;
     const auto candidate = settings.explore_settings_candidate();
-    CHECK_THROWS_AS(settings.persist_explore_class_catalog(candidate, rejected_identity, candidate.preferences.policy), contracts::FailedError);
+    CHECK_THROWS_AS(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = rejected_identity}), contracts::FailedError);
     REQUIRE(std::filesystem::remove(root / "settings.json"));
     REQUIRE(settings.Retry().applied());
     const auto recovered = settings.snapshot();

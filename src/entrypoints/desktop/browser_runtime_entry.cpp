@@ -1,3 +1,4 @@
+#include "src/common/system/runtime_paths.h"
 #include <Loop.h>
 #include <spdlog/spdlog.h>
 #include "src/entrypoints/desktop/browser_runtime_options.h"
@@ -51,7 +52,7 @@ void report_runtime_failure(const std::string_view stage, const std::string_view
 }
 [[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage) noexcept {
     report_runtime_failure(stage);
-    shell.request_shutdown(mmltk::controller::services::ApplicationShutdownReason::InfrastructureFailure);
+    shell.request_shutdown(mmltk::controller::shell::ApplicationShutdownReason::InfrastructureFailure);
     static_cast<void>(shell.shutdown());
     return 1;
 }
@@ -61,7 +62,7 @@ class SignalWaiter final {
         : thread_([&shell, diagnostics_terminal](const std::stop_token stop) {
               sigset_t signals{};
               if (::sigemptyset(&signals) != 0 || ::sigaddset(&signals, SIGINT) != 0 || ::sigaddset(&signals, SIGTERM) != 0) {
-                  shell.request_shutdown(mmltk::controller::services::ApplicationShutdownReason::InfrastructureFailure);
+                  shell.request_shutdown(mmltk::controller::shell::ApplicationShutdownReason::InfrastructureFailure);
                   return;
               }
               mmltk::common::io::ScopedFd signal_fd{::signalfd(-1, &signals, SFD_CLOEXEC)};
@@ -73,11 +74,11 @@ class SignalWaiter final {
               if (stop.stop_requested()) return;
               signalfd_siginfo signal{};
               if (ready < 0 || events[1].revents != 0 || ::read(signal_fd.get(), &signal, sizeof(signal)) != static_cast<ssize_t>(sizeof(signal))) {
-                  shell.request_shutdown(mmltk::controller::services::ApplicationShutdownReason::InfrastructureFailure);
+                  shell.request_shutdown(mmltk::controller::shell::ApplicationShutdownReason::InfrastructureFailure);
                   return;
               }
-              shell.request_shutdown(signal.ssi_signo == SIGINT ? mmltk::controller::services::ApplicationShutdownReason::SignalInterrupt
-                                                                : mmltk::controller::services::ApplicationShutdownReason::SignalTerminate);
+              shell.request_shutdown(signal.ssi_signo == SIGINT ? mmltk::controller::shell::ApplicationShutdownReason::SignalInterrupt
+                                                                : mmltk::controller::shell::ApplicationShutdownReason::SignalTerminate);
           }) {}
     ~SignalWaiter() {
         thread_.request_stop();
@@ -159,7 +160,7 @@ int main(int argc, char** argv) {
         auto runtime = parse_browser_runtime_options(arguments);
         mmltk::controller::shell::ApplicationShellConfig config;
         config.training_executable =
-            mmltk::controller::services::resolve_sibling_mmltk_cli(mmltk::controller::services::current_executable_path());
+            mmltk::controller::services::resolve_sibling_mmltk_cli(mmltk::common::system::runtime_paths::current_executable_path());
         const char* const pixel_trace = std::getenv("MMLTK_GUI_PIXEL_TRACE");
         const char* const lifecycle_trace = std::getenv("MMLTK_GUI_TRACE_FILE");
         const bool pixel_probes = pixel_trace != nullptr && std::string_view{pixel_trace} == "1" && lifecycle_trace != nullptr && *lifecycle_trace != '\0';

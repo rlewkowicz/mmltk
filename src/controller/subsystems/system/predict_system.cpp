@@ -1,3 +1,4 @@
+#include "src/controller/presentation/annotation_palette.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "predict_system.h"
 #include <cuda_runtime_api.h>
@@ -13,11 +14,11 @@
 #include "detail/prediction_preview.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/common/system/execution_policy.h"
-#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/workspace_input.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
-#include "src/controller/subsystems/system/local_run.h"
+#include "src/controller/runtime/local_run.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
@@ -358,7 +359,7 @@ class PredictSystem::Impl final {
                 throw std::runtime_error("Prediction preview exceeds the visual product limits");
             std::vector<PredictLabel> labels;
             if (preview_class_count_ != product.raw->class_count()) {
-                preview_palette_ = contracts::annotation_class_palette(static_cast<std::size_t>(product.raw->class_count()));
+                preview_palette_ = mmltk::controller::annotation_class_palette(static_cast<std::size_t>(product.raw->class_count()));
                 preview_class_count_ = product.raw->class_count();
             }
             const auto& palette = preview_palette_;

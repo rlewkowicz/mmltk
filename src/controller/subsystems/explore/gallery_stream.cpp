@@ -1,3 +1,4 @@
+#include "src/controller/presentation/annotation_palette.h"
 #include "src/backend/models/rfdetr/augmentation/sampling.h"
 #include "src/controller/subsystems/explore/detail/gallery_stream.h"
 #include "src/frameworks/gpu/cuda_error.h"
@@ -2417,7 +2418,7 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
     document->scene.document = contracts::WorkspaceResource::From("explore://image", plan.generation);
     document->scene.frame_index = *plan.selected_image;
     for (const auto& name : State().store->class_names()) document->scene.categories.push_back({.value = name});
-    document->scene.palette = contracts::annotation_class_palette(document->scene.categories.size());
+    document->scene.palette = mmltk::controller::annotation_class_palette(document->scene.categories.size());
     const float document_width = static_cast<float>(detail.source_width);
     const float document_height = static_cast<float>(detail.source_height);
     for (std::size_t index = 0U; index < descriptor_layout_.annotations.count; ++index) {

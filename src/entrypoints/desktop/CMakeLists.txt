@@ -39,6 +39,7 @@ if(BUILD_MMLTK_BROWSER_HOST OR BUILD_TESTS)
         MMLTK_BROWSER_APP_ASSET_ROOT="${CMAKE_INSTALL_FULL_DATADIR}/mmltk/browser-app"
     )
     target_link_libraries(mmltk_entrypoints_desktop_host PRIVATE
+        mmltk::common::system
         mmltk::common::logging
         mmltk::controller::direct_services
         mmltk::controller::shell
@@ -123,7 +124,6 @@ function(mmltk_add_entrypoints_desktop_tests)
         mmltk_entrypoints_desktop_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/browser_runtime_contract.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/browser_runtime_entry.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/firefox_process_owner.test.cpp
     )
     mmltk_configure_component(
         mmltk_entrypoints_desktop_tests PRIVATE_DECLARATIONS)

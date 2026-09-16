@@ -1,7 +1,7 @@
 #pragma once
 #include <optional>
 #include "src/controller/services/firefox_process_observation.h"
-namespace mmltk::controller::services {
+namespace mmltk::controller::shell {
 enum class ApplicationLifecycleEventSource : unsigned char {
     Shell,
     FirefoxSignal,
@@ -18,6 +18,6 @@ enum class ApplicationShutdownReason : unsigned char {
 struct ApplicationLifecycleEvent final {
     ApplicationLifecycleEventSource source = ApplicationLifecycleEventSource::Shell;
     ApplicationShutdownReason reason = ApplicationShutdownReason::WindowClose;
-    std::optional<FirefoxProcessLifecycle> firefox{};
+    std::optional<services::FirefoxProcessLifecycle> firefox{};
 };
-}  // namespace mmltk::controller::services
+}  // namespace mmltk::controller::shell

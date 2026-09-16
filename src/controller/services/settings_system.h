@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include <functional>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -15,8 +15,21 @@
 #include "src/controller/contracts/settings_commands.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/controller/services/settings_location.h"
-#include "src/controller/services/settings_types.h"
-#include "src/controller/subsystems/system/system_events.h"
+namespace mmltk::controller::services {
+enum class SettingsTerminal : std::uint8_t {
+    Applied,
+    Rejected,
+    PersistenceFailed,
+    NotLoaded,
+};
+struct SettingsMutationResult final {
+    SettingsTerminal terminal = SettingsTerminal::NotLoaded;
+    std::uint64_t revision = 0U;
+    std::string detail{};
+    [[nodiscard]] bool applied() const noexcept { return terminal == SettingsTerminal::Applied; }
+};
+}  // namespace mmltk::controller::services
+
 namespace mmltk::controller {
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] SettingsChanged final {
     contracts::SettingsUiState snapshot{};
@@ -29,6 +42,13 @@ struct ExploreSettingsCandidate final {
     mmltk::backend::models::rfdetr::GpuAugmentationConfig augmentation{};
     bool augmentation_preview_enabled = false;
     bool show_original_dimensions = false;
+};
+// Explicit domain edit data; SettingsSystem alone admits and mutates the candidate.
+struct ExploreSettingsEdit final {
+    std::optional<ExploreFilterUpdate> preferences{};
+    std::optional<bool> augmentation_enabled{};
+    std::optional<bool> show_original_dimensions{};
+    std::optional<ExploreClassCatalogIdentity> class_catalog_identity{};
 };
 class SettingsSystem final {
    public:
@@ -45,15 +65,9 @@ class SettingsSystem final {
     [[nodiscard]] contracts::ProviderPreferences provider_preferences() const;
     void RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::TrainRequest, const std::filesystem::path&);
     [[nodiscard]] ExploreSettingsCandidate explore_settings_candidate() const;
-    [[nodiscard]] ExploreSettingsCandidate persist_explore_filter(const ExploreSettingsCandidate&, const ExploreFilterUpdate&);
-    [[nodiscard]] ExploreSettingsCandidate persist_explore_augmentation(const ExploreSettingsCandidate&, bool);
-    [[nodiscard]] ExploreSettingsCandidate persist_explore_product(const ExploreSettingsCandidate&, const ExploreFilterUpdate&, bool augmentation_enabled);
-    [[nodiscard]] ExploreSettingsCandidate persist_explore_detail(const ExploreSettingsCandidate&, bool);
-    void persist_explore_class_catalog(const ExploreSettingsCandidate&, ExploreClassCatalogIdentity, const ExploreFilterUpdate&);
+    [[nodiscard]] ExploreSettingsCandidate Update(const ExploreSettingsCandidate&, const ExploreSettingsEdit&);
 
    private:
-    void persist_explore_candidate(const ExploreSettingsCandidate&, std::function_ref<void(contracts::GuiSettingsState&)> mutate,
-                                   std::string_view invalid_detail, bool preserve_retry_on_failure = false);
     [[nodiscard]] contracts::GuiSettingsState mutation_candidate() const;
     [[nodiscard]] services::SettingsMutationResult persist(contracts::GuiSettingsState, bool preserve_retry_on_failure = false);
     void publish(const services::SettingsMutationResult&) noexcept;

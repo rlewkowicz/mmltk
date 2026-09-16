@@ -13,15 +13,14 @@ mmltk_register_public_headers(
 mmltk_register_ordinary_sources(
     mmltk_controller_annotation_system
     annotation_mask.cpp
-    annotation_document.cpp
+    annotation_persistence.cpp
     annotation_reducer.cpp
     annotation_system.cpp)
 mmltk_register_private_headers(
     mmltk_controller_annotation_system
     detail/annotation_mask.h
     detail/annotation_document.h
-    detail/annotation_render_state.h
-    detail/annotation_atomic_save.h)
+    detail/annotation_render_state.h)
 mmltk_register_retained_module_importers(
     mmltk_controller_annotation_system
     native_annotation_algorithm.cpp)
@@ -32,6 +31,7 @@ target_link_libraries(mmltk_controller_annotation_system
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
     PRIVATE
+        mmltk::common::io
         mmltk::controller::visual_runtime
         mmltk::backend::imaging::raster
         mmltk::backend::imaging::primitives

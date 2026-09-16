@@ -8,14 +8,14 @@ mmltk_register_public_headers(
     mmltk_controller_shell
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
-        application_shell.h)
+        application_shell.h application_lifecycle_event.h)
 mmltk_register_private_headers(
     mmltk_controller_shell
-    direct_visual_systems.h)
+    application_system_storage.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_shell
     application_shell.cpp
-    direct_visual_systems.cpp
+    application_system_storage.cpp
 )
 target_include_directories(mmltk_controller_shell PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -36,20 +36,6 @@ target_link_libraries(mmltk_controller_shell
 mmltk_register_header_isolation(mmltk_controller_shell)
 
 function(mmltk_add_controller_shell_tests)
-    add_library(
-        mmltk_controller_settings_test_support STATIC EXCLUDE_FROM_ALL)
-    mmltk_configure_component(
-        mmltk_controller_settings_test_support PRIVATE_DECLARATIONS)
-    mmltk_register_ordinary_sources(
-        mmltk_controller_settings_test_support
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_settings_test_utils.cpp)
-    mmltk_register_private_headers(
-        mmltk_controller_settings_test_support
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_settings_test_utils.h)
-    target_include_directories(
-        mmltk_controller_settings_test_support PUBLIC
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
-
     add_executable(mmltk_controller_shell_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_controller_shell_tests

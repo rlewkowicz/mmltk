@@ -47,6 +47,7 @@ mmltk_register_public_headers(
     mmltk_controller_contracts
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        annotation_limits.h
         annotation.h
         artifact.h
         compute.h

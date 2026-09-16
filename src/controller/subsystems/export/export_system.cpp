@@ -8,8 +8,8 @@
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/system/detail/cuda_runtime_resources.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
-#include "src/controller/subsystems/system/local_run.h"
-#include "src/controller/subsystems/system/system_events.h"
+#include "src/controller/runtime/local_run.h"
+#include "src/controller/contracts/application_boundary.h"
 #include "src/common/system/execution_policy.h"
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;

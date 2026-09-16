@@ -1,3 +1,4 @@
+#include "src/controller/contracts/application_systems.h"
 #include "src/frameworks/transport/tests/support/browser_assets.h"
 #include "src/controller/browser/tests/support/websocket_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"

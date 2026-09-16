@@ -822,7 +822,7 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     auto policy = candidate.preferences.policy;
     policy.overlay.show_boxes = true;
     policy.overlay.show_masks = true;
-    static_cast<void>(settings.persist_explore_filter(candidate, policy));
+    static_cast<void>(settings.Update(candidate, {.preferences = policy}));
     NativeExploreAudit audit;
     constexpr controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
     const auto nproc = controller::normalize_explore_parallelism(2U);
@@ -931,7 +931,7 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
         const auto candidate = settings.explore_settings_candidate();
         auto policy = candidate.preferences.policy;
         policy.filter.minimum_instances = 1U;
-        static_cast<void>(settings.persist_explore_filter(candidate, policy));
+        static_cast<void>(settings.Update(candidate, {.preferences = policy}));
         NativeExploreFixture subject{settings, h2d};
         auto& audit = subject.audit;
         auto& system = subject.system;

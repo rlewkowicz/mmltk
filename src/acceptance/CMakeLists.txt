@@ -154,6 +154,7 @@ if(BUILD_RFDETR_NATIVE)
         mmltk::common::io
         mmltk::controller::contracts
         mmltk::controller::direct_services
+        mmltk::controller::visual_contract
         mmltk::backend::models::rfdetr::training
         mmltk::backend::ml::torch_dependencies
         mmltk_backend_data_test_support
@@ -201,6 +202,7 @@ endif()
 if(TARGET mmltk_controller_shell)
     mmltk_add_controller_shell_tests()
     mmltk_add_entrypoints_desktop_tests()
+    mmltk_add_controller_firefox_process_tests()
     mmltk_add_controller_services_tests()
     mmltk_add_controller_browser_tests()
 endif()

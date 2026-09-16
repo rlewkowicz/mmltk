@@ -1,3 +1,4 @@
+#include "src/controller/services/tests/support/diagnostics_client_test_access.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/stat.h>
@@ -38,10 +39,6 @@
 #include "src/controller/services/runtime_diagnostic_span.h"
 #include "src/controller/services/settings_store.h"
 namespace mmltk::controller::services {
-struct DiagnosticsClientTestAccess final {
-    [[nodiscard]] static bool WaitForCapacityWaiter(DiagnosticsClient& client) { return client.wait_for_capacity_waiter_for_test(); }
-    [[nodiscard]] static std::unique_lock<std::mutex> LockQueue(DiagnosticsClient& client) { return std::unique_lock{client.queue_mutex_for_test()}; }
-};
 namespace {
 struct DiagnosticCountingClock final {
     using time_point = std::chrono::steady_clock::time_point;
@@ -151,72 +148,79 @@ TEST_CASE("browser runtime exit policy classifies every owned Firefox terminal",
 TEST_CASE("settings store repairs missing malformed and normalized documents", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-settings-store-repair"};
     const auto path = temporary.path() / "gui.json";
-    const auto defaults = SettingsStore::load(path);
-    CHECK(gui_settings_valid(defaults.settings));
+    const auto defaults = SettingsStore::load(path.string());
+    REQUIRE(defaults.succeeded());
+    CHECK(gui_settings_valid(*defaults.settings));
     CHECK(defaults.revision_frontier == 0U);
     CHECK_FALSE(std::filesystem::exists(path));
     {
         std::ofstream malformed(path);
         malformed << "{";
     }
-    const auto repaired = SettingsStore::load(path);
-    CHECK(gui_settings_valid(repaired.settings));
+    const auto repaired = SettingsStore::load(path.string());
+    REQUIRE(repaired.succeeded());
+    CHECK(gui_settings_valid(*repaired.settings));
     CHECK(std::filesystem::exists(path));
     {
         std::ofstream normalizable(path);
         normalizable << R"({"schema_version":0})";
     }
-    const auto normalized = SettingsStore::load(path);
-    CHECK(gui_settings_valid(normalized.settings));
+    const auto normalized = SettingsStore::load(path.string());
+    REQUIRE(normalized.succeeded());
+    CHECK(gui_settings_valid(*normalized.settings));
     CHECK(read_file(path).find("schema_version") != std::string::npos);
 }
 TEST_CASE("settings store validates, creates parents, and cleans failed atomics", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-settings-store-write"};
     const auto root = temporary.path();
     const auto path = root / "nested" / "gui.json";
-    const auto record = SettingsStore::load(path);
-    SettingsStore::save(path, record.settings, record.revision_frontier);
+    const auto record = SettingsStore::load(path.string());
+    REQUIRE(record.succeeded());
+    REQUIRE(SettingsStore::save(path.string(), *record.settings, 1U).succeeded());
     CHECK(std::filesystem::exists(path));
     CHECK_FALSE(std::filesystem::exists(path.string() + ".tmp"));
-    auto invalid = record;
-    invalid.settings.workflows.train.request.preset_name.clear();
-    try {
-        SettingsStore::save(path, invalid.settings, invalid.revision_frontier);
-        FAIL("invalid settings were persisted");
-    } catch (const SettingsStoreError& error) { CHECK(error.stage == SettingsStoreWriteStage::Validation); }
+    auto invalid = *record.settings;
+    invalid.workflows.train.request.preset_name.clear();
+    const auto invalid_save = SettingsStore::save(path.string(), invalid, 2U);
+    CHECK_FALSE(invalid_save.succeeded());
+    CHECK(invalid_save.stage == SettingsStoreWriteStage::Validation);
     const auto blocked = root / "blocked";
     {
         std::ofstream blocker(blocked);
         blocker << "file";
     }
-    try {
-        SettingsStore::save(blocked / "gui.json", record.settings, record.revision_frontier);
-        FAIL("settings parent failure was not reported");
-    } catch (const SettingsStoreError& error) { CHECK(error.stage == SettingsStoreWriteStage::Parent); }
+    const auto blocked_save = SettingsStore::save((blocked / "gui.json").string(), *record.settings, 2U);
+    CHECK_FALSE(blocked_save.succeeded());
+    CHECK(blocked_save.stage == SettingsStoreWriteStage::Parent);
     CHECK_FALSE(std::filesystem::exists((blocked / "gui.json").string() + ".tmp"));
     const auto rename_target = root / "rename-target";
     std::filesystem::create_directory(rename_target);
-    try {
-        SettingsStore::save(rename_target, record.settings, record.revision_frontier);
-        FAIL("settings rename failure was not reported");
-    } catch (const SettingsStoreError& error) { CHECK(error.stage == SettingsStoreWriteStage::Rename); }
+    const auto rename_save = SettingsStore::save(rename_target.string(), *record.settings, 2U);
+    CHECK_FALSE(rename_save.succeeded());
+    CHECK(rename_save.stage == SettingsStoreWriteStage::Rename);
     CHECK_FALSE(std::filesystem::exists(rename_target.string() + ".tmp"));
 }
 TEST_CASE("settings store preserves one durable revision frontier", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-settings-store-revision"};
     const auto path = temporary.path() / "gui.json";
-    auto record = SettingsStore::load(path);
+    auto record = SettingsStore::load(path.string());
     record.revision_frontier = 41U;
-    record.settings.ui.dark_mode = true;
-    SettingsStore::save(path, record.settings, record.revision_frontier);
-    const auto reloaded = SettingsStore::load(path);
+    REQUIRE(record.succeeded());
+    record.settings->ui.dark_mode = true;
+    REQUIRE(SettingsStore::save(path.string(), *record.settings, record.revision_frontier).succeeded());
+    const auto reloaded = SettingsStore::load(path.string());
+    REQUIRE(reloaded.succeeded());
     CHECK(reloaded.revision_frontier == 41U);
-    CHECK(reloaded.settings.ui.dark_mode);
+    CHECK(reloaded.settings->ui.dark_mode);
+    CHECK_FALSE(SettingsStore::save(path.string(), *record.settings, 41U).succeeded());
     {
         std::ofstream invalid(path);
         invalid << R"({"schema_version":1,"settings_revision":-1})";
     }
-    CHECK_THROWS_AS(SettingsStore::load(path), SettingsStoreError);
+    const auto invalid_load = SettingsStore::load(path.string());
+    CHECK_FALSE(invalid_load.succeeded());
+    CHECK_FALSE(invalid_load.settings);
+    CHECK(invalid_load.stage == SettingsStoreWriteStage::Validation);
 }
 TEST_CASE("diagnostics disabled producers perform no submission work", "[gui][services]") {
     DiagnosticsClient diagnostics;

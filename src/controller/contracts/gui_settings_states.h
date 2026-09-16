@@ -17,7 +17,7 @@ struct WorkflowSettingsState {
     [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Annotate)]] AnnotateViewState annotate;
     [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Export)]] ExportViewState export_state;
     [[= mmltk::controller::contracts::reflection::feature_scope(mmltk::controller::contracts::FeatureId::Explore)]] ExploreViewState explore;
-    void apply_defaults() { apply_default_gui_state(train, validate, predict, annotate, export_state, explore); }
+    void apply_defaults() { *this = WorkflowSettingsState{}; }
 };
 // Canonical in-memory settings value. Persistence translates this aggregate at
 // the gui.json boundary; systems exchange immutable snapshots of this type.
@@ -26,11 +26,7 @@ struct GuiSettingsState {
         current_view = mmltk::controller::contracts::FeatureId::Train;
     UiSettingsState ui;
     WorkflowSettingsState workflows;
-    void apply_defaults() {
-        current_view = mmltk::controller::contracts::FeatureId::Train;
-        ui = UiSettingsState{};
-        workflows.apply_defaults();
-    }
+    void apply_defaults() { *this = GuiSettingsState{}; }
     [[nodiscard]] bool operator==(const GuiSettingsState&) const noexcept;
 };
 MMLTK_REFLECT_FIELDS(WorkflowSettingsState)

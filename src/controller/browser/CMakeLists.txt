@@ -1,5 +1,17 @@
 include(MmltkComponent)
 
+# Generic reflected boundary declarations do not depend on product-system composition.
+add_library(mmltk_controller_browser_schema INTERFACE)
+add_library(mmltk::controller::browser::schema ALIAS mmltk_controller_browser_schema)
+mmltk_register_public_headers(mmltk_controller_browser_schema
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES application_stable_identity.h application_schema.h client_record.h)
+target_link_libraries(mmltk_controller_browser_schema INTERFACE
+    mmltk::common::types mmltk::controller::contracts
+    mmltk::controller::visual_contract mmltk::frameworks::reflection
+    mmltk::frameworks::serialization)
+mmltk_register_header_isolation(mmltk_controller_browser_schema)
+
 add_library(mmltk_controller_browser_protocol_v17 STATIC)
 add_library(mmltk::controller::browser::protocol_v17 ALIAS
     mmltk_controller_browser_protocol_v17)
@@ -9,11 +21,8 @@ mmltk_register_public_headers(
     mmltk_controller_browser_protocol_v17
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
-        application_stable_identity.h
-        application_schema.h
         application_materializer.h
-        application_event_publisher.h
-        client_record.h)
+        application_event_publisher.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_browser_protocol_v17
     client_record.cpp)
@@ -23,6 +32,7 @@ target_include_directories(mmltk_controller_browser_protocol_v17 PRIVATE
 target_link_libraries(mmltk_controller_browser_protocol_v17
     PUBLIC
         mmltk::common::types
+        mmltk::controller::browser::schema
         mmltk::controller::application_systems_projection
         mmltk::frameworks::reflection
         mmltk::frameworks::serialization)
@@ -30,7 +40,8 @@ mmltk_register_header_isolation(mmltk_controller_browser_protocol_v17)
 mmltk_register_header_include_orders(mmltk_controller_browser_protocol_v17
     src/controller/presentation/visual_system_types.h
     src/controller/browser/application_schema.h
-    [=[static_assert(mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget() > 0U);]=])
+    [=[#include "src/controller/contracts/application_systems.h"
+static_assert(mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>::BootstrapPayloadBudget() > 0U);]=])
 
 add_library(mmltk_controller_browser_direct STATIC)
 add_library(mmltk::controller::browser::direct ALIAS

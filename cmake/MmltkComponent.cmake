@@ -33,20 +33,24 @@ function(mmltk_configure_header_isolation target owner)
     mmltk_configure_concrete_target("${target}")
     set_target_properties("${target}" PROPERTIES
         UNITY_BUILD OFF DISABLE_PRECOMPILE_HEADERS ON CXX_SCAN_FOR_MODULES OFF)
-    # Preserve the owner's transitive system classifications without creating
-    # library edges from the isolation check back into the product graph. System
-    # metadata can contain entries absent from the actual search list; copy that
-    # list separately so classification does not introduce new search paths.
+    # Declaration-only owners expose usage requirements through INTERFACE_*
+    # properties; concrete owners expose their effective compilation properties.
+    get_target_property(_mmltk_owner_type "${owner}" TYPE)
+    set(_mmltk_usage_prefix "")
+    if(_mmltk_owner_type STREQUAL "INTERFACE_LIBRARY")
+        set(_mmltk_usage_prefix "INTERFACE_")
+    endif()
+    # Preserve system classifications without linking the check back to its owner.
     target_include_directories("${target}" SYSTEM PRIVATE
-        "$<TARGET_PROPERTY:${owner},SYSTEM_INCLUDE_DIRECTORIES>")
+        "$<TARGET_PROPERTY:${owner},${_mmltk_usage_prefix}SYSTEM_INCLUDE_DIRECTORIES>")
     set_property(TARGET "${target}" PROPERTY INCLUDE_DIRECTORIES
-        "$<TARGET_PROPERTY:${owner},INCLUDE_DIRECTORIES>")
+        "$<TARGET_PROPERTY:${owner},${_mmltk_usage_prefix}INCLUDE_DIRECTORIES>")
     target_compile_definitions("${target}" PRIVATE
-        "$<TARGET_PROPERTY:${owner},COMPILE_DEFINITIONS>")
+        "$<TARGET_PROPERTY:${owner},${_mmltk_usage_prefix}COMPILE_DEFINITIONS>")
     target_compile_options("${target}" PRIVATE
-        "$<TARGET_PROPERTY:${owner},COMPILE_OPTIONS>")
+        "$<TARGET_PROPERTY:${owner},${_mmltk_usage_prefix}COMPILE_OPTIONS>")
     target_compile_features("${target}" PRIVATE
-        "$<TARGET_PROPERTY:${owner},COMPILE_FEATURES>")
+        "$<TARGET_PROPERTY:${owner},${_mmltk_usage_prefix}COMPILE_FEATURES>")
 endfunction()
 
 function(mmltk_configure_component target)

@@ -14,11 +14,12 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
+#include <stdexcept>
 #include <variant>
 #include <vector>
 #include "src/controller/browser/application_stable_identity.h"
 #include "src/controller/browser/client_record.h"
-#include "src/controller/contracts/application_systems.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/workflow_path_dialogs.h"
@@ -30,6 +31,11 @@
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/frameworks/serialization/serialization.h"
+namespace mmltk::frameworks::gpu {
+class BorrowedImageWorkspace;
+struct ImageWorkspaceObservation;
+}
+namespace mmltk::controller { struct VisualWorkspaceRequest; }
 namespace mmltk::controller::browser {
 struct ApplicationRequestFieldFact final {
     std::uint64_t endpoint_id = 0U;
@@ -967,7 +973,8 @@ template <class Composition, auto Member>
 }
 template <auto Member>
 [[nodiscard]] consteval std::uint64_t application_system_stable_id() {
-    return application_system_stable_id<mmltk::controller::ApplicationSystems, Member>();
+    using Composition = typename mmltk::frameworks::reflection::MemberPointerOwner<std::remove_cvref_t<decltype(Member)>>::type;
+    return application_system_stable_id<Composition, Member>();
 }
 template <class Composition, auto Member, class Event>
 struct ApplicationEventIdentity final {
@@ -1140,6 +1147,11 @@ template <class Composition>
         }
     }
 }
+// Settings metadata is independent of the application's system composition.
+template <class Settings, class Visitor>
+void VisitSettingsLeaves(Visitor&& visitor) {
+    application_schema_detail::visit_settings_leaves<Settings, Settings>(visitor, {}, application_schema_detail::all_feature_workflows());
+}
 template <class Composition>
 struct ApplicationSchema final {
     using settings_type = typename application_schema_detail::CompositionSettingsSurface<Composition>::settings_type;
@@ -1296,10 +1308,6 @@ struct ApplicationSchema final {
     template <class Visitor>
     static void VisitRequestDefaults(Visitor&& visitor) {
         VisitEndpoints([&]<class Endpoint>() { VisitRequestDefaults<Endpoint>(visitor); });
-    }
-    template <class Settings, class Visitor>
-    static void VisitSettingsLeaves(Visitor&& visitor) {
-        application_schema_detail::visit_settings_leaves<Settings, Settings>(visitor, {}, application_schema_detail::all_feature_workflows());
     }
     [[nodiscard]] static settings_type SettingsDefaults()
         requires(application_settings_surface_is_valid<Composition>())

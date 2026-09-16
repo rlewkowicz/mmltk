@@ -32,7 +32,7 @@ target_link_libraries(mmltk_controller_explore_system
         mmltk::common::concurrency
         mmltk::common::io
         mmltk::common::system
-        mmltk::controller::data_compute_systems)
+        mmltk::controller::direct_services)
 mmltk_link_declarations(mmltk_controller_explore_system PUBLIC
     mmltk::controller::visual_runtime)
 mmltk_register_header_isolation(mmltk_controller_explore_system)

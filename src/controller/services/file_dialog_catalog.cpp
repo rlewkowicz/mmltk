@@ -14,13 +14,12 @@
 #include "src/frameworks/serialization/serialization.h"
 namespace mmltk::controller::services {
 namespace {
-using ApplicationSchema = mmltk::controller::browser::ApplicationSchema<mmltk::controller::ApplicationSystems>;
 using FileDialogDescriptorStorage = std::inplace_vector<FileDialogDescriptor, kFileDialogCatalogCapacity>;
 void append_model_artifact_dialogs(FileDialogDescriptorStorage& dialogs) {
     mmltk::controller::contracts::ModelSelectionRelation::VisitRows([&]<class Relation>(
                                                                         const mmltk::controller::contracts::ModelSelectionCompatibility& compatibility) {
         if (!compatibility.custom_allowed) return;
-        constexpr auto artifact_path = mmltk::frameworks::reflection::reflected_member_path<typename ApplicationSchema::settings_type, Relation::artifact>();
+        constexpr auto artifact_path = mmltk::frameworks::reflection::reflected_member_path<mmltk::controller::contracts::GuiSettingsState, Relation::artifact>();
         const std::uint64_t stable_id = mmltk::controller::browser::application_settings_field_stable_id(artifact_path.view());
         if (std::ranges::any_of(dialogs, [stable_id](const auto& dialog) { return dialog.stable_id == stable_id; })) return;
         if (dialogs.size() == dialogs.capacity()) throw std::logic_error("file-dialog declarations exceed fixed catalog capacity");
@@ -40,7 +39,7 @@ void append_model_artifact_dialogs(FileDialogDescriptorStorage& dialogs) {
 }  // namespace
 FileDialogCatalog FileDialogCatalog::Build() {
     FileDialogDescriptorStorage dialogs;
-    ApplicationSchema::VisitApplicationSettingsLeaves(
+    mmltk::controller::browser::VisitSettingsLeaves<mmltk::controller::contracts::GuiSettingsState>(
         [&]<class Owner, class Declaration, class Member>(const mmltk::controller::browser::ApplicationSettingsLeafFact& field) {
             if (!field.file_dialog) return;
             if (dialogs.size() == dialogs.capacity()) throw std::logic_error("file-dialog declarations exceed fixed catalog capacity");

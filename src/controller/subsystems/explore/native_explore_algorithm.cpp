@@ -1,3 +1,4 @@
+#include "src/controller/presentation/annotation_palette.h"
 #include "src/common/math/deterministic_sampling.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/controller/subsystems/explore/explore_system.h"
@@ -588,7 +589,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
             .image_height = store.header().image_height,
         };
         dataset.class_names.reserve(store.class_names().size());
-        dataset.palette = contracts::annotation_class_palette(store.class_names().size());
+        dataset.palette = mmltk::controller::annotation_class_palette(store.class_names().size());
         for (const auto& name : store.class_names()) dataset.class_names.push_back({.value = name});
         if (stop.stop_requested()) return {};
         DatasetState candidate{

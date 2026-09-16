@@ -9,14 +9,14 @@
 #include <optional>
 #include <string_view>
 #include "src/controller/browser/application_browser_host.h"
-#include "src/controller/services/application_lifecycle_event.h"
+#include "src/controller/shell/application_lifecycle_event.h"
 #include "src/controller/services/diagnostics_client.h"
 #include "src/controller/services/file_dialog_client.h"
 #include "src/controller/services/firefox_process_owner.h"
 #include "src/controller/services/runtime_diagnostics.h"
 #include "src/controller/services/settings_location.h"
 #include "src/controller/services/vast_provider_owner.h"
-#include "src/controller/shell/direct_visual_systems.h"
+#include "src/controller/shell/application_system_storage.h"
 #include "src/controller/subsystems/live/live_system.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/transport/browser_server.h"
@@ -59,7 +59,7 @@ class ApplicationShell final {
     [[nodiscard]] services::FirefoxProcessStartResult start_firefox(services::FirefoxProcessConfig) noexcept;
     [[nodiscard]] services::FirefoxProcessLifecycle firefox_lifecycle() const noexcept;
     void run();
-    void request_shutdown(services::ApplicationShutdownReason) noexcept;
+    void request_shutdown(shell::ApplicationShutdownReason) noexcept;
     [[nodiscard]] bool shutdown() noexcept;
     [[nodiscard]] bool healthy() const noexcept;
     [[nodiscard]] transport::BrowserServer& browser_server() noexcept { return browser_server_; }

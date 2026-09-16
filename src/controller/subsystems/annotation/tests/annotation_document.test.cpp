@@ -1,3 +1,4 @@
+#include "src/controller/presentation/annotation_palette.h"
 #include <catch2/catch_test_macros.hpp>
 #include <array>
 #include <algorithm>
@@ -20,7 +21,7 @@
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/frameworks/serialization/serialization.h"
 #include "src/controller/subsystems/annotation/detail/annotation_mask.h"
-#include "src/controller/presentation/detail/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/cuda_test_utils.hpp"
 namespace mmltk::controller {
@@ -390,7 +391,7 @@ TEST_CASE("Viewed masks import full catalogs and retain editable runs through hi
     source->scene.document = contracts::WorkspaceResource::From("explore://mask", 1U);
     for (std::size_t index = 0U; index < 80U; ++index) source->scene.categories.push_back({.value = "class " + std::to_string(index)});
     source->scene.categories.back().value = "étiquette";
-    source->scene.palette = contracts::annotation_class_palette(80U);
+    source->scene.palette = mmltk::controller::annotation_class_palette(80U);
     source->scene.objects.push_back({
         .name = contracts::AnnotationText::From("striped mask"),
         .shape = contracts::AnnotationShape::Mask,

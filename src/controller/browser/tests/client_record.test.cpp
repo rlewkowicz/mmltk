@@ -1,3 +1,4 @@
+#include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/client_record.h"
 #include "src/controller/presentation/detail/workspace_surface_import_abi.h"
 #include "src/controller/browser/application_materializer.h"
@@ -523,7 +524,7 @@ TEST_CASE("settings leaf traversal retains every reflected constraint dimension"
     std::size_t leaves = 0U;
     bool observed_byte_bound = false;
     bool observed_item_bound = false;
-    ApplicationSchema<FixtureApplicationSystems>::template VisitSettingsLeaves<mmltk::controller::contracts::GuiSettingsState>(
+    VisitSettingsLeaves<mmltk::controller::contracts::GuiSettingsState>(
         [&]<class, class, class>(const ApplicationSettingsLeafFact& fact) {
             ++leaves;
             observed_byte_bound = observed_byte_bound || fact.constraint.minimum_bytes != 0U || fact.constraint.maximum_bytes != 0U;

@@ -1,3 +1,4 @@
+#include "src/common/system/runtime_paths.h"
 #include "tool_launch.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include <signal.h>
@@ -755,7 +756,7 @@ class DistributedTrainingProcess final {
                 worker.distributed_store_path = store;
                 rfdetr::apply_training_partition(worker, partition);
                 auto arguments = services::build_train_command_arguments(worker);
-                arguments.insert(arguments.begin(), services::current_executable_path().string());
+                arguments.insert(arguments.begin(), mmltk::common::system::runtime_paths::current_executable_path().string());
                 const pid_t pid = ::fork();
                 if (pid < 0) throw std::system_error(errno, std::generic_category(), "failed to fork RF-DETR worker");
                 if (pid == 0) {

@@ -1,3 +1,4 @@
+#include "src/controller/presentation/annotation_palette.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -275,7 +276,7 @@ void apply_forward(DocumentState& state, const JournalEntry& entry) {
                     scene.categories.push_back(mutation.after);
                 else
                     scene.categories.pop_back();
-                scene.palette = domain::annotation_class_palette(scene.categories.size());
+                scene.palette = mmltk::controller::annotation_class_palette(scene.categories.size());
             } else if constexpr (std::same_as<Mutation, JournalEntry::Objects>) {
                 scene.objects = mutation.after;
                 state.identities = mutation.after_identities;
@@ -1004,7 +1005,7 @@ class AnnotationDocument::Impl final {
         } catch (...) { return Result(DocumentOutcome::Rejected, "open"); }
         for (auto& object : content.objects)
             if (object.shape == domain::AnnotationShape::Mask) normalize_mask(object);
-        if (content.palette.empty()) content.palette = domain::annotation_class_palette(content.categories.size());
+        if (content.palette.empty()) content.palette = mmltk::controller::annotation_class_palette(content.categories.size());
         const auto outcome = reduce_open(state_, std::move(content));
         if (outcome == DocumentOutcome::Applied) {
             capabilities_revision_ = 0U;

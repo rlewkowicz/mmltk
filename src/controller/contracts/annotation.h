@@ -1,4 +1,5 @@
 #pragma once
+#include "src/controller/contracts/annotation_limits.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -22,12 +23,6 @@
 #include "src/controller/contracts/workspace.h"
 #include "src/backend/data/catalog/class_catalog.h"
 namespace mmltk::controller::contracts {
-inline constexpr int kMinAnnotationBrushRadius = 1;
-inline constexpr int kMaxAnnotationBrushRadius = 128;
-inline constexpr int kDefaultAnnotationBrushRadius = 12;
-inline constexpr int kMinAnnotationMaskCleanupRadius = 1;
-inline constexpr int kMaxAnnotationMaskCleanupRadius = 32;
-inline constexpr int kDefaultAnnotationMaskCleanupRadius = 2;
 inline constexpr std::size_t kAnnotationNameCapacity = 96U;
 inline constexpr std::size_t kAnnotationObjectCapacity = 4096U;
 inline constexpr std::size_t kAnnotationCategoryCapacity = mmltk::backend::data::catalog::kClassCatalogCapacity;
@@ -118,7 +113,6 @@ struct AnnotationColorRange final {
     [[nodiscard]] bool valid() const noexcept { return center.valid() && minus.valid() && plus.valid(); }
     auto operator<=>(const AnnotationColorRange&) const = default;
 };
-[[nodiscard]] std::vector<AnnotationColor> annotation_class_palette(std::size_t);
 struct AnnotationSplineHandle final {
     AnnotationPoint point{};
     bool enabled = false;

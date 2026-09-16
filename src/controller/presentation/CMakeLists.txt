@@ -8,9 +8,10 @@ mmltk_configure_component(
 mmltk_register_public_headers(
     mmltk_controller_visual_contract
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES visual_system_types.h visual_document.h visual_source_projection.h)
+    FILES annotation_palette.h visual_system_types.h visual_document.h visual_source_projection.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_visual_contract
+    annotation_palette.cpp
     visual_system_types.cpp
     visual_document.cpp)
 target_link_libraries(mmltk_controller_visual_contract
@@ -19,6 +20,7 @@ target_link_libraries(mmltk_controller_visual_contract
         mmltk::controller::contracts
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection)
+target_link_libraries(mmltk_controller_visual_contract PRIVATE mmltk::backend::imaging::primitives)
 mmltk_register_header_isolation(mmltk_controller_visual_contract)
 
 add_library(mmltk_controller_visual_runtime STATIC)
@@ -27,11 +29,9 @@ add_library(mmltk::controller::visual_runtime ALIAS
 mmltk_configure_component(mmltk_controller_visual_runtime PUBLIC_DECLARATIONS)
 mmltk_register_public_headers(mmltk_controller_visual_runtime
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES visual_runtime.h visual_diagnostics.h workspace_input.h)
-mmltk_register_private_headers(mmltk_controller_visual_runtime
-    detail/visual_runtime_owner.h)
+    FILES visual_runtime.h visual_runtime_owner.h visual_diagnostics.h workspace_input.h)
 mmltk_register_ordinary_sources(mmltk_controller_visual_runtime
-    visual_diagnostics.cpp workspace_input.cpp detail/visual_runtime_owner.cpp)
+    visual_diagnostics.cpp workspace_input.cpp visual_runtime_owner.cpp)
 mmltk_register_retained_module_importers(mmltk_controller_visual_runtime visual_runtime.cpp)
 target_link_libraries(mmltk_controller_visual_runtime
     PUBLIC

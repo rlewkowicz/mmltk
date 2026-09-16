@@ -15,11 +15,7 @@ mmltk_register_public_headers(
         ../export/export_system.h
         predict_system.h
         dataset_system.h
-        local_run.h
         model_system.h
-        system_events.h
-        ../../services/file_dialog_system.h
-        ../../services/settings_system.h
         ../train/training_system.h)
 mmltk_register_ordinary_sources(
     mmltk_controller_data_compute_systems
@@ -27,9 +23,6 @@ mmltk_register_ordinary_sources(
     compute_runtime.cpp
     detail/cuda_runtime_resources.cpp
     dataset_system.cpp
-    local_run.cpp
-    ../../services/file_dialog_system.cpp
-    ../../services/settings_system.cpp
     ../validate/validation_system.cpp
     ../validate/detail/validation_samples.cpp
     ../train/training_system.cpp)
@@ -53,6 +46,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::common::system
         mmltk::controller::application_boundary
         mmltk::controller::contracts
+        mmltk::controller::runtime
         mmltk::controller::direct_services
         mmltk::controller::visual_contract
         mmltk::frameworks::gpu
@@ -94,6 +88,7 @@ function(mmltk_add_controller_subsystems_system_tests)
         mmltk::backend::models::rfdetr::contract
         mmltk::common::io
         mmltk::controller::data_compute_systems
+        mmltk::controller::runtime
         mmltk::controller::direct_services
         mmltk::controller::presentation_system
         mmltk_backend_data_test_support

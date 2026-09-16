@@ -1,3 +1,4 @@
+#include "src/controller/presentation/annotation_palette.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <sched.h>
@@ -6380,7 +6381,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             CHECK(saved->scene.objects.size() == 44U);
             CHECK(saved->scene.categories.size() == 38U);
             CHECK(std::ranges::count_if(saved->scene.objects, [](const auto& object) { return !object.enabled; }) == 32);
-            CHECK(saved->scene.palette == mmltk::controller::contracts::annotation_class_palette(saved->scene.categories.size()));
+            CHECK(saved->scene.palette == mmltk::controller::annotation_class_palette(saved->scene.categories.size()));
             for (const auto shape : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::AnnotationShape>())
                 CHECK(std::ranges::any_of(saved->scene.objects, [&](const auto& object) { return object.enabled && object.shape == shape.value; }));
             CHECK(std::ranges::any_of(saved->scene.objects, [](const auto& object) {

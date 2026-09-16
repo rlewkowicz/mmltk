@@ -1,4 +1,5 @@
 #pragma once
+#include "src/controller/contracts/application_systems.h"
 #include <array>
 #include <cstddef>
 #include <concepts>

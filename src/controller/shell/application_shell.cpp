@@ -111,13 +111,13 @@ void ApplicationShell::on_firefox_observation(const services::FirefoxPhysicalObs
     if (observation.kind == services::FirefoxPhysicalObservationKind::ProcessTerminal) {
         emit_shutdown_event("shutdown.firefox_terminal");
         request_shutdown(observation.process.terminal == services::FirefoxProcessTerminal::Exited && observation.process.status == 0
-                             ? services::ApplicationShutdownReason::WindowClose
-                             : services::ApplicationShutdownReason::FirefoxExit);
+                             ? shell::ApplicationShutdownReason::WindowClose
+                             : shell::ApplicationShutdownReason::FirefoxExit);
         return;
     }
-    request_shutdown(services::ApplicationShutdownReason::InfrastructureFailure);
+    request_shutdown(shell::ApplicationShutdownReason::InfrastructureFailure);
 }
-void ApplicationShell::request_shutdown(const services::ApplicationShutdownReason reason) noexcept {
+void ApplicationShell::request_shutdown(const shell::ApplicationShutdownReason reason) noexcept {
     std::call_once(shutdown_request_once_, [this, reason] {
         shutdown_requested_.store(true, std::memory_order_release);
         const auto diagnostics = runtime_diagnostics_.target();
@@ -141,7 +141,7 @@ void ApplicationShell::run() {
 }
 bool ApplicationShell::shutdown() noexcept {
     if (shutdown_complete_) return healthy_;
-    request_shutdown(services::ApplicationShutdownReason::WindowClose);
+    request_shutdown(shell::ApplicationShutdownReason::WindowClose);
     emit_shutdown_event("shutdown.browser_close.started");
     const bool browser_closed = browser_server_.close();
     emit_shutdown_event(browser_closed ? "shutdown.browser_close.completed" : "shutdown.browser_close.failed");

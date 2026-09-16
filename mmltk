@@ -3276,10 +3276,12 @@ run_tests() {
         mmltk_controller_browser_tests
         mmltk_controller_visual_systems_tests
         mmltk_controller_services_tests
+        mmltk_test_support_tests
         mmltk_controller_shell_tests
         mmltk_controller_data_compute_systems_tests
         mmltk_entrypoints_cli_tests
         mmltk_entrypoints_desktop_tests
+        mmltk_controller_firefox_process_tests
         mmltk_entrypoints_tools_tests
         mmltk_frameworks_gpu_tests
         mmltk_frameworks_process_tests
@@ -3298,6 +3300,7 @@ run_tests() {
             targets=(
                 mmltk_controller_browser_tests
                 mmltk_controller_services_tests
+                mmltk_test_support_tests
                 mmltk_controller_shell_tests
                 mmltk_controller_data_compute_systems_tests
                 mmltk_controller_visual_systems_tests
@@ -3311,6 +3314,7 @@ run_tests() {
             targets=(
                 mmltk_controller_browser_tests
                 mmltk_controller_services_tests
+                mmltk_test_support_tests
                 mmltk_controller_visual_systems_tests
                 mmltk_frameworks_serialization_tests
             )
@@ -3321,8 +3325,8 @@ run_tests() {
             executables=("${targets[@]}")
             ;;
         browser-runtime)
-            targets=(mmltk_entrypoints_desktop_tests)
-            executables=(mmltk_entrypoints_desktop_tests)
+            targets=(mmltk_entrypoints_desktop_tests mmltk_controller_firefox_process_tests)
+            executables=("${targets[@]}")
             ;;
         workspace-wayland)
             targets=(mmltk_workspace_wayland_integration)

@@ -1,4 +1,4 @@
-#include "src/controller/services/console_output.h"
+#include "src/test_support/console_output.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <array>
@@ -37,7 +37,7 @@ class PipeOwner final {
 }
 void test_append_console_output_normalizes_terminal_sequences() {
     std::string tail;
-    mmltk::controller::services::console_output::append_console_output(tail, "hello\rworld\nabc\b!\033[31m?\n", 128);
+    mmltk::testsupport::console_output::append_console_output(tail, "hello\rworld\nabc\b!\033[31m?\n", 128);
     REQUIRE(tail == "world\nab!?\n");
 }
 void test_drain_nonblocking_fd_reads_available_output() {
@@ -45,7 +45,7 @@ void test_drain_nonblocking_fd_reads_available_output() {
     REQUIRE(pipe.create());
     REQUIRE(set_nonblocking(pipe.read_descriptor()));
     REQUIRE(write_exact(pipe.write_descriptor(), "ready"));
-    const std::string output = mmltk::controller::services::console_output::read_fd(pipe.read_descriptor(), "failed to read test output pipe: ", true);
+    const std::string output = mmltk::testsupport::console_output::read_fd(pipe.read_descriptor(), "failed to read test output pipe: ", true);
     REQUIRE(output == "ready");
 }
 void test_read_fd_to_string_reads_until_eof() {
@@ -53,7 +53,7 @@ void test_read_fd_to_string_reads_until_eof() {
     REQUIRE(pipe.create());
     REQUIRE(write_exact(pipe.write_descriptor(), "vast output"));
     pipe.close_write_descriptor();
-    const std::string output = mmltk::controller::services::console_output::read_fd(pipe.read_descriptor(), "failed to read test blocking output pipe: ");
+    const std::string output = mmltk::testsupport::console_output::read_fd(pipe.read_descriptor(), "failed to read test blocking output pipe: ");
     REQUIRE(output == "vast output");
 }
 }  // namespace

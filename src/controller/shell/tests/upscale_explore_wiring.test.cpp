@@ -11,7 +11,7 @@
 #include <variant>
 #include <vector>
 #include "src/controller/browser/application_materializer.h"
-#include "src/controller/shell/direct_visual_systems.h"
+#include "src/controller/shell/application_system_storage.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/common/system/cpu_affinity.h"
 namespace mmltk::controller::shell {

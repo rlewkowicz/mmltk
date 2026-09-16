@@ -1,3 +1,4 @@
+#include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/client_record.h"
 #include "src/controller/browser/application_schema.h"
 #include <algorithm>

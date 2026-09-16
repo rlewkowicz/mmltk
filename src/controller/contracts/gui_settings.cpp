@@ -685,9 +685,20 @@ nlohmann::json normalize_gui_settings_document_impl(const nlohmann::json& j) {
     return j;
 }
 }  // namespace
-void to_json(nlohmann::json& j, const SourceSelectionState& s) { j = snapshot_fields(s, source_fields); }
-void from_json(const nlohmann::json& j, SourceSelectionState& s) { source_fields(s, JsonFieldReader{j}); }
-void to_json(nlohmann::json& j, const TrainViewState& s) {
+namespace settings_json_detail {
+void convert(JsonWrite<SourceSelectionState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
+    j = snapshot_fields(s, source_fields);
+}
+void convert(JsonRead<SourceSelectionState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
+    source_fields(s, JsonFieldReader{j});
+}
+void convert(JsonWrite<TrainViewState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
     const ModelArtifactSelectionState artifact_state = model_artifacts(s);
     j = snapshot_train_workflow_state(s);
     const JsonFieldWriter write{j};
@@ -697,7 +708,9 @@ void to_json(nlohmann::json& j, const TrainViewState& s) {
     train_execution_target_fields(s, write);
     add_model_selection_json(j, s);
 }
-void from_json(const nlohmann::json& j, TrainViewState& s) {
+void convert(JsonRead<TrainViewState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
     ModelArtifactSelectionState artifact_state = model_artifacts(s);
     const JsonFieldReader read{j};
     train_training_fields(s, read);
@@ -708,55 +721,84 @@ void from_json(const nlohmann::json& j, TrainViewState& s) {
     apply_model_artifacts(s, artifact_state);
     apply_model_selection_json(j, s);
 }
-void to_json(nlohmann::json& j, const AnnotateViewState& s) {
+void convert(JsonWrite<AnnotateViewState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
     j = snapshot_fields(s, annotate_flat_fields);
     add_model_selection_json(j, s);
 }
-void from_json(const nlohmann::json& j, AnnotateViewState& s) {
+void convert(JsonRead<AnnotateViewState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
     annotate_flat_fields(s, JsonFieldReader{j});
     apply_model_selection_json(j, s);
 }
-void to_json(nlohmann::json& j, const ExportViewState& s) {
+void convert(JsonWrite<ExportViewState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
     j = snapshot_fields(s, export_flat_fields);
     add_model_selection_json(j, s);
 }
-void from_json(const nlohmann::json& j, ExportViewState& s) {
+void convert(JsonRead<ExportViewState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
     export_flat_fields(s, JsonFieldReader{j});
     apply_model_selection_json(j, s);
 }
-void to_json(nlohmann::json& j, const ValidateViewState& s) {
+void convert(JsonWrite<ValidateViewState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
     j = snapshot_fields(s.request, validate_flat_fields);
     add_model_selection_json(j, s);
 }
-void from_json(const nlohmann::json& j, ValidateViewState& s) {
+void convert(JsonRead<ValidateViewState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
     validate_flat_fields(s.request, JsonFieldReader{j});
     apply_model_selection_json(j, s);
 }
-void to_json(nlohmann::json& j, const PredictViewState& s) {
+void convert(JsonWrite<PredictViewState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
     j = snapshot_fields(s.request, predict_flat_fields);
     j["source"] = s.source;
     j["live_split_count"] = s.live_split_count;
     add_model_selection_json(j, s);
 }
-void from_json(const nlohmann::json& j, PredictViewState& s) {
+void convert(JsonRead<PredictViewState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
     predict_flat_fields(s.request, JsonFieldReader{j});
     s.request.batch_size = 1U;
     get_optional(j, "source", s.source);
     get_optional(j, "live_split_count", s.live_split_count);
     apply_model_selection_json(j, s);
 }
-void to_json(nlohmann::json& j, const UiSettingsState& s) { j = snapshot_fields(s, ui_settings_fields); }
-void from_json(const nlohmann::json& j, UiSettingsState& s) {
+void convert(JsonWrite<UiSettingsState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
+    j = snapshot_fields(s, ui_settings_fields);
+}
+void convert(JsonRead<UiSettingsState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
     ui_settings_fields(s, JsonFieldReader{j});
     mmltk::frameworks::reflection::normalize_reflected_intrinsics(s, UiSettingsState{});
 }
-void to_json(nlohmann::json& j, const ExploreViewState& s) { j = snapshot_fields(s, explore_fields); }
-void from_json(const nlohmann::json& j, ExploreViewState& s) {
+void convert(JsonWrite<ExploreViewState> value) {
+    auto& j = value.json;
+    const auto& s = value.state;
+    j = snapshot_fields(s, explore_fields);
+}
+void convert(JsonRead<ExploreViewState> value) {
+    const auto& j = value.json;
+    auto& s = value.state;
     explore_fields(s, JsonFieldReader{j});
     mmltk::frameworks::reflection::normalize_reflected_intrinsics(s, ExploreViewState{});
     s.max_instances = std::max(s.max_instances, s.min_instances);
     if (s.max_compiled_index < s.min_compiled_index) { s.max_compiled_index = s.min_compiled_index; }
 }
+}  // namespace settings_json_detail
 nlohmann::json snapshot_workflows(const GuiSettingsState& settings) {
     nlohmann::json j = nlohmann::json::object();
     {
@@ -876,8 +918,18 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsState& state) {
     }
     state = std::move(candidate);
 }
-void to_json(nlohmann::json& json, const GuiSettingsState& state) { json = snapshot_gui_settings(state); }
-void from_json(const nlohmann::json& json, GuiSettingsState& state) { apply_gui_settings(json, state); }
+namespace settings_json_detail {
+void convert(JsonWrite<GuiSettingsState> value) {
+    auto& json = value.json;
+    const auto& state = value.state;
+    json = snapshot_gui_settings(state);
+}
+void convert(JsonRead<GuiSettingsState> value) {
+    const auto& json = value.json;
+    auto& state = value.state;
+    apply_gui_settings(json, state);
+}
+}  // namespace settings_json_detail
 bool load_gui_settings_file(const std::string& path, GuiSettingsState& state, nlohmann::json* const normalized_document, bool* const repair_required) {
     std::ifstream file(path);
     if (!file.is_open()) { return false; }

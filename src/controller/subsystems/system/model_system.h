@@ -11,8 +11,7 @@
 #include "src/controller/contracts/model.h"
 #include "src/controller/services/artifact_store.h"
 #include "src/controller/services/settings_system.h"
-#include "src/controller/subsystems/system/local_run.h"
-#include "src/controller/subsystems/system/system_events.h"
+#include "src/controller/runtime/local_run.h"
 // CLEANUP-IGNORE: Model events form a canonical reflected vocabulary distinct from Dataset artifact progress and
 // terminal facts.
 namespace mmltk::controller {

@@ -13,7 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include "spdmon/spdmon.hpp"
 #include "src/backend/data/dataset_compiler.h"
-#include "src/controller/services/console_output.h"
+#include "src/test_support/console_output.h"
 namespace {
 using ProgressClock = spdmon::ProgressBar::clock_t;
 using ProgressTimePoint = ProgressClock::time_point;
@@ -80,7 +80,7 @@ class ScopedStderrCapture final {
         if (finished_) return output_;
         std::fflush(stderr);
         restore_stderr();
-        output_ = mmltk::controller::services::console_output::read_fd(pipe_fds_[0], "read failed: ");
+        output_ = mmltk::testsupport::console_output::read_fd(pipe_fds_[0], "read failed: ");
         static_cast<void>(::close(pipe_fds_[0]));
         pipe_fds_[0] = -1;
         finished_ = true;
