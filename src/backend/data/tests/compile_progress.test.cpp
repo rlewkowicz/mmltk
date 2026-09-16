@@ -21,15 +21,15 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "async_test_utils.hpp"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/file_memory.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 using namespace mmltk::backend::data;
 using mmltk::common::io::FileHandle;
 using namespace mmltk::backend::data::testsupport;

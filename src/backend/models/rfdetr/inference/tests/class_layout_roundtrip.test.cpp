@@ -7,7 +7,7 @@
 #include <future>
 #include <chrono>
 #include <stop_token>
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"

@@ -1,3 +1,4 @@
+#include "src/frameworks/transport/tests/support/browser_assets.h"
 #include "src/frameworks/transport/browser_server.h"
 #include "src/frameworks/transport/browser_server_lifecycle.h"
 #include <catch2/catch_test_macros.hpp>
@@ -11,7 +12,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 namespace mmltk::frameworks::transport {
 namespace {
 struct CallbackFacts final {

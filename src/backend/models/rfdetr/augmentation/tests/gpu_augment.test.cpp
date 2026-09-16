@@ -1,4 +1,4 @@
-#include "copy_paste_fixture.h"
+#include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 #include "src/backend/data/tests/perceptual_downscale_reference.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>

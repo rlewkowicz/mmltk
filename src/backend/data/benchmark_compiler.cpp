@@ -1637,7 +1637,7 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
 void sync_directory(const std::filesystem::path& path) {
     const int descriptor = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (descriptor < 0) { throw common_io::errno_error("cannot open benchmark directory for sync", path.string()); }
-    common_io::UniqueFd directory(descriptor);
+    common_io::ScopedFd directory(descriptor);
     if (::fsync(directory.get()) != 0) { throw common_io::errno_error("cannot sync benchmark directory", path.string()); }
 }
 void publish_dataset_directory(const std::filesystem::path& staging, const std::filesystem::path& output, const bool overwrite,

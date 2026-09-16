@@ -10,7 +10,7 @@ class ArtifactPublicationCancelled final : public std::runtime_error {
 };
 namespace detail {
 // Shared file primitives: neither admission nor publication owns the other.
-[[nodiscard]] mmltk::common::io::UniqueFd lock_class_artifact(const std::filesystem::path& artifact, bool write, bool create = false);
+[[nodiscard]] mmltk::common::io::ScopedFd lock_class_artifact(const std::filesystem::path& artifact, bool write, bool create = false);
 [[nodiscard]] ModelClassDescriptor read_class_descriptor(const std::filesystem::path& path);
 }  // namespace detail
 }  // namespace mmltk::backend::models::rfdetr

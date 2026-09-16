@@ -4,8 +4,8 @@
 #include <atomic>
 #include <future>
 #include <optional>
-#include "async_test_utils.hpp"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +25,7 @@
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/concurrency/parallel_range.h"
 #include "src/common/concurrency/worker_pool.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 #include "perceptual_downscale_reference.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;

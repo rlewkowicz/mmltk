@@ -66,7 +66,7 @@ function(mmltk_add_backend_imaging_annotation_tests)
     mmltk_configure_component(
         mmltk_backend_imaging_annotation_tests PRIVATE_DECLARATIONS)
     target_link_libraries(mmltk_backend_imaging_annotation_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::backend::imaging::annotation
     )
     catch_discover_tests(

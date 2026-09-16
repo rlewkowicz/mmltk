@@ -11,6 +11,20 @@ namespace mmltk::common::io {
 namespace {
 void assign_errno(std::error_code& error, const int value = errno) noexcept { error.assign(value, std::generic_category()); }
 [[nodiscard]] bool is_dot_entry(const char* name) noexcept { return name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')); }
+enum class CleanupPolicy { FailFast, BestEffort };
+template <typename Remove>
+bool remove_directory_entries(DIR* directory, CleanupPolicy policy, Remove remove, std::error_code& error) {
+    for (;;) {
+        errno = 0;
+        dirent* entry = ::readdir(directory);
+        if (entry == nullptr) {
+            if (errno != 0) { assign_errno(error); return false; }
+            return true;
+        }
+        if (is_dot_entry(entry->d_name)) continue;
+        if (!remove(entry->d_name) && policy == CleanupPolicy::FailFast) return false;
+    }
+}
 [[nodiscard]] bool remove_entry_at(const int parent_fd, const char* name, const dev_t root_device, std::error_code& error) noexcept {
     if (parent_fd < 0) {
         assign_errno(error, EBADF);
@@ -63,23 +77,12 @@ void assign_errno(std::error_code& error, const int value = errno) noexcept { er
         assign_errno(error, ESTALE);
         return false;
     }
-    while (true) {
-        errno = 0;
-        dirent* entry = ::readdir(directory);
-        if (entry == nullptr) {
-            if (errno != 0) {
-                const int saved_errno = errno;
-                ::closedir(directory);
-                assign_errno(error, saved_errno);
-                return false;
-            }
-            break;
-        }
-        if (is_dot_entry(entry->d_name)) { continue; }
-        if (!remove_entry_at(directory_fd, entry->d_name, root_device, error)) {
-            ::closedir(directory);
-            return false;
-        }
+    if (!remove_directory_entries(directory, CleanupPolicy::FailFast,
+            [&](const char* child) { return remove_entry_at(directory_fd, child, root_device, error); }, error)) {
+        const std::error_code saved = error;
+        ::closedir(directory);
+        error = saved;
+        return false;
     }
     if (::closedir(directory) != 0) {
         assign_errno(error);
@@ -100,6 +103,32 @@ void assign_errno(std::error_code& error, const int value = errno) noexcept { er
     return false;
 }
 }  // namespace
+void remove_path_recursively_best_effort(const std::filesystem::path& path) noexcept {
+    try {
+        // Preserve this entry's admission policy: dangling symlinks are left alone,
+        // and mounted directories and symlinked ancestors are permitted.
+        std::error_code error;
+        if (!std::filesystem::exists(path, error) || error) return;
+        struct stat status{};
+        if (::lstat(path.c_str(), &status) != 0) return;
+        if (!S_ISDIR(status.st_mode)) {
+            static_cast<void>(::unlink(path.c_str()));
+            return;
+        }
+        DIR* directory = ::opendir(path.c_str());
+        if (directory != nullptr) {
+            static_cast<void>(remove_directory_entries(directory, CleanupPolicy::BestEffort,
+                [&](const char* child) noexcept {
+                    try { remove_path_recursively_best_effort(path / child); return true; }
+                    catch (...) { return false; }
+                }, error));
+            static_cast<void>(::closedir(directory));
+        }
+        static_cast<void>(::rmdir(path.c_str()));
+    } catch (...) {
+        // Best-effort destruction must never escape through a resource owner.
+    }
+}
 bool remove_tree_no_follow(const std::filesystem::path& path, std::error_code& error) noexcept {
     error.clear();
     try {
@@ -119,7 +148,7 @@ bool remove_tree_no_follow(const std::filesystem::path& path, std::error_code& e
             assign_errno(error);
             return false;
         }
-        const UniqueFd parent_directory(parent_fd);
+        const ScopedFd parent_directory(parent_fd);
         struct stat parent_status{};
         if (::fstat(parent_directory.get(), &parent_status) != 0) {
             assign_errno(error);

@@ -1,4 +1,5 @@
 #pragma once
+#include "src/common/io/scoped_fd.h"
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -8,20 +9,8 @@
 #include <string>
 #include <system_error>
 namespace mmltk::common::io {
-class UniqueFd {
-   public:
-    explicit UniqueFd(int fd = -1) noexcept;
-    ~UniqueFd();
-    UniqueFd(const UniqueFd&) = delete;
-    UniqueFd& operator=(const UniqueFd&) = delete;
-    UniqueFd(UniqueFd&& other) noexcept;
-    UniqueFd& operator=(UniqueFd&& other) noexcept;
-    [[nodiscard]] int get() const noexcept;
-
-   private:
-    int fd_ = -1;
-};
 [[nodiscard]] std::runtime_error errno_error(const char* action, const std::string& path = {});
+void remove_path_recursively_best_effort(const std::filesystem::path& path) noexcept;
 void sync_parent_directory(const std::filesystem::path& path);
 [[nodiscard]] bool remove_tree_no_follow(const std::filesystem::path& path, std::error_code& error) noexcept;
 void publish_staged_path_atomically(const std::filesystem::path& staging, const std::filesystem::path& destination, bool overwrite = true);
@@ -45,7 +34,7 @@ class FileHandle {
     void sync_data() const;
 
    private:
-    UniqueFd fd_;
+    ScopedFd fd_;
 };
 class MappedByteRegion {
    public:

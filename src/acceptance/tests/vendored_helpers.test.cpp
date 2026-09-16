@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 #include "../../../third_party/firefox/dom/webgpu/ipc/WorkspaceSlotReleaseRegistration.h"
-#include "catch2_compat.hpp"
-#include "subprocess_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/subprocess_test_utils.hpp"
 namespace {
 using namespace mmltk::testsupport;
 using mozilla::webgpu::WorkspaceSlotReleaseRegistrationOwner;
@@ -48,91 +48,91 @@ void test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatti
     FixedFormatter formatter("formatted payload");
     spdlog::memory_buf_t formatted;
     const spdlog::string_view_t raw_payload = spdlog::details::format_log_msg_payload(false, formatter, msg, formatted);
-    MMLTK_ASSERT(raw_payload == msg.payload);
-    MMLTK_ASSERT(formatted.size() == 0U);
-    MMLTK_ASSERT(spdlog::details::log_msg_payload_length(raw_payload) == static_cast<int>(msg.payload.size()));
+    REQUIRE((raw_payload == msg.payload));
+    REQUIRE((formatted.size() == 0U));
+    REQUIRE((spdlog::details::log_msg_payload_length(raw_payload) == static_cast<int>(msg.payload.size())));
     const spdlog::string_view_t formatted_payload = spdlog::details::format_log_msg_payload(true, formatter, msg, formatted);
-    MMLTK_ASSERT(formatted_payload == spdlog::string_view_t("formatted payload", 17));
-    MMLTK_ASSERT(spdlog::details::log_msg_payload_length(formatted_payload) == 17);
+    REQUIRE((formatted_payload == spdlog::string_view_t("formatted payload", 17)));
+    REQUIRE((spdlog::details::log_msg_payload_length(formatted_payload) == 17));
 }
 void test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max() {
     constexpr std::array<char, 2> kSentinel{'x', '\0'};
     const std::size_t oversized_length = static_cast<std::size_t>(std::numeric_limits<int>::max()) + 128U;
     const spdlog::string_view_t oversized_payload(kSentinel.data(), oversized_length);
-    MMLTK_ASSERT(spdlog::details::log_msg_payload_length(oversized_payload) == std::numeric_limits<int>::max());
+    REQUIRE((spdlog::details::log_msg_payload_length(oversized_payload) == std::numeric_limits<int>::max()));
 }
 void test_catch2_compact_reporter_formats_shared_assertion_details() {
     const SubprocessResult result = run_reporter_fixture("compact");
-    MMLTK_ASSERT(result.exit_code != 0);
-    MMLTK_ASSERT(result.output_text.find("failed: fixture_value == 2") != std::string::npos);
-    MMLTK_ASSERT(result.output_text.find("for: 1 == 2") != std::string::npos);
-    MMLTK_ASSERT(result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos);
+    REQUIRE((result.exit_code != 0));
+    REQUIRE((result.output_text.find("failed: fixture_value == 2") != std::string::npos));
+    REQUIRE((result.output_text.find("for: 1 == 2") != std::string::npos));
+    REQUIRE((result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos));
 }
 void test_catch2_tap_reporter_formats_shared_assertion_details() {
     const SubprocessResult result = run_reporter_fixture("tap");
-    MMLTK_ASSERT(result.exit_code != 0);
-    MMLTK_ASSERT(result.output_text.find("# vendored_catch2_reporter_fixture") != std::string::npos);
-    MMLTK_ASSERT(result.output_text.find("not ok 1 - fixture_value == 2") != std::string::npos);
-    MMLTK_ASSERT(result.output_text.find("for: 1 == 2") != std::string::npos);
-    MMLTK_ASSERT(result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos);
+    REQUIRE((result.exit_code != 0));
+    REQUIRE((result.output_text.find("# vendored_catch2_reporter_fixture") != std::string::npos));
+    REQUIRE((result.output_text.find("not ok 1 - fixture_value == 2") != std::string::npos));
+    REQUIRE((result.output_text.find("for: 1 == 2") != std::string::npos));
+    REQUIRE((result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos));
 }
 void test_workspace_slot_release_registration_shares_one_window_listener_until_last_device() {
     WorkspaceSlotReleaseRegistrationOwner registrations;
     const auto first = registrations.Register(1U, 11U);
-    MMLTK_ASSERT(first.attach_window == 11U);
-    MMLTK_ASSERT(!first.detach_window);
+    REQUIRE((first.attach_window == 11U));
+    REQUIRE((!first.detach_window));
     const auto second = registrations.Register(2U, 11U);
-    MMLTK_ASSERT(!second.attach_window);
-    MMLTK_ASSERT(!second.detach_window);
-    MMLTK_ASSERT(registrations.DeviceCount(11U) == 2U);
-    MMLTK_ASSERT(registrations.WindowCount() == 1U);
-    MMLTK_ASSERT(!registrations.Unregister(1U));
-    MMLTK_ASSERT(registrations.DeviceCount(11U) == 1U);
-    MMLTK_ASSERT(registrations.Unregister(2U) == 11U);
-    MMLTK_ASSERT(registrations.DeviceCount() == 0U);
-    MMLTK_ASSERT(registrations.WindowCount() == 0U);
+    REQUIRE((!second.attach_window));
+    REQUIRE((!second.detach_window));
+    REQUIRE((registrations.DeviceCount(11U) == 2U));
+    REQUIRE((registrations.WindowCount() == 1U));
+    REQUIRE((!registrations.Unregister(1U)));
+    REQUIRE((registrations.DeviceCount(11U) == 1U));
+    REQUIRE((registrations.Unregister(2U) == 11U));
+    REQUIRE((registrations.DeviceCount() == 0U));
+    REQUIRE((registrations.WindowCount() == 0U));
 }
 void test_workspace_slot_release_registration_tracks_windows_independently() {
     WorkspaceSlotReleaseRegistrationOwner registrations;
-    MMLTK_ASSERT(registrations.Register(1U, 11U).attach_window == 11U);
-    MMLTK_ASSERT(registrations.Register(2U, 22U).attach_window == 22U);
-    MMLTK_ASSERT(registrations.WindowCount() == 2U);
-    MMLTK_ASSERT(registrations.Unregister(1U) == 11U);
-    MMLTK_ASSERT(registrations.WindowCount() == 1U);
-    MMLTK_ASSERT(registrations.DeviceCount(22U) == 1U);
-    MMLTK_ASSERT(registrations.Unregister(2U) == 22U);
+    REQUIRE((registrations.Register(1U, 11U).attach_window == 11U));
+    REQUIRE((registrations.Register(2U, 22U).attach_window == 22U));
+    REQUIRE((registrations.WindowCount() == 2U));
+    REQUIRE((registrations.Unregister(1U) == 11U));
+    REQUIRE((registrations.WindowCount() == 1U));
+    REQUIRE((registrations.DeviceCount(22U) == 1U));
+    REQUIRE((registrations.Unregister(2U) == 22U));
 }
 void test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister() {
     WorkspaceSlotReleaseRegistrationOwner registrations;
-    MMLTK_ASSERT(registrations.Register(1U, 11U).attach_window == 11U);
+    REQUIRE((registrations.Register(1U, 11U).attach_window == 11U));
     const auto duplicate = registrations.Register(1U, 11U);
-    MMLTK_ASSERT(!duplicate.attach_window);
-    MMLTK_ASSERT(!duplicate.detach_window);
-    MMLTK_ASSERT(registrations.DeviceCount(11U) == 1U);
+    REQUIRE((!duplicate.attach_window));
+    REQUIRE((!duplicate.detach_window));
+    REQUIRE((registrations.DeviceCount(11U) == 1U));
     const auto moved = registrations.Register(1U, 22U);
-    MMLTK_ASSERT(moved.detach_window == 11U);
-    MMLTK_ASSERT(moved.attach_window == 22U);
-    MMLTK_ASSERT(registrations.DeviceCount(11U) == 0U);
-    MMLTK_ASSERT(registrations.DeviceCount(22U) == 1U);
-    MMLTK_ASSERT(registrations.Unregister(1U) == 22U);
-    MMLTK_ASSERT(!registrations.Unregister(1U));
+    REQUIRE((moved.detach_window == 11U));
+    REQUIRE((moved.attach_window == 22U));
+    REQUIRE((registrations.DeviceCount(11U) == 0U));
+    REQUIRE((registrations.DeviceCount(22U) == 1U));
+    REQUIRE((registrations.Unregister(1U) == 22U));
+    REQUIRE((!registrations.Unregister(1U)));
 }
 void test_workspace_slot_release_registration_handles_window_death_and_system_teardown() {
     WorkspaceSlotReleaseRegistrationOwner registrations;
-    MMLTK_ASSERT(registrations.Register(1U, 11U).attach_window == 11U);
-    MMLTK_ASSERT(!registrations.Register(2U, 11U).attach_window);
-    MMLTK_ASSERT(registrations.Register(3U, 22U).attach_window == 22U);
-    MMLTK_ASSERT(registrations.RemoveWindow(11U));
-    MMLTK_ASSERT(!registrations.RemoveWindow(11U));
-    MMLTK_ASSERT(!registrations.Unregister(1U));
-    MMLTK_ASSERT(!registrations.Unregister(2U));
-    MMLTK_ASSERT(registrations.DeviceCount() == 1U);
-    MMLTK_ASSERT(registrations.WindowCount() == 1U);
+    REQUIRE((registrations.Register(1U, 11U).attach_window == 11U));
+    REQUIRE((!registrations.Register(2U, 11U).attach_window));
+    REQUIRE((registrations.Register(3U, 22U).attach_window == 22U));
+    REQUIRE((registrations.RemoveWindow(11U)));
+    REQUIRE((!registrations.RemoveWindow(11U)));
+    REQUIRE((!registrations.Unregister(1U)));
+    REQUIRE((!registrations.Unregister(2U)));
+    REQUIRE((registrations.DeviceCount() == 1U));
+    REQUIRE((registrations.WindowCount() == 1U));
     registrations.Clear();
     registrations.Clear();
-    MMLTK_ASSERT(!registrations.Unregister(3U));
-    MMLTK_ASSERT(registrations.DeviceCount() == 0U);
-    MMLTK_ASSERT(registrations.WindowCount() == 0U);
+    REQUIRE((!registrations.Unregister(3U)));
+    REQUIRE((registrations.DeviceCount() == 0U));
+    REQUIRE((registrations.WindowCount() == 0U));
 }
 }  // namespace
 TEST_CASE("vendored_catch2_reporter_fixture", "[.][core][vendored][reporter_fixture]") {
@@ -141,11 +141,11 @@ TEST_CASE("vendored_catch2_reporter_fixture", "[.][core][vendored][reporter_fixt
     // NOLINTNEXTLINE(bugprone-chained-comparison): Catch2 decomposes REQUIRE through operator<=.
     REQUIRE(fixture_value == 2);
 }
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting);
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max);
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_catch2_compact_reporter_formats_shared_assertion_details);
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_catch2_tap_reporter_formats_shared_assertion_details);
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_workspace_slot_release_registration_shares_one_window_listener_until_last_device);
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_workspace_slot_release_registration_tracks_windows_independently);
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister);
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_workspace_slot_release_registration_handles_window_death_and_system_teardown);
+TEST_CASE("test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting", "[core][vendored]") { test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting(); }
+TEST_CASE("test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max", "[core][vendored]") { test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max(); }
+TEST_CASE("test_catch2_compact_reporter_formats_shared_assertion_details", "[core][vendored]") { test_catch2_compact_reporter_formats_shared_assertion_details(); }
+TEST_CASE("test_catch2_tap_reporter_formats_shared_assertion_details", "[core][vendored]") { test_catch2_tap_reporter_formats_shared_assertion_details(); }
+TEST_CASE("test_workspace_slot_release_registration_shares_one_window_listener_until_last_device", "[core][vendored]") { test_workspace_slot_release_registration_shares_one_window_listener_until_last_device(); }
+TEST_CASE("test_workspace_slot_release_registration_tracks_windows_independently", "[core][vendored]") { test_workspace_slot_release_registration_tracks_windows_independently(); }
+TEST_CASE("test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister", "[core][vendored]") { test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister(); }
+TEST_CASE("test_workspace_slot_release_registration_handles_window_death_and_system_teardown", "[core][vendored]") { test_workspace_slot_release_registration_handles_window_death_and_system_teardown(); }

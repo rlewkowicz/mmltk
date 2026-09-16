@@ -13,7 +13,7 @@
 #include <future>
 #include <cstring>
 #include <cuda_runtime_api.h>
-#include "src/acceptance/tests/filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/presentation/visual_document.h"
 #include "src/controller/subsystems/annotation/detail/annotation_document.h"
 #include "src/controller/subsystems/annotation/detail/annotation_render_state.h"
@@ -21,8 +21,8 @@
 #include "src/frameworks/serialization/serialization.h"
 #include "src/controller/subsystems/annotation/detail/annotation_mask.h"
 #include "src/controller/presentation/detail/visual_runtime_owner.h"
-#include "src/acceptance/tests/async_test_utils.hpp"
-#include "src/acceptance/tests/cuda_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 namespace mmltk::controller {
 namespace {
 [[nodiscard]] contracts::AnnotationSceneContent test_scene(const std::string_view identity) {

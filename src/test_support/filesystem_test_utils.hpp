@@ -21,12 +21,4 @@ class ScopedTempDir {
    private:
     std::filesystem::path path_;
 };
-class BrowserAssetDirectory final {
-   public:
-    explicit BrowserAssetDirectory(const char* name_prefix);
-    [[nodiscard]] const std::filesystem::path& path() const noexcept;
-
-   private:
-    ScopedTempDir root_;
-};
 }  // namespace mmltk::testsupport

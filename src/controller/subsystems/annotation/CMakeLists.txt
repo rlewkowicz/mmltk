@@ -39,6 +39,12 @@ mmltk_link_declarations(mmltk_controller_annotation_system PUBLIC
     mmltk::controller::visual_runtime)
 mmltk_register_header_isolation(mmltk_controller_annotation_system)
 
+add_library(mmltk_controller_annotation_test_support INTERFACE)
+mmltk_register_public_headers(mmltk_controller_annotation_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/annotation_test_utils.hpp)
+target_link_libraries(mmltk_controller_annotation_test_support INTERFACE mmltk_test_support mmltk::controller::annotation_system)
+
 function(mmltk_add_controller_annotation_tests)
     add_executable(mmltk_controller_annotation_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(mmltk_controller_annotation_tests PRIVATE_DECLARATIONS)
@@ -46,7 +52,7 @@ function(mmltk_add_controller_annotation_tests)
         mmltk_controller_annotation_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/annotation_document.test.cpp)
     target_link_libraries(mmltk_controller_annotation_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::controller::annotation_system
         mmltk::controller::visual_runtime)
     catch_discover_tests(

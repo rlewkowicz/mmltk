@@ -42,9 +42,9 @@
 #include <vector>
 #include <catch2/generators/catch_generators.hpp>
 #include <cuda.h>
-#include "catch2_compat.hpp"
-#include "filesystem_test_utils.hpp"
-#include "linux_process_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/linux_process_test_utils.hpp"
 #include "workflow_wayland_inputs.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/dataset_compiler.h"
@@ -60,7 +60,7 @@
 #include "src/frameworks/serialization/serialization.h"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/services/firefox_process_owner.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 namespace {
 // CLEANUP-IGNORE: The Wayland product driver imports its own typed test helpers and hardware-only termination
 // vocabulary.
@@ -6748,14 +6748,14 @@ TEST_CASE("browser audit exposes distinct integration phases for progress deadli
 // startup-latched faults + two quiet paths + model workflows = 11 H2D lifetimes. Optional GDR
 // adds one focused lifetime. The former matrix used 23 per transport (46
 // with GDR), recompiling/relaunching ordinary coverage for each case.
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][retained]", workspace_wayland_retained);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][workflows]", workspace_wayland_workflows);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][dpi]", workspace_wayland_dpi);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][terminal]", workspace_wayland_terminal);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][probe_recovery]", workspace_wayland_probe_recovery);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][gdr]", workspace_wayland_gdr);
-MMLTK_REGISTER_TEST_CASE("[workspace_hardware][workspace_wayland_integration][quiet]", workspace_wayland_quiet);
-MMLTK_REGISTER_TEST_CASE("[workspace_wayland_integration][rendered_probe_audit]", rendered_probe_audit_rejects_mismatched_identity);
+TEST_CASE("workspace_wayland_retained", "[workspace_hardware][workspace_wayland_integration][retained]") { workspace_wayland_retained(); }
+TEST_CASE("workspace_wayland_workflows", "[workspace_hardware][workspace_wayland_integration][workflows]") { workspace_wayland_workflows(); }
+TEST_CASE("workspace_wayland_dpi", "[workspace_hardware][workspace_wayland_integration][dpi]") { workspace_wayland_dpi(); }
+TEST_CASE("workspace_wayland_terminal", "[workspace_hardware][workspace_wayland_integration][terminal]") { workspace_wayland_terminal(); }
+TEST_CASE("workspace_wayland_probe_recovery", "[workspace_hardware][workspace_wayland_integration][probe_recovery]") { workspace_wayland_probe_recovery(); }
+TEST_CASE("workspace_wayland_gdr", "[workspace_hardware][workspace_wayland_integration][gdr]") { workspace_wayland_gdr(); }
+TEST_CASE("workspace_wayland_quiet", "[workspace_hardware][workspace_wayland_integration][quiet]") { workspace_wayland_quiet(); }
+TEST_CASE("rendered_probe_audit_rejects_mismatched_identity", "[workspace_wayland_integration][rendered_probe_audit]") { rendered_probe_audit_rejects_mismatched_identity(); }
 }  // namespace
 namespace {
 [[nodiscard]] nlohmann::json native_surface_record(const char* event, const std::uint64_t low = 12U) {

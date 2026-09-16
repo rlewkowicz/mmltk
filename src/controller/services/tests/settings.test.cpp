@@ -10,8 +10,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include "catch2_compat.hpp"
-#include "filesystem_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/explore_filter.h"
@@ -644,48 +644,48 @@ void test_ui_settings_round_trip() {
     explore.detail_scale_mode = ExploreDetailScaleMode::Neural;
     GuiSettingsState& snapshot = make_snapshot(states);
     const nlohmann::json saved = snapshot_gui_settings(snapshot);
-    MMLTK_ASSERT(saved.at("schema_version") == kGuiSettingsSchemaVersion);
-    MMLTK_ASSERT(saved.at("ui").at("workspace_aspect_ratio") == 3);
-    MMLTK_ASSERT(saved.at("ui").at("annotation_brush_radius") == 27);
-    MMLTK_ASSERT(saved.at("ui").at("mask_cleanup_radius") == 6);
-    MMLTK_ASSERT(saved.at("ui").at("show_workspace_performance") == true);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("dataset_paths").at("train_compiled_path") == "/tmp/train.bin");
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("dataset_paths").at("source_dir") == "/tmp/dataset");
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("dataset_paths").at("compiled_directory") == "/tmp/compiled");
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("dataset_paths").at("overwrite") == true);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("dataset_paths").at("compile_dimensions") == true);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("model_artifacts").at("resolution") == 512);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("model_artifacts").at("weights_path") == "/tmp/weights.pt");
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("execution").at("progress_bar") == true);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("training").at("local_device_ids") == nlohmann::json::array({0, 2}));
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("training").at("num_queries") == 111);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("training").at("eval_max_dets") == 113);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("training").at("recipe_overrides").at("lr") == true);
-    MMLTK_ASSERT(saved.at("workflows").at("train").at("training").at("lr_scheduler") == "cosine");
-    MMLTK_ASSERT(saved.at("workflows").at("validate").at("dataset_paths").at("compiled_path") == "/tmp/validate.bin");
-    MMLTK_ASSERT(saved.at("workflows").at("validate").at("validation").at("num_queries") == 211);
-    MMLTK_ASSERT(saved.at("workflows").at("validate").at("validation").at("eval_max_dets") == 213);
-    MMLTK_ASSERT(saved.at("workflows").at("predict").at("predict").at("output_path") == "/tmp/predictions.json");
-    MMLTK_ASSERT(saved.at("workflows").at("annotate").at("annotate").at("output_dir") == "/tmp/annotated-scenes");
-    MMLTK_ASSERT(saved.at("workflows").at("export").at("model_artifacts").at("onnx_input_path") == "/tmp/export-input.onnx");
-    MMLTK_ASSERT(saved.at("workflows").at("export").at("export").at("onnx_output_path") == "/tmp/export-output.onnx");
-    MMLTK_ASSERT(saved.at("workflows").at("export").at("export").at("output_path") == "/tmp/export.engine");
+    REQUIRE((saved.at("schema_version") == kGuiSettingsSchemaVersion));
+    REQUIRE((saved.at("ui").at("workspace_aspect_ratio") == 3));
+    REQUIRE((saved.at("ui").at("annotation_brush_radius") == 27));
+    REQUIRE((saved.at("ui").at("mask_cleanup_radius") == 6));
+    REQUIRE((saved.at("ui").at("show_workspace_performance") == true));
+    REQUIRE((saved.at("workflows").at("train").at("dataset_paths").at("train_compiled_path") == "/tmp/train.bin"));
+    REQUIRE((saved.at("workflows").at("train").at("dataset_paths").at("source_dir") == "/tmp/dataset"));
+    REQUIRE((saved.at("workflows").at("train").at("dataset_paths").at("compiled_directory") == "/tmp/compiled"));
+    REQUIRE((saved.at("workflows").at("train").at("dataset_paths").at("overwrite") == true));
+    REQUIRE((saved.at("workflows").at("train").at("dataset_paths").at("compile_dimensions") == true));
+    REQUIRE((saved.at("workflows").at("train").at("model_artifacts").at("resolution") == 512));
+    REQUIRE((saved.at("workflows").at("train").at("model_artifacts").at("weights_path") == "/tmp/weights.pt"));
+    REQUIRE((saved.at("workflows").at("train").at("execution").at("progress_bar") == true));
+    REQUIRE((saved.at("workflows").at("train").at("training").at("local_device_ids") == nlohmann::json::array({0, 2})));
+    REQUIRE((saved.at("workflows").at("train").at("training").at("num_queries") == 111));
+    REQUIRE((saved.at("workflows").at("train").at("training").at("eval_max_dets") == 113));
+    REQUIRE((saved.at("workflows").at("train").at("training").at("recipe_overrides").at("lr") == true));
+    REQUIRE((saved.at("workflows").at("train").at("training").at("lr_scheduler") == "cosine"));
+    REQUIRE((saved.at("workflows").at("validate").at("dataset_paths").at("compiled_path") == "/tmp/validate.bin"));
+    REQUIRE((saved.at("workflows").at("validate").at("validation").at("num_queries") == 211));
+    REQUIRE((saved.at("workflows").at("validate").at("validation").at("eval_max_dets") == 213));
+    REQUIRE((saved.at("workflows").at("predict").at("predict").at("output_path") == "/tmp/predictions.json"));
+    REQUIRE((saved.at("workflows").at("annotate").at("annotate").at("output_dir") == "/tmp/annotated-scenes"));
+    REQUIRE((saved.at("workflows").at("export").at("model_artifacts").at("onnx_input_path") == "/tmp/export-input.onnx"));
+    REQUIRE((saved.at("workflows").at("export").at("export").at("onnx_output_path") == "/tmp/export-output.onnx"));
+    REQUIRE((saved.at("workflows").at("export").at("export").at("output_path") == "/tmp/export.engine"));
     const nlohmann::json& saved_explore = saved.at("workflows").at("explore");
-    MMLTK_ASSERT(saved_explore.at("device_id") == 2);
-    MMLTK_ASSERT(saved_explore.at("shuffle_seed") == 0x12345678U);
-    MMLTK_ASSERT(saved_explore.at("require_boxes"));
-    MMLTK_ASSERT(saved_explore.at("require_masks"));
-    MMLTK_ASSERT(saved_explore.at("min_instances") == 2U);
-    MMLTK_ASSERT(saved_explore.at("max_instances") == 17U);
-    MMLTK_ASSERT(saved_explore.at("min_compiled_index") == 11U);
-    MMLTK_ASSERT(saved_explore.at("max_compiled_index") == 9'001U);
-    MMLTK_ASSERT(saved_explore.at("class_catalog_identity") == 0x9123'4567'89ab'cdefULL);
-    MMLTK_ASSERT(!saved_explore.at("sample_classes").at(7).get<bool>());
-    MMLTK_ASSERT(!saved_explore.at("overlay_classes").at(9).get<bool>());
-    MMLTK_ASSERT(!saved_explore.at("show_boxes").get<bool>());
-    MMLTK_ASSERT(!saved_explore.at("show_masks").get<bool>());
-    MMLTK_ASSERT(saved_explore.at("show_original_dimensions").get<bool>());
-    MMLTK_ASSERT(saved_explore.at("detail_scale_mode") == static_cast<int>(ExploreDetailScaleMode::Neural));
+    REQUIRE((saved_explore.at("device_id") == 2));
+    REQUIRE((saved_explore.at("shuffle_seed") == 0x12345678U));
+    REQUIRE((saved_explore.at("require_boxes")));
+    REQUIRE((saved_explore.at("require_masks")));
+    REQUIRE((saved_explore.at("min_instances") == 2U));
+    REQUIRE((saved_explore.at("max_instances") == 17U));
+    REQUIRE((saved_explore.at("min_compiled_index") == 11U));
+    REQUIRE((saved_explore.at("max_compiled_index") == 9'001U);
+    REQUIRE((saved_explore.at("class_catalog_identity") == 0x9123'4567'89ab'cdefULL));
+    REQUIRE((!saved_explore.at("sample_classes").at(7).get<bool>()));
+    REQUIRE((!saved_explore.at("overlay_classes").at(9).get<bool>()));
+    REQUIRE((!saved_explore.at("show_boxes").get<bool>()));
+    REQUIRE((!saved_explore.at("show_masks").get<bool>()));
+    REQUIRE((saved_explore.at("show_original_dimensions").get<bool>()));
+    REQUIRE((saved_explore.at("detail_scale_mode") == static_cast<int>(ExploreDetailScaleMode::Neural)));
     SettingsViewStates loaded_states;
     auto& loaded_ui = loaded_states.ui;
     auto& loaded_train = loaded_states.workflows.train;
@@ -696,8 +696,8 @@ void test_ui_settings_round_trip() {
     auto& loaded_explore = loaded_states.workflows.explore;
     GuiSettingsState& loaded = loaded_states;
     apply_gui_settings(saved, loaded);
-    MMLTK_ASSERT(loaded.current_view == mmltk::controller::contracts::FeatureId::Annotate);
-    MMLTK_ASSERT(loaded_annotate.preset_name == "rf-detr-seg-medium");
+    REQUIRE((loaded.current_view == mmltk::controller::contracts::FeatureId::Annotate));
+    REQUIRE((loaded_annotate.preset_name == "rf-detr-seg-medium"));
     CHECK(loaded_train.request.h2d_dataloader);
     CHECK(loaded_validate.request.h2d_dataloader);
     CHECK(loaded_validate.request.numa_node == 3);
@@ -705,110 +705,110 @@ void test_ui_settings_round_trip() {
     CHECK(loaded_predict.request.numa_node == 2);
     CHECK(loaded_explore.h2d_dataloader);
     CHECK(loaded_explore.numa_node == 1);
-    MMLTK_ASSERT(loaded_train.request.train_compiled_path == "/tmp/train.bin");
-    MMLTK_ASSERT(loaded_train.dataset_source_dir == "/tmp/dataset");
-    MMLTK_ASSERT(loaded_train.compiled_dataset_dir == "/tmp/compiled");
-    MMLTK_ASSERT(loaded_train.overwrite_compiled_dataset);
-    MMLTK_ASSERT(loaded_train.compile_dimensions);
+    REQUIRE((loaded_train.request.train_compiled_path == "/tmp/train.bin"));
+    REQUIRE((loaded_train.dataset_source_dir == "/tmp/dataset"));
+    REQUIRE((loaded_train.compiled_dataset_dir == "/tmp/compiled"));
+    REQUIRE((loaded_train.overwrite_compiled_dataset));
+    REQUIRE((loaded_train.compile_dimensions));
     CHECK(loaded_train.compile_perceptual_downscale);
     CHECK(loaded_train.request.gpu_augmentation.perceptual_downscale);
-    MMLTK_ASSERT(loaded_train.request.resolution == 512);
-    MMLTK_ASSERT(loaded_train.request.weights_path == "/tmp/weights.pt");
+    REQUIRE((loaded_train.request.resolution == 512));
+    REQUIRE((loaded_train.request.weights_path == "/tmp/weights.pt"));
     CHECK(loaded_train.request.class_layout_path == "/tmp/train.classes.json");
     CHECK(loaded_validate.request.class_layout_path == "/tmp/validate.classes.json");
     CHECK(loaded_predict.request.class_layout_path == "/tmp/predict.classes.json");
     CHECK(loaded_export.class_layout_path == "/tmp/export.classes.json");
-    MMLTK_ASSERT(loaded_train.request.progress_bar);
-    MMLTK_ASSERT(loaded_train.request.device_ids == std::vector<int>({0, 2}));
-    MMLTK_ASSERT(loaded_train.request.num_queries == 111);
-    MMLTK_ASSERT(loaded_train.request.eval_max_dets == 113);
-    MMLTK_ASSERT(recipe_overridden(loaded_train.request.recipe_overrides, &TrainRequest::lr));
-    MMLTK_ASSERT(loaded_train.request.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine);
+    REQUIRE((loaded_train.request.progress_bar));
+    REQUIRE((loaded_train.request.device_ids == std::vector<int>({0, 2})));
+    REQUIRE((loaded_train.request.num_queries == 111));
+    REQUIRE((loaded_train.request.eval_max_dets == 113));
+    REQUIRE((recipe_overridden(loaded_train.request.recipe_overrides, &TrainRequest::lr)));
+    REQUIRE((loaded_train.request.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
     auto step_document = saved;
     step_document["workflows"]["train"]["training"]["lr_scheduler"] = "step";
     apply_gui_settings(step_document, loaded);
-    MMLTK_ASSERT(loaded.workflows.train.request.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Step);
-    MMLTK_ASSERT(loaded_validate.request.compiled_path == "/tmp/validate.bin");
-    MMLTK_ASSERT(loaded_validate.request.save_engine_path == "/tmp/models/save.engine");
-    MMLTK_ASSERT(loaded_validate.request.num_queries == 211);
-    MMLTK_ASSERT(loaded_validate.request.eval_max_dets == 213);
-    MMLTK_ASSERT(loaded_predict.source.kind == SourceKind::SingleImage);
-    MMLTK_ASSERT(loaded_predict.source.single_image_path == "/tmp/input.png");
-    MMLTK_ASSERT(loaded_predict.request.progress_bar);
-    MMLTK_ASSERT(loaded_predict.request.output_path == "/tmp/predictions.json");
-    MMLTK_ASSERT(loaded_annotate.source.kind == SourceKind::ImageFolder);
-    MMLTK_ASSERT(loaded_annotate.source.image_directory == "/tmp/images");
-    MMLTK_ASSERT(loaded_annotate.full_frame);
-    MMLTK_ASSERT(loaded_export.onnx_input_path == "/tmp/export-input.onnx");
-    MMLTK_ASSERT(loaded_export.onnx_output_path == "/tmp/export-output.onnx");
-    MMLTK_ASSERT(loaded_export.output_path == "/tmp/export.engine");
-    MMLTK_ASSERT(!loaded_export.allow_fp16);
-    MMLTK_ASSERT(loaded_train.visualize_augmentation_in_explore);
-    MMLTK_ASSERT(loaded_explore.dataset_source == ExploreDatasetSource::Custom);
-    MMLTK_ASSERT(loaded_explore.custom_compiled_path == "/tmp/explore.bin");
-    MMLTK_ASSERT(loaded_explore.device_id == 2);
-    MMLTK_ASSERT(loaded_explore.grid_width == 7);
-    MMLTK_ASSERT(loaded_explore.order == ExploreOrder::Shuffled);
-    MMLTK_ASSERT(loaded_explore.shuffle_seed == 0x12345678U);
-    MMLTK_ASSERT(loaded_explore.require_boxes);
-    MMLTK_ASSERT(loaded_explore.require_masks);
-    MMLTK_ASSERT(loaded_explore.min_instances == 2U);
-    MMLTK_ASSERT(loaded_explore.max_instances == 17U);
-    MMLTK_ASSERT(loaded_explore.min_compiled_index == 11U);
-    MMLTK_ASSERT(loaded_explore.max_compiled_index == 9'001U);
-    MMLTK_ASSERT(loaded_explore.class_catalog_identity == 0x9123'4567'89ab'cdefULL);
-    MMLTK_ASSERT(!loaded_explore.sample_classes[7]);
-    MMLTK_ASSERT(!loaded_explore.overlay_classes[9]);
-    MMLTK_ASSERT(!loaded_explore.show_boxes);
-    MMLTK_ASSERT(!loaded_explore.show_masks);
-    MMLTK_ASSERT(loaded_explore.show_original_dimensions);
-    MMLTK_ASSERT(loaded_explore.detail_scale_mode == ExploreDetailScaleMode::Neural);
-    MMLTK_ASSERT(loaded_ui.dark_mode);
-    MMLTK_ASSERT(loaded_ui.ui_scale == 1.35f);
-    MMLTK_ASSERT(loaded_ui.font_size == 18.0f);
-    MMLTK_ASSERT(loaded_ui.secondary_font_size == 15.0f);
-    MMLTK_ASSERT(loaded_ui.mono_font_size == 14.0f);
-    MMLTK_ASSERT(loaded_ui.text_input_font_size == 17.0f);
-    MMLTK_ASSERT(loaded_ui.crop_edge_hit_half_width == 11.0f);
-    MMLTK_ASSERT(loaded_ui.crop_corner_hit_size == 24.0f);
-    MMLTK_ASSERT(loaded_ui.crop_handle_radius == 7.5f);
-    MMLTK_ASSERT(loaded_ui.workspace_aspect_ratio == WorkspaceAspectRatio::Photo);
-    MMLTK_ASSERT(loaded_ui.annotation_brush_radius == 27);
-    MMLTK_ASSERT(loaded_ui.mask_cleanup_radius == 6);
-    MMLTK_ASSERT(loaded_ui.show_workspace_performance);
+    REQUIRE((loaded.workflows.train.request.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Step));
+    REQUIRE((loaded_validate.request.compiled_path == "/tmp/validate.bin"));
+    REQUIRE((loaded_validate.request.save_engine_path == "/tmp/models/save.engine"));
+    REQUIRE((loaded_validate.request.num_queries == 211));
+    REQUIRE((loaded_validate.request.eval_max_dets == 213));
+    REQUIRE((loaded_predict.source.kind == SourceKind::SingleImage));
+    REQUIRE((loaded_predict.source.single_image_path == "/tmp/input.png"));
+    REQUIRE((loaded_predict.request.progress_bar));
+    REQUIRE((loaded_predict.request.output_path == "/tmp/predictions.json"));
+    REQUIRE((loaded_annotate.source.kind == SourceKind::ImageFolder));
+    REQUIRE((loaded_annotate.source.image_directory == "/tmp/images"));
+    REQUIRE((loaded_annotate.full_frame));
+    REQUIRE((loaded_export.onnx_input_path == "/tmp/export-input.onnx"));
+    REQUIRE((loaded_export.onnx_output_path == "/tmp/export-output.onnx"));
+    REQUIRE((loaded_export.output_path == "/tmp/export.engine"));
+    REQUIRE((!loaded_export.allow_fp16));
+    REQUIRE((loaded_train.visualize_augmentation_in_explore));
+    REQUIRE((loaded_explore.dataset_source == ExploreDatasetSource::Custom));
+    REQUIRE((loaded_explore.custom_compiled_path == "/tmp/explore.bin"));
+    REQUIRE((loaded_explore.device_id == 2));
+    REQUIRE((loaded_explore.grid_width == 7));
+    REQUIRE((loaded_explore.order == ExploreOrder::Shuffled));
+    REQUIRE((loaded_explore.shuffle_seed == 0x12345678U));
+    REQUIRE((loaded_explore.require_boxes));
+    REQUIRE((loaded_explore.require_masks));
+    REQUIRE((loaded_explore.min_instances == 2U));
+    REQUIRE((loaded_explore.max_instances == 17U));
+    REQUIRE((loaded_explore.min_compiled_index == 11U));
+    REQUIRE((loaded_explore.max_compiled_index == 9'001U));
+    REQUIRE((loaded_explore.class_catalog_identity == 0x9123'4567'89ab'cdefULL));
+    REQUIRE((!loaded_explore.sample_classes[7]));
+    REQUIRE((!loaded_explore.overlay_classes[9]));
+    REQUIRE((!loaded_explore.show_boxes));
+    REQUIRE((!loaded_explore.show_masks));
+    REQUIRE((loaded_explore.show_original_dimensions));
+    REQUIRE((loaded_explore.detail_scale_mode == ExploreDetailScaleMode::Neural));
+    REQUIRE((loaded_ui.dark_mode));
+    REQUIRE((loaded_ui.ui_scale == 1.35f));
+    REQUIRE((loaded_ui.font_size == 18.0f));
+    REQUIRE((loaded_ui.secondary_font_size == 15.0f));
+    REQUIRE((loaded_ui.mono_font_size == 14.0f));
+    REQUIRE((loaded_ui.text_input_font_size == 17.0f));
+    REQUIRE((loaded_ui.crop_edge_hit_half_width == 11.0f));
+    REQUIRE((loaded_ui.crop_corner_hit_size == 24.0f));
+    REQUIRE((loaded_ui.crop_handle_radius == 7.5f));
+    REQUIRE((loaded_ui.workspace_aspect_ratio == WorkspaceAspectRatio::Photo));
+    REQUIRE((loaded_ui.annotation_brush_radius == 27));
+    REQUIRE((loaded_ui.mask_cleanup_radius == 6));
+    REQUIRE((loaded_ui.show_workspace_performance));
 }
 void test_fresh_defaults_use_capture_only_annotate() {
     SettingsViewStates states;
-    MMLTK_ASSERT(states == default_gui_settings_state());
+    REQUIRE((states == default_gui_settings_state()));
     auto [ui, train, validate, predict, annotate, export_state, explore] = mutable_settings_views(states);
     apply_default_gui_state(train, validate, predict, annotate, export_state, explore);
-    MMLTK_ASSERT(ui.workspace_aspect_ratio == WorkspaceAspectRatio::Widescreen);
-    MMLTK_ASSERT(ui.font_size == 14.0F);
-    MMLTK_ASSERT(ui.secondary_font_size == 12.0F);
-    MMLTK_ASSERT(ui.mono_font_size == 12.0F);
-    MMLTK_ASSERT(ui.text_input_font_size == 13.0F);
-    MMLTK_ASSERT(!ui.show_workspace_performance);
-    MMLTK_ASSERT(train.model_input == ModelArtifactInputKind::Weights);
-    MMLTK_ASSERT(train.dataset_source_dir == "./dataset");
-    MMLTK_ASSERT(train.compiled_dataset_dir == "./compiled");
-    MMLTK_ASSERT(train.request.train_compiled_path == "./compiled/train.bin");
-    MMLTK_ASSERT(train.request.val_compiled_path == "./compiled/val.bin");
-    MMLTK_ASSERT(!train.overwrite_compiled_dataset);
-    MMLTK_ASSERT(!train.compile_dimensions);
+    REQUIRE((ui.workspace_aspect_ratio == WorkspaceAspectRatio::Widescreen));
+    REQUIRE((ui.font_size == 14.0F));
+    REQUIRE((ui.secondary_font_size == 12.0F));
+    REQUIRE((ui.mono_font_size == 12.0F));
+    REQUIRE((ui.text_input_font_size == 13.0F));
+    REQUIRE((!ui.show_workspace_performance));
+    REQUIRE((train.model_input == ModelArtifactInputKind::Weights));
+    REQUIRE((train.dataset_source_dir == "./dataset"));
+    REQUIRE((train.compiled_dataset_dir == "./compiled"));
+    REQUIRE((train.request.train_compiled_path == "./compiled/train.bin"));
+    REQUIRE((train.request.val_compiled_path == "./compiled/val.bin"));
+    REQUIRE((!train.overwrite_compiled_dataset));
+    REQUIRE((!train.compile_dimensions));
     CHECK_FALSE(train.compile_perceptual_downscale);
     CHECK_FALSE(train.request.gpu_augmentation.perceptual_downscale);
-    MMLTK_ASSERT(train.request.num_queries == 0);
-    MMLTK_ASSERT(train.request.eval_max_dets == 0);
-    MMLTK_ASSERT(validate.model_input == ModelArtifactInputKind::Weights);
-    MMLTK_ASSERT(validate.request.num_queries == 0);
-    MMLTK_ASSERT(validate.request.eval_max_dets == 0);
-    MMLTK_ASSERT(predict.model_input == ModelArtifactInputKind::Weights);
-    MMLTK_ASSERT(predict.request.weights_path.empty());
-    MMLTK_ASSERT(annotate.model_input == ModelArtifactInputKind::None);
-    MMLTK_ASSERT(annotate.weights_path.empty());
-    MMLTK_ASSERT(annotate.onnx_path.empty());
-    MMLTK_ASSERT(annotate.tensorrt_path.empty());
-    MMLTK_ASSERT(export_state.model_input == ModelArtifactInputKind::None);
+    REQUIRE((train.request.num_queries == 0));
+    REQUIRE((train.request.eval_max_dets == 0));
+    REQUIRE((validate.model_input == ModelArtifactInputKind::Weights));
+    REQUIRE((validate.request.num_queries == 0));
+    REQUIRE((validate.request.eval_max_dets == 0));
+    REQUIRE((predict.model_input == ModelArtifactInputKind::Weights));
+    REQUIRE((predict.request.weights_path.empty()));
+    REQUIRE((annotate.model_input == ModelArtifactInputKind::None));
+    REQUIRE((annotate.weights_path.empty()));
+    REQUIRE((annotate.onnx_path.empty()));
+    REQUIRE((annotate.tensorrt_path.empty()));
+    REQUIRE((export_state.model_input == ModelArtifactInputKind::None));
 }
 TEST_CASE("explicit compiled selections override inferred directories and keep test input optional", "[gui][settings]") {
     auto state = default_gui_settings_state();
@@ -847,9 +847,9 @@ void test_model_input_load_normalizes_invalid_values_by_workflow() {
     saved["workflows"]["annotate"]["model_artifacts"]["input"] = 99;
     saved["workflows"]["annotate"]["model_artifacts"]["weights_path"] = "/explicit/annotate.pt";
     apply_gui_settings(saved, snapshot);
-    MMLTK_ASSERT(states.workflows.predict.model_input == ModelArtifactInputKind::Weights);
-    MMLTK_ASSERT(states.workflows.annotate.model_input == ModelArtifactInputKind::None);
-    MMLTK_ASSERT(states.workflows.annotate.weights_path.empty());
+    REQUIRE((states.workflows.predict.model_input == ModelArtifactInputKind::Weights));
+    REQUIRE((states.workflows.annotate.model_input == ModelArtifactInputKind::None));
+    REQUIRE((states.workflows.annotate.weights_path.empty()));
 }
 // Seeds view states with sentinel values, then requires that loading `path` fails and leaves them
 // untouched.
@@ -859,10 +859,10 @@ void assert_load_rejected_and_state_preserved(const std::filesystem::path& path,
     states.ui.ui_scale = ui_scale;
     states.workflows.train.request.output_dir = output_dir;
     states.current_view = view;
-    MMLTK_ASSERT(!load_settings(path, states));
-    MMLTK_ASSERT(states.current_view == view);
-    MMLTK_ASSERT(states.ui.ui_scale == ui_scale);
-    MMLTK_ASSERT(states.workflows.train.request.output_dir == output_dir);
+    REQUIRE((!load_settings(path, states)));
+    REQUIRE((states.current_view == view));
+    REQUIRE((states.ui.ui_scale == ui_scale));
+    REQUIRE((states.workflows.train.request.output_dir == output_dir));
 }
 void test_persistence_rejects_unsupported_schema_and_malformed_files() {
     const std::filesystem::path temp_root = mmltk::testsupport::make_temp_root("mmltk-gui-settings-schema-test");
@@ -1230,7 +1230,7 @@ void test_explore_settings_projection_covers_every_scalar_in_both_directions() {
     CHECK(filter.filter.minimum_instances == 3U);
     CHECK(filter.filter.maximum_instances == 29U);
     CHECK(filter.filter.minimum_compiled_index == 41U);
-    CHECK(filter.filter.maximum_compiled_index == 4'091U);
+    CHECK(filter.filter.maximum_compiled_index == 4'091U));
     CHECK(filter.filter.order == ExploreOrder::Shuffled);
     CHECK(filter.filter.shuffle_seed == 0x1234'5678U);
     CHECK_FALSE(filter.overlay.show_boxes);
@@ -1502,30 +1502,30 @@ void test_apply_current_copy_paste_preference() {
     CHECK(persisted_only_requested_preference);
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_ui_settings_round_trip);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_recipe_golden_shape_and_round_trip);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_recipe_scheduler_compatibility);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_recipe_optimizer_compatibility);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_fresh_defaults_use_capture_only_annotate);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_model_input_load_normalizes_invalid_values_by_workflow);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_persistence_rejects_unsupported_schema_and_malformed_files);
+TEST_CASE("test_ui_settings_round_trip", "[gui][settings]") { test_ui_settings_round_trip(); }
+TEST_CASE("test_schema_v8_recipe_golden_shape_and_round_trip", "[gui][settings]") { test_schema_v8_recipe_golden_shape_and_round_trip(); }
+TEST_CASE("test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved", "[gui][settings]") { test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved(); }
+TEST_CASE("test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically", "[gui][settings]") { test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically(); }
+TEST_CASE("test_schema_v8_recipe_scheduler_compatibility", "[gui][settings]") { test_schema_v8_recipe_scheduler_compatibility(); }
+TEST_CASE("test_schema_v8_recipe_optimizer_compatibility", "[gui][settings]") { test_schema_v8_recipe_optimizer_compatibility(); }
+TEST_CASE("test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic", "[gui][settings]") { test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic(); }
+TEST_CASE("test_fresh_defaults_use_capture_only_annotate", "[gui][settings]") { test_fresh_defaults_use_capture_only_annotate(); }
+TEST_CASE("test_model_input_load_normalizes_invalid_values_by_workflow", "[gui][settings]") { test_model_input_load_normalizes_invalid_values_by_workflow(); }
+TEST_CASE("test_persistence_rejects_unsupported_schema_and_malformed_files", "[gui][settings]") { test_persistence_rejects_unsupported_schema_and_malformed_files(); }
 // CLEANUP-IGNORE: Each named settings behavior remains independently registered with the native test inventory.
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_persistence_repairs_catalog_and_compiled_directory_defaults);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_bounded_flat_settings_mutation_is_atomic);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_catalog_source_transition_normalizes_model_input_at_the_native_boundary);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_model_selection_settings_validation_exhausts_canonical_compatibility);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_gui_json_persistence_enforces_reflected_field_policies);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_explore_class_capacity_is_canonical_across_persistence_and_reflection);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_explore_settings_projection_covers_every_scalar_in_both_directions);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_explore_class_catalog_identity_is_ordered_and_deterministic);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_explore_class_catalog_identity_rejects_generic_settings_mutation);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically);
-MMLTK_REGISTER_TEST_CASE("[gui][settings][training_supervision]", test_training_supervision_relation_is_enforced_by_generic_settings_validity);
-MMLTK_REGISTER_TEST_CASE("[gui][settings][training_supervision]", test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection);
-MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_startup_transport_override_is_session_local_in_both_directions);
-MMLTK_REGISTER_TEST_CASE("[gui][settings][explore]", test_explore_preview_candidate_is_atomic_and_persists_native_modes);
-MMLTK_REGISTER_TEST_CASE("[gui][settings][copy_paste]", test_copy_paste_default_and_persisted_overrides);
-MMLTK_REGISTER_TEST_CASE("[.][acceptance][settings]", test_apply_current_copy_paste_preference);
+TEST_CASE("test_persistence_repairs_catalog_and_compiled_directory_defaults", "[gui][settings]") { test_persistence_repairs_catalog_and_compiled_directory_defaults(); }
+TEST_CASE("test_bounded_flat_settings_mutation_is_atomic", "[gui][settings]") { test_bounded_flat_settings_mutation_is_atomic(); }
+TEST_CASE("test_catalog_source_transition_normalizes_model_input_at_the_native_boundary", "[gui][settings]") { test_catalog_source_transition_normalizes_model_input_at_the_native_boundary(); }
+TEST_CASE("test_model_selection_settings_validation_exhausts_canonical_compatibility", "[gui][settings]") { test_model_selection_settings_validation_exhausts_canonical_compatibility(); }
+TEST_CASE("test_gui_json_persistence_enforces_reflected_field_policies", "[gui][settings]") { test_gui_json_persistence_enforces_reflected_field_policies(); }
+TEST_CASE("test_explore_class_capacity_is_canonical_across_persistence_and_reflection", "[gui][settings]") { test_explore_class_capacity_is_canonical_across_persistence_and_reflection(); }
+TEST_CASE("test_explore_settings_projection_covers_every_scalar_in_both_directions", "[gui][settings]") { test_explore_settings_projection_covers_every_scalar_in_both_directions(); }
+TEST_CASE("test_explore_class_catalog_identity_is_ordered_and_deterministic", "[gui][settings]") { test_explore_class_catalog_identity_is_ordered_and_deterministic(); }
+TEST_CASE("test_explore_class_catalog_identity_rejects_generic_settings_mutation", "[gui][settings]") { test_explore_class_catalog_identity_rejects_generic_settings_mutation(); }
+TEST_CASE("test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically", "[gui][settings]") { test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically(); }
+TEST_CASE("test_training_supervision_relation_is_enforced_by_generic_settings_validity", "[gui][settings][training_supervision]") { test_training_supervision_relation_is_enforced_by_generic_settings_validity(); }
+TEST_CASE("test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection", "[gui][settings][training_supervision]") { test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection(); }
+TEST_CASE("test_startup_transport_override_is_session_local_in_both_directions", "[gui][settings]") { test_startup_transport_override_is_session_local_in_both_directions(); }
+TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", "[gui][settings][explore]") { test_explore_preview_candidate_is_atomic_and_persists_native_modes(); }
+TEST_CASE("test_copy_paste_default_and_persisted_overrides", "[gui][settings][copy_paste]") { test_copy_paste_default_and_persisted_overrides(); }
+TEST_CASE("test_apply_current_copy_paste_preference", "[.][acceptance][settings]") { test_apply_current_copy_paste_preference(); }

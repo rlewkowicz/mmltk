@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cstddef>
 #include <limits>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
@@ -132,8 +132,8 @@ void test_query_layout_capacity_checks_each_product_and_sum() {
     CHECK_FALSE(training_supervision_query_layout_valid(config, std::numeric_limits<std::size_t>::max() - 1U, 1U, 1U));
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_defaults_and_cli_spellings_are_stable);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_open_and_closed_ranges_and_relation_are_enforced);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_reflected_cbor_round_trip_preserves_complete_nested_value);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_request_and_model_boundaries_reject_unsupported_feature_combinations);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_query_layout_capacity_checks_each_product_and_sum);
+TEST_CASE("test_defaults_and_cli_spellings_are_stable", "[model][rfdetr][training_supervision]") { test_defaults_and_cli_spellings_are_stable(); }
+TEST_CASE("test_open_and_closed_ranges_and_relation_are_enforced", "[model][rfdetr][training_supervision]") { test_open_and_closed_ranges_and_relation_are_enforced(); }
+TEST_CASE("test_reflected_cbor_round_trip_preserves_complete_nested_value", "[model][rfdetr][training_supervision]") { test_reflected_cbor_round_trip_preserves_complete_nested_value(); }
+TEST_CASE("test_request_and_model_boundaries_reject_unsupported_feature_combinations", "[model][rfdetr][training_supervision]") { test_request_and_model_boundaries_reject_unsupported_feature_combinations(); }
+TEST_CASE("test_query_layout_capacity_checks_each_product_and_sum", "[model][rfdetr][training_supervision]") { test_query_layout_capacity_checks_each_product_and_sum(); }

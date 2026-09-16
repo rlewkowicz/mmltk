@@ -49,6 +49,14 @@ target_link_libraries(mmltk_frameworks_transport
 )
 
 function(mmltk_add_frameworks_transport_tests)
+    add_library(mmltk_frameworks_transport_test_support STATIC EXCLUDE_FROM_ALL)
+    mmltk_configure_component(mmltk_frameworks_transport_test_support PUBLIC_DECLARATIONS)
+    mmltk_register_public_headers(mmltk_frameworks_transport_test_support
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/browser_assets.h)
+    mmltk_register_ordinary_sources(mmltk_frameworks_transport_test_support
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/browser_assets.cpp)
+    target_link_libraries(mmltk_frameworks_transport_test_support PUBLIC mmltk_test_support)
     add_executable(mmltk_frameworks_transport_tests EXCLUDE_FROM_ALL)
     mmltk_register_retained_module_importers(
         mmltk_frameworks_transport_tests
@@ -62,7 +70,8 @@ function(mmltk_add_frameworks_transport_tests)
             ${CMAKE_SOURCE_DIR}/third_party/uSockets/src
     )
     target_link_libraries(mmltk_frameworks_transport_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_frameworks_transport_test_support
+        mmltk_test_support
         mmltk::frameworks::transport
     )
     catch_discover_tests(

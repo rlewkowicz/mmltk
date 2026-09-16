@@ -8,8 +8,8 @@
 #include <onnx/onnx_pb.h>
 #include <cuda_runtime_api.h>
 #include <nlohmann/json.hpp>
-#include "async_test_utils.hpp"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
@@ -24,7 +24,7 @@
 #include "src/backend/models/rfdetr/inference/inference_preprocessor.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.model_export;
 namespace rfdetr = mmltk::backend::models::rfdetr;

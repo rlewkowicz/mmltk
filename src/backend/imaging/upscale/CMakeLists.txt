@@ -125,7 +125,7 @@ function(mmltk_add_backend_imaging_upscale_tests)
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         CUDA_RESOLVE_DEVICE_SYMBOLS ON CUDA_SEPARABLE_COMPILATION ON)
     target_link_libraries(mmltk_backend_imaging_upscale_tests PRIVATE
-        mmltk_acceptance_support mmltk::backend::imaging::upscale
+        mmltk_test_support mmltk::backend::imaging::upscale
         mmltk_shiftlut_onnx_ops mmltk_shiftlut_model_format
         mmltk::vendor::onnxruntime CUDA::cudart ONNX::onnx "${Protobuf_LIBRARY}")
     target_compile_definitions(mmltk_backend_imaging_upscale_tests PRIVATE

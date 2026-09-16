@@ -23,7 +23,7 @@
 #include "detail/model_state_technical.h"
 #include "detail/scalar_type_utils.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
-#include "src/common/io/filesystem_utils.h"
+#include "src/common/io/file_memory.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/frameworks/process/subprocess_utils.h"
 namespace mmltk::backend::models::rfdetr {
@@ -60,7 +60,7 @@ fs::path make_temp_directory(const char* prefix) {
     if (created == nullptr) { throw std::runtime_error(std::string("failed to create temporary RF-DETR checkpoint directory: ") + std::strerror(errno)); }
     return {created};
 }
-void remove_path_recursively_best_effort(const fs::path& path) { mmltk::common::io::filesystem_utils::remove_path_recursively_best_effort(path); }
+void remove_path_recursively_best_effort(const fs::path& path) { mmltk::common::io::remove_path_recursively_best_effort(path); }
 struct ScopedTempDirectory {
     explicit ScopedTempDirectory(const char* prefix) : path(make_temp_directory(prefix)) {}
     ~ScopedTempDirectory() {

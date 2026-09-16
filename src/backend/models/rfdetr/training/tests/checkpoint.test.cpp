@@ -16,7 +16,7 @@
 #include <meta>
 #include <type_traits>
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "detail/checkpoint_private.h"
 #include "model_state_access.h"
 #include "model_state_technical.h"
@@ -24,9 +24,12 @@
 #include "model_state_fixture.h"
 #include "model_technical.h"
 #include "parity_fixture_support.h"
-#include "src/common/io/filesystem_utils.h"
+#include "src/common/io/file_memory.h"
 #include "torch_api.h"
-#include "catch2_compat.hpp"
+#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
+#undef CHECK
+#endif
+#include <catch2/catch_test_macros.hpp>
 import mmltk.backend.models.rfdetr.training.checkpoint;
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.core.model;
@@ -101,36 +104,36 @@ void write_legacy_native_checkpoint(const fs::path& output_path, int version = 1
 }
 void test_upstream_checkpoint_parse(const ParityFixtureCase& fixture, const fs::path& upstream_path) {
     const auto checkpoint = mmltk::backend::models::rfdetr::decode_model_state(upstream_path);
-    MMLTK_ASSERT(checkpoint.metadata.source_kind == "upstream-python");
-    MMLTK_ASSERT(checkpoint.metadata.preset_name == fixture.preset_name);
-    MMLTK_ASSERT(checkpoint.metadata.num_classes == kParityFixtureNumClasses);
-    MMLTK_ASSERT(state_entries(checkpoint).size() == 4);
+    REQUIRE((checkpoint.metadata.source_kind == "upstream-python"));
+    REQUIRE((checkpoint.metadata.preset_name == fixture.preset_name));
+    REQUIRE((checkpoint.metadata.num_classes == kParityFixtureNumClasses));
+    REQUIRE((state_entries(checkpoint).size() == 4));
     bool found_query_feat = false;
     bool found_cls_bias = false;
     bool found_refpoint = false;
     for (const auto& entry : state_entries(checkpoint)) {
         if (entry.name == "query_feat.weight") {
             found_query_feat = true;
-            MMLTK_ASSERT(entry.tensor.dim() == 2);
-            MMLTK_ASSERT(entry.tensor.size(0) == fixture.query_rows);
-            MMLTK_ASSERT(entry.tensor.size(1) == kParityFixtureHiddenDim);
+            REQUIRE((entry.tensor.dim() == 2));
+            REQUIRE((entry.tensor.size(0) == fixture.query_rows));
+            REQUIRE((entry.tensor.size(1) == kParityFixtureHiddenDim));
         }
         if (entry.name == "refpoint_embed.weight") {
             found_refpoint = true;
-            MMLTK_ASSERT(entry.tensor.dim() == 2);
-            MMLTK_ASSERT(entry.tensor.size(0) == fixture.query_rows);
-            MMLTK_ASSERT(entry.tensor.size(1) == 4);
+            REQUIRE((entry.tensor.dim() == 2));
+            REQUIRE((entry.tensor.size(0) == fixture.query_rows));
+            REQUIRE((entry.tensor.size(1) == 4));
         }
         if (entry.name == "class_embed.bias") {
             found_cls_bias = true;
-            MMLTK_ASSERT(entry.tensor.dim() == 1);
-            MMLTK_ASSERT(entry.tensor.size(0) == kParityFixtureNumClasses);
-            MMLTK_ASSERT(entry.tensor.index({0}).item<float>() == make_fixture_class_bias(fixture).index({0}).item<float>());
+            REQUIRE((entry.tensor.dim() == 1));
+            REQUIRE((entry.tensor.size(0) == kParityFixtureNumClasses));
+            REQUIRE((entry.tensor.index({0}).item<float>() == make_fixture_class_bias(fixture).index({0}).item<float>()));
         }
     }
-    MMLTK_ASSERT(found_query_feat);
-    MMLTK_ASSERT(found_cls_bias);
-    MMLTK_ASSERT(found_refpoint);
+    REQUIRE((found_query_feat));
+    REQUIRE((found_cls_bias));
+    REQUIRE((found_refpoint));
 }
 void test_native_checkpoint_roundtrip(const ParityFixtureCase& fixture, const fs::path& upstream_path) {
     const auto upstream = mmltk::backend::models::rfdetr::decode_model_state(upstream_path);
@@ -138,25 +141,25 @@ void test_native_checkpoint_roundtrip(const ParityFixtureCase& fixture, const fs
     fs::create_directories(output_path.parent_path());
     const auto normalized = mmltk::backend::models::rfdetr::normalize_checkpoint_to_native(upstream_path, output_path);
     const bool output_exists = fs::exists(output_path);
-    MMLTK_ASSERT(output_exists);
-    MMLTK_ASSERT(normalized.metadata.preset_name == fixture.preset_name);
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path));
+    REQUIRE((output_exists));
+    REQUIRE((normalized.metadata.preset_name == fixture.preset_name));
+    REQUIRE((mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path)));
     const auto native = mmltk::backend::models::rfdetr::decode_model_state(output_path);
     REQUIRE(native.class_artifact);
     CHECK(native.class_artifact->Matches(output_path));
     CHECK(native.class_artifact->Resolve(native.metadata.num_classes, native.metadata.class_layout) == native.metadata.class_layout);
-    MMLTK_ASSERT(native.metadata.preset_name == upstream.metadata.preset_name);
-    MMLTK_ASSERT(native.metadata.source_kind == "upstream-python");
-    MMLTK_ASSERT(state_entries(native).size() == state_entries(upstream).size());
+    REQUIRE((native.metadata.preset_name == upstream.metadata.preset_name));
+    REQUIRE((native.metadata.source_kind == "upstream-python"));
+    REQUIRE((state_entries(native).size() == state_entries(upstream).size()));
     bool compared_tensor = false;
     for (size_t index = 0; index < state_entries(native).size(); ++index) {
-        MMLTK_ASSERT(state_entries(native)[index].name == state_entries(upstream)[index].name);
+        REQUIRE((state_entries(native)[index].name == state_entries(upstream)[index].name));
         if (!compared_tensor && state_entries(native)[index].name == "class_embed.weight") {
-            MMLTK_ASSERT(tensor_api::equal(state_entries(native)[index].tensor, state_entries(upstream)[index].tensor));
+            REQUIRE((tensor_api::equal(state_entries(native)[index].tensor, state_entries(upstream)[index].tensor)));
             compared_tensor = true;
         }
     }
-    MMLTK_ASSERT(compared_tensor);
+    REQUIRE((compared_tensor));
 }
 void test_native_golden_fixture_roundtrip(const ParityFixtureCase& fixture) {
     const fs::path output_path = native_golden_fixture_path(fixture);
@@ -164,8 +167,8 @@ void test_native_golden_fixture_roundtrip(const ParityFixtureCase& fixture) {
     const auto expected = make_native_parity_fixture(fixture);
     mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, expected);
     const bool output_exists = fs::exists(output_path);
-    MMLTK_ASSERT(output_exists);
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path));
+    REQUIRE((output_exists));
+    REQUIRE((mmltk::backend::models::rfdetr::is_native_checkpoint_file(output_path)));
     const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(output_path);
     require_detection_metadata_equal(expected.metadata, loaded.metadata);
     assert_matches_native_parity_fixture(loaded, fixture);
@@ -195,22 +198,22 @@ void test_native_checkpoint_tensor_preparation() {
     const auto loaded = mmltk::backend::models::rfdetr::decode_model_state(output_path);
     require_detection_metadata_equal(checkpoint.metadata, loaded.metadata);
     const auto* loaded_contiguous = find_entry(loaded, "cpu_contiguous");
-    MMLTK_ASSERT(loaded_contiguous != nullptr);
-    MMLTK_ASSERT(loaded_contiguous->tensor.device().is_cpu());
-    MMLTK_ASSERT(loaded_contiguous->tensor.is_contiguous());
-    MMLTK_ASSERT(tensor_api::equal(loaded_contiguous->tensor, cpu_contiguous));
+    REQUIRE((loaded_contiguous != nullptr));
+    REQUIRE((loaded_contiguous->tensor.device().is_cpu()));
+    REQUIRE((loaded_contiguous->tensor.is_contiguous()));
+    REQUIRE((tensor_api::equal(loaded_contiguous->tensor, cpu_contiguous)));
     const auto* loaded_non_contiguous = find_entry(loaded, "cpu_non_contiguous");
-    MMLTK_ASSERT(loaded_non_contiguous != nullptr);
-    MMLTK_ASSERT(loaded_non_contiguous->tensor.device().is_cpu());
-    MMLTK_ASSERT(loaded_non_contiguous->tensor.is_contiguous());
-    MMLTK_ASSERT(tensor_api::equal(loaded_non_contiguous->tensor, cpu_non_contiguous.contiguous()));
+    REQUIRE((loaded_non_contiguous != nullptr));
+    REQUIRE((loaded_non_contiguous->tensor.device().is_cpu()));
+    REQUIRE((loaded_non_contiguous->tensor.is_contiguous()));
+    REQUIRE((tensor_api::equal(loaded_non_contiguous->tensor, cpu_non_contiguous.contiguous())));
     const auto* loaded_cuda = find_entry(loaded, "cuda_tensor");
-    MMLTK_ASSERT((loaded_cuda != nullptr) == has_cuda);
+    REQUIRE(((loaded_cuda != nullptr) == has_cuda));
     if (loaded_cuda != nullptr) {
         const auto expected = state_entries(checkpoint).back().tensor.detach().to(tensor_api::Device(tensor_api::kCPU)).contiguous();
-        MMLTK_ASSERT(loaded_cuda->tensor.device().is_cpu());
-        MMLTK_ASSERT(loaded_cuda->tensor.is_contiguous());
-        MMLTK_ASSERT(tensor_api::equal(loaded_cuda->tensor, expected));
+        REQUIRE((loaded_cuda->tensor.device().is_cpu()));
+        REQUIRE((loaded_cuda->tensor.is_contiguous()));
+        REQUIRE((tensor_api::equal(loaded_cuda->tensor, expected)));
     }
     checkpoint.metadata.for_each_detection_field([](const char*, auto& field) { field.reset(); });
     mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
@@ -232,10 +235,10 @@ void test_upstream_checkpoint_scalar_type_bridge() {
     require_detection_metadata_equal(state.metadata, checkpoint.metadata);
     const auto* query_feat = find_entry(checkpoint, "query_feat.weight");
     const auto* class_bias = find_entry(checkpoint, "class_embed.bias");
-    MMLTK_ASSERT(query_feat != nullptr);
-    MMLTK_ASSERT(class_bias != nullptr);
-    MMLTK_ASSERT(query_feat->tensor.scalar_type() == tensor_api::kFloat16);
-    MMLTK_ASSERT(class_bias->tensor.scalar_type() == tensor_api::kInt64);
+    REQUIRE((query_feat != nullptr));
+    REQUIRE((class_bias != nullptr));
+    REQUIRE((query_feat->tensor.scalar_type() == tensor_api::kFloat16));
+    REQUIRE((class_bias->tensor.scalar_type() == tensor_api::kInt64));
 }
 void test_cuda_upstream_raw_state_preserves_logical_values() {
     if (!tensor_api::cuda::is_available()) { SKIP("CUDA unavailable"); }
@@ -292,7 +295,7 @@ void test_training_supervision_checkpoint_blob_admission() {
     config.assignment = mmltk::backend::models::rfdetr::TrainAssignmentKind::MatchFree;
     config.match_free.rho = 0.625F;
     config.denoising.enabled = true;
-    MMLTK_ASSERT(round_trip_training_supervision_config(path, config) == config);
+    REQUIRE((round_trip_training_supervision_config(path, config) == config));
     tensor_api::serialize::InputArchive input;
     input.load_from(path.string());
     tensor_api::Tensor encoded;
@@ -433,7 +436,7 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
 }
 }  // namespace
 void test_checkpoint_roundtrip_and_fixture_loading() {
-    mmltk::common::io::filesystem_utils::remove_path_recursively_best_effort(fixture_root());
+    mmltk::common::io::remove_path_recursively_best_effort(fixture_root());
     const auto& fixtures = parity_fixture_cases();
     for (size_t index = 0; index < fixtures.size(); ++index) {
         const auto& fixture = fixtures[index];
@@ -444,7 +447,7 @@ void test_checkpoint_roundtrip_and_fixture_loading() {
         test_native_checkpoint_roundtrip(fixture, upstream_path);
         test_native_golden_fixture_roundtrip(fixture);
     }
-    mmltk::common::io::filesystem_utils::remove_path_recursively_best_effort(fixture_root());
+    mmltk::common::io::remove_path_recursively_best_effort(fixture_root());
 }
 void test_checkpoint_tensor_and_legacy_support() {
     test_native_checkpoint_tensor_preparation();
@@ -453,9 +456,9 @@ void test_checkpoint_tensor_and_legacy_support() {
     test_training_supervision_checkpoint_blob_admission();
     test_strict_model_state_admission_is_duplicate_free_and_atomic();
 }
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint]", test_checkpoint_roundtrip_and_fixture_loading);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint][cuda]", test_cuda_upstream_raw_state_preserves_logical_values);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint][training_supervision]", test_checkpoint_tensor_and_legacy_support);
+TEST_CASE("test_checkpoint_roundtrip_and_fixture_loading", "[model][rfdetr][checkpoint]") { test_checkpoint_roundtrip_and_fixture_loading(); }
+TEST_CASE("test_cuda_upstream_raw_state_preserves_logical_values", "[model][rfdetr][checkpoint][cuda]") { test_cuda_upstream_raw_state_preserves_logical_values(); }
+TEST_CASE("test_checkpoint_tensor_and_legacy_support", "[model][rfdetr][checkpoint][training_supervision]") { test_checkpoint_tensor_and_legacy_support(); }
 TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class identity", "[model][rfdetr][checkpoint][layout]") {
     namespace r = mmltk::backend::models::rfdetr;
     namespace c = mmltk::backend::data::catalog;

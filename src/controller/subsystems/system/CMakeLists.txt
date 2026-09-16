@@ -79,16 +79,16 @@ function(mmltk_add_controller_subsystems_system_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../validate/tests/validation_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_playback.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.cpp
-        ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.cpp)
     mmltk_register_private_headers(mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_test_support.h
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_test_support.h
-        ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_test_support.h)
     mmltk_configure_component(mmltk_controller_data_compute_systems_tests PRIVATE_DECLARATIONS)
     target_include_directories(mmltk_controller_data_compute_systems_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     target_link_libraries(mmltk_controller_data_compute_systems_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_common_system_test_support
+        mmltk_frameworks_gpu_test_support
+        mmltk_test_support
         mmltk::backend::data
         mmltk::backend::models::rfdetr::contract
         mmltk::common::io
@@ -97,7 +97,7 @@ function(mmltk_add_controller_subsystems_system_tests)
         mmltk::controller::presentation_system
         mmltk_backend_data_test_support
         CUDA::cuda_driver
-        Vulkan::Vulkan)
+        mmltk_frameworks_gpu_hardware_test_support)
     catch_discover_tests(
         mmltk_controller_data_compute_systems_tests
         TEST_PREFIX "controller::data_compute_systems::"

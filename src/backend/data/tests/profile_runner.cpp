@@ -9,7 +9,7 @@
 #include <string_view>
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/dataset_loader.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 #include "src/common/system/execution_policy.h"

@@ -12,8 +12,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-#include "subprocess_test_utils.hpp"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/subprocess_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"

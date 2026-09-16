@@ -6,9 +6,9 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "draw.h"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "stb_image.h"
 #include "torch_api.h"
 #include "torch_cuda_utils.h"
@@ -42,9 +42,9 @@ void test_eval_sample_writer_flushes_output() {
     mmltk::backend::models::rfdetr::draw_eval_sample_async_gpu(image, boxes, labels, masks, options);
     mmltk::backend::models::rfdetr::flush_eval_sample_writes();
     const bool output_exists = fs::exists(output_path);
-    MMLTK_ASSERT(output_exists);
+    REQUIRE((output_exists));
     const auto output_size = fs::file_size(output_path);
-    MMLTK_ASSERT(output_size > 0);
+    REQUIRE((output_size > 0));
     int width = 0;
     int height = 0;
     int channels = 0;
@@ -54,9 +54,9 @@ void test_eval_sample_writer_flushes_output() {
     const int center_sum =
         static_cast<int>(decoded[center_offset]) + static_cast<int>(decoded[center_offset + 1]) + static_cast<int>(decoded[center_offset + 2]);
     stbi_image_free(decoded);
-    MMLTK_ASSERT(width == 16);
-    MMLTK_ASSERT(height == 16);
-    MMLTK_ASSERT(center_sum > 100);
+    REQUIRE((width == 16));
+    REQUIRE((height == 16));
+    REQUIRE((center_sum > 100));
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][eval_sample_writer]", test_eval_sample_writer_flushes_output);
+TEST_CASE("test_eval_sample_writer_flushes_output", "[model][rfdetr][eval_sample_writer]") { test_eval_sample_writer_flushes_output(); }

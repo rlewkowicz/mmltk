@@ -30,7 +30,7 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
-#include "async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "detail/benchmark_annotations.h"
 #include "detail/benchmark_cache.h"
 #include "detail/benchmark_compiler.h"
@@ -38,7 +38,7 @@
 #include "detail/benchmark_images.h"
 #include "detail/benchmark_sampling.h"
 #include "detail/benchmark_writer.h"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
 #include "src/common/io/file_digest.h"

@@ -35,7 +35,7 @@ function(mmltk_add_backend_models_catalog_tests)
         mmltk_backend_models_catalog_tests
         ${CMAKE_SOURCE_DIR}/src/backend/models/catalog/tests/model_registry.test.cpp)
     target_link_libraries(mmltk_backend_models_catalog_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::backend::models::catalog
     )
     catch_discover_tests(

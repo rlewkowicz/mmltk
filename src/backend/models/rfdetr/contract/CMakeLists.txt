@@ -57,7 +57,7 @@ function(mmltk_add_backend_models_rfdetr_contract_tests)
     target_link_libraries(
         mmltk_backend_models_rfdetr_contract_tests
         PRIVATE
-            mmltk_acceptance_support
+            mmltk_test_support
             mmltk::backend::models::rfdetr::contract
             mmltk::frameworks::serialization
     )

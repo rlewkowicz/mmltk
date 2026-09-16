@@ -12,7 +12,7 @@
 #include <optional>
 #include <span>
 #include <vector>
-#include "cuda_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 #include "src/backend/data/compiled_format.h"
 #include "src/frameworks/gpu/cuda_high_water_allocation.h"
 #include "src/backend/imaging/explore/explore_render_storage.h"

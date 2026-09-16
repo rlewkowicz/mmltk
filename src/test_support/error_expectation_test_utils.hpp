@@ -3,7 +3,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 namespace mmltk::testsupport {
 // Runs `fn` and requires that it throws `Error` whose message contains `needle`.
 // An empty `needle` only requires that the matching exception type is thrown.
@@ -14,9 +14,9 @@ void expect_error_contains(Fn&& fn, const std::string_view needle = {}) {
         std::forward<Fn>(fn)();
     } catch (const Error& error) {
         threw = true;
-        MMLTK_ASSERT(std::string_view(error.what()).find(needle) != std::string_view::npos);
+        REQUIRE((std::string_view(error.what()).find(needle) != std::string_view::npos));
     }
-    MMLTK_ASSERT(threw);
+    REQUIRE((threw));
 }
 template <typename Fn>
 void expect_runtime_error_contains(Fn&& fn, const std::string_view needle = {}) {

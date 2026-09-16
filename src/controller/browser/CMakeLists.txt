@@ -144,6 +144,12 @@ add_custom_target(mmltk_controller_browser_protocol_v17_boundary
         "${MMLTK_APPLICATION_BINDINGS}"
         "${MMLTK_BROWSER_PROTOCOL_V17_SERVER_FIXTURE}")
 
+add_library(mmltk_controller_browser_test_support INTERFACE)
+mmltk_register_public_headers(mmltk_controller_browser_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/websocket_test_utils.hpp)
+target_link_libraries(mmltk_controller_browser_test_support INTERFACE mmltk_cxx26_dialect)
+
 function(mmltk_add_controller_browser_tests)
     add_executable(mmltk_controller_browser_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
@@ -168,7 +174,10 @@ function(mmltk_add_controller_browser_tests)
         MMLTK_PROTOCOL_V17_CLIENT_FIXTURE_PATH="${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}"
     )
     target_link_libraries(mmltk_controller_browser_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_frameworks_transport_test_support
+        mmltk_controller_browser_test_support
+        mmltk_controller_annotation_test_support
+        mmltk_test_support
         mmltk::controller::browser::direct
         mmltk::controller::browser::protocol_v17
         mmltk::controller::presentation_system

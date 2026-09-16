@@ -69,7 +69,7 @@ function(mmltk_add_backend_media_live_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/live_output_lease.test.cpp)
     target_link_libraries(
         mmltk_backend_media_live_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::backend::media::live)
     catch_discover_tests(
         mmltk_backend_media_live_tests

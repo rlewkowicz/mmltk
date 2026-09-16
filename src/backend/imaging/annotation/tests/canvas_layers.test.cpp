@@ -1,7 +1,6 @@
 #include <array>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 import mmltk.backend.imaging.annotation.canvas_layers;
-#define ANNOTATION_TEST_CASE(fn) MMLTK_TEST_CASE("[backend][imaging][annotation]", fn)
 namespace {
 using namespace mmltk::backend::imaging::annotation;
 constexpr int kCropLayerId = 1;
@@ -12,7 +11,7 @@ CanvasPointerState make_pointer(float x, float y, bool hovered, bool clicked, bo
         x, y, hovered, clicked, down,
     };
 }
-ANNOTATION_TEST_CASE(test_hover_prefers_higher_priority_layer) {
+TEST_CASE("test_hover_prefers_higher_priority_layer", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     const std::array<RectLayerSpec, 2> layers = {{
         RectLayerSpec{kBoxLayerId, AnnotationBox{20, 20, 80, 80}, 100U, 100U, 1, 1, true},
@@ -24,7 +23,7 @@ ANNOTATION_TEST_CASE(test_hover_prefers_higher_priority_layer) {
     REQUIRE(frame.hovered_kind == RectDragKind::ResizeTopLeft);
     REQUIRE(state.active_layer_id == 0);
 }
-ANNOTATION_TEST_CASE(test_active_layer_keeps_pointer_capture_until_release) {
+TEST_CASE("test_active_layer_keeps_pointer_capture_until_release", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     const std::array<RectLayerSpec, 2> layers = {{
         RectLayerSpec{kCropLayerId, AnnotationBox{10, 10, 40, 40}, 100U, 100U, 10, 2, true},
@@ -47,7 +46,7 @@ ANNOTATION_TEST_CASE(test_active_layer_keeps_pointer_capture_until_release) {
     REQUIRE(frame.changed);
     REQUIRE(state.active_layer_id == 0);
 }
-ANNOTATION_TEST_CASE(test_release_commits_the_exact_canvas_box) {
+TEST_CASE("test_release_commits_the_exact_canvas_box", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     const RectLayerSpec layer{
         kCropLayerId, AnnotationBox{34, 24, 66, 56}, 100U, 100U, 10, 1, true,
@@ -62,7 +61,7 @@ ANNOTATION_TEST_CASE(test_release_commits_the_exact_canvas_box) {
     REQUIRE(frame.commit);
     REQUIRE((frame.box == AnnotationBox{44, 32, 76, 64}));
 }
-ANNOTATION_TEST_CASE(test_edge_only_move_requires_hitting_crop_outline) {
+TEST_CASE("test_edge_only_move_requires_hitting_crop_outline", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     const RectLayerSpec crop_layer{
         kCropLayerId, AnnotationBox{10, 10, 40, 40}, 100U, 100U, 10, 1, true, true,
@@ -75,7 +74,7 @@ ANNOTATION_TEST_CASE(test_edge_only_move_requires_hitting_crop_outline) {
     REQUIRE(frame.hovered_layer_id == kCropLayerId);
     REQUIRE(frame.hovered_kind == RectDragKind::Move);
 }
-ANNOTATION_TEST_CASE(test_custom_white_crop_hit_metrics_support_larger_edges_and_corners) {
+TEST_CASE("test_custom_white_crop_hit_metrics_support_larger_edges_and_corners", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     const AnnotationBox box{20, 20, 80, 80};
     const float edge_hit_half_width = 8.0f;

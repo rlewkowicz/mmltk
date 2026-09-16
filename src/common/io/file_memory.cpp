@@ -18,19 +18,6 @@
 #include <vector>
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::common::io {
-UniqueFd::UniqueFd(const int fd) noexcept : fd_(fd) {}
-UniqueFd::~UniqueFd() {
-    if (fd_ >= 0) (void)::close(fd_);
-}
-UniqueFd::UniqueFd(UniqueFd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
-UniqueFd& UniqueFd::operator=(UniqueFd&& other) noexcept {
-    if (this != &other) {
-        if (fd_ >= 0) (void)::close(fd_);
-        fd_ = std::exchange(other.fd_, -1);
-    }
-    return *this;
-}
-int UniqueFd::get() const noexcept { return fd_; }
 std::runtime_error errno_error(const char* action, const std::string& path) {
     const int error = errno;
     std::string message(action);
@@ -41,7 +28,7 @@ std::runtime_error errno_error(const char* action, const std::string& path) {
 }
 void sync_parent_directory(const std::filesystem::path& path) {
     const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
-    const UniqueFd directory(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    const ScopedFd directory(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
     if (directory.get() < 0) throw errno_error("open parent directory failed", parent.string());
     if (::fsync(directory.get()) != 0) throw errno_error("fsync parent directory failed", parent.string());
 }

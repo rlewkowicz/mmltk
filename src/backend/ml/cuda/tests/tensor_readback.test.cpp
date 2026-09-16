@@ -2,11 +2,14 @@
 #include <cuda.h>
 #include <ATen/ops/_neg_view.h>
 #include <torch/serialize.h>
-#include "catch2_compat.hpp"
+#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
+#undef CHECK
+#endif
+#include <catch2/catch_test_macros.hpp>
 #include <array>
 #include <atomic>
 #include <sstream>
-#include "cuda_test_utils.h"
+#include "src/test_support/cuda_test_utils.hpp"
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/common/system/execution_policy.h"

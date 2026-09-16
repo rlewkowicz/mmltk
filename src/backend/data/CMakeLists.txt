@@ -168,15 +168,14 @@ target_link_libraries(mmltk_backend_data
 function(mmltk_add_backend_data_tests)
     add_library(mmltk_backend_data_test_support STATIC EXCLUDE_FROM_ALL)
     mmltk_configure_component(
-        mmltk_backend_data_test_support PRIVATE_DECLARATIONS)
+        mmltk_backend_data_test_support PUBLIC_DECLARATIONS)
     mmltk_register_ordinary_sources(mmltk_backend_data_test_support
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests/test_fixture.cpp)
-    mmltk_register_private_headers(mmltk_backend_data_test_support
-        ${CMAKE_SOURCE_DIR}/src/backend/data/tests/test_fixture.h)
-    target_include_directories(mmltk_backend_data_test_support PUBLIC
-        ${CMAKE_SOURCE_DIR}/src/backend/data/tests
-    )
+    mmltk_register_public_headers(mmltk_backend_data_test_support
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_SOURCE_DIR}/src/backend/data/tests/test_fixture.h)
     target_link_libraries(mmltk_backend_data_test_support PUBLIC
+        mmltk_test_support
         mmltk::backend::data
         stb
     )
@@ -195,11 +194,8 @@ function(mmltk_add_backend_data_tests)
     if(BUILD_RFDETR_NATIVE)
         find_package(Vulkan REQUIRED)
         mmltk_register_ordinary_sources(mmltk_backend_data_tests
-            ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize_cuda.test.cpp
-            ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.cpp)
-        mmltk_register_private_headers(mmltk_backend_data_tests
-            ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/tests/vulkan_workspace_fixture.h)
-        target_link_libraries(mmltk_backend_data_tests PRIVATE Vulkan::Vulkan)
+            ${CMAKE_SOURCE_DIR}/src/backend/data/tests/image_resize_cuda.test.cpp)
+        target_link_libraries(mmltk_backend_data_tests PRIVATE mmltk_frameworks_gpu_hardware_test_support)
     endif()
     mmltk_configure_component(
         mmltk_backend_data_tests PRIVATE_DECLARATIONS)
@@ -208,7 +204,7 @@ function(mmltk_add_backend_data_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/data/tests
     )
     target_link_libraries(mmltk_backend_data_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::backend::data
         mmltk::common::concurrency
         mmltk::common::io

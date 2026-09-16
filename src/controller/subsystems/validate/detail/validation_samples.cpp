@@ -307,7 +307,6 @@ class ValidationSamples::Impl final {
     // each reserve one additional exact aggregate before doing device work.
     static_assert(rfdetr::kValidationSampleCapacity == 3U * 2U);
     static constexpr std::size_t kRawCapacity = 3U * rfdetr::kValidationSampleCapacity;
-    static_assert(kRawCapacity + 2U <= gpu::TerminalCudaRetirementOwner::kMaximumCapacity);
     std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement_ = std::make_shared<gpu::TerminalCudaRetirementOwner>(kRawCapacity + 2U);
     std::unique_ptr<PredictionPreviewPool> pool_;
     std::shared_ptr<Set> current_, displayed_;

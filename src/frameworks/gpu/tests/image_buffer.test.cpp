@@ -1,11 +1,11 @@
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
-#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"
-#include "src/acceptance/tests/cuda_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>

@@ -33,9 +33,9 @@
 #include <utility>
 #include <variant>
 #include <vector>
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_format.h"
-#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/explore/explore_system.h"
 #include "src/controller/presentation/presentation_system.h"
 #include "src/controller/services/settings_system.h"

@@ -48,19 +48,16 @@ function(mmltk_add_backend_imaging_explore_tests)
     add_library(mmltk_backend_imaging_explore_test_support STATIC
         EXCLUDE_FROM_ALL)
     mmltk_configure_component(
-        mmltk_backend_imaging_explore_test_support PRIVATE_DECLARATIONS)
+        mmltk_backend_imaging_explore_test_support PUBLIC_DECLARATIONS)
     mmltk_register_retained_module_importers(
         mmltk_backend_imaging_explore_test_support
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/explore_dataset_fixture.cpp)
-    mmltk_register_private_headers(
-        mmltk_backend_imaging_explore_test_support
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/explore_dataset_fixture.h)
-    target_include_directories(
-        mmltk_backend_imaging_explore_test_support PUBLIC
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests
-    )
+    mmltk_register_public_headers(mmltk_backend_imaging_explore_test_support
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/explore_dataset_fixture.h)
     target_link_libraries(
         mmltk_backend_imaging_explore_test_support PUBLIC
+        mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk::backend::data
         mmltk_backend_data_test_support
         PRIVATE
@@ -74,7 +71,8 @@ function(mmltk_add_backend_imaging_explore_tests)
         mmltk_backend_imaging_explore_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/explore_priority.test.cpp)
     target_link_libraries(mmltk_backend_imaging_explore_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_backend_models_rfdetr_augmentation_test_support
+        mmltk_test_support
         mmltk::backend::imaging::explore
         mmltk::backend::imaging::raster
         mmltk::controller::explore_system

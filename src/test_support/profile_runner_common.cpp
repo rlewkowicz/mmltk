@@ -1,4 +1,4 @@
-#include "profile_runner_common.h"
+#include "src/test_support/profile_runner_common.h"
 #include <array>
 #include <cmath>
 #include <cstdio>

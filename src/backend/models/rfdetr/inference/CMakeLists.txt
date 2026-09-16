@@ -84,7 +84,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/core/detail)
     target_link_libraries(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk_backend_data_test_support
         mmltk::backend::ml::cuda
         mmltk::backend::ml::runtime
@@ -113,7 +113,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk::backend::models::rfdetr::inference
         mmltk::common::logging
         mmltk::common::system
-        mmltk_acceptance_support)
+        mmltk_test_support)
     mmltk_target_cuda_architectures(mmltk_rfdetr_profile_runner)
     mmltk_enable_native_runtime_rpath(mmltk_rfdetr_profile_runner)
 endfunction()

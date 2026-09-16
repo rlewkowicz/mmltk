@@ -9,12 +9,12 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include "catch2_compat.hpp"
-#include "subprocess_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/subprocess_test_utils.hpp"
 // Import-bearing support follows every textual standard-library and POSIX test helper.
 #include "asset_cache_support.h"
 #include "checkpoint_fixture_support.h"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "model_state_access.h"
 #include "model_state_technical.h"
 #include "parity_fixture_support.h"
@@ -120,8 +120,8 @@ void test_native_rfdetr_cached_nano_export_pipeline() {
     });
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]", test_native_rfdetr_cli_checkpoint_smoke);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]", test_native_rfdetr_cached_nano_export_pipeline);
+TEST_CASE("test_native_rfdetr_cli_checkpoint_smoke", "[model][rfdetr][native_integration][cli][integration]") { test_native_rfdetr_cli_checkpoint_smoke(); }
+TEST_CASE("test_native_rfdetr_cached_nano_export_pipeline", "[model][rfdetr][native_integration][cli][integration]") { test_native_rfdetr_cached_nano_export_pipeline(); }
 TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names raw after renaming", "[model][rfdetr][layout][python]") {
     namespace r = mmltk::backend::models::rfdetr;
     namespace c = mmltk::backend::data::catalog;

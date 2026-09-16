@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
@@ -23,7 +23,7 @@
 #include "src/controller/services/train_process_client.h"
 #include "src/controller/services/vast_client.h"
 #include "src/controller/services/vast_provider_owner.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 namespace mmltk::controller::subsystems::system {
 namespace {
 namespace data = mmltk::backend::data;

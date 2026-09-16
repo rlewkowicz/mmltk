@@ -1,4 +1,5 @@
 #pragma once  // backend.data private implementation boundary
+#include "src/common/io/scoped_fd.h"
 #include <atomic>
 #include <concepts>
 #include <cstdint>
@@ -37,7 +38,7 @@ class ArtifactLease {
    private:
     explicit ArtifactLease(int descriptor) noexcept;
     void release() noexcept;
-    int descriptor_ = -1;
+    mmltk::common::io::ScopedFd descriptor_;
 };
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancellation);
 void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value, mmltk::common::concurrency::CancellationObservation cancellation);

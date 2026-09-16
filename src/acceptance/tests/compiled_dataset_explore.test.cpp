@@ -19,12 +19,12 @@
 #include <variant>
 #include <vector>
 #include <cuda_runtime_api.h>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
-#include "filesystem_test_utils.hpp"
-#include "async_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/backend/data/compiled_file_utils.h"
-#include "explore_dataset_fixture.h"
+#include "src/backend/imaging/explore/tests/explore_dataset_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/browser/client_record.h"
@@ -1439,9 +1439,9 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     }
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore]", test_compiled_dataset_explore_projection_navigation_and_streaming);
-MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][capacity]", test_compiled_explore_optional_donors_respect_source_capacity);
-MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][completion]", test_compiled_explore_cancelled_lane_preserves_atomic_product);
-MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][transaction]", test_native_explore_transaction_faults_and_inactive_release);
-MMLTK_REGISTER_TEST_CASE("[acceptance][backend-data][explore][support]", test_compiled_explore_magnified_tiny_mask_and_transfer);
-MMLTK_REGISTER_TEST_CASE("[acceptance][explore][copy_paste]", test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer);
+TEST_CASE("test_compiled_dataset_explore_projection_navigation_and_streaming", "[acceptance][backend-data][explore]") { test_compiled_dataset_explore_projection_navigation_and_streaming(); }
+TEST_CASE("test_compiled_explore_optional_donors_respect_source_capacity", "[acceptance][backend-data][explore][capacity]") { test_compiled_explore_optional_donors_respect_source_capacity(); }
+TEST_CASE("test_compiled_explore_cancelled_lane_preserves_atomic_product", "[acceptance][backend-data][explore][completion]") { test_compiled_explore_cancelled_lane_preserves_atomic_product(); }
+TEST_CASE("test_native_explore_transaction_faults_and_inactive_release", "[acceptance][backend-data][explore][transaction]") { test_native_explore_transaction_faults_and_inactive_release(); }
+TEST_CASE("test_compiled_explore_magnified_tiny_mask_and_transfer", "[acceptance][backend-data][explore][support]") { test_compiled_explore_magnified_tiny_mask_and_transfer(); }
+TEST_CASE("test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer", "[acceptance][explore][copy_paste]") { test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer(); }

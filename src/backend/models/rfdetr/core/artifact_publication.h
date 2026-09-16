@@ -16,7 +16,7 @@ class ClassArtifactPublication final {
     [[nodiscard]] const std::filesystem::path& staged_artifact() const noexcept { return staged_; }
     [[nodiscard]] const std::optional<ModelClassDescriptor>& previous_descriptor() const noexcept { return previous_descriptor_; }
     // Stable prior source admission; release the lease before staged production.
-    [[nodiscard]] mmltk::common::io::UniqueFd LockPreviousArtifact() const;
+    [[nodiscard]] mmltk::common::io::ScopedFd LockPreviousArtifact() const;
     void Publish(std::optional<ModelClassDescriptor> companion = {}, std::function_ref<bool()> cancel_requested = [] { return false; });
 
    private:

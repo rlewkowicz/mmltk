@@ -17,9 +17,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include "catch2_compat.hpp"
-#include "filesystem_test_utils.hpp"
-#include "linux_process_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/linux_process_test_utils.hpp"
 #include "src/common/io/file_memory.h"
 #include "src/common/io/scoped_fd.h"
 namespace {

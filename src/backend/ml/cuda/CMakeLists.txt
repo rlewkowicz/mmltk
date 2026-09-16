@@ -63,13 +63,12 @@ function(mmltk_add_backend_ml_cuda_tests)
     mmltk_register_ordinary_sources(mmltk_backend_ml_cuda_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/tensor_readback.test.cpp)
     target_link_options(mmltk_backend_ml_cuda_tests PRIVATE "LINKER:--wrap=cudaStreamSynchronize" "LINKER:--wrap=cudaMemcpyAsync")
-    mmltk_register_private_headers(mmltk_backend_ml_cuda_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/cuda_test_utils.h)
     target_include_directories(mmltk_backend_ml_cuda_tests PRIVATE
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests
     )
     target_link_libraries(mmltk_backend_ml_cuda_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_frameworks_gpu_test_support
+        mmltk_test_support
         mmltk::backend::ml::cuda
         CUDA::cudart
     )

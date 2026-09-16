@@ -16,7 +16,7 @@
 #include <spdlog/spdlog.h>
 #include "src/common/system/numa_memory.h"
 #include <utility>
-#include "async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/backend/media/video/video_file_source.h"
 #include "src/frameworks/gpu/cuda_context_scope.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"

@@ -108,8 +108,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
     mmltk_register_private_headers(
         mmltk_backend_models_rfdetr_training_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_state_fixture.h
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation_fixture.h
-        ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation_fixture.h)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_training_tests ${sources})
     mmltk_register_ordinary_sources(
@@ -127,8 +126,9 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(
         mmltk_backend_models_rfdetr_training_tests PRIVATE
+        mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk::backend::models::rfdetr::export
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::backend::models::rfdetr::augmentation
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::training
@@ -168,7 +168,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk::common::system
         mmltk::backend::ml::torch_dependencies
         mmltk_backend_data_test_support
-        mmltk_acceptance_support)
+        mmltk_test_support)
     mmltk_target_cuda_architectures(mmltk_rfdetr_train_profile_runner)
     mmltk_enable_native_runtime_rpath(mmltk_rfdetr_train_profile_runner)
 endfunction()

@@ -1,4 +1,4 @@
-#include "explore_dataset_fixture.h"
+#include "src/backend/imaging/explore/tests/explore_dataset_fixture.h"
 #include <cstdint>
 #include <fstream>
 #include <stdexcept>
@@ -6,7 +6,7 @@
 #include <sstream>
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 namespace mmltk::testsupport {
 std::filesystem::path compile_explore_fixture(const std::filesystem::path& temporary_root, const std::string_view fixture_name, const int num_images,

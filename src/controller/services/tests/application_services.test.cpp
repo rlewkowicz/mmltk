@@ -25,8 +25,8 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
-#include "filesystem_test_utils.hpp"
-#include "async_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/workspace.h"

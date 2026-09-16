@@ -41,7 +41,7 @@ function(mmltk_add_frameworks_serialization_tests)
         mmltk_frameworks_serialization_tests
         ${CMAKE_SOURCE_DIR}/src/frameworks/serialization/tests/cbor_wire.test.cpp)
     target_link_libraries(mmltk_frameworks_serialization_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::frameworks::serialization
     )
     catch_discover_tests(

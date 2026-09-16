@@ -1,8 +1,8 @@
 #include "src/backend/imaging/upscale/detail/image_upscaler_cuda.h"
 #include "src/backend/imaging/upscale/detail/shiftlut_onnx_ops.h"
 #include "shiftlut_reference.h"
-#include "async_test_utils.hpp"
-#include "cuda_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <cuda_runtime_api.h>

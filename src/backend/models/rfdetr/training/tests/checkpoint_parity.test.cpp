@@ -5,8 +5,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include "catch2_compat.hpp"
-#include "filesystem_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/filesystem_test_utils.hpp"
 // Import-bearing support follows every textual standard-library test helper.
 #include "checkpoint_fixture_support.h"
 #include "detection_types.h"
@@ -130,4 +130,4 @@ void test_checkpoint_parity_matches_for_all_registered_fixtures() {
     const auto& fixtures = parity_fixture_cases();
     for (size_t index = 0; index < fixtures.size(); ++index) { run_checkpoint_parity_case(fixtures[index], index + 1, fixtures.size()); }
 }
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint_parity][integration]", test_checkpoint_parity_matches_for_all_registered_fixtures);
+TEST_CASE("test_checkpoint_parity_matches_for_all_registered_fixtures", "[model][rfdetr][checkpoint_parity][integration]") { test_checkpoint_parity_matches_for_all_registered_fixtures(); }

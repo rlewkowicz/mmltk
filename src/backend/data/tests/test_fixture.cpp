@@ -1,4 +1,4 @@
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 #include <stb_image_write.h>
 #include <array>
 #include <algorithm>

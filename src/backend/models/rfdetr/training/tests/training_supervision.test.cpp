@@ -21,9 +21,9 @@
 #include <system_error>
 #include <vector>
 #include "archive_utils.h"
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
-#include "cuda_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 #include "detail/checkpoint_private.h"
@@ -39,7 +39,7 @@
 #include "model_state_access.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/models/rfdetr/training/train.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 #include "torch_api.h"
 #include "training_supervision.h"
 #include "detection_ops.h"
@@ -109,8 +109,8 @@ void test_training_supervision_runtime_replication_is_one_shot() {
     rfdetr::TrainingSupervisionImpl replica(config, config.num_classes - 1);
     source.initialize(71U);
     replica.install_replicated_initialized_runtime(config.training_supervision);
-    MMLTK_ASSERT(source.initialized());
-    MMLTK_ASSERT(replica.initialized());
+    REQUIRE((source.initialized()));
+    REQUIRE((replica.initialized()));
     REQUIRE_THROWS(replica.install_replicated_initialized_runtime(config.training_supervision));
     auto incompatible_config = config;
     incompatible_config.training_supervision.match_free.rho = 0.75F;
@@ -134,21 +134,21 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     output.save_to(path.string());
     torch_api::InputArchive input;
     input.load_from(path.string());
-    MMLTK_ASSERT(rfdetr::detail::read_training_supervision_config(input) == config);
+    REQUIRE((rfdetr::detail::read_training_supervision_config(input) == config));
     torch_api::InputArchive resume_archive;
     resume_archive.load_from(path.string(), torch_api::Device(torch_api::kCPU));
     rfdetr::detail::require_resume_training_supervision_config(resume_archive, config);
     REQUIRE_THROWS(rfdetr::detail::require_resume_training_supervision_config(resume_archive, rfdetr::TrainingSupervisionConfig{}));
     torch_api::InputArchive state;
     input.read("state", state);
-    MMLTK_ASSERT(rfdetr::require_int(state, "entry_count") == 1);
+    REQUIRE((rfdetr::require_int(state, "entry_count") == 1));
     torch_api::OutputArchive legacy_output;
     rfdetr::detail::write_training_supervision_config(legacy_output, {});
     rfdetr::detail::write_state_archive(legacy_output, "state", {}, readback, 0);
     legacy_output.save_to(path.string());
     torch_api::InputArchive legacy_input;
     legacy_input.load_from(path.string());
-    MMLTK_ASSERT(rfdetr::detail::read_training_supervision_config(legacy_input) == rfdetr::TrainingSupervisionConfig{});
+    REQUIRE((rfdetr::detail::read_training_supervision_config(legacy_input) == rfdetr::TrainingSupervisionConfig{}));
     rfdetr::TrainingSupervisionConfig inactive_nondefault;
     inactive_nondefault.match_free.rho = 0.75F;
     torch_api::OutputArchive inactive_output;
@@ -156,7 +156,7 @@ void test_checkpoint_supervision_config_and_deployment_pruning() {
     inactive_output.save_to(path.string());
     torch_api::InputArchive inactive_input;
     inactive_input.load_from(path.string());
-    MMLTK_ASSERT(rfdetr::detail::read_training_supervision_config(inactive_input) == inactive_nondefault);
+    REQUIRE((rfdetr::detail::read_training_supervision_config(inactive_input) == inactive_nondefault));
     std::error_code ignored;
     std::filesystem::remove(path, ignored);
 }
@@ -1582,26 +1582,26 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     std::filesystem::remove_all(root, ignored);
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_training_supervision_runtime_replication_is_one_shot);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_checkpoint_supervision_config_and_deployment_pruning);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_feature_active_host_target_invariants);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_ema_shadow_admission_is_transactional);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_native_optimizer_late_failure_preserves_live_state);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_resume_continuation_manifest_is_exact);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_target_scratch_reuse_waits_for_consumer_retirement);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_target_staging_ring_recycles_completed_slots_without_host_wait);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_target_scratch_retires_cross_device_events_on_their_owner);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_build_targets_recovers_after_staging_growth_and_failure);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_training_adapter_matches_raw_augmentation_executor);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_training_mask_targets_follow_spatial_image_erasure);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_parallel_wave_drains_failures_and_cancellation);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][supervision][training_supervision]", test_all_supervision_routes_execute_fixture_backed_training);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][augmentation][support]", test_native_augmentation_preview_target_support_parity);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][augmentation][support]", test_tiny_mask_training_outer_edges);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][copy_paste]", test_copy_paste_ring_support_and_cache_cycles);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision][augmentation][copy_paste]", test_copy_paste_cache_publication_recovers_without_targets);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][ema]", test_ema_selection_restores_identity_and_mode);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][ema]", test_ema_tau_updates_continue_after_restore);
+TEST_CASE("test_training_supervision_runtime_replication_is_one_shot", "[model][rfdetr][training][supervision][training_supervision]") { test_training_supervision_runtime_replication_is_one_shot(); }
+TEST_CASE("test_checkpoint_supervision_config_and_deployment_pruning", "[model][rfdetr][training][supervision][training_supervision]") { test_checkpoint_supervision_config_and_deployment_pruning(); }
+TEST_CASE("test_feature_active_host_target_invariants", "[model][rfdetr][training][supervision][training_supervision]") { test_feature_active_host_target_invariants(); }
+TEST_CASE("test_ema_shadow_admission_is_transactional", "[model][rfdetr][training][supervision][training_supervision]") { test_ema_shadow_admission_is_transactional(); }
+TEST_CASE("test_native_optimizer_late_failure_preserves_live_state", "[model][rfdetr][training][supervision][training_supervision]") { test_native_optimizer_late_failure_preserves_live_state(); }
+TEST_CASE("test_resume_continuation_manifest_is_exact", "[model][rfdetr][training][supervision][training_supervision]") { test_resume_continuation_manifest_is_exact(); }
+TEST_CASE("test_target_scratch_reuse_waits_for_consumer_retirement", "[model][rfdetr][training][supervision][training_supervision]") { test_target_scratch_reuse_waits_for_consumer_retirement(); }
+TEST_CASE("test_target_staging_ring_recycles_completed_slots_without_host_wait", "[model][rfdetr][training][supervision][training_supervision]") { test_target_staging_ring_recycles_completed_slots_without_host_wait(); }
+TEST_CASE("test_target_scratch_retires_cross_device_events_on_their_owner", "[model][rfdetr][training][supervision][training_supervision]") { test_target_scratch_retires_cross_device_events_on_their_owner(); }
+TEST_CASE("test_build_targets_recovers_after_staging_growth_and_failure", "[model][rfdetr][training][supervision][training_supervision]") { test_build_targets_recovers_after_staging_growth_and_failure(); }
+TEST_CASE("test_training_adapter_matches_raw_augmentation_executor", "[model][rfdetr][training][supervision][training_supervision]") { test_training_adapter_matches_raw_augmentation_executor(); }
+TEST_CASE("test_training_mask_targets_follow_spatial_image_erasure", "[model][rfdetr][training][supervision][training_supervision]") { test_training_mask_targets_follow_spatial_image_erasure(); }
+TEST_CASE("test_parallel_wave_drains_failures_and_cancellation", "[model][rfdetr][training][supervision][training_supervision]") { test_parallel_wave_drains_failures_and_cancellation(); }
+TEST_CASE("test_all_supervision_routes_execute_fixture_backed_training", "[model][rfdetr][training][supervision][training_supervision]") { test_all_supervision_routes_execute_fixture_backed_training(); }
+TEST_CASE("test_native_augmentation_preview_target_support_parity", "[model][rfdetr][training][augmentation][support]") { test_native_augmentation_preview_target_support_parity(); }
+TEST_CASE("test_tiny_mask_training_outer_edges", "[model][rfdetr][training][augmentation][support]") { test_tiny_mask_training_outer_edges(); }
+TEST_CASE("test_copy_paste_ring_support_and_cache_cycles", "[model][rfdetr][training_supervision][augmentation][copy_paste]") { test_copy_paste_ring_support_and_cache_cycles(); }
+TEST_CASE("test_copy_paste_cache_publication_recovers_without_targets", "[model][rfdetr][training_supervision][augmentation][copy_paste]") { test_copy_paste_cache_publication_recovers_without_targets(); }
+TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][training][ema]") { test_ema_selection_restores_identity_and_mode(); }
+TEST_CASE("test_ema_tau_updates_continue_after_restore", "[model][rfdetr][training][ema]") { test_ema_tau_updates_continue_after_restore(); }
 TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads",
           "[model][rfdetr][training][augmentation][perceptual][cuda]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA unavailable; Torch resampling custody unexecuted");

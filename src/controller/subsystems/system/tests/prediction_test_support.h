@@ -1,5 +1,5 @@
 #pragma once
-#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/validate/validation_system.h"
 #include "src/controller/subsystems/validate/validation_runtime.h"
 #include "src/controller/subsystems/export/export_system.h"

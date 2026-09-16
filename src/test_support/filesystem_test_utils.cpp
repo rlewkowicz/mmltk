@@ -1,11 +1,11 @@
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
-#include "src/common/io/filesystem_utils.h"
+#include "src/common/io/file_memory.h"
 namespace mmltk::testsupport {
 std::filesystem::path make_temp_root(const char* const name_prefix) {
     std::string pattern = (std::filesystem::temp_directory_path() / (std::string{name_prefix} + ".XXXXXX")).string();
@@ -40,11 +40,7 @@ void write_executable_file(const std::filesystem::path& path, const std::functio
 }
 ScopedTempDir::ScopedTempDir(const char* const name_prefix) : path_(make_temp_root(name_prefix)) {}
 ScopedTempDir::~ScopedTempDir() {
-    if (!path_.empty()) mmltk::common::io::filesystem_utils::remove_path_recursively_best_effort(path_);
+    if (!path_.empty()) mmltk::common::io::remove_path_recursively_best_effort(path_);
 }
 const std::filesystem::path& ScopedTempDir::path() const noexcept { return path_; }
-BrowserAssetDirectory::BrowserAssetDirectory(const char* const name_prefix) : root_(name_prefix) {
-    write_text_file(root_.path() / "index.html", "<!doctype html>");
-}
-const std::filesystem::path& BrowserAssetDirectory::path() const noexcept { return root_.path(); }
 }  // namespace mmltk::testsupport

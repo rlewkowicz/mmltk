@@ -1,7 +1,7 @@
 #include "src/controller/services/train_run_store.h"
 #include "src/backend/models/rfdetr/training/telemetry_writer.h"
-#include "filesystem_test_utils.hpp"
-#include "catch2_compat.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include <fstream>
 using mmltk::controller::services::TrainRunStore;
 namespace {
@@ -65,4 +65,4 @@ void test_current_training_history_pages_and_attempt_configuration() {
     REQUIRE(std::filesystem::is_empty(fresh));
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[gui][train][history]", test_current_training_history_pages_and_attempt_configuration);
+TEST_CASE("test_current_training_history_pages_and_attempt_configuration", "[gui][train][history]") { test_current_training_history_pages_and_attempt_configuration(); }

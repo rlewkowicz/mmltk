@@ -14,7 +14,7 @@
 #include <span>
 #include <vector>
 #include <nlohmann/json.hpp>
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/data/tests/test_fixture.h"

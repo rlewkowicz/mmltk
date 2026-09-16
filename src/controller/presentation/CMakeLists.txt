@@ -82,6 +82,12 @@ mmltk_link_declarations(mmltk_controller_presentation_system PUBLIC
     mmltk::controller::visual_runtime)
 mmltk_register_header_isolation(mmltk_controller_presentation_system)
 
+add_library(mmltk_controller_presentation_test_support INTERFACE)
+mmltk_register_public_headers(mmltk_controller_presentation_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/workspace_surface_socket_test_utils.hpp detail/native_presentation_writer_test_access.h)
+target_link_libraries(mmltk_controller_presentation_test_support INTERFACE mmltk::controller::presentation_system)
+
 function(mmltk_add_controller_presentation_tests)
     add_executable(
         mmltk_controller_visual_systems_tests EXCLUDE_FROM_ALL)
@@ -93,7 +99,9 @@ function(mmltk_add_controller_presentation_tests)
         mmltk_controller_visual_systems_tests PRIVATE_DECLARATIONS)
     target_link_libraries(
         mmltk_controller_visual_systems_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_controller_annotation_test_support
+        mmltk_controller_presentation_test_support
+        mmltk_test_support
         mmltk::controller::browser::protocol_v17
         mmltk::controller::direct_services
         mmltk::controller::annotation_system

@@ -6,7 +6,7 @@
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include <cuda_runtime_api.h>
-#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
@@ -38,7 +38,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/contracts/model_selection.h"

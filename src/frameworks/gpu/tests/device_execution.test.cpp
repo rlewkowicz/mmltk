@@ -1,6 +1,6 @@
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
-#include "cuda_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 #include <cuda.h>
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>

@@ -3,7 +3,7 @@
 #include <string>
 #include <vector>
 #include <utility>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "archive_utils.h"
 #include "detail/checkpoint_private.h"
 #include "detail/model_ema.h"
@@ -196,6 +196,6 @@ void test_ordered_cpu_ema_admission() {
     }
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][continuation]", test_current_continuation_required_fields);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][continuation]", test_current_continuation_scalar_boundaries);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][continuation][ema]", test_ordered_cpu_ema_admission);
+TEST_CASE("test_current_continuation_required_fields", "[model][rfdetr][training][continuation]") { test_current_continuation_required_fields(); }
+TEST_CASE("test_current_continuation_scalar_boundaries", "[model][rfdetr][training][continuation]") { test_current_continuation_scalar_boundaries(); }
+TEST_CASE("test_ordered_cpu_ema_admission", "[model][rfdetr][training][continuation][ema]") { test_ordered_cpu_ema_admission(); }

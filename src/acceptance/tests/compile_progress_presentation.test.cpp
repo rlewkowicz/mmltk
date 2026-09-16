@@ -10,7 +10,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "spdmon/spdmon.hpp"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/controller/services/console_output.h"
@@ -207,8 +207,8 @@ void test_progress_bar_counter_rollback() {
     CHECK(lines.back().find("20/100") != std::string::npos);
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][postfix]", test_compile_postfix_formatting);
-MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][width]", test_progress_bar_non_tty_width);
-MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][throttle]", test_progress_bar_redraw_throttling);
-MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][log]", test_progress_bar_log_preserves_lines);
-MMLTK_REGISTER_TEST_CASE("[acceptance][compile-progress][rollback]", test_progress_bar_counter_rollback);
+TEST_CASE("test_compile_postfix_formatting", "[acceptance][compile-progress][postfix]") { test_compile_postfix_formatting(); }
+TEST_CASE("test_progress_bar_non_tty_width", "[acceptance][compile-progress][width]") { test_progress_bar_non_tty_width(); }
+TEST_CASE("test_progress_bar_redraw_throttling", "[acceptance][compile-progress][throttle]") { test_progress_bar_redraw_throttling(); }
+TEST_CASE("test_progress_bar_log_preserves_lines", "[acceptance][compile-progress][log]") { test_progress_bar_log_preserves_lines(); }
+TEST_CASE("test_progress_bar_counter_rollback", "[acceptance][compile-progress][rollback]") { test_progress_bar_counter_rollback(); }

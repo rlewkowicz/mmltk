@@ -9,7 +9,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include "cli_option_table.h"
+#include "src/test_support/cli_option_table.h"
 namespace fs = std::filesystem;
 namespace mmltk::testsupport {
 struct CommonProfileOptions {

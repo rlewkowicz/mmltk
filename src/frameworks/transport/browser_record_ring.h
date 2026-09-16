@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
-#include "src/frameworks/serialization/serialization.h"
+#include "src/frameworks/serialization/cbor_wire.h"
 namespace mmltk::frameworks::transport {
 inline constexpr std::size_t kBrowserRecordRingCapacity = 64U;
 enum class BrowserRecordPriority : std::uint8_t {

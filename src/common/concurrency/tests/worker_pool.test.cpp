@@ -1,4 +1,4 @@
-#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/common/concurrency/worker_pool.h"
 #include <algorithm>
 #include <atomic>

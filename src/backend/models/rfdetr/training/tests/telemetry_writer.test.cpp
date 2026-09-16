@@ -1,7 +1,7 @@
 #include "src/backend/models/rfdetr/training/telemetry_writer.h"
 #include "src/frameworks/serialization/reflected_json.h"
-#include "filesystem_test_utils.hpp"
-#include "catch2_compat.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include <fstream>
 #include <array>
 #include <cerrno>
@@ -55,8 +55,8 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
     REQUIRE(previous->dropped_before == writer.persistence().dropped_records);
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_telemetry_persistence_failure_is_nonfatal);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_telemetry_pressure_preserves_a_terminal_boundary);
+TEST_CASE("test_telemetry_persistence_failure_is_nonfatal", "[model][rfdetr][training][telemetry]") { test_telemetry_persistence_failure_is_nonfatal(); }
+TEST_CASE("test_telemetry_pressure_preserves_a_terminal_boundary", "[model][rfdetr][training][telemetry]") { test_telemetry_pressure_preserves_a_terminal_boundary(); }
 namespace {
 // The writer's actual Initialize open blocks on this FIFO until Release. No
 // sleeps, scheduler assumptions or production-only persistence hooks are used.
@@ -235,8 +235,8 @@ void test_telemetry_distinct_heads_drain_by_sequence() {
     REQUIRE_FALSE(held.writer->persistence().degraded);
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_telemetry_boundary_pressure_reserves_epoch_and_terminal);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_invalid_terminal_has_truthful_degraded_custody_and_notice);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_rejected_only_submission_notifies_before_empty_close);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_unencodable_terminal_notifies_without_later_submission);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training][telemetry]", test_telemetry_distinct_heads_drain_by_sequence);
+TEST_CASE("test_telemetry_boundary_pressure_reserves_epoch_and_terminal", "[model][rfdetr][training][telemetry]") { test_telemetry_boundary_pressure_reserves_epoch_and_terminal(); }
+TEST_CASE("test_invalid_terminal_has_truthful_degraded_custody_and_notice", "[model][rfdetr][training][telemetry]") { test_invalid_terminal_has_truthful_degraded_custody_and_notice(); }
+TEST_CASE("test_rejected_only_submission_notifies_before_empty_close", "[model][rfdetr][training][telemetry]") { test_rejected_only_submission_notifies_before_empty_close(); }
+TEST_CASE("test_unencodable_terminal_notifies_without_later_submission", "[model][rfdetr][training][telemetry]") { test_unencodable_terminal_notifies_without_later_submission(); }
+TEST_CASE("test_telemetry_distinct_heads_drain_by_sequence", "[model][rfdetr][training][telemetry]") { test_telemetry_distinct_heads_drain_by_sequence(); }

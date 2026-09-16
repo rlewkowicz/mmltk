@@ -2,8 +2,8 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
-#include "cuda_test_utils.h"
-#include "async_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/common/system/execution_policy.h"

@@ -113,7 +113,7 @@ function(mmltk_add_controller_services_tests)
         "MMLTK_FILE_DIALOG_PROCESS_FIXTURE=$<TARGET_FILE:mmltk_controller_services_file_dialog_fixture>"
     )
     target_link_libraries(mmltk_controller_services_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::backend::data
         mmltk::backend::models::rfdetr::contract
         mmltk::common::io

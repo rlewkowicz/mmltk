@@ -49,10 +49,10 @@ class PredictionPreviewFrame final : public std::enable_shared_from_this<Predict
 };
 // One transaction retains the exact drawing set until outer publication settles.
 // Regions and options are renderer facts; sample-selection policy stays native to
-// the domain. The generic resource bound follows the terminal authority.
+// the domain. The composition admits at most 63 simultaneous raw frames.
 class PredictionPreviewComposition final {
    public:
-    static constexpr std::size_t kMaximumFrames = mmltk::frameworks::gpu::TerminalCudaRetirementOwner::kMaximumCapacity - 1U;
+    static constexpr std::size_t kMaximumFrames = 63U;
     struct Region final {
         std::shared_ptr<const PredictionPreviewFrame> frame;
         VisualRegion crop;

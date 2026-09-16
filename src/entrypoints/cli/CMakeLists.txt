@@ -55,7 +55,7 @@ function(mmltk_add_entrypoints_cli_tests)
         MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_entrypoints_cli>"
     )
     target_link_libraries(mmltk_entrypoints_cli_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::frameworks::reflection
     )
     add_dependencies(

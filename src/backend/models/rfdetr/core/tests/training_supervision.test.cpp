@@ -12,9 +12,12 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include "catch2_compat.hpp"
+#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
+#undef CHECK
+#endif
+#include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
-#include "cuda_test_utils.hpp"
+#include "src/test_support/cuda_test_utils.hpp"
 #include "detail/detection_geometry.h"
 #include "detail/detection_ops.h"
 #include "detail/model_access.h"
@@ -1510,29 +1513,29 @@ void test_sparse_masks_share_erasure_after_geometry_and_donor_composition() {
 }
 }  // namespace
 // CLEANUP-IGNORE: These separately registered mathematical cases have different test bodies and acceptance obligations.
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_sparse_masks_share_erasure_after_geometry_and_donor_composition);
+TEST_CASE("test_sparse_masks_share_erasure_after_geometry_and_donor_composition", "[model][rfdetr][training_supervision]") { test_sparse_masks_share_erasure_after_geometry_and_donor_composition(); }
 // CLEANUP-IGNORE: Registration is an exhaustive inventory of semantically independent mathematical tests.
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_geometry_preserves_consumer_policies_and_batch_isolation);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_rectangular_supervision_retains_404_targets_with_300_queries);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradients_live);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_complete_focal_cost_and_both_objectives_keep_prediction_and_probe_gradients);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_focal_broadcast_cost_sums_every_channel_and_places_coefficients_once);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_layer_group_and_device_target_reductions_follow_declared_gating);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_complete_match_free_loss_is_fp32_inside_cuda_autocast);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_timing_leases_are_explicit_bounded_and_harvested_once);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_empty_and_retained_graphs_are_finite_and_independent);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_production_match_free_boundary_captures_layers_and_empty_gradient_anchors);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_mixed_empty_images_use_safe_internal_padding_without_loss_contribution);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_conditional_model_construction_preserves_rng_and_default_state_topology);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_dn_endpoint_transform_mapping_padding_and_one_class_behavior);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_dn_center_underflow_other_label_bijection_and_step_determinism);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_split_self_attention_matches_equation_seven_and_symmetric_group_layout);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_production_dn_forward_preserves_reference_and_output_boundaries);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_production_dn_retained_graph_scratch_padding_and_gradients);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_dn_reference_conventions_inference_removal_and_disabled_exact_path);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_dn_all_empty_loss_is_finite_and_parameter_anchored);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_active_empty_loss_anchors_every_selected_mask_operand);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][training_supervision]", test_feature_initialization_is_reproducible_and_independent_of_dn_toggle);
+TEST_CASE("test_geometry_preserves_consumer_policies_and_batch_isolation", "[model][rfdetr][training_supervision]") { test_geometry_preserves_consumer_policies_and_batch_isolation(); }
+TEST_CASE("test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d", "[model][rfdetr][training_supervision]") { test_gathered_ground_truth_affinity_matches_explicit_one_hot_and_sqrt_d(); }
+TEST_CASE("test_rectangular_supervision_retains_404_targets_with_300_queries", "[model][rfdetr][training_supervision]") { test_rectangular_supervision_retains_404_targets_with_300_queries(); }
+TEST_CASE("test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradients_live", "[model][rfdetr][training_supervision]") { test_scg_excludes_inactive_columns_handles_ties_and_keeps_selected_gradients_live(); }
+TEST_CASE("test_complete_focal_cost_and_both_objectives_keep_prediction_and_probe_gradients", "[model][rfdetr][training_supervision]") { test_complete_focal_cost_and_both_objectives_keep_prediction_and_probe_gradients(); }
+TEST_CASE("test_focal_broadcast_cost_sums_every_channel_and_places_coefficients_once", "[model][rfdetr][training_supervision]") { test_focal_broadcast_cost_sums_every_channel_and_places_coefficients_once(); }
+TEST_CASE("test_layer_group_and_device_target_reductions_follow_declared_gating", "[model][rfdetr][training_supervision]") { test_layer_group_and_device_target_reductions_follow_declared_gating(); }
+TEST_CASE("test_complete_match_free_loss_is_fp32_inside_cuda_autocast", "[model][rfdetr][training_supervision]") { test_complete_match_free_loss_is_fp32_inside_cuda_autocast(); }
+TEST_CASE("test_timing_leases_are_explicit_bounded_and_harvested_once", "[model][rfdetr][training_supervision]") { test_timing_leases_are_explicit_bounded_and_harvested_once(); }
+TEST_CASE("test_empty_and_retained_graphs_are_finite_and_independent", "[model][rfdetr][training_supervision]") { test_empty_and_retained_graphs_are_finite_and_independent(); }
+TEST_CASE("test_production_match_free_boundary_captures_layers_and_empty_gradient_anchors", "[model][rfdetr][training_supervision]") { test_production_match_free_boundary_captures_layers_and_empty_gradient_anchors(); }
+TEST_CASE("test_mixed_empty_images_use_safe_internal_padding_without_loss_contribution", "[model][rfdetr][training_supervision]") { test_mixed_empty_images_use_safe_internal_padding_without_loss_contribution(); }
+TEST_CASE("test_conditional_model_construction_preserves_rng_and_default_state_topology", "[model][rfdetr][training_supervision]") { test_conditional_model_construction_preserves_rng_and_default_state_topology(); }
+TEST_CASE("test_dn_endpoint_transform_mapping_padding_and_one_class_behavior", "[model][rfdetr][training_supervision]") { test_dn_endpoint_transform_mapping_padding_and_one_class_behavior(); }
+TEST_CASE("test_dn_center_underflow_other_label_bijection_and_step_determinism", "[model][rfdetr][training_supervision]") { test_dn_center_underflow_other_label_bijection_and_step_determinism(); }
+TEST_CASE("test_split_self_attention_matches_equation_seven_and_symmetric_group_layout", "[model][rfdetr][training_supervision]") { test_split_self_attention_matches_equation_seven_and_symmetric_group_layout(); }
+TEST_CASE("test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs", "[model][rfdetr][training_supervision]") { test_dn_direct_loss_auxiliary_gating_padding_and_retained_graphs(); }
+TEST_CASE("test_production_dn_forward_preserves_reference_and_output_boundaries", "[model][rfdetr][training_supervision]") { test_production_dn_forward_preserves_reference_and_output_boundaries(); }
+TEST_CASE("test_production_dn_retained_graph_scratch_padding_and_gradients", "[model][rfdetr][training_supervision]") { test_production_dn_retained_graph_scratch_padding_and_gradients(); }
+TEST_CASE("test_dn_reference_conventions_inference_removal_and_disabled_exact_path", "[model][rfdetr][training_supervision]") { test_dn_reference_conventions_inference_removal_and_disabled_exact_path(); }
+TEST_CASE("test_dn_all_empty_loss_is_finite_and_parameter_anchored", "[model][rfdetr][training_supervision]") { test_dn_all_empty_loss_is_finite_and_parameter_anchored(); }
+TEST_CASE("test_active_empty_loss_anchors_every_selected_mask_operand", "[model][rfdetr][training_supervision]") { test_active_empty_loss_anchors_every_selected_mask_operand(); }
+TEST_CASE("test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast", "[model][rfdetr][training_supervision]") { test_dn_preparation_and_objective_remain_fp32_under_cuda_autocast(); }
+TEST_CASE("test_feature_initialization_is_reproducible_and_independent_of_dn_toggle", "[model][rfdetr][training_supervision]") { test_feature_initialization_is_reproducible_and_independent_of_dn_toggle(); }

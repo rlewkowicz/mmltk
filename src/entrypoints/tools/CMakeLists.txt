@@ -58,7 +58,7 @@ if(BUILD_RFDETR_NATIVE)
         target_include_directories(mmltk_entrypoints_tools_tests PRIVATE
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
         target_link_libraries(mmltk_entrypoints_tools_tests PRIVATE
-            mmltk_acceptance_support
+            mmltk_test_support
             mmltk::common::logging
             mmltk_entrypoints_tools_support)
         catch_discover_tests(mmltk_entrypoints_tools_tests

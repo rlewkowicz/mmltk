@@ -7,10 +7,10 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include "async_test_utils.hpp"
-#include "catch2_compat.hpp"
+#include "src/test_support/async_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "detail/onnx_tool_main.h"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 import mmltk.common.logging.mmltk_logging;
 namespace {
 std::filesystem::path captured_model_path;
@@ -91,6 +91,6 @@ void test_onnx_failure_diagnostics_are_lazy() {
     CHECK(text.find("onnx-info-test: observed model operation failure") != std::string::npos);
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_tool_main_routes_one_model_after_logging_options);
-MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_tool_main_rejects_a_missing_model);
-MMLTK_REGISTER_TEST_CASE("[entrypoints][tools][onnx]", test_onnx_failure_diagnostics_are_lazy);
+TEST_CASE("test_onnx_tool_main_routes_one_model_after_logging_options", "[entrypoints][tools][onnx]") { test_onnx_tool_main_routes_one_model_after_logging_options(); }
+TEST_CASE("test_onnx_tool_main_rejects_a_missing_model", "[entrypoints][tools][onnx]") { test_onnx_tool_main_rejects_a_missing_model(); }
+TEST_CASE("test_onnx_failure_diagnostics_are_lazy", "[entrypoints][tools][onnx]") { test_onnx_failure_diagnostics_are_lazy(); }

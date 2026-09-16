@@ -1,5 +1,5 @@
-#include "src/acceptance/tests/async_test_utils.hpp"
-#include "src/acceptance/tests/annotation_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
+#include "src/controller/subsystems/annotation/tests/support/annotation_test_utils.hpp"
 #include "src/frameworks/gpu/gdr_mapped_buffer.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/common/system/cpu_affinity.h"
@@ -66,14 +66,14 @@
 #include "src/frameworks/gpu/image_failure.h"
 #include "src/controller/presentation/detail/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
-#include "src/acceptance/tests/workspace_surface_socket_test_utils.hpp"
+#include "src/controller/presentation/tests/support/workspace_surface_socket_test_utils.hpp"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/services/diagnostics_client.h"
 #include "src/controller/services/runtime_diagnostics.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
-#include "filesystem_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 namespace mmltk::controller {
 namespace {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;

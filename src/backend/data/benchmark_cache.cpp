@@ -54,11 +54,11 @@ namespace {
 std::filesystem::path BenchmarkCacheLayout::source_downloads(const std::string_view source) const { return ensured_source_subdirectory(downloads, source); }
 std::filesystem::path BenchmarkCacheLayout::source_images(const std::string_view source) const { return ensured_source_subdirectory(images, source); }
 std::filesystem::path BenchmarkCacheLayout::source_indexes(const std::string_view source) const { return ensured_source_subdirectory(indexes, source); }
-ArtifactLease::ArtifactLease(ArtifactLease&& other) noexcept : descriptor_(std::exchange(other.descriptor_, -1)) {}
+ArtifactLease::ArtifactLease(ArtifactLease&& other) noexcept : descriptor_(std::move(other.descriptor_)) {}
 ArtifactLease& ArtifactLease::operator=(ArtifactLease&& other) noexcept {
     if (this != &other) {
         release();
-        descriptor_ = std::exchange(other.descriptor_, -1);
+        descriptor_ = std::move(other.descriptor_);
     }
     return *this;
 }
@@ -68,28 +68,21 @@ ArtifactLease ArtifactLease::acquire(const std::filesystem::path& lock_path, mml
     std::filesystem::create_directories(parent);
     const int descriptor = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (descriptor < 0) { throw errno_error("cannot open benchmark cache lock", lock_path.string()); }
-    while (::flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+    mmltk::common::io::ScopedFd owned(descriptor);
+    while (::flock(owned.get(), LOCK_EX | LOCK_NB) != 0) {
         if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            const std::runtime_error error = errno_error("cannot acquire benchmark cache lock", lock_path.string());
-            ::close(descriptor);
-            throw error;
+            throw errno_error("cannot acquire benchmark cache lock", lock_path.string());
         }
-        try {
-            throw_if_benchmark_cancelled(cancel_requested);
-        } catch (...) {
-            ::close(descriptor);
-            throw;
-        }
+        throw_if_benchmark_cancelled(cancel_requested);
         // flock has no readiness fd; this bounded retry exists solely to retain cancellation responsiveness.
         std::this_thread::sleep_for(std::chrono::milliseconds{100});
     }
-    return ArtifactLease(descriptor);
+    return ArtifactLease(owned.release());
 }
 void ArtifactLease::release() noexcept {
-    if (descriptor_ >= 0) {
-        (void)::flock(descriptor_, LOCK_UN);
-        (void)::close(descriptor_);
-        descriptor_ = -1;
+    if (descriptor_.get() >= 0) {
+        (void)::flock(descriptor_.get(), LOCK_UN);
+        descriptor_.reset();
     }
 }
 void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObservation cancel_requested) {

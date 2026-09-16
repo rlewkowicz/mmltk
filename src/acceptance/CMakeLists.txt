@@ -91,39 +91,8 @@ set_target_properties(Catch2 Catch2WithMain PROPERTIES
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/third_party/catch2/extras)
 include(Catch)
 
-add_library(mmltk_acceptance_support STATIC EXCLUDE_FROM_ALL)
-mmltk_configure_component(
-    mmltk_acceptance_support PRIVATE_DECLARATIONS)
-mmltk_register_retained_module_importers(
-    mmltk_acceptance_support
-    tests/catch_main.cpp
-    tests/filesystem_test_utils.cpp
-    tests/profile_runner_common.cpp)
-mmltk_register_private_headers(
-    mmltk_acceptance_support
-    tests/annotation_test_utils.hpp
-    tests/async_test_utils.hpp
-    tests/catch2_compat.hpp
-    tests/cuda_test_utils.hpp
-    tests/cli_option_table.h
-    tests/error_expectation_test_utils.hpp
-    tests/filesystem_test_utils.hpp
-    tests/linux_process_test_utils.hpp
-    tests/parse_cli_integer.h
-    tests/profile_runner_common.h
-    tests/require_test_utils.hpp
-    tests/subprocess_test_utils.hpp
-    tests/websocket_test_utils.hpp
-    tests/workspace_surface_socket_test_utils.hpp)
-target_include_directories(mmltk_acceptance_support PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests
-)
-target_link_libraries(mmltk_acceptance_support PUBLIC
-    Catch2::Catch2
-    mmltk::common::io
-    mmltk::common::logging
-    stb
-)
+add_subdirectory("${CMAKE_SOURCE_DIR}/src/test_support"
+    "${CMAKE_BINARY_DIR}/src/test_support")
 
 add_executable(mmltk_acceptance EXCLUDE_FROM_ALL)
 add_executable(mmltk::acceptance ALIAS mmltk_acceptance)
@@ -140,7 +109,7 @@ target_compile_definitions(mmltk_acceptance PRIVATE
 )
 add_dependencies(mmltk_acceptance mmltk_entrypoints_cli)
 target_link_libraries(mmltk_acceptance PRIVATE
-    mmltk_acceptance_support
+    mmltk_test_support
     mmltk::common::logging
 )
 if(BUILD_RFDETR_NATIVE)
@@ -161,6 +130,7 @@ if(BUILD_RFDETR_NATIVE)
         mmltk::controller::direct_services
         mmltk::controller::shell
         mmltk::controller::data_compute_systems
+        mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk_backend_data_test_support
         mmltk_backend_imaging_explore_test_support
         CUDA::cudart
@@ -183,7 +153,7 @@ if(BUILD_RFDETR_NATIVE)
     target_compile_definitions(mmltk_workspace_wayland_integration PRIVATE
         MMLTK_TEST_MMLTK_GUI_LAUNCHER="/opt/mmltk/bin/mmltk-browser-host")
     target_link_libraries(mmltk_workspace_wayland_integration PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::backend::data
         mmltk::common::io
         mmltk::controller::contracts

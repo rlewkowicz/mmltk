@@ -24,10 +24,12 @@
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "detail/postprocess.h"
 #include "detail/model_access.h"
-#include "require_test_utils.hpp"
 #include "torch_api.h"
-#include "catch2_compat.hpp"
-#include "cuda_test_utils.hpp"
+#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
+#undef CHECK
+#endif
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/cuda_test_utils.hpp"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 import mmltk.backend.models.rfdetr.core.runtime;
 import mmltk.backend.models.rfdetr.core.model;
@@ -39,7 +41,12 @@ torch_api::Tensor sample_packed_masks_cuda(const torch_api::Tensor& packed_mask_
 namespace {
 using namespace torch_api::indexing;
 namespace F = torch_api::nn::functional;
-using mmltk::testsupport::require_optional_ref;
+template <typename T>
+[[nodiscard]] T& require_optional_ref(std::optional<T>& value, const std::string_view message) {
+    if (!value.has_value()) throw std::runtime_error(std::string(message));
+    return *value;
+}
+
 TEST_CASE("Cardinality measures computed sigmoid confidence and actual target counts", "[model][rfdetr][criterion]") {
     using mmltk::backend::models::rfdetr::cardinality_error;
     for (const auto dtype : {torch_api::kFloat32, torch_api::kFloat16, torch_api::kBFloat16}) {
@@ -568,18 +575,18 @@ void test_postprocess_cuda_stream_replacement() {
     }
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_weight_dict_population);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_matcher_and_losses);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_batched_matcher_transfer_matches_single_layer_losses);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_multi_match_box_losses);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_matcher_sanitizes_nonfinite_costs);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_rectangular_matcher_layers_preserve_all_targets);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_cpu_mask_loss_uses_upstream_keys);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_sparse_mask_loss_matches_dense_reference);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_matcher_mask_cost_handles_zero_point_sampling_on_cuda);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_packed_mask_sampling_matches_grid_sample_nearest_boundaries);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops]", test_postprocess);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_ops][cuda]", test_postprocess_cuda_stream_replacement);
+TEST_CASE("test_weight_dict_population", "[model][rfdetr][native_ops]") { test_weight_dict_population(); }
+TEST_CASE("test_matcher_and_losses", "[model][rfdetr][native_ops]") { test_matcher_and_losses(); }
+TEST_CASE("test_batched_matcher_transfer_matches_single_layer_losses", "[model][rfdetr][native_ops]") { test_batched_matcher_transfer_matches_single_layer_losses(); }
+TEST_CASE("test_multi_match_box_losses", "[model][rfdetr][native_ops]") { test_multi_match_box_losses(); }
+TEST_CASE("test_matcher_sanitizes_nonfinite_costs", "[model][rfdetr][native_ops]") { test_matcher_sanitizes_nonfinite_costs(); }
+TEST_CASE("test_rectangular_matcher_layers_preserve_all_targets", "[model][rfdetr][native_ops]") { test_rectangular_matcher_layers_preserve_all_targets(); }
+TEST_CASE("test_cpu_mask_loss_uses_upstream_keys", "[model][rfdetr][native_ops]") { test_cpu_mask_loss_uses_upstream_keys(); }
+TEST_CASE("test_sparse_mask_loss_matches_dense_reference", "[model][rfdetr][native_ops]") { test_sparse_mask_loss_matches_dense_reference(); }
+TEST_CASE("test_matcher_mask_cost_handles_zero_point_sampling_on_cuda", "[model][rfdetr][native_ops]") { test_matcher_mask_cost_handles_zero_point_sampling_on_cuda(); }
+TEST_CASE("test_packed_mask_sampling_matches_grid_sample_nearest_boundaries", "[model][rfdetr][native_ops]") { test_packed_mask_sampling_matches_grid_sample_nearest_boundaries(); }
+TEST_CASE("test_postprocess", "[model][rfdetr][native_ops]") { test_postprocess(); }
+TEST_CASE("test_postprocess_cuda_stream_replacement", "[model][rfdetr][native_ops][cuda]") { test_postprocess_cuda_stream_replacement(); }
 TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity", "[rfdetr][lsap][numa]") {
     using namespace mmltk::backend::models::rfdetr;
     using namespace mmltk::common::system;

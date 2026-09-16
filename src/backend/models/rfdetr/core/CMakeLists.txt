@@ -223,7 +223,8 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/detail
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(mmltk_backend_models_rfdetr_core_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_frameworks_gpu_test_support
+        mmltk_test_support
         mmltk::frameworks::serialization
         mmltk_backend_data_test_support
         nlohmann_json

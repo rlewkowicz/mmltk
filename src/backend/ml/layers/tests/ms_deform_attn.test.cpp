@@ -1,7 +1,10 @@
 #include "ms_deform_attn.h"
 #include <torch/torch.h>
-#include "catch2_compat.hpp"
-#include "cuda_test_utils.hpp"
+#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
+#undef CHECK
+#endif
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/cuda_test_utils.hpp"
 namespace {
 void test_cuda_ms_deform_attn_matches_reference() {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA device unavailable; GPU coverage remains unverified"); }
@@ -18,13 +21,13 @@ void test_cuda_ms_deform_attn_matches_reference() {
     const auto actual =
         mmltk::backend::ml::layers::ms_deform_attn_cuda_autograd(value, spatial_shapes, level_start_index, sampling_locations, attention_weights, 64);
     const auto expected = mmltk::backend::ml::layers::ms_deform_attn_reference(value_ref, spatial_shapes, sampling_ref, attention_ref);
-    MMLTK_ASSERT(torch::allclose(actual, expected, 1.0e-4, 1.0e-4));
+    REQUIRE((torch::allclose(actual, expected, 1.0e-4, 1.0e-4)));
     const auto grad = torch::randn_like(actual);
     (actual * grad).sum().backward();
     (expected * grad).sum().backward();
-    MMLTK_ASSERT(torch::allclose(value.grad(), value_ref.grad(), 2.0e-4, 2.0e-4));
-    MMLTK_ASSERT(torch::allclose(sampling_locations.grad(), sampling_ref.grad(), 2.0e-4, 2.0e-4));
-    MMLTK_ASSERT(torch::allclose(attention_weights.grad(), attention_ref.grad(), 2.0e-4, 2.0e-4));
+    REQUIRE((torch::allclose(value.grad(), value_ref.grad(), 2.0e-4, 2.0e-4)));
+    REQUIRE((torch::allclose(sampling_locations.grad(), sampling_ref.grad(), 2.0e-4, 2.0e-4)));
+    REQUIRE((torch::allclose(attention_weights.grad(), attention_ref.grad(), 2.0e-4, 2.0e-4)));
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[backend][ml][layers]", test_cuda_ms_deform_attn_matches_reference);
+TEST_CASE("test_cuda_ms_deform_attn_matches_reference", "[backend][ml][layers]") { test_cuda_ms_deform_attn_matches_reference(); }

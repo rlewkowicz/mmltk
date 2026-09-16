@@ -67,7 +67,7 @@ function(mmltk_add_controller_shell_tests)
         ${CMAKE_SOURCE_DIR}/third_party/uWebSockets/src
     )
     target_link_libraries(mmltk_controller_shell_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::controller::contracts
         mmltk::controller::shell
         mmltk_frameworks_gpu_test_support

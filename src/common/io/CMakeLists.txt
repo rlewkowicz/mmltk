@@ -11,7 +11,6 @@ mmltk_register_public_headers(mmltk_common_io
         event_fd.h
         file_digest.h
         file_memory.h
-        filesystem_utils.h
         json_file.h
         noexcept_io.h
         scoped_fd.h
@@ -21,7 +20,10 @@ mmltk_register_ordinary_sources(
     mmltk_common_io
     file_digest.cpp
     file_memory.cpp
-    io_ordinary.cpp
+    event_fd.cpp
+    noexcept_io.cpp
+    scoped_fd.cpp
+    staging_directory.cpp
     json_file.cpp
     path_cleanup.cpp)
 

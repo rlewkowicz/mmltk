@@ -40,7 +40,7 @@
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::common::io::errno_error;
 using mmltk::common::io::sync_parent_directory;
-using mmltk::common::io::UniqueFd;
+using mmltk::common::io::ScopedFd;
 using mmltk::common::math::checked_add;
 using mmltk::common::math::checked_cast;
 using mmltk::common::types::trim_http_field_value;
@@ -251,7 +251,7 @@ struct Transfer {
     mmltk::common::concurrency::CancellationObservation cancel_requested = {};
     CurlEasy easy;
     CurlHeaders headers;
-    UniqueFd partial;
+    ScopedFd partial;
     std::uint64_t requested_resume_offset = 0U;
     std::uint64_t resume_offset = 0U;
     std::uint64_t write_offset = 0U;
@@ -296,7 +296,7 @@ struct Transfer {
         }
         const int descriptor = ::open(part_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
         if (descriptor < 0) { throw errno_error("cannot open benchmark partial download", part_path.string()); }
-        partial = UniqueFd(descriptor);
+        partial = ScopedFd(descriptor);
         struct stat status{};
         if (::fstat(descriptor, &status) != 0) { throw errno_error("cannot inspect benchmark partial download", part_path.string()); }
         resume_offset = checked_cast<std::uint64_t>(status.st_size, "partial download size overflow");
@@ -809,7 +809,7 @@ struct SegmentTransfer {
     std::filesystem::create_directories(parent);
     const int descriptor = ::open(partial_path(request).c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (descriptor < 0) { throw errno_error("cannot open segmented benchmark download", partial_path(request).string()); }
-    UniqueFd partial(descriptor);
+    ScopedFd partial(descriptor);
     SegmentedDownloadState state(request, identity, segment_count, progress, trace, descriptor, cancel_requested);
     trace_benchmark_event(trace, "benchmark.download.segmented_start", [&] {
         return nlohmann::json{{"artifact", request.artifact_id}, {"segments", segment_count}, {"bytes", request.expected_size}, {"resumed", state.resumed()}};
@@ -884,7 +884,7 @@ struct SegmentTransfer {
     for (std::thread& thread : transfer_threads) { thread.join(); }
     if (transfer_error) { std::rethrow_exception(transfer_error); }
     if (::fdatasync(descriptor) != 0) { throw errno_error("cannot flush segmented benchmark download", partial_path(request).string()); }
-    partial = UniqueFd{};
+    partial = ScopedFd{};
     throw_if_benchmark_cancelled(cancel_requested);
     const std::string identity_digest = artifact_identity(request, request.expected_size, identity.etag, identity.last_modified);
     throw_if_benchmark_cancelled(cancel_requested);
@@ -917,7 +917,7 @@ struct SegmentTransfer {
 [[nodiscard]] DownloadResult publish_completed_transfer(Transfer& transfer) {
     const DownloadRequest& request = transfer.request;
     if (::fdatasync(transfer.partial.get()) != 0) { throw errno_error("cannot flush benchmark partial download", partial_path(request).string()); }
-    transfer.partial = UniqueFd{};
+    transfer.partial = ScopedFd{};
     const std::uint64_t size = regular_file_size(partial_path(request));
     if (size == 0U || (request.expected_size != 0U && size != request.expected_size)) {
         throw DownloadVerificationError("benchmark download size does not match its catalog");
@@ -1044,7 +1044,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
     const auto schedule_retry = [&](Transfer& transfer, const std::size_t request_index, const bool reset_partial, const CURLcode curl_code,
                                     const std::string& detail) {
         if (reset_partial) {
-            transfer.partial = UniqueFd{};
+            transfer.partial = ScopedFd{};
             std::error_code error;
             std::filesystem::remove(partial_path(transfer.request), error);
             if (error) { throw std::filesystem::filesystem_error("cannot reset invalid benchmark partial download", partial_path(transfer.request), error); }
@@ -1135,7 +1135,7 @@ std::vector<DownloadResult> download_artifacts(const std::vector<DownloadRequest
             try {
                 transfer.persist_partial_metadata();
             } catch (...) {
-                transfer.partial = UniqueFd{};
+                transfer.partial = ScopedFd{};
                 try {
                     std::error_code error;
                     std::filesystem::remove(partial_path(transfer.request), error);

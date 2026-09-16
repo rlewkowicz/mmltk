@@ -30,7 +30,7 @@ ClassArtifactPublication::ClassArtifactPublication(const std::filesystem::path& 
     staged_ = staging_->path() / "artifact" / destination_.filename();
     std::filesystem::create_directory(staged_.parent_path());
 }
-io::UniqueFd ClassArtifactPublication::LockPreviousArtifact() const {
+io::ScopedFd ClassArtifactPublication::LockPreviousArtifact() const {
     auto lease = detail::lock_class_artifact(destination_, false);
     RequirePreviousUnchanged();
     return lease;

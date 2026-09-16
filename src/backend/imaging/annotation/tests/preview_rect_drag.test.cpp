@@ -1,13 +1,12 @@
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 import mmltk.backend.imaging.annotation.preview_rect_drag;
-#define ANNOTATION_TEST_CASE(fn) MMLTK_TEST_CASE("[backend][imaging][annotation]", fn)
 namespace {
 using namespace mmltk::backend::imaging::annotation;
 CanvasViewport make_viewport() { return make_canvas_viewport(0.0f, 0.0f, 100.0f, 100.0f, 100U, 100U); }
 void start_test_create_drag(PreviewRectDragSession& session) {
     start_preview_rect_drag(session, RectDragKind::Create, 10.0f, 10.0f, AnnotationBox{10, 10, 11, 11}, 6);
 }
-ANNOTATION_TEST_CASE(test_create_drag_defers_commit_until_release) {
+TEST_CASE("test_create_drag_defers_commit_until_release", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_test_create_drag(session);
@@ -32,7 +31,7 @@ ANNOTATION_TEST_CASE(test_create_drag_defers_commit_until_release) {
     REQUIRE(release.box.y2 == 20);
     REQUIRE(!session.active);
 }
-ANNOTATION_TEST_CASE(test_create_drag_cancels_when_box_is_too_small) {
+TEST_CASE("test_create_drag_cancels_when_box_is_too_small", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_test_create_drag(session);
@@ -50,7 +49,7 @@ ANNOTATION_TEST_CASE(test_create_drag_cancels_when_box_is_too_small) {
     REQUIRE(release.box.y2 == 14);
     REQUIRE(!session.active);
 }
-ANNOTATION_TEST_CASE(test_move_drag_commits_only_on_release) {
+TEST_CASE("test_move_drag_commits_only_on_release", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::Move, 25.0f, 25.0f, AnnotationBox{20, 20, 40, 40}, 1);
@@ -72,7 +71,7 @@ ANNOTATION_TEST_CASE(test_move_drag_commits_only_on_release) {
     REQUIRE(release.box.x2 == 50);
     REQUIRE(release.box.y2 == 45);
 }
-ANNOTATION_TEST_CASE(test_move_drag_reverses_immediately_after_edge_overshoot) {
+TEST_CASE("test_move_drag_reverses_immediately_after_edge_overshoot", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::Move, 25.0f, 25.0f, AnnotationBox{20, 20, 40, 40}, 1);
@@ -83,7 +82,7 @@ ANNOTATION_TEST_CASE(test_move_drag_reverses_immediately_after_edge_overshoot) {
     REQUIRE(reverse.box.x1 == 120);
     REQUIRE(reverse.box.x2 == 140);
 }
-ANNOTATION_TEST_CASE(test_move_drag_clips_partial_overlap_on_release) {
+TEST_CASE("test_move_drag_clips_partial_overlap_on_release", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::Move, 25.0f, 25.0f, AnnotationBox{20, 20, 40, 40}, 1);
@@ -97,7 +96,7 @@ ANNOTATION_TEST_CASE(test_move_drag_clips_partial_overlap_on_release) {
     REQUIRE(release.box.x1 == 0);
     REQUIRE(release.box.x2 == 10);
 }
-ANNOTATION_TEST_CASE(test_move_drag_deletes_fully_off_canvas_on_release) {
+TEST_CASE("test_move_drag_deletes_fully_off_canvas_on_release", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::Move, 25.0f, 25.0f, AnnotationBox{20, 20, 40, 40}, 1);
@@ -109,7 +108,7 @@ ANNOTATION_TEST_CASE(test_move_drag_deletes_fully_off_canvas_on_release) {
     REQUIRE(!release.commit);
     REQUIRE(!release.cancel);
 }
-ANNOTATION_TEST_CASE(test_create_drag_clamps_both_corners_to_canvas) {
+TEST_CASE("test_create_drag_clamps_both_corners_to_canvas", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::Create, 110.0f, 110.0f, AnnotationBox{100, 100, 100, 100}, 1);
@@ -120,7 +119,7 @@ ANNOTATION_TEST_CASE(test_create_drag_clamps_both_corners_to_canvas) {
     REQUIRE(drag.box.y2 == 100);
 }
 // CLEANUP-IGNORE -- the inlined literals are the independently readable scenario oracle.
-ANNOTATION_TEST_CASE(test_resize_drag_clamps_to_bounds_before_commit) {
+TEST_CASE("test_resize_drag_clamps_to_bounds_before_commit", "[backend][imaging][annotation]") {
     const CanvasViewport viewport = make_viewport();
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::ResizeBottomRight, 40.0f, 40.0f, AnnotationBox{20, 20, 40, 40}, 1);
@@ -142,7 +141,7 @@ ANNOTATION_TEST_CASE(test_resize_drag_clamps_to_bounds_before_commit) {
     REQUIRE(release.box.x2 == 100);
     REQUIRE(release.box.y2 == 100);
 }
-ANNOTATION_TEST_CASE(test_release_rules_match_between_pointer_and_draft_paths) {
+TEST_CASE("test_release_rules_match_between_pointer_and_draft_paths", "[backend][imaging][annotation]") {
     const AnnotationBox original{10, 10, 30, 30};
     const PreviewRectDragResult create_commit = resolve_preview_rect_release(RectDragKind::Create, original, AnnotationBox{10, 10, 19, 20}, 100, 100, 6);
     REQUIRE(create_commit.commit);
@@ -160,7 +159,7 @@ ANNOTATION_TEST_CASE(test_release_rules_match_between_pointer_and_draft_paths) {
     REQUIRE(move_delete.delete_on_commit);
     REQUIRE(!move_delete.commit);
 }
-ANNOTATION_TEST_CASE(test_browser_draft_updates_drive_the_session) {
+TEST_CASE("test_browser_draft_updates_drive_the_session", "[backend][imaging][annotation]") {
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::ResizeBottomRight, 0.0f, 0.0f, AnnotationBox{10, 10, 30, 30}, 1);
     const PreviewRectDragResult drag = apply_preview_rect_draft(session, true, AnnotationBox{10, 10, 140, 50}, 100, 100);
@@ -179,7 +178,7 @@ ANNOTATION_TEST_CASE(test_browser_draft_updates_drive_the_session) {
     REQUIRE(release.box.y2 == 50);
     REQUIRE(!session.active);
 }
-ANNOTATION_TEST_CASE(test_browser_move_draft_stays_unclamped_until_release) {
+TEST_CASE("test_browser_move_draft_stays_unclamped_until_release", "[backend][imaging][annotation]") {
     PreviewRectDragSession session{};
     start_preview_rect_drag(session, RectDragKind::Move, 0.0f, 0.0f, AnnotationBox{10, 10, 30, 30}, 1);
     const PreviewRectDragResult drag = apply_preview_rect_draft(session, true, AnnotationBox{-8, 10, 12, 30}, 100, 100);

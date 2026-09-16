@@ -1,6 +1,6 @@
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include <exception>
-#include "profile_runner_common.h"
+#include "src/test_support/profile_runner_common.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 import mmltk.backend.models.rfdetr.inference.analysis_provider;

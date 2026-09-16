@@ -1,5 +1,5 @@
 #pragma once
-#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>

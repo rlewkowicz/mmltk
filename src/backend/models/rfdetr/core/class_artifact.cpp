@@ -7,9 +7,9 @@
 namespace mmltk::backend::models::rfdetr {
 namespace io = mmltk::common::io;
 namespace detail {
-io::UniqueFd lock_class_artifact(const std::filesystem::path& artifact, bool write, bool create) {
+io::ScopedFd lock_class_artifact(const std::filesystem::path& artifact, bool write, bool create) {
     const auto path = artifact.string() + ".classes.lock";
-    io::UniqueFd lock(::open(path.c_str(), (create ? O_CREAT | O_RDWR : O_RDONLY) | O_CLOEXEC, 0600));
+    io::ScopedFd lock(::open(path.c_str(), (create ? O_CREAT | O_RDWR : O_RDONLY) | O_CLOEXEC, 0600));
     if (lock.get() < 0) {
         if (!create && !write && errno == ENOENT) return lock;
         throw io::errno_error("open RF-DETR bundle lock", path);

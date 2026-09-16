@@ -146,7 +146,7 @@ void simplify_onnx_model_file(const std::filesystem::path& model_path) {
         admit_artifact_class_layout(admitted.num_classes, admitted.class_layout,
                                     descriptor ? std::span<const ModelClassDescriptor>(&*descriptor, 1) : std::span<const ModelClassDescriptor>{});
     auto model = load_onnx_model(model_path);
-    source_lease = mmltk::common::io::UniqueFd{};
+    source_lease = mmltk::common::io::ScopedFd{};
     run_onnx_simplify(model);
     write_onnx_model(model, publication.staged_artifact());
     const auto reopened = load_onnx_model_info(publication.staged_artifact(), roles);

@@ -1,6 +1,6 @@
 #include <string>
 #include <vector>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "src/controller/services/vast_client.h"
 namespace {
 using namespace mmltk::controller::services;
@@ -16,35 +16,35 @@ std::string sample_payload() {
 }
 void test_parse_payload() {
     const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
-    MMLTK_ASSERT(offers.size() == 5U);
-    MMLTK_ASSERT(offers[0].offer_id == 1001);
-    MMLTK_ASSERT(offers[2].gpu_name == "L40S");
+    REQUIRE((offers.size() == 5U));
+    REQUIRE((offers[0].offer_id == 1001));
+    REQUIRE((offers[2].gpu_name == "L40S"));
 }
 void test_parse_payload_from_object_rows() {
     const std::vector<VastRawOffer> offers =
         parse_vast_offer_payload(R"json({"rows":[{"id": 2001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 12.0}]})json");
-    MMLTK_ASSERT(offers.size() == 1U);
-    MMLTK_ASSERT(offers[0].offer_id == 2001);
+    REQUIRE((offers.size() == 1U));
+    REQUIRE((offers[0].offer_id == 2001));
 }
 void test_rank_filters_and_limits() {
     const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
     const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::H100, ProviderGpuFamily::LSeries, ProviderGpuFamily::B200}, 2, 4);
-    MMLTK_ASSERT(ranked.size() == 2U);
-    MMLTK_ASSERT(ranked[0].offer_id == 1003);
-    MMLTK_ASSERT(ranked[1].offer_id == 1001);
+    REQUIRE((ranked.size() == 2U));
+    REQUIRE((ranked[0].offer_id == 1003));
+    REQUIRE((ranked[1].offer_id == 1001));
 }
 void test_rank_excludes_under_min_gpu_count() {
     const std::vector<VastRawOffer> offers = parse_vast_offer_payload(sample_payload());
     const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::A100, ProviderGpuFamily::H100}, 4, 4);
-    MMLTK_ASSERT(ranked.size() == 2U);
-    for (const VastOfferSummary& offer : ranked) { MMLTK_ASSERT(offer.num_gpus >= 4); }
+    REQUIRE((ranked.size() == 2U));
+    for (const VastOfferSummary& offer : ranked) { REQUIRE((offer.num_gpus >= 4)); }
 }
 void test_l_series_matches_l4_family() {
     const std::vector<VastRawOffer> offers = parse_vast_offer_payload(
         R"json([{"id": 3001, "gpu_name": "L4", "num_gpus": 4, "dlperf_usd": 15.0, "dlperf": 50.0, "dph": 3.0, "reliability": 0.96}])json");
     const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::LSeries}, 2, 4);
-    MMLTK_ASSERT(ranked.size() == 1U);
-    MMLTK_ASSERT(ranked[0].family == ProviderGpuFamily::LSeries);
+    REQUIRE((ranked.size() == 1U));
+    REQUIRE((ranked[0].family == ProviderGpuFamily::LSeries));
 }
 void test_rank_tie_breakers_prefer_lower_price_then_reliability() {
     const std::vector<VastRawOffer> offers = parse_vast_offer_payload(
@@ -54,15 +54,15 @@ void test_rank_tie_breakers_prefer_lower_price_then_reliability() {
             {"id": 4003, "gpu_name": "H200", "num_gpus": 4, "dlperf_usd": 20.0, "dlperf": 100.0, "dph": 4.5, "reliability": 0.97}
         ])json");
     const std::vector<VastOfferSummary> ranked = rank_vast_offers(offers, {ProviderGpuFamily::H200}, 3, 4);
-    MMLTK_ASSERT(ranked.size() == 3U);
-    MMLTK_ASSERT(ranked[0].offer_id == 4003);
-    MMLTK_ASSERT(ranked[1].offer_id == 4002);
-    MMLTK_ASSERT(ranked[2].offer_id == 4001);
+    REQUIRE((ranked.size() == 3U));
+    REQUIRE((ranked[0].offer_id == 4003));
+    REQUIRE((ranked[1].offer_id == 4002));
+    REQUIRE((ranked[2].offer_id == 4001));
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[gui][vast_runtime]", test_parse_payload);
-MMLTK_REGISTER_TEST_CASE("[gui][vast_runtime]", test_parse_payload_from_object_rows);
-MMLTK_REGISTER_TEST_CASE("[gui][vast_runtime]", test_rank_filters_and_limits);
-MMLTK_REGISTER_TEST_CASE("[gui][vast_runtime]", test_rank_excludes_under_min_gpu_count);
-MMLTK_REGISTER_TEST_CASE("[gui][vast_runtime]", test_l_series_matches_l4_family);
-MMLTK_REGISTER_TEST_CASE("[gui][vast_runtime]", test_rank_tie_breakers_prefer_lower_price_then_reliability);
+TEST_CASE("test_parse_payload", "[gui][vast_runtime]") { test_parse_payload(); }
+TEST_CASE("test_parse_payload_from_object_rows", "[gui][vast_runtime]") { test_parse_payload_from_object_rows(); }
+TEST_CASE("test_rank_filters_and_limits", "[gui][vast_runtime]") { test_rank_filters_and_limits(); }
+TEST_CASE("test_rank_excludes_under_min_gpu_count", "[gui][vast_runtime]") { test_rank_excludes_under_min_gpu_count(); }
+TEST_CASE("test_l_series_matches_l4_family", "[gui][vast_runtime]") { test_l_series_matches_l4_family(); }
+TEST_CASE("test_rank_tie_breakers_prefer_lower_price_then_reliability", "[gui][vast_runtime]") { test_rank_tie_breakers_prefer_lower_price_then_reliability(); }

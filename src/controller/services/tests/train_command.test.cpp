@@ -9,8 +9,8 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include "catch2_compat.hpp"
-#include "error_expectation_test_utils.hpp"
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/error_expectation_test_utils.hpp"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/backend/models/rfdetr/training/train_recipe.h"
 namespace {
@@ -33,12 +33,12 @@ mmltk::backend::models::rfdetr::TrainRequest make_train_request(std::vector<int>
 }
 void assert_flag_with_value(const std::vector<std::string>& args, const std::string_view flag, const std::string_view value) {
     const auto found = std::find(args.begin(), args.end(), flag);
-    MMLTK_ASSERT(found != args.end());
-    MMLTK_ASSERT(found + 1 != args.end());
-    MMLTK_ASSERT(*(found + 1) == value);
+    REQUIRE((found != args.end()));
+    REQUIRE((found + 1 != args.end()));
+    REQUIRE((*(found + 1) == value));
 }
 void assert_flag_present(const std::vector<std::string>& args, const std::string_view flag) {
-    MMLTK_ASSERT(std::find(args.begin(), args.end(), flag) != args.end());
+    REQUIRE((std::find(args.begin(), args.end(), flag) != args.end()));
 }
 void assert_float_flag_round_trip(const std::vector<std::string>& args, const std::string_view flag, const float expected) {
     const auto found = std::find(args.begin(), args.end(), flag);
@@ -52,7 +52,7 @@ void assert_float_flag_round_trip(const std::vector<std::string>& args, const st
     CHECK(parsed == expected);
 }
 void assert_flag_absent(const std::vector<std::string>& args, const std::string_view flag) {
-    MMLTK_ASSERT(std::find(args.begin(), args.end(), flag) == args.end());
+    REQUIRE((std::find(args.begin(), args.end(), flag) == args.end()));
 }
 void test_single_device_builds_device_id() {
     const std::vector<std::string> args = build_train_command_arguments(make_train_request({2}));
@@ -125,11 +125,11 @@ void test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata() {
     using mmltk::backend::models::rfdetr::cli_enum_spelling;
     using mmltk::backend::models::rfdetr::train_lr_scheduler_from_spelling;
     using mmltk::backend::models::rfdetr::TrainLrSchedulerKind;
-    MMLTK_ASSERT(cli_enum_spelling(TrainLrSchedulerKind::Step) == "step");
-    MMLTK_ASSERT(cli_enum_spelling(TrainLrSchedulerKind::Cosine) == "cosine");
-    MMLTK_ASSERT(train_lr_scheduler_from_spelling("step") == TrainLrSchedulerKind::Step);
-    MMLTK_ASSERT(train_lr_scheduler_from_spelling("cosine") == TrainLrSchedulerKind::Cosine);
-    MMLTK_ASSERT(!train_lr_scheduler_from_spelling("Cosine"));
+    REQUIRE((cli_enum_spelling(TrainLrSchedulerKind::Step) == "step"));
+    REQUIRE((cli_enum_spelling(TrainLrSchedulerKind::Cosine) == "cosine"));
+    REQUIRE((train_lr_scheduler_from_spelling("step") == TrainLrSchedulerKind::Step));
+    REQUIRE((train_lr_scheduler_from_spelling("cosine") == TrainLrSchedulerKind::Cosine));
+    REQUIRE((!train_lr_scheduler_from_spelling("Cosine")));
 }
 void test_recipe_defaults_are_not_serialized_as_overrides() {
     const std::vector<std::string> args = build_train_command_arguments(make_train_request({1}));
@@ -204,14 +204,14 @@ void test_supervision_float_arguments_round_trip_at_representable_boundaries() {
 }
 void test_muon_recipe_defaults_are_resolved() {
     const auto recipe = mmltk::backend::models::rfdetr::resolve_train_recipe("rf-detr-seg-medium", mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon);
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr, 2.0e-4));
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr_encoder, 3.0e-4));
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.momentum, 0.9));
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.weight_decay, 5.0e-4));
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.warmup_epochs, 3.0));
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.warmup_momentum, 0.8));
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr_min_factor, 0.01));
-    MMLTK_ASSERT(recipe.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine);
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr, 2.0e-4)));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr_encoder, 3.0e-4)));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.momentum, 0.9)));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.weight_decay, 5.0e-4)));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.warmup_epochs, 3.0)));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.warmup_momentum, 0.8)));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(recipe.lr_min_factor, 0.01)));
+    REQUIRE((recipe.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
 }
 void test_recipe_application_respects_overrides() {
     mmltk::backend::models::rfdetr::TrainRequest options;
@@ -220,23 +220,23 @@ void test_recipe_application_respects_overrides() {
     TrainRecipeRelation::template set_override<mmltk::frameworks::reflection::member_path<&mmltk::backend::models::rfdetr::TrainRequest::lr>>(overrides);
     mmltk::backend::models::rfdetr::apply_train_recipe(
         options, mmltk::backend::models::rfdetr::resolve_train_recipe("rf-detr-medium", mmltk::backend::models::rfdetr::TrainOptimizerKind::Muon), overrides);
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(options.lr, 9.0e-4));
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(options.lr_encoder, 3.0e-4));
-    MMLTK_ASSERT(options.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine);
-    MMLTK_ASSERT(mmltk::backend::models::rfdetr::train_recipe_value_matches(options.warmup_momentum, 0.8));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(options.lr, 9.0e-4)));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(options.lr_encoder, 3.0e-4)));
+    REQUIRE((options.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Cosine));
+    REQUIRE((mmltk::backend::models::rfdetr::train_recipe_value_matches(options.warmup_momentum, 0.8)));
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_single_device_builds_device_id);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_multi_device_builds_device_ids);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_zero_device_rejected);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_optimizer_arguments_are_forwarded);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_recipe_defaults_are_not_serialized_as_overrides);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_progress_flag_enabled_is_forwarded);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_progress_flag_disabled_is_forwarded);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_resume_input_is_serialized_without_weights);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command][training_supervision]", test_supervision_combinations_are_forwarded_with_exact_values);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command][training_supervision]", test_supervision_float_arguments_round_trip_at_representable_boundaries);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_muon_recipe_defaults_are_resolved);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_recipe_application_respects_overrides);
-MMLTK_REGISTER_TEST_CASE("[gui][train_command][perceptual]", test_perceptual_selection_is_independent_in_child_arguments);
+TEST_CASE("test_single_device_builds_device_id", "[gui][train_command]") { test_single_device_builds_device_id(); }
+TEST_CASE("test_multi_device_builds_device_ids", "[gui][train_command]") { test_multi_device_builds_device_ids(); }
+TEST_CASE("test_zero_device_rejected", "[gui][train_command]") { test_zero_device_rejected(); }
+TEST_CASE("test_optimizer_arguments_are_forwarded", "[gui][train_command]") { test_optimizer_arguments_are_forwarded(); }
+TEST_CASE("test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata", "[gui][train_command]") { test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata(); }
+TEST_CASE("test_recipe_defaults_are_not_serialized_as_overrides", "[gui][train_command]") { test_recipe_defaults_are_not_serialized_as_overrides(); }
+TEST_CASE("test_progress_flag_enabled_is_forwarded", "[gui][train_command]") { test_progress_flag_enabled_is_forwarded(); }
+TEST_CASE("test_progress_flag_disabled_is_forwarded", "[gui][train_command]") { test_progress_flag_disabled_is_forwarded(); }
+TEST_CASE("test_resume_input_is_serialized_without_weights", "[gui][train_command]") { test_resume_input_is_serialized_without_weights(); }
+TEST_CASE("test_supervision_combinations_are_forwarded_with_exact_values", "[gui][train_command][training_supervision]") { test_supervision_combinations_are_forwarded_with_exact_values(); }
+TEST_CASE("test_supervision_float_arguments_round_trip_at_representable_boundaries", "[gui][train_command][training_supervision]") { test_supervision_float_arguments_round_trip_at_representable_boundaries(); }
+TEST_CASE("test_muon_recipe_defaults_are_resolved", "[gui][train_command]") { test_muon_recipe_defaults_are_resolved(); }
+TEST_CASE("test_recipe_application_respects_overrides", "[gui][train_command]") { test_recipe_application_respects_overrides(); }
+TEST_CASE("test_perceptual_selection_is_independent_in_child_arguments", "[gui][train_command][perceptual]") { test_perceptual_selection_is_independent_in_child_arguments(); }

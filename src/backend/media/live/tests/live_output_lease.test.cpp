@@ -10,7 +10,7 @@
 #include <stop_token>
 #include <thread>
 #include <utility>
-#include "async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/backend/media/live/detail/live_output_callback_lifetime.h"
 #include "src/backend/media/live/detail/live_physical_retirement.h"
 #include "src/backend/media/live/detail/live_slot_state.h"

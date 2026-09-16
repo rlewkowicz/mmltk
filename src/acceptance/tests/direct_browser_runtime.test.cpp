@@ -1,7 +1,7 @@
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 #include "src/controller/presentation/presentation_system.h"
 namespace {
-MMLTK_TEST_CASE("[browser_runtime][direct][presentation]", test_direct_presentation_descriptor) {
+TEST_CASE("test_direct_presentation_descriptor", "[browser_runtime][direct][presentation]") {
     const mmltk::controller::PresentationPublication publication{
         .capability =
             {

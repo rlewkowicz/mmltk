@@ -52,20 +52,23 @@ set_target_properties(mmltk_backend_models_rfdetr_augmentation PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     CUDA_SEPARABLE_COMPILATION ON)
 
+add_library(mmltk_backend_models_rfdetr_augmentation_test_support INTERFACE)
+mmltk_register_public_headers(mmltk_backend_models_rfdetr_augmentation_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/gpu_augment_test_support.h tests/copy_paste_fixture.h)
+target_link_libraries(mmltk_backend_models_rfdetr_augmentation_test_support INTERFACE mmltk::backend::models::rfdetr::augmentation)
+
 function(mmltk_add_backend_models_rfdetr_augmentation_tests)
     add_executable(mmltk_backend_models_rfdetr_augmentation_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(
         mmltk_backend_models_rfdetr_augmentation_tests PRIVATE_DECLARATIONS)
-    mmltk_register_private_headers(
-        mmltk_backend_models_rfdetr_augmentation_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/gpu_augment_test_support.h
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/copy_paste_fixture.h)
     mmltk_register_retained_module_importers(
         mmltk_backend_models_rfdetr_augmentation_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/gpu_augment.test.cpp)
     target_link_libraries(
         mmltk_backend_models_rfdetr_augmentation_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_backend_models_rfdetr_augmentation_test_support
+        mmltk_test_support
         mmltk::backend::models::rfdetr::augmentation
         CUDA::cudart)
     mmltk_target_cuda_architectures(

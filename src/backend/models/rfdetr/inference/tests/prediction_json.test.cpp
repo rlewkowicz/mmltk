@@ -11,7 +11,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
-#include "catch2_compat.hpp"
+#include <catch2/catch_test_macros.hpp>
 import mmltk.backend.models.rfdetr.inference.analysis_provider;
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
@@ -54,14 +54,14 @@ void test_prediction_json_writer_emits_expected_payload() {
     writer.Append(record);
     writer.Complete();
     std::ifstream stream(output_path);
-    MMLTK_ASSERT(stream.is_open());
+    REQUIRE((stream.is_open()));
     const json payload = json::parse(stream);
-    MMLTK_ASSERT(payload.at("source_kind") == "image_files");
-    MMLTK_ASSERT(payload.at("input_image_count") == 1);
-    MMLTK_ASSERT(!payload.contains("compiled_path"));
-    MMLTK_ASSERT(payload.at("records").at(0).at("source_name") == "camera0/frame-000001.png");
-    MMLTK_ASSERT(payload.at("records").at(0).at("detections").at(0).at("label") == "2");
-    MMLTK_ASSERT(payload.at("records").at(0).at("detections").at(0).at("mask_rle") == "1:2 5:1");
+    REQUIRE((payload.at("source_kind") == "image_files"));
+    REQUIRE((payload.at("input_image_count") == 1));
+    REQUIRE((!payload.contains("compiled_path")));
+    REQUIRE((payload.at("records").at(0).at("source_name") == "camera0/frame-000001.png"));
+    REQUIRE((payload.at("records").at(0).at("detections").at(0).at("label") == "2"));
+    REQUIRE((payload.at("records").at(0).at("detections").at(0).at("mask_rle") == "1:2 5:1"));
     result.class_catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"first", "middle", "last"});
     result.class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::Foreground;
     result.artifacts.class_layout = native_training_class_layout(*result.class_catalog);
@@ -75,12 +75,12 @@ void test_prediction_json_writer_emits_expected_payload() {
     }
     std::ifstream named_stream(output_path);
     const json named = json::parse(named_stream);
-    MMLTK_ASSERT(named.at("records").at(0).at("detections").at(0).at("label") == "first");
-    MMLTK_ASSERT(named.at("records").at(0).at("detections").at(1).at("label") == "last");
+    REQUIRE((named.at("records").at(0).at("detections").at(0).at("label") == "first"));
+    REQUIRE((named.at("records").at(0).at("detections").at(1).at("label") == "last"));
     std::remove(output_path.c_str());
 }
 }  // namespace
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][prediction_json]", test_prediction_json_writer_emits_expected_payload);
+TEST_CASE("test_prediction_json_writer_emits_expected_payload", "[model][rfdetr][prediction_json]") { test_prediction_json_writer_emits_expected_payload(); }
 TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame", "[model][rfdetr][prediction_json]") {
     using namespace mmltk::backend::models::rfdetr;
     namespace runtime = mmltk::backend::ml::runtime;

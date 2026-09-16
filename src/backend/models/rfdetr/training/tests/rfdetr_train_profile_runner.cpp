@@ -6,7 +6,7 @@
 #include <fstream>
 #include <functional>
 #include <string_view>
-#include "profile_runner_common.h"
+#include "src/test_support/profile_runner_common.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/ml/torch/detail/torch_api.h"
@@ -15,7 +15,7 @@
 #include "src/backend/models/rfdetr/training/train.h"
 #include "src/backend/models/rfdetr/training/train_recipe.h"
 #include "src/common/system/execution_policy.h"
-#include "test_fixture.h"
+#include "src/backend/data/tests/test_fixture.h"
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 using namespace mmltk::testsupport;

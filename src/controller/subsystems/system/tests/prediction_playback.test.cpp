@@ -5,7 +5,7 @@
 #include <limits>
 #include <optional>
 #include <stop_token>
-#include "src/acceptance/tests/async_test_utils.hpp"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/system/detail/prediction_playback.h"
 namespace {
 using Playback = mmltk::controller::detail::PredictionPlayback;

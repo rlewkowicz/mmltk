@@ -12,8 +12,6 @@ mmltk_register_public_headers(mmltk_common_concurrency
         parallel_range.h
         worker_pool.h
 )
-mmltk_register_private_headers(
-    mmltk_common_concurrency detail/exclusive_operation_gate.h)
 mmltk_register_ordinary_sources(
     mmltk_common_concurrency
     event_cancellation.cpp
@@ -33,14 +31,13 @@ function(mmltk_add_common_concurrency_tests)
     mmltk_register_ordinary_sources(
         mmltk_common_concurrency_tests
         ${CMAKE_SOURCE_DIR}/src/common/concurrency/tests/worker_pool.test.cpp
-        ${CMAKE_SOURCE_DIR}/src/common/concurrency/tests/exclusive_operation_gate.test.cpp
         ${CMAKE_SOURCE_DIR}/src/common/concurrency/tests/cancellation_observation.test.cpp
     )
     mmltk_configure_component(
         mmltk_common_concurrency_tests PRIVATE_DECLARATIONS)
     target_link_libraries(mmltk_common_concurrency_tests
         PRIVATE
-            mmltk_acceptance_support
+            mmltk_test_support
             mmltk::common::concurrency
             mmltk::common::system
     )

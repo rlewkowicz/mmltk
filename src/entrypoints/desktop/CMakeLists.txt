@@ -139,7 +139,7 @@ function(mmltk_add_entrypoints_desktop_tests)
         MMLTK_BROWSER_RUNTIME_ENTRY_INVALID_FIREFOX_ROOT="${_mmltk_desktop_invalid_firefox_root}"
     )
     target_link_libraries(mmltk_entrypoints_desktop_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::controller::direct_services
         mmltk::controller::shell
         mmltk::entrypoints::desktop

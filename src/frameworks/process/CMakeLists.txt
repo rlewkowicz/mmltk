@@ -27,7 +27,7 @@ function(mmltk_add_frameworks_process_tests)
     mmltk_configure_component(
         mmltk_frameworks_process_tests PRIVATE_DECLARATIONS)
     target_link_libraries(mmltk_frameworks_process_tests PRIVATE
-        mmltk_acceptance_support
+        mmltk_test_support
         mmltk::frameworks::process
     )
     catch_discover_tests(
