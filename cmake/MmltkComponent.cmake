@@ -35,8 +35,10 @@ function(mmltk_configure_header_isolation target owner)
         UNITY_BUILD OFF DISABLE_PRECOMPILE_HEADERS ON CXX_SCAN_FOR_MODULES OFF)
     target_include_directories("${target}" PRIVATE
         "$<TARGET_PROPERTY:${owner},INCLUDE_DIRECTORIES>")
-    target_include_directories("${target}" SYSTEM PRIVATE
-        "$<TARGET_PROPERTY:${owner},INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
+    # System classifications are not additional search paths. In particular,
+    # imported dependencies may classify relative install paths here. Copy the
+    # owner's complete search path above, without appending classifications as
+    # directories on the independent header target.
     target_compile_definitions("${target}" PRIVATE
         "$<TARGET_PROPERTY:${owner},COMPILE_DEFINITIONS>")
     target_compile_options("${target}" PRIVATE

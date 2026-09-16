@@ -20,7 +20,7 @@ fn label_bounds(
 }
 
 pub(crate) struct PredictionContent {
-    pub(super) metadata: crate::generated::PredictImageMetadata,
+    pub(super) metadata: std::sync::Arc<crate::generated::PredictImageMetadata>,
     labels: Vec<CachedLabel>,
 }
 struct CachedLabel {
@@ -28,33 +28,40 @@ struct CachedLabel {
     width: f32,
     paragraph: iced::advanced::graphics::text::Paragraph,
 }
+impl CachedLabel {
+    fn new(text: String) -> Self {
+        let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
+        let paragraph = iced::advanced::graphics::text::Paragraph::with_text(text::Text {
+            content: &text, bounds: Size::new(width - 6.0, 19.0), size: iced::Pixels(12.0),
+            line_height: text::LineHeight::default(), font: iced::Font::DEFAULT,
+            align_x: text::Alignment::Left, align_y: iced::alignment::Vertical::Center,
+            shaping: text::Shaping::Advanced, wrapping: text::Wrapping::None,
+            ellipsis: text::Ellipsis::default(), hint_factor: None,
+        });
+        Self { text, width, paragraph }
+    }
+}
 impl PredictionContent {
-    pub(crate) fn new(metadata: crate::generated::PredictImageMetadata) -> Self {
+    pub(crate) fn new(metadata: impl Into<std::sync::Arc<crate::generated::PredictImageMetadata>>) -> Self {
+        let metadata = metadata.into();
         let labels = metadata.labels.iter().map(|item| {
             let text = match item.classdomain {
                 crate::generated::ClassReferenceDomain::Foreground => format!("{} {}", item.name, item.confidence),
                 crate::generated::ClassReferenceDomain::RawOutputSlot => format!("Raw slot {} {}", item.classreference, item.confidence),
             };
-            let width = (text.chars().count() as f32 * 7.5 + 8.0).max(20.0);
-            let paragraph = iced::advanced::graphics::text::Paragraph::with_text(text::Text {
-                content: &text, bounds: Size::new(width - 6.0, 19.0), size: iced::Pixels(12.0),
-                line_height: text::LineHeight::default(), font: iced::Font::DEFAULT,
-                align_x: text::Alignment::Left, align_y: iced::alignment::Vertical::Center,
-                shaping: text::Shaping::Advanced, wrapping: text::Wrapping::None,
-                ellipsis: text::Ellipsis::default(), hint_factor: None,
-            });
-            CachedLabel { text, width, paragraph }
+            CachedLabel::new(text)
         }).collect();
         Self { metadata, labels }
     }
 }
 
 pub(crate) struct ValidationContent {
-    pub(crate) metadata: crate::generated::ValidationImageMetadata,
-    labels: Vec<(usize, usize, crate::generated::AnnotationBox)>,
+    pub(crate) metadata: std::sync::Arc<crate::generated::ValidationImageMetadata>,
+    labels: Vec<(usize, usize, crate::generated::AnnotationBox, CachedLabel)>,
 }
 impl ValidationContent {
-    pub(crate) fn new(metadata: crate::generated::ValidationImageMetadata) -> Self {
+    pub(crate) fn new(metadata: impl Into<std::sync::Arc<crate::generated::ValidationImageMetadata>>) -> Self {
+        let metadata = metadata.into();
         let mut labels = Vec::new();
         for (sample_index, sample) in metadata.samples.iter().enumerate().filter(|(_, sample)| sample.available) {
             for (label_index, label) in sample.labels.iter().enumerate() {
@@ -63,15 +70,12 @@ impl ValidationContent {
                     point.x = sample.crop.x as f32 + point.x * sample.crop.width as f32 / sample.originalextent.width as f32;
                     point.y = sample.crop.y as f32 + point.y * sample.crop.height as f32 / sample.originalextent.height as f32;
                 }
-                labels.push((sample_index, label_index, bounds));
+                labels.push((sample_index, label_index, bounds, CachedLabel::new(label.name.clone())));
             }
         }
         Self { metadata, labels }
     }
-    pub(crate) fn sample_at(&self, x: f32, y: f32) -> Option<crate::generated::ValidationSampleIdentity> {
-        self.metadata.samples.iter().find(|sample| sample.available && x >= sample.crop.x as f32 && y >= sample.crop.y as f32 &&
-            x < (sample.crop.x + sample.crop.width) as f32 && y < (sample.crop.y + sample.crop.height) as f32).map(|sample| sample.identity.clone())
-    }
+
 }
 
 #[derive(Clone)]
@@ -144,10 +148,10 @@ impl Source {
                 }
             }
             Self::Validation(content, ground_truth, predictions) => {
-                for (sample, index, bounds) in &content.labels {
+                for (sample, index, bounds, cached) in &content.labels {
                     let item = &content.metadata.samples[*sample].labels[*index];
                     if (item.groundtruth && !ground_truth) || (!item.groundtruth && !predictions) { continue; }
-                    label(item.category as u16, bounds, &item.name, &item.color, 0, None, None);
+                    label(item.category as u16, bounds, &cached.text, &item.color, 0, None, Some(cached));
                 }
             }
             Self::Prediction(snapshot) => {
@@ -417,6 +421,27 @@ pub(crate) fn class_color(color: &crate::generated::AnnotationColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_labels_cache_paragraphs_and_toggle_each_domain_independently() {
+        let content = std::sync::Arc::new(ValidationContent::new(crate::view_model::test_support::validation_image_metadata()));
+        assert_eq!(content.labels.len(), 2);
+        assert_eq!(content.labels[0].2.first.x, 10.0);
+        assert_eq!(content.labels[0].2.first.y, 20.0);
+        let pointer = content.labels[0].3.text.as_ptr();
+        for (gt, predictions, expected) in [(true, true, 2), (true, false, 1), (false, true, 1), (false, false, 0)] {
+            let mut count = 0;
+            Source::Validation(content.clone(), gt, predictions).visit(|_, _, name, _, _, _, cached| {
+                assert!(cached.is_some());
+                assert_eq!(name, "paired name");
+                if gt && count == 0 { assert_eq!(name.as_ptr(), pointer); }
+                count += 1;
+            });
+            assert_eq!(count, expected);
+        }
+        assert_eq!(content.metadata.samples[0].identity.generation, 7);
+        assert!(!content.metadata.samples[2].available);
+    }
 
     #[test]
     fn prediction_labels_cache_exact_text_and_keep_source_products_distinct() {

@@ -1,0 +1,228 @@
+use glam::DVec2;
+use iced::wgpu::*;
+
+use crate::{plot_state::PlotState, style::GridStyle};
+
+pub(crate) struct Grid {
+    pipeline: Option<RenderPipeline>,
+    vertex_buffer: Option<Buffer>,
+    vertex_count: u32,
+    last_center: DVec2,
+    last_extents: DVec2,
+    last_style: GridStyle,
+    last_offset: DVec2,
+    last_bounds: iced::Size,
+    last_ticks: (std::sync::Arc<Vec<crate::ticks::PositionedTick>>, std::sync::Arc<Vec<crate::ticks::PositionedTick>>),
+    scratch: Vec<f32>,
+}
+
+/// The visual weight of a tick / grid line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickWeight {
+    Major,
+    Minor,
+    SubMinor,
+}
+
+impl Grid {
+    pub(crate) fn ensure_pipeline(
+        &mut self,
+        device: &Device,
+        format: TextureFormat,
+        camera_bgl: &BindGroupLayout,
+        sample_count: u32,
+    ) {
+        if self.pipeline.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("shaders/grid.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Grid Pipeline Layout"),
+            bind_group_layouts: &[Some(camera_bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Grid Pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: (std::mem::size_of::<[f32; 2]>()
+                        + std::mem::size_of::<[f32; 4]>()) as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 2]>() as u64,
+                            shader_location: 1,
+                            format: VertexFormat::Float32x4,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState {
+                count: sample_count,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipeline = Some(pipeline);
+    }
+
+    pub(crate) fn update(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        let camera = &state.camera;
+
+        if camera.position == self.last_center
+            && camera.half_extents == self.last_extents
+            && state.grid_style == self.last_style
+            && camera.render_offset == self.last_offset && state.bounds.size() == self.last_bounds
+            && std::sync::Arc::ptr_eq(&state.x_ticks, &self.last_ticks.0)
+            && std::sync::Arc::ptr_eq(&state.y_ticks, &self.last_ticks.1)
+        {
+            return;
+        }
+
+        self.last_center = camera.position;
+        self.last_extents = camera.half_extents;
+        self.last_style = state.grid_style;
+        self.last_offset = camera.render_offset; self.last_bounds = state.bounds.size();
+        self.last_ticks = (state.x_ticks.clone(), state.y_ticks.clone());
+
+        // Calculate bounds in render space (world - offset) for line endpoints
+        let render_center = camera.effective_position();
+        let min_x = render_center.x - camera.half_extents.x;
+        let max_x = render_center.x + camera.half_extents.x;
+        let min_y = render_center.y - camera.half_extents.y;
+        let max_y = render_center.y + camera.half_extents.y;
+
+        let mut verts = std::mem::take(&mut self.scratch);
+        verts.clear();
+        let mut count = 0u32;
+
+        // Build vertical lines from precomputed x ticks
+        let width = state.bounds.width.max(1.0);
+        let height = state.bounds.height.max(1.0);
+        for positioned_tick in state.x_ticks.iter() {
+            let ndc_x = (positioned_tick.screen_pos / width) as f64 * 2.0 - 1.0;
+            let render_x = render_center.x + ndc_x * camera.half_extents.x;
+            let color = match positioned_tick.tick.line_type {
+                TickWeight::Major => state.grid_style.major,
+                TickWeight::Minor => state.grid_style.minor,
+                TickWeight::SubMinor => state.grid_style.sub_minor,
+            };
+            verts.extend_from_slice(&[
+                render_x as f32,
+                min_y as f32,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            ]);
+            verts.extend_from_slice(&[
+                render_x as f32,
+                max_y as f32,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            ]);
+            count += 2;
+        }
+
+        // Build horizontal lines from precomputed y ticks
+        for positioned_tick in state.y_ticks.iter() {
+            let ndc_y = 1.0 - (positioned_tick.screen_pos / height) as f64 * 2.0;
+            let render_y = render_center.y + ndc_y * camera.half_extents.y;
+            let color = match positioned_tick.tick.line_type {
+                TickWeight::Major => state.grid_style.major,
+                TickWeight::Minor => state.grid_style.minor,
+                TickWeight::SubMinor => state.grid_style.sub_minor,
+            };
+            verts.extend_from_slice(&[
+                min_x as f32,
+                render_y as f32,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            ]);
+            verts.extend_from_slice(&[
+                max_x as f32,
+                render_y as f32,
+                color.r,
+                color.g,
+                color.b,
+                color.a,
+            ]);
+            count += 2;
+        }
+
+        self.vertex_count = count;
+        let bytes = bytemuck::cast_slice(&verts);
+        if !bytes.is_empty() {
+            if self.vertex_buffer.as_ref().is_none_or(|buffer| buffer.size() < bytes.len() as u64) {
+                self.vertex_buffer = Some(device.create_buffer(&BufferDescriptor {
+                    label: Some("retained plot grid"), size: bytes.len() as u64,
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST, mapped_at_creation: false,
+                }));
+            }
+            queue.write_buffer(self.vertex_buffer.as_ref().unwrap(), 0, bytes);
+        }
+        self.scratch = verts;
+    }
+
+    pub(crate) fn draw(&self, pass: &mut RenderPass<'_>, camera_bind_group: &BindGroup) {
+        if self.vertex_count == 0 {
+            return;
+        }
+
+        if let (Some(pipeline), Some(vb)) = (&self.pipeline, &self.vertex_buffer) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.draw(0..self.vertex_count, 0..1);
+        }
+    }
+}
+
+impl Default for Grid {
+    fn default() -> Self {
+        Self {
+            pipeline: None,
+            vertex_buffer: None,
+            vertex_count: 0,
+            last_center: DVec2::splat(f64::NAN),
+            last_extents: DVec2::splat(f64::NAN),
+            last_style: GridStyle::default(), last_offset: DVec2::ZERO, last_bounds: iced::Size::default(),
+            last_ticks: (Default::default(), Default::default()), scratch: Vec::new(),
+        }
+    }
+}

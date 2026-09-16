@@ -1,3 +1,4 @@
+pub mod overlay_controls;
 pub mod fields;
 pub mod loading;
 pub mod model_card;

@@ -1,11 +1,11 @@
 use crate::fluent_theme::Element;
 use crate::generated::ProviderOfferIdentity;
-use crate::presentation_surface::Surface;
 use crate::view::settings::{EditSchedule, SettingsModel};
 use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container, text};
 
 mod advanced;
+pub mod output;
 pub(crate) mod dataset;
 
 pub const DATASET_CARD_ID: &str = "train.card.dataset";
@@ -33,12 +33,14 @@ pub enum Message {
     Dataset(dataset::Message),
     Advanced(advanced::Message),
     Model(crate::view::workflow::model_card::Message),
-    Workspace(crate::view::workspace::Message),
+    Metrics(crate::view::metrics::Message),
+    Output(output::Message),
 }
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
     // CLEANUP-IGNORE: Train's outcome begins with domain requests parallel to, but distinct from, raw messages.
+    Output(output::Message),
     CompileRequested,
     StartRequested,
     DatasetStopRequested,
@@ -57,9 +59,15 @@ pub enum Outcome {
 #[derive(Default)]
 pub struct Component {
     model_card: crate::view::workflow::model_card::Component,
+    metrics: crate::view::metrics::Component,
 }
 
 impl Component {
+    pub fn reset(&mut self, visible: bool) {
+        self.model_card = Default::default();
+        self.metrics.reset(visible);
+    }
+    pub fn sync_metrics(&mut self, model: &ApplicationModel, visible: bool) { self.metrics.rebase(model, visible); }
     pub fn rebase(&mut self, model: &ApplicationModel) {
         self.model_card
             .rebase(model, crate::generated::FeatureId::Train);
@@ -102,13 +110,8 @@ impl Component {
                 };
                 Outcome::Model(outcome)
             }
-            Message::Workspace(message) => {
-                let Some(schedule) = crate::view::workflow::update_workspace(model, message)?
-                else {
-                    return Ok(None);
-                };
-                Outcome::SettingsEdited(schedule)
-            }
+            Message::Metrics(message) => { self.metrics.update(message); return Ok(None); }
+            Message::Output(message) => Outcome::Output(message),
         };
         Ok(Some(outcome))
     }
@@ -119,7 +122,6 @@ impl Component {
         &'a self,
         model: &'a ApplicationModel,
         settings: &'a crate::view::settings::SettingsModel,
-        surface: Option<Surface>,
         width: f32,
     ) -> Element<'a, Message> {
         let installed_train = settings
@@ -178,19 +180,6 @@ impl Component {
                 settings_settled,
             )
             .map(Message::Dataset),
-            crate::view::shared::card(
-                "Training output", "Choose an output directory or a checkpoint for continuation.",
-                column![
-                    text(installed_train.map_or("", |train| train.request.outputdir.as_str())),
-                    text(installed_train.map_or("", |train| train.request.resumepath.as_str())),
-                    model.workflow.dialogs(crate::generated::FeatureId::Train)
-                        .filter(|fact| [crate::generated::constraint_workflowstrainrequestoutputdir().stable_field_id,
-                            crate::generated::constraint_workflowstrainrequestresumepath().stable_field_id].contains(&fact.stable_field_id))
-                        .fold(column![], |column, fact| column.push(button(fact.title).on_press_maybe(
-                            model.file_dialog_open_available(fact, crate::generated::FeatureId::Train)
-                                .then_some(Message::Dataset(dataset::Message::Browse(fact.stable_field_id)))))),
-                ].spacing(crate::view::workflow::FIELD_SPACING),
-            ),
             text(model.workflow.start_detail(crate::generated::FeatureId::Train)),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Train,
@@ -207,15 +196,9 @@ impl Component {
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
         .into();
-        let workspace = crate::view::workflow::workspace(
-            surface,
-            settings,
-            settings_edit_available,
-            crate::generated::FeatureId::Train,
-            width,
-            Message::Workspace,
-            crate::workspace_input::Binding::default(),
-        );
+        let chart_width = crate::view::workflow::Composition::new(crate::generated::FeatureId::Train, width).center_width()
+            - 2.0 * crate::view::workflow::CARD_PADDING;
+        let workspace = self.metrics.view(chart_width).map(Message::Metrics);
         let advanced = crate::view::shared::identified(
             "train.card.advanced",
             advanced::view(installed_train, settings, settings_edit_available)
@@ -281,7 +264,7 @@ impl Component {
             setup,
             workspace,
             advanced,
-            diagnostics,
+            column![output::view(model, settings).map(Message::Output), diagnostics].spacing(crate::view::workflow::SECTION_SPACING).into(),
         )
         .render(width)
     }

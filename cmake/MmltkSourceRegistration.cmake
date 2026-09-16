@@ -62,16 +62,11 @@ endfunction()
 # requirements, without linking or constructing that owner's implementation.
 function(mmltk_link_declarations target visibility)
     foreach(_mmltk_owner IN LISTS ARGN)
-        target_include_directories("${target}" "${visibility}"
-            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_INCLUDE_DIRECTORIES>")
-        target_include_directories("${target}" SYSTEM "${visibility}"
-            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_SYSTEM_INCLUDE_DIRECTORIES>")
-        target_compile_definitions("${target}" "${visibility}"
-            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_COMPILE_DEFINITIONS>")
-        target_compile_options("${target}" "${visibility}"
-            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_COMPILE_OPTIONS>")
-        target_compile_features("${target}" "${visibility}"
-            "$<TARGET_PROPERTY:${_mmltk_owner},INTERFACE_COMPILE_FEATURES>")
+        # Preserve the dependency's own generator-expression evaluation context.
+        # Copying transitive TARGET_PROPERTY lists flattens imported install
+        # interfaces (e.g. Torch's relative "include") into this target.
+        target_link_libraries("${target}" "${visibility}"
+            "$<COMPILE_ONLY:${_mmltk_owner}>")
     endforeach()
 endfunction()
 

@@ -1,0 +1,2015 @@
+//! GPU renderer for PlotWidget.
+use super::{
+    CROSSHAIR_RGBA, SELECTION_FILL_RGBA, highlight_marker_plot_position,
+    highlight_mask_plot_position, highlight_mask_rgba,
+};
+use crate::LineStyle;
+use crate::picking::PickingPass;
+use crate::transform::data_value_to_plot_with_axis_range;
+use crate::{LineType, Size, camera::CameraUniform, grid::Grid, plot_state::PlotState};
+use iced::widget::shader::Viewport;
+use iced::{Rectangle, wgpu::*};
+
+/// MSAA sample count for all plot pipelines.
+///
+/// Android: 1 — plots draw inside iced's surface render pass via
+/// `Primitive::draw` (see `draw_in_pass`), and that pass is single-sampled;
+/// MSAA pipelines would be incompatible ("Incompatible sample count"
+/// validation panic). In-pass rendering is required there because per-plot
+/// pass fragmentation corrupts frames on tile-based GPUs (Mali/Adreno).
+///
+/// Desktop: 4 — plots render through `render()`/`encode` into a dedicated
+/// MSAA offscreen target and composite the resolved texture, so
+/// `Primitive::draw` must return `false` (see `PlotWidget` shader impl).
+pub(crate) const MSAA_SAMPLE_COUNT: u32 = if cfg!(target_os = "android") { 1 } else { 4 };
+
+pub struct RenderParams<'a> {
+    pub encoder: &'a mut CommandEncoder,
+    pub target: &'a TextureView,
+    /// clip_bounds considers crop in scrollable viewport
+    pub clip_bounds: &'a Rectangle<u32>,
+}
+
+fn msaa_state() -> MultisampleState {
+    MultisampleState {
+        count: MSAA_SAMPLE_COUNT,
+        mask: !0,
+        alpha_to_coverage_enabled: false,
+    }
+}
+
+fn create_color_texture(
+    device: &Device,
+    label: &'static str,
+    width: u32,
+    height: u32,
+    sample_count: u32,
+    format: TextureFormat,
+    usage: TextureUsages,
+) -> Texture {
+    device.create_texture(&TextureDescriptor {
+        label: Some(label),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    })
+}
+
+fn msaa_attachment<'a>(
+    targets: &'a MsaaTargets,
+    load: LoadOp<Color>,
+) -> RenderPassColorAttachment<'a> {
+    RenderPassColorAttachment {
+        view: &targets.msaa_view,
+        resolve_target: Some(&targets.resolved_view),
+        ops: Operations {
+            load,
+            store: StoreOp::Store,
+        },
+        depth_slice: None,
+    }
+}
+
+fn target_attachment(target: &TextureView) -> RenderPassColorAttachment<'_> {
+    RenderPassColorAttachment {
+        view: target,
+        resolve_target: None,
+        ops: Operations {
+            load: LoadOp::Load,
+            store: StoreOp::Store,
+        },
+        depth_slice: None,
+    }
+}
+
+#[derive(Default, Clone)]
+struct LineSegment {
+    first_vertex: u32,
+    vertex_count: u32,
+}
+
+/// Helper struct for managing vertex buffers
+struct VertexBuffer {
+    buffer: Buffer,
+    vertex_count: u32,
+}
+
+impl VertexBuffer {
+    fn clear(slot: &mut Option<Self>) { if let Some(buffer) = slot { buffer.vertex_count = 0; } }
+    fn upload(slot: &mut Option<Self>, device: &Device, queue: &Queue, data: &[u8], count: u32) {
+        if data.is_empty() { Self::clear(slot); return; }
+        if slot.as_ref().is_none_or(|buffer| buffer.buffer.size() < data.len() as u64) {
+            *slot = Some(Self { buffer: device.create_buffer(&BufferDescriptor {
+                label: Some("retained plot vertices"), size: data.len() as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST, mapped_at_creation: false,
+            }), vertex_count: 0 });
+        }
+        let buffer = slot.as_mut().unwrap();
+        queue.write_buffer(&buffer.buffer, 0, data);
+        buffer.vertex_count = count;
+    }
+}
+
+/// Helper struct for managing line vertex buffers
+struct LineBuffer {
+    buffer: Buffer,
+    segments: Vec<LineSegment>,
+}
+
+struct LineVertex<'a> {
+    start: [f32; 2],
+    end: [f32; 2],
+    color: &'a iced::Color,
+    style: u32,
+    distance_start: f32,
+    segment_length_world: f32,
+    param: f32,
+    width: f32,
+    width_mode: u32,
+    along: f32,
+    side: f32,
+}
+
+#[derive(Clone, Copy)]
+struct LineRenderStyle {
+    width: Size,
+    line_style: u32,
+    style_param: f32,
+}
+
+struct PolylineRef<'a> {
+    positions: &'a [[f32; 2]],
+    distances: &'a [f32],
+    colors: &'a [iced::Color],
+}
+
+/// Cache for render pipelines
+struct PipelineCache {
+    marker: Option<RenderPipeline>,
+    line: Option<RenderPipeline>,
+    fill: Option<RenderPipeline>,
+    overlay: Option<RenderPipeline>,
+    line_overlay: Option<RenderPipeline>,
+    composite: Option<RenderPipeline>,
+}
+
+impl PipelineCache {
+    fn new() -> Self {
+        Self {
+            marker: None,
+            line: None,
+            fill: None,
+            overlay: None,
+            line_overlay: None,
+            composite: None,
+        }
+    }
+}
+
+struct MsaaTargets {
+    width: u32,
+    height: u32,
+    _msaa_texture: Texture,
+    msaa_view: TextureView,
+    _resolved_texture: Texture,
+    resolved_view: TextureView,
+    composite_bind_group: BindGroup,
+}
+
+/// Cache for vertex buffers
+struct BufferCache {
+    markers: Option<VertexBuffer>,
+    fills: Option<VertexBuffer>,
+    lines: Option<LineBuffer>,
+    reflines: Option<LineBuffer>,
+    selection: Option<VertexBuffer>,
+    highlight: Option<VertexBuffer>,
+    highlight_markers: Option<VertexBuffer>,
+    crosshairs: Option<VertexBuffer>,
+}
+
+impl BufferCache {
+    fn new() -> Self {
+        Self {
+            markers: None,
+            fills: None,
+            lines: None,
+            reflines: None,
+            selection: None,
+            highlight: None,
+            highlight_markers: None,
+            crosshairs: None,
+        }
+    }
+}
+
+/// Tracks version numbers to detect changes
+struct VersionTracker {
+    markers: u64,
+    fills: u64,
+    lines: u64,
+    highlight: u64,
+    render_offset: glam::DVec2,
+}
+
+impl VersionTracker {
+    fn new() -> Self {
+        Self {
+            markers: 0,
+            fills: 0,
+            lines: 0,
+            highlight: 0,
+            render_offset: glam::DVec2::ZERO,
+        }
+    }
+}
+
+/// Helper for writing vertex data
+struct VertexWriter {
+    data: Vec<u8>,
+}
+
+impl VertexWriter {
+    fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn write_f32(&mut self, value: f32) {
+        self.data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.data.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_position(&mut self, pos: [f32; 2]) {
+        self.write_f32(pos[0]);
+        self.write_f32(pos[1]);
+    }
+
+    fn write_color(&mut self, color: &iced::Color) {
+        self.write_f32(color.r);
+        self.write_f32(color.g);
+        self.write_f32(color.b);
+        self.write_f32(color.a);
+    }
+
+    fn write_line_vertex(&mut self, vertex: LineVertex<'_>) {
+        self.write_position(vertex.start);
+        self.write_position(vertex.end);
+        self.write_color(vertex.color);
+        self.write_u32(vertex.style);
+        self.write_f32(vertex.distance_start);
+        self.write_f32(vertex.segment_length_world);
+        self.write_f32(vertex.param);
+        self.write_f32(vertex.width);
+        self.write_u32(vertex.width_mode);
+        self.write_f32(vertex.along);
+        self.write_f32(vertex.side);
+    }
+
+    fn byte_len(&self) -> usize {
+        self.data.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+pub struct PlotRenderer {
+    format: TextureFormat,
+    camera_buffer: Buffer,
+    camera_bind_group: BindGroup,
+    camera_bgl: BindGroupLayout,
+    composite_bgl: BindGroupLayout,
+    composite_sampler: Sampler,
+    composite_uniform: Buffer,
+    composite_region: Option<([f32; 4], Rectangle)>,
+    msaa_targets: Option<MsaaTargets>,
+    // Caches
+    pipelines: PipelineCache,
+    buffers: BufferCache,
+    versions: VersionTracker,
+    // Support objects
+    grid: Grid,
+    picking: PickingPass,
+    scale_factor: f32,
+    bounds_w: u32,
+    bounds_h: u32,
+    bounds: Rectangle,
+    prepared: Option<(crate::camera::Camera, u32, u32, f32)>,
+    reference_key: Option<ReferenceKey>,
+    crosshair: Option<(bool, glam::Vec2)>,
+    selection_key: Option<(bool, bool, glam::Vec2, glam::Vec2)>,
+    scratch: VertexWriter,
+    float_scratch: Vec<f32>,
+    marker_scratch: VertexWriter,
+    poly_positions: Vec<[f32; 2]>,
+    poly_distances: Vec<f32>,
+    poly_colors: Vec<iced::Color>,
+}
+
+impl PlotRenderer {
+    pub fn new(device: &Device, _queue: &Queue, format: TextureFormat) -> Self {
+        let camera_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("camera_bgl"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let camera_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("camera_buffer"),
+            size: std::mem::size_of::<crate::camera::CameraUniform>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let camera_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("camera_bg"),
+            layout: &camera_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+        let composite_uniform = device.create_buffer(&BufferDescriptor {
+            label: Some("plot composite UV region"), size: 16,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        let composite_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("plot composite bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: false },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::NonFiltering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2, visibility: ShaderStages::VERTEX,
+                    ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                },
+            ],
+        });
+        let composite_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("plot composite sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Nearest,
+            min_filter: FilterMode::Nearest,
+            mipmap_filter: MipmapFilterMode::Nearest,
+            ..SamplerDescriptor::default()
+        });
+        Self {
+            format,
+            camera_buffer,
+            camera_bind_group,
+            camera_bgl,
+            composite_bgl,
+            composite_sampler, composite_uniform, composite_region: None,
+            msaa_targets: None,
+            pipelines: PipelineCache::new(),
+            buffers: BufferCache::new(),
+            versions: VersionTracker::new(),
+            grid: Grid::default(),
+            picking: PickingPass::default(),
+            bounds_w: 0,
+            bounds_h: 0,
+            bounds: Rectangle::default(),
+            scale_factor: 1.0,
+            prepared: None, reference_key: None, crosshair: None, selection_key: None,
+            float_scratch: Vec::new(), marker_scratch: VertexWriter::new(),
+            scratch: VertexWriter::new(), poly_positions: Vec::new(),
+            poly_distances: Vec::new(), poly_colors: Vec::new(),
+        }
+    }
+
+    // Coordinate conversion helpers
+    fn screen_to_clip(&self, x: f32, y: f32) -> [f32; 2] {
+        let w = self.bounds_w.max(1) as f32;
+        let h = self.bounds_h.max(1) as f32;
+        [(x / w) * 2.0 - 1.0, 1.0 - (y / h) * 2.0]
+    }
+
+    fn world_to_ndc(&self, world: [f64; 2], camera: &crate::camera::Camera) -> [f32; 2] {
+        let render_pos = [
+            (world[0] - camera.render_offset.x) as f32,
+            (world[1] - camera.render_offset.y) as f32,
+        ];
+        let ndc_x =
+            (render_pos[0] - camera.effective_position().x as f32) / camera.half_extents.x as f32;
+        let ndc_y =
+            (render_pos[1] - camera.effective_position().y as f32) / camera.half_extents.y as f32;
+        [ndc_x, ndc_y]
+    }
+
+    fn pixels_to_clip_delta(&self, pixels: f32) -> (f32, f32) {
+        let w = self.bounds_w.max(1) as f32;
+        let h = self.bounds_h.max(1) as f32;
+        (2.0 * pixels / w, 2.0 * pixels / h)
+    }
+
+    // Helper to convert world position to render position (subtract offset)
+    fn world_to_render_pos(&self, world: [f64; 2], camera: &crate::camera::Camera) -> [f32; 2] {
+        [
+            (world[0] - camera.render_offset.x) as f32,
+            (world[1] - camera.render_offset.y) as f32,
+        ]
+    }
+
+    fn world_per_pixel(&self, camera: &crate::camera::Camera) -> [f32; 2] {
+        [
+            ((2.0 * camera.half_extents.x) / self.bounds_w.max(1) as f64) as f32,
+            ((2.0 * camera.half_extents.y) / self.bounds_h.max(1) as f64) as f32,
+        ]
+    }
+
+    fn ensure_pipelines_and_update_grid(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        state: &PlotState,
+    ) {
+        self.ensure_marker_pipeline(device);
+        self.grid
+            .ensure_pipeline(device, self.format, &self.camera_bgl, MSAA_SAMPLE_COUNT);
+        self.grid.update(device, queue, state);
+        if !state.fills.is_empty() {
+            self.ensure_fill_pipeline(device);
+        }
+        if state.series.iter().any(|s| s.line_style.is_some())
+            || !state.vlines.is_empty()
+            || !state.hlines.is_empty()
+        {
+            self.ensure_line_pipeline(device);
+        }
+        self.ensure_overlay_pipeline(device);
+        self.ensure_line_overlay_pipeline(device);
+        // Composite yalnız `encode`'un resolve→hedef blit'inde kullanılır;
+        // pas-içi (MSAA=1) yolda gereksiz.
+        if MSAA_SAMPLE_COUNT > 1 {
+            self.ensure_composite_pipeline(device);
+        }
+    }
+    fn set_bounds(&mut self, w: u32, h: u32) {
+        self.bounds_w = w;
+        self.bounds_h = h;
+    }
+    fn set_scale_factor(&mut self, scale: f32) {
+        self.scale_factor = scale;
+    }
+
+    fn ensure_msaa_targets(&mut self, device: &Device, width: u32, height: u32) {
+        let width = width.max(1);
+        let height = height.max(1);
+
+        if self
+            .msaa_targets
+            .as_ref()
+            .is_some_and(|targets| targets.width == width && targets.height == height)
+        {
+            return;
+        }
+
+        let msaa_texture = create_color_texture(
+            device,
+            "iced_plot msaa color",
+            width,
+            height,
+            MSAA_SAMPLE_COUNT,
+            self.format,
+            TextureUsages::RENDER_ATTACHMENT,
+        );
+        let msaa_view = msaa_texture.create_view(&TextureViewDescriptor::default());
+
+        let resolved_texture = create_color_texture(
+            device,
+            "iced_plot resolved color",
+            width,
+            height,
+            1,
+            self.format,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        );
+        let resolved_view = resolved_texture.create_view(&TextureViewDescriptor::default());
+
+        let composite_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("plot composite bind group"),
+            layout: &self.composite_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&resolved_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(&self.composite_sampler),
+                },
+                BindGroupEntry { binding: 2, resource: self.composite_uniform.as_entire_binding() },
+            ],
+        });
+
+        self.msaa_targets = Some(MsaaTargets {
+            width,
+            height,
+            _msaa_texture: msaa_texture,
+            msaa_view,
+            _resolved_texture: resolved_texture,
+            resolved_view,
+            composite_bind_group,
+        });
+    }
+
+    fn sync(&mut self, device: &Device, queue: &Queue, state: &PlotState, geometry_changed: bool) {
+        // Check if render offset changed - if so, we need to rebuild vertex buffers
+        // since positions are stored relative to render_offset
+        let offset_changed = self.versions.render_offset != state.camera.render_offset;
+
+        if state.markers_version != self.versions.markers || offset_changed {
+            self.rebuild_markers(device, queue, state);
+            self.versions.markers = state.markers_version;
+        }
+        if state.fills_version != self.versions.fills || offset_changed {
+            self.rebuild_fills(device, queue, state);
+            self.versions.fills = state.fills_version;
+        }
+        if state.lines_version != self.versions.lines || offset_changed {
+            self.rebuild_lines(device, queue, state);
+            self.versions.lines = state.lines_version;
+        }
+
+        let reference_key = ReferenceKey::new(state, self.bounds_w, self.bounds_h, self.scale_factor);
+        if self.reference_key != Some(reference_key) {
+            self.rebuild_reflines(device, queue, state);
+            self.reference_key = Some(reference_key);
+        }
+
+        // Update cached render offset
+        self.versions.render_offset = state.camera.render_offset;
+
+        // Selection uploads follow its actual geometry and interaction dependencies.
+        let selection = (state.selection.active, state.selection.moved, state.selection.start, state.selection.end);
+        if geometry_changed || self.selection_key != Some(selection) {
+            self.rebuild_selection(device, queue, state);
+            self.selection_key = Some(selection);
+        }
+
+        // Hover/pick highlight mask boxes are baked in clip space, so they must be rebuilt
+        // whenever the camera or viewport changes (zoom/pan/resize), not only when the
+        // highlighted points change.
+        if state.highlight_version != self.versions.highlight || geometry_changed {
+            self.rebuild_highlight(device, queue, state);
+            self.versions.highlight = state.highlight_version;
+        }
+
+        // Unchanged crosshairs reuse their retained buffer.
+        let crosshair = (state.crosshairs_enabled, state.crosshairs_position);
+        if geometry_changed || self.crosshair != Some(crosshair) {
+            self.rebuild_crosshairs(device, queue, state);
+            self.crosshair = Some(crosshair);
+        }
+    }
+
+    /// Prepare the renderer for a new frame given the viewport and current plot state.
+    /// This sets format/viewport/scale, ensures pipelines and grid, and syncs buffers.
+    pub(crate) fn prepare_frame(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        viewport: &Viewport,
+        bounds: &Rectangle,
+        state: &PlotState,
+    ) {
+        self.bounds = *bounds;
+        let scale = viewport.scale_factor();
+        let physical = Rectangle { x: bounds.x * scale, y: bounds.y * scale,
+            width: bounds.width * scale, height: bounds.height * scale };
+        let window = Rectangle::with_size(iced::Size::new(viewport.physical_size().width as f32, viewport.physical_size().height as f32));
+        let region = chart_composite_region(physical, window);
+        if self.composite_region != region {
+            if let Some((uv, _)) = region { queue.write_buffer(&self.composite_uniform, 0, bytemuck::cast_slice(&uv)); }
+            self.composite_region = region;
+        }
+        let scale_factor = viewport.scale_factor();
+        let bounds_width = ((bounds.width * scale_factor).ceil() as u32).max(1);
+        let bounds_height = ((bounds.height * scale_factor).ceil() as u32).max(1);
+
+
+        self.set_bounds(bounds_width, bounds_height);
+        self.set_scale_factor(scale_factor);
+        // In-pass path (MSAA=1, Android) never runs `encode`, so the offscreen
+        // MSAA/resolve textures would only waste memory; `encode` self-guards
+        // by early-returning when `msaa_targets` is `None`.
+        if MSAA_SAMPLE_COUNT > 1 {
+            self.ensure_msaa_targets(device, bounds_width.max(1), bounds_height.max(1));
+        }
+
+        // Sync picking viewport
+        self.picking
+            .set_view(bounds_width, bounds_height, scale_factor);
+
+        // Ensure pipelines/grid and synchronize GPU buffers
+        self.ensure_pipelines_and_update_grid(device, queue, state);
+
+        // Upload camera uniform based on current camera and bounds dimensions
+        let mut cam_u = CameraUniform::default();
+        cam_u.update(&state.camera, bounds_width, bounds_height);
+        let geometry = (state.camera, bounds_width, bounds_height, scale_factor);
+        let changed = self.prepared != Some(geometry);
+        if changed { queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_u)); }
+        self.sync(device, queue, state, changed);
+        self.prepared = Some(geometry);
+    }
+
+    pub(crate) fn service_picking(
+        &mut self,
+        instance_id: u64,
+        device: &Device,
+        queue: &Queue,
+        state: &PlotState,
+    ) {
+        let marker_buffer = self.buffers.markers.as_ref().map(|vb| &vb.buffer);
+        let marker_instances = self
+            .buffers
+            .markers
+            .as_ref()
+            .map(|vb| vb.vertex_count)
+            .unwrap_or(0);
+
+        self.picking.service(
+            instance_id,
+            device,
+            queue,
+            &self.camera_bind_group,
+            &self.camera_bgl,
+            marker_buffer,
+            marker_instances,
+            &state.points,
+            &state.series,
+        );
+    }
+
+    pub fn ensure_marker_pipeline(&mut self, device: &Device) {
+        if self.pipelines.marker.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("../shaders/markers.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("markers layout"),
+            bind_group_layouts: &[Some(&self.camera_bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("markers pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    // Explicit 36-byte stride: vec2<f32> position (8) + vec4<f32> color (16)
+                    // + u32 marker (4) + f32 size (4) + u32 size_mode/pickable flags (4) = 36
+                    array_stride: 36u64,
+                    step_mode: VertexStepMode::Instance,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 2]>() as u64,
+                            shader_location: 1,
+                            format: VertexFormat::Float32x4,
+                        },
+                        VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 6]>() as u64,
+                            shader_location: 2,
+                            format: VertexFormat::Uint32,
+                        },
+                        VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 6]>() as u64
+                                + std::mem::size_of::<u32>() as u64,
+                            shader_location: 3,
+                            format: VertexFormat::Float32,
+                        },
+                        VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 7]>() as u64
+                                + std::mem::size_of::<u32>() as u64,
+                            shader_location: 4,
+                            format: VertexFormat::Uint32,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: self.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: Some(Face::Back),
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: msaa_state(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipelines.marker = Some(pipeline);
+    }
+
+    pub fn ensure_line_pipeline(&mut self, device: &Device) {
+        if self.pipelines.line.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("../shaders/line.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("line layout"),
+            bind_group_layouts: &[Some(&self.camera_bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("line pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    // vec2<f32> segment_start (8) + vec2<f32> segment_end (8) + vec4<f32> color (16)
+                    // + u32 line_style (4) + f32 distance_start (4) + f32 segment_length_world (4)
+                    // + f32 style_param (4) + f32 width (4) + u32 width_mode (4)
+                    // + f32 along (4) + f32 side (4)
+                    array_stride: 64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: VertexFormat::Float32x2, // segment_start
+                        },
+                        VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: VertexFormat::Float32x2, // segment_end
+                        },
+                        VertexAttribute {
+                            offset: 16,
+                            shader_location: 2,
+                            format: VertexFormat::Float32x4, // color
+                        },
+                        VertexAttribute {
+                            offset: 32,
+                            shader_location: 3,
+                            format: VertexFormat::Uint32, // line_style
+                        },
+                        VertexAttribute {
+                            offset: 36,
+                            shader_location: 4,
+                            format: VertexFormat::Float32, // distance_start
+                        },
+                        VertexAttribute {
+                            offset: 40,
+                            shader_location: 5,
+                            format: VertexFormat::Float32, // segment_length_world
+                        },
+                        VertexAttribute {
+                            offset: 44,
+                            shader_location: 6,
+                            format: VertexFormat::Float32, // style_param
+                        },
+                        VertexAttribute {
+                            offset: 48,
+                            shader_location: 7,
+                            format: VertexFormat::Float32, // width
+                        },
+                        VertexAttribute {
+                            offset: 52,
+                            shader_location: 8,
+                            format: VertexFormat::Uint32, // width_mode
+                        },
+                        VertexAttribute {
+                            offset: 56,
+                            shader_location: 9,
+                            format: VertexFormat::Float32, // along
+                        },
+                        VertexAttribute {
+                            offset: 60,
+                            shader_location: 10,
+                            format: VertexFormat::Float32, // side
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: self.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: msaa_state(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipelines.line = Some(pipeline);
+    }
+
+    pub fn ensure_fill_pipeline(&mut self, device: &Device) {
+        if self.pipelines.fill.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("../shaders/fill.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("fill layout"),
+            bind_group_layouts: &[Some(&self.camera_bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("fill pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        VertexAttribute {
+                            offset: 8,
+                            shader_location: 1,
+                            format: VertexFormat::Float32x4,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: self.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: msaa_state(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipelines.fill = Some(pipeline);
+    }
+
+    pub fn ensure_overlay_pipeline(&mut self, device: &Device) {
+        if self.pipelines.overlay.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("../shaders/selection.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("overlay layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("overlay pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: (std::mem::size_of::<[f32; 2]>()
+                        + std::mem::size_of::<[f32; 4]>()) as u64,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            offset: 0,
+                            shader_location: 0,
+                            format: VertexFormat::Float32x2,
+                        },
+                        VertexAttribute {
+                            offset: std::mem::size_of::<[f32; 2]>() as u64,
+                            shader_location: 1,
+                            format: VertexFormat::Float32x4,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: self.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleStrip,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: msaa_state(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipelines.overlay = Some(pipeline);
+    }
+
+    pub fn ensure_line_overlay_pipeline(&mut self, device: &Device) {
+        if self.pipelines.line_overlay.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("../shaders/selection.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("line overlay layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("line overlay pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[VertexBufferLayout {
+                    array_stride: 24,
+                    step_mode: VertexStepMode::Vertex,
+                    attributes: &[
+                        VertexAttribute {
+                            format: VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: self.format,
+                    blend: Some(BlendState::ALPHA_BLENDING),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: msaa_state(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipelines.line_overlay = Some(pipeline);
+    }
+
+    fn ensure_composite_pipeline(&mut self, device: &Device) {
+        if self.pipelines.composite.is_some() {
+            return;
+        }
+        let shader = device.create_shader_module(include_wgsl!("../shaders/composite.wgsl"));
+        let layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("plot composite layout"),
+            bind_group_layouts: &[Some(&self.composite_bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("plot composite pipeline"),
+            layout: Some(&layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: PipelineCompilationOptions::default(),
+                targets: &[Some(ColorTargetState {
+                    format: self.format,
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::OneMinusSrcAlpha,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::OneMinusSrcAlpha,
+                            operation: BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: ColorWrites::ALL,
+                })],
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.pipelines.composite = Some(pipeline);
+    }
+
+    fn rebuild_markers(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        // Only include series that have markers (marker != u32::MAX)
+        let marker_series_count: usize = state
+            .series
+            .iter()
+            .filter(|s| s.marker != u32::MAX)
+            .map(|s| s.len)
+            .sum();
+
+        if marker_series_count == 0 {
+            VertexBuffer::clear(&mut self.buffers.markers);
+            return;
+        }
+
+        let mut writer = std::mem::replace(&mut self.marker_scratch, VertexWriter::new());
+        writer.data.clear();
+        let mut id_map = self.picking.take_id_map();
+        id_map.clear();
+
+        // Iterate series so we can pick per-point color/marker for each point.
+        for (span_idx, s) in state.series.iter().enumerate() {
+            // Skip series without markers
+            if s.marker == u32::MAX {
+                continue;
+            }
+
+            // safety: ensure span indexes are valid with respect to points slice
+            let end = s.start + s.len;
+            if s.len == 0 || end > state.points.len() {
+                continue;
+            }
+
+            for (local_i, p) in state.points[s.start..end].iter().enumerate() {
+                // Subtract render_offset for high-precision rendering near zero
+                let render_pos = self.world_to_render_pos(p.position, &state.camera);
+                let color_idx = s.start + local_i;
+                let color = state.point_colors.get(color_idx).unwrap_or(&s.color);
+                writer.write_position(render_pos);
+                writer.write_color(color);
+                writer.write_u32(s.marker);
+                writer.write_f32(p.size);
+                writer.write_u32(crate::point::marker_flags(p.size_mode, s.pickable));
+
+                let original_idx = s.point_indices.get(local_i).copied().unwrap_or(local_i);
+                id_map.push((span_idx as u32, original_idx as u32));
+            }
+        }
+
+        let data = writer.as_slice();
+        let needed = data.len() as u64;
+
+        let recreate = match &self.buffers.markers {
+            Some(vb) => vb.buffer.size() < needed,
+            None => true,
+        };
+
+        if recreate {
+            self.buffers.markers = Some(VertexBuffer {
+                buffer: device.create_buffer(&BufferDescriptor {
+                    label: Some("marker vb"),
+                    size: needed.max(2048),
+                    usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                vertex_count: marker_series_count as u32,
+            });
+        } else if let Some(vb) = &mut self.buffers.markers {
+            vb.vertex_count = marker_series_count as u32;
+        }
+
+        if let Some(vb) = &self.buffers.markers {
+            queue.write_buffer(&vb.buffer, 0, data);
+        }
+
+        // Update picking id map
+        self.picking.set_id_map(id_map);
+        self.marker_scratch = writer;
+    }
+
+    fn rebuild_fills(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        VertexBuffer::clear(&mut self.buffers.fills);
+        if state.fills.is_empty() {
+            return;
+        }
+
+        let mut writer = std::mem::replace(&mut self.scratch, VertexWriter::new());
+        writer.data.clear();
+        for fill in state.fills.iter() {
+            for world_pos in fill.vertices.iter() {
+                let render_pos = self.world_to_render_pos(*world_pos, &state.camera);
+                writer.write_position(render_pos);
+                writer.write_color(&fill.color);
+            }
+        }
+
+
+        let data = writer.as_slice();
+        VertexBuffer::upload(&mut self.buffers.fills, device, queue, data, (data.len() / 24) as u32);
+        self.scratch = writer;
+    }
+
+    fn rebuild_lines(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        if let Some(buffer) = self.buffers.lines.as_mut() { buffer.segments.clear(); }
+        if state.series.iter().all(|s| s.line_style.is_none()) {
+            return;
+        }
+
+        let mut writer = std::mem::replace(&mut self.scratch, VertexWriter::new());
+        writer.data.clear();
+        let mut segs = self.buffers.lines.as_mut().map(|buffer| std::mem::take(&mut buffer.segments)).unwrap_or_default();
+        let mut poly_positions = std::mem::take(&mut self.poly_positions);
+        let mut poly_distances = std::mem::take(&mut self.poly_distances);
+        let mut poly_colors = std::mem::take(&mut self.poly_colors);
+        for s in state.series.iter() {
+            let Some(line_style) = s.line_style else {
+                continue;
+            };
+            if s.len < 2 {
+                continue;
+            }
+            let (line_style_u32, style_param) = line_style_params(line_style);
+            let render_style = LineRenderStyle {
+                width: line_style.width,
+                line_style: line_style_u32,
+                style_param,
+            };
+            let points_slice = &state.points[s.start..s.start + s.len];
+            poly_positions.clear(); poly_distances.clear(); poly_colors.clear();
+            let mut cumulative_distance = 0.0f32;
+
+            for (i, point) in points_slice.iter().enumerate() {
+                let break_segment = i > 0
+                    && s.point_indices
+                        .get(i)
+                        .zip(s.point_indices.get(i - 1))
+                        .is_some_and(|(curr, prev)| *curr != *prev + 1);
+
+                if break_segment {
+                    write_polyline_triangles(
+                        &mut writer,
+                        &mut segs,
+                        PolylineRef {
+                            positions: &poly_positions,
+                            distances: &poly_distances,
+                            colors: &poly_colors,
+                        },
+                        render_style,
+                    );
+                    poly_positions.clear();
+                    poly_distances.clear();
+                    poly_colors.clear();
+                    cumulative_distance = 0.0;
+                }
+
+                let render_pos = self.world_to_render_pos(point.position, &state.camera);
+                let color = *state.point_colors.get(s.start + i).unwrap_or(&s.color);
+
+                if let Some(last_pos) = poly_positions.last() {
+                    let dx = render_pos[0] - last_pos[0];
+                    let dy = render_pos[1] - last_pos[1];
+                    let segment_length = (dx * dx + dy * dy).sqrt();
+                    if segment_length <= f32::EPSILON {
+                        if let Some(last_color) = poly_colors.last_mut() {
+                            *last_color = color;
+                        }
+                        continue;
+                    }
+                    cumulative_distance += segment_length;
+                }
+
+                poly_positions.push(render_pos);
+                poly_distances.push(cumulative_distance);
+                poly_colors.push(color);
+            }
+
+            write_polyline_triangles(
+                &mut writer,
+                &mut segs,
+                PolylineRef {
+                    positions: &poly_positions,
+                    distances: &poly_distances,
+                    colors: &poly_colors,
+                },
+                render_style,
+            );
+        }
+
+        let data = writer.as_slice();
+        if !data.is_empty() {
+            if self.buffers.lines.as_ref().is_none_or(|buffer| buffer.buffer.size() < data.len() as u64) {
+                self.buffers.lines = Some(LineBuffer {
+                    buffer: device.create_buffer(&BufferDescriptor {
+                        label: Some("retained plot line vertices"), size: data.len() as u64,
+                        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST, mapped_at_creation: false,
+                    }), segments: Vec::new(),
+                });
+            }
+            let buffer = self.buffers.lines.as_mut().unwrap();
+            queue.write_buffer(&buffer.buffer, 0, data);
+        }
+        if let Some(buffer) = self.buffers.lines.as_mut() { buffer.segments = segs; }
+        self.scratch = writer;
+        self.poly_positions = poly_positions; self.poly_distances = poly_distances; self.poly_colors = poly_colors;
+    }
+
+    fn rebuild_reflines(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        if let Some(buffer) = self.buffers.reflines.as_mut() { buffer.segments.clear(); }
+
+        if state.vlines.is_empty() && state.hlines.is_empty() {
+            return;
+        }
+
+        let mut writer = std::mem::replace(&mut self.scratch, VertexWriter::new());
+        writer.data.clear();
+        let mut segs = self.buffers.reflines.as_mut().map(|buffer| std::mem::take(&mut buffer.segments)).unwrap_or_default();
+        let world_per_px = self.world_per_pixel(&state.camera);
+
+        // Get visible viewport bounds in world coordinates
+        let cam = &state.camera;
+        let left = cam.position.x - cam.half_extents.x;
+        let right = cam.position.x + cam.half_extents.x;
+        let bottom = cam.position.y - cam.half_extents.y;
+        let top = cam.position.y + cam.half_extents.y;
+
+        // Add vertical lines
+        for vline in state.vlines.iter() {
+            let Some(vx_plot) = data_value_to_plot_with_axis_range(
+                vline.x,
+                state.x_axis_scale,
+                vline.transform.as_ref(),
+                Some(state.camera.x_range()),
+            ) else {
+                continue;
+            };
+            // Check if the stroked vline still overlaps the viewport.
+            let half_width = reference_line_half_extent(vline.line_style.width, true, world_per_px);
+            if vx_plot + (half_width as f64) < left || vx_plot - (half_width as f64) > right {
+                continue;
+            }
+
+            let (line_style_u32, style_param) = line_style_params(vline.line_style);
+            let render_style = LineRenderStyle {
+                width: vline.line_style.width,
+                line_style: line_style_u32,
+                style_param,
+            };
+            // Create two endpoints spanning the visible vertical extent.
+            let positions = [
+                self.world_to_render_pos([vx_plot, bottom], &state.camera),
+                self.world_to_render_pos([vx_plot, top], &state.camera),
+            ];
+            let distances = [0.0, (top - bottom) as f32];
+            let colors = [vline.color, vline.color];
+            write_polyline_triangles(
+                &mut writer,
+                &mut segs,
+                PolylineRef {
+                    positions: &positions,
+                    distances: &distances,
+                    colors: &colors,
+                },
+                render_style,
+            );
+        }
+
+        // Add horizontal lines
+        for hline in state.hlines.iter() {
+            let Some(hy_plot) = data_value_to_plot_with_axis_range(
+                hline.y,
+                state.y_axis_scale,
+                hline.transform.as_ref(),
+                Some(state.camera.y_range()),
+            ) else {
+                continue;
+            };
+            // Check if the stroked hline still overlaps the viewport.
+            let half_width =
+                reference_line_half_extent(hline.line_style.width, false, world_per_px);
+            if hy_plot + (half_width as f64) < bottom || hy_plot - (half_width as f64) > top {
+                continue;
+            }
+
+            let (line_style_u32, style_param) = line_style_params(hline.line_style);
+            let render_style = LineRenderStyle {
+                width: hline.line_style.width,
+                line_style: line_style_u32,
+                style_param,
+            };
+            // Create two endpoints spanning the visible horizontal extent.
+            let positions = [
+                self.world_to_render_pos([left, hy_plot], &state.camera),
+                self.world_to_render_pos([right, hy_plot], &state.camera),
+            ];
+            let distances = [0.0, (right - left) as f32];
+            let colors = [hline.color, hline.color];
+            write_polyline_triangles(
+                &mut writer,
+                &mut segs,
+                PolylineRef {
+                    positions: &positions,
+                    distances: &distances,
+                    colors: &colors,
+                },
+                render_style,
+            );
+        }
+
+        let data = writer.as_slice();
+        if !data.is_empty() {
+            if self.buffers.reflines.as_ref().is_none_or(|buffer| buffer.buffer.size() < data.len() as u64) {
+                self.buffers.reflines = Some(LineBuffer {
+                    buffer: device.create_buffer(&BufferDescriptor {
+                        label: Some("retained plot line vertices"), size: data.len() as u64,
+                        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST, mapped_at_creation: false,
+                    }), segments: Vec::new(),
+                });
+            }
+            let buffer = self.buffers.reflines.as_mut().unwrap();
+            queue.write_buffer(&buffer.buffer, 0, data);
+        }
+        if let Some(buffer) = self.buffers.reflines.as_mut() { buffer.segments = segs; }
+        self.scratch = writer;
+    }
+
+    fn rebuild_selection(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        let w = self.bounds_w.max(1) as f32;
+        let h = self.bounds_h.max(1) as f32;
+        if w <= 1.0 || h <= 1.0 {
+            return;
+        }
+        if state.selection.active || state.selection.moved {
+            let p0 = state.selection.start * self.scale_factor;
+            let p1 = state.selection.end * self.scale_factor;
+            let min_x = p0.x.min(p1.x);
+            let max_x = p0.x.max(p1.x);
+            let min_y = p0.y.min(p1.y);
+            let max_y = p0.y.max(p1.y);
+            let tl = self.screen_to_clip(min_x, min_y);
+            let br = self.screen_to_clip(max_x, max_y);
+            let tr = [br[0], tl[1]];
+            let bl = [tl[0], br[1]];
+            let mut data = std::mem::take(&mut self.float_scratch);
+            data.clear();
+            for v in [tl, tr, bl, br] {
+                data.extend_from_slice(&v);
+                data.extend_from_slice(&SELECTION_FILL_RGBA);
+            }
+            let raw = bytemuck::cast_slice(&data);
+            VertexBuffer::upload(&mut self.buffers.selection, device, queue, raw, 4);
+            self.float_scratch = data;
+        } else {
+            VertexBuffer::clear(&mut self.buffers.selection);
+        }
+    }
+
+    fn rebuild_highlight(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        VertexBuffer::clear(&mut self.buffers.highlight);
+        VertexBuffer::clear(&mut self.buffers.highlight_markers);
+
+        if state.highlighted_points.is_empty() {
+            return;
+        }
+
+        let w = self.bounds_w.max(1) as f32;
+        let h = self.bounds_h.max(1) as f32;
+        if w <= 1.0 || h <= 1.0 {
+            return;
+        }
+
+        let mut mask_box_data = std::mem::take(&mut self.float_scratch);
+        mask_box_data.clear();
+        let mut marker_writer = std::mem::replace(&mut self.marker_scratch, VertexWriter::new());
+        marker_writer.data.clear();
+
+        for highlight_point in state.highlighted_points.iter() {
+            // Build mask box if enabled
+            if let Some(mask_padding) = highlight_point.mask_padding
+                && let Some(marker_style) = highlight_point.marker_style
+            {
+                let Some(world_pos) = highlight_mask_plot_position(highlight_point, state) else {
+                    continue;
+                };
+
+                // Convert world coordinates to NDC
+                let ndc = self.world_to_ndc(world_pos, &state.camera);
+                // Calculate mask box size based on marker_size
+                let mask_box_size_px =
+                    marker_style.size.to_px(&state.camera, &state.bounds) + mask_padding;
+
+                let (dx, dy) = self.pixels_to_clip_delta(mask_box_size_px.max(1.0));
+
+                // Build a quad around the point in clip coords
+                let tl = [ndc[0] - dx, ndc[1] + dy];
+                let tr = [ndc[0] + dx, ndc[1] + dy];
+                let bl = [ndc[0] - dx, ndc[1] - dy];
+                let br = [ndc[0] + dx, ndc[1] - dy];
+                let color = highlight_mask_rgba(highlight_point.color);
+                for v in [tl, tr, bl, br] {
+                    mask_box_data.extend_from_slice(&v);
+                    mask_box_data.extend_from_slice(&color);
+                }
+            }
+
+            // Build marker if marker_style is Some
+            if let Some(marker_style) = highlight_point.marker_style {
+                let Some(plot_pos) = highlight_marker_plot_position(highlight_point, state) else {
+                    continue;
+                };
+                let render_pos = self.world_to_render_pos(plot_pos, &state.camera);
+                let (size, size_mode) = marker_style.size.to_raw();
+                marker_writer.write_position(render_pos);
+                marker_writer.write_color(&highlight_point.color);
+                marker_writer.write_u32(marker_style.marker_type as u32);
+                marker_writer.write_f32(size);
+                marker_writer.write_u32(crate::point::marker_flags(size_mode, true));
+            }
+        }
+
+        // Create mask box buffer if we have any
+        if !mask_box_data.is_empty() {
+            let raw = bytemuck::cast_slice(&mask_box_data);
+            VertexBuffer::upload(&mut self.buffers.highlight, device, queue, raw, (mask_box_data.len() / 6) as u32);
+        }
+
+        // Create marker buffer if we have any
+        if !marker_writer.is_empty() {
+            let data = marker_writer.as_slice();
+            let marker_count = (data.len() / 36) as u32; // 36 bytes per marker instance
+            VertexBuffer::upload(&mut self.buffers.highlight_markers, device, queue, data, marker_count);
+        }
+        self.float_scratch = mask_box_data;
+        self.marker_scratch = marker_writer;
+    }
+
+    fn rebuild_crosshairs(&mut self, device: &Device, queue: &Queue, state: &PlotState) {
+        VertexBuffer::clear(&mut self.buffers.crosshairs);
+
+        if !state.crosshairs_enabled {
+            return;
+        }
+
+        let w = self.bounds_w.max(1) as f32;
+        let h = self.bounds_h.max(1) as f32;
+        if w <= 1.0 || h <= 1.0 {
+            return;
+        }
+
+        // Check if cursor is within bounds
+        let pos = state.crosshairs_position * self.scale_factor;
+        if pos.x < 0.0 || pos.y < 0.0 || pos.x > w || pos.y > h {
+            return;
+        }
+
+        // Convert cursor position to clip coordinates
+        let cursor_clip = self.screen_to_clip(pos.x, pos.y);
+
+        let mut data = std::mem::take(&mut self.float_scratch);
+            data.clear();
+
+        // Horizontal line (left to right through cursor)
+        let left = [-1.0, cursor_clip[1]];
+        let right = [1.0, cursor_clip[1]];
+
+        // Vertical line (top to bottom through cursor)
+        let top = [cursor_clip[0], 1.0];
+        let bottom = [cursor_clip[0], -1.0];
+
+        // Add horizontal line vertices
+        data.extend_from_slice(&left);
+        data.extend_from_slice(&CROSSHAIR_RGBA);
+        data.extend_from_slice(&right);
+        data.extend_from_slice(&CROSSHAIR_RGBA);
+
+        // Add vertical line vertices
+        data.extend_from_slice(&top);
+        data.extend_from_slice(&CROSSHAIR_RGBA);
+        data.extend_from_slice(&bottom);
+        data.extend_from_slice(&CROSSHAIR_RGBA);
+
+        let raw = bytemuck::cast_slice(&data);
+        VertexBuffer::upload(&mut self.buffers.crosshairs, device, queue, raw, 4);
+            self.float_scratch = data;
+    }
+
+    /// Draws all plot content into an existing render pass (iced's main
+    /// surface pass). The caller (iced's `shader::Primitive::draw` path) has
+    /// already set the viewport to the widget bounds and the scissor to the
+    /// clip bounds — the same state `encode` sets on its own passes.
+    ///
+    /// Rendering in-pass avoids tearing the surface render pass down per plot
+    /// (`Load`/`Store` round-trips). On tile-based mobile GPUs (Mali/Adreno)
+    /// that pass fragmentation triggered driver-level frame corruption: text
+    /// drawn by other passes intermittently disappeared on screens containing
+    /// plots.
+    pub fn draw_in_pass(&self, pass: &mut iced::wgpu::RenderPass<'_>) {
+        // Main content (grid, fills, lines, reference lines, markers)
+        self.grid.draw(pass, &self.camera_bind_group);
+        if let (Some(pipeline), Some(vb)) = (self.pipelines.fill.as_ref(), &self.buffers.fills) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, vb.buffer.slice(..));
+            pass.draw(0..vb.vertex_count, 0..1);
+        }
+        if let (Some(pipeline), Some(lb)) = (self.pipelines.line.as_ref(), &self.buffers.lines) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, lb.buffer.slice(..));
+            for seg in &lb.segments {
+                pass.draw(seg.first_vertex..seg.first_vertex + seg.vertex_count, 0..1);
+            }
+        }
+        if let (Some(pipeline), Some(lb)) = (self.pipelines.line.as_ref(), &self.buffers.reflines) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, lb.buffer.slice(..));
+            for seg in &lb.segments {
+                pass.draw(seg.first_vertex..seg.first_vertex + seg.vertex_count, 0..1);
+            }
+        }
+        if let (Some(pipeline), Some(vb)) = (self.pipelines.marker.as_ref(), &self.buffers.markers)
+        {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, vb.buffer.slice(..));
+            pass.draw(0..4, 0..vb.vertex_count);
+        }
+        if let (Some(pipeline), Some(vb)) = (
+            self.pipelines.marker.as_ref(),
+            &self.buffers.highlight_markers,
+        ) {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_vertex_buffer(0, vb.buffer.slice(..));
+            pass.draw(0..4, 0..vb.vertex_count);
+        }
+
+        // Selection overlay + highlight mask boxes
+        if let Some(pipeline) = self.pipelines.overlay.as_ref() {
+            pass.set_pipeline(pipeline);
+            if let Some(vb) = &self.buffers.selection {
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                pass.draw(0..vb.vertex_count, 0..1);
+            }
+            if let Some(vb) = &self.buffers.highlight {
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                let quad_count = vb.vertex_count / 4;
+                for i in 0..quad_count {
+                    pass.draw(i * 4..(i + 1) * 4, 0..1);
+                }
+            }
+        }
+
+        // Crosshairs overlay
+        if let (Some(pipeline), Some(vb)) = (
+            self.pipelines.line_overlay.as_ref(),
+            &self.buffers.crosshairs,
+        ) {
+            pass.set_pipeline(pipeline);
+            pass.set_vertex_buffer(0, vb.buffer.slice(..));
+            pass.draw(0..vb.vertex_count, 0..1);
+        }
+    }
+
+    pub fn encode(&self, params: RenderParams) {
+        let Some(msaa_targets) = &self.msaa_targets else {
+            return;
+        };
+
+        // Convert bounds to viewport coordinates
+        let Some((_, visible)) = self.composite_region else { return; };
+        let width = msaa_targets.width as f32;
+        let height = msaa_targets.height as f32;
+
+        // Main pass (grid, lines, markers)
+        {
+            let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("iced_plot main"),
+                color_attachments: &[Some(msaa_attachment(
+                    msaa_targets,
+                    LoadOp::Clear(Color::TRANSPARENT),
+                ))],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            // Set viewport and scissor to respect bounds
+            pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
+            pass.set_scissor_rect(
+                0, 0, msaa_targets.width, msaa_targets.height,
+            );
+
+            // grid
+            self.grid.draw(&mut pass, &self.camera_bind_group);
+            // fills
+            if let (Some(pipeline), Some(vb)) = (self.pipelines.fill.as_ref(), &self.buffers.fills)
+            {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                pass.draw(0..vb.vertex_count, 0..1);
+            }
+            // lines
+            if let (Some(pipeline), Some(lb)) = (self.pipelines.line.as_ref(), &self.buffers.lines)
+            {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, lb.buffer.slice(..));
+                for seg in &lb.segments {
+                    pass.draw(seg.first_vertex..seg.first_vertex + seg.vertex_count, 0..1);
+                }
+            }
+            // reference lines (vlines and hlines)
+            if let (Some(pipeline), Some(lb)) =
+                (self.pipelines.line.as_ref(), &self.buffers.reflines)
+            {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, lb.buffer.slice(..));
+                for seg in &lb.segments {
+                    pass.draw(seg.first_vertex..seg.first_vertex + seg.vertex_count, 0..1);
+                }
+            }
+            // markers
+            if let (Some(pipeline), Some(vb)) =
+                (self.pipelines.marker.as_ref(), &self.buffers.markers)
+            {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                pass.draw(0..4, 0..vb.vertex_count);
+            }
+            // highlight markers (rendered after regular markers so they appear on top)
+            if let (Some(pipeline), Some(vb)) = (
+                self.pipelines.marker.as_ref(),
+                &self.buffers.highlight_markers,
+            ) {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                pass.draw(0..4, 0..vb.vertex_count);
+            }
+        }
+
+        // Selection overlay
+        if let Some(pipeline) = self.pipelines.overlay.as_ref() {
+            let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("selection overlay"),
+                color_attachments: &[Some(msaa_attachment(msaa_targets, LoadOp::Load))],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            // Set viewport and scissor for selection overlay as well
+            pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
+            pass.set_scissor_rect(
+                0, 0, msaa_targets.width, msaa_targets.height,
+            );
+
+            pass.set_pipeline(pipeline);
+            // Draw selection if present
+            if let Some(vb) = &self.buffers.selection {
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                pass.draw(0..vb.vertex_count, 0..1);
+            }
+            // Draw highlight mask boxes if present
+            // Each mask box is a quad (4 vertices) in TriangleStrip topology
+            if let Some(vb) = &self.buffers.highlight {
+                pass.set_vertex_buffer(0, vb.buffer.slice(..));
+                // Draw each quad separately (4 vertices per quad)
+                let quad_count = vb.vertex_count / 4;
+                for i in 0..quad_count {
+                    pass.draw(i * 4..(i + 1) * 4, 0..1);
+                }
+            }
+        }
+
+        // Crosshairs overlay (using line list topology)
+        if let (Some(pipeline), Some(vb)) = (
+            self.pipelines.line_overlay.as_ref(),
+            &self.buffers.crosshairs,
+        ) {
+            let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("crosshairs overlay"),
+                color_attachments: &[Some(msaa_attachment(msaa_targets, LoadOp::Load))],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            // Set viewport and scissor for crosshairs overlay
+            pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
+            pass.set_scissor_rect(
+                0, 0, msaa_targets.width, msaa_targets.height,
+            );
+
+            pass.set_pipeline(pipeline);
+            pass.set_vertex_buffer(0, vb.buffer.slice(..));
+            pass.draw(0..vb.vertex_count, 0..1);
+        }
+
+        if let Some(pipeline) = self.pipelines.composite.as_ref() {
+            let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("iced_plot composite"),
+                color_attachments: &[Some(target_attachment(params.target))],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            pass.set_viewport(
+                visible.x, visible.y, visible.width, visible.height,
+                0.0,
+                1.0,
+            );
+            pass.set_scissor_rect(
+                params.clip_bounds.x,
+                params.clip_bounds.y,
+                params.clip_bounds.width,
+                params.clip_bounds.height,
+            );
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &msaa_targets.composite_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+}
+
+// The offscreen target is chart-local; only its visible UV subsection is
+// composited when the chart is partially outside the window.
+fn chart_composite_region(physical: Rectangle, window: Rectangle) -> Option<([f32; 4], Rectangle)> {
+    if physical.width <= 0.0 || physical.height <= 0.0 { return None; }
+    let visible = physical.intersection(&window)?;
+    Some(([(visible.x - physical.x) / physical.width, (visible.y - physical.y) / physical.height,
+        visible.width / physical.width, visible.height / physical.height], visible))
+}
+
+#[cfg(test)]
+mod retained_target_tests {
+    use super::*;
+    #[test]
+    fn chart_targets_clip_scroll_and_resize_without_window_sized_storage() {
+        let window = Rectangle { x: 0.0, y: 0.0, width: 1920.0, height: 1080.0 };
+        let mut chart = Rectangle { x: 400.0, y: -90.0, width: 640.0, height: 360.0 };
+        let (uv, visible) = chart_composite_region(chart, window).unwrap();
+        assert_eq!(uv, [0.0, 0.25, 1.0, 0.75]);
+        assert_eq!(visible, Rectangle { x: 400.0, y: 0.0, width: 640.0, height: 270.0 });
+        chart.y = 100.0; chart.width = 800.0; chart.height = 450.0;
+        assert_eq!(chart_composite_region(chart, window).unwrap(), ([0.0, 0.0, 1.0, 1.0], chart));
+        chart.width = 0.0;
+        assert!(chart_composite_region(chart, window).is_none());
+        chart.width = 640.0; chart.y = 1200.0;
+        assert!(chart_composite_region(chart, window).is_none());
+    }
+}
+
+// Helper to extract line style parameters
+fn line_style_params(style: LineStyle) -> (u32, f32) {
+    match style.line_type {
+        LineType::Solid => (0u32, 0.0f32),
+        LineType::Dotted { spacing } => (1u32, spacing),
+        LineType::Dashed { length } => (2u32, length),
+    }
+}
+
+fn write_polyline_triangles(
+    writer: &mut VertexWriter,
+    segs: &mut Vec<LineSegment>,
+    polyline: PolylineRef<'_>,
+    style: LineRenderStyle,
+) {
+    if polyline.positions.len() < 2
+        || polyline.positions.len() != polyline.distances.len()
+        || polyline.positions.len() != polyline.colors.len()
+    {
+        return;
+    }
+
+    let (width, width_mode) = line_width_params(style.width);
+    let first_vertex = (writer.byte_len() / 64) as u32;
+    for index in 0..polyline.positions.len() - 1 {
+        let start = polyline.positions[index];
+        let end = polyline.positions[index + 1];
+        let segment_length_world = polyline.distances[index + 1] - polyline.distances[index];
+        if segment_length_world <= f32::EPSILON {
+            continue;
+        }
+
+        let start_color = &polyline.colors[index];
+        let end_color = &polyline.colors[index + 1];
+        let distance_start = polyline.distances[index];
+
+        for (color, along, side) in [
+            (start_color, 0.0, 1.0),
+            (start_color, 0.0, -1.0),
+            (end_color, 1.0, 1.0),
+            (start_color, 0.0, -1.0),
+            (end_color, 1.0, 1.0),
+            (end_color, 1.0, -1.0),
+        ] {
+            writer.write_line_vertex(LineVertex {
+                start,
+                end,
+                color,
+                style: style.line_style,
+                distance_start,
+                segment_length_world,
+                param: style.style_param,
+                width,
+                width_mode,
+                along,
+                side,
+            });
+        }
+    }
+
+    let vertex_count = (writer.byte_len() / 64) as u32 - first_vertex;
+    if vertex_count > 0 {
+        segs.push(LineSegment {
+            first_vertex,
+            vertex_count,
+        });
+    }
+}
+
+// All inputs consumed by reference geometry; series versions are deliberately absent.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct ReferenceKey {
+    content: u64,
+    camera: crate::camera::Camera,
+    width: u32,
+    height: u32,
+    scale: f32,
+    x_axis: crate::AxisScale,
+    y_axis: crate::AxisScale,
+}
+impl ReferenceKey {
+    fn new(state: &PlotState, width: u32, height: u32, scale: f32) -> Self {
+        Self { content: state.reference_version, camera: state.camera, width, height, scale,
+            x_axis: state.x_axis_scale, y_axis: state.y_axis_scale }
+    }
+}
+
+fn reference_line_half_extent(width: Size, vertical: bool, world_per_px: [f32; 2]) -> f32 {
+    match width {
+        Size::Pixels(size) => {
+            let axis_scale = if vertical {
+                world_per_px[0]
+            } else {
+                world_per_px[1]
+            };
+            size.max(0.5) * axis_scale * 0.5
+        }
+        Size::World(size) => size.max(f64::EPSILON) as f32 * 0.5,
+    }
+}
+
+fn line_width_params(width: Size) -> (f32, u32) {
+    match width {
+        Size::Pixels(size) => (size.max(0.5), crate::point::MARKER_SIZE_PIXELS),
+        Size::World(size) => (
+            size.max(f64::EPSILON) as f32,
+            crate::point::MARKER_SIZE_WORLD,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod reference_dependency_tests {
+    use super::*;
+    #[test]
+    fn reference_upload_key_tracks_content_camera_viewport_and_axes_only() {
+        let mut state = PlotState::default();
+        let original = ReferenceKey::new(&state, 640, 360, 1.0);
+        state.lines_version += 1; state.markers_version += 1;
+        assert_eq!(original, ReferenceKey::new(&state, 640, 360, 1.0));
+        state.reference_version += 1;
+        assert_ne!(original, ReferenceKey::new(&state, 640, 360, 1.0));
+        state.reference_version -= 1;
+        assert_ne!(original, ReferenceKey::new(&state, 800, 360, 1.0));
+        assert_ne!(original, ReferenceKey::new(&state, 640, 480, 1.0));
+        assert_ne!(original, ReferenceKey::new(&state, 640, 360, 2.0));
+        state.camera.position.x += 1.0;
+        assert_ne!(original, ReferenceKey::new(&state, 640, 360, 1.0));
+        state.camera.position.x -= 1.0;
+        state.x_axis_scale = crate::AxisScale::Log { base: 10.0 };
+        assert_ne!(original, ReferenceKey::new(&state, 640, 360, 1.0));
+        state.x_axis_scale = crate::AxisScale::Linear;
+        state.y_axis_scale = crate::AxisScale::Log { base: 10.0 };
+        assert_ne!(original, ReferenceKey::new(&state, 640, 360, 1.0));
+    }
+}

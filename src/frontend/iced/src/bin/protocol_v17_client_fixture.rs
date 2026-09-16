@@ -523,6 +523,16 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         && training.progress.val.as_ref().is_some_and(|value| value.bbox.ap == 0.625)
         && training.droppedbefore == 2 && training.sequence == 17,
         "training metric values, unavailability or selected weight provenance changed")?;
+    let scalar_values = training.progress.scalars.values();
+    let scalar = |field| generated::TrainingScalars::FIELDS.iter().position(|(id, _)| *id == field).and_then(|index| scalar_values[index]);
+    require(scalar(generated::TrainingScalarsField::LearningRate) == Some(0.0001)
+        && scalar(generated::TrainingScalarsField::LearningRateMin) == Some(0.00001)
+        && scalar(generated::TrainingScalarsField::LearningRateMax) == Some(0.001)
+        && scalar(generated::TrainingScalarsField::CorrespondenceWeighted) == Some(0.25)
+        && scalar(generated::TrainingScalarsField::Classification).is_none()
+        && training.progress.fullcheckpointpath == "/copied/full.pt"
+        && training.progress.checkpointpath == "/run/epoch.pth",
+        "reflected scalar projection or distinct resumable artifact paths changed")?;
     let training_page = generated::TrainingHistoryPage::from_application_value(model_reference(702)?).map_err(io::Error::other)?;
     let transported_training_page = generated::TrainingHistoryPage::from_application_transport_value(model_reference(703)?).map_err(io::Error::other)?;
     require(training_page == transported_training_page && training_page.generation == 9
@@ -568,6 +578,14 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         && !sample_image.overlays.predictionboxes && sample_image.overlays.predictionmasks
         && !sample_image.overlays.groundtruthboxes && sample_image.overlays.groundtruthmasks,
         "native validation sample image metadata did not survive both codecs")?;
+    let paired_product = generated::decode_workspace_image_product(
+        generated::application_system_stable_id(generated::ApplicationSystem::Validation),
+        model_reference(603)?).map_err(io::Error::other)?;
+    let copied_product = paired_product.clone();
+    require(matches!((&paired_product, &copied_product),
+        (generated::WorkspaceImageProduct::Validation(first), generated::WorkspaceImageProduct::Validation(next))
+            if std::sync::Arc::ptr_eq(first, next) && first.as_ref() == &sample_image),
+        "image product cloning copied or changed the immutable native metadata")?;
     let validation = visual.validation.ok_or_else(|| io::Error::other("validation bootstrap is missing"))?;
     require(validation.metrics.as_ref().is_some_and(|summary| summary.bbox.areaap == [Some(0.0), None, Some(1.0)] && summary.mask.is_none())
         && validation.sampleavailable[0] && validation.sampleidentities[0].generation == 7,

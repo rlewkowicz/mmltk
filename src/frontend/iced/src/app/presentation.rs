@@ -391,6 +391,7 @@ impl App {
         self.presentation.retire_frame();
         self.workspace.select(feature);
         self.model.set_foreground_feature(feature);
+        self.workspace.sync_workflows(&self.model);
         if let Some(frame) = self.model.presentation_refresh() {
             self.select_presentation(frame);
         }
@@ -545,7 +546,7 @@ impl Controller {
             .map_or(feature, |suspended| suspended.route);
         if matches!(
             feature,
-            FeatureId::Train | FeatureId::Validate | FeatureId::Export
+            FeatureId::Train | FeatureId::Export
         ) {
             self.retire_frame();
             return Ok(());

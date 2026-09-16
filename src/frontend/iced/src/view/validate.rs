@@ -1,3 +1,5 @@
+pub mod results;
+pub mod samples;
 // CLEANUP-IGNORE: Validate declares the concrete dependencies required by its independent Iced component.
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
@@ -14,11 +16,14 @@ pub enum Message {
     CompiledPathChanged(String),
     // CLEANUP-IGNORE: Validate retains its generated batch-size message before its workspace child message.
     BatchSizeChanged(u64),
-    Workspace(crate::view::workspace::Message),
+    Results(results::Message),
+    Samples(samples::Message),
 }
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    Details(crate::generated::EvaluationDetailQuery),
+    Sample(samples::Message),
     StartRequested,
     StopRequested,
     // CLEANUP-IGNORE: Validate retains its local dialog outcome and workflow-bound child component ownership.
@@ -30,11 +35,14 @@ pub enum Outcome {
 
 pub struct Component {
     model_card: crate::view::workflow::model_card::Component,
+    results: results::Component,
+    samples: samples::Component,
 }
 
 impl Default for Component {
     fn default() -> Self {
         Self {
+            results: Default::default(), samples: Default::default(),
             model_card: crate::view::workflow::model_card::Component::new(
                 // CLEANUP-IGNORE: Validate binds the child owner to its generated feature.
                 crate::generated::FeatureId::Validate,
@@ -136,15 +144,13 @@ impl Component {
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
         .into();
-        let workspace = crate::view::workflow::workspace(
-            surface,
-            settings,
-            settings_edit_available,
-            crate::generated::FeatureId::Validate,
-            width,
-            Message::Workspace,
-            crate::workspace_input::Binding::default(),
-        );
+        let center = crate::view::workflow::Composition::new(crate::generated::FeatureId::Validate, width).center_width()
+            - 2.0 * crate::view::workflow::CARD_PADDING;
+        let half = (center - 10.0) / 2.0;
+        let workspace = iced::widget::row![
+            container(self.results.view(model).map(Message::Results)).width(half),
+            container(self.samples.view(surface, model, settings, half).map(Message::Samples)).width(half),
+        ].spacing(10).into();
         let advanced = crate::view::shared::card(
             "Advanced",
             "Validation execution and generated constraints.",
@@ -224,13 +230,14 @@ impl Component {
                 })?,
                 // CLEANUP-IGNORE: Validate closes its local settings outcome before workspace routing.
             ),
-            // CLEANUP-IGNORE: Validate alone converts its child workspace result into its local outcome.
-            Message::Workspace(message) => {
-                let Some(schedule) = crate::view::workflow::update_workspace(settings, message)?
-                else {
-                    return Ok(None);
-                };
-                Outcome::SettingsEdited(schedule)
+            Message::Results(message) => {
+                if self.results.update(&message) { return Ok(None); }
+                let results::Message::Page(query) = message else { return Ok(None); };
+                Outcome::Details(query)
+            }
+            Message::Samples(message) => {
+                if self.samples.update(&message) { return Ok(None); }
+                Outcome::Sample(message)
             }
         };
         Ok(Some(outcome))
@@ -240,6 +247,18 @@ impl Component {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_and_fit_are_local_while_sample_selection_keeps_displayed_identity() {
+        let mut component = Component::default();
+        let mut settings = crate::view::settings::SettingsModel::default();
+        for message in [samples::Message::Labels(true, false), samples::Message::Labels(false, true), samples::Message::Fit] {
+            assert!(component.update(&mut settings, Message::Samples(message)).unwrap().is_none());
+        }
+        let identity = crate::generated::ValidationSampleIdentity { generation: 7, datasetindex: 42 };
+        assert!(matches!(component.update(&mut settings, Message::Samples(samples::Message::Select(identity.clone()))).unwrap(),
+            Some(Outcome::Sample(samples::Message::Select(actual))) if actual == identity));
+    }
 
     #[test]
     fn validation_start_is_a_domain_outcome() {

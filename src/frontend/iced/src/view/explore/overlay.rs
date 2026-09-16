@@ -1,6 +1,4 @@
 use crate::fluent_theme::Element;
-use iced::Center;
-use iced::widget::{checkbox, container, row};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -44,27 +42,10 @@ pub(super) fn view(
             super::GALLERY_BOXES_ID,
         ]
     };
-    row![
-        container(
-            checkbox(overlay.showlabels)
-                .label("Labels")
-                .on_toggle_maybe(available.then_some(Message::LabelsToggled))
-        )
-        .id(ids[0]),
-        container(
-            checkbox(overlay.showmasks)
-                .label("Masks")
-                .on_toggle_maybe(available.then_some(Message::MasksToggled))
-        )
-        .id(ids[1]),
-        container(
-            checkbox(overlay.showboxes)
-                .label("Boxes")
-                .on_toggle_maybe(available.then_some(Message::BoxesToggled))
-        )
-        .id(ids[2]),
-    ]
-    .spacing(7)
-    .align_y(Center)
-    .into()
+    crate::view::workflow::overlay_controls::view(overlay.showlabels, overlay.showmasks, overlay.showboxes,
+        available, available, ids).map(|message| match message {
+            crate::view::workflow::overlay_controls::Message::Labels(value) => Message::LabelsToggled(value),
+            crate::view::workflow::overlay_controls::Message::Masks(value) => Message::MasksToggled(value),
+            crate::view::workflow::overlay_controls::Message::Boxes(value) => Message::BoxesToggled(value),
+        })
 }

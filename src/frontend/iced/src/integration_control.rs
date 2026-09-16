@@ -10773,7 +10773,7 @@ impl Controller {
                 else {
                     return Task::none();
                 };
-                let Some(rendered) = image.diagnostics.as_deref() else {
+                let Some(rendered) = image.metadata.diagnostics.as_ref() else {
                     return Task::none();
                 };
 

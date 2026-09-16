@@ -575,7 +575,7 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
     let (surface, crop) = drawn_detail()?;
     let frame = surface.frame?;
     let paired = metadata::pending(frame)?;
-    let detail = paired.detail?;
+    let detail = paired.content.detail()?;
     let source = detail.frame();
     if !paired.view_ready
         || paired.surface.frame != Some(frame)
@@ -1756,7 +1756,7 @@ pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDispl
                 .and_then(|renderer| renderer.imported.as_ref())
                 .is_some_and(|imported| {
                     imported.image.retained().is_some()
-                        && (imported.image.gallery.is_some() || imported.image.detail.is_some())
+                        && (imported.image.content.gallery().is_some() || imported.image.content.detail().is_some())
                 })
         });
         // The initial accepted offer can construct the first shader owner.
@@ -1770,8 +1770,8 @@ pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDispl
         {
             return ExploreDisplay::paired(
                 surface,
-                paired.gallery.as_ref(),
-                paired.detail.as_ref(),
+                paired.content.gallery(),
+                paired.content.detail().as_ref(),
             );
         }
     }
@@ -1784,8 +1784,8 @@ pub(crate) fn explore_display(requested: Option<Surface>) -> Option<ExploreDispl
             {
                 return ExploreDisplay::paired(
                     pending.surface,
-                    pending.gallery.as_ref(),
-                    pending.detail.as_ref(),
+                    pending.content.gallery(),
+                    pending.content.detail().as_ref(),
                 );
             }
         }
@@ -1799,10 +1799,10 @@ pub(crate) fn drawable_annotation(requested: Surface) -> Option<(Surface, Annota
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
         SurfaceRenderer::submitted_draws(&renderer.pending, &renderer.imported, requested)
-            .find_map(|(_, pending)| Some((requested, pending.annotation.clone()?)))
+            .find_map(|(_, pending)| Some((requested, pending.content.annotation()?)))
             .or_else(|| {
                 let image = &renderer.imported.as_ref()?.image;
-                Some((image.retained()?, image.annotation.clone()?))
+                Some((image.retained()?, image.content.annotation()?))
             })
     })
 }
@@ -1813,7 +1813,20 @@ fn drawable_content<T>(
     pending_content: impl Fn(&PendingImage) -> Option<std::sync::Arc<T>>,
     retained_content: impl Fn(&ImagePublication) -> Option<std::sync::Arc<T>>,
 ) -> Option<(Surface, std::sync::Arc<T>)> {
-    if requested.frame?.content_session != crate::generated::presentation_source_session(kind) { return None; }
+    let frame = requested.frame?;
+    if frame.content_session != crate::generated::presentation_source_session(kind) { return None; }
+    let live = LIVE_READS.with(|reads| reads.borrow().iter().flatten()
+        .filter_map(std::sync::Weak::upgrade).any(|read| read.0 == frame));
+    let incumbent = RENDERER.with(|renderer| renderer.borrow().as_ref()
+        .and_then(|renderer| renderer.imported.as_ref())
+        .is_some_and(|imported| imported.image.retained().is_some() && retained_content(&imported.image).is_some()));
+    // Admit an accepted initial offer so the first shader can acquire its read.
+    // Replacements remain paired with the incumbent until their physical read exists.
+    if (live || (!incumbent && BORROWS.with(|borrows| borrows.get().contains(&Some(frame)))))
+        && let Some(pending) = metadata::pending(frame)
+        && pending.view_ready && same_allocation(requested, pending.surface)
+        && let Some(content) = pending_content(&pending)
+    { return Some((requested, content)); }
     RENDERER.with(|renderer| {
         let renderer = renderer.borrow();
         let renderer = renderer.as_ref()?;
@@ -1827,11 +1840,11 @@ fn drawable_content<T>(
 }
 pub(crate) fn drawable_prediction(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::PredictionContent>)> {
     drawable_content(requested, crate::generated::PresentationSourceKind::Predict,
-        |pending| pending.prediction.clone(), |image| image.prediction.clone())
+        |pending| pending.content.prediction(), |image| image.content.prediction())
 }
 pub(crate) fn drawable_validation(requested: Surface) -> Option<(Surface, std::sync::Arc<labels::ValidationContent>)> {
     drawable_content(requested, crate::generated::PresentationSourceKind::Validation,
-        |pending| pending.validation.clone(), |image| image.validation.clone())
+        |pending| pending.content.validation(), |image| image.content.validation())
 }
 
 pub(crate) struct Pipeline {
@@ -1875,17 +1888,13 @@ struct ImagePublication {
     pending_sample: Option<PendingImage>,
     completed: Option<FrameReady>,
     retained_read: Option<std::sync::Arc<SampleRead>>,
-    gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
-    detail: Option<DetailContent>,
-    annotation: Option<AnnotationContent>,
-    prediction: Option<std::sync::Arc<labels::PredictionContent>>,
-    validation: Option<std::sync::Arc<labels::ValidationContent>>,
+    content: metadata::Content,
     placement: Placement,
 }
 
 #[derive(Clone)]
 pub(crate) struct AnnotationContent {
-    pub(crate) diagnostics: Option<std::sync::Arc<crate::generated::AnnotationRenderedFacts>>,
+    pub(crate) metadata: std::sync::Arc<crate::generated::AnnotationImageMetadata>,
 }
 
 #[derive(Clone)]
@@ -1945,11 +1954,7 @@ impl DetailContent {
 struct PendingImage {
     read: Option<std::sync::Arc<SampleRead>>,
     surface: Surface,
-    gallery: Option<std::sync::Arc<crate::generated::ExploreImageMetadata>>,
-    detail: Option<DetailContent>,
-    annotation: Option<AnnotationContent>,
-    prediction: Option<std::sync::Arc<labels::PredictionContent>>,
-    validation: Option<std::sync::Arc<labels::ValidationContent>>,
+    content: metadata::Content,
     placement: Placement,
     complete: bool,
     view_ready: bool,
@@ -2228,8 +2233,8 @@ impl SurfaceRenderer {
             return;
         };
         let (surface, gallery) = submitted.map_or(
-            (imported.image.surface, imported.image.gallery.as_ref()),
-            |(_, pending)| (pending.surface, pending.gallery.as_ref()),
+            (imported.image.surface, imported.image.content.gallery()),
+            |(_, pending)| (pending.surface, pending.content.gallery()),
         );
         if !retained_draw_admitted(surface, requested, placement) {
             self.draws.remove(control);
@@ -2412,11 +2417,7 @@ impl SurfaceRenderer {
                 pending_sample: None,
                 completed: None,
                 retained_read: None,
-                gallery: gallery::matching(surface.frame),
-                detail: None,
-                annotation: None,
-                prediction: None,
-                    validation: None,
+                content: metadata::Content::from_gallery(gallery::matching(surface.frame)),
                 placement,
             },
             views,
@@ -2817,11 +2818,7 @@ impl ImagePublication {
     fn retire(&mut self) -> (Option<PendingImage>, Option<std::sync::Arc<SampleRead>>) {
         self.surface.frame = None;
         self.completed = None;
-        self.gallery = None;
-        self.detail = None;
-        self.annotation = None;
-        self.prediction = None;
-        self.validation = None;
+        self.content = metadata::Content::default();
         (self.pending_sample.take(), self.retained_read.take())
     }
 
@@ -2854,8 +2851,8 @@ impl ImagePublication {
         if let Some(pending) = self.submitted_draw(requested) {
             return ExploreDisplay::paired(
                 requested,
-                pending.gallery.as_ref(),
-                pending.detail.as_ref(),
+                pending.content.gallery(),
+                pending.content.detail().as_ref(),
             );
         }
         let retained = self.retained()?;
@@ -2864,7 +2861,7 @@ impl ImagePublication {
         } else {
             retained
         };
-        ExploreDisplay::paired(surface, self.gallery.as_ref(), self.detail.as_ref())
+        ExploreDisplay::paired(surface, self.content.gallery(), self.content.detail().as_ref())
     }
 
     fn retained(&self) -> Option<Surface> {
@@ -2908,11 +2905,7 @@ impl ImagePublication {
             .expect("matching completed sample");
         trace_surface("sample_promotion_started", pending.surface);
         self.surface = pending.surface;
-        self.gallery = pending.gallery;
-        self.detail = pending.detail;
-        self.annotation = pending.annotation;
-        self.prediction = pending.prediction;
-        self.validation = pending.validation;
+        self.content = pending.content;
         self.placement = pending.placement;
         self.completed = Some(frame);
         self.retained_read = pending.read;
@@ -2989,26 +2982,23 @@ impl Imported {
 
     fn reconcile_sample(&mut self, surface: Surface, placement: Placement) {
         let retained_surface = self.image.surface;
-        let retained_gallery = self.image.gallery.clone();
+        let retained_content = self.image.content.clone();
         let retained_placement = self.image.placement;
         self.image.surface = surface;
-        self.image.gallery = gallery::matching(surface.frame);
+        self.image.content = surface.frame.and_then(metadata::pending).map_or_else(metadata::Content::default, |pending| pending.content);
         self.image.placement = placement;
         self.sample();
         self.image.surface = retained_surface;
-        self.image.gallery = retained_gallery;
+        self.image.content = retained_content;
         self.image.placement = retained_placement;
     }
 
     fn prepare(&mut self, surface: Surface, placement: Placement) {
         let retained = self.image.surface;
-        let retained_gallery = self.image.gallery.clone();
+        let retained_content = self.image.content.clone();
         let retained_placement = self.image.placement;
-        self.image.gallery = gallery::matching(surface.frame).or_else(|| {
-            (self.image.completed == surface.frame)
-                .then(|| retained_gallery.clone())
-                .flatten()
-        });
+        self.image.content = surface.frame.and_then(metadata::pending).map(|pending| pending.content)
+            .unwrap_or_else(|| if self.image.completed == surface.frame { retained_content.clone() } else { metadata::Content::default() });
         self.image.placement = placement;
         self.image.surface = surface;
         self.sample();
@@ -3022,7 +3012,7 @@ impl Imported {
             && (self.image.completed != surface.frame
                 || !retained_draw_admitted(retained, surface, placement))
         {
-            self.image.gallery = retained_gallery;
+            self.image.content = retained_content;
             self.image.placement = retained_placement;
             self.image.surface = retained;
         }
@@ -3042,7 +3032,7 @@ impl Imported {
             return;
         }
         if matches!(self.image.placement, Placement::GalleryGrid { .. })
-            && self.image.gallery.is_none()
+            && self.image.content.gallery().is_none()
         {
             trace_image(
                 "sample_rejected",
@@ -3070,7 +3060,7 @@ impl Imported {
                 "",
                 self.image.surface,
                 self.image.surface,
-                self.image.gallery.as_deref(),
+                self.image.content.gallery().map(std::sync::Arc::as_ref),
                 None,
                 0,
             );
@@ -3102,7 +3092,7 @@ impl Imported {
                 "",
                 sample.surface,
                 self.image.surface,
-                sample.gallery.as_deref(),
+                sample.content.gallery().map(std::sync::Arc::as_ref),
                 None,
                 0,
             );
@@ -3608,11 +3598,7 @@ mod tests {
                     completed: Some(old),
                     pending_sample: None,
                     retained_read: Some(held_encoder.clone()),
-                    gallery: initial.gallery,
-                    detail: initial.detail,
-                    annotation: None,
-                    prediction: None,
-                    validation: None,
+                    content: initial.content,
                     placement: initial.placement,
                 };
                 let mut empty = model.explore.snapshot.clone().unwrap();
@@ -3689,11 +3675,7 @@ mod tests {
                     completed: Some(old),
                     pending_sample: None,
                     retained_read: SampleRead::acquire(old),
-                    gallery: initial.gallery,
-                    detail: initial.detail,
-                    annotation: None,
-                    prediction: None,
-                    validation: None,
+                    content: initial.content,
                     placement: initial.placement,
                 };
                 let mut source = crate::generated::ExploreImageMetadata::from(
@@ -3921,7 +3903,7 @@ mod tests {
                 )
                 .unwrap();
                 let pending = metadata::pending(physical).unwrap();
-                let detail = pending.detail.unwrap();
+                let detail = pending.content.detail().unwrap();
                 let surface = detail.configure_surface(pending.surface, original, 1);
                 let crop = surface.content_region();
                 record_drawn_detail(surface, crop);
@@ -4023,11 +4005,7 @@ mod tests {
                         completed: Some(old),
                         pending_sample: None,
                         retained_read: SampleRead::acquire(old),
-                        gallery: initial.gallery,
-                        detail: initial.detail,
-                        annotation: None,
-                        prediction: None,
-                    validation: None,
+                        content: initial.content,
                         placement: initial.placement,
                     };
                     snapshot.mode = if from_gallery {
@@ -4154,7 +4132,7 @@ mod tests {
         )
         .unwrap();
         let pending = metadata::pending(physical).unwrap();
-        let detail = pending.detail.unwrap();
+        let detail = pending.content.detail().unwrap();
         let surface = pending.surface;
         assert!(physical.matches_content(detail.frame()));
         let configured = detail.configure_surface(surface, true, 2);
@@ -4240,11 +4218,7 @@ mod tests {
                     completed: Some(old),
                     pending_sample: None,
                     retained_read: SampleRead::acquire(old),
-                    gallery: previous.gallery,
-                    detail: previous.detail,
-                    annotation: previous.annotation,
-                    prediction: previous.prediction,
-                    validation: previous.validation,
+                    content: previous.content,
                     placement: previous.placement,
                 };
                 let mut copy_notified = false;
@@ -4273,7 +4247,7 @@ mod tests {
                     let _ = image.promote(next, &model);
                     let promoted = copy_notified && position >= physical_position;
                     assert_eq!(image.completed, Some(if promoted { next } else { old }));
-                    let meaning = image.detail.as_ref().unwrap();
+                    let meaning = image.content.detail().unwrap();
                     assert_eq!(
                         meaning.scene().categories[0].value,
                         if promoted { "successor" } else { "predecessor" }
@@ -4291,7 +4265,7 @@ mod tests {
                     .overlay
                     .showlabels = false;
                 image.reconcile_pending(next, &model);
-                assert!(image.detail.as_ref().unwrap().overlay().showlabels);
+                assert!(image.content.detail().as_ref().unwrap().overlay().showlabels);
                 image.complete(next);
                 assert!(!image.promote(next, &model));
                 let obsolete = FrameReady {
@@ -4460,22 +4434,14 @@ mod tests {
                 pending_sample: Some(PendingImage {
                     read: Some(pending_read),
                     surface: pending_surface,
-                    gallery: None,
-                    detail: None,
-                    annotation: None,
-                    prediction: None,
-                    validation: None,
+                    content: metadata::Content::default(),
                     placement: Placement::Contain,
                     complete: true,
                     view_ready: true,
                 }),
                 completed: Some(frame),
                 retained_read: Some(read),
-                gallery: None,
-                detail: metadata::pending(frame).and_then(|image| image.detail),
-                annotation: None,
-                prediction: None,
-                    validation: None,
+                content: metadata::Content::from_detail(metadata::pending(frame).and_then(|image| image.content.detail())),
                 placement: Placement::Contain,
             };
             DRAW_AUTHORIZATION.with(|authorization| {
@@ -4486,7 +4452,7 @@ mod tests {
             assert!(image.retained().is_none());
             assert!(image.submitted_draw(pending_surface).is_none());
             assert!(image.completed.is_none() && image.surface.frame.is_none());
-            assert!(image.detail.is_none());
+            assert!(image.content.detail().is_none());
             assert_eq!(image.surface.high, surface.high);
             assert_eq!(image.surface.low, surface.low);
             assert_eq!(image.surface.width, surface.width);
@@ -5897,8 +5863,7 @@ mod tests {
         let initial = metadata::pending(first).unwrap();
         let mut image = ImagePublication {
             surface: initial.surface, completed: Some(first), pending_sample: None,
-            retained_read: SampleRead::acquire(first), gallery: None, detail: None, annotation: None,
-            prediction: initial.prediction, validation: initial.validation, placement: Placement::Contain,
+            retained_read: SampleRead::acquire(first), content: initial.content, placement: Placement::Contain,
         };
         let mut viewport = ViewportOwner::default();
         viewport.synchronize_source(image.retained().unwrap());

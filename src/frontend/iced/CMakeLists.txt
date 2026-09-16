@@ -98,6 +98,9 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         "${_mmltk_iced_source_dir}/*.ttf"
         "${_mmltk_iced_source_dir}/*.toml"
         "${_mmltk_iced_source_dir}/*.wgsl"
+        "${CMAKE_SOURCE_DIR}/third_party/iced_plot/*.rs"
+        "${CMAKE_SOURCE_DIR}/third_party/iced_plot/*.toml"
+        "${CMAKE_SOURCE_DIR}/third_party/iced_plot/*.wgsl"
     )
     set(_mmltk_frontend_build_inputs
         "${MMLTK_APPLICATION_BINDINGS}"

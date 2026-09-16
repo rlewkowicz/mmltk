@@ -72,8 +72,12 @@ impl Router {
     pub fn rebase(&mut self, feature: FeatureId, model: &ApplicationModel) {
         self.active = feature;
         self.train.rebase(model);
+        self.sync_workflows(model);
     }
 
+    pub fn sync_workflows(&mut self, model: &ApplicationModel) {
+        self.train.sync_metrics(model, self.active == FeatureId::Train);
+    }
     pub fn install_authoritative_components(&mut self, model: &ApplicationModel) {
         self.explore.rebase(model);
         self.annotation.rebase(model);
@@ -100,7 +104,7 @@ impl Router {
 
     pub fn reset_transport(&mut self, model: &ApplicationModel) {
         self.active = FeatureId::Train;
-        self.train = train::Component::default();
+        self.train.reset(true);
         self.validate = validate::Component::default();
         self.predict = predict::Component::default();
         self.export = export::Component::default();
@@ -270,7 +274,7 @@ impl Router {
         match self.active {
             FeatureId::Train => self
                 .train
-                .view(model, settings.state(), surface, width)
+                .view(model, settings.state(), width)
                 .map(Message::Train),
             FeatureId::Validate => self
                 .validate

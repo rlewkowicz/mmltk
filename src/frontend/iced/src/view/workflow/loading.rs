@@ -99,6 +99,9 @@ pub fn view<'a>(
     settings: &SettingsModel,
     enabled: bool,
 ) -> Element<'a, Message> {
+    if matches!(feature, FeatureId::Train | FeatureId::Validate | FeatureId::Predict) {
+        return space::vertical().height(0).into();
+    }
     let Some(fields) = settings
         .draft
         .as_ref()

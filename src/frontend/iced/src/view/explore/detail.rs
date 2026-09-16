@@ -73,17 +73,11 @@ pub(super) fn view<'a>(
     let overlay = state
         .presented_filter(model.explore.snapshot.as_ref())
         .map_or_else(|| content.overlay().clone(), |request| request.overlay);
-    let image = crate::presentation_surface::labels::view(
-        crate::presentation_surface::Program {
-            show_fps: crate::workspace_fps::enabled(settings),
-            input: Some(input.for_source(content.frame().source.kind, 0, None)),
-            local: None,
-            surface: content.configure_surface(surface, original, state.fit_revision),
-            publish: None,
-            placement: crate::presentation_surface::Placement::Contain,
-            control_id: super::DETAIL_WORKSPACE_ID,
-        },
-        crate::presentation_surface::labels::Source::Detail(content, overlay.showlabels),
+    let image = crate::view::image_viewer::image(
+        content.configure_surface(surface, original, state.fit_revision),
+        crate::presentation_surface::labels::Source::Detail(content.clone(), overlay.showlabels),
+        Some(input.for_source(content.frame().source.kind, 0, None)),
+        crate::workspace_fps::enabled(settings), super::DETAIL_WORKSPACE_ID,
     );
     let active = model.displayed_upscale_kernel();
     let pending = model

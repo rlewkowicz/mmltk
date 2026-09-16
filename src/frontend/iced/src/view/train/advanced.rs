@@ -263,6 +263,16 @@ mod tests {
     use crate::view::settings::installed_settings_model;
 
     #[test]
+    fn ema_uses_the_canonical_false_default_and_round_trips_edits() {
+        let mut model = installed_settings_model();
+        assert!(!model.draft.as_ref().unwrap().workflows.train.request.useema);
+        for enabled in [true, false] {
+            update(&mut model, Message::Ema(enabled)).unwrap();
+            assert_eq!(model.draft.as_ref().unwrap().workflows.train.request.useema, enabled);
+        }
+    }
+
+    #[test]
     fn recipe_edits_pin_values_and_reset_clears_the_basic_override_set() {
         let mut model = installed_settings_model();
         update(&mut model, Message::DecoderLearningRate(0.002)).unwrap();

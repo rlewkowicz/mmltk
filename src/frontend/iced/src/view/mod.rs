@@ -1,3 +1,5 @@
+pub mod metrics;
+pub mod image_viewer;
 pub mod annotation;
 pub mod aspect_ratio;
 pub mod diagnostics;

@@ -165,6 +165,7 @@ impl App {
             }
         }
         let _ = self.model.reduce_reply(reply.correlation, decoded);
+        self.workspace.sync_workflows(&self.model);
         let installed_settings = self
             .model
             .settings_snapshot
@@ -219,6 +220,7 @@ impl App {
         let reconcile_explore = system == crate::generated::ApplicationSystem::Explore;
         let explore_failed = Self::explore_event_failed(&event.event);
         let _ = self.model.reduce_event(event.event);
+        self.workspace.sync_workflows(&self.model);
         if install_component_snapshots {
             self.workspace.install_authoritative_components(&self.model);
         }

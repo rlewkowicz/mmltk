@@ -397,6 +397,8 @@ class BindingEmitter final {
         EmitSettingsHelpers();
         EmitSettingsRelations();
         EmitCatalogs();
+        EmitScalarProjection<mmltk::backend::models::rfdetr::TrainingScalars>();
+
     }
 
    private:
@@ -1266,6 +1268,33 @@ class BindingEmitter final {
         }
     }
 
+    // Structural access for a homogeneous scalar record. Native declaration order
+    // supplies the only member inventory; Rust owns grouping and visual copy.
+    template <class Record>
+    void EmitScalarProjection() {
+        std::size_t count = 0;
+        VisitRustFields<Record>([&]<class Field, class>(const auto&, const std::string&) {
+            static_assert(std::same_as<Field, std::optional<double>>);
+            ++count;
+        });
+        const auto field_type = rust_type<Record>() + "Field";
+        symbols_.Reserve("module", field_type, NativeSource<Record>() + " scalar projection");
+        output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {";
+        VisitRustFields<Record>([&]<class, class>(const auto& fact, const std::string&) {
+            output_ << rust_identifier(fact.member_name, true) << ',';
+        });
+        output_ << "}\nimpl " << rust_type<Record>() << " {\npub const FIELDS: [(" << field_type
+                << ", &'static str); " << count << "] = [";
+        VisitRustFields<Record>([&]<class, class>(const auto& fact, const std::string&) {
+            output_ << '(' << field_type << "::" << rust_identifier(fact.member_name, true) << ',' << std::quoted(fact.member_name) << "),";
+        });
+        output_ << "];\npub fn values(&self) -> [Option<f64>; " << count << "] { [";
+        VisitRustFields<Record>([&]<class, class>(const auto&, const std::string& member) {
+            output_ << "self." << member << ',';
+        });
+        output_ << "] }\n}\n";
+    }
+
     void EmitImageMetadata() {
         Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
             EmitRecordProjection<typename Projection::snapshot_type, typename Projection::image_type>(false, false);
@@ -1277,7 +1306,7 @@ class BindingEmitter final {
         symbols_.Reserve("module", "decode_workspace_image_product", "canonical visual source image projections");
         output_ << "#[derive(Debug, Clone, PartialEq)]\npub enum WorkspaceImageProduct {\n";
         Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
-            output_ << rust_identifier(Cell::name, true) << '(' << rust_type<typename Projection::image_type>() << "),\n";
+            output_ << rust_identifier(Cell::name, true) << "(std::sync::Arc<" << rust_type<typename Projection::image_type>() << ">),\n";
         });
         output_ << "}\npub fn decode_workspace_image_product(system_id: u64, value: Value) -> Result<WorkspaceImageProduct, String> { "
                    "match system_id {\n";
@@ -1287,7 +1316,7 @@ class BindingEmitter final {
                     << "if presentation_source_session(image.frame.source.kind) != "
                     << mmltk::controller::presentation_source_session(Projection::kind)
                     << " { return Err(\"workspace image product kind mismatch\".into()); }\n"
-                    << "Ok(WorkspaceImageProduct::" << rust_identifier(Cell::name, true) << "(image)) },\n";
+                    << "Ok(WorkspaceImageProduct::" << rust_identifier(Cell::name, true) << "(std::sync::Arc::new(image))) },\n";
         });
         output_ << "_ => Err(\"unknown workspace image product\".into()), } }\n";
     }

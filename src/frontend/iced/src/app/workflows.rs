@@ -38,12 +38,21 @@ impl App {
         }
     }
 
+    fn show_live_training(&mut self) {
+        self.model.workflow.training_run = None;
+        self.model.workflow.training_history = None;
+        self.workspace.sync_workflows(&self.model);
+    }
+
     fn request_start(&mut self, feature: FeatureId) {
         if feature == FeatureId::Train { self.model.workflow.resume_ready = None; }
         if !self.settings.draft().is_some_and(|draft| self.model.compute_start_available(draft, feature)) { return; }
         let Some(inputs) = self.settings.draft().and_then(|draft| crate::view_model::StartInputs::capture(draft, feature)) else {
             return;
         };
+        if feature == FeatureId::Train {
+            self.show_live_training();
+        }
         self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
             feature, inputs, preparation: StartPreparation::Waiting, resume_checkpoint: None,
         });
@@ -58,6 +67,7 @@ impl App {
                 if self.settings.draft().is_some_and(|draft| draft.workflows.train.request.resumepath == checkpoint.path)
                     && !self.settings_unsettled() {
                     let checkpoint = self.model.workflow.resume_ready.take().unwrap();
+                    self.show_live_training();
                     let inputs = crate::view_model::StartInputs::capture(self.settings.draft().unwrap(), FeatureId::Train).unwrap();
                     self.model.workflow.pending_start = Some(crate::view_model::PendingStart {
                         feature: FeatureId::Train, inputs, preparation: StartPreparation::Waiting,
@@ -277,6 +287,21 @@ impl App {
 
     pub(super) fn on_train(&mut self, outcome: crate::view::train::Outcome) -> Task<Message> {
         match outcome {
+            crate::view::train::Outcome::Output(message) => {
+                use crate::view::train::output::Message as Output;
+                match message {
+                    Output::Browse(id) => self.open_dialog(id),
+                    Output::Live => self.show_live_training(),
+                    Output::Open(directory) => { self.submit_intent(ApplicationIntentEndpoint::TrainingOpenRun, |correlation|
+                        crate::generated::encode_training_OpenRun(correlation, crate::generated::TrainingDirectoryQuery { directory })); },
+                    Output::History(query) => { self.submit_intent(ApplicationIntentEndpoint::TrainingHistory, |correlation|
+                        crate::generated::encode_training_History(correlation, query)); },
+                    Output::Inspect(path) => { self.submit_intent(ApplicationIntentEndpoint::TrainingInspectCheckpoint, |correlation|
+                        crate::generated::encode_training_InspectCheckpoint(correlation, crate::generated::TrainingCheckpointQuery { path })); },
+                    Output::Resume(path) => { self.submit_intent(ApplicationIntentEndpoint::TrainingPrepareResume, |correlation|
+                        crate::generated::encode_training_PrepareResume(correlation, crate::generated::TrainingCheckpointQuery { path })); },
+                }
+            }
             crate::view::train::Outcome::CompileRequested => {
                 if self.settings.has_local_edits() || !self.model.dataset_compile_available() {
                     self.model.error = Some(UiError::busy(
@@ -408,6 +433,19 @@ impl App {
 
     pub(super) fn on_validate(&mut self, outcome: crate::view::validate::Outcome) -> Task<Message> {
         match outcome {
+            crate::view::validate::Outcome::Details(query) => { self.submit_intent(ApplicationIntentEndpoint::ValidationDetails,
+                |correlation| crate::generated::encode_validation_Details(correlation, query)); }
+            crate::view::validate::Outcome::Sample(message) => {
+                use crate::view::validate::samples::Message as Sample;
+                match message {
+                    Sample::Select(identity) => { self.submit_intent(ApplicationIntentEndpoint::ValidationSelectSample,
+                        |correlation| crate::generated::encode_validation_SelectSample(correlation, identity)); }
+                    Sample::Close => { self.submit_intent(ApplicationIntentEndpoint::ValidationCloseDetail, crate::generated::encode_validation_CloseDetail); }
+                    Sample::Overlays(overlays) => { self.submit_intent(ApplicationIntentEndpoint::ValidationSetOverlays,
+                        |correlation| crate::generated::encode_validation_SetOverlays(correlation, overlays)); }
+                    Sample::Fit | Sample::Labels(..) => {}
+                }
+            }
             crate::view::validate::Outcome::StartRequested => {
                 self.request_start(FeatureId::Validate);
             }
@@ -566,6 +604,57 @@ mod tests {
         let CapturedRecord::Intent(intent) = capture.try_recv().expect("submitted intent") else { panic!("expected intent"); };
         assert_eq!(crate::generated::decode_application_intent_endpoint(intent.endpoint_id), Some(expected));
         intent
+    }
+
+    #[test]
+    fn output_inspection_and_history_use_direct_operations_without_starting() {
+        use crate::view::train::{Outcome, output::Message as Output};
+        for (message, endpoint) in [
+            (Output::Open("/saved/run".into()), ApplicationIntentEndpoint::TrainingOpenRun),
+            (Output::Inspect("/copied/full.pt".into()), ApplicationIntentEndpoint::TrainingInspectCheckpoint),
+            (Output::History(crate::generated::TrainingHistoryQuery { generation: 7, cursor: 128, count: 32 }), ApplicationIntentEndpoint::TrainingHistory),
+        ] {
+            let (mut app, mut capture) = start_app();
+            drop(app.on_train(Outcome::Output(message)));
+            next_intent(&mut capture, endpoint);
+            assert!(app.model.workflow.pending_start.is_none());
+            assert!(app.model.workflow.resume_ready.is_none());
+            assert!(capture.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn start_resume_and_live_selection_invalidate_selected_history_immediately() {
+        for action in 0..3 {
+            let resume = action == 1;
+            let (mut app, _capture) = start_app();
+            app.model.workflow.training_history = Some(crate::generated::TrainingHistoryPage {
+                generation: 7, nextcursor: 32, more: true, records: Vec::new(),
+            });
+            if resume {
+                let snapshot = app.model.settings_snapshot.as_mut().unwrap();
+                snapshot.settingsstate.workflows.train.request.resumepath = "/saved/full.pt".into();
+                app.settings.install(snapshot);
+                app.model.workflow.resume_ready = Some(crate::generated::TrainingCheckpoint {
+                    path: "/saved/full.pt".into(), attemptid: "old".into(), originalweights: String::new(),
+                    originalclassdescriptor: String::new(), resumable: true, epoch: 1,
+                    configuration: None, classlayout: None, evaluatedweights: crate::generated::EvaluatedWeights::Ordinary,
+                });
+                app.advance_start();
+            } else if action == 0 {
+                app.request_start(FeatureId::Train);
+            } else {
+                drop(app.on_train(crate::view::train::Outcome::Output(crate::view::train::output::Message::Live)));
+            }
+            assert!(app.model.workflow.training_run.is_none());
+            assert!(app.model.workflow.training_history.is_none());
+            if action == 2 {
+                assert!(app.model.workflow.pending_start.is_none());
+            } else {
+                let pending = app.model.workflow.pending_start.as_ref().unwrap();
+                assert_eq!(pending.resume_checkpoint.is_some(), resume);
+            }
+        }
     }
 
     #[test]

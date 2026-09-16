@@ -273,6 +273,12 @@ int main(const int argument_count, char* const* const arguments) {
     training_record.evaluated_weights = rfdetr::EvaluatedWeights::Ema;
     training_record.progress.phase = rfdetr::TrainingPhase::EpochComplete;
     training_record.progress.scalars.total = 1.25;
+    training_record.progress.scalars.learning_rate = 0.0001;
+    training_record.progress.scalars.learning_rate_min = 0.00001;
+    training_record.progress.scalars.learning_rate_max = 0.001;
+    training_record.progress.scalars.correspondence_weighted = 0.25;
+    training_record.progress.full_checkpoint_path = "/copied/full.pt";
+    training_record.progress.checkpoint_path = "/run/epoch.pth";
     training_record.progress.val.emplace();
     training_record.progress.val->bbox.ap = 0.625;
     rfdetr::TrainingHistoryPage training_page;
