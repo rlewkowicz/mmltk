@@ -69,6 +69,7 @@ constexpr auto kWaylandStartupDeadline = std::chrono::seconds{20};
 constexpr auto kWaylandInteractionDeadline = std::chrono::seconds{6};
 constexpr auto kWaylandWorkDeadline = std::chrono::seconds{15};
 constexpr auto kWaylandFailureSettlementDeadline = std::chrono::seconds{5};
+// CLEANUP-IGNORE: Acceptance opt-in and desktop opt-in are independent process gates, not a shared runtime owner.
 constexpr auto kWaylandShutdownDeadline = std::chrono::seconds{15};
 [[nodiscard]] bool execution_requested() noexcept {
     const char* const requested = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION");
@@ -583,6 +584,7 @@ int WaylandSession::PollEvents(std::array<pollfd, 4U>& events) const {
         {.fd = process_->control_fd(), .events = POLLIN, .revents = 0},
         {.fd = deadline.get(), .events = POLLIN, .revents = 0},
     }};
+    // CLEANUP-IGNORE: Wayland waits on its own four descriptors and returns status; subprocess capture has different failure policy.
     int ready = -1;
     do { ready = ::poll(events.data(), events.size(), -1); } while (ready < 0 && errno == EINTR);
     return ready;

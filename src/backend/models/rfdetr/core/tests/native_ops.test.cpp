@@ -634,6 +634,7 @@ TEST_CASE("Criterion losses and gradients share one assignment upload under both
         if (!(status == CUDA_SUCCESS && mmap) && ::access("/dev/gdrdrv", R_OK | W_OK) != 0)
             SKIP("GDR unavailable; criterion GDR loss and gradient parity remain unverified");
     }
+    // CLEANUP-IGNORE: Criterion parity owns its device placement after its transport-specific hardware admission.
     const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
     const auto& p = execution.placement;
     mmltk::common::system::ScopedExecutionPolicy policy({p.cpus, {}, 0, p.numa_node, -10, false});

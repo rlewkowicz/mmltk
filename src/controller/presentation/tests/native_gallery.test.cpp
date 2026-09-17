@@ -1824,6 +1824,7 @@ TEST_CASE("Native initialization rollback resumes held incumbent input through a
             // supersession state and has different wake and failure ownership.
         } catch (...) {}
     };
+    // CLEANUP-IGNORE: Rollback owns this acceptance socket and gate lifetime independently of the supersession interleave scenario.
     std::array<int, 2U> sockets{};
     REQUIRE(::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets.data()) == 0);
     mmltk::common::io::ScopedFd commands{sockets[0U]};

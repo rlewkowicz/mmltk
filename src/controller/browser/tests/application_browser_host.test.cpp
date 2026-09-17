@@ -85,6 +85,7 @@ template <class Composition>
 [[nodiscard]] consteval bool reflected_event_ids_are_exhaustive() {
     std::vector<std::uint64_t> identities;
     std::size_t system_count = 0U;
+    // CLEANUP-IGNORE: Stable system IDs and exhaustive event IDs are independent compile-time oracles over different facts.
     bool matched = true;
     template for (constexpr auto reflected_member :
                   std::define_static_array(std::meta::nonstatic_data_members_of(^^Composition, std::meta::access_context::unchecked()))) {
@@ -555,6 +556,7 @@ TEST_CASE("application interaction rejection emits bounded endpoint and error di
     diagnostics.close(services::DiagnosticsCloseMode::Discard);
 }
 TEST_CASE("direct host closes a real peer when an interaction endpoint is unknown") {
+    // CLEANUP-IGNORE: This peer setup precedes deliberate opcode corruption; the other scenario checks a valid rejected interaction.
     RunningHost server{OpenPressure::None};
     LoopbackWebSocket peer{server.websocket()};
     REQUIRE(peer.receive());

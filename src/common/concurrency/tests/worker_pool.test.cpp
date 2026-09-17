@@ -205,6 +205,7 @@ TEST_CASE("Child pools use immutable placement after the creator is pinned", "[c
     CHECK(observed.second.numa_node == placement.numa_node);
     CHECK(observed.second.nice_value <= -10);
 }
+// CLEANUP-IGNORE: Overlapping worker budgets and nested child placement independently capture their creator topology.
 TEST_CASE("Placed worker budgets overlap one local CPU with stable assignments", "[common][concurrency][worker_pool]") {
     using namespace mmltk::common::system;
     const auto topology = NumaTopology::Capture();

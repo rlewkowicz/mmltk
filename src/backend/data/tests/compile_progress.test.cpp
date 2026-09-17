@@ -53,10 +53,7 @@ void expect_compile_failure(const FixtureSpec& fixture, const std::function<void
     create_synthetic_dataset(fixture);
     const fs::path annotation_path = fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl";
     mutate(annotation_path);
-    CompilerConfig config;
-    config.source_dir = dataset_dir(fixture);
-    config.output_dir = fixture.root_dir + "/compiled";
-    config.split = fixture.split;
+    auto config = compiler_config(fixture);
     config.target_width = static_cast<uint32_t>(target_width > 0 ? target_width : fixture.width);
     config.target_height = static_cast<uint32_t>(target_height > 0 ? target_height : fixture.height);
     config.num_workers = 2;
@@ -76,10 +73,7 @@ void overwrite_annotation(const fs::path& annotation_path, const std::string& re
     file << record << "\n";
 }
 void compile_resized_fixture(const FixtureSpec& fixture) {
-    CompilerConfig config;
-    config.source_dir = dataset_dir(fixture);
-    config.output_dir = compiled_dir(fixture);
-    config.split = fixture.split;
+    auto config = compiler_config(fixture);
     config.target_width = 8;
     config.target_height = 8;
     config.num_workers = 2;
@@ -96,10 +90,7 @@ void compile_resized_fixture(const FixtureSpec& fixture) {
 }
 [[nodiscard]] DatasetCompilePlan prepare_cancellation_compile(const FixtureSpec& fixture) {
     create_synthetic_dataset(fixture);
-    CompilerConfig config;
-    config.source_dir = dataset_dir(fixture);
-    config.output_dir = fixture.root_dir + "/compiled";
-    config.split = fixture.split;
+    auto config = compiler_config(fixture);
     config.target_width = 32U;
     config.target_height = 32U;
     return DatasetCompiler::prepare(config, {config.split});
@@ -264,10 +255,7 @@ void test_compile_progress_reports_monotonic_updates() {
         root.path().string(), "train", 257, 193, 96,
     };
     create_synthetic_dataset(fixture);
-    CompilerConfig config;
-    config.source_dir = dataset_dir(fixture);
-    config.output_dir = fixture.root_dir + "/compiled";
-    config.split = fixture.split;
+    auto config = compiler_config(fixture);
     config.target_width = 97;
     config.target_height = 73;
     config.num_workers = 4;
@@ -356,10 +344,7 @@ void test_snapshot_overlaps_compile_reset() {
         root.path().string(), "train", 16, 16, 1,
     };
     create_synthetic_dataset(fixture);
-    CompilerConfig config;
-    config.source_dir = dataset_dir(fixture);
-    config.output_dir = fixture.root_dir + "/compiled";
-    config.split = fixture.split;
+    auto config = compiler_config(fixture);
     config.target_width = 16U;
     config.target_height = 16U;
     config.num_workers = 1;
@@ -449,12 +434,7 @@ TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense 
             output << categories;
         };
         write();
-        CompilerConfig config;
-        config.source_dir = dataset_dir(fixture);
-        config.output_dir = compiled_dir(fixture);
-        config.split = fixture.split;
-        config.target_width = fixture.width;
-        config.target_height = fixture.height;
+        const auto config = compiler_config(fixture);
         const auto plan = DatasetCompiler::prepare(config, {fixture.split});
         CHECK(plan.class_map.at("person") == 0);
         CHECK(plan.class_map.at("ret") == 1);

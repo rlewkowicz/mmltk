@@ -47,6 +47,7 @@ class ExportSystem::Impl final {
          std::optional<mmltk::frameworks::gpu::DeviceExecution> execution)
         : settings_(settings), model_(model), factory_(std::move(factory)), events_(std::move(events)), configuration_{std::move(execution)} {
         if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
+        // CLEANUP-IGNORE: Export and validation have distinct admission and worker preparation after this common settings guard.
     }
     ~Impl() { Shutdown(); }
     [[nodiscard]] contracts::ComputeUiState Start() {

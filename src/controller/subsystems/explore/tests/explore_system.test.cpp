@@ -337,6 +337,7 @@ class CancellableOpenPreparationAlgorithm final : public SynchronousExploreAlgor
     std::optional<std::uint32_t> Adjacent(const std::uint32_t value, std::int64_t) const override {
         return Contains(value) ? std::optional{value} : std::nullopt;
     }
+    // CLEANUP-IGNORE: These fake algorithms publish different semantic-plane values; only their clean-plane fill is shared.
     void RenderProduct(const ExploreRenderPlan& plan, const ExploreOrderCandidate*, std::size_t, const mmltk::frameworks::gpu::ImagePlaneView clean,
                        const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) override {
         Fill(clean, static_cast<std::uint8_t>(plan.generation));
@@ -1135,7 +1136,9 @@ TEST_CASE("Explore prepared-product failure restores exact borrows or retires fa
     // persistence failure, so their identical admission preamble is not shared behavior.
     StreamingExploreFixture scenario{2U};
     auto& explore = scenario.system();
+    // CLEANUP-IGNORE: This streaming admission precedes an independent failure or stop scenario and keeps its causal wait visible.
     scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    // CLEANUP-IGNORE: This scenario observes allocation before its specific rollback, stop, or pre-read transition.
     scenario.probe().AllowAllocation();
     REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
     const auto incumbent = explore.snapshot();
@@ -1175,7 +1178,9 @@ TEST_CASE("Explore Stop abandons unfinished thumbnails while retaining completed
     // CLEANUP-IGNORE: Stop coverage deliberately creates unfinished lanes but does not configure candidate failure.
     StreamingExploreFixture scenario{2U};
     auto& explore = scenario.system();
+    // CLEANUP-IGNORE: This streaming admission precedes an independent failure or stop scenario and keeps its causal wait visible.
     scenario.OpenAndWait({.extent = {8U, 4U}, .row_count = 1U, .columns = 2U});
+    // CLEANUP-IGNORE: This scenario observes allocation before its specific rollback, stop, or pre-read transition.
     scenario.probe().AllowAllocation();
     REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
     const auto incumbent = explore.snapshot();
@@ -1279,6 +1284,7 @@ TEST_CASE("Explore render mutations abort queued lanes before failed cancelled a
             const auto enabled = explore.UpdateAugmentation({.enabled = true});
             REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > enabled.revision; }));
         }
+        // CLEANUP-IGNORE: This scenario observes allocation before its specific rollback, stop, or pre-read transition.
         scenario.probe().AllowAllocation();
         REQUIRE(scenario.probe().Wait([&] { return scenario.probe().assignments.size() == 2U; }));
         scenario.probe().AllowPreRead();
@@ -1508,6 +1514,7 @@ TEST_CASE("Explore storage diagnostics aggregate renderer and all three output s
         CHECK(capture.storage.context.augmentation_pinned_bytes == 25U);
     }
     const auto before_restore = explore.snapshot().frame.revision;
+    // CLEANUP-IGNORE: The second toggle restores the overlay and independently observes its completed revision before shutdown.
     overlay.show_masks = !overlay.show_masks;
     static_cast<void>(explore.UpdateOverlay(overlay));
     REQUIRE(events.Wait([&] {
@@ -1854,6 +1861,7 @@ TEST_CASE("Explore Open rejects a settings candidate made stale during rendering
 }
 TEST_CASE("failed and cancelled Explore opens preserve the last successful catalog preferences") {
     SECTION("failed open") {
+        // CLEANUP-IGNORE: Failed-open preservation requires an independent settings/backend lifetime from successful catalog replacement.
         LoadedSettings settings;
         auto backend = std::make_shared<FakeImageBackend>();
         ExploreScenario scenario{settings, backend};
@@ -1944,6 +1952,7 @@ TEST_CASE("Explore shuffled policy rerolls with a fresh resolved seed and valida
         .filter = {.maximum_compiled_index = 2U, .order = ExploreOrder::Shuffled, .shuffle_seed = 97U},
         .overlay = {},
     };
+    // CLEANUP-IGNORE: Seeded filter admission is an independent prerequisite for the reroll oracle, not catalog-selection preservation.
     auto admitted = explore.UpdateFilter(shuffled);
     REQUIRE(scenario.Wait([&] { return !explore.snapshot().busy && explore.snapshot().revision > admitted.revision; }));
     CHECK(explore.snapshot().order.shuffle_seed == 97U);
@@ -2467,6 +2476,7 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
 }
 TEST_CASE("post-render Explore cancellation restores the committed gallery product") {
     const auto run = [](const bool selection) {
+        // CLEANUP-IGNORE: Cancellation owns a separate post-render gate from stale settings persistence and observes different rollback facts.
         auto backend = std::make_shared<FakeImageBackend>();
         auto gate = std::make_shared<ExplorePostRenderGate>(1U);
         auto entered = gate->entered.get_future();
@@ -2601,6 +2611,7 @@ TEST_CASE("stopping Explore retains busy until its admitted operation settles") 
     CHECK(explore.snapshot().revision > stopping.revision);
     CHECK(explore.snapshot().frame.revision == completed);
 }
+// CLEANUP-IGNORE: Filter cancellation tracks native commit ownership; lifecycle Stop observes a different admitted operation.
 TEST_CASE("cancelled Explore filter retains one native and public committed order") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<CancellationProbe>();

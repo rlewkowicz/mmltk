@@ -187,6 +187,7 @@ struct JsonFieldReader {
         if (!found->is_string()) return;
         if (const auto parsed = mmltk::backend::models::rfdetr::train_lr_scheduler_from_spelling(found->get<std::string>())) value = *parsed;
     }
+    // CLEANUP-IGNORE: Assignment rejects invalid strings; scheduler loading tolerates legacy integers and ignores unsupported values.
     void operator()(const char* key, mmltk::backend::models::rfdetr::TrainAssignmentKind& value) const {
         const auto found = json.find(key);
         if (found == json.end()) return;
@@ -200,11 +201,13 @@ struct JsonFieldReader {
         get_optional(json, key, index);
         value = model_input_from_index(index, value);
     }
+    // CLEANUP-IGNORE: This enum retains its own persisted integer admission and fallback policy; adjacent enum policies differ.
     void operator()(const char* key, ModelSelectionSource& value) const {
         int index = static_cast<int>(value);
         get_optional(json, key, index);
         value = model_selection_source_from_index(index, value);
     }
+    // CLEANUP-IGNORE: This enum retains its own persisted integer admission and fallback policy; adjacent enum policies differ.
     void operator()(const char* key, ExploreDatasetSource& value) const {
         int index = static_cast<int>(value);
         get_optional(json, key, index);
@@ -212,11 +215,13 @@ struct JsonFieldReader {
                     ? static_cast<ExploreDatasetSource>(index)
                     : ExploreDatasetSource::Train;
     }
+    // CLEANUP-IGNORE: This enum retains its own persisted integer admission and fallback policy; adjacent enum policies differ.
     void operator()(const char* key, ExploreOrder& value) const {
         int index = static_cast<int>(value);
         get_optional(json, key, index);
         value = index == static_cast<int>(ExploreOrder::Shuffled) ? ExploreOrder::Shuffled : ExploreOrder::Sequential;
     }
+    // CLEANUP-IGNORE: This enum retains its own persisted integer admission and fallback policy; adjacent enum policies differ.
     void operator()(const char* key, ExploreDetailScaleMode& value) const {
         int index = static_cast<int>(value);
         get_optional(json, key, index);

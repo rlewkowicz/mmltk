@@ -80,6 +80,7 @@ void LiveManualOverlayWorker::ScrubProduct(Slot& slot) noexcept {
     slot.has_content = false;
 }
 void LiveManualOverlayWorker::publish_slot(Slot& slot, const SlotState published) noexcept {
+    // CLEANUP-IGNORE: Publication already uses the shared slot helper; the adjacent stop functions settle different product resources.
     publish_latest_live_owner_slot(latest_, slot.index, slot.state, published, [&slot] noexcept { ScrubProduct(slot); });
 }
 void LiveManualOverlayWorker::stop() noexcept {

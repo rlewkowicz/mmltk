@@ -275,6 +275,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
         if (direct_shuffle_span) {
             for (size_t i = 0; i < batch.num_images; ++i) { REQUIRE(batch.image_indices[i] == batch.image_indices[0] + i); }
         }
+        // CLEANUP-IGNORE: Shuffled-batch transfer has its own host-view invalidation oracle; retain the explicit handoff and release boundary.
         shuffled_loader.handoff_batch(batch, compute_stream);
         ensure_cuda_ok(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, compute_stream), "cudaMemsetAsync");
         shuffled_loader.release_batch(batch, compute_stream);
@@ -349,13 +350,11 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     shard0_loader.begin_epoch();
     shard1_loader.begin_epoch();
     std::vector<uint32_t> sharded_seen;
-    while (shard0_loader.next_batch(batch)) {
-        sharded_seen.insert(sharded_seen.end(), batch.image_indices, batch.image_indices + batch.num_images);
-        shard0_loader.release_batch(batch);
-    }
-    while (shard1_loader.next_batch(batch)) {
-        sharded_seen.insert(sharded_seen.end(), batch.image_indices, batch.image_indices + batch.num_images);
-        shard1_loader.release_batch(batch);
+    for (auto* loader : std::array{&shard0_loader, &shard1_loader}) {
+        while (loader->next_batch(batch)) {
+            sharded_seen.insert(sharded_seen.end(), batch.image_indices, batch.image_indices + batch.num_images);
+            loader->release_batch(batch);
+        }
     }
     shard0_loader.synchronize();
     shard1_loader.synchronize();
@@ -472,9 +471,6 @@ void test_roundtrip_end_to_end() {
     profile_set_run_label("test_roundtrip");
     const mmltk::testsupport::ScopedTempDir root("mmltk_roundtrip");
     const FixtureSpec fixture{root.path().string(), "train", 65, 65, 20};
-    const std::string dataset_dir_path = dataset_dir(fixture);
-    const std::string compiled_dir_path = compiled_dir(fixture);
-    const std::string split = fixture.split;
     const int W = fixture.width;
     const int H = fixture.height;
     const int NUM_IMAGES = fixture.num_images;
@@ -485,12 +481,7 @@ void test_roundtrip_end_to_end() {
     const auto compute_stream = reinterpret_cast<cudaStream_t>(owned_stream.native_handle());
     create_synthetic_dataset(fixture);
     printf("=== Test dataset: %d images at %dx%d ===\n", NUM_IMAGES, W, H);
-    CompilerConfig ccfg;
-    ccfg.source_dir = dataset_dir_path;
-    ccfg.output_dir = compiled_dir_path;
-    ccfg.split = split;
-    ccfg.target_width = W;
-    ccfg.target_height = H;
+    auto ccfg = compiler_config(fixture);
     ccfg.num_workers = 2;
     const DatasetCompilePlan compile_plan = DatasetCompiler::prepare(ccfg, {ccfg.split});
     DatasetCompiler::compile(compile_plan, 0U);
@@ -541,8 +532,7 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
     mmltk::testsupport::ScopedTempDir root("perceptual-compiled");
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 65, .height = 49, .num_images = 2, .background_images = 0};
     create_synthetic_dataset(fixture);
-    CompilerConfig config;
-    config.source_dir = dataset_dir(fixture);
+    auto config = compiler_config(fixture);
     config.output_dir = (root.path() / "ordinary").string();
     config.target_width = 31;
     config.target_height = 31;

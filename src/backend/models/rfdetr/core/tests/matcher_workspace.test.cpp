@@ -72,6 +72,7 @@ TEST_CASE("Matcher assignment CPU projections share one immutable packed set", "
     }
     REQUIRE(retained.flatten()[3].item<std::int64_t>() == 31);
 }
+// CLEANUP-IGNORE: Rectangular packing and immutable projections require independent topology snapshots and workspace lifetimes.
 TEST_CASE("Rectangular assignment packing uses full target offsets and retained active extents", "[rfdetr][matcher][numa]") {
     const auto topology = mmltk::common::system::NumaTopology::Capture();
     MatcherWorkspace workspace(topology.permitted_nodes.front(), true);
@@ -181,6 +182,7 @@ TEST_CASE("Assignment transports retain autograd indices across overlapping resu
         } catch (const std::runtime_error& error) { REQUIRE(std::string_view(error.what()) == "cancel owner after submitting forward"); }
         // The result's retained context/storage outlives exception-driven owner
         // destruction, and remains usable by a later backward consumer.
+        // CLEANUP-IGNORE: Backward after owner destruction independently proves escaped storage lifetime, unlike workspace reuse.
         escaped_loss.backward();
         REQUIRE(at::equal(mmltk::backend::ml::cuda::numa_readback(values.grad()), at::tensor({1.f, 0.f, 1.f, 0.f, 1.f, 0.f}).view({2, 3})));
     }

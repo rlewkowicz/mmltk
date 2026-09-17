@@ -426,6 +426,7 @@ ImagePlaneView ImageWorkspace::ProducerPlaneLocked(const DeviceContext& context,
                 state_->owner->Failed(failure);
                 std::rethrow_exception(failure);
             }
+            // CLEANUP-IGNORE: Producer rebinding and final detach release under different settlement/failure policies and context lifetimes.
             state_->producer_allocation.reset();
         }
         state_->producer_stream.reset();

@@ -1475,6 +1475,7 @@ template <class T>
                 if (error.path.empty()) prepend_path(error, *key);
                 return std::unexpected(std::move(error));
             }
+            // CLEANUP-IGNORE: Ordinary and opaque records already share contextual key errors but retain distinct required-member policies.
             if (!*decoded) return std::unexpected(contextual_key_error(reader, wire::ErrorCode::UnknownKey, *key));
             seen.push_back(std::move(*key));
         }

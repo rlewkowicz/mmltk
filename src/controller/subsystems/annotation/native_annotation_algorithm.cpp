@@ -329,6 +329,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             EnsureMasks(total_words * sizeof(std::uint32_t));
             auto* const pairs = static_cast<std::uint32_t*>(mask_host_->data());
             std::size_t offset = 0U;
+            // CLEANUP-IGNORE: Enabled-object traversal feeds distinct geometry, RLE packing, and drawing bodies; no repeated loop body exists.
             for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
                 const auto& object = description.DrawingObjectAt(index);
                 if (!object.enabled) continue;
@@ -360,6 +361,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 raster::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value, palette_[index].r,
                                           palette_[index].g, palette_[index].b);
         }
+        // CLEANUP-IGNORE: Enabled-object traversal feeds distinct geometry, RLE packing, and drawing bodies; no repeated loop body exists.
         for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
             const auto& object = description.DrawingObjectAt(index);
             if (!object.enabled) continue;

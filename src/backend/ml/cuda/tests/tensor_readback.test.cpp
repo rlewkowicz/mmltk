@@ -14,6 +14,7 @@ namespace {
 [[nodiscard]] mmltk::common::system::ScopedExecutionPolicy readback_test_policy() {
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) SKIP("CUDA unavailable");
+    // CLEANUP-IGNORE: Readback owns this device and placement scope independently of NUMA tensor storage tests.
     CUDA_ASSERT_OK(cudaSetDevice(0));
     const auto execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture());
     const auto& placement = execution.placement;

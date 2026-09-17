@@ -284,6 +284,7 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
 }
 TEST_CASE("prediction raw custody is bounded under retained readers and preserves pixels", "[controller][gpu]") {
     using namespace mmltk::controller;
+    // CLEANUP-IGNORE: Raw prediction custody and concurrent receiver retirement own independent device-context lifetimes.
     namespace gpu = mmltk::frameworks::gpu;
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     REQUIRE(cudaSetDevice(0) == cudaSuccess);

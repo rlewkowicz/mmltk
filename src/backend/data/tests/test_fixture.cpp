@@ -69,13 +69,17 @@ void write_synthetic_sample(const fs::path& split_dir, const int image_index, co
 std::string dataset_dir(const FixtureSpec& spec) { return spec.root_dir + "/dataset"; }
 std::string compiled_dir(const FixtureSpec& spec) { return spec.root_dir + "/compiled"; }
 std::string compiled_bin_path(const FixtureSpec& spec) { return compiled_dir(spec) + "/" + spec.split + ".bin"; }
-void compile_existing_fixture(const FixtureSpec& spec) {
+CompilerConfig compiler_config(const FixtureSpec& spec) {
     CompilerConfig config;
     config.source_dir = dataset_dir(spec);
     config.output_dir = compiled_dir(spec);
     config.split = spec.split;
     config.target_width = spec.width;
     config.target_height = spec.height;
+    return config;
+}
+void compile_existing_fixture(const FixtureSpec& spec) {
+    auto config = compiler_config(spec);
     config.num_workers = 1;
     const auto plan = DatasetCompiler::prepare(config, {config.split});
     DatasetCompiler::compile(plan, 0U);

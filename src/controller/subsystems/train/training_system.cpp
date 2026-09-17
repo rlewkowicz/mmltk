@@ -47,9 +47,11 @@ contracts::ProviderQueryResult NativeTrainingRuntime::Query(const contracts::Pro
     const auto offers = services::VastClient{config_.provider}.query(preferences, cancellation.token());
     return services::materialize_provider_query_result(offers);
 }
-contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::ProviderMutation mutation, const contracts::ProviderPreferences& preferences,
-                                                              const contracts::ProviderOfferIdentity offer, const int instance,
-                                                              const std::string_view launch_token, const std::stop_token stop) {
+contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(
+    const contracts::ProviderMutation mutation, const contracts::ProviderPreferences& preferences, const contracts::ProviderOfferIdentity offer,
+    const int instance,
+    // CLEANUP-IGNORE: Only the provider guard and scoped cancellation agree; query, mutation, and reconciliation settle differently.
+    const std::string_view launch_token, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
     mmltk::common::concurrency::ScopedEventCancellation<services::VastCancellationSource> cancellation{stop};
     services::VastEffectAttempt attempt;
@@ -72,6 +74,7 @@ contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::P
         return attempt.started() ? contracts::provider_effect_inconclusive("provider mutation failed")
                                  : contracts::provider_effect_not_applied("provider mutation failed");
     }
+    // CLEANUP-IGNORE: Only the provider guard and scoped cancellation agree; query, mutation, and reconciliation settle differently.
 }
 contracts::ProviderEffectResult NativeTrainingRuntime::Reconcile(const services::VastReconciliationRequest& request, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");

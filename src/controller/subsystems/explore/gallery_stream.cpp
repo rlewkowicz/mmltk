@@ -1377,6 +1377,7 @@ ExploreGalleryPublication GalleryStream::Impl::RenderReadyTiles(const mmltk::fra
             }
         }
     }
+    // CLEANUP-IGNORE: Descriptor allocation already has one owner; cached tile meanings and ready lanes supply different counts and packing.
     descriptors_.PrepareDescriptors(ready_lanes.size(), ready_annotation_count, ready_rle_count, State().active_classes.size(), ready_lanes.size(),
                                     diagnostics_, device_, State().plan.generation);
     std::size_t annotation_count = 0U;

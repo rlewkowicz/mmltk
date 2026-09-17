@@ -134,6 +134,7 @@ TEST_CASE("checked operation identity advancement refuses exhaustion", "[control
 TEST_CASE("Local compute admission waits for required worker placement", "[controller][compute][placement]") {
     using namespace mmltk::common::system;
     using namespace mmltk::controller;
+    // CLEANUP-IGNORE: Worker-admission evidence must capture its own caller placement; the topology selector already owns lookup.
     const auto topology = NumaTopology::Capture();
     const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
     const auto cpu = selected.cpu;

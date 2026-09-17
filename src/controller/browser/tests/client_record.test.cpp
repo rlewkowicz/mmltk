@@ -479,6 +479,7 @@ TEST_CASE("Bootstrap uses the compact protocol-17 fingerprint and bounded snapsh
              InteractionRejected{.endpoint_id = 7U, .error = {.detail = "input unavailable"}},
              InteractionRejected{.endpoint_id = 1U,
                                  .error = {.category = mmltk::controller::contracts::ApplicationErrorCategory::Unavailable, .detail = "unavailable"}}}) {
+        // CLEANUP-IGNORE: Interaction rejection round trips are independent wire-variant oracles, not a second codec implementation.
         REQUIRE(encode_server_record(record, encoded));
         const auto decoded = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
         REQUIRE(decoded);

@@ -112,6 +112,7 @@ TEST_CASE("shell forwards the first ready Explore event unchanged and warms Upsc
     CHECK(route.forwarded().back() == route.expected());
     CHECK(probe->calls.load(std::memory_order_acquire) == 1U);
 }
+// CLEANUP-IGNORE: Atlas-priority routing has its own warm-up preconditions; the existing route and Upscale fixtures are already shared.
 TEST_CASE("shell prioritizes visible atlas completion before warming viewer methods") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto probe = std::make_shared<ShellWarmProbe>();

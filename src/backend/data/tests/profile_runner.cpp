@@ -146,12 +146,7 @@ void run_loader_case(const char* label, const DatasetLoader::Config& cfg, int nu
     if (consumer_stream) { ensure_cuda_ok(cudaStreamDestroy(consumer_stream), "cudaStreamDestroy"); }
 }
 void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
-    CompilerConfig ccfg;
-    ccfg.source_dir = dataset_dir(fixture);
-    ccfg.output_dir = compiled_dir(fixture);
-    ccfg.split = fixture.split;
-    ccfg.target_width = static_cast<uint32_t>(fixture.width);
-    ccfg.target_height = static_cast<uint32_t>(fixture.height);
+    auto ccfg = compiler_config(fixture);
     ccfg.num_workers = opts.compile_workers;
     const auto compile_start = std::chrono::steady_clock::now();
     const DatasetCompilePlan compile_plan = DatasetCompiler::prepare(ccfg, {ccfg.split});

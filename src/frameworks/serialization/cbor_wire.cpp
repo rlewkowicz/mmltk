@@ -583,6 +583,7 @@ std::expected<FlatValue, DecodeError> Reader::read_scalar_item(const std::size_t
     if (!head) { return std::unexpected(head.error()); }
     return read_flat_scalar(*head, true);
 }
+// CLEANUP-IGNORE: Both readers use item_head; scalar admission and bounded flat-array decoding have different bodies.
 std::expected<FlatValue, DecodeError> Reader::read_flat_item(const std::size_t depth) {
     auto head = item_head(depth);
     if (!head) { return std::unexpected(head.error()); }

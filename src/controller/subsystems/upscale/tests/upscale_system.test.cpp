@@ -466,6 +466,7 @@ TEST_CASE("Upscale publishes only the newest selected kernel after obsolete devi
     // CLEANUP-IGNORE: This source feeds a supersession/commit gate; the cached-selection scenario retains three
     // completed methods and validates a different ownership path.
     MutableVisualSource source{backend, {16U, 8U}};
+    // CLEANUP-IGNORE: Supersession and cached selection retain separate commit probes and publication-count oracles.
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
     auto runs = std::make_shared<std::atomic_uint32_t>(0U);
     auto gate = std::make_shared<MutationCommitProbe>();

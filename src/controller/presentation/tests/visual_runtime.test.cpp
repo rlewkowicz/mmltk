@@ -577,6 +577,7 @@ TEST_CASE("safe incumbent retirement failure preserves the promoted runtime and 
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(next, "next", 2s));
     owner.StopAndWait();
 }
+// CLEANUP-IGNORE: Construction-stop and staged-replacement tests use distinct receipts and cancellation boundaries.
 TEST_CASE("active stop during staged construction rejects replacement before domain work") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);
@@ -602,7 +603,9 @@ TEST_CASE("active stop during staged construction rejects replacement before dom
     owner.RequestActiveStop();
     release.set_value();
     REQUIRE_NOTHROW(mmltk::testsupport::await_test_promise(cancelled, "cancelled", 2s));
+    // CLEANUP-IGNORE: This assertion proves work never entered during construction cancellation, not absence of a completion notification.
     CHECK_FALSE(entered.load());
+    // CLEANUP-IGNORE: Borrow retention after construction cancellation is a separate oracle from in-flight work cancellation.
     auto retained = owner.Borrow();
     REQUIRE(retained.valid());
     CHECK(retained.plane(0U).revision() == revision);
@@ -726,6 +729,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
 }
 TEST_CASE("visual continuation cancellation policy is independent of output availability registration") {
     const bool output_wake = GENERATE(false, true);
+    // CLEANUP-IGNORE: Continuation input preservation and producer completion are different booleans with independent event receipts.
     const bool preserve_input = GENERATE(false, true);
     auto backend = std::make_shared<FakeImageBackend>();
     auto captures = std::make_shared<std::atomic<std::uint64_t>>(0U);

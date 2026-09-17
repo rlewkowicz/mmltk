@@ -45,6 +45,7 @@ auto settle_annotation_on_exit(AnnotationSystem& annotation, std::promise<void>&
     }};
 }
 void complete_annotation_box_drag(AnnotationSystem& annotation, EventGate& events, std::uint64_t peer) {
+    // CLEANUP-IGNORE: The box-drag oracle owns its edit receipt; browser-host gesture routing has a separate interaction boundary.
     const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{contracts::AnnotationTool::Box}}});
     mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
     const auto before = annotation.snapshot().ui;

@@ -821,6 +821,7 @@ std::pair<torch::Tensor, torch::Tensor> gen_encoder_output_proposals(const torch
         output_proposals = output_proposals.masked_fill(~output_proposals_valid, 0.0);
     }
     auto output_memory = memory;
+    // CLEANUP-IGNORE: Proposal coordinates and transformer memory are different tensors with distinct masking and output semantics.
     if (memory_padding_mask.defined()) { output_memory = output_memory.masked_fill(memory_padding_mask.unsqueeze(-1), 0.0); }
     output_memory = output_memory.masked_fill(~output_proposals_valid, 0.0);
     return {output_memory.to(memory.dtype()), output_proposals.to(memory.dtype())};

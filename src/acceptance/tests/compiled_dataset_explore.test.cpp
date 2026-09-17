@@ -213,6 +213,7 @@ class NativeExploreAudit final {
     [[nodiscard]] std::uint64_t image_pixel_count() const noexcept { return image_pixel_count_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t image_seed(const std::size_t image) const noexcept { return image_seeds_[image].load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t image_checksum(const std::size_t image) const noexcept {
+        // CLEANUP-IGNORE: These atomic getters expose different image, semantic, checksum, and donor facts; their storage is not interchangeable.
         return image_checksums_[image].load(std::memory_order_acquire);
     }  // CLEANUP-IGNORE: Indexed image checksums and donor counters are independent observations with distinct storage.
     [[nodiscard]] std::uint64_t donor_count() const noexcept { return donor_count_.load(std::memory_order_acquire); }
@@ -532,6 +533,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
                std::ranges::all_of(snapshot.gallery.slots, [](auto ready) { return ready == 1U; });
     }));
     check_published_frame(system);
+    // CLEANUP-IGNORE: Augmentation disable must be observed at this native-gallery admission boundary before checking pixel work.
     preview_admission = system.UpdateAugmentation({.enabled = false});
     REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > preview_admission.revision; }));
     const auto disabled_augmentation_count = audit.augmentation_count();
@@ -1390,6 +1392,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
         observation.release.set_value();
         REQUIRE(entered == std::future_status::ready);
     }
+    // CLEANUP-IGNORE: This wait proves cancellation and physical settlement; catalog replacement has a separate commit oracle.
     REQUIRE(audit.Wait([&] { return !system.snapshot().busy && system.snapshot().revision > admitted.revision; }));
     const auto settled = system.snapshot();
     {

@@ -115,6 +115,7 @@ bool rebuild_explore_order(const std::span<const ExploreImageSummary> summaries,
                 (filter.require_masks && !summary.has_masks) || (filter.restrict_classes && !class_masks_intersect(summary.classes, filter.classes)))
                 continue;
             scratch[image_index] = static_cast<std::uint32_t>(image_index);
+            // CLEANUP-IGNORE: Summary production and filter classification use different callbacks; parallel_for already owns the shared mechanism.
         }
     };
     if (workers != nullptr && summaries.size() > 4096U)

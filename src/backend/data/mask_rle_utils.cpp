@@ -26,6 +26,7 @@ void include_run(RowMajorMaskBounds* bounds, const std::size_t begin, const std:
     const std::uint32_t begin_y = checked_cast<std::uint32_t>(begin / width, "mask run y overflow");
     const std::uint32_t begin_x = checked_cast<std::uint32_t>(begin % width, "mask run x overflow");
     const std::size_t final = end - 1U;
+    // CLEANUP-IGNORE: Run start and inclusive final pixel have distinct bound roles; retain explicit quotient and remainder coordinates.
     const std::uint32_t end_y = checked_cast<std::uint32_t>(final / width, "mask run y overflow");
     const std::uint32_t end_x = checked_cast<std::uint32_t>(final % width, "mask run x overflow");
     if (!bounds->has_foreground) {

@@ -814,6 +814,7 @@ TEST_CASE("Source release submission requires one exact acquired transfer", "[wo
     auto release = acquired;
     release.opcode = abi::Opcode::ReleaseSubmitted;
     if (invalid != 0U) {
+        // CLEANUP-IGNORE: This acquisition receipt is an independent protocol precondition for the following malformed or stale release.
         REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
         fixture.channel.pump();
         REQUIRE(fixture.channel.take_source_transition().has_value());
@@ -862,9 +863,11 @@ TEST_CASE("A release receipt from an earlier transfer cannot settle the next acq
     abi::Record settled{};
     static_cast<void>(mmltk::testsupport::receive_workspace_record(fixture.peer.get(), settled));
     ++acquired.offset;
+    // CLEANUP-IGNORE: This acquisition receipt is an independent protocol precondition for the following malformed or stale release.
     REQUIRE(send_workspace_record(fixture.peer.get(), acquired));
     fixture.channel.pump();
     REQUIRE(fixture.channel.take_source_transition().has_value());
+    // CLEANUP-IGNORE: This error is for a previous-transfer receipt; malformed current releases have separate input assertions.
     REQUIRE(send_workspace_record(fixture.peer.get(), release));
     fixture.channel.pump();
     CHECK(fixture.channel.terminal_error().has_value());
@@ -1181,6 +1184,7 @@ TEST_CASE("Presentation directly refreshes a selected private product") {
     CHECK(writer_state->timeline.load(std::memory_order_acquire) == 6U);
     // If the newer observation is already available at rejection, catch up
     // immediately even before its separate source notification is delivered.
+    // CLEANUP-IGNORE: This later admission tests an already-available newer source observation, not disconnected-peer recovery.
     writer_state->allow_publication.store(false, std::memory_order_release);
     source.Advance();
     presentation.SourceChanged(source.identity());
@@ -1219,6 +1223,7 @@ TEST_CASE("Presentation carries its submitted observation through metadata chang
     writer->allow_publication.store(false);
     PresentationSystem presentation{kDevice, TestPresentationWriter::Factory(source.backend(), writer), source.sources(),
                                     [&events](PresentationSystem::event_type) { events.Advance(); }};
+    // CLEANUP-IGNORE: Initial source-observation admission is independent of the reconnect/publication scenario.
     PresentationScenario scenario{presentation, writer};
     static_cast<void>(presentation.Select(source.identity()));
     REQUIRE(events.Wait([&] { return presentation.snapshot().capability.condition == PresentationCapabilityCondition::Admitted; }));

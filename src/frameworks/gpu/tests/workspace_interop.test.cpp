@@ -101,6 +101,7 @@ TEST_CASE("Partial display stream construction retains its context and both fail
     runtime.BindContext();
     CHECK(runtime.Retire().safe_to_destroy);
 }
+// CLEANUP-IGNORE: Admission rejection and partial display construction need different failure injection and cleanup expectations.
 TEST_CASE("Safe workspace rejection releases candidates and permits a fresh admission", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
@@ -317,6 +318,7 @@ TEST_CASE("Exact external acquisition races replacement without reusing a held f
         return result;
     };
     const auto fill = [](std::uint8_t value) {
+        // CLEANUP-IGNORE: This single memset callback supplies workspace pixel evidence; product-lease evidence owns a separate callback.
         return [value](auto clean, auto, auto) {
             std::memset(reinterpret_cast<void*>(clean.data), value, clean.descriptor.pitch_bytes * clean.descriptor.height);
         };
@@ -1442,6 +1444,7 @@ TEST_CASE("Workspace cancellation publishes availability before ordered product 
 TEST_CASE("Shutdown settles pending workspace finalization with allocation-local cleanup custody", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();
+    // CLEANUP-IGNORE: Workspace admission already uses its shared factory; each test owns its separate retirement observation.
     auto backend = std::make_shared<FakeImageBackend>();
     auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
         backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));

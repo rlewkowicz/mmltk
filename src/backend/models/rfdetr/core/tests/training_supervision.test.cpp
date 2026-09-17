@@ -799,6 +799,7 @@ void test_conditional_model_construction_preserves_rng_and_default_state_topolog
     for (const auto& buffer : inactive_buffers) {
         inactive_buffer_names.emplace(buffer.key());
         REQUIRE_FALSE(buffer.key().starts_with("training_supervision."));
+        // CLEANUP-IGNORE: Named buffers and isolated supervision parameters are independent equality oracles with distinct inventories.
         const auto* enabled_buffer = active_buffers.find(buffer.key());
         REQUIRE(enabled_buffer != nullptr);
         REQUIRE(torch::equal(buffer.value(), *enabled_buffer));
@@ -1032,7 +1033,9 @@ void test_split_self_attention_matches_equation_seven_and_symmetric_group_layout
     rfdetr::DecoderQueryLayout grouped_layout;
     grouped_layout.ordinary = {2, 3};
     grouped_layout.denoising_groups = 2;
+    // CLEANUP-IGNORE: The grouped-query oracle independently declares its denoising extent; it differs from the equation-seven layout.
     grouped_layout.denoising_queries_per_group = 2;
+    // CLEANUP-IGNORE: Grouped attention and equation-seven attention use different ordinary query layouts and independent masks.
     grouped_layout.denoising_key_padding = torch::zeros({1, 2, 2}, torch::TensorOptions().dtype(torch::kBool));
     grouped_layout.denoising_valid_slots = torch::ones({1, 2, 2}, torch::TensorOptions().dtype(torch::kBool));
     const auto grouped_split = rfdetr::isolated_group_self_attention(attention, grouped_target, grouped_position, grouped_layout);
@@ -1456,6 +1459,7 @@ void test_feature_initialization_is_reproducible_and_independent_of_dn_toggle() 
     const auto match_parameters = match_only.named_parameters(true);
     const auto combined_parameters = combined.named_parameters(true);
     for (const auto& parameter : match_parameters) {
+        // CLEANUP-IGNORE: Named buffers and isolated supervision parameters are independent equality oracles with distinct inventories.
         const auto* other = combined_parameters.find(parameter.key());
         REQUIRE(other != nullptr);
         REQUIRE(torch::equal(parameter.value(), *other));

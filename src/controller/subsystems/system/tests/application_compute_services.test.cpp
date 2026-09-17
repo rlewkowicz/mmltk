@@ -685,6 +685,7 @@ TEST_CASE("Vast admission rejects malformed input before provider effects", "[gu
     CHECK(operations.queries == 0U);
     CHECK(operations.creates == 0U);
 }
+// CLEANUP-IGNORE: These are aliases into the existing Vast fixture; mutation-edge and result-admission assertions remain independent.
 TEST_CASE("Vast create accepts only complete provider result records", "[gui][services]") {
     VastClientFixture fixture;
     auto& operations = fixture.operations();

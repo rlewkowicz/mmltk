@@ -394,6 +394,7 @@ TEST_CASE("a quarantined scalar read retains its allocation after source destruc
     borrowed = {};
     CHECK(backend->planes_freed == 1U);
 }
+// CLEANUP-IGNORE: This receiver-copy case owns its gate and lease through copy completion; the other case tests a direct reader.
 TEST_CASE("receiver retains a product lease through deferred source completion") {
     using namespace std::chrono_literals;
     auto backend = std::make_shared<FakeImageBackend>();

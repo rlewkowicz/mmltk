@@ -122,6 +122,7 @@ void GpuBatchAugmenter::CheckSettlement(const cudaError_t status, const char* de
 }
 void GpuBatchAugmenter::ensure_copy_paste_resources() {
     if (resources_->donor_images_.defined()) { return; }
+    // CLEANUP-IGNORE: Constructor output and lazy donor storage need separate CUDA guard lifetimes and allocation failure handling.
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
     const auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
     const auto int64_options = torch::TensorOptions().dtype(torch::kInt64).device(mmltk::backend::ml::cuda::cuda_device(device_id_));

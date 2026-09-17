@@ -94,6 +94,7 @@ void emit_rust_value(std::ostream& output, const mmltk::controller::browser::wir
     if (std::ranges::find(keywords, result) != keywords.end()) result.push_back('_');
     return result;
 }
+// CLEANUP-IGNORE: Constant and type identifiers share only namespace stripping; casing and keyword policies are distinct.
 [[nodiscard]] std::string rust_constant_identifier(std::string_view source) {
     if (const auto separator = source.rfind("::"); separator != std::string_view::npos) source.remove_prefix(separator + 2U);
     std::string result;

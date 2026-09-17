@@ -517,6 +517,7 @@ MatcherMaskLogits sample_matcher_mask_logits(const OutputLayer& layer, const Det
     }
     if (layer.sparse_pred_masks.has_value()) {
         const auto& sparse = *layer.sparse_pred_masks;
+        // CLEANUP-IGNORE: Dense mask logits and sparse spatial features determine different sampling domains and downstream tensor work.
         const int64_t num_points = sparse.spatial_features.size(-2) * sparse.spatial_features.size(-1) / config.mask_point_sample_ratio;
         auto point_coords = torch::rand({1, num_points, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(sparse.spatial_features.device()));
         auto sampled_features =

@@ -632,6 +632,7 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
     }
     const double clamped_x1 = std::clamp(x1, 0.0, static_cast<double>(metadata.width));
     const double clamped_y1 = std::clamp(y1, 0.0, static_cast<double>(metadata.height));
+    // CLEANUP-IGNORE: Minimum and maximum box corners are independent coordinates clamped against their corresponding image axes.
     const double clamped_x2 = std::clamp(x2, 0.0, static_cast<double>(metadata.width));
     const double clamped_y2 = std::clamp(y2, 0.0, static_cast<double>(metadata.height));
     if (clamped_x2 <= clamped_x1 || clamped_y2 <= clamped_y1) {

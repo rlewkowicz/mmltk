@@ -162,9 +162,7 @@ class PredictSystem::Impl final {
     [[nodiscard]] PredictSnapshot Start() {
         {
             std::scoped_lock lock(mutex_);
-            if (state_.operation.active) throw contracts::BusyError("prediction is busy");
-            if (!retirement_.admission_open() || !preview_retirement_->admission_open())
-                throw contracts::UnavailableError("prediction has unobservable CUDA custody");
+            RequireStartAdmissionLocked();
         }
         // CLEANUP-IGNORE: Predict begins from canonical settings but then owns a distinct visual operation path.
         const auto settings = settings_.materialization_facts();
@@ -174,9 +172,7 @@ class PredictSystem::Impl final {
         PredictSnapshot admitted;
         {
             std::scoped_lock lock(mutex_);
-            if (state_.operation.active) throw contracts::BusyError("prediction is busy");
-            if (!retirement_.admission_open() || !preview_retirement_->admission_open())
-                throw contracts::UnavailableError("prediction has unobservable CUDA custody");
+            RequireStartAdmissionLocked();
             const auto prior = state_;
             const auto& source = settings.settings.workflows.predict.source;
             const auto key = std::to_string(static_cast<unsigned>(source.kind)) + ":" +
@@ -290,6 +286,11 @@ class PredictSystem::Impl final {
     }
 
    private:
+    void RequireStartAdmissionLocked() const {
+        if (state_.operation.active) throw contracts::BusyError("prediction is busy");
+        if (!retirement_.admission_open() || !preview_retirement_->admission_open())
+            throw contracts::UnavailableError("prediction has unobservable CUDA custody");
+    }
     mmltk::frameworks::gpu::DeviceContext PreviewContext(const mmltk::frameworks::gpu::DeviceExecution& execution) {
         std::scoped_lock lock(preview_context_mutex_);
         if (!preview_retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");

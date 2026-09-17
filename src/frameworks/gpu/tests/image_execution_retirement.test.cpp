@@ -375,6 +375,7 @@ TEST_CASE("typed image failure inspection follows primary then secondary branche
     CHECK(find_image_failure<std::invalid_argument>(combined) == first);
     CHECK(test_support::ContainsImageFailure(combined, second));
 }
+// CLEANUP-IGNORE: These runtimes exercise distinct unsafe-retirement and last-reader ownership paths; retain their explicit lifetimes.
 TEST_CASE("image teardown retains its aggregate when context settlement cannot be established") {
     auto backend = std::make_shared<FakeImageBackend>();
     auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
@@ -455,6 +456,7 @@ TEST_CASE("failed imported image release remains finite and inert") {
 }
 TEST_CASE("final borrowed view retires on the owning runtime path") {
     using namespace std::chrono_literals;
+    // CLEANUP-IGNORE: These runtimes exercise distinct unsafe-retirement and last-reader ownership paths; retain their explicit lifetimes.
     auto backend = std::make_shared<FakeImageBackend>();
     auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = 0, .backend = backend});
     runtime->Publish(8U, 8U, [](auto, auto, auto) {});

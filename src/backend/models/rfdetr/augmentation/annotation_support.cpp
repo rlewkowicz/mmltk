@@ -27,6 +27,7 @@ AugmentationAnnotationSupport mask_extent(std::span<const mmltk::backend::data::
 }
 bool contains(const std::array<float, 4>& box, std::span<const mmltk::backend::data::RLEPair> runs, const std::array<float, 6>& inverse, float x, float y,
               int width, int height) {
+    // CLEANUP-IGNORE: Inverse support sampling and forward box-corner projection intentionally express opposite coordinate mappings.
     const float sx = inverse[0] * x + inverse[1] * y + inverse[2];
     const float sy = inverse[3] * x + inverse[4] * y + inverse[5];
     if (sx < 0 || sx > 1 || sy < 0 || sy > 1) return false;
