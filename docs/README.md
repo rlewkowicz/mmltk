@@ -7,8 +7,8 @@
 - [Build and reusable state](build.md): prerequisites, container toolchains,
   package outputs, Firefox staging, declaration isolation, target-local PCHs,
   generated bindings, caches, and build timing.
-- [Commands](commands.md): wrapper operations, native CLI, desktop options,
-  and model tooling.
+- [Commands](commands.md): wrapper operations, process snapshots, native CLI,
+  desktop options, and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
   training inputs and live progress, EMA, checkpoint resume, saved history,
   evaluation metrics and samples, and incremental image/video prediction.
@@ -16,8 +16,8 @@
 ## Architecture and frameworks
 
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
-  shared Linux/image facilities, generated boundaries, frontend components,
-  and vendor ownership.
+  shared Linux/image facilities, reflected CLI and persistence boundaries,
+  generated bindings, frontend components, and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, the retained training dashboard,
   numeric editing, shared immediate mouse input, native command settlement,

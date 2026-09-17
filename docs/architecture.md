@@ -116,13 +116,21 @@ remains private to the implementation.
 ## Shared Linux facilities
 
 [ScopedFd](../src/common/io/scoped_fd.h) owns descriptors, and
-[event_fd.h](../src/common/io/event_fd.h) centralizes signal, drain, and
-blocking worker-wait behavior. Callers choose the failure policy.
-[file_memory.h](../src/common/io/file_memory.h) owns file handles and mappings;
+[event_fd.h](../src/common/io/event_fd.h) centralizes counter reads, signal,
+drain, and blocking worker-wait behavior. Counter reads retry `EINTR` and return
+the count, byte count, and captured error; callers retain their own short-read,
+empty-read, and failure policies.
+[ScopedEventCancellation](../src/common/concurrency/event_cancellation.h)
+bridges a worker's stop token to a domain's minted cancellation source/token.
+It supports borrowed or consumed tokens and destroys the stop callback before
+its owned cancellation storage, settling any in-flight callback first.
+
+[file_memory.h](../src/common/io/file_memory.h) owns file handles, mappings, and
+shared destination-parent creation, treating a bare filename's parent as `.`.
 [json_file.h](../src/common/io/json_file.h) supplies append and atomic JSON
 publication; [StagingDirectory](../src/common/io/staging_directory.h) owns
-temporary-directory cleanup until publication. These facilities do not own
-domain persistence formats.
+temporary-directory cleanup until publication. Domain owners retain staging,
+sync, cancellation, overwrite, and persistence-format policy.
 
 [runtime_paths.h](../src/common/system/runtime_paths.h) resolves repository,
 executable, installation, and packaged asset paths for native consumers.
@@ -140,6 +148,39 @@ visibility independent of logger initialization and optional file sinks.
 Entrypoints choose the failure context and exit policy; the
 [logging guide](logging.md#fatal-stderr-reports) defines the report and process
 status behavior.
+
+## Reflected value and persistence boundaries
+
+[reflected_descriptors.h](../src/frameworks/reflection/reflected_descriptors.h)
+owns CLI assignment and emission. Non-boolean scalar, optional, and repeatable
+values share parsing and scalar validation before mutation; repeatable
+admission then checks the declared item limit and physical fixed capacity in
+that order.
+[reflected_field_policy.h](../src/frameworks/reflection/reflected_field_policy.h)
+owns the `std::inplace_vector` capacity traits used by both runtime assignment
+and compile-time descriptor validation. Without a declared item limit, a
+physically full destination rejects a valid next value with the typed capacity
+error; rejected input preserves its existing values.
+
+[cbor_wire.h](../src/frameworks/serialization/cbor_wire.h) owns bounded CBOR
+reading, including non-consuming lookahead across split input storage.
+[reflected_cbor_detail.h](../src/frameworks/serialization/reflected_cbor_detail.h)
+derives typed decoding and contextual key errors. Application positional
+records and named persistence retain their separate
+[wire policies](gui-interaction.md#typed-application-boundary).
+
+[gui_settings.cpp](../src/controller/contracts/gui_settings.cpp) projects
+same-name source, UI, training-target, and shared loading fields through their
+materialized native declarations. Renamed keys and field-specific conversion
+and repair remain local to settings persistence. Benchmark rejection counters
+likewise derive their binary and named JSON projections from one declaration;
+their [cache-format guards](datasets.md#benchmark-source-acquisition) preserve
+the persisted order and representation.
+
+RF-DETR's [preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)
+owns exact, case-sensitive preset-name lookup.
+[model_config.cpp](../src/backend/models/rfdetr/contract/model_config.cpp)
+retains the separate weight-filename and path-inference policies.
 
 ## Native/Rust boundary
 

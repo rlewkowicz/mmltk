@@ -331,6 +331,12 @@ and incomplete stages, then selects one run and follows bounded identity
 chains. Each evidence row explains its inclusion. Use `--query` to narrow
 anchors and `--where` to constrain every pass.
 
+For a quiet build or test interval, the wrapper's
+[process snapshots](commands.md#process-snapshots) show current activity in
+this repository's running containers. Use the snapshot alongside the captured
+command log; elapsed time or one wait-channel observation does not establish
+a stalled operation.
+
 A single-file triage input discovers same-family current siblings, or only
 the matching archive batch for an archived file. It does not mix an
 archived-only input with the current run. Added sources carry `@discovery`

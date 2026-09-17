@@ -101,7 +101,12 @@ remain unavailable when the selected evaluation did not produce them.
 **Epoch axis** is on initially and uses fractional epoch positions for live
 training; turning it off selects the global optimizer-step axis.
 **Log loss scale** changes only training-loss and loss-component charts. There
-is no validation loss curve; images/second belongs to the live progress card. The
+is no validation loss curve; images/second belongs to the live progress card.
+A loss-scale change preserves non-loss cameras, legends, and prepared geometry,
+including hidden charts and explicitly selected saved history. Reapplying the
+current loss-scale value does not invalidate charts. Each chart's preparation
+key records its effective scale, so later non-loss updates cannot apply the
+global loss setting to that chart. The
 [workflow guide](rfdetr-workflows.md#saved-history-and-plots) explains sparse
 validation observations, loss conventions, and saved-history selection.
 
@@ -118,10 +123,11 @@ live and saved histories. Each curve retains at most 128 summary buckets with
 endpoints and extrema. Sequence gaps, unavailable values, missing records, and
 new attempts break lines, while isolated points remain visible as markers.
 When older disconnected summaries must be retired, the Output card reports
-chart omissions; saved history is unchanged. Hidden views continue ingesting
-records without rebuilding geometry; only visible changed charts prepare their
-retained summaries. Plot objects, series, and GPU buffers retain useful
-capacity.
+chart omissions; retired extrema do not affect the retained plot. Missing
+observations keep a pending gap even when live display samples are coalesced.
+Saved history is unchanged. Hidden views continue ingesting records without
+rebuilding geometry; only visible changed charts prepare their retained
+summaries. Plot objects, series, and GPU buffers retain useful capacity.
 
 The vendored [plot widget](../third_party/iced_plot/src/plot_widget.rs) keeps
 settled view state independently of the temporary Iced widget tree. Axis labels

@@ -12,8 +12,10 @@ Docker and attempts a noninteractive daemon start for ordinary build/runtime
 operations. Read-only diagnostic commands require an already-running daemon.
 
 The wrapper builds the toolchains in containers. Its normal runtime uses a
-repository-scoped reusable container, while build, test, and diagnostic
-operations own their execution containers. GUI/runtime and Wayland acceptance
+repository-scoped reusable container, while build, test, and image-based
+diagnostics own their execution containers. The
+[process snapshot](commands.md#process-snapshots) inspects existing wrapper
+containers without creating one. GUI/runtime and Wayland acceptance
 use privileged containers and host resource mounts. Log and I/O diagnostic
 containers use restricted, read-only mounts; see [logging](logging.md) and
 [GPU execution](gpu-execution.md).

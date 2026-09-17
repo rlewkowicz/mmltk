@@ -152,7 +152,10 @@ Owner-thread completion, settlement, and cancelled writes wake display
 availability after releasing the workspace lock, only when physical storage
 is available. A held display read keeps its custody through these notifications.
 The next dirty render or pending admission resumes on that real availability
-edge.
+edge. Product wake callbacks remain separate from display-availability
+callbacks; final detach emits its display wake independently of the ordinary
+availability gate. Callback exceptions are contained, and a wake itself grants
+no read or write permission.
 
 The independent backing reference survives browser resource retirement,
 replacement, and exporter process exit while native aliases or GPU work remain.
@@ -161,6 +164,15 @@ device through partial construction and final destruction, even after registry
 or IPC removal. Exporter exit alone proves neither GPU completion nor safe
 native reuse. [Presentation lifetime](gui-interaction.md#native-gpu-custody-and-completion)
 owns source-read, callback, draw, and terminal-settlement rules.
+
+[SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.cpp) binds its
+execution context before model release and again before destroying the released
+model. Failed binding or incomplete release retains the model, context, and
+stream custody with the failure. Live's private
+[slot-state operations](../src/backend/media/live/detail/live_slot_state.h)
+share a retirement claim that makes at most one compare/exchange attempt.
+Callers retain their completion waits and publication policy; the claim itself
+does not establish CUDA completion.
 
 When the raw producer device differs from the display device, workspace
 finalization owns the existing peer or reusable pinned transfer route and any

@@ -179,6 +179,9 @@ executable and prints a backtrace. Native Catch2 runs have no wrapper-imposed
 whole-executable or whole-suite timeout. `MMLTK_TEST_TIMEOUT_SECONDS`
 is no longer a supported timeout control. Standalone GPU diagnostics have
 their own bounded execution described below.
+For current activity during a quiet command, use the read-only
+[process snapshot](commands.md#process-snapshots); it does not interrupt the
+running build or test.
 
 Fixtures retain bounded startup, entered-boundary, progress, operation, and
 shutdown waits. The packaged Wayland harness currently uses these deadlines:
@@ -473,7 +476,7 @@ sessions retain ordinary clipboard permissions.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, rejection, and cancellation |
-| `mmltk_controller_services_tests` | Independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
+| `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
 | `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
@@ -483,7 +486,8 @@ sessions retain ordinary clipboard permissions.
 | `mmltk_controller_visual_systems_tests` | Shared visual runtime, presentation protocol/custody, native gallery cache/priority/atlas integration, acceptance gates, and cross-system workspace behavior |
 | `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, receiver/device transfers, acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, independent prepared/released artifacts, and bounded fatal reporting with disabled/uninitialized/failed sinks and broken pipes |
-| `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | CLI/ONNX fatal stderr, logging overrides and named file identities, and preserved command exit behavior |
+| `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | Reflected CLI parsing, scalar/item/fixed-capacity error precedence and unchanged rejected destinations; CLI/ONNX fatal stderr, logging overrides and named file identities, and command exit behavior |
+| `mmltk_common_concurrency_tests` | Borrowed cancellation, scoped stop-token bridging, pre-requested/concurrent cancellation, unwind, and source destruction policy |
 | `mmltk_entrypoints_desktop_tests` and `mmltk_controller_firefox_process_tests` | Desktop startup/child failure status, exact launch OS errors, unexpected signal reporting, and quiet requested shutdown |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
@@ -510,11 +514,29 @@ Annotation, Explore, and Upscale executables require `all` or explicit
 Neutral fixtures and the shared Catch runner belong to
 [src/test_support](../src/test_support). Domain fixture targets live with
 their owning components and publish their own declaration dependencies.
+
+| Fixture | Ownership and use |
+| --- | --- |
+| [ScopedTestStream](../src/test_support/cuda_test_utils.hpp) | Neutral nonblocking CUDA stream lifetime for media and inference tests |
+| [Dataset fixture](../src/backend/data/tests/test_fixture.h) | Synthetic inputs, one canonical compiler configuration, and compilation of existing deliberately modified inputs |
+| [NUMA topology support](../src/common/system/tests/numa_topology_test_support.h) | Value-only selection from a caller-captured topology; each scenario retains its own snapshot and worker budget |
+| [ClassArtifactFixture](../src/backend/models/rfdetr/core/tests/class_artifact_fixture.h) | RF-DETR artifact/descriptor seeding and independent SHA-256 preservation checks, including absence of staged directories |
+| [Application data support](../src/controller/subsystems/system/tests/application_data_test_support.h) | Data/compute inspection fixtures and their domain facts |
+
 Torch-backed test consumers use
 [`mmltk_backend_ml_torch_test_support`](../src/backend/ml/torch/CMakeLists.txt),
 whose [catch_support.h](../src/backend/ml/torch/tests/catch_support.h) admits
 Torch declarations while preserving Catch2's `CHECK` assertion. Production
 Torch usage has no test-support dependency.
+
+The [metrics component cases](../src/frontend/iced/src/view/metrics.rs) drive
+ordinary plot shader redraw and drag events, reduce returned messages, and
+inspect settled camera/legend observations after remount. They cover loss-scale
+changes for every non-loss chart, visible and hidden charts, and independent
+live/saved history; repeated selection does not invalidate the view. Separate
+cases verify actual loss-axis scaling and autoscale after epoch, history, or
+data changes. Those component checks complement the packaged browser's
+canvas-pixel and retained-interaction evidence above.
 
 Native fixtures use causal entered receipts and release/stop-before-join
 cleanup. Borrowed GPU locks are acquired and released on their owning thread;

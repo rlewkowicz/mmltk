@@ -241,6 +241,16 @@ checks and concurrent reservations; and
 source/phase progress projection. Download/cache identity stays with the data
 layer while resizing uses the shared imaging owners below.
 
+The normalized annotation-index cache has its own version-2 format and
+256-byte header, independent of compiled format 7.
+[AnnotationRejectCounts](../src/backend/data/detail/benchmark_annotations.h)
+is the canonical declaration for its six rejection counters. Binary
+encode/decode follows reflected declaration order; compile-time guards pin
+the six names, `uint64` types, and order required by that cache format. Named
+JSON projections derive from those same fields. The
+[index implementation](../src/backend/data/benchmark_annotations.cpp) owns
+the header layout and staged publication.
+
 ## Optional perceptual downscaling
 
 Compilation and GPU augmentation each expose an independent

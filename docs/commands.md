@@ -24,6 +24,7 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |
 | `./mmltk --logs --help` | Show log-query grammar and options |
+| `./mmltk --diagnose-processes [WRAPPER_MODE]` | Inspect processes in this repository's running wrapper containers |
 | `./mmltk --diagnose-io FILE` | Report a compiled file's storage/GPU capabilities |
 | `./mmltk --diagnose-gpu-environment runtime\|wayland-validation\|development` | Inspect an existing image's GPU, driver, library, and ICD environment |
 | `./mmltk --diagnose-gpu-program SOURCE.cpp ARGS...` | Compile and run a standalone CUDA-driver/Vulkan diagnostic using existing images |
@@ -35,7 +36,7 @@ The `|` entries above mean choose one value; they are not shell pipelines.
 Build, test, tidy, cleanup, export, and diagnostics are separate operations.
 Put `--logs`, `--diagnose-io`, `--diagnose-nvidia-payload`,
 `--diagnose-gpu-environment`, `--diagnose-gpu-program`, `--diagnose-native-symbols`,
-`--diagnose-native-link`, or `--cleanup-report`
+`--diagnose-native-link`, `--diagnose-processes`, or `--cleanup-report`
 first when invoking that standalone operation.
 
 The [validation guide](validation.md#standalone-cudavulkan-diagnostic) owns
@@ -43,6 +44,28 @@ CUDA/Vulkan cases and argument meanings; [logging](logging.md) owns query,
 Vulkan-message, and descriptor-lineage examples. See
 [native link diagnostics](validation.md#native-symbol-and-link-diagnostics)
 for symbol filters, linker maps, and saved LTO intermediates.
+
+### Process snapshots
+
+```bash
+./mmltk --diagnose-processes --help
+./mmltk --diagnose-processes
+./mmltk --diagnose-processes build
+./mmltk --diagnose-processes test
+```
+
+The default selects all running containers labeled as wrapper-owned by this
+repository. The optional argument matches the exact wrapper mode label; `test`
+includes both test compilation and execution. Output identifies each container
+and mode, then reports PID, parent PID, elapsed time, CPU time, CPU/memory
+percentages, process state, wait channel, and process name. It omits command
+arguments and environment variables.
+
+This read-only operation requires a running Docker daemon and does not start
+one, create or alter containers, attach to a process, or build/pull images.
+Each daemon query has a 15-second deadline. No matching running container is
+a successful empty result. A snapshot describes current process state; it
+does not by itself establish a stall, completed work, or product performance.
 
 ## Native CLI
 
