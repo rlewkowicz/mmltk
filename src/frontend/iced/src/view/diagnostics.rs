@@ -22,35 +22,35 @@ impl Component {
 }
 
 pub fn view<'a>(model: &'a ApplicationModel, component: &Component) -> Element<'a, Message> {
-    let presentation = model.presentation.as_ref();
-    let typography = model.typography();
-    let content = column![
-        row![
-            text("Transport").size(typography.secondary),
-            text(model.connection.label()).size(typography.monospace),
-        ]
-        .spacing(10),
-        row![
-            text("Pending intents").size(typography.secondary),
-            text(model.pending_count().to_string()).size(typography.monospace),
-        ]
-        .spacing(10),
-        row![
-            text("Presentation").size(typography.secondary),
-            text(
-                presentation
-                    .map(|snapshot| format!(
-                        "{:?} · selection revision {}",
-                        snapshot.selected.kind, snapshot.revision
-                    ))
-                    .unwrap_or_else(|| "not installed".into())
-            )
-            .size(typography.monospace),
-        ]
-        .spacing(10),
-    ]
-    .spacing(6);
     let content: Element<'_, Message> = if component.expanded {
+        let presentation = model.presentation.as_ref();
+        let typography = model.typography();
+        let content = column![
+            row![
+                text("Transport").size(typography.secondary),
+                text(model.connection.label()).size(typography.monospace),
+            ]
+            .spacing(10),
+            row![
+                text("Pending intents").size(typography.secondary),
+                text(model.pending_count().to_string()).size(typography.monospace),
+            ]
+            .spacing(10),
+            row![
+                text("Presentation").size(typography.secondary),
+                text(
+                    presentation
+                        .map(|snapshot| format!(
+                            "{:?} · selection revision {}",
+                            snapshot.selected.kind, snapshot.revision
+                        ))
+                        .unwrap_or_else(|| "not installed".into())
+                )
+                .size(typography.monospace),
+            ]
+            .spacing(10),
+        ]
+        .spacing(6);
         column![
             content,
             iced::widget::button("Hide diagnostics").on_press(Message::Toggled)

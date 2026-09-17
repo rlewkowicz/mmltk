@@ -169,6 +169,7 @@ impl Component {
         .into();
         let workspace = crate::view::workflow::workspace(
             surface,
+            crate::presentation_surface::labels::Source::Hidden,
             settings,
             settings_edit_available,
             crate::generated::FeatureId::Export,
@@ -236,7 +237,7 @@ impl Component {
         let diagnostics = crate::view::shared::card(
             "Export status",
             "Canonical artifact outcome.",
-            text(crate::view::shared::compute_status(operation)),
+            text(crate::view::workflow::status::compute_status(operation)),
         );
         crate::view::workflow::Regions::new(
             crate::generated::FeatureId::Export,

@@ -3,6 +3,7 @@ pub mod loading;
 pub mod model_card;
 pub mod overlay_controls;
 pub mod progress;
+pub mod status;
 
 use crate::fluent_theme::Element;
 use iced::widget::{button, column, container, text};
@@ -10,9 +11,8 @@ use iced::{Fill, Font, Length, Padding};
 
 pub const SIDEBAR_PORTION: f32 = 0.19;
 pub const WORKSPACE_PORTION: f32 = 0.62;
-pub const CARD_PADDING: f32 = 10.0;
+pub use crate::fluent_theme::{CARD_PADDING, FIELD_SPACING};
 pub const SECTION_SPACING: f32 = 10.0;
-pub const FIELD_SPACING: f32 = 4.0;
 pub const PRIMARY_ACTION_HEIGHT: f32 = 48.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +166,7 @@ impl<'a, Message: 'a> Regions<'a, Message> {
 
 pub fn workspace<'a, Message: 'a>(
     surface: Option<crate::presentation_surface::Surface>,
+    labels: crate::presentation_surface::labels::Source,
     settings: &'a crate::view::settings::SettingsModel,
     settings_enabled: bool,
     page: crate::generated::FeatureId,
@@ -179,6 +180,7 @@ pub fn workspace<'a, Message: 'a>(
     );
     crate::view::workspace::view(
         surface,
+        labels,
         aspect,
         settings_enabled,
         Composition::new(page, page_width).center_width(),

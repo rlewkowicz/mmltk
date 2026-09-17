@@ -1,3 +1,4 @@
+#include "src/backend/data/data_loading_options.h"
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/browser/application_outer_routing_emitter.h"
@@ -281,7 +282,7 @@ class BindingEmitter final {
 
    public:
     explicit BindingEmitter(std::ostream& output) : output_(output) {
-        for (const std::string_view symbol : {"Cow", "Value", "Intent", "IntentField", "Interaction", "IntoApplicationValue", "FromApplicationValue", "object",
+        for (const std::string_view symbol : {"Cow", "Value", "IntoApplicationValue", "FromApplicationValue", "object",
                                               "take_field", "take_optional_field", "application_value_within_limits"})
             symbols_.Reserve("module", symbol, "codec foundation");
     }
@@ -297,7 +298,7 @@ class BindingEmitter final {
                    "use std::borrow::Cow;\n"
                    "use crate::application_codec::{application_value_within_limits, object, take_field, "
                    "take_optional_field, FromApplicationValue, IntoApplicationValue, Value};\n"
-                   "use crate::protocol::client_records::{Intent, IntentField, Interaction};\n\n"
+                   "\n"
                    "pub const BROWSER_PROTOCOL_VERSION: u64 = "
                 << mmltk::controller::browser::kBrowserProtocolVersion
                 << ";\npub const MAX_RECORD_WIRE_BYTES: usize = " << mmltk::controller::browser::kMaxRecordWireBytes
@@ -334,6 +335,9 @@ class BindingEmitter final {
         Schema::VisitEndpoints([&]<class Endpoint>() {
             if constexpr (Endpoint::interaction) EmitCompactType<typename Endpoint::request_type>();
         });
+        EmitClientRecord<IntentField>();
+        EmitClientRecord<Intent>();
+        EmitClientRecord<Interaction>();
         EmitInteractionEnvelope();
         EmitEndpoints();
         symbols_.Reserve("module", "default_workspace_mouse", "canonical workspace mouse defaults");
@@ -343,7 +347,7 @@ class BindingEmitter final {
         for (const bool retained : {false, true}) {
             output_ << "pub fn encode_workspace_mouse"
                     << (retained ? "_into(mouse: &WorkspaceMouse, scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), "
-                                 : "(mouse: WorkspaceMouse) -> Result<crate::protocol::client_records::Interaction, ")
+                                 : "(mouse: WorkspaceMouse) -> Result<crate::protocol::client_records::ScheduledInteraction, ")
                     << "crate::protocol::ProtocolError> { match mouse.source {\n";
             Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
                 std::size_t count = 0U;
@@ -364,6 +368,7 @@ class BindingEmitter final {
         EmitDefaults();
         EmitSettingsHelpers();
         EmitSettingsRelations();
+        EmitDataLoadingBindings();
         EmitCatalogs();
         EmitScalarProjection<mmltk::backend::models::rfdetr::TrainingScalars>();
     }
@@ -892,6 +897,92 @@ class BindingEmitter final {
         });
         output_ << "} }\n";
     }
+    // Client records keep their native wire spelling. The negotiated protocol
+    // field is supplied by the generated projection, not stored by Rust callers.
+    template <class Type>
+    void EmitClientRecord() {
+        const auto name = rust_type<Type>();
+        if (!ReserveType<Type>(name)) return;
+        VisitRustFields<Type>([&]<class Field, class>(const auto&, const std::string&) { EmitType<Field>(); });
+        output_ << "#[derive(Debug, Clone, PartialEq)]\npub struct " << name << " {\n";
+        VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string&) {
+            if (fact.member_name == "protocol_version") return;
+            const std::string member(fact.member_name);
+            symbols_.Reserve("struct " + name, member, NativeSource<Type>() + "." + member);
+            output_ << "pub " << member << ": " << rust_type<Field>() << ",\n";
+        });
+        symbols_.Reserve("impl " + name, "client_value", NativeSource<Type>() + " borrowed client projection");
+        output_ << "}\nimpl " << name << " { pub(crate) fn client_value(&self) -> Value { ";
+        EmitClientValue<Type>("self");
+        output_ << " } }\n";
+    }
+    template <class Type>
+    void EmitClientValue(const std::string& expression) {
+        if constexpr (schema::Sequence<Type>::value && !schema::ByteSequence<Type>::value) {
+            output_ << "Value::Array(" << expression << ".iter().map(|item| ";
+            EmitClientValue<typename schema::Sequence<Type>::value_type>("item");
+            output_ << ").collect())";
+        } else if constexpr (schema::ReflectedObject<Type> && !Builtin<Type>) {
+            output_ << "Value::Object(vec![\n";
+            VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
+                output_ << "(\"" << fact.member_name << "\".into(), ";
+                constexpr bool client = std::same_as<Type, mmltk::controller::browser::Intent> ||
+                                        std::same_as<Type, mmltk::controller::browser::IntentField> ||
+                                        std::same_as<Type, mmltk::controller::browser::Interaction>;
+                if (client && fact.member_name == "protocol_version")
+                    output_ << "BROWSER_PROTOCOL_VERSION.into_application_value()";
+                else
+                    EmitClientValue<Field>(expression + "." + (client ? std::string(fact.member_name) : member));
+                output_ << "),\n";
+            });
+            output_ << "])";
+        } else {
+            output_ << expression << ".clone().into_application_value()";
+        }
+    }
+
+    void EmitDataLoadingBindings() {
+        using Loading = mmltk::backend::data::DataLoadingOptions;
+        ReserveGeneratedStruct("DataLoadingField", "canonical loading field binding", {"value", "constraint", "edit"});
+        symbols_.Reserve("module", "DataLoadingBinding", "canonical loading membership");
+        symbols_.Reserve("module", "data_loading_binding", "canonical loading settings relation");
+        output_ << "pub struct DataLoadingField<T> { pub value: T, pub constraint: SettingsLeafConstraint, "
+                   "pub edit: fn(&mut GuiSettingsState, T) -> SettingsValueUpdate }\n"
+                   "pub struct DataLoadingBinding {\n";
+        VisitRustFields<Loading>([&]<class Field, class>(const auto& fact, const std::string& member) {
+            symbols_.Reserve("struct DataLoadingBinding", member, std::string(fact.member_name));
+            output_ << "pub " << member << ": DataLoadingField<" << rust_type<Field>() << ">,\n";
+        });
+        output_ << "}\npub fn data_loading_binding(feature: FeatureId, state: &GuiSettingsState) -> Option<DataLoadingBinding> { match feature {\n";
+        for (const auto feature : mmltk::frameworks::reflection::enum_entries<mmltk::controller::contracts::FeatureId>()) {
+            std::ostringstream fields;
+            std::size_t count = 0U;
+            std::size_t found = 0U;
+            VisitRustFields<Loading>([&]<class Field, class LoadingDeclaration>(const auto&, const std::string& member) {
+                ++count;
+                std::size_t matches = 0U;
+                Schema::VisitApplicationSettingsLeaves([&]<class Owner, class Declaration, class Member>(const auto& fact) {
+                    if constexpr (std::same_as<LoadingDeclaration, Declaration>) {
+                        bool applies = false;
+                        for (std::size_t index = 0; index < fact.workflows.count; ++index)
+                            applies = applies || fact.workflows.workflows[index] == feature.value;
+                        if (!applies) return;
+                        ++matches;
+                        fields << member << ": DataLoadingField { value: state";
+                        emit_rust_field_access(fields, fact.path);
+                        const auto path = rust_identifier(fact.path, false);
+                        fields << ", constraint: constraint_" << path << "(), edit: edit_" << path << " },\n";
+                    }
+                });
+                if (matches > 1U) throw std::logic_error("ambiguous data loading settings scope");
+                found += matches;
+            });
+            if (found == 0U) continue;
+            if (found != count) throw std::logic_error("incomplete data loading settings scope");
+            output_ << "FeatureId::" << rust_identifier(feature.name, true) << " => Some(DataLoadingBinding {" << fields.str() << "}),\n";
+        }
+        output_ << "_ => None } }\n";
+    }
     void EmitInteractionEnvelope() {
         using namespace mmltk::controller::browser;
         symbols_.Reserve("module", "encode_interaction_record", "canonical numeric interaction envelope");
@@ -1050,9 +1141,9 @@ class BindingEmitter final {
             symbols_.Reserve("module", function, "endpoint encoder " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name));
             if constexpr (Endpoint::interaction) {
                 output_ << "pub fn " << function << "(request: " << rust_type<typename Endpoint::request_type>()
-                        << ") -> Result<Interaction, crate::protocol::ProtocolError> { Ok(Interaction { endpoint_id: " << Endpoint::stable_id
-                        << ", replaceable: " << (Endpoint::replaceable ? "true" : "false")
-                        << ", value: crate::protocol::client_records::compact_bytes(&request)? }) }\n";
+                        << ") -> Result<crate::protocol::client_records::ScheduledInteraction, crate::protocol::ProtocolError> { Ok(crate::protocol::client_records::ScheduledInteraction { record: Interaction { endpoint_id: " << Endpoint::stable_id
+                        << ", value: crate::application_codec::ByteBuffer(crate::protocol::client_records::compact_bytes(&request)?) }, replaceable: "
+                        << (Endpoint::replaceable ? "true" : "false") << " }) }\n";
                 symbols_.Reserve("module", function + "_into", "retained compact endpoint encoder " + std::string(Endpoint::name));
                 output_ << "pub fn " << function << "_into(request: &" << rust_type<typename Endpoint::request_type>()
                         << ", scratch: &mut Vec<u8>, output: &mut Vec<u8>) -> Result<(), crate::protocol::ProtocolError> { "

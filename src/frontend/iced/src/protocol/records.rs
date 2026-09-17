@@ -1,6 +1,6 @@
 use super::client_records::{Intent, IntentField, Interaction};
 use super::{
-    ProtocolError, decode_envelope, encode_envelope, object, reject_unknown_fields,
+    ProtocolError, decode_envelope, encode_envelope, reject_unknown_fields,
     validate_client_dynamic_value, validate_server_dynamic_value,
 };
 use crate::application_codec::{FromApplicationValue, IntoApplicationValue, Value};
@@ -37,6 +37,7 @@ pub enum ServerRecord {
     IntegrationControl(crate::generated::IntegrationControl),
 }
 
+#[cfg(test)]
 fn protocol_payload(values: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
     let mut fields = vec![(
         "protocol_version".into(),
@@ -71,7 +72,7 @@ fn bootstrap_payload(
     ])
 }
 
-fn encode_fields(fields: &[IntentField]) -> Result<Value, ProtocolError> {
+fn validate_fields(fields: &[IntentField]) -> Result<(), ProtocolError> {
     if fields.len() > MAX_INTENT_FIELDS
         || fields.iter().any(|field| field.field_id == 0)
         || fields.iter().enumerate().any(|(index, field)| {
@@ -82,17 +83,10 @@ fn encode_fields(fields: &[IntentField]) -> Result<Value, ProtocolError> {
     {
         return Err(ProtocolError("intent fields are invalid".into()));
     }
-    fields
-        .iter()
-        .map(|field| {
-            validate_client_dynamic_value(&field.value)?;
-            Ok(object([
-                ("field_id", Value::Unsigned(field.field_id)),
-                ("value", field.value.clone()),
-            ]))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Value::Array)
+    for field in fields {
+        validate_client_dynamic_value(&field.value)?;
+    }
+    Ok(())
 }
 
 impl Intent {
@@ -100,14 +94,8 @@ impl Intent {
         if self.correlation == 0 || self.endpoint_id == 0 {
             return Err(ProtocolError("intent identity is invalid".into()));
         }
-        encode_envelope(
-            "Intent",
-            &protocol_payload([
-                ("correlation", Value::Unsigned(self.correlation)),
-                ("endpoint_id", Value::Unsigned(self.endpoint_id)),
-                ("fields", encode_fields(&self.fields)?),
-            ]),
-        )
+        validate_fields(&self.fields)?;
+        encode_envelope("Intent", &self.client_value())
     }
 }
 
@@ -116,11 +104,11 @@ impl Interaction {
         if self.endpoint_id == 0 {
             return Err(ProtocolError("interaction endpoint is invalid".into()));
         }
-        if self.value.len() > crate::generated::MAX_INTENT_VALUE_BYTES {
+        if self.value.0.len() > crate::generated::MAX_INTENT_VALUE_BYTES {
             return Err(ProtocolError("interaction byte capacity exceeded".into()));
         }
         let mut bytes = Vec::new();
-        super::client_records::encode_interaction_bytes(self.endpoint_id, &self.value, &mut bytes)?;
+        super::client_records::encode_interaction_bytes(self.endpoint_id, &self.value.0, &mut bytes)?;
         Ok(bytes)
     }
 }
@@ -375,6 +363,7 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::object;
 
     #[test]
     fn full_scene_output_reaches_typed_server_decode_without_relaxing_input() {
@@ -444,9 +433,10 @@ mod tests {
         ));
         assert!(
             Interaction {
-                replaceable: false,
                 endpoint_id: 1,
-                value: vec![0; crate::generated::MAX_INTENT_VALUE_BYTES + 1],
+                value: crate::application_codec::ByteBuffer(vec![
+                    0; crate::generated::MAX_INTENT_VALUE_BYTES + 1
+                ]),
             }
             .encode()
             .is_err()

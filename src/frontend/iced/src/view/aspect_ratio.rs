@@ -2,40 +2,16 @@ use crate::fluent_theme::Element;
 use iced::widget::{button, container, row, text};
 use iced::{Center, Length};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scope {
-    Workspace,
-}
-
-pub const fn bar_id(scope: Scope) -> &'static str {
-    match scope {
-        Scope::Workspace => "workflow.workspace.aspect",
-    }
-}
-
 pub const fn option_id(
-    scope: Scope,
     aspect: crate::generated::WorkspaceAspectRatio,
 ) -> &'static str {
-    match (scope, aspect) {
-        (Scope::Workspace, crate::generated::WorkspaceAspectRatio::Widescreen) => {
-            "workflow.aspect.widescreen"
-        }
-        (Scope::Workspace, crate::generated::WorkspaceAspectRatio::Portrait) => {
-            "workflow.aspect.portrait"
-        }
-        (Scope::Workspace, crate::generated::WorkspaceAspectRatio::Standard) => {
-            "workflow.aspect.standard"
-        }
-        (Scope::Workspace, crate::generated::WorkspaceAspectRatio::Photo) => {
-            "workflow.aspect.photo"
-        }
-        (Scope::Workspace, crate::generated::WorkspaceAspectRatio::Square) => {
-            "workflow.aspect.square"
-        }
-        (Scope::Workspace, crate::generated::WorkspaceAspectRatio::SixteenTen) => {
-            "workflow.aspect.sixteen_ten"
-        }
+    match aspect {
+        crate::generated::WorkspaceAspectRatio::Widescreen => "workflow.aspect.widescreen",
+        crate::generated::WorkspaceAspectRatio::Portrait => "workflow.aspect.portrait",
+        crate::generated::WorkspaceAspectRatio::Standard => "workflow.aspect.standard",
+        crate::generated::WorkspaceAspectRatio::Photo => "workflow.aspect.photo",
+        crate::generated::WorkspaceAspectRatio::Square => "workflow.aspect.square",
+        crate::generated::WorkspaceAspectRatio::SixteenTen => "workflow.aspect.sixteen_ten",
     }
 }
 
@@ -69,7 +45,6 @@ pub fn extent_for_width(width: f32, aspect: crate::generated::WorkspaceAspectRat
 pub fn selector<'a, Message: Clone + 'a>(
     selected: crate::generated::WorkspaceAspectRatio,
     enabled: bool,
-    scope: Scope,
     message: fn(crate::generated::WorkspaceAspectRatio) -> Message,
 ) -> Element<'a, Message> {
     let options = crate::generated::WORKSPACE_ASPECT_RATIO_VALUES
@@ -90,12 +65,12 @@ pub fn selector<'a, Message: Clone + 'a>(
                                 crate::fluent_theme::button_secondary
                             }),
                     )
-                    .id(option_id(scope, aspect)),
+                    .id(option_id(aspect)),
                 )
             },
         );
     container(options)
-        .id(bar_id(scope))
+        .id("workflow.workspace.aspect")
         .padding([4, 8])
         .width(Length::Fill)
         .style(crate::fluent_theme::container_header)

@@ -1,0 +1,9 @@
+firefox
+firefox-bin
+libxul.so
+libmozgtk.so
+libmozwayland.so
+application.ini
+platform.ini
+omni.ja
+browser/omni.ja

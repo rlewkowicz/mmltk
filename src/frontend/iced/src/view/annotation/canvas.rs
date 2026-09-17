@@ -85,7 +85,6 @@ pub(super) fn view(
         crate::view::aspect_ratio::selector(
             aspect,
             settings_available,
-            crate::view::aspect_ratio::Scope::Workspace,
             |aspect| super::Message::Workspace(workspace::Message::AspectSelected(aspect))
         ),
         container(

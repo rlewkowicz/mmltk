@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include "src/common/io/scoped_fd.h"
-#include "src/controller/presentation/detail/workspace_surface_import_abi.h"
+#include "src/controller/presentation/abi/workspace_surface_import_abi.h"
 namespace mmltk::testsupport {
 // Upper bound on the descriptors a single workspace surface protocol message carries, which also
 // sizes the ancillary control buffer.

@@ -19,7 +19,7 @@
 #include "src/common/io/scoped_fd.h"
 #include "src/common/types/generation.h"
 #include <charconv>
-#include "src/controller/presentation/detail/workspace_frame_signal.h"
+#include "src/controller/presentation/abi/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/native_presentation_writer_test_access.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/frameworks/gpu/external_graphics_timeline.h"

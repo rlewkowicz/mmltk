@@ -13,21 +13,13 @@ export MMLTK_WORKSPACE_GRAPHICS_ABI
 
 export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${MMLTK_JOBS}"
 
+runtime_manifest="$(dirname -- "${BASH_SOURCE[0]}")/firefox_runtime_files.txt"
 runtime_root="${MMLTK_FIREFOX_CACHE_ROOT}/obj-minimal-opt/dist/firefox"
 runtime_complete() {
     local required_path
-    for required_path in \
-        firefox \
-        firefox-bin \
-        libxul.so \
-        libmozgtk.so \
-        libmozwayland.so \
-        application.ini \
-        platform.ini \
-        omni.ja \
-        browser/omni.ja; do
+    while IFS= read -r required_path; do
         [[ -e "${runtime_root}/${required_path}" ]] || return 1
-    done
+    done < "${runtime_manifest}"
 }
 
 next_built_input="${MMLTK_FIREFOX_BUILT_INPUT}.next.$$"
@@ -37,6 +29,7 @@ cleanup_next_built_input() {
 trap cleanup_next_built_input EXIT
 {
     cat -- "${MMLTK_FIREFOX_BUILD_INPUT}"
+    sha256sum -- "${runtime_manifest}" | cut -d' ' -f1
     sha256sum -- "${MMLTK_WORKSPACE_GRAPHICS_ABI}" | cut -d' ' -f1
 } > "${next_built_input}"
 

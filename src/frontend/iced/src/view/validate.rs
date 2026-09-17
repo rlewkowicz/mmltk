@@ -196,7 +196,7 @@ impl Component {
         let diagnostics = crate::view::shared::card(
             "Validation status",
             "Canonical native operation outcome.",
-            text(crate::view::shared::compute_status(
+            text(crate::view::workflow::status::compute_status(
                 model
                     .workflow
                     .validation

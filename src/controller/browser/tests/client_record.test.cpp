@@ -1,6 +1,6 @@
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/browser/client_record.h"
-#include "src/controller/presentation/detail/workspace_surface_import_abi.h"
+#include "src/controller/presentation/abi/workspace_surface_import_abi.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/gui_settings_mutation.h"

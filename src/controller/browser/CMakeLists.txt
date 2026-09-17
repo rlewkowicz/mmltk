@@ -112,8 +112,8 @@ add_custom_command(
         application_outer_routing_emitter.h
         application_visual_projection_emitter.h
         application_workspace_abi_emitter.h
-        ${CMAKE_SOURCE_DIR}/src/controller/presentation/detail/workspace_surface_import_abi.h
-        ${CMAKE_SOURCE_DIR}/src/controller/presentation/detail/workspace_frame_signal.h
+        ${CMAKE_SOURCE_DIR}/src/controller/presentation/abi/workspace_surface_import_abi.h
+        ${CMAKE_SOURCE_DIR}/src/controller/presentation/abi/workspace_frame_signal.h
         ${CMAKE_SOURCE_DIR}/src/controller/presentation/workspace_presentation_types.h
         ${CMAKE_SOURCE_DIR}/src/frameworks/gpu/image_workspace.h
         application_materializer.h

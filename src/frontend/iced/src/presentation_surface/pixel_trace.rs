@@ -1,4 +1,5 @@
-use super::{SampleRead, Surface, wgpu};
+use super::{SampleRead, Surface};
+use iced::wgpu;
 use std::sync::{Arc, Mutex};
 
 thread_local! {

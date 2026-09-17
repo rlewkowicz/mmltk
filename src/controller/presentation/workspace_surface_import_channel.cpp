@@ -38,7 +38,7 @@
 #include "src/common/io/noexcept_io.h"
 #include "src/common/io/scoped_fd.h"
 import mmltk.common.logging.mmltk_logging;
-#include "src/controller/presentation/detail/workspace_frame_signal.h"
+#include "src/controller/presentation/abi/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/controller/presentation/presentation_system.h"
 namespace mmltk::controller::presentation {

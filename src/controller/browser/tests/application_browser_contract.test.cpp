@@ -23,7 +23,7 @@
 #include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/controller/contracts/gui_settings_states.h"
 #include "src/controller/contracts/model_selection.h"
-#include "src/controller/presentation/detail/workspace_surface_import_abi.h"
+#include "src/controller/presentation/abi/workspace_surface_import_abi.h"
 #include "src/controller/services/file_dialog_catalog.h"
 #include "src/controller/subsystems/annotation/annotation_system.h"
 #include "src/controller/subsystems/explore/explore_system.h"

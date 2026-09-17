@@ -769,10 +769,12 @@ mod tests {
         for _ in 0..64 {
             assert_eq!(
                 connection
-                    .send_interaction(crate::protocol::client_records::Interaction {
+                    .send_interaction(crate::protocol::client_records::ScheduledInteraction {
                         replaceable: false,
-                        endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                        value: Vec::new()
+                        record: crate::generated::Interaction {
+                            endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
+                            value: crate::application_codec::ByteBuffer(Vec::new()),
+                        },
                     })
                     .unwrap(),
                 crate::transport_connection::SendDisposition::Queued
@@ -989,10 +991,12 @@ mod tests {
             if failure == "capacity" {
                 for _ in 0..64 {
                     connection
-                        .send_interaction(crate::protocol::client_records::Interaction {
+                        .send_interaction(crate::protocol::client_records::ScheduledInteraction {
                             replaceable: false,
-                            endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
-                            value: Vec::new(),
+                            record: crate::generated::Interaction {
+                                endpoint_id: crate::generated::ENDPOINT_Explore_UpdateViewport,
+                                value: crate::application_codec::ByteBuffer(Vec::new()),
+                            },
                         })
                         .unwrap();
                 }

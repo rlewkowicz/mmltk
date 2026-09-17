@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <string_view>
 namespace mmltk::common::io {

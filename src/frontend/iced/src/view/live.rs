@@ -81,6 +81,7 @@ impl Component {
         .into();
         let workspace = crate::view::workflow::workspace(
             surface,
+            crate::presentation_surface::labels::Source::Hidden,
             settings,
             settings_edit_available,
             crate::generated::FeatureId::Live,

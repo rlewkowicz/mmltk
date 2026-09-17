@@ -46,17 +46,12 @@ if(BUILD_MMLTK_FIREFOX_RUNTIME)
             "Missing Firefox build input fingerprint: ${MMLTK_FIREFOX_BUILD_INPUT}")
     endif()
 
-    set(_mmltk_firefox_required_runtime_files
-        firefox
-        firefox-bin
-        libxul.so
-        libmozgtk.so
-        libmozwayland.so
-        application.ini
-        platform.ini
-        omni.ja
-        browser/omni.ja
-    )
+    set(_mmltk_firefox_runtime_manifest
+        "${CMAKE_CURRENT_SOURCE_DIR}/firefox_runtime_files.txt")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${_mmltk_firefox_runtime_manifest}")
+    file(STRINGS "${_mmltk_firefox_runtime_manifest}"
+        _mmltk_firefox_required_runtime_files)
     set(_mmltk_firefox_runtime_byproducts
         "${MMLTK_FIREFOX_CACHE_ROOT}/obj-minimal-opt/dist/.mmltk-runtime-stage.sha256")
     foreach(_mmltk_firefox_runtime_file IN LISTS
@@ -89,6 +84,7 @@ if(BUILD_MMLTK_FIREFOX_RUNTIME)
             "${MMLTK_WORKSPACE_GRAPHICS_ABI}"
             "${MMLTK_FIREFOX_BUILD_INPUT}"
             "${_mmltk_firefox_build_command}"
+            "${_mmltk_firefox_runtime_manifest}"
         BYPRODUCTS ${_mmltk_firefox_runtime_byproducts}
         WORKING_DIRECTORY "${_mmltk_firefox_source_dir}"
         COMMENT "Building and staging the owned Firefox runtime with ${MMLTK_BUILD_JOBS} workers"

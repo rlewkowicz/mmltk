@@ -1,5 +1,5 @@
 use crate::protocol::ProtocolError;
-use crate::protocol::client_records::{Intent, Interaction};
+use crate::protocol::client_records::{Intent, ScheduledInteraction};
 use futures_channel::mpsc;
 use std::collections::VecDeque;
 use std::fmt;
@@ -42,7 +42,7 @@ impl Outbound {
 pub(crate) enum OutboundRecord {
     Wake,
     Intent(Intent),
-    Interaction(Interaction),
+    Interaction(ScheduledInteraction),
     Mouse(crate::generated::WorkspaceMouse),
     IntegrationControl(crate::generated::IntegrationControl),
 }
@@ -127,7 +127,7 @@ impl Connection {
 
     pub fn send_interaction(
         &mut self,
-        interaction: Interaction,
+        interaction: ScheduledInteraction,
     ) -> Result<SendDisposition, OutboundSendError> {
         self.send(OutboundRecord::Interaction(interaction), true)
     }
@@ -279,7 +279,7 @@ impl Connection {
             let replace = retained.adjacent_record
                 && matches!((&record, retained.records.back()),
                 (OutboundRecord::Interaction(next), Some(OutboundRecord::Interaction(prior)))
-                    if next.replaceable && prior.endpoint_id == next.endpoint_id);
+                    if next.replaceable && prior.record.endpoint_id == next.record.endpoint_id);
             if replace {
                 *retained.records.back_mut().expect("adjacent record") = record;
             } else {

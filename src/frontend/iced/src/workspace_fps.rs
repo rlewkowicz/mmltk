@@ -75,6 +75,7 @@ pub(crate) struct Meter {
     previous: u64,
     since: Instant,
     text: String,
+    text_scratch: String,
     paragraph: iced::advanced::graphics::text::Paragraph,
     pub(crate) frames: u64,
     pub(crate) seconds: f64,
@@ -108,6 +109,7 @@ impl Meter {
             previous: 0,
             since: now,
             text: "0 FPS".into(),
+            text_scratch: String::with_capacity(16),
             paragraph: Self::paragraph("0 FPS"),
             frames: 0,
             seconds: 0.0,
@@ -129,9 +131,12 @@ impl Meter {
             meter.frames = submitted.wrapping_sub(meter.previous);
             meter.seconds = elapsed.as_secs_f64();
             use std::fmt::Write;
-            meter.text.clear();
-            let _ = write!(meter.text, "{:.0} FPS", meter.frames as f64 / meter.seconds);
-            meter.paragraph = Self::paragraph(&meter.text);
+            meter.text_scratch.clear();
+            let _ = write!(meter.text_scratch, "{:.0} FPS", meter.frames as f64 / meter.seconds);
+            if meter.text_scratch != meter.text {
+                std::mem::swap(&mut meter.text, &mut meter.text_scratch);
+                meter.paragraph = Self::paragraph(&meter.text);
+            }
             meter.previous = submitted;
             meter.since = *now;
         }
@@ -185,8 +190,18 @@ mod tests {
         }
         Meter::update(&mut meter, true, &redraw(1000));
         assert_eq!(meter.as_ref().unwrap().text(), "40 FPS");
-        Meter::update(&mut meter, false, &redraw(1001));
-        Meter::update(&mut meter, true, &redraw(1100));
+        let retained_paragraph = meter.as_ref().unwrap().paragraph.clone();
+        for _ in 0..20 {
+            observer();
+        }
+        Meter::update(&mut meter, true, &redraw(1500));
+        assert_eq!(meter.as_ref().unwrap().text(), "40 FPS");
+        assert!(std::ptr::eq(
+            meter.as_ref().unwrap().paragraph.buffer(),
+            retained_paragraph.buffer()
+        ));
+        Meter::update(&mut meter, false, &redraw(1501));
+        Meter::update(&mut meter, true, &redraw(1600));
         assert_eq!(meter.as_ref().unwrap().text(), "0 FPS");
     }
 }

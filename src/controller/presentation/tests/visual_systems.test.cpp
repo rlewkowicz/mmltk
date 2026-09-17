@@ -64,7 +64,7 @@
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include "src/frameworks/gpu/image_failure.h"
-#include "src/controller/presentation/detail/workspace_frame_signal.h"
+#include "src/controller/presentation/abi/workspace_frame_signal.h"
 #include "src/controller/presentation/detail/workspace_surface_import_channel.h"
 #include "src/controller/presentation/tests/support/workspace_surface_socket_test_utils.hpp"
 #include "src/controller/services/settings_system.h"

@@ -196,8 +196,15 @@ impl Component {
         ]
         .spacing(crate::view::workflow::SECTION_SPACING)
         .into();
+        let prediction = surface.and_then(crate::presentation_surface::drawable_prediction);
+        let surface = prediction.as_ref().map(|(surface, _)| *surface).or(surface);
+        let labels = prediction.map_or(
+            crate::presentation_surface::labels::Source::Hidden,
+            |(_, prediction)| crate::presentation_surface::labels::Source::Prediction(prediction),
+        );
         let workspace = crate::view::workflow::workspace(
             surface,
+            labels,
             settings,
             settings_edit_available,
             crate::generated::FeatureId::Predict,
@@ -261,7 +268,7 @@ impl Component {
         let diagnostics = crate::view::shared::card(
             "Prediction status",
             "Canonical result and frame activity.",
-            text(crate::view::shared::compute_status(operation)),
+            text(crate::view::workflow::status::compute_status(operation)),
         );
         crate::view::workflow::Regions::new(
             // CLEANUP-IGNORE: Predict supplies its generated page identity to the shared compositor.

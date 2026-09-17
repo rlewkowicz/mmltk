@@ -42,7 +42,7 @@ impl Component {
                     container(
                         button(text(format!("{action:?}"))).on_press_maybe(
                             state
-                                .is_some_and(|state| available && action_available(state, action))
+                                .is_some_and(|state| available && action_available(state))
                                 .then_some(Message::Action(action)),
                         ),
                     )
@@ -85,9 +85,7 @@ fn action_id(action: crate::generated::AnnotationSetupAction) -> String {
 
 fn action_available(
     state: &crate::generated::AnnotationUiState,
-    action: crate::generated::AnnotationSetupAction,
 ) -> bool {
-    let _ = action;
     state.sourcenavigationavailable
 }
 

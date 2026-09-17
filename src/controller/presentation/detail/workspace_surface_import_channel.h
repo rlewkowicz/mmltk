@@ -8,7 +8,7 @@
 #include <optional>
 #include <string>
 #include "src/controller/contracts/diagnostic_context.h"
-#include "src/controller/presentation/detail/workspace_surface_import_abi.h"
+#include "src/controller/presentation/abi/workspace_surface_import_abi.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
 #include "src/controller/presentation/visual_system_types.h"

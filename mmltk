@@ -2088,10 +2088,12 @@ firefox_source_state_fingerprint_for() {
         printf 'firefox-build-command\0%s\0' \
             "$(fingerprint_path \
                 "${repo_root}/src/entrypoints/desktop/build_firefox_runtime.sh")"
+        printf 'firefox-runtime-manifest\0%s\0' \
+            "$(fingerprint_path "${repo_root}/src/entrypoints/desktop/firefox_runtime_files.txt")"
         local graphics_input
         for graphics_input in \
-            src/controller/presentation/detail/workspace_surface_import_abi.h \
-            src/controller/presentation/detail/workspace_frame_signal.h \
+            src/controller/presentation/abi/workspace_surface_import_abi.h \
+            src/controller/presentation/abi/workspace_frame_signal.h \
             src/controller/presentation/workspace_presentation_types.h \
             src/frameworks/gpu/image_workspace.h \
             src/controller/browser/application_workspace_abi_emitter.h \

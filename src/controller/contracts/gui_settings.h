@@ -34,6 +34,11 @@ concept GuiSettingsJsonAdapter = settings_json_detail::adapter_type<T>();
 namespace settings_json_detail {
 // Each canonical type instantiates ordinary external-format conversion
 // declarations. Hidden-friend lookup avoids a second handwritten type inventory.
+// The overloads are intentionally non-template functions defined in gui_settings.cpp.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnon-template-friend"
+#endif
 template <GuiSettingsJsonAdapter State>
 struct JsonWrite final {
     nlohmann::json& json;
@@ -46,6 +51,9 @@ struct JsonRead final {
     State& state;
     friend void convert(JsonRead);
 };
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 }  // namespace settings_json_detail
 template <GuiSettingsJsonAdapter State>
 void to_json(nlohmann::json& json, const State& state) {

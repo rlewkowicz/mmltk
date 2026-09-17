@@ -17,26 +17,3 @@ pub enum Message {
     Diagnostics(diagnostics::Message),
     Integration(crate::integration_control::Message),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn root_message_surface_wraps_component_messages() {
-        let messages = [
-            Message::Workspace(router::Message::Navigation(
-                crate::view::navigation::Message::SettingsRequested,
-            )),
-            Message::FileDialog(file_dialog::Message::StopRequested),
-            Message::Settings(settings::Message::Close),
-            Message::Error(error_modal::Message::Dismiss),
-            Message::Diagnostics(diagnostics::Message::Toggled),
-            Message::Integration(crate::integration_control::Message::Located {
-                control: "fixture".into(),
-                bounds: iced::Rectangle::default(),
-            }),
-        ];
-        assert_eq!(messages.len(), 6);
-    }
-}

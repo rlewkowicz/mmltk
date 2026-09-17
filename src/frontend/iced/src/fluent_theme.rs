@@ -423,3 +423,8 @@ mod tests {
         }
     }
 }
+
+// Neutral spacing shared by ordinary cards and modal surfaces.
+pub const CARD_PADDING: f32 = 10.0;
+pub const FIELD_SPACING: f32 = 4.0;
+pub const MODAL_PADDING: f32 = 24.0;

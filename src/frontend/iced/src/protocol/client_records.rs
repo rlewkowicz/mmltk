@@ -1,23 +1,18 @@
 use crate::application_codec::Value;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct IntentField {
-    pub field_id: u64,
-    pub value: Value,
-}
+pub use crate::generated::{Intent, IntentField, Interaction};
 
+// Adjacent-record replacement belongs to local transport scheduling, never wire data.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Intent {
-    pub correlation: u64,
-    pub endpoint_id: u64,
-    pub fields: Vec<IntentField>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Interaction {
+pub struct ScheduledInteraction {
     pub replaceable: bool,
-    pub endpoint_id: u64,
-    pub value: Vec<u8>,
+    pub record: Interaction,
+}
+
+impl ScheduledInteraction {
+    pub fn encode(&self) -> Result<Vec<u8>, super::ProtocolError> {
+        self.record.encode()
+    }
 }
 
 // Structural implementations are generated from the same native declarations

@@ -74,7 +74,7 @@ endif()
 
 function(mmltk_add_entrypoints_desktop_tests)
     set(_mmltk_desktop_test_asset_root
-        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/assets")
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/assets")
     set(_mmltk_desktop_fixture_root
         "${CMAKE_CURRENT_BINARY_DIR}/entrypoints-desktop-fixtures")
     set(_mmltk_desktop_fake_firefox_root

@@ -7,7 +7,7 @@ pub const STABLE_ID: &str = "workflow.visual.workspace";
 
 #[cfg(test)]
 pub fn aspect_id(aspect: crate::generated::WorkspaceAspectRatio) -> &'static str {
-    crate::view::aspect_ratio::option_id(crate::view::aspect_ratio::Scope::Workspace, aspect)
+    crate::view::aspect_ratio::option_id(aspect)
 }
 
 #[derive(Debug, Clone)]
@@ -48,18 +48,13 @@ pub fn surface_extent(
 
 pub fn view(
     surface: Option<Surface>,
+    labels: crate::presentation_surface::labels::Source,
     selected: crate::generated::WorkspaceAspectRatio,
     settings_edit_available: bool,
     center_width: f32,
     input: crate::workspace_input::Binding,
     show_fps: bool,
 ) -> Element<'static, Message> {
-    let prediction = surface.and_then(crate::presentation_surface::drawable_prediction);
-    let surface = prediction.as_ref().map(|(surface, _)| *surface).or(surface);
-    let labels = prediction.map_or(
-        crate::presentation_surface::labels::Source::Hidden,
-        |(_, prediction)| crate::presentation_surface::labels::Source::Prediction(prediction),
-    );
     let (surface_width, surface_height) = surface_extent(center_width, selected);
     let content: Element<'static, Message> = crate::presentation_surface::labels::view(
         crate::presentation_surface::Program {
@@ -89,7 +84,6 @@ pub fn view(
         container(crate::view::aspect_ratio::selector(
             selected,
             settings_edit_available,
-            crate::view::aspect_ratio::Scope::Workspace,
             Message::AspectSelected,
         ))
         .width(Length::Fixed(surface_width)),
