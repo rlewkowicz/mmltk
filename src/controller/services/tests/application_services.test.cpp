@@ -196,6 +196,7 @@ TEST_CASE("settings store validates, creates parents, and cleans failed atomics"
     const auto rename_target = root / "rename-target";
     std::filesystem::create_directory(rename_target);
     const auto rename_save = SettingsStore::save(rename_target.string(), *record.settings, 2U);
+    INFO(rename_save.detail);
     CHECK_FALSE(rename_save.succeeded());
     CHECK(rename_save.stage == SettingsStoreWriteStage::Rename);
     CHECK_FALSE(std::filesystem::exists(rename_target.string() + ".tmp"));

@@ -54,6 +54,10 @@ constexpr std::string_view kRevisionField{"settings_revision"};
     return revision;
 }
 [[nodiscard]] std::optional<std::uint64_t> inspect_raw_revision(const std::filesystem::path& path) {
+    // A directory has no durable revision. Let the atomic write report its
+    // existing rename failure instead of opening it as a JSON input stream.
+    std::error_code status_error;
+    if (std::filesystem::is_directory(path, status_error)) return std::nullopt;
     std::ifstream file(path);
     if (!file.is_open()) return std::nullopt;
     const nlohmann::json raw = nlohmann::json::parse(file, nullptr, false);

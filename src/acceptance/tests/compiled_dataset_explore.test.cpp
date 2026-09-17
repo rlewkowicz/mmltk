@@ -1126,15 +1126,20 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     mmltk::common::io::ScopedFd commands{sockets[0]};
     auto gate = std::make_shared<controller::ExploreAcceptanceGate>(sockets[1]);
     NativeExploreAudit audit;
+    mmltk::testsupport::TestGate prefetch_lane{"second Explore image before viewport growth"};
     mmltk::testsupport::TestGate stale_lane{"third Explore lane before acceptance wait"};
     struct ReadObservation {
         NativeExploreAudit& audit;
         mmltk::testsupport::TestGate::Receipt stale_lane;
+        mmltk::testsupport::TestGate::Receipt prefetch_lane;
         std::atomic_uint64_t started{0U};
         std::atomic_size_t discarded{0U};
         std::atomic_bool hold_third{false};
         std::atomic_uint64_t held_generation{0U};
-    } reads{audit, stale_lane.receipt()};
+    } reads{audit, stale_lane.receipt(), prefetch_lane.receipt()};
+    gate->SetReadObserver(&reads, [](void* context, std::uint64_t, const std::uint32_t index) {
+        if (index == 1U) static_cast<ReadObservation*>(context)->prefetch_lane.ArriveAndWait();
+    });
     gate->SetInitialWaitObserver(&reads, [](void* context, const std::uint64_t generation) {
         auto& observed = *static_cast<ReadObservation*>(context);
         if (observed.hold_third.exchange(false)) {
@@ -1163,11 +1168,13 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     struct StopGate {
         controller::ExploreAcceptanceGate& gate;
         mmltk::testsupport::TestGate& lane;
+        mmltk::testsupport::TestGate& prefetch;
         ~StopGate() {
             gate.Stop();
             lane.Release();
+            prefetch.Release();
         }
-    } stop{*gate, stale_lane};
+    } stop{*gate, stale_lane, prefetch_lane};
     const auto send = [&](const std::uint8_t command) { REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command)); };
     const auto viewport = [](const std::uint32_t rows) { return controller::ExploreViewport{.extent = {32U, 32U * rows}, .row_count = rows, .columns = 1U}; };
     static_cast<void>(system.Open({.viewport = viewport(1U), .compiled_source = compiled.string()}));
@@ -1218,12 +1225,19 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
             cudaSuccess);
     CHECK(std::ranges::equal(retained_training_pixels, training.host_images(batch)));
     send(1U);
-    REQUIRE(audit.Wait([&] { return audit.last_tile_cumulative() == 1U && (audit.prefetched_indices() & 2U) != 0U; }));
-    // One physical lane renders the retained first tile and the prefetched
-    // second tile, then waits before reading the third.
+    REQUIRE(prefetch_lane.WaitEntered(std::chrono::seconds{2}));
+    REQUIRE(audit.Wait([&] { return audit.last_tile_cumulative() == 1U; }));
+    // Hold the one physical lane at the second image until viewport growth
+    // commits, so speculative reads cannot consume the third image first.
     reads.hold_third.store(true);
     system.UpdateViewport({.viewport = viewport(3U)});
-    REQUIRE(stale_lane.WaitEntered(std::chrono::seconds{2}));
+    REQUIRE(audit.Wait([&] { return system.snapshot().gallery.slots == std::vector<bool>{true, false, false}; }));
+    prefetch_lane.Release();
+    const bool third_lane_entered = stale_lane.WaitEntered(std::chrono::seconds{2});
+    INFO("third lane entered=" << third_lane_entered << " failure=" << audit.failure_detail() << " started=" << reads.started.load()
+                              << " prefetched=" << audit.prefetched_indices() << " tiles=" << audit.last_tile_cumulative()
+                              << " busy=" << system.snapshot().busy << " generation=" << system.snapshot().gallery.generation);
+    REQUIRE(third_lane_entered);
     REQUIRE(audit.Wait(
         [&] { return (reads.started.load(std::memory_order_acquire) & 4U) != 0U && system.snapshot().gallery.slots == std::vector<bool>{true, true, false}; }));
     const auto reused = audit.reused_tiles();

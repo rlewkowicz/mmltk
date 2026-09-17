@@ -51,7 +51,8 @@ function(mmltk_add_controller_explore_tests)
     mmltk_register_ordinary_sources(mmltk_controller_explore_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/explore_system.test.cpp)
     target_link_libraries(mmltk_controller_explore_tests PRIVATE
-        mmltk_controller_explore_test_support )
+        mmltk_controller_explore_test_support
+        mmltk::controller::browser::protocol_v17)
     catch_discover_tests(mmltk_controller_explore_tests
         TEST_PREFIX "controller::explore::" DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)
 endfunction()

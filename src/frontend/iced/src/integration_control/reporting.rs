@@ -1373,10 +1373,9 @@ mod tests {
             wire,
             vec![expected(IntegrationControlKind::Settled, 10, 0, "")]
         );
+        let failure_detail = "Protocol: Invalid snapshot: inconsistent frame revision";
         let failure_line = line!() + 1;
-        driver
-            .driver
-            .fail("Protocol: Invalid snapshot: inconsistent frame revision");
+        driver.driver.fail(failure_detail);
         assert_eq!(driver.driver.failure_line, failure_line);
         driver.publish_control(&mut connection);
         wire.clear();
@@ -1392,7 +1391,7 @@ mod tests {
                 IntegrationControlKind::Failed,
                 15,
                 failure_line,
-                "Protocol: Invalid snapshot: inconsistent frame revision"
+                failure_detail
             )]
         );
         let forwarded_line = line!() + 1;
