@@ -44,7 +44,8 @@ fi
     "${MMLTK_FIREFOX_MACH}" build \
         --jobs "${MMLTK_JOBS}" \
         --priority normal
-"${MMLTK_FIREFOX_MACH}" mmltk-stage-runtime
+"${MMLTK_FIREFOX_MACH}" mmltk-stage-runtime \
+    --runtime-manifest "${runtime_manifest}"
 
 mv -f -- "${next_built_input}" "${MMLTK_FIREFOX_BUILT_INPUT}"
 trap - EXIT

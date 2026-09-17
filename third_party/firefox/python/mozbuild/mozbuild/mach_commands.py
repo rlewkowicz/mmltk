@@ -997,17 +997,6 @@ def package(command_context, verbose=False):
     return ret
 
 
-_MMLTK_RUNTIME_REQUIRED_FILES = (
-    "firefox",
-    "firefox-bin",
-    "libxul.so",
-    "libmozgtk.so",
-    "libmozwayland.so",
-    "application.ini",
-    "platform.ini",
-    "omni.ja",
-    "browser/omni.ja",
-)
 _MMLTK_RUNTIME_FINGERPRINT_INPUTS = (
     "mozconfig",
     "browser/installer/package-manifest.in",
@@ -1055,10 +1044,12 @@ def _mmltk_hash_tree(digest, root, buffer):
             _mmltk_hash_file(digest, entry.path, buffer)
 
 
-def _mmltk_runtime_fingerprint(command_context):
+def _mmltk_runtime_fingerprint(command_context, manifest_content):
     import hashlib
 
     digest = hashlib.sha256()
+    digest.update(len(manifest_content).to_bytes(8, "little"))
+    digest.update(manifest_content)
     dist_bin = Path(command_context.topobjdir) / "dist" / "bin"
     if not dist_bin.is_dir():
         raise RuntimeError(f"Firefox build output is missing: {dist_bin}")
@@ -1075,11 +1066,9 @@ def _mmltk_runtime_fingerprint(command_context):
     return digest.hexdigest()
 
 
-def _mmltk_runtime_complete(path):
+def _mmltk_runtime_complete(path, required_files):
     path = Path(path)
-    if not all(
-        (path / relative).is_file() for relative in _MMLTK_RUNTIME_REQUIRED_FILES
-    ):
+    if not all((path / relative).is_file() for relative in required_files):
         return False
     return all(
         os.access(path / executable, os.X_OK)
@@ -1153,7 +1142,12 @@ def _mmltk_replace_runtime(next_runtime, runtime):
     conditions=[conditions.has_build_or_shell],
     description="Incrementally stage the owned Firefox runtime for mmltk.",
 )
-def mmltk_stage_runtime(command_context):
+@CommandArgument(
+    "--runtime-manifest",
+    required=True,
+    help="Application-owned manifest listing the required runtime files.",
+)
+def mmltk_stage_runtime(command_context, runtime_manifest):
     """Publish dist/firefox atomically without creating a compressed package."""
 
     dist = Path(command_context.topobjdir) / "dist"
@@ -1162,11 +1156,13 @@ def mmltk_stage_runtime(command_context):
     fingerprint_path = dist / ".mmltk-runtime-stage.sha256"
     fingerprint = ""
     try:
-        fingerprint = _mmltk_runtime_fingerprint(command_context)
+        manifest_content = Path(runtime_manifest).read_bytes()
+        required_files = manifest_content.decode("utf-8").splitlines()
+        fingerprint = _mmltk_runtime_fingerprint(command_context, manifest_content)
         current = (
             fingerprint_path.is_file()
             and fingerprint_path.read_text(encoding="utf-8").strip() == fingerprint
-            and _mmltk_runtime_complete(runtime)
+            and _mmltk_runtime_complete(runtime, required_files)
         )
         if current:
             _mmltk_stage_event("cache_hit", fingerprint=fingerprint)
@@ -1183,7 +1179,7 @@ def mmltk_stage_runtime(command_context):
         )
         if result:
             raise RuntimeError(f"stage-package exited with status {result}")
-        if not _mmltk_runtime_complete(next_runtime):
+        if not _mmltk_runtime_complete(next_runtime, required_files):
             raise RuntimeError(f"staged Firefox runtime is incomplete: {next_runtime}")
         _mmltk_replace_runtime(next_runtime, runtime)
         fingerprint_next = fingerprint_path.with_name(
