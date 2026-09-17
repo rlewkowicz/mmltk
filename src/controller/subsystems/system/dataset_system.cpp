@@ -3,27 +3,26 @@
 #include <stdexcept>
 #include <utility>
 #include "src/controller/contracts/compute.h"
+#include "src/common/concurrency/event_cancellation.h"
 namespace mmltk::controller {
 ArtifactDatasetRuntime::ArtifactDatasetRuntime() = default;
 ArtifactDatasetRuntime::ArtifactDatasetRuntime(services::ArtifactStore store, services::ArtifactDiagnosticObserver diagnostics)
     : store_(std::move(store)), diagnostics_(diagnostics) {}
 services::ArtifactCompileResult ArtifactDatasetRuntime::Compile(const services::ArtifactCompileRequest& request, const std::stop_token stop,
                                                                 const std::function<void(const contracts::ArtifactProgress&)>& progress) {
-    auto cancellation = services::ArtifactCancellationSource::Mint();
-    std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
+    mmltk::common::concurrency::ScopedEventCancellation<services::ArtifactCancellationSource> cancellation{stop};
     services::ArtifactProgressObserver observer{.context = const_cast<std::function<void(const contracts::ArtifactProgress&)>*>(&progress),
                                                 .report = [](void* context, const contracts::ArtifactProgress& value) noexcept {
                                                     try {
                                                         (*static_cast<std::function<void(const contracts::ArtifactProgress&)>*>(context))(value);
                                                     } catch (...) {}
                                                 }};
-    return store_.compile(request, cancellation.second, observer, diagnostics_);
+    return store_.compile(request, cancellation.token(), observer, diagnostics_);
 }
 contracts::ArtifactInspection ArtifactDatasetRuntime::Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
                                                               const std::string_view preset, const std::uint32_t resolution, const std::stop_token stop) {
-    auto cancellation = services::ArtifactCancellationSource::Mint();
-    std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
-    return store_.inspect(paths, preset, resolution, cancellation.second);
+    mmltk::common::concurrency::ScopedEventCancellation<services::ArtifactCancellationSource> cancellation{stop};
+    return store_.inspect(paths, preset, resolution, cancellation.token());
 }
 DatasetSystem::DatasetSystem(SettingsSystem& settings, RuntimeFactory factory, SystemEventSink<event_type> events)
     : settings_(settings), factory_(std::move(factory)), events_(std::move(events)) {

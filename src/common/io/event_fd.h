@@ -1,9 +1,18 @@
 #pragma once
 #include <cstdint>
+#include <sys/types.h>
 namespace mmltk::common::io {
 // EAGAIN is success for a nonblocking eventfd: a saturated counter already
 // carries the wake edge. Callers decide whether other failures are fatal.
 [[nodiscard]] bool signal_event_fd(int descriptor) noexcept;
+struct CounterRead final {
+    std::uint64_t count = 0U;
+    ssize_t bytes = -1;
+    int error = 0;
+};
+// Retries only interrupted reads. The caller owns size, value and failure policy.
+// Captures failure errno without clearing or otherwise changing ambient errno.
+[[nodiscard]] CounterRead read_counter_fd(int descriptor) noexcept;
 enum class EventFdWaitStatus : std::uint8_t {
     // The descriptor signalled POLLIN and its counter was consumed.
     Woken = 0U,

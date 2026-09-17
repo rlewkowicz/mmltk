@@ -30,6 +30,7 @@ target_link_libraries(mmltk_backend_media_capture
     CUDA::cudart
     Threads::Threads
     mmltk::common::concurrency
+    mmltk::common::io
     mmltk::common::logging
     mmltk::common::system
     mmltk::common::types

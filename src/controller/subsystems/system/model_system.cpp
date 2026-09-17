@@ -5,6 +5,7 @@
 #include <system_error>
 #include <utility>
 #include "src/controller/contracts/compute.h"
+#include "src/common/concurrency/event_cancellation.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
@@ -24,8 +25,7 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
         if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
         artifact = custom;
     } else {
-        auto cancellation = services::ArtifactCancellationSource::Mint();
-        std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
+        mmltk::common::concurrency::ScopedEventCancellation<services::ArtifactCancellationSource> cancellation{stop};
         // CLEANUP-IGNORE: Artifact weight and dataset progress observers adapt distinct typed service callbacks at their
         // respective runtime boundaries.
         const services::ArtifactWeightProgressObserver observer{.context = const_cast<std::function<void(const contracts::ModelProgress&)>*>(&progress),
@@ -34,7 +34,7 @@ ModelArtifactAdmission ArtifactModelRuntime::Acquire(const contracts::ModelSelec
                                                                         (*static_cast<std::function<void(const contracts::ModelProgress&)>*>(context))(value);
                                                                     } catch (...) {}
                                                                 }};
-        artifact = store_.canonical_weight_path(key.preset, cancellation.second, observer);
+        artifact = store_.canonical_weight_path(key.preset, cancellation.token(), observer);
     }
     if (stop.stop_requested()) throw std::runtime_error("model selection cancelled");
     namespace rfdetr = mmltk::backend::models::rfdetr;

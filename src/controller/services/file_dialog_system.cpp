@@ -1,6 +1,7 @@
 #include "src/controller/services/file_dialog_system.h"
 #include <string_view>
 #include "src/controller/contracts/compute.h"
+#include "src/common/concurrency/event_cancellation.h"
 namespace mmltk::controller {
 namespace {
 [[nodiscard]] std::string bounded_dialog_detail(const std::string_view detail) { return std::string{detail.substr(0, services::kFileDialogTextCapacity)}; }
@@ -9,9 +10,8 @@ services::FileDialogSelection NativeFileDialogRuntime::Open(const services::Reso
     if (!client_.valid()) throw contracts::UnavailableError("file dialog service is unavailable");
     services::FileDialogRequest request{resolved.descriptor.title, resolved.descriptor.mode, resolved.descriptor.filter};
     if (!request.valid()) throw contracts::InvalidIntentError("file dialog declaration is invalid");
-    auto cancellation = services::FileDialogCancellationSource::Mint();
-    std::stop_callback bridge(stop, [&source = cancellation.first] { static_cast<void>(source.RequestCancel()); });
-    const auto result = client_.run(request, std::move(cancellation.second));
+    mmltk::common::concurrency::ScopedEventCancellation<services::FileDialogCancellationSource> cancellation{stop};
+    const auto result = client_.run(request, cancellation.ConsumeToken());
     services::FileDialogSelection selection{.target = resolved.target};
     if (result.disposition == services::FileDialogDisposition::Cancelled || result.disposition == services::FileDialogDisposition::Reaped) return selection;
     if (result.disposition != services::FileDialogDisposition::Selected || !result.path.valid()) throw contracts::FailedError("file dialog operation failed");

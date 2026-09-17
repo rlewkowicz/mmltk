@@ -1,4 +1,5 @@
 #pragma once
+#include "src/common/io/event_fd.h"
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -50,10 +51,8 @@ inline void arm_timerfd(const int descriptor, const std::chrono::nanoseconds dur
     }
 }
 [[nodiscard]] inline bool consume_timerfd(const int descriptor) noexcept {
-    std::uint64_t expirations = 0U;
-    ssize_t received;
-    do { received = ::read(descriptor, &expirations, sizeof(expirations)); } while (received < 0 && errno == EINTR);
-    return received == static_cast<ssize_t>(sizeof(expirations)) && expirations == 1U;
+    const auto received = mmltk::common::io::read_counter_fd(descriptor);
+    return received.bytes == static_cast<ssize_t>(sizeof(received.count)) && received.count == 1U;
 }
 [[nodiscard]] inline PidfdWaitResult reap_pidfd(const int pidfd, const pid_t child) noexcept {
     siginfo_t terminal{};

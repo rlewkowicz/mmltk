@@ -4,6 +4,7 @@
 #include <ranges>
 #include <stdexcept>
 #include <utility>
+#include "src/common/concurrency/event_cancellation.h"
 #include "src/controller/services/train_process_client.h"
 #include "src/controller/services/train_run_store.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
@@ -18,18 +19,13 @@ namespace {
     if (result.disposition == Source::NotApplied) return {.disposition = Target::NotApplied};
     return {.disposition = Target::Inconclusive, .instance_id = instance};
 }
-template <class Source>
-auto cancellation_bridge(Source& source, const std::stop_token stop) {
-    return std::stop_callback{stop, [&source] { static_cast<void>(source.RequestCancel()); }};
-}
 }  // namespace
 NativeTrainingRuntime::NativeTrainingRuntime(NativeTrainingConfiguration configuration) : config_(std::move(configuration)) {}
 contracts::ComputeTerminal NativeTrainingRuntime::Train(mmltk::backend::models::rfdetr::TrainRequest request, const std::stop_token stop,
                                                         const std::function<void(const services::TrainProcessProgress&)>& progress) {
     if (config_.training_executable.empty()) throw contracts::UnavailableError("local training executable is unavailable");
     auto process = services::TrainProcessClient::launch(request, config_.training_executable);
-    auto [source, token] = services::TrainProcessStopSource::Mint();
-    auto cancellation = cancellation_bridge(source, stop);
+    mmltk::common::concurrency::ScopedEventCancellation<services::TrainProcessStopSource> cancellation{stop};
     struct Observer final {
         const std::function<void(const services::TrainProcessProgress&)>* sink;
         static void Report(void* context, const services::TrainProcessProgress& value) noexcept {
@@ -38,7 +34,7 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(mmltk::backend::models::
             } catch (...) {}
         }
     } observer{&progress};
-    const auto result = process.Run(std::move(token), {.context = &observer, .report = &Observer::Report});
+    const auto result = process.Run(cancellation.ConsumeToken(), {.context = &observer, .report = &Observer::Report});
     const auto outcome = result.terminal.outcome == services::TrainProcessExitOutcome::Succeeded   ? contracts::ComputeOperationOutcome::Succeeded
                          : result.terminal.outcome == services::TrainProcessExitOutcome::Cancelled ? contracts::ComputeOperationOutcome::Cancelled
                                                                                                    : contracts::ComputeOperationOutcome::Failed;
@@ -47,27 +43,25 @@ contracts::ComputeTerminal NativeTrainingRuntime::Train(mmltk::backend::models::
 }
 contracts::ProviderQueryResult NativeTrainingRuntime::Query(const contracts::ProviderPreferences& preferences, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
-    auto [source, token] = services::VastCancellationSource::Mint();
-    auto cancellation = cancellation_bridge(source, stop);
-    const auto offers = services::VastClient{config_.provider}.query(preferences, token);
+    mmltk::common::concurrency::ScopedEventCancellation<services::VastCancellationSource> cancellation{stop};
+    const auto offers = services::VastClient{config_.provider}.query(preferences, cancellation.token());
     return services::materialize_provider_query_result(offers);
 }
 contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::ProviderMutation mutation, const contracts::ProviderPreferences& preferences,
                                                               const contracts::ProviderOfferIdentity offer, const int instance,
                                                               const std::string_view launch_token, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
-    auto [source, token] = services::VastCancellationSource::Mint();
-    auto cancellation = cancellation_bridge(source, stop);
+    mmltk::common::concurrency::ScopedEventCancellation<services::VastCancellationSource> cancellation{stop};
     services::VastEffectAttempt attempt;
     try {
         services::VastClient client{config_.provider};
         if (mutation == contracts::ProviderMutation::Create) {
-            const auto created = client.create(offer.offer_id, preferences, launch_token, attempt, token);
+            const auto created = client.create(offer.offer_id, preferences, launch_token, attempt, cancellation.token());
             if (!created.success || created.instance_id <= 0) return contracts::provider_effect_not_applied("provider did not allocate the selected offer");
             return {.disposition = contracts::ProviderReconciliationDisposition::Applied, .instance_id = created.instance_id};
         }
-        client.mutate(mutation, instance, attempt, token);
-        return reconcile_result(client.reconcile({.mutation = mutation, .instance_id = instance, .launch_token = {}}, token), instance);
+        client.mutate(mutation, instance, attempt, cancellation.token());
+        return reconcile_result(client.reconcile({.mutation = mutation, .instance_id = instance, .launch_token = {}}, cancellation.token()), instance);
     } catch (const services::VastBridgeError& error) {
         const bool cancelled = error.kind() == services::VastBridgeFailureKind::Cancelled;
         return attempt.started() ? contracts::provider_effect_inconclusive(error.what(), cancelled)
@@ -81,10 +75,9 @@ contracts::ProviderEffectResult NativeTrainingRuntime::Mutate(const contracts::P
 }
 contracts::ProviderEffectResult NativeTrainingRuntime::Reconcile(const services::VastReconciliationRequest& request, const std::stop_token stop) {
     if (!config_.provider.valid()) throw contracts::UnavailableError("provider access is unavailable");
-    auto [source, token] = services::VastCancellationSource::Mint();
-    auto cancellation = cancellation_bridge(source, stop);
+    mmltk::common::concurrency::ScopedEventCancellation<services::VastCancellationSource> cancellation{stop};
     try {
-        return reconcile_result(services::VastClient{config_.provider}.reconcile(request, token), request.instance_id);
+        return reconcile_result(services::VastClient{config_.provider}.reconcile(request, cancellation.token()), request.instance_id);
     } catch (const services::VastBridgeError& error) {
         return contracts::provider_effect_inconclusive(error.what(), error.kind() == services::VastBridgeFailureKind::Cancelled);
     } catch (const std::exception& error) { return contracts::provider_effect_inconclusive(error.what()); } catch (...) {

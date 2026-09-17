@@ -414,10 +414,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 int status;
                 do { status = ::poll(&wake, 1, -1); } while (status < 0 && errno == EINTR);
                 if (status < 0 || (wake.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) return Retirement::UnsafeFailure;
-                std::uint64_t value;
-                ssize_t read;
-                do { read = ::read(wake_->get(), &value, sizeof(value)); } while (read < 0 && errno == EINTR);
-                if (read < 0 && errno != EAGAIN) return Retirement::UnsafeFailure;
+                const auto read = mmltk::common::io::read_counter_fd(wake_->get());
+                if (read.bytes < 0 && read.error != EAGAIN) return Retirement::UnsafeFailure;
             }
             for (const auto* arena : {active_.get(), candidate_.get(), retiring_[0].get(), retiring_[1].get()})
                 if (arena) DiagnoseArena(VisualDiagnosticOperation::PresentationRetirement, *arena, released ? 1U : 0U);
@@ -507,10 +505,8 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         return result;
     }
     void DrainCompletion() {
-        std::uint64_t edge = 0U;
-        ssize_t read;
-        do { read = ::read(wake_->get(), &edge, sizeof(edge)); } while (read < 0 && errno == EINTR);
-        if (read < 0 && errno != EAGAIN) throw std::runtime_error("presentation completion wake failed");
+        const auto read = mmltk::common::io::read_counter_fd(wake_->get());
+        if (read.bytes < 0 && read.error != EAGAIN) throw std::runtime_error("presentation completion wake failed");
         if (completion_.ready.exchange(false, std::memory_order_acq_rel)) {
             if (completion_.status != cudaSuccess) throw std::runtime_error("presentation asynchronous graphics work failed");
             if (stage_ != Stage::ReadyPending || !transfer_) throw std::runtime_error("presentation ready completion has no publication");

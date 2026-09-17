@@ -1,4 +1,5 @@
 #include "src/controller/services/diagnostics_client.h"
+#include "src/common/io/event_fd.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -178,10 +179,8 @@ bool DiagnosticsClient::State::wait_for_writer_event(const bool output_pending) 
     do { ready = ::poll(events.data(), event_count, -1); } while (ready < 0 && errno == EINTR);
     if (ready < 0 || (events[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) return false;
     if ((events[0].revents & POLLIN) == 0) return true;
-    std::uint64_t ignored = 0U;
-    ssize_t consumed = -1;
-    do { consumed = ::read(wake.get(), &ignored, sizeof(ignored)); } while (consumed < 0 && errno == EINTR);
-    return consumed == static_cast<ssize_t>(sizeof(ignored)) || (consumed < 0 && errno == EAGAIN);
+    const auto consumed = mmltk::common::io::read_counter_fd(wake.get());
+    return consumed.bytes == static_cast<ssize_t>(sizeof(consumed.count)) || (consumed.bytes < 0 && consumed.error == EAGAIN);
 }
 void DiagnosticsClient::State::run() noexcept {
     sigset_t blocked_signals{};
@@ -362,8 +361,7 @@ DiagnosticsCounters DiagnosticsClient::counters() const noexcept {
 int DiagnosticsClient::terminal_fd() const noexcept { return state_ == nullptr ? -1 : state_->terminal_wake.get(); }
 void DiagnosticsClient::consume_terminal_wake() const noexcept {
     if (state_ == nullptr || terminal() == DiagnosticsTerminal::Pending) return;
-    std::uint64_t ignored = 0U;
-    while (::read(state_->terminal_wake.get(), &ignored, sizeof(ignored)) < 0 && errno == EINTR) {}
+    static_cast<void>(mmltk::common::io::read_counter_fd(state_->terminal_wake.get()));
 }
 DiagnosticsTerminal DiagnosticsClient::terminal() const noexcept {
     return state_ == nullptr ? DiagnosticsTerminal::Drained : state_->terminal.load(std::memory_order_acquire);

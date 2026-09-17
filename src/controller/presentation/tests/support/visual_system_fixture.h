@@ -1,4 +1,5 @@
 #pragma once
+#include "src/common/io/event_fd.h"
 #include <sys/types.h>
 #include "src/common/types/generation.h"
 #include <algorithm>
@@ -174,10 +175,8 @@ class TestPresentationWriter final : public PresentationNativeWriter {
     PresentationNativeOutcome Pump(const std::uint64_t current_selection_generation) override {
         context_.Bind();
         state_->context_bindings.fetch_add(1U, std::memory_order_acq_rel);
-        std::uint64_t wake = 0U;
-        ssize_t consumed = -1;
-        do { consumed = ::read(state_->readiness.get(), &wake, sizeof(wake)); } while (consumed < 0 && errno == EINTR);
-        if (consumed < 0 && errno != EAGAIN) throw std::runtime_error("test presentation readiness read failed");
+        const auto consumed = mmltk::common::io::read_counter_fd(state_->readiness.get());
+        if (consumed.bytes < 0 && consumed.error != EAGAIN) throw std::runtime_error("test presentation readiness read failed");
         if (state_->fail_pump.load(std::memory_order_acquire)) throw std::runtime_error("test presentation writer failure");
         if (state_->block_pump.load(std::memory_order_acquire)) {
             if (!state_->pump_block_reported.exchange(true, std::memory_order_acq_rel)) state_->pump_entered.set_value();

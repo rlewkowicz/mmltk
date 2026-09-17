@@ -1,4 +1,5 @@
 #include "detail/capture_session_impl.hpp"
+#include "src/common/io/event_fd.h"
 #include "src/backend/media/capture/capture_session.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/device_execution.h"
@@ -26,31 +27,11 @@
 #include <utility>
 #include <vector>
 namespace {
-void drain_event_fd(const int fd) noexcept {
-    if (fd < 0) { return; }
-    std::uint64_t value = 0;
-    while (true) {
-        const ssize_t read_rc = ::read(fd, &value, sizeof(value));
-        if (read_rc == static_cast<ssize_t>(sizeof(value))) { continue; }
-        if (read_rc < 0 && errno == EINTR) { continue; }
-        return;
-    }
-}
 using AtomicListener = std::atomic<std::shared_ptr<const std::function<void()>>>;
 void store_listener(AtomicListener& destination, std::function<void()> listener) {
     std::shared_ptr<const std::function<void()>> stored;
     if (listener) { stored = std::make_shared<const std::function<void()>>(std::move(listener)); }
     destination.store(std::move(stored), std::memory_order_release);
-}
-[[nodiscard]] bool signal_event_fd(const int fd) noexcept {
-    if (fd < 0) { return false; }
-    const std::uint64_t value = 1;
-    while (true) {
-        const ssize_t write_rc = ::write(fd, &value, sizeof(value));
-        if (write_rc == static_cast<ssize_t>(sizeof(value))) { return true; }
-        if (write_rc < 0 && errno == EINTR) { continue; }
-        return write_rc < 0 && errno == EAGAIN;
-    }
 }
 void retain_first_failure(mmltk::backend::media::capture::Status* target, mmltk::backend::media::capture::Status candidate) {
     if (target != nullptr && target->ok() && !candidate.ok()) { *target = std::move(candidate); }
@@ -112,8 +93,8 @@ CaptureSessionStartResult CaptureSession::Impl::prepare_start() {
     if (previous_generation == std::numeric_limits<std::uint64_t>::max()) {
         return {.status = MakeStatus(StatusCode::kUnsupported, "capture session generation space exhausted")};
     }
-    drain_event_fd(stop_event_fd_);
-    drain_event_fd(terminal_event_fd_);
+    mmltk::common::io::drain_event_fd(stop_event_fd_);
+    mmltk::common::io::drain_event_fd(terminal_event_fd_);
     ResetStats();
     ResetRuntimeState();
     terminal_storage_ = std::make_shared<CaptureStopTerminal>();
@@ -215,11 +196,11 @@ Status CaptureSession::Impl::request_stop(const CaptureSessionIdentity identity)
     if (terminal_published_.load(std::memory_order_acquire)) { return Status::Ok(); }
     stop_requested_.store(true, std::memory_order_release);
     CloseFilledAdmission();
-    if (!signal_event_fd(stop_event_fd_)) {
+    if (!mmltk::common::io::signal_event_fd(stop_event_fd_)) {
         const Status status = MakeErrnoStatus(StatusCode::kInternalError, "capture stop eventfd write");
         RetainFirstFailure(identity, status);
         SetLastError(status.message);
-        static_cast<void>(signal_event_fd(completion_event_fd_));
+        static_cast<void>(mmltk::common::io::signal_event_fd(completion_event_fd_));
         return status;
     }
     return Status::Ok();
@@ -235,7 +216,7 @@ std::shared_ptr<const CaptureStopTerminal> CaptureSession::Impl::try_take_stop_t
     if (!terminal_published_.load(std::memory_order_acquire)) { return {}; }
     bool expected = false;
     if (!terminal_delivered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) { return {}; }
-    drain_event_fd(terminal_event_fd_);
+    mmltk::common::io::drain_event_fd(terminal_event_fd_);
     return terminal_.load(std::memory_order_acquire);
 }
 Status CaptureSession::Impl::validate_finalize(const std::shared_ptr<const CaptureStopTerminal>& terminal) const {
@@ -373,13 +354,13 @@ void CaptureSession::Impl::PublishStopTerminal(CaptureLoopResult result) {
     std::shared_ptr<const CaptureStopTerminal> immutable = terminal_storage_;
     terminal_.store(std::move(immutable), std::memory_order_release);
     terminal_published_.store(true, std::memory_order_release);
-    static_cast<void>(signal_event_fd(terminal_event_fd_));
+    static_cast<void>(mmltk::common::io::signal_event_fd(terminal_event_fd_));
 }
 void CaptureSession::Impl::CloseFilledAdmission() noexcept { shutdown_.store(true, std::memory_order_release); }
 void CaptureSession::Impl::ReportCameraFault(const std::string& message) {
     camera_fault_.store(true, std::memory_order_release);
     SetLastError(message);
-    static_cast<void>(signal_event_fd(stop_event_fd_));
+    static_cast<void>(mmltk::common::io::signal_event_fd(stop_event_fd_));
 }
 void CaptureSession::Impl::ResetStats() {
     queued_v4l2_buffers_.store(0, std::memory_order_release);

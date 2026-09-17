@@ -1,4 +1,5 @@
 #include "detail/capture_session_impl.hpp"
+#include "src/common/io/event_fd.h"
 #include "src/backend/media/capture/capture_session.h"
 #include "src/frameworks/gpu/pinned_host_buffer.h"
 #include "src/frameworks/gpu/device_execution.h"
@@ -29,27 +30,6 @@ using capture_internal::kBgr3V4l2PixelFormat;
 using capture_internal::MakeErrnoStatus;
 using capture_internal::MakeStatus;
 using capture_internal::NowNs;
-namespace {
-void drain_event(const int fd) noexcept {
-    std::uint64_t value = 0;
-    while (fd >= 0) {
-        const ssize_t result = ::read(fd, &value, sizeof(value));
-        if (result == static_cast<ssize_t>(sizeof(value))) continue;
-        if (result < 0 && errno == EINTR) continue;
-        return;
-    }
-}
-[[nodiscard]] bool signal_event(const int fd) noexcept {
-    const std::uint64_t value = 1U;
-    while (fd >= 0) {
-        const ssize_t result = ::write(fd, &value, sizeof(value));
-        if (result == static_cast<ssize_t>(sizeof(value))) return true;
-        if (result < 0 && errno == EINTR) continue;
-        return result < 0 && errno == EAGAIN;
-    }
-    return false;
-}
-}  // namespace
 CaptureSession::Impl::CaptureReadyResult CaptureSession::Impl::WaitForCaptureReady() {
     if (camera_fault_.load(std::memory_order_acquire)) return CaptureReadyResult::kCameraError;
     pollfd descriptors[3]{
@@ -64,11 +44,11 @@ CaptureSession::Impl::CaptureReadyResult CaptureSession::Impl::WaitForCaptureRea
         return CaptureReadyResult::kCameraError;
     }
     if ((descriptors[2].revents & POLLIN) != 0) {
-        drain_event(completion_event_fd_);
+        mmltk::common::io::drain_event_fd(completion_event_fd_);
         return CaptureReadyResult::kCompletionReady;
     }
     if ((descriptors[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
-        drain_event(stop_event_fd_);
+        mmltk::common::io::drain_event_fd(stop_event_fd_);
         return stop_requested_.load(std::memory_order_acquire) ? CaptureReadyResult::kStopRequested : CaptureReadyResult::kCameraError;
     }
     const short camera = descriptors[0].revents;
@@ -263,7 +243,7 @@ Status CaptureSession::Impl::SettleSlotsBeforeTeardown(CaptureTeardownDispositio
         int result = 0;
         do { result = ::poll(&completion, 1, -1); } while (result < 0 && errno == EINTR);
         if (result < 0) return MakeErrnoStatus(StatusCode::kInternalError, "poll capture completion");
-        drain_event(completion_event_fd_);
+        mmltk::common::io::drain_event_fd(completion_event_fd_);
     }
 }
 Status CaptureSession::Impl::try_take_filled(FilledCaptureSlotLease* const output) {
@@ -311,7 +291,7 @@ Status CaptureSession::Impl::return_after_h2d(FilledCaptureSlotLease&& lease) no
     }
     CaptureSession::ConsumeFilledSlotLease(lease);
     if (newly_completed) h2d_frames_completed_.fetch_add(1U, std::memory_order_relaxed);
-    if (!signal_event(completion_event_fd_)) {
+    if (!mmltk::common::io::signal_event_fd(completion_event_fd_)) {
         Status failure{StatusCode::kInternalError, "failed to signal completed capture slot"};
         static_cast<void>(report_failure(active_identity(), failure));
         return failure;
@@ -335,8 +315,8 @@ Status CaptureSession::Impl::report_failure(const CaptureSessionIdentity identit
     RetainFirstFailure(identity, std::move(failure));
     stop_requested_.store(true, std::memory_order_release);
     CloseFilledAdmission();
-    const bool stop_signaled = signal_event(stop_event_fd_);
-    const bool completion_signaled = signal_event(completion_event_fd_);
+    const bool stop_signaled = mmltk::common::io::signal_event_fd(stop_event_fd_);
+    const bool completion_signaled = mmltk::common::io::signal_event_fd(completion_event_fd_);
     if (!stop_signaled && !completion_signaled) {
         Status wake_failure = MakeStatus(StatusCode::kInternalError, "failed to signal capture owner after physical failure");
         RetainFirstFailure(identity, wake_failure);

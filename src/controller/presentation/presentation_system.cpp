@@ -361,10 +361,8 @@ class PresentationSystem::Impl final {
                 throw std::runtime_error("Presentation native event wait failed");
             }
             if ((descriptors[1].revents & POLLIN) != 0) {
-                std::uint64_t wake = 0U;
-                ssize_t consumed = -1;
-                do { consumed = ::read(control_fd_.get(), &wake, sizeof(wake)); } while (consumed < 0 && errno == EINTR);
-                if (consumed < 0 && errno != EAGAIN) throw std::runtime_error("Presentation control wake failed");
+                const auto consumed = mmltk::common::io::read_counter_fd(control_fd_.get());
+                if (consumed.bytes < 0 && consumed.error != EAGAIN) throw std::runtime_error("Presentation control wake failed");
                 if (stop.stop_requested()) return;
             }
             if ((descriptors[0].revents & POLLNVAL) != 0) throw std::runtime_error("Presentation native descriptor is invalid");

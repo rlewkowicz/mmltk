@@ -138,19 +138,34 @@ TEST_CASE("Firefox process custody settles through its retained PID") {
     CHECK(observations.terminal_count == 1U);
 }
 }  // namespace
-TEST_CASE("browser runtime exit mapping distinguishes requested termination from child failure") {
+TEST_CASE("browser runtime exit policy classifies every owned Firefox terminal", "[gui][services][firefox][lifecycle]") {
     using services::FirefoxProcessLifecycle;
     using services::FirefoxProcessTerminal;
-    CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0}, true) == 0);
-    CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 23}, true) == 23);
-    const FirefoxProcessLifecycle requested{.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true};
-    CHECK(services::browser_runtime_exit_status(requested, true) == 0);
-    CHECK(services::browser_runtime_exit_status(requested, false) == 128 + SIGTERM);
-    CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM}, true) == 128 + SIGTERM);
-    CHECK(services::browser_runtime_exit_status(
-              {.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGKILL, .stop_requested = true, .kill_selected = true}, true) == 128 + SIGKILL);
-    CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = ENOENT}, true) == ENOENT);
-    CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0}, false) == 1);
+    struct ExitCase final {
+        FirefoxProcessLifecycle lifecycle;
+        int healthy;
+        int unhealthy;
+    };
+    const std::array cases{
+        ExitCase{{.terminal = FirefoxProcessTerminal::Exited, .status = 0}, 0, 1},
+        ExitCase{{.terminal = FirefoxProcessTerminal::Exited, .status = 0, .stop_requested = true}, 0, 1},
+        ExitCase{{.terminal = FirefoxProcessTerminal::Exited, .status = 23}, 23, 23},
+        ExitCase{{.terminal = FirefoxProcessTerminal::Exited, .status = 17, .stop_requested = true}, 17, 17},
+        ExitCase{{.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM}, 128 + SIGTERM, 128 + SIGTERM},
+        ExitCase{{.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true}, 0, 128 + SIGTERM},
+        ExitCase{{.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true, .kill_selected = true},
+                 128 + SIGTERM, 128 + SIGTERM},
+        ExitCase{{.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGKILL, .stop_requested = true, .kill_selected = true},
+                 128 + SIGKILL, 128 + SIGKILL},
+        ExitCase{{.terminal = FirefoxProcessTerminal::StartupFailed, .status = ENOENT}, ENOENT, ENOENT},
+        ExitCase{{.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1}, 1, 1},
+        ExitCase{{.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1, .error_code = EACCES}, 1, 1},
+    };
+    for (const auto& value : cases) {
+        CAPTURE(value.lifecycle.status, value.lifecycle.stop_requested, value.lifecycle.kill_selected, value.lifecycle.error_code);
+        CHECK(services::browser_runtime_exit_status(value.lifecycle, true) == value.healthy);
+        CHECK(services::browser_runtime_exit_status(value.lifecycle, false) == value.unhealthy);
+    }
 }
 TEST_CASE("Firefox startup cause is retained separately from its mapped status") {
     REQUIRE(services::block_browser_runtime_signals());

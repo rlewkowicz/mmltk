@@ -52,6 +52,7 @@ target_link_libraries(mmltk_controller_data_compute_systems
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection
     PRIVATE
+        mmltk::common::concurrency
         mmltk::backend::models::rfdetr::inference
         mmltk::backend::models::rfdetr::training
         mmltk::controller::visual_runtime

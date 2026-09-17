@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <stdexcept>
+#include <stop_token>
 #include <system_error>
 #include <utility>
 #include "src/common/io/scoped_fd.h"
@@ -95,5 +96,27 @@ class EventCancellationSource final {
     explicit EventCancellationSource(const int descriptor) noexcept : emitter_(descriptor) {}
     [[nodiscard]] int duplicate_descriptor(const char* const purpose) const { return emitter_.duplicate_descriptor(purpose); }
     detail::CancellationEmitter emitter_;
+};
+// The callback is destroyed first, waiting for any in-flight request before the
+// privately owned source and token are released.
+template <class Source>
+class ScopedEventCancellation final {
+   public:
+    using Token = typename Source::Token;
+    explicit ScopedEventCancellation(const std::stop_token stop) : cancellation_(Source::Mint()), callback_(stop, Request{&cancellation_.first}) {}
+    ScopedEventCancellation(const ScopedEventCancellation&) = delete;
+    ScopedEventCancellation& operator=(const ScopedEventCancellation&) = delete;
+    ScopedEventCancellation(ScopedEventCancellation&&) = delete;
+    ScopedEventCancellation& operator=(ScopedEventCancellation&&) = delete;
+    [[nodiscard]] const Token& token() const noexcept { return cancellation_.second; }
+    [[nodiscard]] Token ConsumeToken() noexcept { return std::move(cancellation_.second); }
+
+   private:
+    struct Request final {
+        Source* source;
+        void operator()() const noexcept { static_cast<void>(source->RequestCancel()); }
+    };
+    std::pair<Source, Token> cancellation_;
+    std::stop_callback<Request> callback_;
 };
 }  // namespace mmltk::common::concurrency

@@ -1,4 +1,5 @@
 #include "src/controller/services/firefox_process_owner.h"
+#include "src/common/io/event_fd.h"
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -335,10 +336,7 @@ class FirefoxProcessOwner::Implementation final {
             do { written = ::write(stop_fd_.get(), &value, sizeof(value)); } while (written < 0 && errno == EINTR);
             if (written == static_cast<ssize_t>(sizeof(value)) || (written < 0 && errno == EAGAIN)) return;
             error = written < 0 ? errno : EIO;
-            if (!infrastructure_error_) {
-                infrastructure_error_ = error;
-                lifecycle_.error_code = written < 0 ? error : 0;
-            }
+            record_infrastructure_failure_locked(error, written < 0 ? error : 0);
             static_cast<void>(custody_.Signal(SIGKILL));
             const itimerspec immediate{
                 .it_interval = {},
@@ -386,11 +384,9 @@ class FirefoxProcessOwner::Implementation final {
             }
             if ((descriptors[1].revents & POLLIN) != 0 && !begin_stop()) return;
             if ((descriptors[2].revents & POLLIN) != 0) {
-                std::uint64_t expirations = 0U;
-                ssize_t consumed = -1;
-                do { consumed = ::read(timer_fd_.get(), &expirations, sizeof(expirations)); } while (consumed < 0 && errno == EINTR);
-                if (consumed != static_cast<ssize_t>(sizeof(expirations))) {
-                    terminal_monitor_failure("child.stop_timer_read_refused", consumed < 0 ? errno : EIO, consumed < 0 ? errno : 0);
+                const auto consumed = mmltk::common::io::read_counter_fd(timer_fd_.get());
+                if (consumed.bytes != static_cast<ssize_t>(sizeof(consumed.count))) {
+                    terminal_monitor_failure("child.stop_timer_read_refused", consumed.bytes < 0 ? consumed.error : EIO, consumed.bytes < 0 ? consumed.error : 0);
                     return;
                 }
                 disarm_timer();
@@ -403,17 +399,13 @@ class FirefoxProcessOwner::Implementation final {
         }
     }
     [[nodiscard]] bool begin_stop() noexcept {
-        std::uint64_t value = 0U;
-        while (::read(stop_fd_.get(), &value, sizeof(value)) < 0 && errno == EINTR) {}
+        static_cast<void>(mmltk::common::io::read_counter_fd(stop_fd_.get()));
         trace("stop.term_selected");
         bool signaled = false;
         {
             std::scoped_lock lock{mutex_};
             signaled = custody_.Signal(SIGTERM);
-            if (!signaled && !infrastructure_error_) {
-                infrastructure_error_ = errno != 0 ? errno : EIO;
-                lifecycle_.error_code = errno;
-            }
+            if (!signaled) record_infrastructure_failure_locked(errno, errno);
         }
         if (!signaled) { return force_stop(); }
         const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(stop_grace_);
@@ -433,6 +425,11 @@ class FirefoxProcessOwner::Implementation final {
         const itimerspec disarmed{};
         static_cast<void>(::timerfd_settime(timer_fd_.get(), 0, &disarmed, nullptr));
     }
+    void record_infrastructure_failure_locked(const int status, const int cause) noexcept {
+        if (infrastructure_error_) return;
+        infrastructure_error_ = status != 0 ? status : EIO;
+        lifecycle_.error_code = cause;
+    }
     void terminal_monitor_failure(const std::string_view event, const int error, const int cause = 0) noexcept {
         disarm_timer();
         settle_failure(event, error, cause);
@@ -443,10 +440,7 @@ class FirefoxProcessOwner::Implementation final {
             std::scoped_lock lock{mutex_};
             if (lifecycle_.settled() || lifecycle_.kill_selected) return false;
             lifecycle_.kill_selected = true;
-            if (!custody_.Signal(SIGKILL) && !infrastructure_error_) {
-                infrastructure_error_ = errno != 0 ? errno : EIO;
-                lifecycle_.error_code = errno;
-            }
+            if (!custody_.Signal(SIGKILL)) record_infrastructure_failure_locked(errno, errno);
             settlement = custody_.Settle(diagnostics_);
         }
         trace("stop.kill_selected");
@@ -482,15 +476,9 @@ class FirefoxProcessOwner::Implementation final {
         {
             std::scoped_lock lock{mutex_};
             if (lifecycle_.settled()) return;
-            if (!infrastructure_error_) {
-                infrastructure_error_ = error != 0 ? error : EIO;
-                lifecycle_.error_code = cause;
-            }
+            record_infrastructure_failure_locked(error, cause);
             lifecycle_.kill_selected = true;
-            if (!custody_.Signal(SIGKILL) && !infrastructure_error_) {
-                infrastructure_error_ = errno != 0 ? errno : EIO;
-                lifecycle_.error_code = errno;
-            }
+            static_cast<void>(custody_.Signal(SIGKILL));
             settlement = custody_.Settle(diagnostics_);
         }
         publish_settlement(settlement.child);

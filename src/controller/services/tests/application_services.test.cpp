@@ -1,6 +1,8 @@
 #include "src/controller/services/tests/support/diagnostics_client_test_access.h"
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -29,6 +31,7 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/common/io/scoped_fd.h"
+#include "src/common/io/event_fd.h"
 #include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/controller/contracts/workspace.h"
 #include "src/controller/services/diagnostics_client.h"
@@ -55,6 +58,15 @@ using mmltk::common::io::ScopedFd;
     std::pair<ScopedFd, ScopedFd> pipe{ScopedFd{descriptors[0]}, ScopedFd{descriptors[1]}};
     if (capacity != 0) REQUIRE(::fcntl(pipe.second.get(), F_SETPIPE_SZ, capacity) > 0);
     return pipe;
+}
+// Only the interrupted-counter case installs this handler, before starting its
+// reader. The descriptor stays owned until that reader and handler have joined.
+volatile std::sig_atomic_t interrupted_counter_writer = -1;
+void release_interrupted_counter(int) noexcept {
+    const int saved_errno = errno;
+    const std::uint64_t value = 37U;
+    static_cast<void>(::write(interrupted_counter_writer, &value, sizeof(value)));
+    errno = saved_errno;
 }
 class ScopedEnvironmentVariable final {
    public:
@@ -132,20 +144,96 @@ void require_one_terminal_wake(DiagnosticsClient& diagnostics) {
     return owner.client().run(request, std::move(token));
 }
 }  // namespace
-TEST_CASE("browser runtime exit policy classifies every owned Firefox terminal", "[gui][services][firefox][lifecycle]") {
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0}, true) == 0);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0}, false) == 1);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0, .stop_requested = true}, true) == 0);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 17, .stop_requested = true}, true) == 17);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true, .kill_selected = false},
-                                      true) == 0);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM}, true) == 128 + SIGTERM);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true, .kill_selected = true},
-                                      true) == 128 + SIGTERM);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1}, true) == 1);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1, .error_code = EACCES}, true) == 1);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1, .error_code = EACCES}, false) == 1);
-    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true}, false) == 128 + SIGTERM);
+TEST_CASE("counter descriptor reads retain size value and failure policy", "[gui][services][counter]") {
+    using mmltk::common::io::read_counter_fd;
+    auto [reader, writer] = make_diagnostic_pipe(O_NONBLOCK);
+    const std::uint64_t expected = 0x123456789abcdef0ULL;
+    REQUIRE(::write(writer.get(), &expected, sizeof(expected)) == static_cast<ssize_t>(sizeof(expected)));
+    errno = EDOM;
+    const auto full = read_counter_fd(reader.get());
+    const int full_errno = errno;
+    CHECK(full.bytes == static_cast<ssize_t>(sizeof(expected)));
+    CHECK(full.count == expected);
+    CHECK(full.error == 0);
+    CHECK(full_errno == EDOM);
+    const auto empty = read_counter_fd(reader.get());
+    const int empty_errno = errno;
+    CHECK(empty.bytes == -1);
+    CHECK(empty.error == EAGAIN);
+    CHECK(empty_errno == EAGAIN);
+    const std::array<unsigned char, 3> fragment{0x12, 0x34, 0x56};
+    REQUIRE(::write(writer.get(), fragment.data(), fragment.size()) == static_cast<ssize_t>(fragment.size()));
+    errno = ERANGE;
+    const auto short_read = read_counter_fd(reader.get());
+    const int short_errno = errno;
+    CHECK(short_read.bytes == static_cast<ssize_t>(fragment.size()));
+    CHECK(short_read.error == 0);
+    CHECK(short_errno == ERANGE);
+    writer.reset();
+    const auto eof = read_counter_fd(reader.get());
+    CHECK(eof.bytes == 0);
+    CHECK(eof.error == 0);
+    const auto invalid = read_counter_fd(-1);
+    const int invalid_errno = errno;
+    CHECK(invalid.bytes == -1);
+    CHECK(invalid.error == EBADF);
+    CHECK(invalid_errno == EBADF);
+}
+TEST_CASE("counter descriptor read retries a causally interrupted blocking read", "[gui][services][counter]") {
+    auto [reader, writer] = make_diagnostic_pipe();
+    struct sigaction previous{};
+    struct sigaction action{};
+    action.sa_handler = &release_interrupted_counter;
+    REQUIRE(::sigemptyset(&action.sa_mask) == 0);
+    REQUIRE(::sigaction(SIGUSR1, &action, &previous) == 0);
+    mmltk::testsupport::ScopedTestCleanup restore_signal{[&] { static_cast<void>(::sigaction(SIGUSR1, &previous, nullptr)); }};
+    interrupted_counter_writer = writer.get();
+    struct ReadResult final {
+        mmltk::common::io::CounterRead counter;
+        int ambient_error;
+    };
+    std::promise<pid_t> entered;
+    auto entered_future = entered.get_future();
+    std::promise<ReadResult> completed;
+    auto completed_future = completed.get_future();
+    std::jthread worker{[&] {
+        sigset_t signals{};
+        static_cast<void>(::sigemptyset(&signals));
+        static_cast<void>(::sigaddset(&signals, SIGUSR1));
+        const int unblocked = ::pthread_sigmask(SIG_UNBLOCK, &signals, nullptr);
+        entered.set_value(unblocked == 0 ? static_cast<pid_t>(::syscall(SYS_gettid)) : -1);
+        errno = 0;
+        const auto result = mmltk::common::io::read_counter_fd(reader.get());
+        completed.set_value({result, errno});
+    }};
+    // Release a still-blocked read before jthread joins on any failed assertion.
+    mmltk::testsupport::ScopedTestCleanup release_reader{[&] {
+        const std::uint64_t fallback = 1U;
+        static_cast<void>(::write(writer.get(), &fallback, sizeof(fallback)));
+    }};
+    const auto tid = mmltk::testsupport::await_test_future(entered_future, "counter reader started");
+    REQUIRE(tid > 0);
+    // Observe the actual blocked Linux syscall, rather than racing a promise
+    // published just before read or assuming a sleep proves it was interrupted.
+    const auto syscall_path = std::filesystem::path{"/proc/self/task"} / std::to_string(tid) / "syscall";
+    bool blocked_read = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+    do {
+        std::ifstream state{syscall_path};
+        long number = -1;
+        unsigned long descriptor = 0;
+        if (state >> number >> std::hex >> descriptor)
+            blocked_read = number == SYS_read && descriptor == static_cast<unsigned long>(reader.get());
+        if (!blocked_read) std::this_thread::yield();
+    } while (!blocked_read && std::chrono::steady_clock::now() < deadline);
+    REQUIRE(blocked_read);
+    REQUIRE(::pthread_kill(worker.native_handle(), SIGUSR1) == 0);
+    const auto result = mmltk::testsupport::await_test_future(completed_future, "interrupted counter read");
+    worker.join();
+    CHECK(result.counter.bytes == static_cast<ssize_t>(sizeof(std::uint64_t)));
+    CHECK(result.counter.count == 37U);
+    CHECK(result.counter.error == 0);
+    CHECK(result.ambient_error == EINTR);
 }
 TEST_CASE("settings store repairs missing malformed and normalized documents", "[gui][services]") {
     mmltk::testsupport::ScopedTempDir temporary{"mmltk-settings-store-repair"};
@@ -469,10 +557,8 @@ TEST_CASE("diagnostics environment uses only the canonical GUI trace path", "[gu
     }
 }
 TEST_CASE("runtime diagnostics owns bounded benchmark trace JSONL", "[gui][services]") {
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
-    ScopedFd reader{descriptors[0]};
-    DiagnosticsClient diagnostics{ScopedFd{descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    auto [reader, writer] = make_diagnostic_pipe();
+    DiagnosticsClient diagnostics{std::move(writer), DiagnosticsExecutionPolicy::CallerDriven};
     RuntimeDiagnostics runtime{diagnostics.producer()};
     const auto target = runtime.target();
     REQUIRE(target.benchmark_trace_enabled());
@@ -491,10 +577,8 @@ TEST_CASE("runtime diagnostics owns bounded benchmark trace JSONL", "[gui][servi
     diagnostics.close(DiagnosticsCloseMode::Discard);
 }
 TEST_CASE("diagnostics close publishes one synchronous owner terminal for manual clients", "[gui][services]") {
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
-    ScopedFd reader{descriptors[0]};
-    DiagnosticsClient diagnostics{ScopedFd{descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    auto [reader, writer] = make_diagnostic_pipe();
+    DiagnosticsClient diagnostics{std::move(writer), DiagnosticsExecutionPolicy::CallerDriven};
     REQUIRE(diagnostics.producer().acquire().submit({"{\"event\":\"terminal\"}"}) == DiagnosticSubmitResult::Accepted);
     CHECK(diagnostics.terminal() == DiagnosticsTerminal::Pending);
     diagnostics.close(DiagnosticsCloseMode::Discard);
@@ -504,10 +588,8 @@ TEST_CASE("diagnostics close publishes one synchronous owner terminal for manual
     diagnostics.close(DiagnosticsCloseMode::Flush);
 }
 TEST_CASE("diagnostics flush close settles a queued manual owner exactly once", "[gui][services]") {
-    int descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
-    ScopedFd reader{descriptors[0]};
-    DiagnosticsClient diagnostics{ScopedFd{descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    auto [reader, writer] = make_diagnostic_pipe();
+    DiagnosticsClient diagnostics{std::move(writer), DiagnosticsExecutionPolicy::CallerDriven};
     const auto operation = diagnostics.producer().acquire();
     REQUIRE(operation.submit({"{\"index\":1}"}) == DiagnosticSubmitResult::Accepted);
     REQUIRE(operation.submit({"{\"index\":2}"}) == DiagnosticSubmitResult::Accepted);
@@ -607,10 +689,7 @@ TEST_CASE("diagnostics validates records and fixed capacity", "[gui][services]")
 TEST_CASE("diagnostics close interrupts a stalled output descriptor", "[gui][services]") {
     for (const DiagnosticsCloseMode mode : {DiagnosticsCloseMode::Discard, DiagnosticsCloseMode::Flush}) {
         INFO((mode == DiagnosticsCloseMode::Discard ? "discard" : "flush"));
-        int descriptors[2]{-1, -1};
-        REQUIRE(::pipe2(descriptors, O_CLOEXEC) == 0);
-        ScopedFd reader{descriptors[0]};
-        ScopedFd writer{descriptors[1]};
+        auto [reader, writer] = make_diagnostic_pipe();
         const std::string maximum_record = maximum_diagnostic_record();
         const int pipe_capacity = ::fcntl(writer.get(), F_SETPIPE_SZ, 4096);
         REQUIRE(pipe_capacity > 0);
@@ -849,17 +928,13 @@ TEST_CASE("diagnostics path sessions truncate and producers expire after close",
     CHECK(producer.acquire().submit({"{\"event\":\"closed\"}"}) == DiagnosticSubmitResult::Disabled);
 }
 TEST_CASE("diagnostics moves release replaced owners without terminal waits", "[gui][services]") {
-    int first_descriptors[2]{-1, -1};
-    int second_descriptors[2]{-1, -1};
-    REQUIRE(::pipe2(first_descriptors, O_CLOEXEC) == 0);
-    REQUIRE(::pipe2(second_descriptors, O_CLOEXEC) == 0);
-    ScopedFd first_reader{first_descriptors[0]};
-    ScopedFd second_reader{second_descriptors[0]};
-    DiagnosticsClient first{ScopedFd{first_descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    auto [first_reader, first_writer] = make_diagnostic_pipe();
+    auto [second_reader, second_writer] = make_diagnostic_pipe();
+    DiagnosticsClient first{std::move(first_writer), DiagnosticsExecutionPolicy::CallerDriven};
     REQUIRE(first.producer().acquire().submit({"{\"event\":\"first\"}"}) == DiagnosticSubmitResult::Accepted);
     DiagnosticsClient moved{std::move(first)};
     CHECK(first.terminal() == DiagnosticsTerminal::Drained);
-    DiagnosticsClient replacement{ScopedFd{second_descriptors[1]}, DiagnosticsExecutionPolicy::CallerDriven};
+    DiagnosticsClient replacement{std::move(second_writer), DiagnosticsExecutionPolicy::CallerDriven};
     REQUIRE(replacement.producer().acquire().submit({"{\"event\":\"second\"}"}) == DiagnosticSubmitResult::Accepted);
     replacement = std::move(moved);
     CHECK(moved.terminal() == DiagnosticsTerminal::Drained);
