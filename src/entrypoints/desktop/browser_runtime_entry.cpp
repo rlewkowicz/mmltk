@@ -57,8 +57,8 @@ class UwsLoopOwner final {
     static_cast<void>(std::to_chars(detail.data() + prefix.size(), detail.data() + detail.size() - 1U, error));
     return detail;
 }
-[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage,
-                              const std::string_view detail = {}, const std::optional<int> status = std::nullopt) noexcept {
+[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage, const std::string_view detail = {},
+                              const std::optional<int> status = std::nullopt) noexcept {
     mmltk::common::logging::report_fatal(stage, detail, status);
     shell.request_shutdown(mmltk::controller::shell::ApplicationShutdownReason::InfrastructureFailure);
     static_cast<void>(shell.shutdown());
@@ -269,16 +269,15 @@ int main(int argc, char** argv) {
                 else if (firefox.terminal == FirefoxProcessTerminal::StartupFailed) {
                     const auto detail = firefox_error_detail(firefox.error_code);
                     mmltk::common::logging::report_fatal("Firefox process infrastructure failure", detail.data(), firefox.status);
-                }
-                else if (firefox.terminal == FirefoxProcessTerminal::Exited && firefox.status != 0)
+                } else if (firefox.terminal == FirefoxProcessTerminal::Exited && firefox.status != 0)
                     mmltk::common::logging::report_fatal("Firefox", "child exited unsuccessfully", firefox.status);
                 else
                     mmltk::common::logging::report_fatal("browser runtime", "application health failure", status);
             }
             return status;
-        } catch (const std::exception& error) {
-            return fail_closed(shell, "browser host runtime exception", error.what());
-        } catch (...) { return fail_closed(shell, "browser host unknown runtime exception"); }
+        } catch (const std::exception& error) { return fail_closed(shell, "browser host runtime exception", error.what()); } catch (...) {
+            return fail_closed(shell, "browser host unknown runtime exception");
+        }
     } catch (const std::exception& error) {
         mmltk::common::logging::report_fatal("browser host construction exception", error.what());
         return 1;

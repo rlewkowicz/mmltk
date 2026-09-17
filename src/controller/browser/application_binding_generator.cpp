@@ -1265,9 +1265,8 @@ class BindingEmitter final {
                 for (std::size_t index = 0; index < schema::StaticArray<Field>::extent; ++index)
                     visitor(selector + "(" + std::to_string(index) + ")", name + "[" + std::to_string(index) + "]");
             } else if constexpr (schema::ReflectedObject<Field> && !Builtin<Field>) {
-                VisitScalarSelectors<Field>([&](const std::string& nested, const std::string& leaf) {
-                    visitor(selector + "(" + nested + ")", name + "." + leaf);
-                });
+                VisitScalarSelectors<Field>(
+                    [&](const std::string& nested, const std::string& leaf) { visitor(selector + "(" + nested + ")", name + "." + leaf); });
             } else {
                 visitor(selector, name);
             }
@@ -1275,8 +1274,10 @@ class BindingEmitter final {
     }
     template <class Field>
     void EmitScalarAccess(const std::string& expression) {
-        if constexpr (std::same_as<Field, double>) output_ << "Some(" << expression << ')';
-        else if constexpr (std::same_as<Field, std::optional<double>>) output_ << expression;
+        if constexpr (std::same_as<Field, double>)
+            output_ << "Some(" << expression << ')';
+        else if constexpr (std::same_as<Field, std::optional<double>>)
+            output_ << expression;
         else {
             static_assert(std::is_arithmetic_v<Field>, "unsupported scalar projection leaf");
             output_ << "None";
@@ -1289,16 +1290,17 @@ class BindingEmitter final {
         const auto source = NativeSource<Record>() + " scalar projection";
         if (!symbols_.Reserve("module", field_type, source)) return;
         VisitRustFields<Record>([&]<class Field, class>(const auto&, const std::string&) {
-            if constexpr (schema::ReflectedObject<Field> && !Builtin<Field> && !schema::Sequence<Field>::value)
-                EmitScalarProjection<Field>();
+            if constexpr (schema::ReflectedObject<Field> && !Builtin<Field> && !schema::Sequence<Field>::value) EmitScalarProjection<Field>();
         });
         output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {";
         VisitRustFields<Record>([&]<class Field, class>(const auto& fact, const std::string&) {
             const auto variant = rust_identifier(fact.member_name, true);
             symbols_.Reserve("enum " + field_type, variant, source + "." + std::string(fact.member_name));
             output_ << variant;
-            if constexpr (schema::StaticArray<Field>::value) output_ << "(usize)";
-            else if constexpr (schema::ReflectedObject<Field> && !Builtin<Field>) output_ << '(' << rust_type<Field>() << "Field)";
+            if constexpr (schema::StaticArray<Field>::value)
+                output_ << "(usize)";
+            else if constexpr (schema::ReflectedObject<Field> && !Builtin<Field>)
+                output_ << '(' << rust_type<Field>() << "Field)";
             output_ << ',';
         });
         output_ << "}\n";

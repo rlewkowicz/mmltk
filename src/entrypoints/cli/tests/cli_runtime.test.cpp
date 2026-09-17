@@ -819,14 +819,12 @@ TEST_CASE("RF-DETR help exposes independent augmentation and compiler resampling
         }
     }
 }
-
 TEST_CASE("CLI fatal boundaries remain visible with logging off or unavailable", "[core][cli][logging]") {
     const ScopedTempDir root{"mmltk-cli-fatal"};
-    const std::vector<std::vector<std::string>> cases{
-        {"--log-level=off", "unknown-command"},
-        {"--log-level=off", "rfdetr", "unknown-command"},
-        {"--log-level=off", "rfdetr", "train", "--unknown-option"},
-        {"--log-level=info", "--log-file=" + root.path().string(), "--help"}};
+    const std::vector<std::vector<std::string>> cases{{"--log-level=off", "unknown-command"},
+                                                      {"--log-level=off", "rfdetr", "unknown-command"},
+                                                      {"--log-level=off", "rfdetr", "train", "--unknown-option"},
+                                                      {"--log-level=info", "--log-file=" + root.path().string(), "--help"}};
     for (const auto& arguments : cases) {
         std::vector<std::string> command{"env", "-u", "MMLTK_LOG_LEVEL", "-u", "MMLTK_LOG_FILE", "-u", "MMLTK_LOG_DIR", mmltk_cli_path()};
         command.insert(command.end(), arguments.begin(), arguments.end());
@@ -838,12 +836,11 @@ TEST_CASE("CLI fatal boundaries remain visible with logging off or unavailable",
         CHECK(result.stderr_text.find("fatal: ", 1U) == std::string::npos);
     }
 }
-
 TEST_CASE("RF-DETR fatal file diagnostics retain their named owner", "[core][cli][logging]") {
     const ScopedTempDir root{"mmltk-rfdetr-fatal-name"};
     const auto log = root.path() / "fatal.log";
-    const auto result = run_subprocess_capture_output({mmltk_cli_path(), "--log-level=info", "--log-file=" + log.string(),
-        "rfdetr", "train", "--unknown-option"});
+    const auto result =
+        run_subprocess_capture_output({mmltk_cli_path(), "--log-level=info", "--log-file=" + log.string(), "rfdetr", "train", "--unknown-option"});
     CHECK(result.exit_code == 1);
     CHECK(result.stderr_text.find("fatal: ") != std::string::npos);
     CHECK(result.stderr_text.find("fatal: ", result.stderr_text.find("fatal: ") + 1U) == std::string::npos);

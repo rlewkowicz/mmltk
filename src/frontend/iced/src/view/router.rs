@@ -75,7 +75,10 @@ impl Router {
         self.sync_workflows(model);
     }
 
-    pub(crate) fn train_chart_view(&self, chart: crate::view::metrics::Chart) -> Option<crate::view::metrics::ChartView> {
+    pub(crate) fn train_chart_view(
+        &self,
+        chart: crate::view::metrics::Chart,
+    ) -> Option<crate::view::metrics::ChartView> {
         self.train.chart_view(chart)
     }
     pub fn sync_workflows(&mut self, model: &ApplicationModel) {

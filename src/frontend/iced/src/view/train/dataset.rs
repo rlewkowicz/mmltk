@@ -182,10 +182,12 @@ pub fn view<'a>(
             enabled,
             Message::TestSplitChanged,
         ))
-        .push(button("Clear test dataset").on_press_maybe(
-            (enabled && !train.request.testcompiledpath.is_empty())
-                .then(|| Message::TestSplitChanged(String::new())),
-        ))
+        .push(
+            button("Clear test dataset").on_press_maybe(
+                (enabled && !train.request.testcompiledpath.is_empty())
+                    .then(|| Message::TestSplitChanged(String::new())),
+            ),
+        )
         .push(crate::view::workflow::fields::toggle(
             "Overwrite",
             train.overwritecompileddataset,
@@ -281,9 +283,18 @@ mod tests {
             ));
             let train = &model.draft.as_ref().unwrap().workflows.train;
             assert_eq!(train.request.testcompiledpath, path);
-            assert_eq!(train.usecompileddirectorydefaults, before.usecompileddirectorydefaults);
-            assert_eq!(train.request.traincompiledpath, before.request.traincompiledpath);
-            assert_eq!(train.request.valcompiledpath, before.request.valcompiledpath);
+            assert_eq!(
+                train.usecompileddirectorydefaults,
+                before.usecompileddirectorydefaults
+            );
+            assert_eq!(
+                train.request.traincompiledpath,
+                before.request.traincompiledpath
+            );
+            assert_eq!(
+                train.request.valcompiledpath,
+                before.request.valcompiledpath
+            );
         }
     }
 

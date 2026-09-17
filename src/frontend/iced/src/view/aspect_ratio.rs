@@ -41,7 +41,11 @@ pub fn extent_for_width(width: f32, aspect: crate::generated::WorkspaceAspectRat
 }
 
 /// Fit an aspect-preserving workspace inside the actual page-body budget.
-pub fn fit_extent(width: f32, height: f32, aspect: crate::generated::WorkspaceAspectRatio) -> (f32, f32) {
+pub fn fit_extent(
+    width: f32,
+    height: f32,
+    aspect: crate::generated::WorkspaceAspectRatio,
+) -> (f32, f32) {
     let factor = height_factor(aspect);
     let height = (width.max(1.0) * factor).min(height.max(1.0));
     (height / factor, height)

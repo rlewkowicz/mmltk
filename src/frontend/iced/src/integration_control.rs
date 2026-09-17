@@ -373,6 +373,7 @@ extern "C" {
         control: &str,
         css_bounds: &[f64],
         chart: bool,
+        progress: bool,
         source: f64,
         presentation: f64,
         completed: &wasm_bindgen::JsValue,
@@ -392,7 +393,14 @@ extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationWheel)]
     fn wheel_js(x: f64, y: f64, delta: f64, control: bool, pixels: bool) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationChartInput)]
-    fn chart_input_js(x: f64, y: f64, width: f64, height: f64, pan: bool, completed: &wasm_bindgen::JsValue) -> u32;
+    fn chart_input_js(
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        pan: bool,
+        completed: &wasm_bindgen::JsValue,
+    ) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationChartSettled)]
     fn chart_settled_js(completed: &wasm_bindgen::JsValue);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationSliderDrag)]
@@ -1417,6 +1425,22 @@ impl Controller {
         self.retained.observe_upscale_request(&self.driver, kernel);
     }
 
+    pub(crate) fn hold_initial_upscale(&self) -> bool {
+        // The semantics fixture must draw the original scene before testing
+        // all derived methods. Other scenarios exercise automatic Basic.
+        self.driver.viewer_scenario == "semantics"
+            && matches!(
+                self.driver.phase,
+                Phase::AwaitDetail(_)
+                    | Phase::DetailOriginal { .. }
+                    | Phase::AwaitDetailOriginal { .. }
+                    | Phase::DetailFit
+                    | Phase::AwaitDetailFit
+                    | Phase::ViewerOverlay(_)
+                    | Phase::AwaitViewerOverlay(_)
+            )
+    }
+
     pub(super) fn update_location(
         &mut self,
         control: String,
@@ -1631,8 +1655,12 @@ impl Controller {
                 return None;
             }
             Message::ChartInputDelivered(delivered) => {
-                if delivered { self.workflows.chart_input_delivered(&mut self.driver); }
-                else { self.driver.fail("Chart input/render callback was invalidated"); }
+                if delivered {
+                    self.workflows.chart_input_delivered(&mut self.driver);
+                } else {
+                    self.driver
+                        .fail("Chart input/render callback was invalidated");
+                }
                 return None;
             }
             Message::NumberWheelDelivered => {

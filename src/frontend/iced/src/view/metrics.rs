@@ -2,15 +2,20 @@
 mod catalog;
 mod chart;
 mod history;
+use crate::fluent_theme::Element;
 pub use catalog::Chart;
 use catalog::Metric;
 use chart::RetainedChart;
-use crate::fluent_theme::Element;
 use iced::widget::{button, checkbox, column, container, row, text};
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Visible(Chart, bool), Reset, Selector, Expand(Option<Chart>), Epoch(bool), Log(bool),
+    Visible(Chart, bool),
+    Reset,
+    Selector,
+    Expand(Option<Chart>),
+    Epoch(bool),
+    Log(bool),
     Plot(Chart, iced_plot::PlotUiMessage),
 }
 /// Read-only rendered-view facts, collected only by enabled acceptance workflows.
@@ -37,9 +42,18 @@ impl Default for Component {
     fn default() -> Self {
         let metrics = catalog::catalog();
         Self {
-            charts: Chart::ALL.into_iter().map(|kind| RetainedChart::new(kind, metrics.len())).collect(),
-            live: history::History::new(&metrics), saved: history::History::new(&metrics), saved_selected: false,
-            metrics, epoch: true, log: false, selector: false, expanded: None,
+            charts: Chart::ALL
+                .into_iter()
+                .map(|kind| RetainedChart::new(kind, metrics.len()))
+                .collect(),
+            live: history::History::new(&metrics),
+            saved: history::History::new(&metrics),
+            saved_selected: false,
+            metrics,
+            epoch: true,
+            log: false,
+            selector: false,
+            expanded: None,
         }
     }
 }
@@ -47,21 +61,46 @@ impl Component {
     pub(crate) fn chart_view(&self, kind: Chart) -> Option<ChartView> {
         let chart = self.charts.iter().find(|chart| chart.kind == kind)?;
         Some(ChartView {
-            ranges: chart.plot.view_ranges()?, plot_bounds: chart.plot.view_bounds()?,
+            ranges: chart.plot.view_ranges()?,
+            plot_bounds: chart.plot.view_bounds()?,
             legend_collapsed: chart.plot.legend_collapsed(),
             legend_control: chart.plot.legend_control_id(),
-            visible: self.expanded.map_or(chart.visible, |expanded| expanded == kind),
+            visible: self
+                .expanded
+                .map_or(chart.visible, |expanded| expanded == kind),
         })
     }
-    fn invalidate(&mut self) { for chart in &mut self.charts { chart.dirty = true; } }
-    fn history(&self) -> &history::History { if self.saved_selected { &self.saved } else { &self.live } }
-    pub fn clear(&mut self) { self.live.clear(&self.metrics); self.saved.clear(&self.metrics); self.invalidate(); }
-    pub fn reset(&mut self, visible: bool) { self.clear(); if visible { self.prepare(); } }
+    fn invalidate(&mut self) {
+        for chart in &mut self.charts {
+            chart.dirty = true;
+        }
+    }
+    fn history(&self) -> &history::History {
+        if self.saved_selected {
+            &self.saved
+        } else {
+            &self.live
+        }
+    }
+    pub fn clear(&mut self) {
+        self.live.clear(&self.metrics);
+        self.saved.clear(&self.metrics);
+        self.invalidate();
+    }
+    pub fn reset(&mut self, visible: bool) {
+        self.clear();
+        if visible {
+            self.prepare();
+        }
+    }
     pub fn rebase(&mut self, model: &crate::view_model::ApplicationModel, visible: bool) {
         let mut live_changed = 0;
         if let Some(training) = &model.workflow.training {
             if training.local.active && training.local.progress.sequence == 0 {
-                if self.live.sequence.is_some() { self.live.clear(&self.metrics); live_changed = u16::MAX; }
+                if self.live.sequence.is_some() {
+                    self.live.clear(&self.metrics);
+                    live_changed = u16::MAX;
+                }
             } else if let Some(record) = &training.metrics {
                 live_changed = self.live.ingest(record, true, &self.metrics);
             }
@@ -77,59 +116,142 @@ impl Component {
             if let Some(page) = &model.workflow.training_history {
                 let key = (page.generation, page.nextcursor);
                 if page.generation == self.saved.generation && self.saved.page != Some(key) {
-                    for record in &page.records { saved_changed |= self.saved.ingest(record, false, &self.metrics); }
+                    for record in &page.records {
+                        saved_changed |= self.saved.ingest(record, false, &self.metrics);
+                    }
                     self.saved.page = Some(key);
                 }
             }
         }
-        let changed = if selected != self.saved_selected { u16::MAX } else if selected { saved_changed } else { live_changed };
-        for chart in &mut self.charts { chart.dirty |= changed & (1 << chart.kind as usize) != 0; }
+        let changed = if selected != self.saved_selected {
+            u16::MAX
+        } else if selected {
+            saved_changed
+        } else {
+            live_changed
+        };
+        for chart in &mut self.charts {
+            chart.dirty |= changed & (1 << chart.kind as usize) != 0;
+        }
         self.saved_selected = selected;
-        if visible { self.prepare(); }
+        if visible {
+            self.prepare();
+        }
     }
     pub fn update(&mut self, message: Message) {
         match message {
-            Message::Visible(kind, visible) => { if let Some(chart) = self.charts.iter_mut().find(|c| c.kind == kind) { chart.visible = visible; } }
-            Message::Reset => { for chart in &mut self.charts { chart.visible = chart.kind.main(); } self.expanded = None; }
+            Message::Visible(kind, visible) => {
+                if let Some(chart) = self.charts.iter_mut().find(|c| c.kind == kind) {
+                    chart.visible = visible;
+                }
+            }
+            Message::Reset => {
+                for chart in &mut self.charts {
+                    chart.visible = chart.kind.main();
+                }
+                self.expanded = None;
+            }
             Message::Selector => self.selector = !self.selector,
             Message::Expand(chart) => self.expanded = chart,
-            Message::Epoch(epoch) => { self.epoch = epoch; self.invalidate(); }
-            Message::Log(log) => { self.log = log; self.invalidate(); }
-            Message::Plot(kind, message) => { if let Some(chart) = self.charts.iter_mut().find(|c| c.kind == kind) { chart.plot.update(message); } }
+            Message::Epoch(epoch) => {
+                self.epoch = epoch;
+                self.invalidate();
+            }
+            Message::Log(log) => {
+                self.log = log;
+                self.invalidate();
+            }
+            Message::Plot(kind, message) => {
+                if let Some(chart) = self.charts.iter_mut().find(|c| c.kind == kind) {
+                    chart.plot.update(message);
+                }
+            }
         }
         self.prepare();
     }
     fn prepare(&mut self) {
-        let history = if self.saved_selected { &self.saved } else { &self.live };
+        let history = if self.saved_selected {
+            &self.saved
+        } else {
+            &self.live
+        };
         for chart in &mut self.charts {
-            if self.expanded.map_or(chart.visible, |kind| kind == chart.kind) {
+            if self
+                .expanded
+                .map_or(chart.visible, |kind| kind == chart.kind)
+            {
                 chart.prepare(&history.curves, &self.metrics, self.epoch, self.log);
             }
         }
     }
-    pub fn omitted_summaries(&self) -> u64 { self.history().curves.iter().map(|curve| curve.omitted).sum() }
-    pub fn controls_height(&self) -> f32 { (if self.selector { 230.0 } else { 40.0 }) + if self.expanded.is_some() { 34.0 } else { 0.0 } }
+    pub fn omitted_summaries(&self) -> u64 {
+        self.history()
+            .curves
+            .iter()
+            .map(|curve| curve.omitted)
+            .sum()
+    }
+    pub fn controls_height(&self) -> f32 {
+        (if self.selector { 230.0 } else { 40.0 })
+            + if self.expanded.is_some() { 34.0 } else { 0.0 }
+    }
     pub fn view(&self, width: f32, height: f32) -> Element<'_, Message> {
-        let controls = row![container(button("Charts").on_press(Message::Selector)).id("train.metrics.charts"),
-            checkbox(self.epoch).label("Epoch axis").on_toggle(Message::Epoch),
-            checkbox(self.log).label("Log loss scale").on_toggle(Message::Log)].spacing(8);
+        let controls = row![
+            container(button("Charts").on_press(Message::Selector)).id("train.metrics.charts"),
+            checkbox(self.epoch)
+                .label("Epoch axis")
+                .on_toggle(Message::Epoch),
+            checkbox(self.log)
+                .label("Log loss scale")
+                .on_toggle(Message::Log)
+        ]
+        .spacing(8);
         let mut content = column![controls].spacing(6);
         if self.selector {
-            let mut choices = column![button("Reset to main charts").on_press(Message::Reset)].spacing(4);
+            let mut choices =
+                column![button("Reset to main charts").on_press(Message::Reset)].spacing(4);
             for chunk in self.charts.chunks(2) {
                 let mut line = row![].spacing(8);
-                for chart in chunk { let kind = chart.kind; line = line.push(container(checkbox(chart.visible).label(kind.label()).on_toggle(move |v| Message::Visible(kind, v))).id(format!("train.metrics.visible.{kind:?}")).width(iced::FillPortion(1))); }
+                for chart in chunk {
+                    let kind = chart.kind;
+                    line = line.push(
+                        container(
+                            container(
+                                checkbox(chart.visible)
+                                    .label(kind.label())
+                                    .on_toggle(move |v| Message::Visible(kind, v)),
+                            )
+                            .id(format!("train.metrics.visible.{kind:?}")),
+                        )
+                        .width(iced::FillPortion(1)),
+                    );
+                }
                 choices = choices.push(line);
             }
             content = content.push(container(choices).id("train.metrics.selector"));
         }
-        let selected: Vec<_> = self.charts.iter().filter(|c| self.expanded.map_or(c.visible, |kind| kind == c.kind)).collect();
+        let selected: Vec<_> = self
+            .charts
+            .iter()
+            .filter(|c| self.expanded.map_or(c.visible, |kind| kind == c.kind))
+            .collect();
         let workspace: Element<'_, Message> = if selected.is_empty() {
-            container(text("No charts selected")).center(iced::Fill).into()
+            container(text("No charts selected"))
+                .center(iced::Fill)
+                .into()
         } else if self.history().sequence.is_none() {
-            container(text("No training data yet")).center(iced::Fill).into()
+            container(text("No training data yet"))
+                .center(iced::Fill)
+                .into()
         } else {
-            let columns = if self.expanded.is_some() { 1 } else { ((selected.len() as f32 * width / height.max(1.0) / 1.5).sqrt().round() as usize).clamp(1, selected.len()) };
+            let columns = if self.expanded.is_some() {
+                1
+            } else {
+                ((selected.len() as f32 * width / height.max(1.0) / 1.5)
+                    .sqrt()
+                    .round() as usize)
+                    .clamp(1, selected.len())
+            };
             let rows = selected.len().div_ceil(columns);
             let gap = 6.0_f32.min(height / (rows * 2) as f32);
             let tile_height = (height - gap * (rows - 1) as f32) / rows as f32;
@@ -138,18 +260,65 @@ impl Component {
                 let mut line = row![].spacing(6).height(tile_height);
                 for chart in chunk {
                     let kind = chart.kind;
-                    let header = container(container(button(text(kind.label()).size(12)).on_press(Message::Expand(if self.expanded.is_some() { None } else { Some(kind) }))).id(format!("train.metrics.expand.{kind:?}"))).center_x(iced::Fill);
-                    let has_data = self.history().curves.iter().zip(&self.metrics).any(|(c, m)| m.chart == kind && !c.buckets.is_empty());
-                    let body: Element<'_, Message> = if has_data { chart.plot.view().map(move |m| Message::Plot(kind, m)) }
-                        else { container(text(if kind.loss() || kind == Chart::LearningRate { "No recorded measurements" } else { "Waiting for validation" }).size(12)).center(iced::Fill).into() };
-                    line = line.push(container(column![header, body].spacing(2)).clip(true).id(format!("train.metrics.chart.{kind:?}")).width(iced::FillPortion(1)).height(iced::Fill).style(crate::fluent_theme::container_workspace));
+                    let header =
+                        container(
+                            container(button(text(kind.label()).size(12)).on_press(
+                                Message::Expand(if self.expanded.is_some() {
+                                    None
+                                } else {
+                                    Some(kind)
+                                }),
+                            ))
+                            .id(format!("train.metrics.expand.{kind:?}")),
+                        )
+                        .center_x(iced::Fill);
+                    let has_data = self
+                        .history()
+                        .curves
+                        .iter()
+                        .zip(&self.metrics)
+                        .any(|(c, m)| m.chart == kind && !c.buckets.is_empty());
+                    let body: Element<'_, Message> = if has_data {
+                        chart.plot.view().map(move |m| Message::Plot(kind, m))
+                    } else {
+                        container(
+                            text(if kind.loss() || kind == Chart::LearningRate {
+                                "No recorded measurements"
+                            } else {
+                                "Waiting for validation"
+                            })
+                            .size(12),
+                        )
+                        .center(iced::Fill)
+                        .into()
+                    };
+                    line = line.push(
+                        container(column![header, body].spacing(2))
+                            .clip(true)
+                            .id(format!("train.metrics.chart.{kind:?}"))
+                            .width(iced::FillPortion(1))
+                            .height(iced::Fill)
+                            .style(crate::fluent_theme::container_workspace),
+                    );
                 }
                 grid = grid.push(line);
             }
             grid.into()
         };
-        if self.expanded.is_some() { content = content.push(container(button("Back to charts").on_press(Message::Expand(None))).id("train.metrics.back")); }
-        content.push(container(workspace).id("train.metrics.plot").width(width).height(height)).into()
+        if self.expanded.is_some() {
+            content = content.push(
+                container(button("Back to charts").on_press(Message::Expand(None)))
+                    .id("train.metrics.back"),
+            );
+        }
+        content
+            .push(
+                container(workspace)
+                    .id("train.metrics.plot")
+                    .width(width)
+                    .height(height),
+            )
+            .into()
     }
 }
 
@@ -219,16 +388,32 @@ pub(crate) mod tests {
     }
 
     pub(super) fn evaluation() -> EvalSummary {
-        EvalSummary { bbox: MetricSummary {
-            ap: 0.42, ap50: 0.65, ap75: 0.37, available: true,
-            averagerecall: [Some(0.2), Some(0.4), Some(0.6)],
-            detectionlimits: [1, 10, 300], areaap: [Some(0.1), None, Some(0.7)],
-            areaar: [Some(0.2), None, Some(0.8)],
-            confidence: ConfidenceMetrics { precision: 0.8, recall: 0.5, f1: 0.615 },
-            confidencethreshold: 0.5,
-        }, mask: None, modeldetectionbudget: 300 }
+        EvalSummary {
+            bbox: MetricSummary {
+                ap: 0.42,
+                ap50: 0.65,
+                ap75: 0.37,
+                available: true,
+                averagerecall: [Some(0.2), Some(0.4), Some(0.6)],
+                detectionlimits: [1, 10, 300],
+                areaap: [Some(0.1), None, Some(0.7)],
+                areaar: [Some(0.2), None, Some(0.8)],
+                confidence: ConfidenceMetrics {
+                    precision: 0.8,
+                    recall: 0.5,
+                    f1: 0.615,
+                },
+                confidencethreshold: 0.5,
+            },
+            mask: None,
+            modeldetectionbudget: 300,
+        }
     }
-    fn curve<'a>(history: &'a history::History, metrics: &[Metric], chart: Chart) -> &'a history::Curve {
+    fn curve<'a>(
+        history: &'a history::History,
+        metrics: &[Metric],
+        chart: Chart,
+    ) -> &'a history::Curve {
         &history.curves[metrics.iter().position(|m| m.chart == chart).unwrap()]
     }
     #[test]
@@ -239,10 +424,13 @@ pub(crate) mod tests {
         history.ingest(&sample, true, &metrics);
         assert!(curve(&history, &metrics, Chart::Ap50).buckets.is_empty());
         for epoch in 0..2 {
-            sample.sequence += 1; sample.role = TrainingRecordRole::Epoch;
-            sample.progress.epoch = epoch; sample.progress.val = Some(evaluation());
+            sample.sequence += 1;
+            sample.role = TrainingRecordRole::Epoch;
+            sample.progress.epoch = epoch;
+            sample.progress.val = Some(evaluation());
             history.ingest(&sample, true, &metrics);
-            sample.sequence += 1; sample.role = TrainingRecordRole::Live;
+            sample.sequence += 1;
+            sample.role = TrainingRecordRole::Live;
             sample.progress.val = None;
             history.ingest(&sample, true, &metrics);
         }
@@ -252,8 +440,10 @@ pub(crate) mod tests {
         assert_eq!(ap.buckets[0].first.epoch, 1.0);
         assert_eq!(ap.buckets[1].first.epoch, 2.0);
         assert_eq!(ap.buckets[0].segment, ap.buckets[1].segment);
-        sample.sequence += 1; sample.role = TrainingRecordRole::Terminal;
-        sample.progress.val = Some(evaluation()); sample.progress.test = Some(evaluation());
+        sample.sequence += 1;
+        sample.role = TrainingRecordRole::Terminal;
+        sample.progress.val = Some(evaluation());
+        sample.progress.test = Some(evaluation());
         history.ingest(&sample, true, &metrics);
         assert_eq!(curve(&history, &metrics, Chart::Ap50).buckets.len(), 2);
     }
@@ -261,7 +451,8 @@ pub(crate) mod tests {
     fn gaps_invalid_evaluations_and_resumed_attempts_never_join() {
         let metrics = catalog::catalog();
         let mut history = history::History::new(&metrics);
-        let mut sample = record(); sample.role = TrainingRecordRole::Epoch;
+        let mut sample = record();
+        sample.role = TrainingRecordRole::Epoch;
         sample.progress.val = Some(evaluation());
         history.ingest(&sample, true, &metrics);
         for missing in [true, false] {
@@ -269,15 +460,22 @@ pub(crate) mod tests {
             sample.progress.epoch += 1;
             sample.progress.val.as_mut().unwrap().bbox.ap50 = f64::NAN;
             history.ingest(&sample, true, &metrics);
-            sample.sequence += 1; sample.progress.epoch += 1;
+            sample.sequence += 1;
+            sample.progress.epoch += 1;
             sample.progress.val = Some(evaluation());
             history.ingest(&sample, true, &metrics);
         }
-        sample.attemptid = "resume".into(); sample.sequence = 0;
+        sample.attemptid = "resume".into();
+        sample.sequence = 0;
         history.ingest(&sample, true, &metrics);
         let ap = curve(&history, &metrics, Chart::Ap50);
         assert_eq!(ap.buckets.len(), 4);
-        assert!(ap.buckets.iter().zip(ap.buckets.iter().skip(1)).all(|(a,b)| a.segment != b.segment));
+        assert!(
+            ap.buckets
+                .iter()
+                .zip(ap.buckets.iter().skip(1))
+                .all(|(a, b)| a.segment != b.segment)
+        );
     }
     #[test]
     fn evaluation_availability_caps_and_nonfinite_leaves_are_honest() {
@@ -297,11 +495,22 @@ pub(crate) mod tests {
         bbox.confidence.precision = f64::INFINITY;
         bbox.areaap[0] = Some(f64::NEG_INFINITY);
         history.ingest(&sample, false, &metrics);
-        assert_eq!(curve(&history, &metrics, Chart::Ap).buckets[0].first.value, 0.42);
-        assert!(curve(&history, &metrics, Chart::Confidence).buckets.is_empty());
+        assert_eq!(
+            curve(&history, &metrics, Chart::Ap).buckets[0].first.value,
+            0.42
+        );
+        assert!(
+            curve(&history, &metrics, Chart::Confidence)
+                .buckets
+                .is_empty()
+        );
         assert!(curve(&history, &metrics, Chart::Area).buckets.is_empty());
-        let recalls = metrics.iter().zip(&history.curves).filter(|(m, _)| m.chart == Chart::AverageRecall)
-            .map(|(_, c)| c.name.as_str()).collect::<Vec<_>>();
+        let recalls = metrics
+            .iter()
+            .zip(&history.curves)
+            .filter(|(m, _)| m.chart == Chart::AverageRecall)
+            .map(|(_, c)| c.name.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(recalls, ["Box AR@2", "Box AR@23", "Box AR@456"]);
     }
     #[test]
@@ -315,20 +524,27 @@ pub(crate) mod tests {
         let id = component.charts[0].shapes[0];
         assert!(id.is_some());
         assert_eq!(component.live.curves[0].buckets[0].first.epoch, 1.1);
-        sample.sequence += 1; sample.progress.elapsedseconds += 0.2;
+        sample.sequence += 1;
+        sample.progress.elapsedseconds += 0.2;
         assert_eq!(component.live.ingest(&sample, true, &component.metrics), 0);
-        sample.sequence += 1; sample.progress.phase = TrainingPhase::Validate;
+        sample.sequence += 1;
+        sample.progress.phase = TrainingPhase::Validate;
         assert_ne!(component.live.ingest(&sample, true, &component.metrics), 0);
         component.update(Message::Expand(Some(Chart::Loss)));
         component.update(Message::Expand(None));
         assert_eq!(component.charts[0].shapes[0], id);
-        for kind in Chart::ALL { component.update(Message::Visible(kind, false)); }
+        for kind in Chart::ALL {
+            component.update(Message::Visible(kind, false));
+        }
         assert!(component.charts.iter().all(|c| !c.visible));
         component.update(Message::Reset);
         assert_eq!(component.charts.iter().filter(|c| c.visible).count(), 6);
         component.reset(true);
         assert_eq!(component.charts[0].shapes[0], id);
-        component.charts[0].plot.update_series(&id.unwrap(), |s| assert!(s.positions.is_empty())).unwrap();
+        component.charts[0]
+            .plot
+            .update_series(&id.unwrap(), |s| assert!(s.positions.is_empty()))
+            .unwrap();
     }
     #[test]
     fn hidden_navigation_saved_selection_and_preparation_preserve_independent_live_history() {
@@ -337,15 +553,30 @@ pub(crate) mod tests {
         let mut sample = record();
         model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
         component.rebase(&model, false);
-        assert!(component.charts.iter().all(|c| c.shapes.iter().all(Option::is_none)));
+        assert!(
+            component
+                .charts
+                .iter()
+                .all(|c| c.shapes.iter().all(Option::is_none))
+        );
         component.rebase(&model, true);
         let shape = component.charts[0].shapes[0].unwrap();
-        component.charts[0].plot.update_series(&shape, |series| {
-            assert_eq!(series.positions, vec![[1.1, 1.0]]);
-        }).unwrap();
+        component.charts[0]
+            .plot
+            .update_series(&shape, |series| {
+                assert_eq!(series.positions, vec![[1.1, 1.0]]);
+            })
+            .unwrap();
 
-        let configuration = model.settings_snapshot.as_ref().unwrap()
-            .settingsstate.workflows.train.request.clone();
+        let configuration = model
+            .settings_snapshot
+            .as_ref()
+            .unwrap()
+            .settingsstate
+            .workflows
+            .train
+            .request
+            .clone();
         model.workflow.training_run = Some(TrainingOpenedRun {
             generation: 3,
             directory: "saved-output".into(),
@@ -409,9 +640,12 @@ pub(crate) mod tests {
         assert!(component.saved_selected);
         assert_eq!(component.history().curves[0].buckets[0].first.value, 77.0);
         assert_eq!(component.charts[0].shapes[0], Some(shape));
-        component.charts[0].plot.update_series(&shape, |series| {
-            assert_eq!(series.positions, vec![[9.1, 77.0]]);
-        }).unwrap();
+        component.charts[0]
+            .plot
+            .update_series(&shape, |series| {
+                assert_eq!(series.positions, vec![[9.1, 77.0]]);
+            })
+            .unwrap();
 
         // Live delivery continues while saved charts are selected and hidden.
         sample.sequence += 1;
@@ -424,9 +658,12 @@ pub(crate) mod tests {
         assert_eq!(component.live.curves[0].buckets.len(), 2);
         assert_eq!(component.history().curves[0].buckets[0].first.value, 77.0);
         component.rebase(&model, true);
-        component.charts[0].plot.update_series(&shape, |series| {
-            assert_eq!(series.positions, vec![[9.1, 77.0]]);
-        }).unwrap();
+        component.charts[0]
+            .plot
+            .update_series(&shape, |series| {
+                assert_eq!(series.positions, vec![[9.1, 77.0]]);
+            })
+            .unwrap();
 
         // This is the same explicit selection clearing used by Current live run.
         model.workflow.training_run = None;
@@ -434,9 +671,12 @@ pub(crate) mod tests {
         component.rebase(&model, true);
         assert!(!component.saved_selected);
         assert_eq!(component.charts[0].shapes[0], Some(shape));
-        component.charts[0].plot.update_series(&shape, |series| {
-            assert_eq!(series.positions, vec![[1.1, 1.0], [1.2, 2.0]]);
-        }).unwrap();
+        component.charts[0]
+            .plot
+            .update_series(&shape, |series| {
+                assert_eq!(series.positions, vec![[1.1, 1.0], [1.2, 2.0]]);
+            })
+            .unwrap();
 
         // Old metric storage can still be present during new-run inspection.
         let snapshot = model.workflow.training.as_mut().unwrap();
@@ -446,8 +686,11 @@ pub(crate) mod tests {
         assert!(component.live.sequence.is_none());
         assert_eq!(component.saved.curves[0].buckets[0].first.value, 77.0);
         assert_eq!(component.charts[0].shapes[0], Some(shape));
-        component.charts[0].plot.update_series(&shape, |series| {
-            assert!(series.positions.is_empty());
-        }).unwrap();
+        component.charts[0]
+            .plot
+            .update_series(&shape, |series| {
+                assert!(series.positions.is_empty());
+            })
+            .unwrap();
     }
 }

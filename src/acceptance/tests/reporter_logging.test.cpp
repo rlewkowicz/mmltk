@@ -106,7 +106,6 @@ TEST_CASE("test_catch2_compact_reporter_formats_shared_assertion_details", "[cor
     test_catch2_compact_reporter_formats_shared_assertion_details();
 }
 TEST_CASE("test_catch2_tap_reporter_formats_shared_assertion_details", "[core][vendored]") { test_catch2_tap_reporter_formats_shared_assertion_details(); }
-
 TEST_CASE("fatal_reporting_fixture", "[.][core][logging][fatal_fixture]") {
     namespace logging = mmltk::common::logging;
     const char* scenario = std::getenv("MMLTK_FATAL_FIXTURE");
@@ -154,9 +153,9 @@ TEST_CASE("fatal reporting is bounded visible and independent of diagnostic sink
         const auto log = directory.path() / (mode + ".log");
         if (mode == "init-failure") std::filesystem::create_directory(log);
         const bool enabled = mode == "enabled" || mode == "disabled-after-init" || mode == "sink-failure" || mode == "init-failure";
-        const auto result = run_subprocess_capture_output({"env", "-u", "MMLTK_LOG_DIR", "MMLTK_FATAL_FIXTURE=" + mode,
-            "MMLTK_LOG_LEVEL=off", "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(),
-            current_test_binary_path(), "fatal_reporting_fixture", "--reporter", "compact", "--colour-mode", "none"});
+        const auto result = run_subprocess_capture_output({"env", "-u", "MMLTK_LOG_DIR", "MMLTK_FATAL_FIXTURE=" + mode, "MMLTK_LOG_LEVEL=off",
+                                                           "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(), current_test_binary_path(),
+                                                           "fatal_reporting_fixture", "--reporter", "compact", "--colour-mode", "none"});
         INFO(result.output_text);
         REQUIRE(result.exit_code == 0);
         const auto begin = result.stderr_text.find("fatal: ");
@@ -167,9 +166,12 @@ TEST_CASE("fatal reporting is bounded visible and independent of diagnostic sink
         CHECK(terminal.size() <= 1024U);
         CHECK(result.stderr_text.find("fatal: ", end) == std::string::npos);
         CHECK(std::count(result.stderr_text.begin(), result.stderr_text.end(), '\n') == 3);
-        if (mode == "init-failure") CHECK(result.stderr_text.find("logging initialization") != std::string::npos);
-        else if (mode == "long") CHECK(result.stderr_text.find("... (status=-2147483647)") != std::string::npos);
-        else CHECK(terminal == "fatal: fixture component: failure detail second line (status=23)\n");
+        if (mode == "init-failure")
+            CHECK(result.stderr_text.find("logging initialization") != std::string::npos);
+        else if (mode == "long")
+            CHECK(result.stderr_text.find("... (status=-2147483647)") != std::string::npos);
+        else
+            CHECK(terminal == "fatal: fixture component: failure detail second line (status=23)\n");
         if (!enabled) CHECK_FALSE(std::filesystem::exists(log));
         if (mode == "enabled") {
             std::ifstream input{log};
@@ -179,7 +181,6 @@ TEST_CASE("fatal reporting is bounded visible and independent of diagnostic sink
         if (mode == "disabled-after-init") CHECK(std::filesystem::file_size(log) == 0U);
     }
 }
-
 TEST_CASE("fatal reporting preserves thread signals and status with a broken stderr pipe", "[core][logging]") {
     for (const bool pending_before : {false, true}) {
         std::array<int, 2U> descriptors{};
@@ -192,10 +193,10 @@ TEST_CASE("fatal reporting preserves thread signals and status with a broken std
             struct sigaction disposition{};
             disposition.sa_handler = SIG_DFL;
             sigset_t pipe_signal{}, original{}, after{}, pending{};
-            if (::sigemptyset(&disposition.sa_mask) != 0 || ::sigaction(SIGPIPE, &disposition, nullptr) != 0 ||
-                ::sigemptyset(&pipe_signal) != 0 || ::sigaddset(&pipe_signal, SIGPIPE) != 0 ||
-                ::pthread_sigmask(pending_before ? SIG_BLOCK : SIG_UNBLOCK, &pipe_signal, nullptr) != 0 ||
-                ::pthread_sigmask(SIG_BLOCK, nullptr, &original) != 0 || ::dup2(writer.get(), STDERR_FILENO) < 0) std::_Exit(90);
+            if (::sigemptyset(&disposition.sa_mask) != 0 || ::sigaction(SIGPIPE, &disposition, nullptr) != 0 || ::sigemptyset(&pipe_signal) != 0 ||
+                ::sigaddset(&pipe_signal, SIGPIPE) != 0 || ::pthread_sigmask(pending_before ? SIG_BLOCK : SIG_UNBLOCK, &pipe_signal, nullptr) != 0 ||
+                ::pthread_sigmask(SIG_BLOCK, nullptr, &original) != 0 || ::dup2(writer.get(), STDERR_FILENO) < 0)
+                std::_Exit(90);
             if (pending_before && ::raise(SIGPIPE) != 0) std::_Exit(91);
             errno = EINVAL;
             mmltk::common::logging::report_fatal("broken pipe fixture", "must return");

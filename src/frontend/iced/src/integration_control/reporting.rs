@@ -17,8 +17,19 @@ use iced::Rectangle;
 use std::cell::RefCell;
 
 pub(super) fn chart_view(stage: &str, view: &crate::view::metrics::ChartView) {
-    emit(|sink| sink.record("integration.chart_view", "train.metrics.chart.Loss", stage,
-        [view.ranges[0][0], view.ranges[0][1], view.ranges[1][0], view.ranges[1][1]]));
+    emit(|sink| {
+        sink.record(
+            "integration.chart_view",
+            "train.metrics.chart.Loss",
+            stage,
+            [
+                view.ranges[0][0],
+                view.ranges[0][1],
+                view.ranges[1][0],
+                view.ranges[1][1],
+            ],
+        )
+    });
 }
 
 pub(crate) fn metric_projection(label: &str, positions: &[[f64; 2]]) {
@@ -29,8 +40,16 @@ pub(crate) fn metric_projection(label: &str, positions: &[[f64; 2]]) {
             .windows(2)
             .filter(|pair| finite(&pair[0]) && finite(&pair[1]) && pair[0] != pair[1])
             .count();
-        if let (Some(first), Some(last)) = (positions.iter().find(|p| finite(p)), positions.iter().rfind(|p| finite(p))) {
-            sink.record("integration.metric_values", "train.metrics.plot", label, [first[0], first[1], last[0], last[1]]);
+        if let (Some(first), Some(last)) = (
+            positions.iter().find(|p| finite(p)),
+            positions.iter().rfind(|p| finite(p)),
+        ) {
+            sink.record(
+                "integration.metric_values",
+                "train.metrics.plot",
+                label,
+                [first[0], first[1], last[0], last[1]],
+            );
         }
         sink.record(
             "integration.metric_projection",

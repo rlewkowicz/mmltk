@@ -557,7 +557,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     }
     const size_t batches_per_step = micro_batches_per_optimizer_step(options, train_lane_count);
     const auto total_images = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(usable_full_batches),
-                                                                  static_cast<std::uint64_t>(options.batch_size), "training image total overflow");
+                                                                    static_cast<std::uint64_t>(options.batch_size), "training image total overflow");
     const auto steps_per_epoch = static_cast<int64_t>(usable_full_batches / batches_per_step);
     const int64_t total_training_steps = std::max<int64_t>(1, steps_per_epoch * options.epochs);
     DetectionConfig detection_config = make_detection_config(artifacts.config, distributed.world_size, options.compilation_mode);
@@ -658,8 +658,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         auto last_progress_submit = epoch_started - std::chrono::seconds(1);
         std::unique_ptr<spdmon::ProgressBar> progress;
         if (main_process && options.progress_bar) {
-            progress = std::make_unique<spdmon::ProgressBar>(phase_progress_label("train", epoch, options.epochs),
-                                                             static_cast<size_t>(total_images), "img");
+            progress = std::make_unique<spdmon::ProgressBar>(phase_progress_label("train", epoch, options.epochs), static_cast<size_t>(total_images), "img");
             progress->set_postfix("cl=warming, bl=warming, l=warming");
         }
         auto write_progress_snapshot = [&](TrainingPhase phase, std::optional<double> val_loss, const std::optional<EvalSummary>& val_summary,
@@ -678,8 +677,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             snapshot.total_epochs = options.epochs;
             snapshot.completed_batches = local_micro_batches;
             snapshot.total_batches = usable_full_batches;
-            snapshot.completed_images = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(local_micro_batches),
-                                                                              static_cast<std::uint64_t>(options.batch_size), "training image progress overflow");
+            snapshot.completed_images = mmltk::common::math::checked_multiply(
+                static_cast<std::uint64_t>(local_micro_batches), static_cast<std::uint64_t>(options.batch_size), "training image progress overflow");
             snapshot.total_images = total_images;
             snapshot.completed_waves = local_waves;
             snapshot.optimizer_steps = optimizer_steps;

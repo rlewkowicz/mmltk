@@ -73,9 +73,15 @@ pub fn view<'a>(
         let canvas_width = layout.canvas_width;
         let page_width = layout.page_width;
         let page_offset = layout.page_offset;
-        let body: Element<'_, Message> = responsive(move |body_size| {
+        let body: Element<'_, Message> = responsive(move |body_size| -> Element<'_, Message> {
             let page = router
-                .view(model, settings_component, surface, page_width, (body_size.height - 10.0).max(1.0))
+                .view(
+                    model,
+                    settings_component,
+                    surface,
+                    page_width,
+                    (body_size.height - 10.0).max(1.0),
+                )
                 .map(Message::Workspace);
             let page = container(page).padding(Padding {
                 top: 10.0,
@@ -93,7 +99,8 @@ pub fn view<'a>(
                     .height(Fill)
                     .into()
             }
-        }).into();
+        })
+        .into();
         let header = scrollable(
             container(
                 container(

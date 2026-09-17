@@ -949,9 +949,7 @@ int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int arg
                                 std::ranges::find(command_arguments, std::string_view{"-h"}) != command_arguments.end();
     try {
         return dispatch_command(*descriptor, command_arguments, help_requested, logging::scan_cli_overrides(argc, argv));
-    } catch (const std::exception& error) {
-        logging::report_fatal("mmltk rfdetr error", error.what(), std::nullopt, "rfdetr.cli");
-    } catch (...) {
+    } catch (const std::exception& error) { logging::report_fatal("mmltk rfdetr error", error.what(), std::nullopt, "rfdetr.cli"); } catch (...) {
         logging::report_fatal("mmltk rfdetr error", "unknown exception", std::nullopt, "rfdetr.cli");
     }
     return 1;

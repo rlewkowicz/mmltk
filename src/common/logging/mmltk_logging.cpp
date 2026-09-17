@@ -227,8 +227,7 @@ void report_fatal(const std::string_view component, const std::string_view detai
     }
     buffer[size++] = '\n';
     sigset_t blocked{}, previous{}, pending{};
-    if (::sigemptyset(&blocked) == 0 && ::sigaddset(&blocked, SIGPIPE) == 0 &&
-        ::pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0) {
+    if (::sigemptyset(&blocked) == 0 && ::sigaddset(&blocked, SIGPIPE) == 0 && ::pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0) {
         // A pending signal belongs to the caller. Only consume a new SIGPIPE
         // caused by this write, while it is blocked on this thread alone.
         if (::sigpending(&pending) == 0) {
@@ -238,8 +237,10 @@ void report_fatal(const std::string_view component, const std::string_view detai
             bool broken_pipe = false;
             while (written < size) {
                 const ssize_t count = ::write(STDERR_FILENO, buffer.data() + written, size - written);
-                if (count > 0) written += static_cast<std::size_t>(count);
-                else if (count < 0 && errno == EINTR && ++interruptions < 4U) continue;
+                if (count > 0)
+                    written += static_cast<std::size_t>(count);
+                else if (count < 0 && errno == EINTR && ++interruptions < 4U)
+                    continue;
                 else {
                     broken_pipe = count < 0 && errno == EPIPE;
                     break;

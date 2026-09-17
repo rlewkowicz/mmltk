@@ -568,28 +568,87 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
         "reflected scalar projection or distinct resumable artifact paths changed",
     )?;
     {
+        use generated::ConfidenceMetricsField::{F1, Precision, Recall};
         use generated::MetricSummaryField::*;
-        use generated::ConfidenceMetricsField::{Precision, Recall, F1};
         let evaluation = training.progress.val.as_ref().unwrap();
-        let fields = [Ap, Ap50, Ap75, AverageRecall(0), AverageRecall(1), AverageRecall(2),
-            AreaAp(0), AreaAp(1), AreaAp(2), AreaAr(0), AreaAr(1), AreaAr(2),
-            Confidence(Precision), Confidence(Recall), Confidence(F1), ConfidenceThreshold];
+        let fields = [
+            Ap,
+            Ap50,
+            Ap75,
+            AverageRecall(0),
+            AverageRecall(1),
+            AverageRecall(2),
+            AreaAp(0),
+            AreaAp(1),
+            AreaAp(2),
+            AreaAr(0),
+            AreaAr(1),
+            AreaAr(2),
+            Confidence(Precision),
+            Confidence(Recall),
+            Confidence(F1),
+            ConfidenceThreshold,
+        ];
         for (summary, expected) in [
-            (&evaluation.bbox, [Some(0.625), Some(0.875), Some(0.375), Some(0.125), None, Some(0.75),
-                None, Some(0.25), Some(0.5), Some(0.3125), Some(0.5625), None,
-                Some(0.8125), Some(0.4375), Some(0.6875), Some(0.1875)]),
-            (evaluation.mask.as_ref().unwrap(), [Some(0.0625), Some(0.9375), Some(0.15625), Some(0.21875), Some(0.28125), None,
-                Some(0.34375), None, Some(0.40625), None, Some(0.46875), Some(0.53125),
-                Some(0.59375), Some(0.65625), Some(0.71875), Some(0.78125)]),
+            (
+                &evaluation.bbox,
+                [
+                    Some(0.625),
+                    Some(0.875),
+                    Some(0.375),
+                    Some(0.125),
+                    None,
+                    Some(0.75),
+                    None,
+                    Some(0.25),
+                    Some(0.5),
+                    Some(0.3125),
+                    Some(0.5625),
+                    None,
+                    Some(0.8125),
+                    Some(0.4375),
+                    Some(0.6875),
+                    Some(0.1875),
+                ],
+            ),
+            (
+                evaluation.mask.as_ref().unwrap(),
+                [
+                    Some(0.0625),
+                    Some(0.9375),
+                    Some(0.15625),
+                    Some(0.21875),
+                    Some(0.28125),
+                    None,
+                    Some(0.34375),
+                    None,
+                    Some(0.40625),
+                    None,
+                    Some(0.46875),
+                    Some(0.53125),
+                    Some(0.59375),
+                    Some(0.65625),
+                    Some(0.71875),
+                    Some(0.78125),
+                ],
+            ),
         ] {
-            require(summary.available && fields.map(|field| summary.value(field)) == expected,
-                "reflected evaluation leaves changed across native/Rust transport")?;
-            require(summary.value(AverageRecall(usize::MAX)).is_none()
-                && summary.value(AreaAp(usize::MAX)).is_none()
-                && summary.value(AreaAr(usize::MAX)).is_none(), "invalid scalar selector was accepted")?;
+            require(
+                summary.available && fields.map(|field| summary.value(field)) == expected,
+                "reflected evaluation leaves changed across native/Rust transport",
+            )?;
+            require(
+                summary.value(AverageRecall(usize::MAX)).is_none()
+                    && summary.value(AreaAp(usize::MAX)).is_none()
+                    && summary.value(AreaAr(usize::MAX)).is_none(),
+                "invalid scalar selector was accepted",
+            )?;
         }
-        require(evaluation.bbox.detectionlimits == [2, 20, 200]
-            && evaluation.mask.as_ref().unwrap().detectionlimits == [3, 30, 300], "detection caps changed")?;
+        require(
+            evaluation.bbox.detectionlimits == [2, 20, 200]
+                && evaluation.mask.as_ref().unwrap().detectionlimits == [3, 30, 300],
+            "detection caps changed",
+        )?;
     }
     let training_page =
         generated::TrainingHistoryPage::from_application_value(model_reference(702)?)

@@ -75,7 +75,6 @@ void test_current_training_history_pages_and_attempt_configuration() {
 TEST_CASE("test_current_training_history_pages_and_attempt_configuration", "[gui][train][history]") {
     test_current_training_history_pages_and_attempt_configuration();
 }
-
 TEST_CASE("saved training format one is explicitly incompatible", "[gui][train][history]") {
     namespace r = mmltk::backend::models::rfdetr;
     mmltk::testsupport::ScopedTempDir temp{"training-old-format"};

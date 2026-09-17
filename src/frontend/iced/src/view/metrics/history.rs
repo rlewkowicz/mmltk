@@ -52,9 +52,16 @@ impl Curve {
         }
     }
     pub(super) fn clear(&mut self, name: &str) {
-        self.name.clear(); self.name.push_str(name); self.buckets.clear(); self.scratch.clear();
-        self.omitted = 0; self.omitted_extrema = None; self.missing = false;
-        self.available = false; self.segment = 0; self.external = None;
+        self.name.clear();
+        self.name.push_str(name);
+        self.buckets.clear();
+        self.scratch.clear();
+        self.omitted = 0;
+        self.omitted_extrema = None;
+        self.missing = false;
+        self.available = false;
+        self.segment = 0;
+        self.external = None;
     }
     pub(super) fn push(&mut self, segment: u64, point: Option<Point>) {
         self.available = point.is_some();
@@ -105,7 +112,7 @@ impl Curve {
 }
 
 use super::catalog::{Metric, Source};
-use crate::generated::{TrainingRecord, TrainingRecordRole, TrainingPhase};
+use crate::generated::{TrainingPhase, TrainingRecord, TrainingRecordRole};
 
 pub(super) struct History {
     pub(super) curves: Vec<Curve>,
@@ -122,67 +129,152 @@ pub(super) struct History {
 }
 impl History {
     pub(super) fn new(metrics: &[Metric]) -> Self {
-        Self { curves: metrics.iter().map(|m| Curve::new(&m.label)).collect(),
-            run: String::new(), attempt: String::new(), sequence: None, dropped: 0, segment: 0,
-            last_live: None, last_phase_epoch: None, last_evaluation: None,
-            page: None, generation: 0 }
+        Self {
+            curves: metrics.iter().map(|m| Curve::new(&m.label)).collect(),
+            run: String::new(),
+            attempt: String::new(),
+            sequence: None,
+            dropped: 0,
+            segment: 0,
+            last_live: None,
+            last_phase_epoch: None,
+            last_evaluation: None,
+            page: None,
+            generation: 0,
+        }
     }
-    pub(super) fn set_run(&mut self, run: &str, generation: u64) { self.run.clear(); self.run.push_str(run); self.generation = generation; }
+    pub(super) fn set_run(&mut self, run: &str, generation: u64) {
+        self.run.clear();
+        self.run.push_str(run);
+        self.generation = generation;
+    }
     pub(super) fn clear(&mut self, metrics: &[Metric]) {
-        self.run.clear(); self.attempt.clear(); self.sequence = None; self.dropped = 0;
-        self.segment = 0; self.last_live = None; self.last_phase_epoch = None;
-        self.last_evaluation = None; self.page = None; self.generation = 0;
+        self.run.clear();
+        self.attempt.clear();
+        self.sequence = None;
+        self.dropped = 0;
+        self.segment = 0;
+        self.last_live = None;
+        self.last_phase_epoch = None;
+        self.last_evaluation = None;
+        self.page = None;
+        self.generation = 0;
         // Keep chart/series identities and allocated bucket storage through source changes.
         for (curve, metric) in self.curves.iter_mut().zip(metrics) {
             curve.clear(&metric.label);
         }
-
     }
-    pub(super) fn ingest(&mut self, record: &TrainingRecord, live: bool, metrics: &[Metric]) -> u16 {
+    pub(super) fn ingest(
+        &mut self,
+        record: &TrainingRecord,
+        live: bool,
+        metrics: &[Metric],
+    ) -> u16 {
         let mut changed = 0;
-        if self.run != record.runid { self.clear(metrics); self.run.clone_from(&record.runid); changed = u16::MAX; }
+        if self.run != record.runid {
+            self.clear(metrics);
+            self.run.clone_from(&record.runid);
+            changed = u16::MAX;
+        }
         let attempt_changed = self.attempt != record.attemptid;
-        if attempt_changed { self.sequence = None; self.dropped = 0; self.last_live = None; self.last_evaluation = None; }
-        if self.sequence.is_some_and(|sequence| record.sequence <= sequence) { return 0; }
-        if attempt_changed || record.droppedbefore > self.dropped || self.sequence.is_some_and(|sequence| sequence.checked_add(1) != Some(record.sequence)) {
+        if attempt_changed {
+            self.sequence = None;
+            self.dropped = 0;
+            self.last_live = None;
+            self.last_evaluation = None;
+        }
+        if self
+            .sequence
+            .is_some_and(|sequence| record.sequence <= sequence)
+        {
+            return 0;
+        }
+        if attempt_changed
+            || record.droppedbefore > self.dropped
+            || self
+                .sequence
+                .is_some_and(|sequence| sequence.checked_add(1) != Some(record.sequence))
+        {
             self.segment = self.segment.wrapping_add(1);
         }
         self.attempt.clone_from(&record.attemptid);
-        self.sequence = Some(record.sequence); self.dropped = record.droppedbefore;
+        self.sequence = Some(record.sequence);
+        self.dropped = record.droppedbefore;
         let progress = &record.progress;
         let phase_epoch = (progress.phase, progress.epoch);
-        let admit = !live || record.role != TrainingRecordRole::Live || attempt_changed
+        let admit = !live
+            || record.role != TrainingRecordRole::Live
+            || attempt_changed
             || self.last_phase_epoch != Some(phase_epoch)
-            || !self.last_live.is_some_and(|last| progress.elapsedseconds >= last && progress.elapsedseconds - last < 1.0);
+            || !self.last_live.is_some_and(|last| {
+                progress.elapsedseconds >= last && progress.elapsedseconds - last < 1.0
+            });
         self.last_phase_epoch = Some(phase_epoch);
-        if admit && record.role == TrainingRecordRole::Live { self.last_live = Some(progress.elapsedseconds); }
+        if admit && record.role == TrainingRecordRole::Live {
+            self.last_live = Some(progress.elapsedseconds);
+        }
         // Only completed epoch observations contribute validation. Live and terminal
         // records can carry copied summaries, and neither is another evaluation.
         let evaluation = record.role == TrainingRecordRole::Epoch
-            && self.last_evaluation.as_ref().is_none_or(|(attempt, epoch)| attempt != &record.attemptid || *epoch != progress.epoch);
-        if evaluation { self.last_evaluation = Some((record.attemptid.clone(), progress.epoch)); }
+            && self
+                .last_evaluation
+                .as_ref()
+                .is_none_or(|(attempt, epoch)| {
+                    attempt != &record.attemptid || *epoch != progress.epoch
+                });
+        if evaluation {
+            self.last_evaluation = Some((record.attemptid.clone(), progress.epoch));
+        }
         for (metric, curve) in metrics.iter().zip(&mut self.curves) {
             let (value, is_evaluation) = match metric.source {
                 Source::Scalar(field) => (progress.scalars.value(field), false),
                 Source::Evaluation { mask, field } => {
-                    if !evaluation { continue; }
-                    let summary = progress.val.as_ref().and_then(|v| if mask { v.mask.as_ref() } else { Some(&v.bbox) });
+                    if !evaluation {
+                        continue;
+                    }
+                    let summary = progress
+                        .val
+                        .as_ref()
+                        .and_then(|v| if mask { v.mask.as_ref() } else { Some(&v.bbox) });
                     if let crate::generated::MetricSummaryField::AverageRecall(index) = field {
                         if let Some(cap) = summary.and_then(|s| s.detectionlimits.get(index)) {
-                            curve.name = format!("{} AR@{}", if mask { "Mask" } else { "Box" }, cap);
+                            curve.name =
+                                format!("{} AR@{}", if mask { "Mask" } else { "Box" }, cap);
                         }
                     }
-                    (summary.filter(|s| s.available).and_then(|s| s.value(field)), true)
+                    (
+                        summary.filter(|s| s.available).and_then(|s| s.value(field)),
+                        true,
+                    )
                 }
             };
             let value = value.filter(|v| v.is_finite());
             curve.available = value.is_some();
-            if !admit { if value.is_none() { curve.missing = true; } continue; }
-            let fraction = if is_evaluation || record.role == TrainingRecordRole::Epoch { 1.0 }
-                else if progress.totalbatches > 0 { (progress.completedbatches as f64 / progress.totalbatches as f64).clamp(0.0, 1.0) } else { 0.0 };
-            if value.is_some() { changed |= 1 << metric.chart as usize; }
-            curve.push(self.segment, value.map(|value| Point { step: progress.globaloptimizerstep as f64, epoch: progress.epoch as f64 + fraction, value, order: record.sequence }));
-
+            if !admit {
+                if value.is_none() {
+                    curve.missing = true;
+                }
+                continue;
+            }
+            let fraction = if is_evaluation || record.role == TrainingRecordRole::Epoch {
+                1.0
+            } else if progress.totalbatches > 0 {
+                (progress.completedbatches as f64 / progress.totalbatches as f64).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if value.is_some() {
+                changed |= 1 << metric.chart as usize;
+            }
+            curve.push(
+                self.segment,
+                value.map(|value| Point {
+                    step: progress.globaloptimizerstep as f64,
+                    epoch: progress.epoch as f64 + fraction,
+                    value,
+                    order: record.sequence,
+                }),
+            );
         }
         changed
     }
@@ -190,7 +282,7 @@ impl History {
 
 #[cfg(test)]
 mod tests {
-use super::*;
+    use super::*;
     #[test]
     fn observed_sequences_and_cumulative_drops_survive_display_coalescing() {
         let metrics = super::super::catalog::catalog();
@@ -298,7 +390,6 @@ use super::*;
             sample.role = TrainingRecordRole::Live;
         }
     }
-
 
     #[test]
     fn missing_values_form_gaps_and_disconnected_capacity_is_bounded() {

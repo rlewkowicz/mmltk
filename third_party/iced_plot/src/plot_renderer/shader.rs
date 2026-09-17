@@ -2022,18 +2022,18 @@ mod reference_dependency_tests {
 
     fn project(plot: &PlotWidget) -> PlotState {
         let mut state = PlotState::default();
-        update_projection(plot, &mut state);
+        let _ = update_projection(plot, &mut state);
         state
     }
 
-    fn update_projection(plot: &PlotWidget, state: &mut PlotState) {
-        let _ = iced::widget::shader::Program::update(
+    fn update_projection(plot: &PlotWidget, state: &mut PlotState) -> Option<crate::PlotUiMessage> {
+        iced::widget::shader::Program::update(
             plot,
             state,
             &iced::Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now())),
             Rectangle::with_size(iced::Size::new(640.0, 360.0)),
             iced::mouse::Cursor::Unavailable,
-        );
+        ).and_then(|action| action.into_inner().0)
     }
 
     fn reference(state: &PlotState) -> ReferenceKey {
@@ -2128,15 +2128,17 @@ mod reference_dependency_tests {
     #[test]
     fn empty_remount_requests_every_projection_clear_then_reuses_it() {
         let (mut plot, id, vertical, horizontal) = populated_plot();
-        let populated = project(&plot);
+        let mut populated = PlotState::default();
+        let publication = update_projection(&plot, &mut populated)
+            .expect("initial projection publishes its camera and source");
+        plot.update(publication);
         let mut dependencies = BufferDependencies::new();
         dependencies.synchronized(&populated, reference(&populated));
         plot.set_series_positions(&id, &[]);
         plot.update(crate::PlotUiMessage::ToggleSeriesVisibility(vertical.id));
         plot.update(crate::PlotUiMessage::ToggleSeriesVisibility(horizontal.id));
         plot.picked_points.clear();
-        // Preserve the actual widget's saved view, as navigation does.
-        plot.camera_bounds = Some((populated.camera, populated.bounds));
+        // Remount through the settled view retained by the actual render message.
         let empty = project(&plot);
         assert_eq!(empty.camera, populated.camera);
         assert_eq!(empty.lines_version, populated.lines_version);
@@ -2162,10 +2164,10 @@ mod reference_dependency_tests {
         dependencies.synchronized(&state, reference(&state));
         vertical.label = Some("label only".into());
         plot.add_vline(vertical);
-        update_projection(&plot, &mut state);
+        let _ = update_projection(&plot, &mut state);
         assert_eq!(dependencies.changes(&state, reference(&state), false), BufferChanges::default());
         plot.set_series_positions(&id, &[[0.0, 0.0], [1.0, 0.5], [2.0, 1.0]]);
-        update_projection(&plot, &mut state);
+        let _ = update_projection(&plot, &mut state);
         let changes = dependencies.changes(&state, reference(&state), false);
         assert!(changes.markers && changes.lines && changes.fills);
         assert!(!changes.reference && !changes.highlight);
@@ -2269,7 +2271,7 @@ mod reference_dependency_tests {
                 state = replacement;
             } else {
                 // The same tree can change marker generation while a map is pending.
-                update_projection(&plot, &mut state);
+                let _ = update_projection(&plot, &mut state);
             }
             request(&plot, &mut state);
             renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);

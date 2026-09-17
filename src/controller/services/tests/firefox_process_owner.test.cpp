@@ -138,7 +138,6 @@ TEST_CASE("Firefox process custody settles through its retained PID") {
     CHECK(observations.terminal_count == 1U);
 }
 }  // namespace
-
 TEST_CASE("browser runtime exit mapping distinguishes requested termination from child failure") {
     using services::FirefoxProcessLifecycle;
     using services::FirefoxProcessTerminal;
@@ -148,25 +147,27 @@ TEST_CASE("browser runtime exit mapping distinguishes requested termination from
     CHECK(services::browser_runtime_exit_status(requested, true) == 0);
     CHECK(services::browser_runtime_exit_status(requested, false) == 128 + SIGTERM);
     CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM}, true) == 128 + SIGTERM);
-    CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGKILL,
-        .stop_requested = true, .kill_selected = true}, true) == 128 + SIGKILL);
+    CHECK(services::browser_runtime_exit_status(
+              {.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGKILL, .stop_requested = true, .kill_selected = true}, true) == 128 + SIGKILL);
     CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = ENOENT}, true) == ENOENT);
     CHECK(services::browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Exited, .status = 0}, false) == 1);
 }
-
 TEST_CASE("Firefox startup cause is retained separately from its mapped status") {
     REQUIRE(services::block_browser_runtime_signals());
     for (const bool refused_log : {false, true}) {
         mmltk::testsupport::ScopedTempDir root{"mmltk-firefox-startup-error"};
         const auto non_executable = root.path() / "firefox";
-        { std::ofstream file{non_executable}; file << "fixture without execute permission\n"; }
+        {
+            std::ofstream file{non_executable};
+            file << "fixture without execute permission\n";
+        }
         std::filesystem::permissions(non_executable, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
         FirefoxObservations observations;
-        services::FirefoxProcessOwner owner{
-            "/tmp/mmltk-test-import.sock",
-            {.executable = refused_log ? std::filesystem::path{MMLTK_BROWSER_RUNTIME_CHILD_FIXTURE} : non_executable,
-             .page_url = "normal-exit", .log_file = refused_log ? root.path() : std::filesystem::path{}},
-            observations.target()};
+        services::FirefoxProcessOwner owner{"/tmp/mmltk-test-import.sock",
+                                            {.executable = refused_log ? std::filesystem::path{MMLTK_BROWSER_RUNTIME_CHILD_FIXTURE} : non_executable,
+                                             .page_url = "normal-exit",
+                                             .log_file = refused_log ? root.path() : std::filesystem::path{}},
+                                            observations.target()};
         CHECK(owner.start() == services::FirefoxProcessStartResult::Terminal);
         owner.wait();
         const auto lifecycle = owner.lifecycle();

@@ -547,6 +547,10 @@ impl App {
         }
         if !self.model.has_upscale_pending()
             && self
+                .integration
+                .as_ref()
+                .is_none_or(|integration| !integration.hold_initial_upscale())
+            && self
                 .model
                 .explore
                 .snapshot

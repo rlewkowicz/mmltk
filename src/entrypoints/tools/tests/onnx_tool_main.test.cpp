@@ -97,4 +97,6 @@ TEST_CASE("test_onnx_tool_main_routes_one_model_after_logging_options", "[entryp
     test_onnx_tool_main_routes_one_model_after_logging_options();
 }
 TEST_CASE("test_onnx_tool_main_rejects_a_missing_model", "[entrypoints][tools][onnx]") { test_onnx_tool_main_rejects_a_missing_model(); }
-TEST_CASE("test_onnx_fatal_errors_remain_visible_with_diagnostics_off", "[entrypoints][tools][onnx]") { test_onnx_fatal_errors_remain_visible_with_diagnostics_off(); }
+TEST_CASE("test_onnx_fatal_errors_remain_visible_with_diagnostics_off", "[entrypoints][tools][onnx]") {
+    test_onnx_fatal_errors_remain_visible_with_diagnostics_off();
+}

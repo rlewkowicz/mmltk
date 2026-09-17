@@ -69,7 +69,10 @@ impl Component {
         self.model_card = Default::default();
         self.metrics.reset(visible);
     }
-    pub(crate) fn chart_view(&self, chart: crate::view::metrics::Chart) -> Option<crate::view::metrics::ChartView> {
+    pub(crate) fn chart_view(
+        &self,
+        chart: crate::view::metrics::Chart,
+    ) -> Option<crate::view::metrics::ChartView> {
         self.metrics.chart_view(chart)
     }
     pub fn sync_metrics(&mut self, model: &ApplicationModel, visible: bool) {
@@ -94,7 +97,9 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
-            Message::AspectSelected(aspect) => Outcome::SettingsEdited(crate::view::workspace::edit_aspect(model, aspect)?),
+            Message::AspectSelected(aspect) => {
+                Outcome::SettingsEdited(crate::view::workspace::edit_aspect(model, aspect)?)
+            }
             Message::StartRequested => Outcome::StartRequested,
             Message::TrainingStopRequested => Outcome::TrainingStopRequested,
             Message::QueryOffersRequested => Outcome::QueryOffersRequested,
@@ -216,15 +221,33 @@ impl Component {
             crate::view::workflow::Composition::new(crate::generated::FeatureId::Train, width)
                 .center_width()
                 - 2.0 * crate::view::workflow::CARD_PADDING;
-        let aspect = settings.draft.as_ref().map_or(crate::generated::WorkspaceAspectRatio::Widescreen, |draft| draft.ui.workspaceaspectratio);
+        let aspect = settings.draft.as_ref().map_or(
+            crate::generated::WorkspaceAspectRatio::Widescreen,
+            |draft| draft.ui.workspaceaspectratio,
+        );
         let active = progress::active(model);
-        let available_height = (body_height - self.metrics.controls_height() - 64.0 - if active { 220.0 } else { 0.0 }).max(1.0);
-        let (chart_width, chart_height) = crate::view::aspect_ratio::fit_extent(chart_width, available_height, aspect);
+        let available_height = (body_height
+            - self.metrics.controls_height()
+            - 64.0
+            - if active { 220.0 } else { 0.0 })
+        .max(1.0);
+        let (chart_width, chart_height) =
+            crate::view::aspect_ratio::fit_extent(chart_width, available_height, aspect);
         let mut center = column![
-            crate::view::aspect_ratio::selector(aspect, settings_edit_available, Message::AspectSelected),
-            self.metrics.view(chart_width, chart_height).map(Message::Metrics),
-        ].spacing(crate::view::workflow::SECTION_SPACING).align_x(iced::Center);
-        if active { center = center.push(progress::view(model)); }
+            crate::view::aspect_ratio::selector(
+                aspect,
+                settings_edit_available,
+                Message::AspectSelected
+            ),
+            self.metrics
+                .view(chart_width, chart_height)
+                .map(Message::Metrics),
+        ]
+        .spacing(crate::view::workflow::SECTION_SPACING)
+        .align_x(iced::Center);
+        if active {
+            center = center.push(progress::view(model));
+        }
         let workspace = center.into();
         let advanced = crate::view::shared::identified(
             "train.card.advanced",
@@ -297,7 +320,8 @@ impl Component {
             workspace,
             advanced,
             column![
-                output::view(model, settings, self.metrics.omitted_summaries()).map(Message::Output),
+                output::view(model, settings, self.metrics.omitted_summaries())
+                    .map(Message::Output),
                 diagnostics
             ]
             .spacing(crate::view::workflow::SECTION_SPACING)

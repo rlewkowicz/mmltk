@@ -164,14 +164,23 @@ pub fn view<'a>(
     if let Some(record) = record {
         if let Some(test) = &record.progress.test {
             if test.bbox.available {
-                content = content.push(text(format!("Final test · Box AP50 {:.3} · AP50:95 {:.3}", test.bbox.ap50, test.bbox.ap)));
+                content = content.push(text(format!(
+                    "Final test · Box AP50 {:.3} · AP50:95 {:.3}",
+                    test.bbox.ap50, test.bbox.ap
+                )));
             }
             if let Some(mask) = test.mask.as_ref().filter(|m| m.available) {
-                content = content.push(text(format!("Final test · Mask AP50 {:.3} · AP50:95 {:.3}", mask.ap50, mask.ap)));
+                content = content.push(text(format!(
+                    "Final test · Mask AP50 {:.3} · AP50:95 {:.3}",
+                    mask.ap50, mask.ap
+                )));
             }
         }
         if record.droppedbefore > 0 {
-            content = content.push(text(format!("History incomplete: {} records dropped", record.droppedbefore)));
+            content = content.push(text(format!(
+                "History incomplete: {} records dropped",
+                record.droppedbefore
+            )));
         }
         for (label, path) in [
             ("Full checkpoint", &record.progress.fullcheckpointpath),
@@ -185,7 +194,8 @@ pub fn view<'a>(
     if let Some(snapshot) = &model.workflow.training {
         if !snapshot.outputdirectory.is_empty() {
             content = content.push(text(format!(
-                "Active output directory: {}", snapshot.outputdirectory
+                "Active output directory: {}",
+                snapshot.outputdirectory
             )));
         }
         if snapshot.persistence.degraded {

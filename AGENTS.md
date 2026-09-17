@@ -62,18 +62,7 @@ preceding changes are committed, spawn exactly one fresh astra max subagent to
 update the complete documentation set against the current codebase.
 It verifies commands, paths, formats, behavior, ownership, and cross-links from
 authoritative source and tooling, edits documentation only, and reports the
-result. It creates and maintains `docs/api/README.md` as the public API reference
-index and documents every first-party public API introduced, changed, or used
-by the completed action plan. Group the reference by cohesive API families,
-with class/function overviews, exact public signatures, parameters and defaults,
-units and valid domains, returns, failure behavior, ownership and lifetime,
-threading/cancellation requirements, and small source-verified usage examples
-where applicable. Provide navigable links between related APIs, their declaring
-headers or modules, and the relevant architecture and workflow guides. Aim for
-the clarity and completeness of OpenCV's API reference; exclude private
-implementation inventories and unsupported behavior. Reconstruct the API set
-from the plan's preserved phase evidence and current public declarations, not
-only the remaining plan text.
+result.
 The main agent reviews the documentation diff for accuracy, scope, and
 organization, then commits it. This documentation pass does not reopen
 implementation review, cleanup, builds, tests, or acceptance.

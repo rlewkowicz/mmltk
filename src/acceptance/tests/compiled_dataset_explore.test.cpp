@@ -1235,8 +1235,8 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
     prefetch_lane.Release();
     const bool third_lane_entered = stale_lane.WaitEntered(std::chrono::seconds{2});
     INFO("third lane entered=" << third_lane_entered << " failure=" << audit.failure_detail() << " started=" << reads.started.load()
-                              << " prefetched=" << audit.prefetched_indices() << " tiles=" << audit.last_tile_cumulative()
-                              << " busy=" << system.snapshot().busy << " generation=" << system.snapshot().gallery.generation);
+                               << " prefetched=" << audit.prefetched_indices() << " tiles=" << audit.last_tile_cumulative()
+                               << " busy=" << system.snapshot().busy << " generation=" << system.snapshot().gallery.generation);
     REQUIRE(third_lane_entered);
     REQUIRE(audit.Wait(
         [&] { return (reads.started.load(std::memory_order_acquire) & 4U) != 0U && system.snapshot().gallery.slots == std::vector<bool>{true, true, false}; }));

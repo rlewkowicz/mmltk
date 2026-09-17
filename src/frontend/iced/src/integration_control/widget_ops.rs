@@ -407,34 +407,59 @@ pub(super) fn click_number_edge(_bounds: Rectangle, _upper: bool) -> bool {
 pub(super) fn chart_input(bounds: Option<Rectangle>, pan: bool) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        let Some(mut output) = scenario_output() else { return false; };
+        let Some(mut output) = scenario_output() else {
+            return false;
+        };
         output.receipt = None;
         let completed = wasm_bindgen::closure::Closure::once_into_js(move |outcome: String| {
             output.send(Message::ChartInputDelivered(outcome == "observed"));
         });
         if let Some(bounds) = bounds {
-            crate::integration_control::chart_input_js(bounds.x as f64, bounds.y as f64,
-                bounds.width as f64, bounds.height as f64, pan, &completed) == 1
+            crate::integration_control::chart_input_js(
+                bounds.x as f64,
+                bounds.y as f64,
+                bounds.width as f64,
+                bounds.height as f64,
+                pan,
+                &completed,
+            ) == 1
         } else {
             crate::integration_control::chart_settled_js(&completed);
             true
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    { let _ = (bounds, pan); false }
+    {
+        let _ = (bounds, pan);
+        false
+    }
 }
 
 /// Exercise the enclosing page's wheel route without changing chart controls.
 pub(super) fn chart_wheel(bounds: Rectangle, index: u8, scale: f32) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        let x = bounds.x + match index % 3 { 0 => bounds.width * 0.7, 1 => 10.0 * scale, _ => 100.0 * scale };
+        let x = bounds.x
+            + match index % 3 {
+                0 => bounds.width * 0.7,
+                1 => 10.0 * scale,
+                _ => 100.0 * scale,
+            };
         let y = bounds.y + 42.0 * scale;
         let pixels = index < 3;
-        wheel_js(x as f64, y as f64, if pixels { 8.0 } else { 0.25 }, index % 2 == 1, pixels) == 1
+        wheel_js(
+            x as f64,
+            y as f64,
+            if pixels { 8.0 } else { 0.25 },
+            index % 2 == 1,
+            pixels,
+        ) == 1
     }
     #[cfg(not(target_arch = "wasm32"))]
-    { let _ = (bounds, index, scale); false }
+    {
+        let _ = (bounds, index, scale);
+        false
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -442,7 +467,9 @@ pub(super) fn wheel_number_input(bounds: Rectangle) -> bool {
     wheel_js(
         f64::from(bounds.x + bounds.width * 0.5),
         f64::from(bounds.y + bounds.height * 0.5),
-        -96.0, false, true,
+        -96.0,
+        false,
+        true,
     ) == 1
 }
 
