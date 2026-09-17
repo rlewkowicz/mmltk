@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/common/io/file_digest.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
@@ -36,7 +37,7 @@ inline fs::path cached_model_assets_root() {
     return fs::temp_directory_path() / "mmltk" / "tests" / "rfdetr";
 }
 inline const PresetCatalogEntry& require_model_preset(std::string_view preset_name) {
-    const auto* preset = find_model_preset(preset_name);
+    const auto* preset = find_preset_catalog_entry(preset_name);
     if (preset == nullptr) { throw std::runtime_error("unknown RF-DETR test preset: " + std::string(preset_name)); }
     return *preset;
 }

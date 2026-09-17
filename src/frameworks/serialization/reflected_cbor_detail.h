@@ -1452,10 +1452,7 @@ void require_projected_members(wire::Reader& reader, const Seen& seen, std::opti
     visit_members<T>([&]<class Declaration>(const auto& fact) {
         using Member = typename Declaration::member_type;
         if (!failure && !kIsOptional<Member> && std::ranges::find(seen, fact.member_name) == seen.end()) {
-            auto error = reader.contextualize(decode_error(wire::ErrorCode::UnknownKey));
-            if (!error.path.empty()) { error.path.push_back('.'); }
-            error.path.append(fact.member_name);
-            failure = std::move(error);
+            failure = contextual_key_error(reader, wire::ErrorCode::UnknownKey, fact.member_name);
         }
     });
 }
@@ -1522,10 +1519,7 @@ template <class Sequence>
     auto key = reader.read_object_key(depth);
     if (!key) return std::unexpected(key.error());
     if (*key == expected) return {};
-    auto error = reader.contextualize(decode_error(wire::ErrorCode::TypeMismatch));
-    if (!error.path.empty()) error.path.push_back('.');
-    error.path.append(expected);
-    return std::unexpected(std::move(error));
+    return std::unexpected(contextual_key_error(reader, wire::ErrorCode::TypeMismatch, expected));
 }
 template <class Variant>
 [[nodiscard]] std::expected<Variant, wire::DecodeError> decode_projected_variant(wire::Reader& reader, const std::size_t depth) {

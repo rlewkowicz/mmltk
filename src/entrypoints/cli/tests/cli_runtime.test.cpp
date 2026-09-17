@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <inplace_vector>
 #include <limits>
 #include <meta>
 #include <new>
@@ -15,6 +16,7 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+#include <utility>
 #include <catch2/catch_test_macros.hpp>
 #include "mmltk/frameworks/reflection/materializer.h"
 #include "src/frameworks/reflection/field_policy.h"
@@ -45,17 +47,6 @@ thread_local std::size_t g_cli_allocation_count = 0U;
 namespace {
 using namespace mmltk::testsupport;
 namespace fs = std::filesystem;
-fs::path make_temp_dir(const char* label) {
-    const fs::path dir = fs::temp_directory_path() / (std::string(label) + "-" + std::to_string(static_cast<long long>(::getpid())));
-    std::error_code error;
-    fs::create_directories(dir, error);
-    REQUIRE((!error));
-    return dir;
-}
-void cleanup_temp_dir(const fs::path& dir) {
-    std::error_code error;
-    fs::remove_all(dir, error);
-}
 std::vector<std::string> read_text_lines(const fs::path& path) {
     std::ifstream stream(path);
     REQUIRE((stream.is_open()));
@@ -359,6 +350,45 @@ void test_reflected_cli_policy_boundaries_and_diagnostics() {
         CAPTURE(test.name);
         CHECK(!mmltk::frameworks::reflection::validate_reflected_fields(direct).has_value() == test.accepted);
     }
+    ParserRequest full{};
+    full.values = {1, 2};
+    const auto before = full;
+    const auto& repeatable = kParserOptions[6U];
+    const auto invalid_full = repeatable.assign(full, "invalid", false, repeatable.constraint);
+    REQUIRE_FALSE(invalid_full);
+    CHECK(invalid_full.error().code == mmltk::frameworks::reflection::ParseErrorCode::InvalidInteger);
+    CHECK(std::string_view(invalid_full.error().what()) == "invalid integer");
+    CHECK(full == before);
+    const auto overflow_full = repeatable.assign(full, "3", false, repeatable.constraint);
+    REQUIRE_FALSE(overflow_full);
+    CHECK(std::string_view(overflow_full.error().what()) == "too many option values");
+    CHECK(full == before);
+    struct FixedRequest {
+        std::inplace_vector<int, 1U> values{1};
+    } fixed;
+    namespace reflection = mmltk::frameworks::reflection;
+    reflection::FieldConstraint fixed_policy{.has_minimum = true, .minimum = 0.0L, .maximum_items = 1U};
+    for (const auto& [text, message] : std::array{
+             std::pair{"invalid", "invalid integer"},
+             std::pair{"-1", "value violates field policy"},
+             std::pair{"2", "too many option values"},
+         }) {
+        const auto result = reflection::assign_accessed<FixedRequest, &FixedRequest::values>(fixed, text, false, fixed_policy);
+        REQUIRE_FALSE(result);
+        CHECK(std::string_view(result.error().what()) == message);
+        CHECK(fixed.values.size() == 1U);
+        CHECK(fixed.values.front() == 1);
+    }
+    fixed_policy.maximum_items = 0U;
+    const auto capacity = reflection::assign_accessed<FixedRequest, &FixedRequest::values>(fixed, "2", false, fixed_policy);
+    REQUIRE_FALSE(capacity);
+    CHECK(std::string_view(capacity.error().what()) == "option capacity exceeded");
+    CHECK(fixed.values.size() == 1U);
+    CHECK(fixed.values.front() == 1);
+    full.optional_path = "/tmp/existing";
+    const auto& optional = kParserOptions[5U];
+    REQUIRE(optional.assign(full, "", false, optional.constraint));
+    CHECK_FALSE(full.optional_path.has_value());
     const auto unknown = parse_parser_request(std::array<std::string_view, 2U>{"--unknown", "1"});
     REQUIRE((!unknown && unknown.error().code == mmltk::frameworks::reflection::ParseErrorCode::UnknownOption));
     const auto duplicate = parse_parser_request(std::array<std::string_view, 5U>{"--count", "1", "--count", "2", "3"});
@@ -511,7 +541,8 @@ void test_rfdetr_info_forwards_explicit_logging_options() {
     }
 }
 void test_log_file_flag_creates_requested_log_file() {
-    const fs::path temp_dir = make_temp_dir("mmltk-log-file-flag");
+    const ScopedTempDir directory{"mmltk-log-file-flag"};
+    const fs::path& temp_dir = directory.path();
     const fs::path log_path = temp_dir / "explicit.log";
     const SubprocessResult result = run_subprocess_capture_output({
         mmltk_cli_path(),
@@ -536,10 +567,10 @@ void test_log_file_flag_creates_requested_log_file() {
         REQUIRE((disabled.stderr_text.empty()));
         REQUIRE((!fs::exists(log_path)));
     }
-    cleanup_temp_dir(temp_dir);
 }
 void test_log_dir_flag_creates_default_log_file() {
-    const fs::path temp_dir = make_temp_dir("mmltk-log-dir-flag");
+    const ScopedTempDir directory{"mmltk-log-dir-flag"};
+    const fs::path& temp_dir = directory.path();
     const SubprocessResult result = run_subprocess_capture_output({
         mmltk_cli_path(),
         "--log-dir",
@@ -548,10 +579,10 @@ void test_log_dir_flag_creates_default_log_file() {
     });
     REQUIRE((result.exit_code == 0));
     REQUIRE((fs::exists(temp_dir / "mmltk.log")));
-    cleanup_temp_dir(temp_dir);
 }
 void test_env_log_file_creates_requested_log_file() {
-    const fs::path temp_dir = make_temp_dir("mmltk-log-file-env");
+    const ScopedTempDir directory{"mmltk-log-file-env"};
+    const fs::path& temp_dir = directory.path();
     const fs::path log_path = temp_dir / "env.log";
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
@@ -571,10 +602,10 @@ void test_env_log_file_creates_requested_log_file() {
         REQUIRE((overridden.exit_code == 0));
         REQUIRE((fs::exists(log_path) == override_off));
     }
-    cleanup_temp_dir(temp_dir);
 }
 void test_env_log_dir_creates_default_log_file() {
-    const fs::path temp_dir = make_temp_dir("mmltk-log-dir-env");
+    const ScopedTempDir directory{"mmltk-log-dir-env"};
+    const fs::path& temp_dir = directory.path();
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
         "MMLTK_LOG_DIR=" + temp_dir.string(),
@@ -583,7 +614,6 @@ void test_env_log_dir_creates_default_log_file() {
     });
     REQUIRE((result.exit_code == 0));
     REQUIRE((fs::exists(temp_dir / "mmltk.log")));
-    cleanup_temp_dir(temp_dir);
 }
 void test_invalid_log_level_flag_reports_error_on_stderr() {
     const SubprocessResult result = run_subprocess_capture_output({
@@ -644,7 +674,8 @@ std::vector<std::string> capture_wrapper_logging_arguments(const fs::path& temp_
     return read_text_lines(state_dir / "exec_1_args.txt");
 }
 void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
-    const fs::path temp_dir = make_temp_dir("mmltk-wrapper-log-env");
+    const ScopedTempDir directory{"mmltk-wrapper-log-env"};
+    const fs::path& temp_dir = directory.path();
     const fs::path state_dir = temp_dir / "state";
     const fs::path log_path = temp_dir / "wrapper.log";
     const fs::path log_dir = temp_dir / "logs";
@@ -670,10 +701,10 @@ void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
             assert_contains_line(arguments, "MMLTK_LOG_LEVEL=" + level);
         }
     }
-    cleanup_temp_dir(temp_dir);
 }
 void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
-    const fs::path temp_dir = make_temp_dir("mmltk-wrapper-log-cli");
+    const ScopedTempDir directory{"mmltk-wrapper-log-cli"};
+    const fs::path& temp_dir = directory.path();
     const fs::path state_dir = temp_dir / "state";
     const fs::path log_path = temp_dir / "explicit.log";
     const fs::path log_dir = temp_dir / "logdir";
@@ -723,10 +754,10 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
             REQUIRE((std::equal(logging_case.arguments.rbegin(), logging_case.arguments.rend(), arguments.rbegin())));
         }
     }
-    cleanup_temp_dir(temp_dir);
 }
 void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
-    const fs::path temp_dir = make_temp_dir("mmltk-wrapper-gui-tmpfs");
+    const ScopedTempDir directory{"mmltk-wrapper-gui-tmpfs"};
+    const fs::path& temp_dir = directory.path();
     const fs::path state_dir = temp_dir / "state";
     const fs::path runtime_dir = temp_dir / "runtime";
     const fs::path wayland_socket_path = runtime_dir / "wayland-0";
@@ -760,7 +791,6 @@ void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
     assert_contains_line(run_args, expected_tmpfs);
     assert_contains_substring(run_args, "com.mmltk.runtime=");
     assert_contains_substring(run_args, "tmpfs=" + expected_tmpfs);
-    cleanup_temp_dir(temp_dir);
 }
 }  // namespace
 TEST_CASE("test_subprocess_capture_keeps_stdout_and_stderr_separate", "[core][cli][subprocess]") { test_subprocess_capture_keeps_stdout_and_stderr_separate(); }

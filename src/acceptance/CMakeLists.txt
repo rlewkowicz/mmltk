@@ -111,6 +111,7 @@ target_compile_definitions(mmltk_acceptance PRIVATE
 target_link_libraries(mmltk_acceptance PRIVATE
     mmltk_test_support
     mmltk::common::logging
+    mmltk::common::system
 )
 if(BUILD_RFDETR_NATIVE)
     mmltk_register_retained_module_importers(

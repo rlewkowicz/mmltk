@@ -864,8 +864,9 @@ TEST_CASE("benchmark destination preparation preserves parent and obstruction be
     for (const auto& path : paths) {
         write_json_atomically(path, {{"value", 19U}}, {});
         CHECK(read_json_file(path).at("value") == 19U);
-        auto lease = ArtifactLease::acquire(path.string() + ".lock", {});
-        lease.release();
+        {
+            auto lease = ArtifactLease::acquire(path.string() + ".lock", {});
+        }
         fs::remove(path.string() + ".lock");
         fs::path staged;
         {

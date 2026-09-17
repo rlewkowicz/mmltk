@@ -51,13 +51,12 @@ TEST_CASE("RF-DETR preset projection preserves every architecture field", "[back
     REQUIRE(kRfdetrContract.model_id == std::string_view{"rfdetr"});
     REQUIRE(kRfdetrContract.presets.size() == 10U);
     REQUIRE(model_presets().size() == kRfdetrContract.presets.size());
-    const auto* source = find_preset_catalog_entry("rf-detr-seg-medium");
-    const auto* preset = find_model_preset("rf-detr-seg-medium");
-    REQUIRE(source != nullptr);
+    const auto* preset = find_preset_catalog_entry("rf-detr-seg-medium");
     REQUIRE(preset != nullptr);
-    REQUIRE(preset->preset_name == source->preset_name);
-    REQUIRE(preset->encoder == source->encoder);
-    REQUIRE(preset->canonical_weight_filename == source->canonical_weight_filename);
+    REQUIRE(preset == &kPresetCatalog[6U]);
+    REQUIRE(preset->preset_name == "rf-detr-seg-medium");
+    REQUIRE(preset->encoder == "dinov2_windowed_small");
+    REQUIRE(preset->canonical_weight_filename == "rf-detr-seg-medium.pt");
     REQUIRE(preset->resolution == 432);
     REQUIRE(preset->patch_size == 12);
     REQUIRE(preset->window_count == 2);
@@ -82,7 +81,7 @@ TEST_CASE("RF-DETR preset projection preserves every architecture field", "[back
     REQUIRE(large->window_count == 2);
     REQUIRE(large->positional_encoding_size == 44);
     REQUIRE(large->task == ModelTask::Detection);
-    const auto* seg_nano = find_model_preset("rf-detr-seg-nano");
+    const auto* seg_nano = find_preset_catalog_entry("rf-detr-seg-nano");
     REQUIRE(seg_nano != nullptr);
     REQUIRE(seg_nano->patch_size == 12);
     REQUIRE(seg_nano->window_count == 1);
@@ -96,10 +95,13 @@ TEST_CASE("RF-DETR preset lookup rejects retired ambiguous and unknown names", "
     const auto* legacy = infer_model_preset_from_path(std::filesystem::path{"/tmp/engines/output-seg-med/1train/checkpoint.pt"});
     REQUIRE(legacy != nullptr);
     REQUIRE(legacy->preset_name == std::string_view{"rf-detr-seg-medium"});
-    for (const auto* preset_name : kRetiredPresetNames) REQUIRE(find_model_preset(preset_name) == nullptr);
+    for (const auto* preset_name : kRetiredPresetNames) REQUIRE(find_preset_catalog_entry(preset_name) == nullptr);
     for (const auto* filename : kRetiredWeightFilenames) REQUIRE(find_model_preset_by_weight_filename(filename) == nullptr);
     REQUIRE(find_model_preset_by_weight_filename("checkpoint_best_regular.pth") == nullptr);
-    REQUIRE(find_model_preset("unknown-preset") == nullptr);
+    REQUIRE(find_preset_catalog_entry("unknown-preset") == nullptr);
+    REQUIRE(find_preset_catalog_entry("") == nullptr);
+    REQUIRE(find_preset_catalog_entry("RF-DETR-NANO") == nullptr);
+    for (const auto& entry : kPresetCatalog) REQUIRE(find_preset_catalog_entry(entry.preset_name) == &entry);
     REQUIRE(find_model_preset_by_weight_filename("unknown-file.pth") == nullptr);
     REQUIRE(infer_model_preset_from_path(std::filesystem::path{"/tmp/unrelated.bin"}) == nullptr);
 }

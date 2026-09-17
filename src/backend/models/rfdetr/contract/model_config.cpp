@@ -55,12 +55,6 @@ void consider_known_aliases(const PresetCatalogEntry& preset, const std::string_
 }
 }  // namespace
 std::span<const PresetCatalogEntry> model_presets() noexcept { return kPresetCatalog; }
-const PresetCatalogEntry* find_model_preset(const std::string_view preset_name) noexcept {
-    for (const auto& preset : kPresetCatalog) {
-        if (preset.preset_name == preset_name) return &preset;
-    }
-    return nullptr;
-}
 const PresetCatalogEntry* find_model_preset_by_weight_filename(const std::string_view filename) noexcept {
     const PresetCatalogEntry* match = nullptr;
     for (const auto& preset : kPresetCatalog) {

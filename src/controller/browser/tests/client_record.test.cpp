@@ -335,10 +335,7 @@ TEST_CASE("Rust Protocol-17 client fixtures are accepted by native codec", "[con
     for (std::size_t alternative = 0U; alternative != annotation_alternatives; ++alternative) {
         const std::string name = "Intent:annotation.Edit." + std::to_string(alternative);
         const auto& fixture = fixture_named(fixtures, name);
-        const auto record = decode_client_record(wire::ByteSegments{.first = fixture.bytes, .second = {}});
-        REQUIRE(record);
-        REQUIRE(std::holds_alternative<Intent>(*record));
-        const auto& edit = std::get<Intent>(*record);
+        const auto edit = decode_intent_fixture(fixture);
         CHECK(edit.correlation == 100U + alternative);
         CHECK(edit.endpoint_id == application_stable_id("annotation", "Edit"));
         const auto edit_reply = dispatch_intent(systems, edit);

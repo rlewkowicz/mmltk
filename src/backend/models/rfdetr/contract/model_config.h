@@ -91,7 +91,6 @@ struct NativeRfDetrConfig {
     return true;
 }
 [[nodiscard]] std::span<const PresetCatalogEntry> model_presets() noexcept;
-[[nodiscard]] const PresetCatalogEntry* find_model_preset(std::string_view preset_name) noexcept;
 [[nodiscard]] const PresetCatalogEntry* find_model_preset_by_weight_filename(std::string_view filename) noexcept;
 [[nodiscard]] const PresetCatalogEntry* infer_model_preset_from_path(const std::filesystem::path& path);
 [[nodiscard]] NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset);

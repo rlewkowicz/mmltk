@@ -249,10 +249,10 @@ ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path
     const auto canonical = canonical_path(weights_path);
     auto state = decode_model_state(canonical, std::move(admission), class_layout_path, stop);
     const PresetCatalogEntry* preset = nullptr;
-    if (!state.metadata.preset_name.empty()) { preset = find_model_preset(state.metadata.preset_name); }
+    if (!state.metadata.preset_name.empty()) { preset = find_preset_catalog_entry(state.metadata.preset_name); }
     if (preset == nullptr) { preset = find_model_preset_by_weight_filename(canonical.filename().string()); }
     if (preset == nullptr) { preset = infer_model_preset_from_path(canonical); }
-    if (preset == nullptr && !preset_name.empty()) { preset = find_model_preset(preset_name); }
+    if (preset == nullptr && !preset_name.empty()) { preset = find_preset_catalog_entry(preset_name); }
     if (preset == nullptr) { throw std::runtime_error("unable to resolve RF-DETR weights preset"); }
     ResolvedModelArtifacts result;
     result.input_kind = state.metadata.source_kind == "upstream-python" ? "upstream-python" : "native-pt";
@@ -269,7 +269,7 @@ ResolvedModelState resolve_model_state(const std::filesystem::path& weights_path
     result.source_num_select = state.metadata.num_select > 0 ? static_cast<int>(state.metadata.num_select) : result.config.num_select;
     result.automatic_num_queries_cap = result.config.num_queries;
     if (!preset_name.empty() && result.config.preset_name != preset_name) {
-        const auto* declared = find_model_preset(preset_name);
+        const auto* declared = find_preset_catalog_entry(preset_name);
         if (declared == nullptr) { throw std::runtime_error("unknown RF-DETR preset override: " + std::string(preset_name)); }
         const auto classes = result.config.num_classes;
         result.config = native_config_from_preset(*declared);

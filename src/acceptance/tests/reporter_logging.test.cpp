@@ -21,6 +21,7 @@
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 #include "src/common/io/scoped_fd.h"
+#include "src/common/system/runtime_paths.h"
 #include "src/test_support/linux_process_test_utils.hpp"
 #include "src/test_support/subprocess_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -39,16 +40,9 @@ class FixedFormatter final : public spdlog::formatter {
    private:
     std::string text_;
 };
-std::string current_test_binary_path() {
-    std::array<char, 4096> buffer{};
-    const ssize_t bytes_read = ::readlink("/proc/self/exe", buffer.data(), buffer.size() - 1U);
-    if (bytes_read <= 0) { throw std::runtime_error("failed to resolve current test binary path"); }
-    buffer[static_cast<std::size_t>(bytes_read)] = '\0';
-    return {buffer.data()};
-}
 SubprocessResult run_reporter_fixture(const std::string& reporter_name) {
     return run_subprocess_capture_output({
-        current_test_binary_path(),
+        mmltk::common::system::runtime_paths::current_executable_path().string(),
         "vendored_catch2_reporter_fixture",
         "--reporter",
         reporter_name,
@@ -154,7 +148,7 @@ TEST_CASE("fatal reporting is bounded visible and independent of diagnostic sink
         if (mode == "init-failure") std::filesystem::create_directory(log);
         const bool enabled = mode == "enabled" || mode == "disabled-after-init" || mode == "sink-failure" || mode == "init-failure";
         const auto result = run_subprocess_capture_output({"env", "-u", "MMLTK_LOG_DIR", "MMLTK_FATAL_FIXTURE=" + mode, "MMLTK_LOG_LEVEL=off",
-                                                           "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(), current_test_binary_path(),
+                                                           "MMLTK_LOG_FILE=", "MMLTK_FATAL_LOG=" + log.string(), mmltk::common::system::runtime_paths::current_executable_path().string(),
                                                            "fatal_reporting_fixture", "--reporter", "compact", "--colour-mode", "none"});
         INFO(result.output_text);
         REQUIRE(result.exit_code == 0);

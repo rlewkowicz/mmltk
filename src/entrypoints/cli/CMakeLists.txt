@@ -53,6 +53,7 @@ mmltk_register_public_headers(mmltk_entrypoints_cli_test_support
     FILES tests/support/cli_path.h)
 target_compile_definitions(mmltk_entrypoints_cli_test_support PRIVATE
     MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_entrypoints_cli>")
+target_link_libraries(mmltk_entrypoints_cli_test_support PRIVATE mmltk::common::system)
 add_dependencies(mmltk_entrypoints_cli_test_support mmltk_entrypoints_cli)
 mmltk_register_header_isolation(mmltk_entrypoints_cli_test_support)
 

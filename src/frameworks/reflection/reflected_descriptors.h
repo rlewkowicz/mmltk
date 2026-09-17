@@ -225,31 +225,29 @@ template <class Request, auto Access>
         if (!parsed) return std::unexpected(std::move(parsed.error()));
         access<Request, Access>(request) = negated ? !*parsed : *parsed;
         return {};
-    } else if constexpr (OptionalValue<Value>::value) {
-        auto parsed = parse_scalar<Value>(text);
-        if (!parsed) return std::unexpected(std::move(parsed.error()));
-        if (auto valid = validate_scalar(*parsed, constraint, text); !valid) { return std::unexpected(std::move(valid.error())); }
-        access<Request, Access>(request) = std::move(*parsed);
-        return {};
-    } else if constexpr (kRepeatableValue<Value>) {
-        using Item = sequence_value_t<Value>;
-        auto parsed = parse_scalar<Item>(text);
+    } else {
+        using Parsed = typename decltype([] {
+            if constexpr (kRepeatableValue<Value>) {
+                return std::type_identity<sequence_value_t<Value>>{};
+            } else {
+                return std::type_identity<Value>{};
+            }
+        }())::type;
+        auto parsed = parse_scalar<Parsed>(text);
         if (!parsed) return std::unexpected(std::move(parsed.error()));
         if (auto valid = validate_scalar(*parsed, constraint, text); !valid) return std::unexpected(std::move(valid.error()));
         auto& destination = access<Request, Access>(request);
-        if (constraint.maximum_items != 0U && destination.size() >= constraint.maximum_items) {
-            return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "too many option values"});
+        if constexpr (kRepeatableValue<Value>) {
+            if (constraint.maximum_items != 0U && destination.size() >= constraint.maximum_items) {
+                return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "too many option values"});
+            }
+            if constexpr (requires { destination.full(); }) {
+                if (destination.full()) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "option capacity exceeded"}); }
+            }
+            destination.push_back(std::move(*parsed));
+        } else {
+            destination = std::move(*parsed);
         }
-        if constexpr (requires { destination.full(); }) {
-            if (destination.full()) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "option capacity exceeded"}); }
-        }
-        destination.push_back(std::move(*parsed));
-        return {};
-    } else {
-        auto parsed = parse_scalar<Value>(text);
-        if (!parsed) return std::unexpected(std::move(parsed.error()));
-        if (auto valid = validate_scalar(*parsed, constraint, text); !valid) return std::unexpected(std::move(valid.error()));
-        access<Request, Access>(request) = std::move(*parsed);
         return {};
     }
 }

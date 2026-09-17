@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include <torch/utils.h>
 #include <filesystem>
 #include "src/backend/models/rfdetr/contract/model_config.h"
@@ -23,7 +24,7 @@ namespace fs = std::filesystem;
 namespace model_detail = mmltk::backend::models::rfdetr::detail;
 // CLEANUP-IGNORE: This checkpoint test names the exact RF-DETR types used by its independent parity oracles.
 namespace {
-using mmltk::backend::models::rfdetr::find_model_preset;
+using mmltk::backend::models::rfdetr::find_preset_catalog_entry;
 // CLEANUP-IGNORE: This parity test names the concrete checkpoint types used by its standalone fixtures.
 using mmltk::backend::models::rfdetr::ModelOutputs;
 using mmltk::backend::models::rfdetr::ModelStateLoadSummary;
@@ -38,7 +39,7 @@ using mmltk::backend::models::rfdetr::testsupport::make_fixture_image;
 using mmltk::backend::models::rfdetr::testsupport::parity_fixture_cases;
 using mmltk::backend::models::rfdetr::testsupport::ParityFixtureCase;
 NativeRfDetrConfig config_for_fixture(const ParityFixtureCase& fixture) {
-    const auto* preset = find_model_preset(fixture.preset_name);
+    const auto* preset = find_preset_catalog_entry(fixture.preset_name);
     if (preset == nullptr) { throw std::runtime_error(std::string("missing model preset for parity fixture: ") + fixture.preset_name); }
     return native_config_from_preset(*preset);
 }

@@ -1,4 +1,5 @@
 #include <array>
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include <cmath>
 #include <cstddef>
 #include <limits>
@@ -106,14 +107,14 @@ void test_request_and_model_boundaries_reject_unsupported_feature_combinations()
     request.training_supervision.denoising.enabled = true;
     request.compilation_mode = CompilationMode::kFullTrace;
     CHECK_THROWS(validate_train_request(request));
-    NativeRfDetrConfig model = native_config_from_preset(*find_model_preset("rf-detr-nano"));
+    NativeRfDetrConfig model = native_config_from_preset(*find_preset_catalog_entry("rf-detr-nano"));
     model.training_supervision.assignment = TrainAssignmentKind::MatchFree;
     CHECK(training_supervision_model_config_valid(model));
     model.set_cost_class = 0.0;
     model.set_cost_bbox = 0.0;
     model.set_cost_giou = 0.0;
     CHECK_FALSE(training_supervision_model_config_valid(model));
-    model = native_config_from_preset(*find_model_preset("rf-detr-nano"));
+    model = native_config_from_preset(*find_preset_catalog_entry("rf-detr-nano"));
     model.training_supervision.denoising.enabled = true;
     model.cls_loss_coef = 0.0;
     model.bbox_loss_coef = 0.0;

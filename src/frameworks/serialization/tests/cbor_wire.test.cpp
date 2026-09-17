@@ -193,6 +193,34 @@ MMLTK_REFLECT_FIELDS(InheritedCborBase)
 MMLTK_REFLECT_FIELDS(InheritedCbor)
 MMLTK_REFLECT_FIELDS(DuplicateCborBase)
 MMLTK_REFLECT_FIELDS(DuplicateCbor)
+struct ProjectedKeyEnvelope {
+    InheritedCbor nested;
+    std::variant<InheritedCbor> choice;
+    [[= mmltk::frameworks::reflection::MaxBytes{8U}]][[= mmltk::frameworks::reflection::MaxItems{8U}]] wire::FlatValue payload;
+};
+MMLTK_REFLECT_FIELDS(ProjectedKeyEnvelope)
+TEST_CASE("projected CBOR reports nested required members and expected variant keys", "[frameworks][serialization][reflection]") {
+    namespace cbor = mmltk::frameworks::serialization;
+    const auto decode_object = [](wire::Value::Object object) {
+        wire::ByteBuffer encoded;
+        REQUIRE(wire::encode(wire::Value(std::move(object)), encoded, test_limits(256U)));
+        return cbor::decode<ProjectedKeyEnvelope>({encoded, {}}, test_limits(256U));
+    };
+    const auto missing = decode_object({{"nested", wire::Value(wire::Value::Object{})}});
+    require_decode_error(missing, wire::ErrorCode::UnknownKey);
+    CHECK(missing.error().path == "nested.inherited_limit");
+    CHECK(missing.error().offset == 0U);
+    const auto variant = cbor::reflected_value(std::variant<InheritedCbor>{InheritedCbor{}});
+    REQUIRE(variant);
+    for (const std::size_t key_index : {0U, 1U}) {
+        auto fields = std::get<wire::Value::Object>(variant->storage);
+        fields[key_index].first = "wrong";
+        const auto wrong = decode_object({{"choice", wire::Value(std::move(fields))}});
+        require_decode_error(wrong, wire::ErrorCode::TypeMismatch);
+        CHECK(wrong.error().path == (key_index == 0U ? "choice.kind" : "choice.payload"));
+        CHECK(wrong.error().offset == 0U);
+    }
+}
 TEST_CASE("reflected CBOR flattens inherited members base first and enforces the complete object contract",
           "[frameworks][serialization][reflection][inheritance]") {
     InheritedCbor source;
@@ -484,6 +512,20 @@ TEST_CASE("opaque relation storage remains sealed while every reflected CBOR fac
         REQUIRE_FALSE(result.has_value());
         CHECK(destination == before);
     }
+    const wire::Value missing_override(wire::Value::Object{
+        {"owner", wire::Value(wire::Value::Object{
+                      {"value", wire::Value(std::uint64_t{19U})},
+                      {"overrides", wire::Value(wire::Value::Object{})},
+                  })},
+        {"payload", wire::Value(std::uint64_t{7U})},
+    });
+    wire::ByteBuffer missing_bytes;
+    REQUIRE(wire::encode(missing_override, missing_bytes, test_limits(128U)));
+    const auto missing_projected =
+        mmltk::frameworks::serialization::decode<mmltk::frameworks::serialization::test::OpaqueProjectedEnvelope>({missing_bytes, {}}, test_limits(128U));
+    require_decode_error(missing_projected, wire::ErrorCode::UnknownKey);
+    CHECK(missing_projected.error().path == "owner.overrides.mask");
+    CHECK(missing_projected.error().offset == 0U);
     std::array<std::byte, 128U> fixed{};
     const auto fixed_size = mmltk::frameworks::serialization::encode(source, fixed, test_limits(fixed.size()));
     REQUIRE(fixed_size.has_value());
@@ -532,6 +574,50 @@ TEST_CASE("bounded_cbor_round_trips_deterministic_maps_and_segmented_input", "[f
     const auto decoded = wire::decode({std::span(encoded).first(split), std::span(encoded).subspan(split)}, {128U, 32U, 8U});
     REQUIRE(decoded.has_value());
     REQUIRE(std::get<wire::Value::Object>(decoded->storage).at(0).first == "first");
+}
+TEST_CASE("CBOR byte peeks preserve offsets across empty input and segment transitions", "[frameworks][serialization]") {
+    const std::array bytes{std::byte{0xf6}, std::byte{0x18}, std::byte{0x18}, std::byte{0xf6}};
+    for (std::size_t split = 0U; split <= bytes.size(); ++split) {
+        wire::Reader reader({std::span(bytes).first(split), std::span(bytes).subspan(split)}, test_limits(bytes.size()));
+        for (const std::size_t offset : {0U, 1U, 3U}) {
+            for (int repetition = 0; repetition != 2; ++repetition) {
+                const auto peek = reader.next_is_null();
+                REQUIRE(peek);
+                CHECK(*peek == (offset != 1U));
+                CHECK(reader.offset() == offset);
+            }
+            REQUIRE(reader.read_scalar_item(0U));
+        }
+        CHECK(reader.offset() == bytes.size());
+        CHECK(reader.items_read() == 3U);
+        require_decode_error(reader.next_is_null(), wire::ErrorCode::UnexpectedEof);
+        const auto failed = reader.read_scalar_item(0U);
+        require_decode_error(failed, wire::ErrorCode::UnexpectedEof);
+        CHECK(failed.error().offset == bytes.size());
+        CHECK(reader.offset() == bytes.size());
+    }
+    wire::Reader empty({}, test_limits(0U));
+    auto scope = empty.enter_path("nested");
+    const auto eof = empty.next_is_null();
+    require_decode_error(eof, wire::ErrorCode::UnexpectedEof);
+    CHECK(eof.error().offset == 0U);
+    CHECK(eof.error().path == "nested");
+    CHECK(empty.offset() == 0U);
+    CHECK(empty.items_read() == 0U);
+    wire::Reader oversized({bytes, {}}, test_limits(0U));
+    const auto limited = oversized.next_is_null();
+    require_decode_error(limited, wire::ErrorCode::LimitExceeded);
+    CHECK(limited.error().offset == 0U);
+    CHECK(oversized.offset() == 0U);
+    CHECK(oversized.items_read() == 0U);
+    const std::array truncated{std::byte{0x19}, std::byte{0x01}};
+    wire::Reader partial({std::span(truncated).first(1U), std::span(truncated).subspan(1U)}, test_limits(truncated.size()));
+    const auto failure = partial.read_scalar_item(0U);
+    require_decode_error(failure, wire::ErrorCode::UnexpectedEof);
+    CHECK(failure.error().offset == 2U);
+    CHECK(partial.offset() == 2U);
+    require_decode_error(partial.next_is_null(), wire::ErrorCode::UnexpectedEof);
+    CHECK(partial.offset() == 2U);
 }
 TEST_CASE("dynamic_value_limits_reject_descendants_and_keys", "[frameworks][serialization]") {
     const wire::DynamicValueLimits limits{.max_bytes = 4U, .max_items = 2U, .max_depth = 16U};

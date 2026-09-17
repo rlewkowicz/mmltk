@@ -322,15 +322,19 @@ DecodeError Reader::contextualize(DecodeError result) const {
 }
 std::expected<bool, DecodeError> Reader::next_is_null() const {
     if (input_.size() > limits_.max_bytes) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
+    const auto next = peek_byte();
+    if (!next) return std::unexpected(next.error());
+    return *next == std::byte{0xf6};
+}
+std::expected<std::byte, DecodeError> Reader::peek_byte() const {
     if (offset_ >= input_.size()) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
-    const std::byte next = offset_ < input_.first.size() ? input_.first[offset_] : input_.second[offset_ - input_.first.size()];
-    return next == std::byte{0xf6};
+    return offset_ < input_.first.size() ? input_.first[offset_] : input_.second[offset_ - input_.first.size()];
 }
 std::expected<std::byte, DecodeError> Reader::byte() {
-    if (offset_ >= input_.size()) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
-    const std::byte result = offset_ < input_.first.size() ? input_.first[offset_] : input_.second[offset_ - input_.first.size()];
+    const auto result = peek_byte();
+    if (!result) return std::unexpected(result.error());
     ++offset_;
-    return result;
+    return *result;
 }
 std::expected<std::uint64_t, DecodeError> Reader::argument(const std::uint8_t additional) {
     if (additional < 24U) { return additional; }

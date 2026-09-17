@@ -228,6 +228,7 @@ class Reader {
         std::size_t data_offset = 0U;
         std::size_t size = 0U;
     };
+    [[nodiscard]] std::expected<std::byte, DecodeError> peek_byte() const;
     [[nodiscard]] std::expected<std::byte, DecodeError> byte();
     [[nodiscard]] std::expected<std::uint64_t, DecodeError> argument(std::uint8_t additional);
     [[nodiscard]] std::expected<std::size_t, DecodeError> size_argument(std::uint8_t additional);

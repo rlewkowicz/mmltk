@@ -1,4 +1,5 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include <algorithm>
 #include <cstddef>
 #include <limits>
@@ -56,12 +57,12 @@ void validate_train_request(const TrainRequest& request) {
         throw std::runtime_error("RF-DETR Match-Free and denoising supervision do not support full-trace compilation");
     }
     if (request.training_supervision.assignment == TrainAssignmentKind::MatchFree) {
-        const PresetCatalogEntry* preset = find_model_preset(request.preset_name);
+        const PresetCatalogEntry* preset = find_preset_catalog_entry(request.preset_name);
         if (preset != nullptr && preset->task == ModelTask::Segmentation) {
             throw std::runtime_error("RF-DETR Match-Free supervision does not support segmentation");
         }
     }
-    if (const PresetCatalogEntry* preset = find_model_preset(request.preset_name)) {
+    if (const PresetCatalogEntry* preset = find_preset_catalog_entry(request.preset_name)) {
         NativeRfDetrConfig model_config = native_config_from_preset(*preset);
         model_config.training_supervision = request.training_supervision;
         if (training_supervision_enabled(request.training_supervision) && request.num_queries != 0U) {

@@ -1,4 +1,5 @@
 module;
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "prediction_capacity.h"
@@ -217,7 +218,7 @@ ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& r
     result.artifact_root = artifact.path.parent_path();
     const PresetCatalogEntry* preset = nullptr;
     if (!request.preset_name.empty()) {
-        preset = find_model_preset(request.preset_name);
+        preset = find_preset_catalog_entry(request.preset_name);
         if (preset == nullptr) { throw std::invalid_argument("unknown RF-DETR preset override: " + request.preset_name); }
     } else {
         preset = infer_model_preset_from_path(artifact.path);
