@@ -49,6 +49,8 @@ set_target_properties(mmltk_backend_ml_cuda PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+mmltk_target_precompiled_headers(mmltk_backend_ml_cuda std torch)
+
 function(mmltk_add_backend_ml_cuda_tests)
     add_executable(mmltk_backend_ml_cuda_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(

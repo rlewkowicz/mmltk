@@ -8,16 +8,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <algorithm>
-#include <array>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <utility>
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/scoped_fd.h"
 namespace mmltk::controller::services {

@@ -139,7 +139,8 @@ function(mmltk_register_retained_module_providers target)
     foreach(_mmltk_input IN LISTS _mmltk_sources)
         _mmltk_absolute_source(_mmltk_source "${_mmltk_input}")
         set_source_files_properties(
-            "${_mmltk_source}" PROPERTIES CXX_SCAN_FOR_MODULES ON)
+            "${_mmltk_source}" PROPERTIES
+            CXX_SCAN_FOR_MODULES ON SKIP_PRECOMPILE_HEADERS ON)
         list(APPEND _mmltk_modules "${_mmltk_source}")
     endforeach()
     string(TOLOWER "${_mmltk_visibility}" _mmltk_file_set_visibility)
@@ -153,7 +154,8 @@ function(mmltk_register_retained_module_implementation_units target)
     foreach(_mmltk_input IN LISTS ARGN)
         _mmltk_absolute_source(_mmltk_source "${_mmltk_input}")
         set_source_files_properties(
-            "${_mmltk_source}" PROPERTIES CXX_SCAN_FOR_MODULES ON)
+            "${_mmltk_source}" PROPERTIES
+            CXX_SCAN_FOR_MODULES ON SKIP_PRECOMPILE_HEADERS ON)
         target_sources("${target}" PRIVATE "${_mmltk_source}")
     endforeach()
 endfunction()
@@ -162,7 +164,8 @@ function(mmltk_register_retained_module_importers target)
     foreach(_mmltk_input IN LISTS ARGN)
         _mmltk_absolute_source(_mmltk_source "${_mmltk_input}")
         set_source_files_properties(
-            "${_mmltk_source}" PROPERTIES CXX_SCAN_FOR_MODULES ON)
+            "${_mmltk_source}" PROPERTIES
+            CXX_SCAN_FOR_MODULES ON SKIP_PRECOMPILE_HEADERS ON)
         target_sources("${target}" PRIVATE "${_mmltk_source}")
     endforeach()
 endfunction()

@@ -148,6 +148,8 @@ set_target_properties(mmltk_backend_models_rfdetr_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
 )
 
+mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_core std torch)
+
 function(mmltk_add_backend_models_rfdetr_core_tests)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         add_library(

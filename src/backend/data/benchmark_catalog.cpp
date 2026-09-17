@@ -1,12 +1,8 @@
 #include "detail/benchmark_catalog.h"
 #include "src/backend/data/catalog/coco_catalog.h"
-#include <array>
-#include <cstdint>
 #include <cstdio>
 #include <span>
-#include <string>
 #include <string_view>
-#include <vector>
 #include "src/backend/data/benchmark_dataset_compiler.h"
 namespace mmltk::backend::data::benchmark_internal {
 namespace {

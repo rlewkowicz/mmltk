@@ -1,12 +1,6 @@
 #include "detail/mask_rle_utils.h"
 #include <immintrin.h>
-#include <algorithm>
-#include <array>
-#include <cstdint>
-#include <limits>
 #include <span>
-#include <stdexcept>
-#include <vector>
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/math/checked_arithmetic.h"

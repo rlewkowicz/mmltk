@@ -1,14 +1,7 @@
 #include "tensor_readback.h"
 #include "numa_host_tensor.h"
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-#include <algorithm>
-#include <limits>
-#include <optional>
-#include <stdexcept>
-#include <vector>
 #include "src/common/system/numa_memory.h"
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"

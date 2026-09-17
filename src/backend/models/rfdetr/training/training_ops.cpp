@@ -1,11 +1,8 @@
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 
 #include <torch/torch.h>
-#include <algorithm>
 #include <cmath>
 #include <numbers>
-#include <stdexcept>
-#include <vector>
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/frameworks/gpu/cuda_device_scope.h"
 #include "src/frameworks/gpu/cuda_error.h"

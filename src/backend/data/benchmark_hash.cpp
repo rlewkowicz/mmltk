@@ -1,6 +1,4 @@
 #include "src/backend/data/benchmark_hash.h"
-#include <array>
-#include <cstddef>
 #include <cstring>
 #if defined(__x86_64__) && defined(__SSE4_2__)
 #include <nmmintrin.h>

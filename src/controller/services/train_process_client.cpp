@@ -10,8 +10,6 @@
 #include <sys/timerfd.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <algorithm>
-#include <array>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -20,13 +18,8 @@
 #include <cstring>
 #include <fstream>
 #include <inplace_vector>
-#include <limits>
-#include <nlohmann/json.hpp>
 #include <ranges>
-#include <stdexcept>
 #include <system_error>
-#include <utility>
-#include <vector>
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include "src/common/io/event_fd.h"
 #include "src/common/io/scoped_fd.h"

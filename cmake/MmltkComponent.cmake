@@ -95,6 +95,61 @@ function(mmltk_target_cuda_architectures target)
     endif()
 endfunction()
 
+# Call after the owner's sources and compilation settings have been registered.
+# Contents may be shared; compiled artifacts deliberately remain target-local.
+function(mmltk_target_precompiled_headers target)
+    get_target_property(_mmltk_disabled "${target}" DISABLE_PRECOMPILE_HEADERS)
+    get_target_property(_mmltk_existing "${target}" PRECOMPILE_HEADERS)
+    if(_mmltk_disabled OR _mmltk_existing OR NOT ARGN)
+        message(FATAL_ERROR "Invalid PCH registration for `${target}`")
+    endif()
+    set(_mmltk_policy "")
+    foreach(_mmltk_group IN LISTS ARGN)
+        if(NOT _mmltk_group MATCHES "^(std|torch|json)$")
+            message(FATAL_ERROR "Unknown PCH group `${_mmltk_group}`")
+        endif()
+        set(_mmltk_header "${CMAKE_SOURCE_DIR}/src/pch_${_mmltk_group}.h")
+        target_precompile_headers("${target}" PRIVATE
+            "$<$<COMPILE_LANGUAGE:CXX>:${_mmltk_header}>")
+        string(APPEND _mmltk_policy "header\t${_mmltk_header}\n")
+    endforeach()
+    set_target_properties("${target}" PROPERTIES PCH_WARN_INVALID ON)
+    target_compile_options("${target}" PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:-Werror=invalid-pch>")
+
+    get_target_property(_mmltk_sources "${target}" SOURCES)
+    set(_mmltk_participant_count 0)
+    foreach(_mmltk_source IN LISTS _mmltk_sources)
+        get_source_file_property(_mmltk_modules "${_mmltk_source}" CXX_SCAN_FOR_MODULES)
+        get_source_file_property(_mmltk_skip "${_mmltk_source}" SKIP_PRECOMPILE_HEADERS)
+        # A different per-source environment cannot consume the target artifact.
+        foreach(_mmltk_property IN ITEMS
+                COMPILE_DEFINITIONS COMPILE_OPTIONS COMPILE_FLAGS INCLUDE_DIRECTORIES)
+            get_source_file_property(_mmltk_value "${_mmltk_source}" "${_mmltk_property}")
+            if(_mmltk_value)
+                set(_mmltk_skip ON)
+            endif()
+        endforeach()
+        if(_mmltk_source MATCHES "\\.(cc|cpp|cxx|c\\+\\+|C)$"
+           AND NOT _mmltk_modules AND NOT _mmltk_skip)
+            math(EXPR _mmltk_participant_count "${_mmltk_participant_count} + 1")
+            string(APPEND _mmltk_policy "use\t${_mmltk_source}\n")
+        else()
+            set_source_files_properties("${_mmltk_source}" PROPERTIES
+                SKIP_PRECOMPILE_HEADERS ON)
+            string(APPEND _mmltk_policy "skip\t${_mmltk_source}\n")
+        endif()
+    endforeach()
+    if(_mmltk_participant_count LESS 2)
+        message(FATAL_ERROR "PCH requires multiple ordinary sources for `${target}`")
+    endif()
+    # This is generated evidence of the canonical target registration, not a
+    # separately maintained source inventory.
+    file(GENERATE
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/${target}.dir/mmltk-pch-policy.txt"
+        CONTENT "${_mmltk_policy}")
+endfunction()
+
 function(mmltk_register_runtime_library_directory build_directory)
     set(options)
     set(oneValueArgs INSTALL_DIRECTORY)

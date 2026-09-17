@@ -1,8 +1,5 @@
 #include "src/backend/models/rfdetr/training/training_partition.h"
-#include <algorithm>
-#include <cstddef>
 #include <set>
-#include <stdexcept>
 namespace mmltk::backend::models::rfdetr {
 void apply_training_partition(TrainRequest& request, const DistributedTrainingPartition& partition) {
     request.device_id = partition.device_id;

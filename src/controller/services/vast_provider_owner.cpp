@@ -1,7 +1,5 @@
 #include "src/controller/services/vast_provider_owner.h"
 #include <chrono>
-#include <stdexcept>
-#include <utility>
 namespace mmltk::controller::services {
 namespace {
 constexpr std::size_t kProviderFieldCapacity = 4U * 1024U;

@@ -1,11 +1,7 @@
 #include <atomic>
-#include <cstddef>
-#include <cstdint>
 #include <filesystem>
 #include <span>
-#include <string>
 #include <unordered_map>
-#include <vector>
 #include "detail/dataset_compiler_internal.h"
 #include "src/backend/data/dataset_compiler.h"
 namespace mmltk::backend::data::compiler_internal {

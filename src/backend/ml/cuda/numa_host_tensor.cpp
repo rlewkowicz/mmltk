@@ -1,11 +1,6 @@
 #include "numa_host_tensor.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime_api.h>
-#include <limits>
-#include <algorithm>
-#include <stdexcept>
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::backend::ml::cuda {
 NumaHostTensor::NumaHostTensor(int device, std::shared_ptr<void> context_custody) : device_(device), context_custody_(std::move(context_custody)) {

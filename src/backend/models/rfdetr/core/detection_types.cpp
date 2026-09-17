@@ -1,8 +1,5 @@
 
 #include "src/backend/models/rfdetr/core/detection_types.h"
-#include <cstdint>
-#include <stdexcept>
-#include <string>
 namespace mmltk::backend::models::rfdetr {
 void assert_inference_output_dtype(const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes, const at::ScalarType expected_dtype,
                                    const char* context) {

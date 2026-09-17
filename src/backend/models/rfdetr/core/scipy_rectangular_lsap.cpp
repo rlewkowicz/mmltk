@@ -1,11 +1,6 @@
 #include "detail/scipy_rectangular_lsap.h"
-#include <algorithm>
 #include <cmath>
-#include <cstddef>
-#include <limits>
 #include <numeric>
-#include <utility>
-#include <vector>
 namespace mmltk::backend::models::rfdetr {
 namespace {
 void argsort_iter(const std::pmr::vector<intptr_t>& values, std::pmr::vector<intptr_t>& index) {

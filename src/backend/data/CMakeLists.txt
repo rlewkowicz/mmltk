@@ -140,6 +140,8 @@ target_link_libraries(mmltk_backend_data
         ${MMLTK_TURBOJPEG_LIBRARY}
 )
 
+mmltk_target_precompiled_headers(mmltk_backend_data std json)
+
 function(mmltk_add_backend_data_tests)
     add_library(mmltk_backend_data_test_support STATIC EXCLUDE_FROM_ALL)
     mmltk_configure_component(

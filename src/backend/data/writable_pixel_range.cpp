@@ -1,7 +1,5 @@
 #include "detail/writable_pixel_range.h"
 #include <sys/mman.h>
-#include <cstddef>
-#include <cstdint>
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::detail {

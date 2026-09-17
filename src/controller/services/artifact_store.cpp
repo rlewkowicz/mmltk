@@ -5,8 +5,6 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -14,16 +12,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <memory>
-#include <optional>
 #include <ranges>
 #include <span>
-#include <stdexcept>
-#include <string>
 #include <string_view>
 #include <system_error>
 #include <tuple>
-#include <vector>
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"

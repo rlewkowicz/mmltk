@@ -95,6 +95,8 @@ target_link_libraries(mmltk_backend_models_rfdetr_training
 )
 mmltk_enable_torch(mmltk_backend_models_rfdetr_training PRIVATE)
 
+mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_training std torch)
+
 function(mmltk_add_backend_models_rfdetr_training_tests)
     set(sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/distributed_placement.test.cpp

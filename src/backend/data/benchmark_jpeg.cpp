@@ -3,14 +3,7 @@
 
 #include "detail/benchmark_jpeg.h"
 #include <turbojpeg.h>
-#include <algorithm>
-#include <cstddef>
-#include <cstdint>
-#include <limits>
 #include <span>
-#include <stdexcept>
-#include <string>
-#include <vector>
 #include "src/common/math/checked_arithmetic.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::common::math::checked_cast;

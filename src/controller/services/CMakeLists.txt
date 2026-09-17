@@ -82,6 +82,8 @@ target_link_libraries(mmltk_controller_settings_test_support INTERFACE
     mmltk::controller::direct_services mmltk_test_support)
 mmltk_register_header_isolation(mmltk_controller_settings_test_support)
 
+mmltk_target_precompiled_headers(mmltk_controller_direct_services std json)
+
 function(mmltk_add_controller_services_tests)
     add_executable(mmltk_controller_services_file_dialog_fixture
         EXCLUDE_FROM_ALL)

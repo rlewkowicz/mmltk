@@ -1,7 +1,4 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-#include <cstdint>
-#include <limits>
-#include <stdexcept>
 namespace mmltk::backend::ml::cuda {
 TorchDeviceIndex checked_device_index(const int device_id) {
     if (device_id < std::numeric_limits<TorchDeviceIndex>::min() || device_id > std::numeric_limits<TorchDeviceIndex>::max()) {

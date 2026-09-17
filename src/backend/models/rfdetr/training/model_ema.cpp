@@ -2,13 +2,9 @@
 #include "detail/model_ema.h"
 #include <ATen/ops/_foreach_add.h>
 #include <ATen/ops/_foreach_mul.h>
-#include <algorithm>
 #include <cmath>
 #include <exception>
 #include <iterator>
-#include <limits>
-#include <stdexcept>
-#include <utility>
 #include "src/backend/ml/cuda/tensor_readback.h"
 namespace mmltk::backend::models::rfdetr {
 namespace torch_cuda = mmltk::backend::ml::cuda;

@@ -1,14 +1,7 @@
 #include "src/controller/services/settings_store.h"
-#include <cstdint>
 #include <exception>
-#include <memory>
-#include <utility>
 #include <filesystem>
 #include <fstream>
-#include <nlohmann/json.hpp>
-#include <optional>
-#include <stdexcept>
-#include <string>
 #include <string_view>
 #include "src/common/io/json_file.h"
 #include "src/controller/contracts/default_state.h"

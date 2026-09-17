@@ -207,6 +207,102 @@ def check_dependency_declarations(policy, repo_root):
         raise ValueError(f"{cargo_config}: Linux linker={linker!r}: {error}") from error
 
 
+def pch_environment(arguments, source, directory):
+    """Retain every option except the mechanics of creating/using the artifact."""
+    result = []
+    index = 0
+    paired = {"-o", "--output-file", "-MF", "-MT", "-MQ", "-x", "-include"}
+    mechanics = {"-c", "-MD", "-MMD", "-MP", "-fpch-preprocess",
+                 "-fpch-instantiate-templates", "-Winvalid-pch"}
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument in paired:
+            index += 2
+            continue
+        is_source = not argument.startswith("-") and absolute(argument, directory) == source
+        if argument not in mechanics and not is_source:
+            result.append(argument)
+        index += 1
+    return result
+
+
+def check_precompiled_headers(entries, first_party_targets):
+    """Compare generated creation/use against the owning CMake registrations."""
+    owners = {}
+    for entry in entries:
+        compiler, arguments, directory, environment = compiler_command(entry)
+        source = absolute(entry["file"], directory)
+        outputs = option_values(arguments, {"-o", "--output-file"})
+        require(entry.get("output") or outputs, f"missing compile output: {source}")
+        output = absolute(entry.get("output") or outputs[-1], directory)
+        owner = next((parent for parent in output.parents
+                      if parent.name.endswith(".dir") and
+                      parent.parent.name == "CMakeFiles"), None)
+        if owner is None or owner.name not in first_party_targets:
+            continue
+        includes = option_values(arguments, {"-include", "-include-pch", "-imacros"})
+        pch_includes = [absolute(value, directory) for value in includes
+                        if Path(value).name.startswith("cmake_pch.")]
+        creation = output.suffix == ".gch"
+        policy_path = owner / "mmltk-pch-policy.txt"
+        if "header-isolation" in source.parts:
+            require(not includes and not creation,
+                    f"header isolation must remain unforced and PCH-free: {source}")
+        excluded = (source.suffix in {".c", ".cu", ".cppm", ".ixx"} or
+                    any(arg.startswith(("-fmodules", "-fmodule-mapper"))
+                        for arg in arguments))
+        require(not excluded or (not creation and not pch_includes),
+                f"excluded compilation received a PCH: {source}")
+        if not policy_path.is_file():
+            require(not creation and not pch_includes,
+                    f"PCH without an owning registration: {source}")
+            continue
+        state = owners.setdefault(owner, {"creations": [], "uses": {}})
+        if not creation and not pch_includes:
+            continue
+        require(len(pch_includes) == 1,
+                f"expected one target-local PCH include for {source}: {pch_includes}")
+        header = pch_includes[0]
+        require(header.parent == owner and header.name == "cmake_pch.hxx",
+                f"cross-target or unexpected PCH artifact: {header}")
+        require("-Werror=invalid-pch" in arguments and "-Winvalid-pch" in arguments
+                and "-Wno-invalid-pch" not in arguments
+                and "-Wno-error=invalid-pch" not in arguments,
+                f"invalid-PCH diagnostics must be fatal: {source}")
+        signature = (compiler, pch_environment(arguments, source, directory),
+                     environment)
+        if creation:
+            require(source.name == "cmake_pch.hxx.cxx" and
+                    output == Path(str(header) + ".gch") and
+                    option_values(arguments, {"-x"}) == ["c++-header"],
+                    f"unexpected PCH creation command: {source}")
+            state["creations"].append((header, signature))
+        else:
+            require(source not in state["uses"], f"duplicate PCH use: {source}")
+            state["uses"][source] = signature
+    for owner, state in owners.items():
+        rows = [line.split("\t", 1) for line in
+                (owner / "mmltk-pch-policy.txt").read_text().splitlines()]
+        expected = {Path(value) for kind, value in rows if kind == "use"}
+        excluded = {Path(value) for kind, value in rows if kind == "skip"}
+        headers = [Path(value) for kind, value in rows if kind == "header"]
+        require(len(state["creations"]) == 1,
+                f"expected one PCH creation for {owner}")
+        header, signature = state["creations"][0]
+        require(set(state["uses"]) == expected and len(expected) >= 2,
+                f"PCH consumption differs from registration for {owner}: "
+                f"missing={expected - state['uses'].keys()}, "
+                f"extra={state['uses'].keys() - expected}")
+        require(not (excluded & state["uses"].keys()),
+                f"excluded source consumes a PCH for {owner}")
+        require(all(value == signature for value in state["uses"].values()),
+                f"PCH compiler, options, definitions or environment differ for {owner}")
+        actual_headers = [Path(value) for value in re.findall(
+            r'^\s*#include "([^"]+)"', header.read_text(), flags=re.MULTILINE)]
+        require(actual_headers == headers,
+                f"generated PCH groups differ from registration for {owner}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path)
@@ -237,6 +333,7 @@ def main():
             counts[policy.command(entry, repo_root, first_party_targets)] += 1
         except (ValueError, OSError, subprocess.CalledProcessError) as error:
             raise ValueError(f"{entry.get('file', '<missing source>')}: {error}") from error
+    check_precompiled_headers(entries, first_party_targets)
     print(f"mmltk: compiler invariants verified: {json.dumps(counts, sort_keys=True)}")
 
 

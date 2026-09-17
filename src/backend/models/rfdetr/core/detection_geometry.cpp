@@ -1,7 +1,5 @@
 #include "detail/detection_geometry.h"
 #include <ATen/TensorIndexing.h>
-#include <stdexcept>
-#include <string>
 #include "src/backend/ml/ops/box_iou.h"
 namespace mmltk::backend::models::rfdetr {
 namespace {

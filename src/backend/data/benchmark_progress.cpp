@@ -1,8 +1,4 @@
 #include "detail/benchmark_progress.h"
-#include <algorithm>
-#include <limits>
-#include <stdexcept>
-#include <utility>
 namespace mmltk::backend::data::benchmark_internal {
 using Clock = std::chrono::steady_clock;
 ProgressReporter::ProgressReporter(BenchmarkProgressCallback callback, const BenchmarkTraceSink& trace) : callback_(std::move(callback)), trace_(&trace) {

@@ -1,21 +1,12 @@
 #include "src/controller/services/runtime_diagnostics.h"
-#include <algorithm>
-#include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
-#include <cstddef>
-#include <cstdint>
 #include <cstdio>
-#include <limits>
-#include <nlohmann/json.hpp>
 #include <span>
-#include <string>
-#include <stdexcept>
 #include <string_view>
 #include <system_error>
 #include <type_traits>
-#include <utility>
 #include <variant>
 namespace mmltk::controller::services {
 namespace {

@@ -1,5 +1,4 @@
 #include "telemetry_writer.h"
-#include <array>
 #include <cerrno>
 #include <atomic>
 #include <fstream>

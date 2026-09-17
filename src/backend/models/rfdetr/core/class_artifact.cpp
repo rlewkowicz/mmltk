@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <sys/file.h>
-#include <utility>
 namespace mmltk::backend::models::rfdetr {
 namespace io = mmltk::common::io;
 namespace detail {

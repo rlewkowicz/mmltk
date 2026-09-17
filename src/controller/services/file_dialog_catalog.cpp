@@ -1,13 +1,7 @@
 #include "src/controller/services/file_dialog_catalog.h"
-#include <algorithm>
-#include <cstddef>
-#include <cstdint>
 #include <inplace_vector>
 #include <ranges>
 #include <span>
-#include <stdexcept>
-#include <string>
-#include <utility>
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/model_selection.h"
 #include "src/frameworks/reflection/reflection_metadata.h"

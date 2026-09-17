@@ -5,7 +5,6 @@
 #include <signal.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-#include <array>
 #include <atomic>
 #include <cerrno>
 #include <condition_variable>
@@ -14,9 +13,7 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
-#include <nlohmann/json.hpp>
 #include <thread>
-#include <utility>
 #include "src/common/io/noexcept_io.h"
 namespace mmltk::controller::services {
 struct DiagnosticsClient::State final {

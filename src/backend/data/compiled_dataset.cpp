@@ -1,11 +1,7 @@
 #include "src/backend/data/compiled_dataset.h"
 #include <sys/mman.h>
-#include <algorithm>
 #include <cassert>
 #include <cstring>
-#include <limits>
-#include <stdexcept>
-#include <utility>
 #include "src/backend/data/compiled_file_utils.h"
 namespace mmltk::backend::data {
 CompiledDataset CompiledDataset::open(const std::filesystem::path& path, const AccessPattern access) {
