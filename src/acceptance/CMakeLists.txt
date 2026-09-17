@@ -98,8 +98,9 @@ add_executable(mmltk_acceptance EXCLUDE_FROM_ALL)
 add_executable(mmltk::acceptance ALIAS mmltk_acceptance)
 mmltk_configure_component(mmltk_acceptance PRIVATE_DECLARATIONS)
 mmltk_register_ordinary_sources(
-    mmltk_acceptance tests/reporter_logging.test.cpp
-        tests/workspace_registration.test.cpp)
+    mmltk_acceptance tests/workspace_registration.test.cpp)
+mmltk_register_retained_module_importers(
+    mmltk_acceptance tests/reporter_logging.test.cpp)
 target_include_directories(mmltk_acceptance PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
 )

@@ -17,8 +17,11 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
+#include "src/common/io/scoped_fd.h"
+#include "src/test_support/linux_process_test_utils.hpp"
 #include "src/test_support/subprocess_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 import mmltk.common.logging.mmltk_logging;
