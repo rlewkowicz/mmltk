@@ -1,3 +1,5 @@
+#include "src/backend/models/rfdetr/contract/training_metrics.h"
+#include "src/frameworks/serialization/reflected_json.h"
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -1377,7 +1379,37 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             return value;
         }(),
     };
-    const auto require_selected_evaluation = [](const rfdetr::TrainRequest& request, const rfdetr::TrainRunResult& result) {
+    const auto require_selected_evaluation = [&fixture](const rfdetr::TrainRequest& request, const rfdetr::TrainRunResult& result) {
+        std::ifstream metrics(request.output_dir / "metrics.jsonl");
+        REQUIRE(metrics.good());
+        std::string line;
+        bool starting = false;
+        bool completed = false;
+        // The fixture has one rank; usable full microbatches exclude its tail.
+        const auto expected_images = (fixture.num_images / request.batch_size) * request.batch_size;
+        while (std::getline(metrics, line)) {
+            const auto record = mmltk::frameworks::serialization::decode_reflected_json<rfdetr::TrainingRecord>(
+                line, {.max_bytes = rfdetr::kTrainingRecordBytes, .max_items = 8192, .max_depth = 32});
+            const auto& progress = record.progress;
+            REQUIRE(record.format_version == 2);
+            REQUIRE(progress.total_images == expected_images);
+            REQUIRE(progress.total_images == progress.total_batches * request.batch_size);
+            REQUIRE(progress.completed_images == progress.completed_batches * request.batch_size);
+            REQUIRE(progress.completed_images <= progress.total_images);
+            REQUIRE(progress.epoch == result.last_epoch);
+            if (progress.phase == rfdetr::TrainingPhase::Starting) {
+                starting = true;
+                REQUIRE(progress.completed_images == 0);
+                REQUIRE_FALSE(progress.scalars.total.has_value());
+            }
+            if (progress.phase == rfdetr::TrainingPhase::Completed) {
+                completed = true;
+                REQUIRE(progress.completed_images == expected_images);
+                REQUIRE(progress.completed_images > 0);
+            }
+        }
+        REQUIRE(starting);
+        REQUIRE(completed);
         REQUIRE(result.history.size() == 1);
         const auto& epoch = result.history.front();
         REQUIRE(epoch.evaluated_ema == request.use_ema);

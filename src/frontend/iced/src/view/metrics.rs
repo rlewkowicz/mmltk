@@ -518,7 +518,7 @@ mod tests {
     fn record() -> TrainingRecord {
         use crate::generated::*;
         TrainingRecord {
-            formatversion: 1,
+            formatversion: 2,
             runid: "run".into(),
             attemptid: "attempt".into(),
             sequence: 1,
@@ -532,6 +532,8 @@ mod tests {
                 totalepochs: 3,
                 completedbatches: 1,
                 totalbatches: 10,
+                completedimages: 4,
+                totalimages: 40,
                 completedwaves: 1,
                 optimizersteps: 1,
                 globaloptimizerstep: 1,

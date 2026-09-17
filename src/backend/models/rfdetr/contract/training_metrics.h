@@ -8,7 +8,7 @@
 #include "class_layout.h"
 #include "workflow_requests.h"
 namespace mmltk::backend::models::rfdetr {
-inline constexpr std::uint32_t kTrainingRunFormat = 1;
+inline constexpr std::uint32_t kTrainingRunFormat = 2;
 inline constexpr std::size_t kTrainingHistoryPageSize = 32;
 inline constexpr std::size_t kTrainingRecordBytes = 512U * 1024U;
 inline constexpr std::size_t kTrainingManifestBytes = 4U * 1024U * 1024U;
@@ -51,6 +51,8 @@ struct TrainingMetricProgress final {
     int total_epochs = 1;
     std::int64_t completed_batches = 0;
     std::int64_t total_batches = 0;
+    std::uint64_t completed_images = 0;
+    std::uint64_t total_images = 0;
     std::int64_t completed_waves = 0;
     std::int64_t optimizer_steps = 0;
     std::int64_t global_optimizer_step = 0;

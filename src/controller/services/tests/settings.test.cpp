@@ -827,6 +827,35 @@ TEST_CASE("explicit compiled selections override inferred directories and keep t
     REQUIRE(apply_gui_settings_values(inferred, unrelated));
     CHECK(inferred.workflows.train.request.test_compiled_path.empty());
 }
+TEST_CASE("optional test selection and persistence are independent of inferred training splits", "[gui][settings]") {
+    auto state = default_gui_settings_state();
+    const auto edit = [&](const char* path, const char* value) {
+        const std::array updates{SettingsValueUpdate{
+            .path = path, .value = *mmltk::frameworks::serialization::wire::FlatValue::text(value, mmltk::frameworks::reflection::kMaximumPathBytes)}};
+        REQUIRE(apply_gui_settings_values(state, updates));
+    };
+    edit("workflows.train.request.test_compiled_path", "/independent/evaluation.bin");
+    REQUIRE(state.workflows.train.use_compiled_directory_defaults);
+    edit("workflows.train.compiled_dataset_dir", "/selected/compiled");
+    CHECK(state.workflows.train.request.train_compiled_path == "/selected/compiled/train.bin");
+    CHECK(state.workflows.train.request.val_compiled_path == "/selected/compiled/val.bin");
+    CHECK(state.workflows.train.request.test_compiled_path == "/independent/evaluation.bin");
+    mmltk::testsupport::ScopedTempDir temp{"optional-test-settings"};
+    const auto path = temp.path() / "gui.json";
+    mmltk::testsupport::write_text_file(path, snapshot_gui_settings(state).dump());
+    auto loaded = default_gui_settings_state();
+    REQUIRE(load_settings(path, loaded));
+    CHECK(loaded.workflows.train.use_compiled_directory_defaults);
+    CHECK(loaded.workflows.train.request.test_compiled_path == state.workflows.train.request.test_compiled_path);
+    edit("workflows.train.request.test_compiled_path", "");
+    edit("workflows.train.compiled_dataset_dir", "/another/compiled");
+    CHECK(state.workflows.train.use_compiled_directory_defaults);
+    CHECK(state.workflows.train.request.test_compiled_path.empty());
+    mmltk::testsupport::write_text_file(path, snapshot_gui_settings(state).dump());
+    REQUIRE(load_settings(path, loaded));
+    CHECK(loaded.workflows.train.request.test_compiled_path.empty());
+    CHECK(loaded.workflows.train.use_compiled_directory_defaults);
+}
 TEST_CASE("GUI prediction loads batch one while backend requests retain batching", "[gui][settings]") {
     auto state = default_gui_settings_state();
     REQUIRE(state.workflows.predict.request.batch_size == 1U);

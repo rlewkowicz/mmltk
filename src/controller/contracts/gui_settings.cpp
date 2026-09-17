@@ -962,9 +962,7 @@ bool load_gui_settings_file(const std::string& path, GuiSettingsState& state, nl
         if (candidate.workflows.train.use_compiled_directory_defaults) {
             const std::filesystem::path directory{candidate.workflows.train.compiled_dataset_dir};
             const bool defaults_match = candidate.workflows.train.request.train_compiled_path == directory / "train.bin" &&
-                                        candidate.workflows.train.request.val_compiled_path == directory / "val.bin" &&
-                                        (candidate.workflows.train.request.test_compiled_path.empty() ||
-                                         candidate.workflows.train.request.test_compiled_path == directory / "test.bin");
+                                        candidate.workflows.train.request.val_compiled_path == directory / "val.bin";
             if (!defaults_match) {
                 candidate.workflows.train.use_compiled_directory_defaults = false;
                 repaired = true;

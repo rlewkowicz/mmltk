@@ -429,6 +429,19 @@ impl App {
             crate::view::train::Outcome::Output(message) => {
                 use crate::view::train::output::Message as Output;
                 match message {
+                    Output::DirectoryChanged(value) => {
+                        let schedule = self.settings.edit(
+                            crate::view::settings::EditCadence::Debounced,
+                            |draft| crate::generated::edit_workflowstrainrequestoutputdir(draft, value),
+                        );
+                        return match schedule {
+                            Ok(schedule) => self.handle_settings_schedule(schedule),
+                            Err(error) => {
+                                self.model.error = Some(UiError::invalid(error));
+                                Task::none()
+                            }
+                        };
+                    }
                     Output::Browse(id) => self.open_dialog(id),
                     Output::Live => self.show_live_training(),
                     Output::Open(directory) => {
@@ -814,6 +827,41 @@ mod tests {
             Some(expected)
         );
         intent
+    }
+
+    #[test]
+    fn output_edits_only_schedule_settings_and_browse_only_opens_the_dialog() {
+        use crate::view::train::{Outcome, output::Message as Output};
+        let (mut app, mut capture) = start_app();
+        drop(app.on_train(Outcome::Output(Output::DirectoryChanged("/new/output".into()))));
+        assert_eq!(app.settings.draft().unwrap().workflows.train.request.outputdir, "/new/output");
+        assert!(app.settings.has_local_edits());
+        assert!(app.model.workflow.pending_start.is_none());
+        assert!(app.model.workflow.training_run.is_none());
+        assert!(capture.try_recv().is_err());
+
+        let (mut app, mut capture) = start_app();
+        let before = app.settings.draft().unwrap().workflows.train.request.outputdir.clone();
+        let id = crate::generated::constraint_workflowstrainrequestoutputdir().stable_field_id;
+        drop(app.on_train(Outcome::Output(Output::Browse(id))));
+        let intent = next_intent(&mut capture, ApplicationIntentEndpoint::FileDialogOpen);
+        let target = crate::generated::FileDialogTarget::SettingsFieldTarget(
+            crate::generated::SettingsFieldTarget { stableid: id });
+        app.model.reduce_reply(intent.correlation, Ok(crate::generated::ApplicationReply::FileDialogOpen(
+            crate::generated::FileDialogSnapshot {
+                generation: 1, active: false, cancellationrequested: false, target: target.clone(),
+                selection: Some(crate::generated::FileDialogSelection {
+                    target,
+                    result: crate::generated::FileDialogCancelledOrFileDialogSelectedVariant::FileDialogCancelled(
+                        crate::generated::FileDialogCancelled {}),
+                }),
+            })));
+        assert_eq!(app.settings.draft().unwrap().workflows.train.request.outputdir, before);
+        assert!(app.model.error.is_none());
+        assert!(app.model.file_dialog.as_ref().is_some_and(|dialog| !dialog.active));
+        assert!(app.model.workflow.pending_start.is_none());
+        assert!(app.model.workflow.training_run.is_none());
+        assert!(capture.try_recv().is_err());
     }
 
     #[test]

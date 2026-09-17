@@ -249,3 +249,12 @@ TEST_CASE("test_recipe_application_respects_overrides", "[gui][train_command]") 
 TEST_CASE("test_perceptual_selection_is_independent_in_child_arguments", "[gui][train_command][perceptual]") {
     test_perceptual_selection_is_independent_in_child_arguments();
 }
+
+TEST_CASE("training command forwards only an explicitly selected test dataset", "[gui][train]") {
+    auto request = make_train_request({0});
+    assert_flag_absent(build_train_command_arguments(request), "--test-compiled");
+    request.test_compiled_path = "/independent/test.bin";
+    assert_flag_with_value(build_train_command_arguments(request), "--test-compiled", "/independent/test.bin");
+    request.test_compiled_path.clear();
+    assert_flag_absent(build_train_command_arguments(request), "--test-compiled");
+}

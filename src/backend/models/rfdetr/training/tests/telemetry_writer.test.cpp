@@ -33,8 +33,10 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
     r::TrainingTelemetryWriter writer(run);
     r::TrainingMetricProgress progress;
     progress.phase = r::TrainingPhase::Train;
+    progress.total_images = 4096U * 7U;
     for (int sample = 0; sample < 4096; ++sample) {
         progress.optimizer_steps = sample;
+        progress.completed_images = static_cast<std::uint64_t>(sample + 1) * 7U;
         writer.Submit(progress, r::TrainingRecordRole::Live);
     }
     progress.phase = r::TrainingPhase::Completed;
@@ -52,6 +54,9 @@ void test_telemetry_pressure_preserves_a_terminal_boundary() {
     REQUIRE(previous.has_value());
     REQUIRE(previous->role == r::TrainingRecordRole::Terminal);
     REQUIRE(previous->sequence == 4096);
+    REQUIRE(previous->format_version == 2);
+    REQUIRE(previous->progress.completed_images == 4096U * 7U);
+    REQUIRE(previous->progress.total_images == previous->progress.completed_images);
     REQUIRE(previous->dropped_before == writer.persistence().dropped_records);
 }
 }  // namespace

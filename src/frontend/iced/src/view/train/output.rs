@@ -4,6 +4,7 @@ use crate::view_model::ApplicationModel;
 use iced::widget::{button, column, container, text};
 #[derive(Debug, Clone)]
 pub enum Message {
+    DirectoryChanged(String),
     Browse(u64),
     Open(String),
     History(generated::TrainingHistoryQuery),
@@ -45,7 +46,13 @@ pub fn view<'a>(
             )
         });
     let mut content = column![
-        text(directory),
+        crate::view::workflow::fields::text_field(
+            "Output directory",
+            generated::constraint_workflowstrainrequestoutputdir().stable_field_id,
+            directory,
+            model.settings_edit_available(),
+            Message::DirectoryChanged,
+        ),
         dialogs,
         button("Open saved run").on_press_maybe(
             (available
@@ -54,7 +61,6 @@ pub fn view<'a>(
             .then(|| Message::Open(directory.to_owned()))
         ),
         button("Current live run").on_press(Message::Live),
-        text(checkpoint),
         button("Inspect checkpoint").on_press_maybe(
             (available
                 && !checkpoint.is_empty()
@@ -63,7 +69,10 @@ pub fn view<'a>(
             .then(|| Message::Inspect(checkpoint.to_owned()))
         ),
     ]
-    .spacing(5);
+    .spacing(crate::view::workflow::FIELD_SPACING);
+    if !checkpoint.is_empty() {
+        content = content.push(text(checkpoint));
+    }
     if let Some(opened) = &model.workflow.training_run {
         let page = model
             .workflow
@@ -149,21 +158,21 @@ pub fn view<'a>(
             .and_then(|snapshot| snapshot.metrics.as_ref())
     };
     if let Some(record) = record {
-        content = content
-            .push(text(format!(
-                "Full checkpoint: {}",
-                record.progress.fullcheckpointpath
-            )))
-            .push(text(format!(
-                "Selected / epoch weights: {}",
-                record.progress.checkpointpath
-            )));
+        for (label, path) in [
+            ("Full checkpoint", &record.progress.fullcheckpointpath),
+            ("Selected / epoch weights", &record.progress.checkpointpath),
+        ] {
+            if !path.is_empty() {
+                content = content.push(text(format!("{label}: {path}")));
+            }
+        }
     }
     if let Some(snapshot) = &model.workflow.training {
-        content = content.push(text(format!(
-            "Active output directory: {}",
-            snapshot.outputdirectory
-        )));
+        if !snapshot.outputdirectory.is_empty() {
+            content = content.push(text(format!(
+                "Active output directory: {}", snapshot.outputdirectory
+            )));
+        }
         if snapshot.persistence.degraded {
             content = content.push(text(format!(
                 "History incomplete: {} ({} dropped)",

@@ -239,7 +239,6 @@ void apply_compiled_directory_defaults(TrainViewState& train) {
     const std::filesystem::path directory{train.compiled_dataset_dir};
     train.request.train_compiled_path = directory / "train.bin";
     train.request.val_compiled_path = directory / "val.bin";
-    if (!train.request.test_compiled_path.empty()) train.request.test_compiled_path = directory / "test.bin";
 }
 template <class Selection>
 void normalize_canonical_source_transition(const Selection& installed, Selection& candidate) noexcept {
@@ -271,8 +270,7 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
     }
     const auto& installed_train = state.workflows.train.request;
     const auto& selected_train = candidate.workflows.train.request;
-    if (selected_train.train_compiled_path != installed_train.train_compiled_path || selected_train.val_compiled_path != installed_train.val_compiled_path ||
-        selected_train.test_compiled_path != installed_train.test_compiled_path)
+    if (selected_train.train_compiled_path != installed_train.train_compiled_path || selected_train.val_compiled_path != installed_train.val_compiled_path)
         candidate.workflows.train.use_compiled_directory_defaults = false;
     apply_compiled_directory_defaults(candidate.workflows.train);
     normalize_canonical_source_transitions(state, candidate);

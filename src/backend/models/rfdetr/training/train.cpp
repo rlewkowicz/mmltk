@@ -1,3 +1,4 @@
+#include "src/common/math/checked_arithmetic.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "detail/training_snapshot.h"
 #include "detail/training_lanes.h"
@@ -556,6 +557,8 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             "grad_accum_steps, --lanes, or world size");
     }
     const size_t batches_per_step = micro_batches_per_optimizer_step(options, train_lane_count);
+    const auto total_images = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(usable_full_batches),
+                                                                  static_cast<std::uint64_t>(options.batch_size), "training image total overflow");
     const auto steps_per_epoch = static_cast<int64_t>(usable_full_batches / batches_per_step);
     const int64_t total_training_steps = std::max<int64_t>(1, steps_per_epoch * options.epochs);
     DetectionConfig detection_config = make_detection_config(artifacts.config, distributed.world_size, options.compilation_mode);
@@ -606,6 +609,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         last_training_progress.epoch = start_epoch;
         last_training_progress.total_epochs = options.epochs;
         last_training_progress.total_batches = usable_full_batches;
+        last_training_progress.total_images = total_images;
         last_training_progress.steps_per_epoch = steps_per_epoch;
         last_training_progress.train_lanes = train_lane_count;
         progress_writer->Submit(last_training_progress, TrainingRecordRole::Boundary);
@@ -656,7 +660,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
         std::unique_ptr<spdmon::ProgressBar> progress;
         if (main_process && options.progress_bar) {
             progress = std::make_unique<spdmon::ProgressBar>(phase_progress_label("train", epoch, options.epochs),
-                                                             static_cast<size_t>(usable_full_batches) * static_cast<size_t>(options.batch_size), "img");
+                                                             static_cast<size_t>(total_images), "img");
             progress->set_postfix("cl=warming, bl=warming, l=warming");
         }
         auto write_progress_snapshot = [&](TrainingPhase phase, std::optional<double> val_loss, const std::optional<EvalSummary>& val_summary,
@@ -675,6 +679,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
             snapshot.total_epochs = options.epochs;
             snapshot.completed_batches = local_micro_batches;
             snapshot.total_batches = usable_full_batches;
+            snapshot.completed_images = mmltk::common::math::checked_multiply(static_cast<std::uint64_t>(local_micro_batches),
+                                                                              static_cast<std::uint64_t>(options.batch_size), "training image progress overflow");
+            snapshot.total_images = total_images;
             snapshot.completed_waves = local_waves;
             snapshot.optimizer_steps = optimizer_steps;
             snapshot.global_optimizer_step = static_cast<std::int64_t>(epoch) * steps_per_epoch + optimizer_steps;

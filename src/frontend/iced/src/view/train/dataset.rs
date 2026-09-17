@@ -147,7 +147,7 @@ pub fn view<'a>(
                 )
             )),
         crate::view::workflow::fields::toggle(
-            "Infer splits",
+            "Infer train/validation splits",
             train.usecompileddirectorydefaults,
             enabled,
             Message::InferSplitsChanged,
@@ -173,16 +173,19 @@ pub fn view<'a>(
                 enabled,
                 Message::ValidationSplitChanged,
             ))
-            .push(crate::view::workflow::fields::text_field(
-                "Test split override",
-                crate::generated::constraint_workflowstrainrequesttestcompiledpath()
-                    .stable_field_id,
-                &train.request.testcompiledpath,
-                enabled,
-                Message::TestSplitChanged,
-            ))
     };
     let fields = fields
+        .push(crate::view::workflow::fields::text_field(
+            "Test dataset (optional)",
+            crate::generated::constraint_workflowstrainrequesttestcompiledpath().stable_field_id,
+            &train.request.testcompiledpath,
+            enabled,
+            Message::TestSplitChanged,
+        ))
+        .push(button("Clear test dataset").on_press_maybe(
+            (enabled && !train.request.testcompiledpath.is_empty())
+                .then(|| Message::TestSplitChanged(String::new())),
+        ))
         .push(crate::view::workflow::fields::toggle(
             "Overwrite",
             train.overwritecompileddataset,
@@ -266,6 +269,23 @@ pub fn view<'a>(
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+
+    #[test]
+    fn test_selection_and_clear_preserve_inference_and_other_inputs() {
+        let mut model = installed_settings_model();
+        let before = model.draft.as_ref().unwrap().workflows.train.clone();
+        for path in ["/independent/test.bin", ""] {
+            assert!(matches!(
+                update(&mut model, Message::TestSplitChanged(path.into())),
+                Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))
+            ));
+            let train = &model.draft.as_ref().unwrap().workflows.train;
+            assert_eq!(train.request.testcompiledpath, path);
+            assert_eq!(train.usecompileddirectorydefaults, before.usecompileddirectorydefaults);
+            assert_eq!(train.request.traincompiledpath, before.request.traincompiledpath);
+            assert_eq!(train.request.valcompiledpath, before.request.valcompiledpath);
+        }
+    }
 
     #[test]
     fn dataset_controls_retain_wayland_acceptance_identities() {
