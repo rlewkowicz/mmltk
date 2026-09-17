@@ -346,7 +346,7 @@ mod route_tests {
 
     #[test]
     fn fps_canvas_completion_drives_restoration_through_the_application_guard() {
-        use crate::integration_control::{FpsPixelOutcome, tests::ProbeFixture};
+        use crate::integration_control::{FpsPixelOutcome, ProbeFixture};
         for baseline in [false, true] {
             for failed in [false, true] {
                 let mut app = fps_app();
@@ -366,7 +366,7 @@ mod route_tests {
 
     #[test]
     fn disabling_fps_diagnostics_wakes_restoration_with_or_without_a_capture() {
-        use crate::integration_control::{self, FpsPixelOutcome, tests::ProbeFixture};
+        use crate::integration_control::{self, FpsPixelOutcome, ProbeFixture};
         for baseline in [false, true] {
             // Deliver either cancellation first to prove exactly one restoration.
             for callback_first in [None, Some(false), Some(true)] {
@@ -412,7 +412,7 @@ mod route_tests {
 
     #[test]
     fn fps_cancellation_preserves_terminal_transport_failure() {
-        use crate::integration_control::{self, tests::ProbeFixture};
+        use crate::integration_control::{self, ProbeFixture};
         let mut app = fps_app();
         let mut fixture = ProbeFixture::new("square");
         assert!(

@@ -1,5 +1,15 @@
 //! Real widget discovery, visibility and input operations.
-use super::*;
+use crate::integration_control::{Driver, Message, reporting};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::probe::scenario_output;
+use crate::message::Message as RootMessage;
+use iced::{Rectangle, Task, Vector};
+use iced::advanced::widget::{Id, Operation};
+use iced::advanced::widget as widget;
+use iced::advanced::widget::operation::Outcome;
+use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{click_after_surface_draw_js, click_js, paste_number_js, replace_number_js, wheel_js};
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ControlBounds {
     pub(super) target: Rectangle,
@@ -303,6 +313,10 @@ pub(super) fn reveal_control(control: String, generation: u64, reveal: Annotatio
     })
 }
 
+const SIDEBAR_HEADER_HEIGHT: f32 = 48.0;
+const SIDEBAR_REVEAL_INSET: f32 = 16.0;
+const SIDEBAR_VISIBLE_INSET: f32 = 8.0;
+
 pub(super) fn sidebar_reveal_offset(pane: Rectangle, target: Rectangle) -> Option<AbsoluteOffset> {
     let visible_top = pane.y + SIDEBAR_HEADER_HEIGHT + SIDEBAR_REVEAL_INSET;
     let visible_bottom = pane.y + pane.height - SIDEBAR_REVEAL_INSET;
@@ -508,25 +522,6 @@ impl RevealState {
     pub(super) fn measured_reveal(&mut self, offset: AbsoluteOffset) { self.reveal_offset = offset; }
 }
 
-#[cfg(test)]
-pub(super) struct Fixture {
-    pub(super) location_pending: bool,
-}
-#[cfg(test)]
-impl RevealState {
-    pub(super) fn fixture(&self) -> Fixture {
-        Fixture {
-            location_pending: self.location_pending.clone(),
-        }
-    }
-    pub(super) fn configure_fixture<R>(&mut self, edit: impl FnOnce(&mut Fixture) -> R) -> R {
-        let mut fixture = self.fixture();
-        let result = edit(&mut fixture);
-        self.location_pending = fixture.location_pending;
-        result
-    }
-}
 
-const SIDEBAR_HEADER_HEIGHT: f32 = 48.0;
-const SIDEBAR_REVEAL_INSET: f32 = 16.0;
-const SIDEBAR_VISIBLE_INSET: f32 = 8.0;
+#[cfg(test)]
+pub(in crate::integration_control) mod tests;

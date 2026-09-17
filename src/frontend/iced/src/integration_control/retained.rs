@@ -1,4 +1,19 @@
-use super::*;
+use crate::integration_control::widget_ops::{click, click_after_surface_draw, click_number_edge, paste_number_input, wheel_number_input};
+use crate::integration_control::pixel_checks::sample_upscale_pixels;
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::pixel_checks::atlas_resize_dimensions;
+use crate::generated::FeatureId;
+use crate::integration_control::{COMPLETION_WITHOUT_INPUT, Driver, EXPLORE_AUGMENTATION_REROLL, EXPLORE_AUGMENTATION_TOGGLE, EXPLORE_DATASET_PANE, EXPLORE_DETAILS_PANE, EXPLORE_DETAIL_CLOSE, EXPLORE_DETAIL_ORIGINAL, EXPLORE_GALLERY, EXPLORE_RESHUFFLE, EXPLORE_UPSCALE_ACTIONS, Message, Phase, explore_message, pixel_checks, probe, reporting, route_edit_available, settled_settings_snapshot, widget_ops};
+use crate::integration_control::pixel_checks::{AtlasDraw, ProbeOutcome, atlas_scroll_window, displayed_detail, fully_drawn_gallery, pixel_fixture_enabled, sampleable_presentation};
+use crate::integration_control::probe::{ProbeReceipt, ScenarioOutput, complete_atlas_probe, current_receipt, invalidate_atlas_observation, probe_output, rearm_viewer_observation};
+use crate::integration_control::widget_ops::{gallery_slot_bounds, sidebar_control_visible, sidebar_reveal_offset};
+use crate::message::Message as RootMessage;
+use crate::view::{explore, train};
+use crate::view_model::ApplicationModel;
+use iced::{Rectangle, Task};
+use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{canvas_size_js, canvas_size_settled_js, fullscreen_js, fullscreen_settled_js, hover_after_surface_draw_js, restore_canvas_size_js, sweep_js};
 
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
@@ -4353,8 +4368,8 @@ impl State {
                     Phase::Complete
                 };
             }
-            
-        
+
+
     }
 }
 
@@ -4541,51 +4556,6 @@ pub(super) const EXPLORE_PREVIOUS: &str = explore::DETAIL_PREVIOUS_ID;
 
 pub(super) const EXPLORE_ANNOTATE: &str = explore::DETAIL_ANNOTATE_ID;
 
+
 #[cfg(test)]
-pub(super) struct Fixture {
-    pub(super) explore_paste_read: bool,
-    pub(super) gallery_completion_held: Option<(u64, u32)>,
-    pub(super) upscale_pixels: Option<(u64, u64, u32, u32)>,
-    pub(super) atlas_row_extent: f32,
-    pub(super) atlas_receipt: Option<AtlasDraw>,
-    pub(super) atlas_pixels: Option<AtlasDraw>,
-    pub(super) atlas_composition: Option<AtlasDraw>,
-    pub(super) atlas_baseline: Option<(u64, u64)>,
-    pub(super) explore_integer_baseline: u64,
-    pub(super) explore_integer_target: u64,
-    pub(super) oversized_gallery: Option<(iced::Size, crate::generated::VisualExtent)>,
-}
-#[cfg(test)]
-impl State {
-    pub(super) fn fixture(&self) -> Fixture {
-        Fixture {
-            explore_paste_read: self.explore_paste_read.clone(),
-            gallery_completion_held: self.gallery_completion_held.clone(),
-            upscale_pixels: self.upscale_pixels.clone(),
-            atlas_row_extent: self.atlas_row_extent.clone(),
-            atlas_receipt: self.atlas_receipt.clone(),
-            atlas_pixels: self.atlas_pixels.clone(),
-            atlas_composition: self.atlas_composition.clone(),
-            atlas_baseline: self.atlas_baseline.clone(),
-            explore_integer_baseline: self.explore_integer_baseline.clone(),
-            explore_integer_target: self.explore_integer_target.clone(),
-            oversized_gallery: self.oversized_gallery.clone(),
-        }
-    }
-    pub(super) fn configure_fixture<R>(&mut self, edit: impl FnOnce(&mut Fixture) -> R) -> R {
-        let mut fixture = self.fixture();
-        let result = edit(&mut fixture);
-        self.explore_paste_read = fixture.explore_paste_read;
-        self.gallery_completion_held = fixture.gallery_completion_held;
-        self.upscale_pixels = fixture.upscale_pixels;
-        self.atlas_row_extent = fixture.atlas_row_extent;
-        self.atlas_receipt = fixture.atlas_receipt;
-        self.atlas_pixels = fixture.atlas_pixels;
-        self.atlas_composition = fixture.atlas_composition;
-        self.atlas_baseline = fixture.atlas_baseline;
-        self.explore_integer_baseline = fixture.explore_integer_baseline;
-        self.explore_integer_target = fixture.explore_integer_target;
-        self.oversized_gallery = fixture.oversized_gallery;
-        result
-    }
-}
+pub(in crate::integration_control) mod tests;

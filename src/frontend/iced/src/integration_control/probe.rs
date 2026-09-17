@@ -1,5 +1,13 @@
 //! Exact receipt and asynchronous callback custody.
-use super::*;
+use crate::integration_control::{Driver, EXPLORE_GALLERY, Message, Phase, pixel_checks, reporting, reporting_enabled, widget_ops};
+use crate::integration_control::pixel_checks::{AtlasDraw, FpsPixelOutcome, ProbeOutcome, SampleablePresentation, sampleable_presentation};
+use crate::view::explore;
+use crate::view_model::ApplicationModel;
+use iced::Rectangle;
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{annotation_swatch_js, capture_probe_js, fps_draw_js, receipt_js};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::pixel_checks::pixel_result_callback;
 #[derive(Clone)]
 pub(super) struct ControlProbe {
     pub(super) output: ScenarioOutput,
@@ -820,103 +828,6 @@ pub(super) fn complete_atlas_probe(composition: bool) {
     });
 }
 
-#[cfg(test)]
-pub(super) struct Fixture {
-    pub(super) annotation_probe: Option<AnnotationProbe>,
-    pub(super) annotation_pixels_receipt: Option<ProbeReceipt>,
-    pub(super) annotation_pixels_pending: Option<ProbeReceipt>,
-    pub(super) control_probe_receipt: Option<ProbeReceipt>,
-    pub(super) control_probe: Option<ControlProbe>,
-    pub(super) annotation_drawn: Option<(u64, u64)>,
-    pub(super) viewer_drawn: Option<(u64, u64, ViewerDraw)>,
-    pub(super) upscale_pixel_pending: Option<ProbeReceipt>,
-    pub(super) gallery_drawn: Option<(u64, u64)>,
-}
-#[cfg(test)]
-impl Requests {
-    pub(super) fn fixture(&self) -> Fixture {
-        Fixture {
-            annotation_probe: self.annotation_probe.clone(),
-            annotation_pixels_receipt: self.annotation_pixels_receipt.clone(),
-            annotation_pixels_pending: self.annotation_pixels_pending.clone(),
-            control_probe_receipt: self.control_probe_receipt.clone(),
-            control_probe: self.control_probe.clone(),
-            annotation_drawn: self.annotation_drawn.clone(),
-            viewer_drawn: self.viewer_drawn.clone(),
-            upscale_pixel_pending: self.upscale_pixel_pending.clone(),
-            gallery_drawn: self.gallery_drawn.clone(),
-        }
-    }
-    pub(super) fn configure_fixture<R>(&mut self, edit: impl FnOnce(&mut Fixture) -> R) -> R {
-        let mut fixture = self.fixture();
-        let result = edit(&mut fixture);
-        self.annotation_probe = fixture.annotation_probe;
-        self.annotation_pixels_receipt = fixture.annotation_pixels_receipt;
-        self.annotation_pixels_pending = fixture.annotation_pixels_pending;
-        self.control_probe_receipt = fixture.control_probe_receipt;
-        self.control_probe = fixture.control_probe;
-        self.annotation_drawn = fixture.annotation_drawn;
-        self.viewer_drawn = fixture.viewer_drawn;
-        self.upscale_pixel_pending = fixture.upscale_pixel_pending;
-        self.gallery_drawn = fixture.gallery_drawn;
-        result
-    }
-}
 
 #[cfg(test)]
-pub(super) struct ObserverFixture {
-    pub(super) generation: u64,
-    pub(super) subscription: Option<std::sync::Arc<()>>,
-    pub(super) receipts: std::collections::BTreeMap<&'static str, ProbeReceipt>,
-    pub(super) output: Option<ScenarioOutput>,
-    pub(super) identity: (u64, u64),
-    pub(super) viewer: Option<(u64, u64, ViewerDraw)>,
-    pub(super) gallery: Option<(u64, u64)>,
-    pub(super) atlas: Option<AtlasDraw>,
-    pub(super) atlas_pixels_owner: Option<std::sync::Arc<()>>,
-    pub(super) atlas_composition_owner: Option<std::sync::Arc<()>>,
-    pub(super) fps_sample: Option<iced::time::Instant>,
-    pub(super) fps_draw: Option<reporting::FpsEvidence>,
-}
-#[cfg(test)]
-pub(super) fn with_observer_fixture<R>(edit: impl FnOnce(&std::cell::RefCell<ObserverFixture>) -> R) -> R {
-    SURFACE_DRAW_OBSERVER.with(|owner| {
-        let state = owner.borrow();
-        let fixture = std::cell::RefCell::new(ObserverFixture {
-            generation: state.generation.clone(),
-            subscription: state.subscription.clone(),
-            receipts: state.receipts.clone(),
-            output: state.output.clone(),
-            identity: state.identity.clone(),
-            viewer: state.viewer.clone(),
-            gallery: state.gallery.clone(),
-            atlas: state.atlas.clone(),
-            atlas_pixels_owner: state.atlas_pixels_owner.clone(),
-            atlas_composition_owner: state.atlas_composition_owner.clone(),
-            fps_sample: state.fps_sample.clone(),
-            fps_draw: state.fps_draw.clone(),
-        });
-        drop(state);
-        let result = edit(&fixture);
-        let fixture = fixture.into_inner();
-        let mut state = owner.borrow_mut();
-        state.generation = fixture.generation;
-        state.subscription = fixture.subscription;
-        state.receipts = fixture.receipts;
-        state.output = fixture.output;
-        state.identity = fixture.identity;
-        state.viewer = fixture.viewer;
-        state.gallery = fixture.gallery;
-        state.atlas = fixture.atlas;
-        state.atlas_pixels_owner = fixture.atlas_pixels_owner;
-        state.atlas_composition_owner = fixture.atlas_composition_owner;
-        state.fps_sample = fixture.fps_sample;
-        state.fps_draw = fixture.fps_draw;
-        result
-    })
-}
-
-#[cfg(test)]
-impl SurfaceDrawSubscription {
-    pub(super) fn for_test(owner: std::sync::Arc<()>) -> Self { Self(owner) }
-}
+pub(in crate::integration_control) mod tests;

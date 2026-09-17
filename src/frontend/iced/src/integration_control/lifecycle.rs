@@ -1,4 +1,14 @@
-use super::*;
+use crate::integration_control::widget_ops::{click, click_number_edge, wheel_number_input};
+use crate::generated::FeatureId;
+use crate::integration_control::{Driver, Phase, reporting, route_edit_available, settled_settings_snapshot, ui_scale_evidence, widget_ops};
+use crate::integration_control::widget_ops::{AnnotationReveal, reveal_control};
+use crate::message::Message as RootMessage;
+use crate::view::train;
+use crate::view_model::ApplicationModel;
+use iced::{Rectangle, Task};
+use iced::widget::operation::RelativeOffset;
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::slider_drag_js;
 
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
@@ -447,7 +457,7 @@ impl State {
                     .settings_snapshot
                     .as_ref()
                     .map_or(0, |snapshot| snapshot.revision);
-                widgets.arm(driver, 
+                widgets.arm(driver,
                     crate::generated::constraint_workflowstrainrequesttrainingsupervisiondenoisingenabled()
                         .stable_field_id
                         .to_string(),

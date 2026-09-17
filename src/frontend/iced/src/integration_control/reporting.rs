@@ -1,8 +1,16 @@
-use super::retained::{EXPLORE_OPEN};
-use super::lifecycle::{advanced_layout_field, COMPILE_DATASET, DATASET_BROWSE, TRAIN_MODEL_CARD, BENCHMARK_OVERRIDE};
 //! Effect-only integration reporting. Payloads enter here before collection.
-use super::*;
+use crate::generated::FeatureId;
+use crate::integration_control::{Driver, EXPLORE_GALLERY, EXPLORE_UPSCALE_ACTIONS, Phase, probe, reporting_enabled, retained};
+use crate::integration_control::pixel_checks::sampleable_presentation;
+use crate::integration_control::probe::current_receipt;
+use crate::view::explore;
+use crate::view_model::ApplicationModel;
+use iced::Rectangle;
+use super::retained::EXPLORE_OPEN;
+use super::lifecycle::{advanced_layout_field, COMPILE_DATASET, DATASET_BROWSE, TRAIN_MODEL_CARD, BENCHMARK_OVERRIDE};
 use std::cell::RefCell;
+#[cfg(test)]
+use crate::integration_control::initialize_reporting;
 
 pub(crate) fn metric_projection(label: &str, positions: &[[f64; 2]]) {
     emit(|sink| {
@@ -743,7 +751,13 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Capture, STYLES};
+    use crate::integration_control::retained::EXPLORE_OPEN;
+    use crate::integration_control::lifecycle::{BENCHMARK_OVERRIDE, TRAIN_MODEL_CARD};
+    use crate::view::explore;
+    use crate::integration_control::{COMPLETION_WITHOUT_INPUT, Controller, EXPLORE_GALLERY, Message, Phase};
+    use crate::generated::FeatureId;
+    use iced::Rectangle;
     use crate::generated::{ExploreMode, ExploreOrder, IntegrationControlKind};
     use std::cell::Cell;
 
@@ -831,7 +845,7 @@ mod tests {
             ));
             assert_eq!(driver.driver.phase, Phase::SettingsOpen);
             assert_eq!(driver.driver.input_scale, 1.5);
-            assert!(driver.widgets.fixture().location_pending);
+            assert!(driver.widgets.location_pending());
             driver.driver.report_phase_progress();
             driver.driver.report_phase_progress();
             let records = capture.records();
@@ -977,7 +991,7 @@ mod tests {
             let bounds = Rectangle::new(iced::Point::new(12.0, 24.0), iced::Size::new(96.0, 32.0));
             for _ in 0..2 {
                 driver.driver.phase = Phase::ExploreOpen;
-                driver.widgets.configure_fixture(|fixture| fixture.location_pending = true);
+                driver.widgets.begin_location();
                 driver.update(Message::Located {
                     control: EXPLORE_OPEN.into(),
                     bounds,
@@ -985,7 +999,7 @@ mod tests {
                 // The native fixture has no Firefox click adapter. Its existing
                 // failure behavior still follows the real located-style route.
                 assert_eq!(driver.driver.phase, Phase::Failed);
-                assert!(!driver.widgets.fixture().location_pending);
+                assert!(!driver.widgets.location_pending());
                 assert!(COMPLETION_WITHOUT_INPUT.with(Cell::get));
                 let records = capture.records();
                 if enabled {

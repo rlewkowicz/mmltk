@@ -1,28 +1,26 @@
+use crate::integration_control::widget_ops::click;
+use crate::generated::FeatureId;
+use crate::integration_control::probe::{reset_observer, surface_draw_stream};
+use crate::message::Message as RootMessage;
+use crate::view::{annotation, explore, train};
+use crate::view_model::{ApplicationModel, ConnectionState};
+use iced::{Rectangle, Task};
 mod retained;
 mod lifecycle;
 mod widget_ops;
 mod probe;
 mod pixel_checks;
-use widget_ops::*;
-use probe::*;
-use pixel_checks::*;
 pub use probe::{ProbeReceipt, ViewerDraw};
 pub use pixel_checks::{AtlasDraw, FpsPixelOutcome, ProbeOutcome};
-pub(crate) use probe::{record_probe_draw, report_workspace_fps};
+pub(crate) use probe::{record_probe_draw, report_surface_draw, report_workspace_fps};
+#[cfg(test)]
+pub(crate) use probe::tests::ProbeFixture;
 pub(crate) use pixel_checks::{report_atlas_draw, sample_boundary_pixels};
 mod annotation_checks;
 mod annotation_product;
 mod reporting;
 pub(crate) use reporting::metric_projection as report_metric_projection;
 mod workflows;
-use crate::generated::FeatureId;
-use crate::message::Message as RootMessage;
-use crate::view::{annotation, explore, train};
-use crate::view_model::{ApplicationModel, ConnectionState};
-use iced::advanced::widget::operation::Outcome;
-use iced::advanced::widget::{self, Id, Operation};
-use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
-use iced::{Rectangle, Task, Vector};
 
 thread_local! {
     static DRIVER_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -75,35 +73,12 @@ pub(crate) fn notify_driver_draw(
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 pub const EXPLORE_DATASET_PANE: &str = explore::DATASET_PANE_ID;
 pub const EXPLORE_DETAILS_PANE: &str = explore::DETAILS_PANE_ID;
 pub const EXPLORE_DETAIL_CLOSE: &str = explore::DETAIL_CLOSE_ID;
 
 
 const EXPLORE_GALLERY: &str = explore::GALLERY_WORKSPACE_ID;
-
-
-
-
-
 
 
 fn annotation_message(message: annotation::Message) -> Task<RootMessage> {
@@ -117,7 +92,6 @@ fn explore_message(message: explore::Message) -> Task<RootMessage> {
         crate::view::router::Message::Explore(message),
     ))
 }
-
 
 
 pub(crate) fn report_viewer_label(
@@ -183,31 +157,11 @@ pub const EXPLORE_UPSCALE_ACTIONS: [&str; 3] = [
 ];
 
 
-
 // Fixture demand windows are disjoint and separated beyond the native four
 // neighbour rows. This does not change the producer's admission/cache policy.
 
 
-
-
-
-
 const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 #[derive(Debug, Clone)]
@@ -480,8 +434,6 @@ pub(crate) fn report_snapshot_conflict(family: &str, revision: u64, fields: &str
         )
     });
 }
-
-pub(crate) use probe::report_surface_draw;
 
 
 pub(crate) fn report_surface_geometry(
@@ -1068,33 +1020,6 @@ impl Phase {
 }
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn route_edit_available(
     model: &ApplicationModel,
     settings: &crate::view::settings::SettingsModel,
@@ -1484,7 +1409,6 @@ impl Controller {
             Err(_) => self.driver.fail("integration control delivery failed"),
         }
     }
-
 
 
     pub(crate) fn observe_upscale_request(&mut self, kernel: crate::generated::UpscaleKernel) {
@@ -2038,7 +1962,7 @@ impl Driver {
                     self.fail("Firefox click dispatch failed");
                 }
                 None
-            
+
     }
     pub(super) fn advance_to(&mut self, phase: Phase) -> Task<RootMessage> {
         reporting::emit(|sink| {
@@ -2063,7 +1987,6 @@ impl Driver {
         self.reporting
             .observe(|reporting| reporting.phase_progress(&self.phase));
     }
-
 
 
 }
@@ -2112,6 +2035,9 @@ impl Driver {
 
 impl Controller {
     pub fn update(&mut self, message: Message) -> Option<train::Message> {
+        if !self.driver.running() {
+            return None;
+        }
         let result = self.update_probe_message(message);
         self.finish_transition();
         result
@@ -2136,8 +2062,11 @@ impl Controller {
         active: FeatureId,
         surface: Option<crate::presentation_surface::Surface>,
     ) -> Task<RootMessage> {
+        let running = self.driver.running();
         let result = self.advance_transition(model, settings, applied_scale, router, active, surface);
-        self.finish_transition();
+        if running {
+            self.finish_transition();
+        }
         result
     }
     fn finish_transition(&mut self) {

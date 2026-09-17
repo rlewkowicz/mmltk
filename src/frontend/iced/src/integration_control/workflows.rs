@@ -1,6 +1,19 @@
-use super::annotation_checks::{annotation_layout_scale};
 //! Real model workflows driven through the packaged Iced interface.
-use super::*;
+use crate::integration_control::widget_ops::click;
+use crate::generated::FeatureId;
+use crate::integration_control::{Driver, Phase, reporting, widget_ops};
+use crate::integration_control::pixel_checks::ProbeOutcome;
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{Message, probe::scenario_output};
+use crate::integration_control::widget_ops::{AnnotationReveal, locate, reveal_control};
+use crate::message::Message as RootMessage;
+use crate::view_model::ApplicationModel;
+use iced::{Rectangle, Task};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::workflow_pixels_js;
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::pixel_checks::pixel_result_callback;
+use super::annotation_checks::annotation_layout_scale;
 use crate::generated::{ComputeOperationOutcome, SourceKind};
 use crate::view::{settings, workflow};
 
@@ -113,11 +126,13 @@ fn completed(stage: &str, facts: [f64; 4]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Picture, Step};
+    use crate::integration_control::{Message, Phase};
+    use crate::integration_control::pixel_checks::ProbeOutcome;
 
     #[test]
     fn workflow_completion_requires_current_nonempty_canvas_evidence() {
-        let mut fixture = crate::integration_control::tests::ProbeFixture::new("workflows");
+        let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
         let controller = &mut fixture.controller;
         controller.driver.phase = Phase::Workflows(Step::AwaitPixels(Picture::Narrow, 0));
         let capture = |generation, outcome| Message::Scoped {
@@ -427,7 +442,7 @@ impl State {
             Step::Predict => {
                 self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Predict))
             }
-            Step::Source(index) if active == FeatureId::Predict && settled => self.workflow_control(widgets, driver, 
+            Step::Source(index) if active == FeatureId::Predict && settled => self.workflow_control(widgets, driver,
                     [
                         "predict.source.compiled",
                         "predict.source.image",

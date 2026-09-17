@@ -1,5 +1,13 @@
 //! Independent canvas pixel and FPS observations.
-use super::*;
+use crate::integration_control::{COMPLETION_WITHOUT_INPUT, Driver, EXPLORE_GALLERY, Message, PIXEL_FIXTURE_ENABLED, Phase, pixel_checks, reporting, reporting_enabled};
+use crate::integration_control::probe::{ProbeReceipt, ScenarioOutput, current_fps_draw, current_receipt, observe_atlas_draw, probe_output, rearm_fps_sampling, same_probe};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::probe::{atlas_probe_output, observer_generation};
+use crate::message::Message as RootMessage;
+use crate::view_model::ApplicationModel;
+use iced::{Rectangle, Task};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{atlas_composition_js, atlas_pixels_js, boundary_pixels_js, fps_current_js, fps_pixels_js, upscale_pixels_js};
 #[derive(Debug, Clone)]
 pub enum FpsPixelOutcome {
     Invalidated,
@@ -950,125 +958,6 @@ pub(super) fn verify_workspace_fps_pixels(image: &FpsPixels, evidence: reporting
     valid
 }
 
-#[cfg(test)]
-pub(super) fn fps_pixel_fixture(dark: bool, scale: f32) -> (FpsPixels, reporting::FpsEvidence) {
-    let width = (74.0 * scale) as u32;
-    let height = (22.0 * scale) as u32;
-    let mut rgba = vec![if dark { 0 } else { 255 }; width as usize * height as usize * 4];
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel[3] = 255;
-    }
-    // Representative contrasting glyph stroke, safely inside the padded border.
-    for y in (8.0 * scale) as u32..(18.0 * scale) as u32 {
-        for x in (48.0 * scale) as u32..(51.0 * scale) as u32 {
-            let offset = (y as usize * width as usize + x as usize) * 4;
-            rgba[offset..offset + 3].fill(if dark { 255 } else { 0 });
-        }
-    }
-    (
-        FpsPixels {
-            width,
-            height,
-            rgba,
-        },
-        reporting::FpsEvidence {
-            bounds: Rectangle::new(iced::Point::new(20.0, 6.0), iced::Size::new(74.0, 22.0)),
-            clip: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 60.0)),
-            dark,
-            frames: 30,
-            seconds: 0.5,
-        },
-    )
-}
-
-#[cfg(test)]
-mod fps_tests {
-    use super::*;
-    use super::reporting::{Capture, FpsEvidence};
-    #[test]
-    fn workspace_fps_pixel_acceptance_uses_the_visible_counter_at_each_scale_and_theme() {
-        let capture = Capture::new(true);
-        for scale in [1.0, 1.25, 1.5, 2.25] {
-            for dark in [false, true] {
-                let (pixels, evidence) = fps_pixel_fixture(dark, scale);
-                assert!(verify_workspace_fps_pixels(&pixels, evidence));
-            }
-        }
-        let records = capture.records();
-        assert_eq!(records.len(), 8);
-        assert!(records.iter().all(|(event, control, detail, values)| {
-            event == "integration.workspace_fps_pixels"
-                && control == EXPLORE_GALLERY
-                && detail == "visible-counter"
-                && values[0] == 30.0
-                && values[1] == 0.5
-        }));
-    }
-
-    #[test]
-    fn fps_pixels_require_opaque_text_background_complete_extent_and_unclipped_placement() {
-        let _capture = Capture::new(true);
-        for dark in [false, true] {
-            let (pixels, evidence) = fps_pixel_fixture(dark, 1.0);
-            let mut missing = pixels.clone();
-            missing.rgba.clear();
-            assert!(!verify_workspace_fps_pixels(&missing, evidence));
-            let mut background = pixels.clone();
-            for pixel in background.rgba.chunks_exact_mut(4) {
-                pixel[..3].fill(if dark { 0 } else { 255 });
-            }
-            assert!(!verify_workspace_fps_pixels(&background, evidence));
-            let mut transparent = pixels.clone();
-            transparent.rgba[3] = 0;
-            assert!(!verify_workspace_fps_pixels(&transparent, evidence));
-            let mut incomplete = pixels.clone();
-            incomplete.rgba.pop();
-            assert!(!verify_workspace_fps_pixels(&incomplete, evidence));
-            let mut border = pixels.clone();
-            for pixel in border.rgba[..border.width as usize * 4].chunks_exact_mut(4) {
-                pixel[..3].fill(if dark { 255 } else { 0 });
-            }
-            assert!(!verify_workspace_fps_pixels(&border, evidence));
-            assert!(!verify_workspace_fps_pixels(
-                &pixels,
-                FpsEvidence {
-                    dark: !dark,
-                    ..evidence
-                }
-            ));
-            for seconds in [0.0, 0.499, f64::NAN, f64::INFINITY] {
-                assert!(!verify_workspace_fps_pixels(
-                    &pixels,
-                    FpsEvidence {
-                        seconds,
-                        ..evidence
-                    }
-                ));
-            }
-            assert!(!verify_workspace_fps_pixels(
-                &pixels,
-                FpsEvidence {
-                    frames: 0,
-                    ..evidence
-                }
-            ));
-            for x in [f32::NAN, -1.0, 21.0, 100.0] {
-                assert!(!verify_workspace_fps_pixels(
-                    &pixels,
-                    FpsEvidence {
-                        bounds: Rectangle {
-                            x,
-                            ..evidence.bounds
-                        },
-                        ..evidence
-                    }
-                ));
-            }
-        }
-    }
-
-}
-
 impl State {
     pub(super) fn advance_pixel_checks(
         &mut self, driver: &mut Driver,
@@ -1239,30 +1128,6 @@ impl State {
 pub(super) const WORKSPACE_FPS_PIXEL_FAILURE: &str =
     "Workspace FPS canvas capture did not contain its upper-right counter background and text";
 
+
 #[cfg(test)]
-pub(super) struct Fixture {
-    pub(super) workspace_fps_baseline: bool,
-    pub(super) workspace_fps_verified: bool,
-    pub(super) workspace_fps_probe: Option<ScenarioOutput>,
-    pub(super) workspace_fps_failure: Option<&'static str>,
-}
-#[cfg(test)]
-impl State {
-    pub(super) fn fixture(&self) -> Fixture {
-        Fixture {
-            workspace_fps_baseline: self.workspace_fps_baseline.clone(),
-            workspace_fps_verified: self.workspace_fps_verified.clone(),
-            workspace_fps_probe: self.workspace_fps_probe.clone(),
-            workspace_fps_failure: self.workspace_fps_failure.clone(),
-        }
-    }
-    pub(super) fn configure_fixture<R>(&mut self, edit: impl FnOnce(&mut Fixture) -> R) -> R {
-        let mut fixture = self.fixture();
-        let result = edit(&mut fixture);
-        self.workspace_fps_baseline = fixture.workspace_fps_baseline;
-        self.workspace_fps_verified = fixture.workspace_fps_verified;
-        self.workspace_fps_probe = fixture.workspace_fps_probe;
-        self.workspace_fps_failure = fixture.workspace_fps_failure;
-        result
-    }
-}
+pub(in crate::integration_control) mod tests;

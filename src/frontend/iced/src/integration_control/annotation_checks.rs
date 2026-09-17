@@ -1,5 +1,20 @@
-use super::retained::{EXPLORE_ANNOTATE};
-use super::lifecycle::{same_numeric_value};
+use crate::integration_control::widget_ops::click;
+use crate::generated::FeatureId;
+use crate::integration_control::{ANNOTATION_SURFACE, CopyScaleStage, Driver, Message, Phase, annotation_checks, annotation_product, annotation_message, probe, reporting, settled_settings_snapshot, widget_ops};
+use crate::integration_control::pixel_checks::ProbeOutcome;
+use crate::integration_control::probe::{ProbeReceipt, current_receipt};
+use crate::integration_control::widget_ops::{AnnotationReveal, locate, reveal_control, scroll_control_into_view};
+use crate::message::Message as RootMessage;
+use crate::view::{annotation, train};
+use crate::view_model::ApplicationModel;
+use iced::{Rectangle, Task};
+use iced::widget::operation::RelativeOffset;
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{annotation_pixels_js, annotation_pointer_js, annotation_release_js};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::pixel_checks::pixel_result_callback;
+use super::retained::EXPLORE_ANNOTATE;
+use super::lifecycle::same_numeric_value;
 use crate::generated::{AnnotationMask, AnnotationShape, AnnotationUiState};
 
 pub(super) fn mask_contains(mask: &AnnotationMask, [x, y]: [u16; 2]) -> bool {
@@ -309,7 +324,7 @@ impl State {
                         revision: snapshot.ui.interactionrevision,
                         tool: crate::generated::AnnotationTool::Point,
                     };
-                    return self.annotation_arm_scrolled(widgets, driver, probes, 
+                    return self.annotation_arm_scrolled(widgets, driver, probes,
                         annotation::tool_id(crate::generated::AnnotationTool::Point),
                         RelativeOffset::START,
                     );
@@ -430,7 +445,7 @@ impl State {
                             driver.fail("Annotation long-list setup did not preserve its exact bounded inventory");
                             return Task::none();
                         }
-                        return self.copy_scale_transition(driver, 
+                        return self.copy_scale_transition(driver,
                             model,
                             applied_scale,
                             CopyScaleStage::Wide,
@@ -532,7 +547,7 @@ impl State {
                     return Task::none();
                 }
                 self.copy_capability_ready = false;
-                self.annotation_arm_scrolled(widgets, driver, probes, 
+                self.annotation_arm_scrolled(widgets, driver, probes,
                     annotation::tool_id(crate::generated::AnnotationTool::ColorSample),
                     RelativeOffset::START,
                 )
@@ -605,7 +620,7 @@ impl State {
                         return Task::none();
                     }
                     self.copy_product_gesture = None;
-                    return self.copy_scale_transition(driver, 
+                    return self.copy_scale_transition(driver,
                         model,
                         applied_scale,
                         if self.copy_narrow {
@@ -715,7 +730,7 @@ impl State {
                         revision: snapshot.ui.interactionrevision,
                         tool: crate::generated::AnnotationTool::Box,
                     };
-                    return self.annotation_arm_scrolled(widgets, driver, probes, 
+                    return self.annotation_arm_scrolled(widgets, driver, probes,
                         annotation::tool_id(crate::generated::AnnotationTool::Box),
                         RelativeOffset::START,
                     );
@@ -1024,7 +1039,7 @@ impl State {
                         driver.fail("Annotation pixel inventory lost its next expected sample");
                         return Task::none();
                     };
-                    if !probes.prepare_annotation_probe(widgets, 
+                    if !probes.prepare_annotation_probe(widgets,
                         snapshot.frame.revision,
                         presentation_revision,
                         [snapshot.frame.extent.width, snapshot.frame.extent.height],
@@ -1787,40 +1802,6 @@ pub(super) const ANNOTATION_STOP: &str = "annotation.stop";
 
 pub(super) const ANNOTATION_BRUSH_RADIUS: &str = "annotation.brush_radius";
 
-#[cfg(test)]
-pub(super) struct Fixture {
-    pub(super) copy_original_scale: f32,
-    pub(super) copy_requested_scale: f32,
-    pub(super) copy_swatch_color: [f64; 3],
-    pub(super) copy_swatch_ready: bool,
-    pub(super) copy_capability_ready: bool,
-    pub(super) copy_capability_available: bool,
-}
-#[cfg(test)]
-impl State {
-    pub(super) fn fixture(&self) -> Fixture {
-        Fixture {
-            copy_original_scale: self.copy_original_scale.clone(),
-            copy_requested_scale: self.copy_requested_scale.clone(),
-            copy_swatch_color: self.copy_swatch_color.clone(),
-            copy_swatch_ready: self.copy_swatch_ready.clone(),
-            copy_capability_ready: self.copy_capability_ready.clone(),
-            copy_capability_available: self.copy_capability_available.clone(),
-        }
-    }
-    pub(super) fn configure_fixture<R>(&mut self, edit: impl FnOnce(&mut Fixture) -> R) -> R {
-        let mut fixture = self.fixture();
-        let result = edit(&mut fixture);
-        self.copy_original_scale = fixture.copy_original_scale;
-        self.copy_requested_scale = fixture.copy_requested_scale;
-        self.copy_swatch_color = fixture.copy_swatch_color;
-        self.copy_swatch_ready = fixture.copy_swatch_ready;
-        self.copy_capability_ready = fixture.copy_capability_ready;
-        self.copy_capability_available = fixture.copy_capability_available;
-        result
-    }
-}
-
 fn advance_annotation(driver: &mut Driver, phase: Phase) -> Task<RootMessage> {
     let reveal = matches!(phase, Phase::CopyProductWait);
     let continuation = driver.advance_to(phase);
@@ -1829,3 +1810,6 @@ fn advance_annotation(driver: &mut Driver, phase: Phase) -> Task<RootMessage> {
         scroll_control_into_view(ANNOTATION_SURFACE.into(), AnnotationReveal::Geometry).chain(continuation)
     } else { continuation }
 }
+
+#[cfg(test)]
+pub(in crate::integration_control) mod tests;
