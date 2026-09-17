@@ -241,8 +241,10 @@ template <class Request, auto Access>
             if (constraint.maximum_items != 0U && destination.size() >= constraint.maximum_items) {
                 return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "too many option values"});
             }
-            if constexpr (requires { destination.full(); }) {
-                if (destination.full()) { return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "option capacity exceeded"}); }
+            if constexpr (kInplaceVector<Value>) {
+                if (destination.size() == InplaceVectorCapacity<Value>::value) {
+                    return std::unexpected(ParseError{ParseErrorCode::InvalidValue, text, "option capacity exceeded"});
+                }
             }
             destination.push_back(std::move(*parsed));
         } else {
@@ -322,9 +324,7 @@ template <class Request, auto Access, bool (*EmissionEnabled)(const Request&) no
     }
     if (!negated_name.empty() && !std::is_same_v<Value, bool>) throw "only a boolean option can be negated";
     if (constraint.maximum_items != 0U && !kRepeatableValue<Value>) { throw "item capacity requires a repeatable option"; }
-    if constexpr (kRepeatableValue<Value> && requires(Value& value) { value.full(); }) {
-        if (constraint.maximum_items != 0U && constraint.maximum_items > Value{}.capacity()) { throw "item policy exceeds fixed-capacity option storage"; }
-    }
+    if (!fixed_sequence_capacity_is_valid<Value>(constraint.maximum_items)) { throw "item policy exceeds fixed-capacity option storage"; }
     // CLEANUP-IGNORE: The custom reflected descriptor has distinct assignment policy and callback authority.
     return OptionDescriptor<Request>{
         .name = name,

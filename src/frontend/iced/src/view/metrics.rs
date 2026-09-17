@@ -158,8 +158,12 @@ impl Component {
                 self.invalidate();
             }
             Message::Log(log) => {
-                self.log = log;
-                self.invalidate();
+                if self.log != log {
+                    self.log = log;
+                    for chart in &mut self.charts {
+                        chart.dirty |= chart.kind.loss();
+                    }
+                }
             }
             Message::Plot(kind, message) => {
                 if let Some(chart) = self.charts.iter_mut().find(|c| c.kind == kind) {

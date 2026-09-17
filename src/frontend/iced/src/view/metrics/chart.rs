@@ -49,6 +49,7 @@ impl RetainedChart {
         if !self.dirty {
             return;
         }
+        let log = log && self.kind.loss();
         if self.axes != Some((epoch, log)) {
             self.plot
                 .set_x_axis_label(if epoch { "Epoch" } else { "Optimizer step" });
@@ -58,7 +59,7 @@ impl RetainedChart {
                 Chart::Errors => "Error",
                 _ => "Score",
             });
-            self.plot.set_y_axis_scale(if log && self.kind.loss() {
+            self.plot.set_y_axis_scale(if log {
                 AxisScale::Log { base: 10.0 }
             } else {
                 AxisScale::Linear

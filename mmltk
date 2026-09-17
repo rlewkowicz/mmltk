@@ -2638,6 +2638,36 @@ run_gpu_environment_diagnostic() {
     run_owned_docker_command "${diagnostic_container}" "${diagnostic_args[@]}"
 }
 
+run_process_diagnostic() {
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        printf '%s\n' \
+            'Usage: ./mmltk --diagnose-processes [WRAPPER_MODE]' \
+            'Read-only process snapshots for running wrapper containers owned by this repository.' \
+            'Shows process names, elapsed/CPU time, CPU/memory use, state and wait channel; omits arguments and environment.' \
+            'Does not create, stop, attach to, or alter containers; each daemon query has a 15-second deadline.'
+        return 0
+    fi
+    (( $# <= 1 )) || die "--diagnose-processes accepts at most one wrapper mode"
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    local -a filters=(--filter label=com.mmltk.wrapper=1 --filter "label=com.mmltk.repo=${repo_root}")
+    if (( $# == 1 )); then filters+=(--filter "label=com.mmltk.mode=$1"); fi
+    local containers container
+    containers="$(timeout --foreground --signal=KILL 15s docker ps "${filters[@]}" --format '{{.ID}}')" ||
+        die "could not enumerate running wrapper containers"
+    if [[ -z "${containers}" ]]; then
+        printf '%s\n' 'No matching running wrapper containers.'
+        return 0
+    fi
+    while IFS= read -r container; do
+        timeout --foreground --signal=KILL 15s docker inspect \
+            --format 'Container {{.Name}} ({{.Id}}), mode={{index .Config.Labels "com.mmltk.mode"}}' "${container}" ||
+            die "could not inspect wrapper container ${container}"
+        timeout --foreground --signal=KILL 15s docker top "${container}" \
+            -eo pid,ppid,etime,time,pcpu,pmem,stat,wchan:32,comm ||
+            die "could not inspect processes in wrapper container ${container}"
+    done <<<"${containers}"
+}
+
 run_native_symbols_diagnostic() {
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         printf '%s\n' \
@@ -3668,6 +3698,12 @@ if [[ "${1:-}" == "--diagnose-native-symbols" ]]; then
     exit $?
 fi
 
+if [[ "${1:-}" == "--diagnose-processes" ]]; then
+    invocation_mode="diagnose-processes"
+    run_process_diagnostic "${@:2}"
+    exit $?
+fi
+
 if [[ "${1:-}" == "--diagnose-native-link" ]]; then
     invocation_mode="diagnose-native-link"
     run_native_link_diagnostic "${@:2}"
@@ -3836,6 +3872,8 @@ for arg in "${passthrough_args[@]}"; do
         die "--diagnose-gpu-program must be the standalone operation; use './mmltk --diagnose-gpu-program --help'"
     [[ "${arg}" != "--diagnose-native-symbols" ]] ||
         die "--diagnose-native-symbols must be the standalone operation; use './mmltk --diagnose-native-symbols --help'"
+    [[ "${arg}" != "--diagnose-processes" ]] ||
+        die "--diagnose-processes must be the standalone operation; use './mmltk --diagnose-processes --help'"
     [[ "${arg}" != "--diagnose-native-link" ]] ||
         die "--diagnose-native-link must be the standalone operation; use './mmltk --diagnose-native-link --help'"
 done
