@@ -51,9 +51,11 @@ class NativeGdrBackend final : public GdrBufferBackend {
             int version{};
             ensure_cuda_driver_ok(cuDriverGetVersion(&version), "query DMA-BUF driver version");
             if (version < 13030) throw GdrTransportUnavailable("GDR DMA-BUF mmap requires driver 13.3+");
-            ensure_cuda_driver_ok(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_MMAP_SUPPORTED, device), "query selected device DMA-BUF mmap support");
+            ensure_cuda_driver_ok(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_MMAP_SUPPORTED, device),
+                                  "query selected device DMA-BUF mmap support");
         } else {
-            ensure_cuda_driver_ok(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, device), "query selected device GPUDirect support");
+            ensure_cuda_driver_ok(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, device),
+                                  "query selected device GPUDirect support");
         }
         if (!supported) throw GdrTransportUnavailable("selected GPU does not support the required GDR backend");
     }
@@ -65,7 +67,8 @@ class NativeGdrBackend final : public GdrBufferBackend {
     }
     void sync_memops(CUdeviceptr allocation) override {
         unsigned value = 1;
-        ensure_cuda_driver_ok(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, allocation), "enable synchronous memops on original GDR allocation");
+        ensure_cuda_driver_ok(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, allocation),
+                              "enable synchronous memops on original GDR allocation");
     }
     int free(CUdeviceptr allocation) noexcept override { return static_cast<int>(cuMemFree(allocation)); }
     std::uintptr_t pin(void* handle, CUdeviceptr data, std::size_t bytes) override {

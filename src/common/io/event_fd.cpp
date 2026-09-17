@@ -24,7 +24,7 @@ EventFdWait wait_event_fd(const int descriptor) noexcept {
     if (poll_result != 1 || (readiness.revents & POLLIN) == 0) return {EventFdWaitStatus::WaitFailed, 0U};
     const auto result = read_counter_fd(descriptor);
     return result.bytes == static_cast<ssize_t>(sizeof(result.count)) ? EventFdWait{EventFdWaitStatus::Woken, result.count}
-                                                                   : EventFdWait{EventFdWaitStatus::ReadFailed, 0U};
+                                                                      : EventFdWait{EventFdWaitStatus::ReadFailed, 0U};
 }
 void drain_event_fd(const int descriptor) noexcept {
     if (descriptor < 0) return;

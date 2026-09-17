@@ -30,8 +30,7 @@ TEST_CASE("scoped event cancellation preserves borrowing consumption and source 
         using Source = mmltk::common::concurrency::EventCancellationSource<ObservationTestTag, CancelOnDestruction>;
         using Binding = mmltk::common::concurrency::ScopedEventCancellation<Source>;
         static_assert(!std::is_copy_constructible_v<Binding> && !std::is_move_constructible_v<Binding>);
-        static_assert(!std::is_same_v<typename Binding::Token,
-                                     mmltk::common::concurrency::EventCancellationToken<OtherObservationTestTag>>);
+        static_assert(!std::is_same_v<typename Binding::Token, mmltk::common::concurrency::EventCancellationToken<OtherObservationTestTag>>);
         static_assert(std::is_same_v<decltype(std::declval<const Binding&>().token()), const typename Source::Token&>);
         {
             std::stop_source stop;

@@ -598,7 +598,9 @@ pub(crate) mod tests {
                 Point::new(320.0, 180.0),
             ),
             (
-                mouse::Event::CursorMoved { position: Point::new(380.0, 200.0) },
+                mouse::Event::CursorMoved {
+                    position: Point::new(380.0, 200.0),
+                },
                 Point::new(380.0, 200.0),
             ),
             (
@@ -618,7 +620,9 @@ pub(crate) mod tests {
             component,
             kind,
             state,
-            Event::Mouse(mouse::Event::CursorMoved { position: Point::new(-1.0, -1.0) }),
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(-1.0, -1.0),
+            }),
             mouse::Cursor::Unavailable,
         );
         redraw(component, kind, state);
@@ -628,28 +632,31 @@ pub(crate) mod tests {
     }
 
     fn dashboard_records(saved: bool) -> Vec<TrainingRecord> {
-        [0, 1].into_iter().map(|index| {
-            let mut sample = record();
-            sample.sequence = index + 1;
-            sample.role = TrainingRecordRole::Epoch;
-            sample.progress.epoch = index as i32 * 2;
-            sample.progress.globaloptimizerstep = 10 + index as i64 * 20;
-            sample.progress.scalars.total = Some(if index == 0 { 1.0 } else { 100.0 });
-            sample.progress.scalars.classification = sample.progress.scalars.total;
-            sample.progress.scalars.learningrate = Some(0.001 * (index + 1) as f64);
-            sample.progress.scalars.classerror = Some((index + 1) as f64);
-            let mut summary = evaluation();
-            summary.bbox.ap50 = if index == 0 { 0.2 } else { 0.8 };
-            summary.mask = Some(summary.bbox.clone());
-            sample.progress.val = Some(summary);
-            if saved {
-                sample.runid = "saved".into();
-                sample.attemptid = "saved-attempt".into();
-                sample.progress.epoch += 10;
-                sample.progress.globaloptimizerstep += 100;
-            }
-            sample
-        }).collect()
+        [0, 1]
+            .into_iter()
+            .map(|index| {
+                let mut sample = record();
+                sample.sequence = index + 1;
+                sample.role = TrainingRecordRole::Epoch;
+                sample.progress.epoch = index as i32 * 2;
+                sample.progress.globaloptimizerstep = 10 + index as i64 * 20;
+                sample.progress.scalars.total = Some(if index == 0 { 1.0 } else { 100.0 });
+                sample.progress.scalars.classification = sample.progress.scalars.total;
+                sample.progress.scalars.learningrate = Some(0.001 * (index + 1) as f64);
+                sample.progress.scalars.classerror = Some((index + 1) as f64);
+                let mut summary = evaluation();
+                summary.bbox.ap50 = if index == 0 { 0.2 } else { 0.8 };
+                summary.mask = Some(summary.bbox.clone());
+                sample.progress.val = Some(summary);
+                if saved {
+                    sample.runid = "saved".into();
+                    sample.attemptid = "saved-attempt".into();
+                    sample.progress.epoch += 10;
+                    sample.progress.globaloptimizerstep += 100;
+                }
+                sample
+            })
+            .collect()
     }
 
     fn dashboard(saved: bool) -> (Component, crate::view_model::ApplicationModel) {
@@ -699,7 +706,10 @@ pub(crate) mod tests {
                     let mut remount = PlotState::default();
                     assert!(redraw(&mut component, kind, &mut remount));
                     let view = component.chart_view(kind).unwrap();
-                    assert_eq!(view.ranges, camera, "{kind:?}, saved={saved}, hidden={hidden}");
+                    assert_eq!(
+                        view.ranges, camera,
+                        "{kind:?}, saved={saved}, hidden={hidden}"
+                    );
                     assert_eq!(view.legend_collapsed, legend);
                 }
             }
@@ -718,9 +728,13 @@ pub(crate) mod tests {
             // A prepared data version publishes even if its numerical camera
             // happens to be unchanged. This observes the ordinary program path.
             assert!(!redraw(&mut component, Chart::Ap50, &mut state));
-            assert!(component.charts.iter()
-                .filter(|chart| !chart.kind.loss())
-                .all(|chart| !chart.dirty));
+            assert!(
+                component
+                    .charts
+                    .iter()
+                    .filter(|chart| !chart.kind.loss())
+                    .all(|chart| !chart.dirty)
+            );
         }
     }
 
@@ -736,8 +750,11 @@ pub(crate) mod tests {
                     let camera = pan(&mut component, kind, &mut state);
                     component.update(Message::Log(log));
                     redraw(&mut component, kind, &mut PlotState::default());
-                    assert_eq!(component.chart_view(kind).unwrap().ranges, camera,
-                        "{kind:?}, saved={saved}, log={log}");
+                    assert_eq!(
+                        component.chart_view(kind).unwrap().ranges,
+                        camera,
+                        "{kind:?}, saved={saved}, log={log}"
+                    );
                 }
             }
         }
@@ -746,8 +763,10 @@ pub(crate) mod tests {
     fn assert_center(component: &Component, kind: Chart, expected: [f64; 2]) {
         let ranges = component.chart_view(kind).unwrap().ranges;
         for (range, expected) in ranges.into_iter().zip(expected) {
-            assert!(((range[0] + range[1]) / 2.0 - expected).abs() < 1e-9,
-                "{kind:?}: {ranges:?}, expected center {expected}");
+            assert!(
+                ((range[0] + range[1]) / 2.0 - expected).abs() < 1e-9,
+                "{kind:?}: {ranges:?}, expected center {expected}"
+            );
         }
     }
 

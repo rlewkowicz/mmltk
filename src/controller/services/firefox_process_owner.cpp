@@ -386,7 +386,8 @@ class FirefoxProcessOwner::Implementation final {
             if ((descriptors[2].revents & POLLIN) != 0) {
                 const auto consumed = mmltk::common::io::read_counter_fd(timer_fd_.get());
                 if (consumed.bytes != static_cast<ssize_t>(sizeof(consumed.count))) {
-                    terminal_monitor_failure("child.stop_timer_read_refused", consumed.bytes < 0 ? consumed.error : EIO, consumed.bytes < 0 ? consumed.error : 0);
+                    terminal_monitor_failure("child.stop_timer_read_refused", consumed.bytes < 0 ? consumed.error : EIO,
+                                             consumed.bytes < 0 ? consumed.error : 0);
                     return;
                 }
                 disarm_timer();

@@ -2,7 +2,6 @@
 #include "src/common/system/numa_topology.h"
 #include <algorithm>
 #include <stdexcept>
-
 namespace mmltk::common::system::test_support {
 [[nodiscard]] inline CpuTopology first_permitted_cpu(const NumaTopology& topology) {
     if (topology.permitted_cpus.empty()) throw std::runtime_error("test topology has no permitted CPUs");

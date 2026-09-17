@@ -36,9 +36,8 @@ using mmltk::common::io::sync_parent_directory;
 using mmltk::common::math::checked_cast;
 nlohmann::json reject_json(const AnnotationRejectCounts& rejected) {
     nlohmann::json result = nlohmann::json::object();
-    mmltk::frameworks::reflection::visit_materialized_members<AnnotationRejectCounts>([&]<class Declaration>(const auto& field) {
-        result[field.member_name] = rejected.*Declaration::pointer;
-    });
+    mmltk::frameworks::reflection::visit_materialized_members<AnnotationRejectCounts>(
+        [&]<class Declaration>(const auto& field) { result[field.member_name] = rejected.*Declaration::pointer; });
     return result;
 }
 namespace {

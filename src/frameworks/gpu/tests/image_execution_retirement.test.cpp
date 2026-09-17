@@ -110,8 +110,8 @@ class RebindingReleaseModel final : public SystemImageModel {
         bool destroyed = false;
         bool in_runtime_context = false;
     };
-    RebindingReleaseModel(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<Destruction> destruction,
-                          std::exception_ptr rebind_failure = {}, std::exception_ptr release_failure = {})
+    RebindingReleaseModel(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<Destruction> destruction, std::exception_ptr rebind_failure = {},
+                          std::exception_ptr release_failure = {})
         : backend_(std::move(backend)),
           destruction_(std::move(destruction)),
           rebind_failure_(std::move(rebind_failure)),

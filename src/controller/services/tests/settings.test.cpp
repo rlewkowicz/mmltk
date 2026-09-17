@@ -621,7 +621,6 @@ void test_ui_settings_round_trip() {
     train.remote_family_enabled = {true, false, true, false, false};
     train.remote_container_image = "test-training-image";
     train.remote_launch_template = "/tmp/launch-template";
-
     predict.request.weights_path = "/tmp/predict.pt";
     train.request.class_layout_path = "/tmp/train.classes.json";
     validate.request.class_layout_path = "/tmp/validate.classes.json";
@@ -665,22 +664,41 @@ void test_ui_settings_round_trip() {
     const nlohmann::json saved = snapshot_gui_settings(snapshot);
     REQUIRE((saved.at("schema_version") == kGuiSettingsSchemaVersion));
     CHECK(saved.at("schema_version") == 8);
-    const nlohmann::json expected_source{{"kind", 1}, {"compiled_path", "/tmp/source.bin"}, {"single_image_path", "/tmp/input.png"},
-                                         {"image_directory", "/tmp/images"}, {"video_file_path", "/tmp/movie.mp4"}, {"recursive", true},
-                                         {"device_index", 3}, {"capture_width", 640}, {"capture_height", 480}, {"capture_fps", 29},
-                                         {"v4l2_buffer_count", 7}, {"crop_x", 11}, {"crop_y", 13}, {"crop_width", 101}, {"crop_height", 103}};
+    const nlohmann::json expected_source{{"kind", 1},
+                                         {"compiled_path", "/tmp/source.bin"},
+                                         {"single_image_path", "/tmp/input.png"},
+                                         {"image_directory", "/tmp/images"},
+                                         {"video_file_path", "/tmp/movie.mp4"},
+                                         {"recursive", true},
+                                         {"device_index", 3},
+                                         {"capture_width", 640},
+                                         {"capture_height", 480},
+                                         {"capture_fps", 29},
+                                         {"v4l2_buffer_count", 7},
+                                         {"crop_x", 11},
+                                         {"crop_y", 13},
+                                         {"crop_width", 101},
+                                         {"crop_height", 103}};
     CHECK(saved.at("workflows").at("predict").at("source") == expected_source);
     const auto& saved_training = saved.at("workflows").at("train").at("training");
     CHECK(saved_training.at("execution_target") == 1);
     CHECK(saved_training.at("remote_family_enabled") == nlohmann::json::array({true, false, true, false, false}));
     CHECK(saved_training.at("remote_container_image") == "test-training-image");
     CHECK(saved_training.at("remote_launch_template") == "/tmp/launch-template");
-    const nlohmann::json expected_ui{{"dark_mode", true}, {"show_workspace_performance", true}, {"ui_scale", 1.35f},
-                                     {"font_size", 18.0f}, {"secondary_font_size", 15.0f}, {"mono_font_size", 14.0f},
-                                     {"text_input_font_size", 17.0f}, {"crop_edge_hit_half_width", 11.0f}, {"crop_corner_hit_size", 24.0f},
-                                     {"crop_handle_radius", 7.5f}, {"workspace_aspect_ratio", 3}, {"annotation_brush_radius", 27}, {"mask_cleanup_radius", 6}};
+    const nlohmann::json expected_ui{{"dark_mode", true},
+                                     {"show_workspace_performance", true},
+                                     {"ui_scale", 1.35f},
+                                     {"font_size", 18.0f},
+                                     {"secondary_font_size", 15.0f},
+                                     {"mono_font_size", 14.0f},
+                                     {"text_input_font_size", 17.0f},
+                                     {"crop_edge_hit_half_width", 11.0f},
+                                     {"crop_corner_hit_size", 24.0f},
+                                     {"crop_handle_radius", 7.5f},
+                                     {"workspace_aspect_ratio", 3},
+                                     {"annotation_brush_radius", 27},
+                                     {"mask_cleanup_radius", 6}};
     CHECK(saved.at("ui") == expected_ui);
-
     REQUIRE((saved.at("ui").at("workspace_aspect_ratio") == 3));
     REQUIRE((saved.at("ui").at("annotation_brush_radius") == 27));
     REQUIRE((saved.at("ui").at("mask_cleanup_radius") == 6));
@@ -737,9 +755,11 @@ void test_ui_settings_round_trip() {
     CHECK(loaded_train.remote_family_enabled == train.remote_family_enabled);
     CHECK(loaded_train.remote_container_image == "test-training-image");
     CHECK(loaded_train.remote_launch_template == "/tmp/launch-template");
-    apply_gui_settings({{"schema_version", 8}, {"ui", {{"dark_mode", false}}},
-                        {"workflows", {{"predict", {{"source", {{"recursive", false}}}}},
-                                       {"train", {{"training", {{"remote_container_image", "updated-image"}}}}}}}}, loaded);
+    apply_gui_settings(
+        {{"schema_version", 8},
+         {"ui", {{"dark_mode", false}}},
+         {"workflows", {{"predict", {{"source", {{"recursive", false}}}}}, {"train", {{"training", {{"remote_container_image", "updated-image"}}}}}}}},
+        loaded);
     CHECK_FALSE(loaded_ui.dark_mode);
     CHECK(loaded_ui.font_size == 18.0f);
     CHECK_FALSE(loaded_predict.source.recursive);
@@ -748,7 +768,6 @@ void test_ui_settings_round_trip() {
     CHECK(loaded_train.remote_launch_template == "/tmp/launch-template");
     // Restore the complete document for the existing round-trip assertions.
     apply_gui_settings(saved, loaded);
-
     REQUIRE((loaded.current_view == mmltk::controller::contracts::FeatureId::Annotate));
     REQUIRE((loaded_annotate.preset_name == "rf-detr-seg-medium"));
     CHECK(loaded_train.request.h2d_dataloader);

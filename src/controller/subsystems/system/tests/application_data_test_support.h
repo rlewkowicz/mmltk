@@ -35,8 +35,7 @@ namespace mmltk::controller::test_support {
             .max_instances_per_image = 1U,
             .class_names = {{.value = "object"}}};
 }
-[[nodiscard]] inline contracts::ArtifactInspection successful_inspection(
-    const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths) {
+[[nodiscard]] inline contracts::ArtifactInspection successful_inspection(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths) {
     contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
     for (const auto& path : paths)
         if (!path.empty()) result.splits.push_back(split(path));

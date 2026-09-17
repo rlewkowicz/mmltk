@@ -41,6 +41,7 @@
 #include "src/controller/services/runtime_diagnostics.h"
 #include "src/controller/services/runtime_diagnostic_span.h"
 #include "src/controller/services/settings_store.h"
+#include "src/common/io/noexcept_io.h"
 namespace mmltk::controller::services {
 namespace {
 struct DiagnosticCountingClock final {
@@ -65,7 +66,7 @@ volatile std::sig_atomic_t interrupted_counter_writer = -1;
 void release_interrupted_counter(int) noexcept {
     const int saved_errno = errno;
     const std::uint64_t value = 37U;
-    static_cast<void>(::write(interrupted_counter_writer, &value, sizeof(value)));
+    mmltk::common::io::write_all_noexcept(interrupted_counter_writer, {reinterpret_cast<const char*>(&value), sizeof(value)});
     errno = saved_errno;
 }
 class ScopedEnvironmentVariable final {
@@ -209,7 +210,7 @@ TEST_CASE("counter descriptor read retries a causally interrupted blocking read"
     // Release a still-blocked read before jthread joins on any failed assertion.
     mmltk::testsupport::ScopedTestCleanup release_reader{[&] {
         const std::uint64_t fallback = 1U;
-        static_cast<void>(::write(writer.get(), &fallback, sizeof(fallback)));
+        mmltk::common::io::write_all_noexcept(writer.get(), {reinterpret_cast<const char*>(&fallback), sizeof(fallback)});
     }};
     const auto tid = mmltk::testsupport::await_test_future(entered_future, "counter reader started");
     REQUIRE(tid > 0);
@@ -222,8 +223,7 @@ TEST_CASE("counter descriptor read retries a causally interrupted blocking read"
         std::ifstream state{syscall_path};
         long number = -1;
         unsigned long descriptor = 0;
-        if (state >> number >> std::hex >> descriptor)
-            blocked_read = number == SYS_read && descriptor == static_cast<unsigned long>(reader.get());
+        if (state >> number >> std::hex >> descriptor) blocked_read = number == SYS_read && descriptor == static_cast<unsigned long>(reader.get());
         if (!blocked_read) std::this_thread::yield();
     } while (!blocked_read && std::chrono::steady_clock::now() < deadline);
     REQUIRE(blocked_read);

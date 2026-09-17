@@ -364,8 +364,8 @@ void test_benchmark_annotation_indexes() {
     REQUIRE(parsed.rejected.duplicate_boxes == 1U);
     REQUIRE(parsed.rejected.degenerate_boxes == 1U);
     REQUIRE(parsed.rejected.unmapped_categories == 1U);
-    parsed.rejected = {.raw_records = 101U, .unmapped_categories = 23U, .unknown_images = 37U,
-                       .malformed_records = 41U, .degenerate_boxes = 53U, .duplicate_boxes = 67U};
+    parsed.rejected = {
+        .raw_records = 101U, .unmapped_categories = 23U, .unknown_images = 37U, .malformed_records = 41U, .degenerate_boxes = 53U, .duplicate_boxes = 67U};
     const fs::path index_path = root.path() / "mini-coco.index";
     store_normalized_annotation_index(index_path, parsed, {});
     auto loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
@@ -395,8 +395,8 @@ void test_benchmark_annotation_indexes() {
     persisted.read(reinterpret_cast<char*>(slots.data()), sizeof(slots));
     REQUIRE(persisted.good());
     CHECK((slots == std::array<std::uint64_t, 6>{101U, 23U, 37U, 41U, 53U, 67U}));
-    const nlohmann::json expected_rejections{{"raw_records", 101U}, {"unmapped_categories", 23U}, {"unknown_images", 37U},
-                                             {"malformed_records", 41U}, {"degenerate_boxes", 53U}, {"duplicate_boxes", 67U}};
+    const nlohmann::json expected_rejections{{"raw_records", 101U},      {"unmapped_categories", 23U}, {"unknown_images", 37U},
+                                             {"malformed_records", 41U}, {"degenerate_boxes", 53U},    {"duplicate_boxes", 67U}};
     const auto manifest_path = root.path() / "manifest" / "rejections.json";
     write_json_atomically(manifest_path, {{"rejected_records", reject_json(parsed.rejected)}}, {});
     CHECK(read_json_file(manifest_path).at("rejected_records") == expected_rejections);
@@ -864,9 +864,7 @@ TEST_CASE("benchmark destination preparation preserves parent and obstruction be
     for (const auto& path : paths) {
         write_json_atomically(path, {{"value", 19U}}, {});
         CHECK(read_json_file(path).at("value") == 19U);
-        {
-            auto lease = ArtifactLease::acquire(path.string() + ".lock", {});
-        }
+        { auto lease = ArtifactLease::acquire(path.string() + ".lock", {}); }
         fs::remove(path.string() + ".lock");
         fs::path staged;
         {

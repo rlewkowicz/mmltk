@@ -7,7 +7,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-
 namespace mmltk::backend::models::rfdetr::test_support {
 class ClassArtifactFixture final {
    public:
