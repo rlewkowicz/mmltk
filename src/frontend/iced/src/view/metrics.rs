@@ -326,6 +326,9 @@ impl Component {
 pub(crate) mod tests {
     use super::*;
     use crate::generated::*;
+    use iced::widget::shader::Program;
+    use iced::{Event, Point, Rectangle, Size, mouse};
+    use iced_plot::{PlotUiMessage, PlotWidget};
     pub(crate) fn record() -> TrainingRecord {
         use crate::generated::*;
         TrainingRecord {
@@ -546,28 +549,268 @@ pub(crate) mod tests {
             .update_series(&id.unwrap(), |s| assert!(s.positions.is_empty()))
             .unwrap();
     }
-    #[test]
-    fn hidden_navigation_saved_selection_and_preparation_preserve_independent_live_history() {
+    type PlotState = <PlotWidget as Program<PlotUiMessage>>::State;
+
+    fn plot_event(
+        component: &mut Component,
+        kind: Chart,
+        state: &mut PlotState,
+        event: Event,
+        cursor: mouse::Cursor,
+    ) -> bool {
+        let chart = component
+            .charts
+            .iter()
+            .find(|chart| chart.kind == kind)
+            .unwrap();
+        let message = Program::update(
+            &chart.plot,
+            state,
+            &event,
+            Rectangle::with_size(Size::new(640.0, 360.0)),
+            cursor,
+        )
+        .and_then(|action| action.into_inner().0);
+        let published = message.is_some();
+        if let Some(message) = message {
+            component.update(Message::Plot(kind, message));
+        }
+        published
+    }
+
+    fn redraw(component: &mut Component, kind: Chart, state: &mut PlotState) -> bool {
+        plot_event(
+            component,
+            kind,
+            state,
+            Event::Window(iced::window::Event::RedrawRequested(
+                iced::time::Instant::now(),
+            )),
+            mouse::Cursor::Unavailable,
+        )
+    }
+
+    fn pan(component: &mut Component, kind: Chart, state: &mut PlotState) -> [[f64; 2]; 2] {
+        let initial = component.chart_view(kind).unwrap().ranges;
+        for (event, position) in [
+            (
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                Point::new(320.0, 180.0),
+            ),
+            (
+                mouse::Event::CursorMoved { position: Point::new(380.0, 200.0) },
+                Point::new(380.0, 200.0),
+            ),
+            (
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+                Point::new(380.0, 200.0),
+            ),
+        ] {
+            plot_event(
+                component,
+                kind,
+                state,
+                Event::Mouse(event),
+                mouse::Cursor::Available(position),
+            );
+        }
+        plot_event(
+            component,
+            kind,
+            state,
+            Event::Mouse(mouse::Event::CursorMoved { position: Point::new(-1.0, -1.0) }),
+            mouse::Cursor::Unavailable,
+        );
+        redraw(component, kind, state);
+        let panned = component.chart_view(kind).unwrap().ranges;
+        assert_ne!(panned, initial, "{kind:?} must actually pan");
+        panned
+    }
+
+    fn dashboard_records(saved: bool) -> Vec<TrainingRecord> {
+        [0, 1].into_iter().map(|index| {
+            let mut sample = record();
+            sample.sequence = index + 1;
+            sample.role = TrainingRecordRole::Epoch;
+            sample.progress.epoch = index as i32 * 2;
+            sample.progress.globaloptimizerstep = 10 + index as i64 * 20;
+            sample.progress.scalars.total = Some(if index == 0 { 1.0 } else { 100.0 });
+            sample.progress.scalars.classification = sample.progress.scalars.total;
+            sample.progress.scalars.learningrate = Some(0.001 * (index + 1) as f64);
+            sample.progress.scalars.classerror = Some((index + 1) as f64);
+            let mut summary = evaluation();
+            summary.bbox.ap50 = if index == 0 { 0.2 } else { 0.8 };
+            summary.mask = Some(summary.bbox.clone());
+            sample.progress.val = Some(summary);
+            if saved {
+                sample.runid = "saved".into();
+                sample.attemptid = "saved-attempt".into();
+                sample.progress.epoch += 10;
+                sample.progress.globaloptimizerstep += 100;
+            }
+            sample
+        }).collect()
+    }
+
+    fn dashboard(saved: bool) -> (Component, crate::view_model::ApplicationModel) {
         let mut component = Component::default();
         let mut model = crate::view_model::test_support::bootstrapped();
-        let mut sample = record();
-        model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
-        component.rebase(&model, false);
-        assert!(
-            component
-                .charts
-                .iter()
-                .all(|c| c.shapes.iter().all(Option::is_none))
-        );
-        component.rebase(&model, true);
-        let shape = component.charts[0].shapes[0].unwrap();
-        component.charts[0]
-            .plot
-            .update_series(&shape, |series| {
-                assert_eq!(series.positions, vec![[1.1, 1.0]]);
-            })
-            .unwrap();
+        for sample in dashboard_records(false) {
+            model.workflow.training.as_mut().unwrap().metrics = Some(sample);
+            component.rebase(&model, true);
+        }
+        if saved {
+            select_saved_run(&mut model);
+            model.workflow.training_history = Some(TrainingHistoryPage {
+                generation: 3,
+                nextcursor: 100,
+                more: false,
+                records: dashboard_records(true),
+            });
+            component.rebase(&model, true);
+        }
+        assert_eq!(component.saved_selected, saved);
+        for kind in Chart::ALL {
+            component.update(Message::Visible(kind, true));
+        }
+        assert!(component.charts.iter().all(|chart| !chart.dirty));
+        (component, model)
+    }
 
+    #[test]
+    fn loss_scale_preserves_non_loss_camera_and_legend_through_remount() {
+        for saved in [false, true] {
+            for hidden in [false, true] {
+                for kind in Chart::ALL.into_iter().filter(|kind| !kind.loss()) {
+                    let (mut component, _) = dashboard(saved);
+                    let mut state = PlotState::default();
+                    assert!(redraw(&mut component, kind, &mut state));
+                    let camera = pan(&mut component, kind, &mut state);
+                    component.update(Message::Plot(kind, PlotUiMessage::ToggleLegend));
+                    let legend = component.chart_view(kind).unwrap().legend_collapsed;
+                    assert!(!legend);
+                    if hidden {
+                        component.update(Message::Visible(kind, false));
+                    }
+                    component.update(Message::Log(true));
+                    if hidden {
+                        component.update(Message::Visible(kind, true));
+                    }
+                    let mut remount = PlotState::default();
+                    assert!(redraw(&mut component, kind, &mut remount));
+                    let view = component.chart_view(kind).unwrap();
+                    assert_eq!(view.ranges, camera, "{kind:?}, saved={saved}, hidden={hidden}");
+                    assert_eq!(view.legend_collapsed, legend);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loss_scale_does_not_prepare_unrelated_visible_or_hidden_charts() {
+        for saved in [false, true] {
+            let (mut component, _) = dashboard(saved);
+            let mut state = PlotState::default();
+            redraw(&mut component, Chart::Ap50, &mut state);
+            assert!(!redraw(&mut component, Chart::Ap50, &mut state));
+            component.update(Message::Visible(Chart::LearningRate, false));
+            component.update(Message::Log(true));
+            // A prepared data version publishes even if its numerical camera
+            // happens to be unchanged. This observes the ordinary program path.
+            assert!(!redraw(&mut component, Chart::Ap50, &mut state));
+            assert!(component.charts.iter()
+                .filter(|chart| !chart.kind.loss())
+                .all(|chart| !chart.dirty));
+        }
+    }
+
+    #[test]
+    fn unchanged_loss_scale_selection_preserves_settled_views() {
+        for saved in [false, true] {
+            for log in [false, true] {
+                for kind in Chart::ALL {
+                    let (mut component, _) = dashboard(saved);
+                    component.update(Message::Log(log));
+                    let mut state = PlotState::default();
+                    redraw(&mut component, kind, &mut state);
+                    let camera = pan(&mut component, kind, &mut state);
+                    component.update(Message::Log(log));
+                    redraw(&mut component, kind, &mut PlotState::default());
+                    assert_eq!(component.chart_view(kind).unwrap().ranges, camera,
+                        "{kind:?}, saved={saved}, log={log}");
+                }
+            }
+        }
+    }
+
+    fn assert_center(component: &Component, kind: Chart, expected: [f64; 2]) {
+        let ranges = component.chart_view(kind).unwrap().ranges;
+        for (range, expected) in ranges.into_iter().zip(expected) {
+            assert!(((range[0] + range[1]) / 2.0 - expected).abs() < 1e-9,
+                "{kind:?}: {ranges:?}, expected center {expected}");
+        }
+    }
+
+    #[test]
+    fn loss_and_components_change_effective_scale_for_live_and_saved_histories() {
+        for saved in [false, true] {
+            for kind in [Chart::Loss, Chart::Components] {
+                let (mut component, _) = dashboard(saved);
+                let mut state = PlotState::default();
+                redraw(&mut component, kind, &mut state);
+                let x = if saved { 12.0 } else { 2.0 };
+                assert_center(&component, kind, [x, 50.5]);
+                pan(&mut component, kind, &mut state);
+                component.update(Message::Log(true));
+                redraw(&mut component, kind, &mut PlotState::default());
+                assert_center(&component, kind, [x, 1.0]);
+                component.update(Message::Log(false));
+                redraw(&mut component, kind, &mut PlotState::default());
+                assert_center(&component, kind, [x, 50.5]);
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_data_and_explicit_history_changes_still_autoscale_retained_charts() {
+        let (mut component, mut model) = dashboard(true);
+        let kind = Chart::Ap50;
+        let mut state = PlotState::default();
+        redraw(&mut component, kind, &mut state);
+        assert_center(&component, kind, [12.0, 0.5]);
+        pan(&mut component, kind, &mut state);
+        component.update(Message::Epoch(false));
+        let mut state = PlotState::default();
+        redraw(&mut component, kind, &mut state);
+        assert_center(&component, kind, [120.0, 0.5]);
+        pan(&mut component, kind, &mut state);
+        // Current live run is an explicit source transition with its own bounds.
+        model.workflow.training_run = None;
+        model.workflow.training_history = None;
+        component.rebase(&model, true);
+        let mut state = PlotState::default();
+        redraw(&mut component, kind, &mut state);
+        assert_center(&component, kind, [20.0, 0.5]);
+        pan(&mut component, kind, &mut state);
+        let sample = model
+            .workflow
+            .training
+            .as_mut()
+            .unwrap()
+            .metrics
+            .as_mut()
+            .unwrap();
+        sample.sequence += 1;
+        sample.progress.epoch = 9;
+        sample.progress.globaloptimizerstep = 80;
+        sample.progress.val.as_mut().unwrap().bbox.ap50 = 0.95;
+        component.rebase(&model, false);
+        component.rebase(&model, true);
+        redraw(&mut component, kind, &mut PlotState::default());
+        assert_center(&component, kind, [45.0, 0.575]);
+    }
+
+    fn select_saved_run(model: &mut crate::view_model::ApplicationModel) {
         let configuration = model
             .settings_snapshot
             .as_ref()
@@ -625,6 +868,30 @@ pub(crate) mod tests {
                 resumeoptimizerstep: 0,
             },
         });
+    }
+    #[test]
+    fn hidden_navigation_saved_selection_and_preparation_preserve_independent_live_history() {
+        let mut component = Component::default();
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut sample = record();
+        model.workflow.training.as_mut().unwrap().metrics = Some(sample.clone());
+        component.rebase(&model, false);
+        assert!(
+            component
+                .charts
+                .iter()
+                .all(|c| c.shapes.iter().all(Option::is_none))
+        );
+        component.rebase(&model, true);
+        let shape = component.charts[0].shapes[0].unwrap();
+        component.charts[0]
+            .plot
+            .update_series(&shape, |series| {
+                assert_eq!(series.positions, vec![[1.1, 1.0]]);
+            })
+            .unwrap();
+
+        select_saved_run(&mut model);
         let mut saved = record();
         saved.runid = "saved".into();
         saved.attemptid = "saved-attempt".into();

@@ -30,9 +30,7 @@ pub(super) struct Curve {
     pub(super) name: String,
     pub(super) buckets: VecDeque<Bucket>,
     pub(super) omitted: u64,
-    pub(super) omitted_extrema: Option<(f64, f64)>,
     pub(super) missing: bool,
-    pub(super) available: bool,
     pub(super) segment: u64,
     external: Option<u64>,
     scratch: VecDeque<Bucket>,
@@ -43,9 +41,7 @@ impl Curve {
             name: name.into(),
             buckets: VecDeque::with_capacity(BUCKETS),
             omitted: 0,
-            omitted_extrema: None,
             missing: false,
-            available: false,
             segment: 0,
             external: None,
             scratch: VecDeque::with_capacity(BUCKETS),
@@ -57,14 +53,11 @@ impl Curve {
         self.buckets.clear();
         self.scratch.clear();
         self.omitted = 0;
-        self.omitted_extrema = None;
         self.missing = false;
-        self.available = false;
         self.segment = 0;
         self.external = None;
     }
     pub(super) fn push(&mut self, segment: u64, point: Option<Point>) {
-        self.available = point.is_some();
         let Some(point) = point else {
             self.missing = true;
             return;
@@ -91,13 +84,7 @@ impl Curve {
             }
             std::mem::swap(&mut self.buckets, &mut self.scratch);
             if self.buckets.len() == BUCKETS {
-                let retired = self.buckets.pop_front().unwrap();
-                self.omitted_extrema = Some(
-                    self.omitted_extrema
-                        .map_or((retired.min.value, retired.max.value), |(min, max)| {
-                            (min.min(retired.min.value), max.max(retired.max.value))
-                        }),
-                );
+                self.buckets.pop_front();
                 self.omitted += 1;
             }
         }
@@ -249,7 +236,6 @@ impl History {
                 }
             };
             let value = value.filter(|v| v.is_finite());
-            curve.available = value.is_some();
             if !admit {
                 if value.is_none() {
                     curve.missing = true;
@@ -334,13 +320,14 @@ mod tests {
         record.progress.elapsedseconds = 1.2;
         record.progress.scalars.total = None;
         component.ingest(&record, true, &metrics);
-        assert!(!component.curves[0].available);
+        assert!(component.curves[0].missing);
         assert_eq!(component.curves[0].buckets.len(), 1);
         record.sequence = 3;
         record.progress.elapsedseconds = 1.4;
         record.progress.scalars.total = Some(3.0);
         component.ingest(&record, true, &metrics);
-        assert!(component.curves[0].available);
+        assert_eq!(component.curves[0].buckets.len(), 1);
+        assert_eq!(component.curves[0].buckets[0].last.value, 1.0);
         assert!(component.curves[0].missing);
         record.sequence = 4;
         record.progress.elapsedseconds = 2.0;
@@ -354,8 +341,9 @@ mod tests {
         record.sequence = 6;
         record.progress.scalars.total = None;
         component.ingest(&record, true, &metrics);
-        assert!(!component.curves[0].available);
-        assert!(!component.curves[0].buckets.is_empty());
+        assert!(component.curves[0].missing);
+        assert_eq!(component.curves[0].buckets.len(), 3);
+        assert_eq!(component.curves[0].buckets.back().unwrap().last.value, 3.0);
     }
 
     #[test]
