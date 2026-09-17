@@ -271,11 +271,12 @@ impl Router {
         settings: &'a crate::view::settings::Component,
         surface: Option<Surface>,
         width: f32,
+        body_height: f32,
     ) -> Element<'a, Message> {
         match self.active {
             FeatureId::Train => self
                 .train
-                .view(model, settings.state(), width)
+                .view(model, settings.state(), width, body_height)
                 .map(Message::Train),
             FeatureId::Validate => self
                 .validate
@@ -334,6 +335,7 @@ mod tests {
                 &crate::view::settings::Component::default(),
                 None,
                 1280.0,
+                720.0,
             ));
         }
     }

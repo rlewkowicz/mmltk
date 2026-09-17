@@ -529,17 +529,10 @@ search callers for an existing registry, reflected dispatch surface, factory,
 ordinary system, or utility expressing the concept. Before deleting/replacing
 artifacts, search the entire repository and migrate every caller in one cutover.
 
-`tools/generate_cleanup_json.mjs` writes
-`cleanup/cpp-code-deduplication.json` with:
-
-- `hits`: Duplo textual duplicate blocks, ordered cross-file before within-file.
-- `structural_hits`: CPD structural duplicate blocks, ordered cross-file before
-  within-file.
-
-Cleanup affecting handwritten Rust runs both the default C++ profile and
-`tools/generate_cleanup_json.mjs --frontend`, which writes
-`cleanup/frontend-code-deduplication.json` with the same ordered hit model.
-Resolve Rust duplication in the component owning the behavior or data.
+Cleanup affecting handwritten Rust runs both the C++ and frontend profiles.
+Resolve Rust duplication in the component owning the behavior or data. See
+[validation](docs/validation.md#deduplication-reports) for cleanup commands and
+report formats.
 
 ### Deduplication rules
 

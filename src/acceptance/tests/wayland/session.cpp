@@ -634,7 +634,10 @@ void WaylandSession::RunWorkflows() {
             FAIL("rendered workflow exited or exceeded its phase deadline");
         }
     }
-    CHECK((workflow_steps_ == std::set<std::string>{"train", "validation", "compiled", "image", "video", "stop", "theme", "narrow"}));
+    CHECK((workflow_steps_ == std::set<std::string>{"train", "validation", "compiled", "image", "video", "stop", "theme", "narrow",
+        "chart_tile_0", "chart_tile_1", "chart_tile_2", "chart_tile_3", "chart_tile_4", "chart_tile_5", "chart_expanded",
+        "chart_aspect_0", "chart_aspect_1", "chart_aspect_2", "chart_aspect_3", "chart_aspect_4", "chart_aspect_5",
+        "chart_wheel_grid_0", "chart_wheel_grid_1", "chart_wheel_grid_2", "chart_wheel_grid_3", "chart_wheel_grid_4", "chart_wheel_grid_5", "chart_wheel_expanded_0", "chart_wheel_expanded_1", "chart_wheel_expanded_2", "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"}));
     CHECK((workflow_pixels_ == std::set<std::string>{"train", "validation", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
     CHECK_FALSE(surface_audit.surfaces.empty());
     process.interrupt();

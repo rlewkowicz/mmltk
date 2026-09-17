@@ -836,7 +836,7 @@ export function mmltkIntegrationSweep(x, y, width, height) {
   return 1;
 }
 
-export function mmltkIntegrationWheel(x, y) {
+export function mmltkIntegrationWheel(x, y, delta = -96, control = false, pixels = true) {
   const canvas = document.querySelector('canvas');
   if (!canvas || !Number.isFinite(x) || !Number.isFinite(y)) return 0;
   const rect = canvas.getBoundingClientRect();
@@ -846,8 +846,9 @@ export function mmltkIntegrationWheel(x, y) {
       cancelable: true,
       clientX: rect.left + x,
       clientY: rect.top + y,
-      deltaY: -96,
-      deltaMode: WheelEvent.DOM_DELTA_PIXEL,
+      deltaY: delta,
+      ctrlKey: control,
+      deltaMode: pixels ? WheelEvent.DOM_DELTA_PIXEL : WheelEvent.DOM_DELTA_LINE,
     }));
   });
   return 1;

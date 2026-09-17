@@ -58,6 +58,42 @@ These generate the C++ and/or frontend reports under `cleanup/`.
 textual `hits` and structural `structural_hits`, ordered with cross-file
 findings before within-file findings. Use the applicable full profiles and
 resolution rules in `AGENTS.md`; reports do not themselves change product code.
+The target files contain only match sizes, source paths/ranges, and applicable
+consolidation patterns. Detector configuration, inventory, rejected candidates,
+and inline-suppression details live separately in `cleanup/rejected.json`,
+under the selected profile. Running one profile preserves the other's rejection
+record. Each output is replaced atomically.
+
+C++ CPD uses a 39-token minimum with identifiers anonymized. Only matches from
+39 through 99 tokens enter the source-context filter. Matches of 100 tokens or
+more bypass it unchanged and remain for executor review; the ordinary narrow
+inline suppression rules still apply. A source-context pass compares complete
+statements, restoring operation names, types, member
+identities, constants, assertion facts, and local-variable relationships.
+Independent dimension/storage reads retain their local role names. This removes
+matches that hide a different callee or argument outside CPD's fragment,
+declaration/signature boilerplate, aliases, adjacent getters, isolated calls,
+lock-and-forward bodies, and loop headers without a repeated body.
+Shared arithmetic can use a local value or a member receiver through the same
+method API; receiver overlays preserve repeated-input relationships.
+
+The pass retains repeated executable sequences, complete identical records in
+distinct declarations, and overloads sharing a name, complete first parameter,
+and meaningful opening setup statement. A common guard or local alias alone
+does not establish an overload algorithm. Repeated fragments of one containing
+statement or declaration are not independent occurrences. Equal operation
+patterns are consolidated across CPD matches while preserving distinct targets.
+Unbalanced syntax stays visible for manual review. The lexical index supplies
+candidate triage; extraction still requires ownership, resource-lifetime, and
+existing-API review. Match sizes do not estimate removable lines.
+
+Each affected file is indexed once, with one file's token index resident at a
+time. Statement boundaries and scope ownership are cached; reported spans and
+pattern identities are grouped without all-pairs function comparisons. No
+filename exclusions or suppression registry are added.
+
+`./mmltk --test cleanup-tool` exercises inventory, detector options, context
+filtering, suppression behavior, and the terse report/rejection split.
 
 ## Native and browser suites
 

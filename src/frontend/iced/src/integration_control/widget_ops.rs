@@ -402,11 +402,25 @@ pub(super) fn click_number_edge(_bounds: Rectangle, _upper: bool) -> bool {
     false
 }
 
+/// Exercise the enclosing page's wheel route without changing chart controls.
+pub(super) fn chart_wheel(bounds: Rectangle, index: u8, scale: f32) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let x = bounds.x + match index % 3 { 0 => bounds.width * 0.7, 1 => 10.0 * scale, _ => 100.0 * scale };
+        let y = bounds.y + 42.0 * scale;
+        let pixels = index < 3;
+        wheel_js(x as f64, y as f64, if pixels { 8.0 } else { 0.25 }, index % 2 == 1, pixels) == 1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = (bounds, index, scale); false }
+}
+
 #[cfg(target_arch = "wasm32")]
 pub(super) fn wheel_number_input(bounds: Rectangle) -> bool {
     wheel_js(
         f64::from(bounds.x + bounds.width * 0.5),
         f64::from(bounds.y + bounds.height * 0.5),
+        -96.0, false, true,
     ) == 1
 }
 

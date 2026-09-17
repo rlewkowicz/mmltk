@@ -371,6 +371,7 @@ class BindingEmitter final {
         EmitDataLoadingBindings();
         EmitCatalogs();
         EmitScalarProjection<mmltk::backend::models::rfdetr::TrainingScalars>();
+        EmitFieldIdentities<mmltk::backend::models::rfdetr::MetricSummary>();
     }
 
    private:
@@ -1253,6 +1254,14 @@ class BindingEmitter final {
             output_ << "} }\n";
         }
     }
+    template <class Record>
+    void EmitFieldIdentities() {
+        const auto field_type = rust_type<Record>() + "Field";
+        symbols_.Reserve("module", field_type, NativeSource<Record>() + " scalar projection");
+        output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {";
+        VisitRustFields<Record>([&]<class, class>(const auto& fact, const std::string&) { output_ << rust_identifier(fact.member_name, true) << ','; });
+        output_ << "}\n";
+    }
     // Structural access for a homogeneous scalar record. Native declaration order
     // supplies the only member inventory; Rust owns grouping and visual copy.
     template <class Record>
@@ -1262,17 +1271,19 @@ class BindingEmitter final {
             static_assert(std::same_as<Field, std::optional<double>>);
             ++count;
         });
+        EmitFieldIdentities<Record>();
         const auto field_type = rust_type<Record>() + "Field";
-        symbols_.Reserve("module", field_type, NativeSource<Record>() + " scalar projection");
-        output_ << "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum " << field_type << " {";
-        VisitRustFields<Record>([&]<class, class>(const auto& fact, const std::string&) { output_ << rust_identifier(fact.member_name, true) << ','; });
-        output_ << "}\nimpl " << rust_type<Record>() << " {\npub const FIELDS: [(" << field_type << ", &'static str); " << count << "] = [";
+        output_ << "impl " << rust_type<Record>() << " {\npub const FIELDS: [(" << field_type << ", &'static str); " << count << "] = [";
         VisitRustFields<Record>([&]<class, class>(const auto& fact, const std::string&) {
             output_ << '(' << field_type << "::" << rust_identifier(fact.member_name, true) << ',' << std::quoted(fact.member_name) << "),";
         });
         output_ << "];\npub fn values(&self) -> [Option<f64>; " << count << "] { [";
         VisitRustFields<Record>([&]<class, class>(const auto&, const std::string& member) { output_ << "self." << member << ','; });
-        output_ << "] }\n}\n";
+        output_ << "] }\npub fn value(&self, field: " << field_type << ") -> Option<f64> { match field {\n";
+        VisitRustFields<Record>([&]<class, class>(const auto& fact, const std::string& member) {
+            output_ << field_type << "::" << rust_identifier(fact.member_name, true) << " => self." << member << ",\n";
+        });
+        output_ << "} }\n}\n";
     }
     void EmitImageMetadata() {
         Schema::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {

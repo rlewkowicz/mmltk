@@ -6,13 +6,15 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { availableParallelism, cpus, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { filterCpdCandidates, MAX_CPD_FILTER_TOKENS } from "./cleanup/cpd_patterns.mjs";
 
 const REPO_ROOT = process.cwd();
 const DUPLO_BINARY = "/bin/duplo";
@@ -108,7 +110,7 @@ const CPP_PROFILE = {
   cpd: {
     binary: PMD_BINARY,
     language: "cpp",
-    minTokens: 100,
+    minTokens: 39,
     flags: ["--ignore-identifiers", "--ignore-literal-sequences"],
   },
   inventoryLabels: {
@@ -226,8 +228,8 @@ export function usageText() {
     "selected first-party source inventory with Duplo and PMD CPD, then writes",
     "the corresponding cleanup/*-code-deduplication.json report.",
     "",
-    "  --cpp       C/C++/CUDA: Duplo 7 lines; C++ CPD 69 tokens",
-    "  --frontend  Iced Rust: Duplo 9 lines; Rust CPD 75 tokens",
+    `  --cpp       C/C++/CUDA: Duplo ${CPP_PROFILE.duplo.minLines} lines; C++ CPD ${CPP_PROFILE.cpd.minTokens} tokens`,
+    `  --frontend  Iced Rust: Duplo ${FRONTEND_PROFILE.duplo.minLines} lines; Rust CPD ${FRONTEND_PROFILE.cpd.minTokens} tokens`,
     "  -h, --help  Show this help",
   ].join("\n");
 }
@@ -484,7 +486,16 @@ export function parseCpdXml(xml) {
           `CPD returned an invalid source range: ${fileMatch[0]}`,
         );
       }
-      occurrences.push({ path: attributes.path, start, end });
+      const column = attributes.column === undefined ? undefined : Number(attributes.column);
+      const endColumn = attributes.endcolumn === undefined ? undefined : Number(attributes.endcolumn);
+      if ([column, endColumn].some((value) => value !== undefined && (!Number.isInteger(value) || value < 1))) {
+        throw new Error(`CPD returned an invalid source column: ${fileMatch[0]}`);
+      }
+      occurrences.push({
+        path: attributes.path, start, end,
+        ...(column === undefined ? {} : { column }),
+        ...(endColumn === undefined ? {} : { endColumn }),
+      });
     }
     if (occurrences.length < 2) {
       throw new Error(
@@ -615,7 +626,6 @@ export function makeHit(lineCount, tokenCount, rangesByFile, mergeRanges) {
     ...(tokenCount === undefined ? {} : { token_count: tokenCount }),
     file_count: files.length,
     occurrence_count: occurrenceCount,
-    removable_duplicate_lines: lineCount * (occurrenceCount - 1),
     ...(crossFile
       ? {
           highest_shared_directory: sharedDirectory || ".",
@@ -645,12 +655,14 @@ export function structuralHits(
         ranges.push([occurrence.start, occurrence.end]);
         rangesByFile.set(path, ranges);
       }
-      return makeHit(
+      const hit = makeHit(
         duplication.lineCount,
         duplication.tokenCount,
         rangesByFile,
         true,
       );
+      if (duplication.patterns) hit.patterns = duplication.patterns;
+      return hit;
     })
     .filter((hit) => hit.occurrence_count >= 2);
 }
@@ -864,9 +876,7 @@ export function compareHits(left, right) {
 
 export function summarize(hits) {
   const affectedFiles = new Set();
-  let removableDuplicateLines = 0;
   for (const hit of hits) {
-    removableDuplicateLines += hit.removable_duplicate_lines;
     for (const file of hit.files) {
       affectedFiles.add(file.path);
     }
@@ -876,7 +886,6 @@ export function summarize(hits) {
     cross_file_hits: hits.filter((hit) => hit.kind === "cross-file").length,
     within_file_hits: hits.filter((hit) => hit.kind === "within-file").length,
     affected_file_count: affectedFiles.size,
-    removable_duplicate_lines: removableDuplicateLines,
   };
 }
 
@@ -1028,14 +1037,14 @@ export function applyInlineSuppressions(hits, suppressions, detector) {
       0,
     );
     if (occurrenceCount >= 2) {
-      remaining.push(
-        makeHit(
+      const retained = makeHit(
           hit.line_count,
           hit.token_count,
           rangesByFile,
           false,
-        ),
-      );
+        );
+      if (hit.patterns) retained.patterns = hit.patterns;
+      remaining.push(retained);
     }
   }
   return { hits: remaining, suppressed };
@@ -1194,7 +1203,48 @@ export function buildReport({
 }
 
 export function serializeReport(report) {
-  return `${JSON.stringify(report, null, 2)}\n`;
+  const concise = (hit) => ({
+    ...(hit.token_count === undefined ? { line_count: hit.line_count } : { token_count: hit.token_count }),
+    ...(hit.patterns === undefined ? {} : { patterns: hit.patterns }),
+    files: hit.files,
+  });
+  return `${JSON.stringify({
+    hits: report.hits.map(concise),
+    structural_hits: report.structural_hits.map(concise),
+  }, null, 2)}\n`;
+}
+
+export function rejectionReport(previous, report, filteredCpd) {
+  const { hits, structural_hits, ...diagnostics } = report;
+  return {
+    ...previous,
+    [report.profile]: {
+      ...diagnostics,
+      cpd_candidate_filter: {
+        maximum_tokens: report.profile === "cpp" ? MAX_CPD_FILTER_TOKENS : null,
+        indexed_files: filteredCpd.indexedFiles,
+        rejected: filteredCpd.filtered.map((duplication) => ({
+          reason: duplication.reason,
+          token_count: duplication.tokenCount,
+          occurrences: duplication.occurrences.map((occurrence) => ({
+            ...occurrence, path: repoRelativePath(occurrence.path),
+          })),
+        })),
+      },
+    },
+  };
+}
+
+function writeAtomic(path, contents) {
+  mkdirSync(dirname(path), { recursive: true });
+  const directory = mkdtempSync(join(dirname(path), ".cleanup-"));
+  const temporary = join(directory, basename(path));
+  try {
+    writeFileSync(temporary, contents, "utf8");
+    renameSync(temporary, path);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 export async function generateReport(
@@ -1227,9 +1277,12 @@ export async function generateReport(
     codeOnlyDuplo.hits,
     files.scannedFiles,
   ).sort(compareHits);
+  const filteredCpd = profile.name === "cpp"
+    ? filterCpdCandidates(cpd.duplications)
+    : { duplications: cpd.duplications, filtered: [], reasons: {}, indexedFiles: 0 };
   const rawCpdHits = structuralHits(
     profile,
-    cpd.duplications,
+    filteredCpd.duplications,
     files.scannedFiles,
   ).sort(compareHits);
   const suppressions = loadInlineSuppressions(files.scannedFiles);
@@ -1265,9 +1318,10 @@ export async function generateReport(
   });
 
   const outputPath = join(REPO_ROOT, profile.output);
-  mkdirSync(dirname(outputPath), { recursive: true });
-  rmSync(outputPath, { force: true });
-  writeFileSync(outputPath, serializeReport(report), "utf8");
+  const rejectedPath = join(dirname(outputPath), "rejected.json");
+  const previous = existsSync(rejectedPath) ? JSON.parse(readFileSync(rejectedPath, "utf8")) : {};
+  writeAtomic(rejectedPath, `${JSON.stringify(rejectionReport(previous, report, filteredCpd), null, 2)}\n`);
+  writeAtomic(outputPath, serializeReport(report));
 
   const inventoryMessages =
     profile.name === "cpp"
@@ -1285,6 +1339,7 @@ export async function generateReport(
       ...inventoryMessages,
       `Duplo: ${report.summary.cross_file_hits} cross-file and ${report.summary.within_file_hits} within-file groups`,
       `CPD: ${report.structural_summary.cross_file_hits} cross-file and ${report.structural_summary.within_file_hits} within-file groups`,
+      ...(profile.name === "cpp" ? [`CPD candidate filter: ${filteredCpd.filtered.length} rejected; details in cleanup/rejected.json`] : []),
       `timing: detectors ${externalSeconds.toFixed(1)}s, total ${((Date.now() - startedAt) / 1000).toFixed(1)}s`,
     ].join("\n"),
   );

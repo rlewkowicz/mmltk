@@ -766,6 +766,7 @@ impl PlotState {
                 }
             }
             Event::WheelScrolled { delta } => {
+                if widget.controls.scroll_action(self.modifiers).is_none() { return needs_redraw; }
                 // Only respond to wheel when cursor is inside our bounds
                 let Some(cursor_position) = self.available_cursor_local_position_inside(cursor)
                 else {
@@ -1650,6 +1651,31 @@ mod tests {
         assert!(state.pan.active);
         assert_eq!(state.cursor_position, Vec2::new(50.0, 350.0));
         assert_ne!(state.camera.position, DVec2::ZERO);
+    }
+
+    #[test]
+    fn unbound_wheel_and_trackpad_leave_camera_and_cursor_unchanged() {
+        let mut widget = PlotWidget::new();
+        widget.get_controls_mut().clear_scroll_bindings();
+        let mut state = PlotState {
+            bounds: Rectangle { x: 0.0, y: 0.0, width: 400.0, height: 300.0 },
+            cursor_position: Vec2::new(25.0, 25.0),
+            ..PlotState::default()
+        };
+        let camera = state.camera;
+        for modifiers in [keyboard::Modifiers::NONE, keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT | keyboard::Modifiers::ALT] {
+            state.modifiers = modifiers;
+            for delta in [mouse::ScrollDelta::Lines { x: 1.0, y: -3.0 }, mouse::ScrollDelta::Pixels { x: -2.0, y: 17.0 }] {
+                let mut hover = None;
+                let mut drag = None;
+                assert!(!state.handle_mouse_event(Event::WheelScrolled { delta },
+                    mouse::Cursor::Available(Point::new(200.0, 150.0)), &widget, &mut hover, &mut drag));
+                assert_eq!(state.camera, camera);
+                assert_eq!(state.cursor_position, Vec2::new(25.0, 25.0));
+                assert!(hover.is_none() && drag.is_none());
+            }
+        }
     }
 
     #[test]

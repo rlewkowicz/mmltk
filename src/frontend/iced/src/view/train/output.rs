@@ -15,6 +15,7 @@ pub enum Message {
 pub fn view<'a>(
     model: &'a ApplicationModel,
     settings: &'a crate::view::settings::SettingsModel,
+    chart_omissions: u64,
 ) -> Element<'a, Message> {
     let request = settings
         .draft
@@ -70,6 +71,9 @@ pub fn view<'a>(
         ),
     ]
     .spacing(crate::view::workflow::FIELD_SPACING);
+    if chart_omissions > 0 {
+        content = content.push(text(format!("Charts omit {chart_omissions} older disconnected summaries; saved history remains unchanged.")));
+    }
     if !checkpoint.is_empty() {
         content = content.push(text(checkpoint));
     }
@@ -158,6 +162,17 @@ pub fn view<'a>(
             .and_then(|snapshot| snapshot.metrics.as_ref())
     };
     if let Some(record) = record {
+        if let Some(test) = &record.progress.test {
+            if test.bbox.available {
+                content = content.push(text(format!("Final test · Box AP50 {:.3} · AP50:95 {:.3}", test.bbox.ap50, test.bbox.ap)));
+            }
+            if let Some(mask) = test.mask.as_ref().filter(|m| m.available) {
+                content = content.push(text(format!("Final test · Mask AP50 {:.3} · AP50:95 {:.3}", mask.ap50, mask.ap)));
+            }
+        }
+        if record.droppedbefore > 0 {
+            content = content.push(text(format!("History incomplete: {} records dropped", record.droppedbefore)));
+        }
         for (label, path) in [
             ("Full checkpoint", &record.progress.fullcheckpointpath),
             ("Selected / epoch weights", &record.progress.checkpointpath),

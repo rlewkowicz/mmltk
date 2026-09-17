@@ -40,6 +40,13 @@ pub fn extent_for_width(width: f32, aspect: crate::generated::WorkspaceAspectRat
     (width, width * height_factor(aspect))
 }
 
+/// Fit an aspect-preserving workspace inside the actual page-body budget.
+pub fn fit_extent(width: f32, height: f32, aspect: crate::generated::WorkspaceAspectRatio) -> (f32, f32) {
+    let factor = height_factor(aspect);
+    let height = (width.max(1.0) * factor).min(height.max(1.0));
+    (height / factor, height)
+}
+
 pub fn selector<'a, Message: Clone + 'a>(
     selected: crate::generated::WorkspaceAspectRatio,
     enabled: bool,
@@ -78,6 +85,17 @@ pub fn selector<'a, Message: Clone + 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_ratio_fits_small_and_wide_body_budgets() {
+        for aspect in crate::generated::WORKSPACE_ASPECT_RATIO_VALUES {
+            for (width, height) in [(600.0, 220.0), (900.0, 600.0), (400.0, 1.0)] {
+                let (w, h) = fit_extent(width, height, *aspect);
+                assert!(w <= width + 0.001 && h <= height + 0.001);
+                assert!((h / w - height_factor(*aspect)).abs() < 0.001);
+            }
+        }
+    }
 
     #[test]
     fn every_generated_ratio_has_exact_width_geometry() {

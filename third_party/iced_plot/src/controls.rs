@@ -167,6 +167,11 @@ impl PlotControls {
         self.scroll.remove(&modifiers)
     }
 
+    /// Let an enclosing page own every wheel and trackpad gesture.
+    pub fn clear_scroll_bindings(&mut self) {
+        self.scroll.clear();
+    }
+
     /// Return the scroll action for active modifiers.
     ///
     /// Exact modifier bindings win. If no exact binding exists, a Ctrl binding

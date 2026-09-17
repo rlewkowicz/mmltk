@@ -24,6 +24,9 @@ pub(crate) fn metric_projection(label: &str, positions: &[[f64; 2]]) {
             .windows(2)
             .filter(|pair| finite(&pair[0]) && finite(&pair[1]) && pair[0] != pair[1])
             .count();
+        if let (Some(first), Some(last)) = (positions.iter().find(|p| finite(p)), positions.iter().rfind(|p| finite(p))) {
+            sink.record("integration.metric_values", "train.metrics.plot", label, [first[0], first[1], last[0], last[1]]);
+        }
         sink.record(
             "integration.metric_projection",
             "train.metrics.plot",

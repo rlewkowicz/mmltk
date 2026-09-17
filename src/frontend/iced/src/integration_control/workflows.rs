@@ -66,7 +66,18 @@ pub(super) enum Step {
     ReturnTrain,
     Trained,
     NoImageWorkspace,
-    NoTrainAspect,
+    TrainAspect,
+    ChartBounds,
+    ChartTile(u8),
+    ExpandChart,
+    ExpandedBounds,
+    ExpandedChart,
+    ChartWheel(u8, bool),
+    ChartWheelPending(u8, bool),
+    ChartScrolled(u8, bool),
+    BackToCharts,
+    ChartAspect(u8),
+    ChartAspectReady(u8),
     Validate,
     StartValidate,
     Validating,
@@ -101,6 +112,8 @@ pub(super) enum Step {
 
 #[derive(Default)]
 pub(super) struct State {
+    chart_bounds: Rectangle,
+    wheel_y: f32,
     hidden_sequence: u64,
     generation: u64,
     video_index: u64,
@@ -161,6 +174,12 @@ mod tests {
 }
 
 impl State {
+    pub(super) fn wheel_delivered(&mut self, driver: &mut Driver) {
+        if let Phase::Workflows(Step::ChartWheelPending(index, expanded)) = driver.phase {
+            driver.phase = Phase::Workflows(Step::ChartScrolled(index, expanded));
+        }
+    }
+
     pub(super) fn workflow_step(&mut self, driver: &mut Driver, step: Step) -> Task<RootMessage> {
         driver.advance_to(Phase::Workflows(step))
     }
@@ -184,7 +203,7 @@ impl State {
                     | Step::Predict
                     | Step::Theme
                     | Step::NoImageWorkspace
-                    | Step::NoTrainAspect
+                    | Step::TrainAspect
                     | Step::NoValidationAspect
             )
         ) {
@@ -261,17 +280,24 @@ impl State {
         };
         if matches!(
             step,
-            Step::NoImageWorkspace | Step::NoTrainAspect | Step::NoValidationAspect
+            Step::NoImageWorkspace | Step::NoValidationAspect
         ) {
             if bounds.width > 0.0 || bounds.height > 0.0 {
                 driver.fail("Workflow still exposes a removed image workspace or aspect selector");
                 return;
             }
             driver.phase = Phase::Workflows(match step {
-                Step::NoImageWorkspace => Step::NoTrainAspect,
-                Step::NoTrainAspect => Step::Validate,
+                Step::NoImageWorkspace => Step::TrainAspect,
                 _ => Step::Pixels(Picture::Validation, 0),
             });
+            return;
+        }
+        if matches!(step, Step::TrainAspect) {
+            if bounds.width <= 0.0 || bounds.height <= 0.0 {
+                driver.fail("Train workspace aspect selector is missing");
+            } else {
+                driver.phase = Phase::Workflows(Step::ChartBounds);
+            }
             return;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
@@ -279,6 +305,50 @@ impl State {
                 "Workflow control {control} is missing from the rendered Iced tree in {step:?}"
             ));
             return;
+        }
+        match step {
+            Step::ChartBounds | Step::ExpandedBounds => {
+                self.chart_bounds = bounds;
+                driver.phase = Phase::Workflows(if step == Step::ExpandedBounds { Step::ExpandedChart } else { Step::ChartTile(0) });
+                return;
+            }
+            Step::ChartWheel(index, expanded) => {
+                self.wheel_y = bounds.y;
+                driver.phase = Phase::Workflows(Step::ChartWheelPending(index, expanded));
+                if !widget_ops::chart_wheel(crate::presentation_surface::physical_bounds(bounds, driver.input_scale), index, driver.input_scale) {
+                    driver.fail("Chart wheel dispatch failed");
+                }
+                return;
+            }
+            Step::ChartScrolled(index, expanded) => {
+                if bounds.y >= self.wheel_y - 0.1 {
+                    driver.fail("Wheel over chart did not scroll the enclosing page"); return;
+                }
+                completed(&format!("chart_wheel_{}_{}", if expanded { "expanded" } else { "grid" }, index), [self.wheel_y as f64, bounds.y as f64, index as f64, 0.0]);
+                driver.phase = Phase::Workflows(if index < 5 { Step::ChartWheel(index + 1, expanded) } else if expanded { Step::BackToCharts } else { Step::ExpandChart });
+                return;
+            }
+            Step::ChartTile(_) | Step::ExpandedChart => {
+                let index = if let Step::ChartTile(index) = step { index } else { 0 };
+                let region = self.chart_bounds;
+                if bounds.x < region.x - 1.0 || bounds.y < region.y - 1.0
+                    || bounds.x + bounds.width > region.x + region.width + 1.0
+                    || bounds.y + bounds.height > region.y + region.height + 1.0 {
+                    driver.fail("Training chart extends outside its workspace"); return;
+                }
+                if step == Step::ExpandedChart {
+                    if (bounds.width - region.width).abs() > 2.0 || (bounds.height - region.height).abs() > 2.0 {
+                        driver.fail("Expanded chart does not fill its workspace"); return;
+                    }
+                    completed("chart_expanded", [bounds.width as f64, bounds.height as f64, 0.0, 0.0]);
+                    driver.phase = Phase::Workflows(Step::ChartWheel(0, true));
+                } else {
+                    completed(&format!("chart_tile_{index}"), [index as f64, bounds.width as f64, bounds.height as f64, 0.0]);
+                    driver.phase = Phase::Workflows(if index < 5 { Step::ChartTile(index + 1) } else { Step::ChartWheel(0, false) });
+                }
+                return;
+            }
+            _ => {}
         }
         driver
             .reporting
@@ -323,6 +393,9 @@ impl State {
             return;
         }
         driver.phase = Phase::Workflows(match step {
+            Step::ExpandChart => Step::ExpandedBounds,
+            Step::BackToCharts => Step::ChartAspect(0),
+            Step::ChartAspect(index) => Step::ChartAspectReady(index),
             Step::Train => Step::StartTrain,
             Step::StartTrain => Step::Training,
             Step::LeaveTrain => Step::HiddenTrain,
@@ -416,8 +489,32 @@ impl State {
                 );
                 self.workflow_step(driver, Step::Pixels(Picture::Train, 0))
             }
+            Step::ChartWheel(_, _) => self.workflow_control(widgets, driver, "train.metrics.chart.Loss"),
+            Step::ChartScrolled(_, _) => {
+                if widgets.begin_location() { locate("train.metrics.chart.Loss", driver.generation) } else { Task::none() }
+            }
+            Step::ChartBounds | Step::ExpandedBounds => self.workflow_control(widgets, driver, "train.metrics.plot"),
+            Step::ChartTile(index) => {
+                let names = ["Loss", "Ap50", "Ap", "AverageRecall", "Confidence", "LearningRate"];
+                self.workflow_control(widgets, driver, format!("train.metrics.chart.{}", names[index as usize]))
+            }
+            Step::ExpandChart => self.workflow_control(widgets, driver, "train.metrics.expand.Loss"),
+            Step::ExpandedChart => self.workflow_control(widgets, driver, "train.metrics.chart.Loss"),
+            Step::BackToCharts => self.workflow_control(widgets, driver, "train.metrics.back"),
+            Step::ChartAspect(index) => {
+                let aspect = crate::generated::WORKSPACE_ASPECT_RATIO_VALUES[index as usize];
+                self.workflow_control(widgets, driver, crate::view::aspect_ratio::option_id(aspect))
+            }
+            Step::ChartAspectReady(index) if settled => {
+                let aspect = crate::generated::WORKSPACE_ASPECT_RATIO_VALUES[index as usize];
+                if settings.draft.as_ref().is_none_or(|s| s.ui.workspaceaspectratio != aspect) {
+                    driver.fail("Training aspect selection did not update settings"); return Task::none();
+                }
+                completed(&format!("chart_aspect_{index}"), [index as f64, crate::view::aspect_ratio::height_factor(aspect) as f64, 0.0, 0.0]);
+                self.workflow_step(driver, if index as usize + 1 < crate::generated::WORKSPACE_ASPECT_RATIO_VALUES.len() { Step::ChartAspect(index + 1) } else { Step::Validate })
+            }
             Step::NoImageWorkspace => widgets.arm(driver, "workflow.visual.workspace"),
-            Step::NoTrainAspect | Step::NoValidationAspect => {
+            Step::TrainAspect | Step::NoValidationAspect => {
                 widgets.arm(driver, "workflow.workspace.aspect")
             }
             Step::StartValidate if active == FeatureId::Validate && settled => {

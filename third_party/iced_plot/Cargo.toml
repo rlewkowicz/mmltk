@@ -14,7 +14,7 @@ keywords    = ["iced", "plot", "widget", "wgpu", "plotting"]
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
 glam     = "0.25"
-iced     = { path = "../iced", default-features = false, features = ["advanced", "wgpu-bare"] }
+iced     = { path = "../iced", default-features = false, features = ["advanced", "wgpu-bare", "canvas"] }
 iced-fluent-theme = { path = "../iced-fluent-theme" }
 indexmap = "2.14"
 

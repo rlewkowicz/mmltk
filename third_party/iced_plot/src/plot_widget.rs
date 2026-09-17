@@ -707,8 +707,6 @@ impl PlotWidget {
         Message: 'a,
         MapPlot: Fn(PlotUiMessage) -> Message + Copy + 'a,
     {
-        let style = self.cached_style();
-
         let tooltip_overlays = self
             .visible_highlighted_points()
             .filter_map(|(_, tooltip)| self.view_tooltip_overlay(tooltip, &self.camera_bounds))
@@ -728,10 +726,6 @@ impl PlotWidget {
         layers.push(inner_container);
         layers.push(self.view_top_right_overlay(has_legend).map(map_plot));
 
-        if let Some(tick_labels) = self.view_tick_labels() {
-            layers.push(tick_labels.map(map_plot));
-        }
-
         if let Some(legend) = legend {
             layers.push(legend.map(map_plot));
         }
@@ -743,10 +737,13 @@ impl PlotWidget {
 
         container(axes_labels::stack_with_labels(
             elements,
+            self.view_tick_labels(true).map(|labels| labels.map(map_plot)).unwrap_or_else(|| container(widget::space()).height(Length::Fill).into()),
+            self.view_tick_labels(false).map(|labels| labels.map(map_plot)).unwrap_or_else(|| container(widget::space()).width(Length::Fill).into()),
+            self.tick_label_size,
             &self.x_axis_label,
             &self.y_axis_label,
             self.axis_label_size,
-            style.axis_label_color,
+            &self.style,
         ))
         .padding(3.0)
         .style(|theme: &Theme| self.update_style(theme).frame)
@@ -1160,20 +1157,19 @@ impl PlotWidget {
         )
     }
 
-    fn view_tick_labels(&self) -> Option<Element<'_, PlotUiMessage>> {
+    fn view_tick_labels(&self, y_axis: bool) -> Option<Element<'_, PlotUiMessage>> {
         if self.x_ticks.is_empty() && self.y_ticks.is_empty() {
             return None;
         }
 
         let mut tick_elements = Vec::with_capacity(self.x_ticks.len() + self.y_ticks.len());
-        let tick_label_color = self.cached_style().tick_label_color;
         let tick_text = |text| {
             widget::text(text)
                 .size(self.tick_label_size)
-                .color(tick_label_color)
+                .style(|theme| widget::text::Style { color: Some((self.style)(theme).tick_label_color) })
         };
 
-        if let Some(formatter) = &self.x_axis_formatter {
+        if let Some(formatter) = &self.x_axis_formatter && !y_axis {
             for tick in &self.x_ticks {
                 let label_text = formatter(tick.tick);
                 let centering_offset = 2.0 * (label_text.len() as f32); // A bit of a fudge.
@@ -1181,7 +1177,7 @@ impl PlotWidget {
                 let positioned_label = container(text_widget)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .padding(padding::left(tick.screen_pos - centering_offset))
+                    .padding(padding::left((tick.screen_pos - centering_offset).max(0.0).min(self.camera_bounds.map_or(f32::MAX, |(_, bounds)| (bounds.width - centering_offset * 2.0).max(0.0)))))
                     .align_x(Horizontal::Left)
                     .align_y(Vertical::Bottom)
                     .style(container::transparent);
@@ -1189,15 +1185,15 @@ impl PlotWidget {
             }
         }
 
-        if let Some(formatter) = &self.y_axis_formatter {
+        if let Some(formatter) = &self.y_axis_formatter && y_axis {
             for tick in &self.y_ticks {
                 let label_text = formatter(tick.tick);
                 let text_widget = tick_text(label_text);
                 let positioned_label = widget::container(text_widget)
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .padding(padding::top(tick.screen_pos - 5.0))
-                    .align_x(alignment::Horizontal::Left)
+                    .padding(padding::top((tick.screen_pos - self.tick_label_size * 0.5).max(0.0).min(self.camera_bounds.map_or(f32::MAX, |(_, bounds)| (bounds.height - self.tick_label_size).max(0.0)))))
+                    .align_x(alignment::Horizontal::Right)
                     .align_y(Vertical::Top)
                     .style(container::transparent);
                 tick_elements.push(positioned_label.into());

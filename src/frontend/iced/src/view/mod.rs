@@ -73,26 +73,27 @@ pub fn view<'a>(
         let canvas_width = layout.canvas_width;
         let page_width = layout.page_width;
         let page_offset = layout.page_offset;
-        let page = router
-            .view(model, settings_component, surface, page_width)
-            .map(Message::Workspace);
-        let page = container(page).padding(Padding {
-            top: 10.0,
-            left: page_offset,
-            ..Padding::ZERO
-        });
-        let body: Element<'_, Message> = if router.active() == crate::generated::FeatureId::Explore
-        {
-            page.width(Fill).height(Fill).into()
-        } else {
-            scrollable(page)
-                .id(PAGE_SCROLL_ID)
-                .direction(Direction::Vertical(compact_scrollbar()))
-                .style(crate::fluent_theme::scrollable_default)
-                .width(Fill)
-                .height(Fill)
-                .into()
-        };
+        let body: Element<'_, Message> = responsive(move |body_size| {
+            let page = router
+                .view(model, settings_component, surface, page_width, (body_size.height - 10.0).max(1.0))
+                .map(Message::Workspace);
+            let page = container(page).padding(Padding {
+                top: 10.0,
+                left: page_offset,
+                ..Padding::ZERO
+            });
+            if router.active() == crate::generated::FeatureId::Explore {
+                page.width(Fill).height(Fill).into()
+            } else {
+                scrollable(page)
+                    .id(PAGE_SCROLL_ID)
+                    .direction(Direction::Vertical(compact_scrollbar()))
+                    .style(crate::fluent_theme::scrollable_default)
+                    .width(Fill)
+                    .height(Fill)
+                    .into()
+            }
+        }).into();
         let header = scrollable(
             container(
                 container(
@@ -204,8 +205,8 @@ mod tests {
         let settings = super::settings::Component::default();
         for feature in crate::generated::FEATURE_ID_VALUES {
             router.select(*feature);
-            drop(router.view(&model, &settings, None, 700.0));
-            drop(router.view(&model, &settings, None, 1200.0));
+            drop(router.view(&model, &settings, None, 700.0, 720.0));
+            drop(router.view(&model, &settings, None, 1200.0, 720.0));
         }
 
         assert_eq!(super::HORIZONTAL_SCROLL_ID, "application.horizontal.scroll");

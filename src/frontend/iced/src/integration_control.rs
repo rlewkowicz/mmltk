@@ -389,7 +389,7 @@ extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationSweep)]
     fn sweep_js(x: f64, y: f64, width: f64, height: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationWheel)]
-    fn wheel_js(x: f64, y: f64) -> u32;
+    fn wheel_js(x: f64, y: f64, delta: f64, control: bool, pixels: bool) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationSliderDrag)]
     fn slider_drag_js(x: f64, y: f64, width: f64, height: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReplaceNumber)]
@@ -1633,6 +1633,7 @@ impl Controller {
                     request_receipt,
                 );
                 self.lifecycle.wheel_delivered(&mut self.driver);
+                self.workflows.wheel_delivered(&mut self.driver);
                 return None;
             }
 
