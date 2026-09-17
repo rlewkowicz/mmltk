@@ -495,12 +495,16 @@ void test_rfdetr_info_forwards_explicit_logging_options() {
         INFO("exit status=" << result.exit_code << "\n" << result.output_text);
         CHECK(result.exit_code == 1);
         CHECK(result.stdout_text.empty());
+        CHECK(result.stderr_text.find("mmltk rfdetr onnx info error:") != std::string::npos);
+        CHECK(result.stderr_text.find("missing.onnx") != std::string::npos);
+        CHECK(result.stderr_text.size() <= 1024U);
+        CHECK(result.stderr_text.find("fatal: ", result.stderr_text.find("fatal: ") + 1U) == std::string::npos);
         if (!entry.enabled) {
-            CHECK(result.stderr_text.empty());
             if (!entry.sink.empty()) CHECK_FALSE(fs::exists(entry.sink));
         } else {
             REQUIRE(fs::exists(entry.sink));
             const auto lines = read_text_lines(entry.sink);
+            assert_contains_substring(lines, "[rfdetr.onnx_info]");
             assert_contains_substring(lines, "mmltk rfdetr onnx info error:");
             assert_contains_substring(lines, "missing.onnx");
         }
@@ -814,4 +818,34 @@ TEST_CASE("RF-DETR help exposes independent augmentation and compiler resampling
             CHECK(result.stdout_text.find("--perceptual-downscale") != std::string::npos);
         }
     }
+}
+
+TEST_CASE("CLI fatal boundaries remain visible with logging off or unavailable", "[core][cli][logging]") {
+    const ScopedTempDir root{"mmltk-cli-fatal"};
+    const std::vector<std::vector<std::string>> cases{
+        {"--log-level=off", "unknown-command"},
+        {"--log-level=off", "rfdetr", "unknown-command"},
+        {"--log-level=off", "rfdetr", "train", "--unknown-option"},
+        {"--log-level=info", "--log-file=" + root.path().string(), "--help"}};
+    for (const auto& arguments : cases) {
+        std::vector<std::string> command{"env", "-u", "MMLTK_LOG_LEVEL", "-u", "MMLTK_LOG_FILE", "-u", "MMLTK_LOG_DIR", mmltk_cli_path()};
+        command.insert(command.end(), arguments.begin(), arguments.end());
+        const auto result = run_subprocess_capture_output(command);
+        INFO(result.output_text);
+        CHECK(result.exit_code == 1);
+        CHECK(result.stderr_text.starts_with("fatal: mmltk"));
+        CHECK(result.stderr_text.size() <= 1024U);
+        CHECK(result.stderr_text.find("fatal: ", 1U) == std::string::npos);
+    }
+}
+
+TEST_CASE("RF-DETR fatal file diagnostics retain their named owner", "[core][cli][logging]") {
+    const ScopedTempDir root{"mmltk-rfdetr-fatal-name"};
+    const auto log = root.path() / "fatal.log";
+    const auto result = run_subprocess_capture_output({mmltk_cli_path(), "--log-level=info", "--log-file=" + log.string(),
+        "rfdetr", "train", "--unknown-option"});
+    CHECK(result.exit_code == 1);
+    CHECK(result.stderr_text.find("fatal: ") != std::string::npos);
+    CHECK(result.stderr_text.find("fatal: ", result.stderr_text.find("fatal: ") + 1U) == std::string::npos);
+    assert_contains_substring(read_text_lines(log), "[rfdetr.cli]");
 }

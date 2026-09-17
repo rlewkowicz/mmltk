@@ -11,6 +11,8 @@ struct FirefoxProcessLifecycle final {
     int status = 1;
     bool stop_requested = false;
     bool kill_selected = false;
+    // Exact startup/infrastructure errno when available; never an exit policy.
+    int error_code = 0;
     [[nodiscard]] bool settled() const noexcept { return terminal != FirefoxProcessTerminal::Pending; }
     bool operator==(const FirefoxProcessLifecycle&) const = default;
 };

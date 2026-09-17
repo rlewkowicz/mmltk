@@ -33,6 +33,13 @@ void initialize(const LoggingConfig& config);
     const auto active = level();
     return active != spdlog::level::off && candidate >= active;
 }
+// Ordinary terminal boundaries only (not signal handlers). Writes at most 1024 bytes
+// to stderr and best-effort to the enabled file sink, without duplicate stderr.
+// Broken pipes preserve the calling thread's mask and pre-existing pending SIGPIPE.
+// diagnostic_logger selects only the file record identity (first 160 bytes);
+// an empty name uses the configured application identity. All inputs are borrowed.
+void report_fatal(std::string_view component, std::string_view detail, std::optional<int> status = std::nullopt,
+                  std::string_view diagnostic_logger = {}) noexcept;
 void flush();
 void set_level(spdlog::level::level_enum new_level);
 }  // namespace mmltk::common::logging

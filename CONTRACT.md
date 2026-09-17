@@ -347,7 +347,10 @@ The optional workspace FPS display counts actual browser queue submissions
 containing workspace draws and belongs to the workspace component.
 
 Opt-in JSONL diagnostics provide granular system, operation, resource, and
-failure context. Disabled diagnostics create no active diagnostic or probe
+failure context. Crashes and fatal operation or process failures remain visible
+on stderr in normal execution, with a concise component and available error or
+exit status, independently of optional diagnostic sinks. Requested healthy
+shutdown remains quiet. Disabled diagnostics create no active diagnostic or probe
 state and perform no diagnostic collection, formatting, clock reads, counter
 updates, or I/O. Diagnostic identities remain effect-only observations.
 Explicitly enabled fatal diagnostics capture bounded troubleshooting context

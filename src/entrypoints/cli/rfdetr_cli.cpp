@@ -17,6 +17,7 @@
 #include <expected>
 #include <filesystem>
 #include <meta>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -938,7 +939,7 @@ int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int arg
     }
     const auto command = rfdetr::parse_rfdetr_command(arguments.front());
     if (!command) {
-        std::fprintf(stderr, "unknown command: %.*s\n", static_cast<int>(arguments.front().size()), arguments.front().data());
+        logging::report_fatal("mmltk rfdetr unknown command", arguments.front());
         return 1;
     }
     const auto* descriptor = rfdetr::rfdetr_command_descriptor(*command);
@@ -948,12 +949,10 @@ int handle_rfdetr_cli(const std::span<const std::string_view> arguments, int arg
                                 std::ranges::find(command_arguments, std::string_view{"-h"}) != command_arguments.end();
     try {
         return dispatch_command(*descriptor, command_arguments, help_requested, logging::scan_cli_overrides(argc, argv));
-    } catch (const reflection::ParseError& error) { std::fprintf(stderr, "%s\n", error.what()); } catch (const std::exception& error) {
-        if (logging::enabled(spdlog::level::err)) {
-            logging::error("rfdetr.cli", [&](auto& current) { current.error("mmltk rfdetr error: {}", error.what()); });
-        } else {
-            std::fprintf(stderr, "mmltk rfdetr error: %s\n", error.what());
-        }
+    } catch (const std::exception& error) {
+        logging::report_fatal("mmltk rfdetr error", error.what(), std::nullopt, "rfdetr.cli");
+    } catch (...) {
+        logging::report_fatal("mmltk rfdetr error", "unknown exception", std::nullopt, "rfdetr.cli");
     }
     return 1;
 }

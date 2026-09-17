@@ -34,15 +34,6 @@ int handle_rfdetr_cli(std::span<const std::string_view> arguments, int argc, cha
 }
 #endif
 namespace {
-void report_cli_error(const std::string_view message) noexcept {
-    try {
-        if (logging::enabled(spdlog::level::err)) {
-            logging::error([&](auto& current) { current.error("{}", message); });
-        } else {
-            std::fprintf(stderr, "%.*s\n", static_cast<int>(message.size()), message.data());
-        }
-    } catch (...) { std::fprintf(stderr, "%.*s\n", static_cast<int>(message.size()), message.data()); }
-}
 struct BenchCommandRequest final : data::DataLoadingOptions {
     [[= reflection::MaxBytes{reflection::kMaximumPathBytes}]] std::string compiled_path;
     [[= reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 32U;
@@ -257,8 +248,8 @@ int main(const int argc, char** argv) {
         const bool help_requested = std::ranges::find(arguments, std::string_view{"--help"}) != arguments.end() ||
                                     std::ranges::find(arguments, std::string_view{"-h"}) != arguments.end();
         return command->handler(arguments, argc, argv, help_requested);
-    } catch (const std::exception& error) { report_cli_error(std::string("mmltk error: ") + error.what()); } catch (...) {
-        report_cli_error("mmltk error: unknown exception");
+    } catch (const std::exception& error) { logging::report_fatal("mmltk error", error.what()); } catch (...) {
+        logging::report_fatal("mmltk error", "unknown exception");
     }
     return 1;
 }

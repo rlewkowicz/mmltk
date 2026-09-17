@@ -1,6 +1,7 @@
 #include "detail/onnx_tool_main.h"
 #include <cstdio>
 #include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -8,6 +9,7 @@
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::entrypoints::tools {
 int run_onnx_tool_main(const int argc, char** argv, const OnnxToolMainConfig& config, const OnnxToolOperation operation) {
+    const auto component = config.error_prefix.ends_with(": ") ? config.error_prefix.substr(0U, config.error_prefix.size() - 2U) : config.error_prefix;
     try {
         auto logging_config = mmltk::common::logging::config_from_env(std::string(config.application_name));
         logging_config = mmltk::common::logging::merge(std::move(logging_config), mmltk::common::logging::scan_cli_overrides(argc, argv));
@@ -31,9 +33,10 @@ int run_onnx_tool_main(const int argc, char** argv, const OnnxToolMainConfig& co
         operation(std::filesystem::path(positionals.front()));
         return 0;
     } catch (const std::exception& error) {
-        try {
-            mmltk::common::logging::error(config.logger_name, [&](auto& logger) { logger.error("{}{}", config.error_prefix, error.what()); });
-        } catch (...) {}
+        mmltk::common::logging::report_fatal(component, error.what(), std::nullopt, config.logger_name);
+        return 1;
+    } catch (...) {
+        mmltk::common::logging::report_fatal(component, "unknown exception", std::nullopt, config.logger_name);
         return 1;
     }
 }

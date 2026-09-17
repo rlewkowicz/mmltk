@@ -143,6 +143,8 @@ TEST_CASE("browser runtime exit policy classifies every owned Firefox terminal",
     CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true, .kill_selected = true},
                                       true) == 128 + SIGTERM);
     CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1}, true) == 1);
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1, .error_code = EACCES}, true) == 1);
+    CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::StartupFailed, .status = 1, .error_code = EACCES}, false) == 1);
     CHECK(browser_runtime_exit_status({.terminal = FirefoxProcessTerminal::Signaled, .status = 128 + SIGTERM, .stop_requested = true}, false) == 128 + SIGTERM);
 }
 TEST_CASE("settings store repairs missing malformed and normalized documents", "[gui][services]") {

@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <signal.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -86,6 +87,14 @@ int main(const int argc, char* argv[]) {
     if (!parse_page(argv[9], &target)) return 65;
     const int fetch_result = fetch_page(target);
     if (fetch_result != 0) return fetch_result;
+    const char* mode_text = std::getenv("MMLTK_ENTRY_FIXTURE_MODE");
+    const std::string_view mode = mode_text != nullptr ? mode_text : "healthy";
+    if (mode == "exit-failure") return 23;
+    if (mode == "signal-failure") static_cast<void>(::kill(::getpid(), SIGKILL));
+    if (mode == "request-int" || mode == "request-term") {
+        if (::kill(::getppid(), mode == "request-int" ? SIGINT : SIGTERM) != 0) return 76;
+        for (;;) ::pause();
+    }
     const std::string_view page{argv[9]};
     const char* pixel = std::getenv("MMLTK_GUI_PIXEL_TRACE");
     if (std::printf("mmltk fake Firefox tracing lifecycle=%d pixels=%d environment=%d\n",

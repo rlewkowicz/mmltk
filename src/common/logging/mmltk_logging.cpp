@@ -1,8 +1,15 @@
 module;
+#include <spdlog/details/log_msg.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <array>
+#include <charconv>
+#include <cerrno>
+#include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
@@ -25,6 +32,7 @@ constexpr std::size_t kLogRotationFiles = 5U;
 std::mutex g_mutex;
 std::shared_ptr<spdlog::logger> g_root_logger;
 std::vector<spdlog::sink_ptr> g_sinks;
+spdlog::sink_ptr g_fatal_file_sink;
 std::string g_app_name;
 std::atomic<spdlog::level::level_enum> g_level{spdlog::level::off};
 bool is_known_level_name(std::string_view value) {
@@ -89,6 +97,7 @@ void install_logger_locked(const LoggingConfig& config) {
     }
     g_root_logger.reset();
     g_sinks.clear();
+    g_fatal_file_sink.reset();
     if (runtime_level == spdlog::level::off) { return; }
     spdlog::set_pattern(kDefaultPattern);
     spdlog::set_level(runtime_level);
@@ -105,6 +114,7 @@ void install_logger_locked(const LoggingConfig& config) {
     g_app_name = config.app_name;
     g_level = runtime_level;
     g_root_logger = std::move(root);
+    g_fatal_file_sink = g_sinks.back();
 }
 }  // namespace
 LoggingConfig default_config(std::string app_name) {
@@ -186,6 +196,78 @@ std::shared_ptr<spdlog::logger> logger(std::string_view name) {
     return named;
 }
 spdlog::level::level_enum level() { return g_level.load(std::memory_order_relaxed); }
+void report_fatal(const std::string_view component, const std::string_view detail, const std::optional<int> status,
+                  const std::string_view diagnostic_logger) noexcept {
+    const int saved_errno = errno;
+    // The maximum record is 997 bytes, including truncation markers, an int
+    // status and newline; the fixed budget also stays below Linux PIPE_BUF.
+    std::array<char, 1024> buffer{};
+    std::size_t size = 0U;
+    const auto append = [&](const std::string_view text, const std::size_t limit) {
+        const std::size_t count = std::min(text.size(), limit);
+        for (std::size_t index = 0U; index < count; ++index) {
+            const unsigned char character = static_cast<unsigned char>(text[index]);
+            buffer[size++] = character < 32U || character == 127U ? ' ' : static_cast<char>(character);
+        }
+        if (text.size() > count) {
+            buffer[size++] = '.';
+            buffer[size++] = '.';
+            buffer[size++] = '.';
+        }
+    };
+    append("fatal: ", 7U);
+    append(component, 160U);
+    append(": ", 2U);
+    append(detail, 800U);
+    if (status) {
+        append(" (status=", 9U);
+        const auto result = std::to_chars(buffer.data() + size, buffer.data() + buffer.size() - 2U, *status);
+        size = static_cast<std::size_t>(result.ptr - buffer.data());
+        buffer[size++] = ')';
+    }
+    buffer[size++] = '\n';
+    sigset_t blocked{}, previous{}, pending{};
+    if (::sigemptyset(&blocked) == 0 && ::sigaddset(&blocked, SIGPIPE) == 0 &&
+        ::pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0) {
+        // A pending signal belongs to the caller. Only consume a new SIGPIPE
+        // caused by this write, while it is blocked on this thread alone.
+        if (::sigpending(&pending) == 0) {
+            const bool already_pending = ::sigismember(&pending, SIGPIPE) == 1;
+            std::size_t written = 0U;
+            unsigned int interruptions = 0U;
+            bool broken_pipe = false;
+            while (written < size) {
+                const ssize_t count = ::write(STDERR_FILENO, buffer.data() + written, size - written);
+                if (count > 0) written += static_cast<std::size_t>(count);
+                else if (count < 0 && errno == EINTR && ++interruptions < 4U) continue;
+                else {
+                    broken_pipe = count < 0 && errno == EPIPE;
+                    break;
+                }
+            }
+            if (broken_pipe && !already_pending) {
+                const timespec immediate{};
+                int consumed = -1;
+                do { consumed = ::sigtimedwait(&blocked, nullptr, &immediate); } while (consumed < 0 && errno == EINTR);
+            }
+        }
+        static_cast<void>(::pthread_sigmask(SIG_SETMASK, &previous, nullptr));
+    }
+    // Terminal visibility does not depend on logger initialization or sink health.
+    // Address only the file sink so configured stderr logging cannot duplicate it.
+    if (enabled(spdlog::level::critical)) {
+        try {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (g_fatal_file_sink && g_level.load(std::memory_order_relaxed) != spdlog::level::off) {
+                const auto name = (diagnostic_logger.empty() ? std::string_view{g_app_name} : diagnostic_logger).substr(0U, 160U);
+                const spdlog::details::log_msg message{name, spdlog::level::critical, {buffer.data(), size - 1U}};
+                g_fatal_file_sink->log(message);
+                g_fatal_file_sink->flush();
+            }
+        } catch (...) {}
+    }
+    errno = saved_errno;
+}
 void flush() {
     if (level() == spdlog::level::off) { return; }
     if (auto current = root_logger(); current != nullptr) { current->flush(); }

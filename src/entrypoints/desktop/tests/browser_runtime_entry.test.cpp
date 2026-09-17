@@ -14,6 +14,7 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -64,7 +65,8 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
 }
 [[nodiscard]] EntryResult run_entry(const std::filesystem::path& executable, const std::filesystem::path& firefox_log,
                                     const std::filesystem::path& working_directory, const std::filesystem::path& firefox_root, const int tracing = 0,
-                                    const bool integration = false) {
+                                    const bool integration = false, const char* mode = "healthy",
+                                    const char* logging_level = nullptr) {
     const std::string executable_path = executable.string();
     const std::string diagnostics_path = (working_directory / "trace.jsonl").string();
     std::array<int, 2U> control{-1, -1};
@@ -83,6 +85,8 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
             ::unsetenv("MMLTK_LOG_FILE") != 0 || ::unsetenv("MMLTK_LOG_DIR") != 0 ||
             ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION", integration ? "1" : "0", 1) != 0)
             std::_Exit(126);
+        if (::setenv("MMLTK_ENTRY_FIXTURE_MODE", mode, 1) != 0 ||
+            (logging_level != nullptr && ::setenv("MMLTK_LOG_LEVEL", logging_level, 1) != 0)) std::_Exit(126);
         if (integration &&
             (::fcntl(control_child.get(), F_SETFD, 0) != 0 || ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_EXPLORE_CONTROL_FD", control_text.c_str(), 1) != 0 ||
              ::setenv("MMLTK_RUN_WORKSPACE_WAYLAND_DATASET_SOURCE", working_directory.c_str(), 1) != 0 ||
@@ -102,7 +106,12 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
             ::setenv("MMLTK_FIREFOX_RUNTIME_ROOT_OVERRIDE", firefox_root.c_str(), 1) != 0) {
             std::_Exit(126);
         }
-        ::execl(executable_path.c_str(), executable_path.c_str(), nullptr);
+        if (std::string_view{mode} == "invalid-assets")
+            static_cast<void>(::setenv("MMLTK_BROWSER_APP_ASSET_ROOT_OVERRIDE", "/nonexistent/mmltk-assets", 1));
+        if (std::string_view{mode} == "invalid-option")
+            ::execl(executable_path.c_str(), executable_path.c_str(), "--unknown-option", nullptr);
+        else
+            ::execl(executable_path.c_str(), executable_path.c_str(), nullptr);
         std::_Exit(127);
     }
     control_child.reset();
@@ -146,6 +155,19 @@ void terminate_and_reap(const pid_t child, const int pidfd) noexcept {
         throw;
     }
 }
+[[nodiscard]] std::string native_output(const std::filesystem::path& directory) {
+    const auto file = FileHandle::open_readonly((directory / "native-output.txt").string());
+    std::string text(file.size(), '\0');
+    if (!text.empty()) file.pread_all(text.data(), text.size(), 0U);
+    return text;
+}
+void check_fatal_output(const std::filesystem::path& directory, const std::string_view expected) {
+    const auto text = native_output(directory);
+    CHECK(text.starts_with("fatal: "));
+    CHECK(text.find(expected) != std::string::npos);
+    CHECK(text.size() <= 1024U);
+    CHECK(text.find("fatal: ", 1U) == std::string::npos);
+}
 TEST_CASE("browser runtime entry redirects Firefox logs and returns startup failures", "[gui][browser-runtime][entry]") {
     const std::filesystem::path entry{MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE};
     const std::filesystem::path healthy_firefox{MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT};
@@ -155,6 +177,7 @@ TEST_CASE("browser runtime entry redirects Firefox logs and returns startup fail
     REQUIRE(healthy.terminal == EntryTerminal::Reaped);
     REQUIRE(healthy.exited());
     CHECK(healthy.exit_code() == 0);
+    CHECK(native_output(firefox_log.directory()).empty());
     const FileHandle log = FileHandle::open_readonly(firefox_log.path().string());
     std::string log_text(log.size(), '\0');
     if (!log_text.empty()) { log.pread_all(log_text.data(), log_text.size(), 0U); }
@@ -168,7 +191,12 @@ TEST_CASE("browser runtime entry redirects Firefox logs and returns startup fail
         REQUIRE(refused.terminal == EntryTerminal::Reaped);
         REQUIRE(refused.exited());
         CHECK(refused.exit_code() != 0);
-        CHECK(std::filesystem::file_size(refusal.directory() / "native-output.txt") == 0U);
+        check_fatal_output(refusal.directory(), refuse_settings ? "exception" : "Firefox");
+        if (!refuse_settings) {
+            CHECK(refused.exit_code() == 1);
+            CHECK(native_output(refusal.directory()).find("errno=") == std::string::npos);
+            CHECK(native_output(refusal.directory()).find("status=1") != std::string::npos);
+        }
     }
 }
 TEST_CASE("desktop pixel probes require explicit opt-in beyond lifecycle tracing", "[gui][browser-runtime][entry][pixel]") {
@@ -202,7 +230,59 @@ TEST_CASE("integration entry selects explicit complete evidence without forcing 
         run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, refused.path(), refused.directory(), MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, 1, true);
     REQUIRE(result.exited());
     CHECK(result.exit_code() != 0);
-    CHECK(std::filesystem::file_size(refused.directory() / "native-output.txt") == 0U);
+    check_fatal_output(refused.directory(), "exception");
     CHECK_FALSE(std::filesystem::exists(refused.path()));
 }
 }  // namespace
+
+TEST_CASE("desktop terminal reports preserve process status and quiet requested shutdown", "[gui][browser-runtime][entry]") {
+    struct Case { const char* mode; int status; const char* detail; };
+    const std::array cases{
+        Case{"healthy", 0, ""}, Case{"exit-failure", 23, "status=23"},
+        Case{"signal-failure", 128 + SIGKILL, "terminated by signal (status=9)"},
+        Case{"request-int", 0, ""}, Case{"request-term", 0, ""},
+        Case{"invalid-option", 1, "unknown"}, Case{"invalid-assets", 1, "browser host"}};
+    for (const auto& entry : cases) {
+        for (const char* level : {static_cast<const char*>(nullptr), "off"}) {
+            CAPTURE(entry.mode, level == nullptr ? "default" : level);
+            TemporaryFirefoxLog output;
+            const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, output.path(), output.directory(),
+                MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, 0, false, entry.mode, level);
+            REQUIRE(result.exited());
+            CHECK(result.exit_code() == entry.status);
+            if (entry.status == 0) CHECK(native_output(output.directory()).empty());
+            else check_fatal_output(output.directory(), entry.detail);
+            CHECK_FALSE(std::filesystem::exists(output.directory() / "trace.jsonl"));
+            CHECK_FALSE(std::filesystem::exists(output.directory() / ".mmltk-data" / "logs"));
+        }
+    }
+    TemporaryFirefoxLog output;
+    const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, output.path(), output.directory(),
+        MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT, 0, false, "healthy", "invalid-level");
+    REQUIRE(result.exited());
+    CHECK(result.exit_code() == 1);
+    check_fatal_output(output.directory(), "invalid MMLTK log level");
+}
+
+TEST_CASE("desktop startup reports exact errno without changing its exit status", "[gui][browser-runtime][entry]") {
+    for (const bool refused_log : {false, true}) {
+        TemporaryFirefoxLog output;
+        std::filesystem::path firefox_root{MMLTK_BROWSER_RUNTIME_ENTRY_FAKE_FIREFOX_ROOT};
+        if (refused_log) {
+            std::filesystem::create_directory(output.path());
+        } else {
+            firefox_root = output.directory() / "non-executable";
+            std::filesystem::create_directory(firefox_root);
+            const auto executable = firefox_root / "firefox";
+            { std::ofstream file{executable}; file << "fixture without execute permission\n"; }
+            std::filesystem::permissions(executable, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+        }
+        const auto result = run_entry(MMLTK_BROWSER_RUNTIME_ENTRY_FIXTURE, output.path(), output.directory(), firefox_root, 0, false, "healthy", "off");
+        REQUIRE(result.exited());
+        CHECK(result.exit_code() == 1);
+        check_fatal_output(output.directory(), "Firefox process start failed");
+        const auto text = native_output(output.directory());
+        CHECK(text.find("errno=" + std::to_string(refused_log ? EISDIR : EACCES)) != std::string::npos);
+        CHECK(text.find("status=1") != std::string::npos);
+    }
+}

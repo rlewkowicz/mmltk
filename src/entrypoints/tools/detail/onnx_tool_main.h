@@ -5,6 +5,7 @@ namespace mmltk::entrypoints::tools {
 struct OnnxToolMainConfig final {
     std::string_view usage;
     std::string_view application_name;
+    // Diagnostic file identity for the operation and its fatal boundary.
     std::string_view logger_name;
     std::string_view error_prefix;
 };

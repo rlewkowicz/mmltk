@@ -11,11 +11,13 @@
 #include <unistd.h>
 #include "src/common/io/scoped_fd.h"
 #include <cstdlib>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stop_token>
 #include <string>
@@ -47,11 +49,17 @@ class UwsLoopOwner final {
     const char* const integration = std::getenv("MMLTK_RUN_WORKSPACE_WAYLAND_INTEGRATION");
     return integration != nullptr && std::string_view{integration} == "1";
 }
-void report_runtime_failure(const std::string_view stage, const std::string_view detail = {}) noexcept {
-    mmltk::common::logging::error([&](auto& logger) { logger.error("browser runtime failure: stage={}, detail={}", stage, detail); });
+[[nodiscard]] std::array<char, 32U> firefox_error_detail(const int error) noexcept {
+    std::array<char, 32U> detail{};
+    if (error == 0) return detail;
+    constexpr std::string_view prefix{"errno="};
+    for (std::size_t index = 0U; index < prefix.size(); ++index) detail[index] = prefix[index];
+    static_cast<void>(std::to_chars(detail.data() + prefix.size(), detail.data() + detail.size() - 1U, error));
+    return detail;
 }
-[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage) noexcept {
-    report_runtime_failure(stage);
+[[nodiscard]] int fail_closed(mmltk::controller::shell::ApplicationShell& shell, const std::string_view stage,
+                              const std::string_view detail = {}, const std::optional<int> status = std::nullopt) noexcept {
+    mmltk::common::logging::report_fatal(stage, detail, status);
     shell.request_shutdown(mmltk::controller::shell::ApplicationShutdownReason::InfrastructureFailure);
     static_cast<void>(shell.shutdown());
     return 1;
@@ -152,7 +160,7 @@ int main(int argc, char** argv) {
         }
         UwsLoopOwner loop_owner;
         if (!mmltk::controller::services::block_browser_runtime_signals()) {
-            report_runtime_failure("signal-mask setup failed");
+            mmltk::common::logging::report_fatal("browser runtime signal-mask setup", "failed");
             return 1;
         }
         std::vector<std::string_view> arguments;
@@ -171,14 +179,13 @@ int main(int argc, char** argv) {
             std::error_code error;
             integration_file_dialog_root = std::filesystem::current_path(error).string();
             if (error || integration_file_dialog_root.empty()) {
-                if (mmltk::common::logging::enabled(spdlog::level::err))
-                    report_runtime_failure("integration working-directory discovery failed", error.message());
+                mmltk::common::logging::report_fatal("integration working-directory discovery failed", error.message());
                 return 1;
             }
             config.file_dialog_launch_directory = integration_file_dialog_root;
             const int explore_control = integration_control_fd();
             if (explore_control < 0) {
-                report_runtime_failure("Explore acceptance control descriptor rejected");
+                mmltk::common::logging::report_fatal("Explore acceptance control descriptor", "rejected");
                 return 1;
             }
             config.explore.acceptance = std::make_shared<mmltk::controller::ExploreAcceptanceGate>(explore_control);
@@ -246,19 +253,37 @@ int main(int argc, char** argv) {
                                      .log_file = firefox_log_file(),
                                      .integration = integration,
                                      .integration_high_dpi = integration_high_dpi});
-            if (process_start == mmltk::controller::services::FirefoxProcessStartResult::Terminal) return fail_closed(shell, "Firefox process start failed");
+            if (process_start == mmltk::controller::services::FirefoxProcessStartResult::Terminal) {
+                const auto firefox = shell.firefox_lifecycle();
+                const auto detail = firefox_error_detail(firefox.error_code);
+                return fail_closed(shell, "Firefox process start failed", detail.data(), firefox.status);
+            }
             SignalWaiter signal_waiter{shell, diagnostics_terminal};
             shell.run();
-            return mmltk::controller::services::browser_runtime_exit_status(shell.firefox_lifecycle(), shell.healthy());
+            const auto firefox = shell.firefox_lifecycle();
+            const int status = mmltk::controller::services::browser_runtime_exit_status(firefox, shell.healthy());
+            if (status != 0) {
+                using mmltk::controller::services::FirefoxProcessTerminal;
+                if (firefox.terminal == FirefoxProcessTerminal::Signaled)
+                    mmltk::common::logging::report_fatal("Firefox", "terminated by signal", firefox.status - 128);
+                else if (firefox.terminal == FirefoxProcessTerminal::StartupFailed) {
+                    const auto detail = firefox_error_detail(firefox.error_code);
+                    mmltk::common::logging::report_fatal("Firefox process infrastructure failure", detail.data(), firefox.status);
+                }
+                else if (firefox.terminal == FirefoxProcessTerminal::Exited && firefox.status != 0)
+                    mmltk::common::logging::report_fatal("Firefox", "child exited unsuccessfully", firefox.status);
+                else
+                    mmltk::common::logging::report_fatal("browser runtime", "application health failure", status);
+            }
+            return status;
         } catch (const std::exception& error) {
-            report_runtime_failure("browser host runtime exception", error.what());
-            return fail_closed(shell, "browser host fail-closed shutdown");
+            return fail_closed(shell, "browser host runtime exception", error.what());
         } catch (...) { return fail_closed(shell, "browser host unknown runtime exception"); }
     } catch (const std::exception& error) {
-        report_runtime_failure("browser host construction exception", error.what());
+        mmltk::common::logging::report_fatal("browser host construction exception", error.what());
         return 1;
     } catch (...) {
-        report_runtime_failure("browser host unknown construction exception");
+        mmltk::common::logging::report_fatal("browser host construction", "unknown exception");
         return 1;
     }
 }
