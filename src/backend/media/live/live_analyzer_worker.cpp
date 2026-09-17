@@ -109,9 +109,7 @@ void LiveAnalyzerWorker::stop() noexcept {
             const auto completion = slot.frame->result().completion();
             if (completion.valid()) settled = scope.Record(cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(completion.event))) == cudaSuccess && settled;
         }
-        const SlotState current = static_cast<SlotState>(slot.state.load(std::memory_order_acquire));
-        bool owned = current == SlotState::Completing;
-        if (!owned && current != SlotState::Free && current != SlotState::Terminal) owned = claim_live_slot(slot.state, current);
+        const bool owned = claim_live_slot_retirement(slot.state);
         if (!owned) continue;
         if (slot.frame.has_value()) {
             auto result = std::move(*slot.frame).release_result();

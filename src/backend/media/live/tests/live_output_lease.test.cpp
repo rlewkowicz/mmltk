@@ -4,6 +4,7 @@
 #include "src/backend/media/capture/status.h"
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -94,6 +95,23 @@ TEST_CASE("moving over an active Live output lease abandons only the displaced s
     CHECK(first.abandonments == 1U);
     CHECK(second.completions == 1U);
     CHECK(second.abandonments == 0U);
+}
+TEST_CASE("Live retirement claims every occupied state and preserves inert states", "[live][retirement]") {
+    const auto initial = GENERATE(SlotState::Free, SlotState::Uploading, SlotState::Published, SlotState::Acquired, SlotState::Completing, SlotState::Terminal);
+    std::atomic<std::uint32_t> state{slot_state_value(initial)};
+    const bool occupied = initial != SlotState::Free && initial != SlotState::Terminal;
+    CHECK(claim_live_slot_retirement(state) == occupied);
+    CHECK(slot_state_is(state, occupied ? SlotState::Completing : initial));
+}
+TEST_CASE("Live single-attempt claim preserves a concurrently replaced state", "[live][retirement]") {
+    const auto observed = GENERATE(SlotState::Uploading, SlotState::Published, SlotState::Acquired);
+    const auto replacement = GENERATE(SlotState::Free, SlotState::Completing, SlotState::Terminal);
+    std::atomic<std::uint32_t> state{slot_state_value(observed)};
+    // Model the state changing between the retirement acquire-load and its
+    // single compare-exchange; a losing claim must not retry on the new state.
+    publish_live_slot_state(state, replacement);
+    CHECK_FALSE(claim_live_slot(state, observed));
+    CHECK(slot_state_is(state, replacement));
 }
 TEST_CASE("Live source slot publishes Free only after product scrub") {
     std::atomic<std::uint32_t> state{slot_state_value(SlotState::Acquired)};

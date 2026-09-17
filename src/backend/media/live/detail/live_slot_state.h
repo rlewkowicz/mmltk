@@ -25,6 +25,12 @@ inline void publish_live_slot_state(std::atomic<std::uint32_t>& state, const Slo
 [[nodiscard]] inline bool claim_live_slot(std::atomic<std::uint32_t>& state, const SlotState expected) noexcept {
     return transition_slot_state(state, expected, SlotState::Completing);
 }
+[[nodiscard]] inline bool claim_live_slot_retirement(std::atomic<std::uint32_t>& state) noexcept {
+    const auto current = static_cast<SlotState>(state.load(std::memory_order_acquire));
+    if (current == SlotState::Completing) return true;
+    if (current == SlotState::Free || current == SlotState::Terminal) return false;
+    return claim_live_slot(state, current);
+}
 inline void clear_latest_live_slot(std::atomic<int>& latest, const std::uint32_t slot) noexcept {
     int expected = static_cast<int>(slot);
     static_cast<void>(latest.compare_exchange_strong(expected, -1, std::memory_order_acq_rel, std::memory_order_acquire));

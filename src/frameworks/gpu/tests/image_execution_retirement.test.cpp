@@ -106,17 +106,31 @@ class FailingReleaseModel final : public SystemImageModel {
 };
 class RebindingReleaseModel final : public SystemImageModel {
    public:
-    RebindingReleaseModel(std::shared_ptr<FakeImageBackend> backend, bool& destroyed_in_runtime_context)
-        : backend_(std::move(backend)), destroyed_in_runtime_context_(destroyed_in_runtime_context) {}
-    ~RebindingReleaseModel() override { destroyed_in_runtime_context_ = backend_->last_bound_context.load(std::memory_order_acquire) == 1U; }
+    struct Destruction {
+        bool destroyed = false;
+        bool in_runtime_context = false;
+    };
+    RebindingReleaseModel(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<Destruction> destruction,
+                          std::exception_ptr rebind_failure = {}, std::exception_ptr release_failure = {})
+        : backend_(std::move(backend)),
+          destruction_(std::move(destruction)),
+          rebind_failure_(std::move(rebind_failure)),
+          release_failure_(std::move(release_failure)) {}
+    ~RebindingReleaseModel() override {
+        destruction_->destroyed = true;
+        destruction_->in_runtime_context = backend_->last_bound_context.load(std::memory_order_acquire) == 1U;
+    }
     [[nodiscard]] Release ReleaseResources() noexcept override {
         backend_->BindContext(999U);
-        return {};
+        if (rebind_failure_) backend_->FailAfter(FakeImageBackend::FailurePoint::Bind, 0U, rebind_failure_);
+        return {.failure = release_failure_};
     }
 
    private:
     std::shared_ptr<FakeImageBackend> backend_;
-    bool& destroyed_in_runtime_context_;
+    std::shared_ptr<Destruction> destruction_;
+    std::exception_ptr rebind_failure_;
+    std::exception_ptr release_failure_;
 };
 TEST_CASE("direct image contexts and high-water planes are independent") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -158,14 +172,15 @@ TEST_CASE("runtime terminal custody is local to each physical aggregate") {
 }
 TEST_CASE("partial runtime construction releases its model and established context") {
     auto backend = std::make_shared<FakeImageBackend>();
-    bool model_destroyed_in_context = false;
+    auto destruction = std::make_shared<RebindingReleaseModel::Destruction>();
     backend->FailAfter(FakeImageBackend::FailurePoint::CreateStream);
     CHECK_THROWS(SystemImageRuntime(SystemImageRuntimeConfig{
         .device = 0,
         .backend = backend,
-        .model = std::make_unique<RebindingReleaseModel>(backend, model_destroyed_in_context),
+        .model = std::make_unique<RebindingReleaseModel>(backend, destruction),
     }));
-    CHECK(model_destroyed_in_context);
+    CHECK(destruction->destroyed);
+    CHECK(destruction->in_runtime_context);
     CHECK(backend->contexts_destroyed == 1U);
     CHECK(backend->streams_destroyed == 0U);
 }
@@ -251,14 +266,47 @@ TEST_CASE("release error after complete identity release permits destruction") {
 }
 TEST_CASE("runtime rebinds its context immediately after model release") {
     auto backend = std::make_shared<FakeImageBackend>();
-    bool destroyed_in_runtime_context = false;
+    auto destruction = std::make_shared<RebindingReleaseModel::Destruction>();
     auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
         .device = 0,
         .backend = backend,
-        .model = std::make_unique<RebindingReleaseModel>(backend, destroyed_in_runtime_context),
+        .model = std::make_unique<RebindingReleaseModel>(backend, destruction),
     });
     CHECK(runtime->Retire().safe_to_destroy);
-    CHECK(destroyed_in_runtime_context);
+    CHECK(destruction->destroyed);
+    CHECK(destruction->in_runtime_context);
+}
+TEST_CASE("post-release context bind failure retains model stream and context with ordered failures", "[gpu][retirement]") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto destruction = std::make_shared<RebindingReleaseModel::Destruction>();
+    const bool release_fails = GENERATE(false, true);
+    const auto binding_failure = std::make_exception_ptr(std::runtime_error("post-release binding failure"));
+    const auto release_failure = release_fails ? std::make_exception_ptr(std::runtime_error("model release failure")) : std::exception_ptr{};
+    auto runtime = std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{
+        .device = 0,
+        .backend = backend,
+        .model = std::make_unique<RebindingReleaseModel>(backend, destruction, binding_failure, release_failure),
+    });
+    const auto retirement = runtime->Retire();
+    CHECK_FALSE(retirement.safe_to_destroy);
+    REQUIRE(retirement.custody.valid());
+    CHECK_FALSE(retirement.custody.deferred());
+    CHECK(test_support::ContainsImageFailure(retirement.failure, binding_failure));
+    if (release_fails) CHECK(test_support::ContainsImageFailure(retirement.failure, release_failure));
+    CHECK_THROWS_WITH(std::rethrow_exception(retirement.failure), release_fails ? "model release failure" : "post-release binding failure");
+    CHECK(retirement.custody.failure() == retirement.failure);
+    CHECK(backend->last_bound_context == 999U);
+    CHECK_FALSE(destruction->destroyed);
+    CHECK(backend->synchronized == 1U);
+    CHECK(backend->streams_destroyed == 0U);
+    CHECK(backend->contexts_destroyed == 0U);
+    const auto binds = backend->contexts_bound.load();
+    CHECK_FALSE(runtime->Retire().safe_to_destroy);
+    CHECK(backend->contexts_bound == binds);
+    runtime.reset();
+    CHECK_FALSE(destruction->destroyed);
+    CHECK(backend->streams_destroyed == 0U);
+    CHECK(backend->contexts_destroyed == 0U);
 }
 TEST_CASE("completed execution failure remains typed after a later successful settlement") {
     auto backend = std::make_shared<FakeImageBackend>();

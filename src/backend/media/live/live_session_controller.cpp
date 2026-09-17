@@ -323,11 +323,7 @@ void LiveMediaDataPlane::Impl::record_cuda_failure(const cudaError_t failure) no
     try {
         status = {capture::StatusCode::kCudaError, "Live CUDA failure " + std::to_string(static_cast<int>(failure))};
     } catch (...) { status = {capture::StatusCode::kCudaError, "Live CUDA failure"}; }
-    {
-        std::lock_guard lock(lifecycle_);
-        record_failure_locked(std::move(status));
-    }
-    wake_condition_.notify_all();
+    record_failure(std::move(status));
 }
 void LiveMediaDataPlane::Impl::record_failure(capture::Status failure) noexcept {
     if (failure.ok()) return;

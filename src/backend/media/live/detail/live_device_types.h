@@ -67,10 +67,7 @@ class LivePhysicalCudaContext final {
                                                                const cudaStream_t stream) noexcept {
     bool synchronized = static_cast<bool>(scope);
     if (scope && stream != nullptr) synchronized = scope.Record(cudaStreamSynchronize(stream)) == cudaSuccess;
-    const auto current = static_cast<SlotState>(state.load(std::memory_order_acquire));
-    bool claimed = current == SlotState::Completing;
-    if (!claimed && current != SlotState::Free && current != SlotState::Terminal) claimed = claim_live_slot(state, current);
-    if (!claimed) return std::nullopt;
+    if (!claim_live_slot_retirement(state)) return std::nullopt;
     return synchronized ? SlotState::Free : SlotState::Terminal;
 }
 template <class Slot, class Publish>

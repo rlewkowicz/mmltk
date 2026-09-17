@@ -146,20 +146,24 @@ struct TrainingSupervisionImpl::TimingState {
                 }
             }
         } catch (...) {
-            for (auto& slot : slots) {
-                if (slot.start != nullptr) { static_cast<void>(cudaEventDestroy(slot.start)); }
-                if (slot.stop != nullptr) { static_cast<void>(cudaEventDestroy(slot.stop)); }
-            }
+            release_events();
             throw;
         }
     }
     ~TimingState() {
         c10::cuda::CUDAGuard guard(static_cast<c10::DeviceIndex>(device_id));
+        release_events();
+    }
+
+   private:
+    void release_events() noexcept {
         for (auto& slot : slots) {
             if (slot.start != nullptr) { static_cast<void>(cudaEventDestroy(slot.start)); }
             if (slot.stop != nullptr) { static_cast<void>(cudaEventDestroy(slot.stop)); }
         }
     }
+
+   public:
     [[nodiscard]] bool matches(const c10::DeviceIndex device, const std::size_t loss_capacity) const noexcept {
         return device_id == device && maximum_accumulated_losses == loss_capacity;
     }

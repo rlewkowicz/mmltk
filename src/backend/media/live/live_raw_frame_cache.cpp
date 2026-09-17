@@ -143,9 +143,7 @@ void LiveRawFrameCache::clear() noexcept {
     if (scope && store_stream_ != nullptr) synchronized = scope.Record(cudaStreamSynchronize(store_stream_)) == cudaSuccess;
     for (std::uint32_t index = 0U; index < slot_count_; ++index) {
         Slot& slot = slots_[index];
-        const SlotState current = static_cast<SlotState>(slot.state.load(std::memory_order_acquire));
-        bool owned = current == SlotState::Completing;
-        if (!owned && current != SlotState::Free && current != SlotState::Terminal) owned = claim_live_slot(slot.state, current);
+        const bool owned = claim_live_slot_retirement(slot.state);
         if (owned) publish_slot(slot, synchronized ? SlotState::Free : SlotState::Terminal);
     }
 }

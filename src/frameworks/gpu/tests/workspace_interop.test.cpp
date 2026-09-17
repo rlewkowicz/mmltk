@@ -1327,26 +1327,40 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
         backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
     const auto raw = runtime.ObserveWorkspace();
     const bool settle_directly = GENERATE(false, true);
+    const bool throwing_sinks = GENERATE(false, true);
     struct DisplayObservation {
         std::size_t notifications = 0U;
         bool ready = false;
     };
     const auto display = std::make_shared<DisplayObservation>();
     workspace->SetDisplayAvailabilitySink(std::make_shared<const std::function<void()>>(
-        [display, weak = std::weak_ptr{workspace}, content = ImageWorkspaceContent{raw.product_owner, raw.product_revision}] {
+        [display, throwing_sinks, weak = std::weak_ptr{workspace}, content = ImageWorkspaceContent{raw.product_owner, raw.product_revision}] {
             ++display->notifications;
             const auto completed = weak.lock();
             display->ready = completed && completed->Contains(content) && completed->WriteAvailable();
+            if (throwing_sinks) throw std::runtime_error("display wake failure");
         }));
     backend->defer_notifications = true;
     CHECK_FALSE(runtime.PrepareDisplay(raw.product_revision, workspace));
+    const auto product_wakes = std::make_shared<std::size_t>(0U);
+    if (throwing_sinks) {
+        workspace->SetAvailabilitySink(std::make_shared<const std::function<void()>>([product_wakes] {
+            ++*product_wakes;
+            throw std::runtime_error("product wake failure");
+        }));
+    } else {
+        workspace->SetAvailabilitySink({});
+    }
+    workspace->CancelWrite();
+    CHECK(*product_wakes == 0U);
     CHECK_FALSE(workspace->Contains({raw.product_owner, raw.product_revision}));
     CHECK_FALSE(runtime.DetachDisplay(workspace));
     auto baseline = runtime.Completed();
     CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
     CHECK(runtime.Borrow().valid());
     CHECK_FALSE(workspace->ReserveDisplayWrite());
-    backend->CompleteNotifications();
+    CHECK_NOTHROW(backend->CompleteNotifications());
+    CHECK(*product_wakes == (throwing_sinks ? 1U : 0U));
     CHECK_FALSE(workspace->Contains({raw.product_owner, raw.product_revision}));
     CHECK(display->notifications == 0U);
     CHECK(backend->planes_freed == 0U);
@@ -1365,9 +1379,65 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
     REQUIRE(workspace->ReserveDisplayWrite());
     workspace->CancelDisplayWrite();
     workspace->SetDisplayAvailabilitySink({});
+    workspace->SetAvailabilitySink({});
     CHECK(*reinterpret_cast<const std::byte*>(runtime.BorrowWorkspace().plane().data) == std::byte{37});
     CHECK(runtime.TryAcquireOutput(baseline).valid());
     CHECK(runtime.PrepareDisplay(raw.product_revision, workspace));
+}
+TEST_CASE("Workspace cancellation publishes availability before ordered product and display wakes", "[gpu][workspace]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout(0));
+    const bool throwing_sinks = GENERATE(false, true);
+    struct Observation {
+        bool display;
+        bool available;
+    };
+    auto observed = std::make_shared<std::vector<Observation>>();
+    const auto make_sink = [&](bool display) {
+        return std::make_shared<const std::function<void()>>([observed, weak = std::weak_ptr{workspace}, throwing_sinks, display] {
+            const auto owner = weak.lock();
+            if (!owner) return;
+            // This takes the access lock: callbacks must run outside it.
+            static_cast<void>(owner->StorageFootprint());
+            observed->push_back({display, owner->WriteAvailable()});
+            if (throwing_sinks) throw std::runtime_error("availability wake failure");
+        });
+    };
+    workspace->SetAvailabilitySink(make_sink(false));
+    workspace->SetDisplayAvailabilitySink(make_sink(true));
+    REQUIRE(workspace->ReserveDisplayWrite());
+    CHECK_NOTHROW(workspace->CancelDisplayWrite());
+    REQUIRE(observed->size() == 3U);
+    CHECK_FALSE((*observed)[0].display);
+    CHECK_FALSE((*observed)[0].available);
+    CHECK_FALSE((*observed)[1].display);
+    CHECK((*observed)[1].available);
+    CHECK((*observed)[2].display);
+    CHECK((*observed)[2].available);
+    observed->clear();
+    REQUIRE(workspace->ReserveWrite());
+    CHECK_NOTHROW(workspace->CancelWrite());
+    REQUIRE(observed->size() == 2U);
+    CHECK_FALSE((*observed)[0].display);
+    CHECK((*observed)[0].available);
+    CHECK((*observed)[1].display);
+    CHECK((*observed)[1].available);
+    observed->clear();
+    REQUIRE(workspace->ReserveDisplayWrite());
+    CHECK_NOTHROW(workspace->Detach(0U));
+    REQUIRE(observed->size() == 1U);
+    CHECK((*observed)[0].display);
+    CHECK_FALSE((*observed)[0].available);
+    workspace->SetAvailabilitySink({});
+    workspace->SetDisplayAvailabilitySink({});
+    CHECK_NOTHROW(workspace->CancelDisplayWrite());
+    CHECK(workspace->WriteAvailable());
+    REQUIRE(workspace->ReserveWrite());
+    CHECK_NOTHROW(workspace->CancelWrite());
+    CHECK(workspace->WriteAvailable());
+    CHECK_NOTHROW(workspace->Detach(0U));
 }
 TEST_CASE("Shutdown settles pending workspace finalization with allocation-local cleanup custody", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;

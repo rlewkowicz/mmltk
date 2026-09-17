@@ -12,6 +12,12 @@ cudaError_t runtime_set_device(void*, const int device) noexcept { return cudaSe
 void ensure_cuda_ok(const cudaError_t status, const char* context) {
     if (status != cudaSuccess) { throw CudaError(status, context); }
 }
+void ensure_cuda_driver_ok(const CUresult status, const char* operation) {
+    if (status == CUDA_SUCCESS) return;
+    const char* detail = nullptr;
+    (void)cuGetErrorString(status, &detail);
+    throw std::runtime_error(std::string(operation) + ": " + (detail ? detail : "CUDA driver failure"));
+}
 int current_cuda_highest_stream_priority() {
     int least_priority = 0;
     int greatest_priority = 0;

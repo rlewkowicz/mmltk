@@ -27,26 +27,19 @@ import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::data {
 namespace gpu = mmltk::frameworks::gpu;
 namespace {
-void driver_check(const CUresult result, const char* operation) {
-    if (result != CUDA_SUCCESS) {
-        const char* message = nullptr;
-        (void)cuGetErrorString(result, &message);
-        throw std::runtime_error(std::string(operation) + ": " + (message ? message : "CUDA driver failure"));
-    }
-}
 template <class Operation>
 void on_context(const CUcontext context, Operation&& operation) {
     if (context == nullptr) throw std::logic_error("compiled image stream has no owning CUDA context");
-    driver_check(cuCtxPushCurrent(context), "compiled image stream context binding");
+    gpu::ensure_cuda_driver_ok(cuCtxPushCurrent(context), "compiled image stream context binding");
     CUcontext popped = nullptr;
     try {
         operation();
     } catch (...) {
         const auto failure = std::current_exception();
-        driver_check(cuCtxPopCurrent(&popped), "compiled image stream context restoration");
+        gpu::ensure_cuda_driver_ok(cuCtxPopCurrent(&popped), "compiled image stream context restoration");
         std::rethrow_exception(failure);
     }
-    driver_check(cuCtxPopCurrent(&popped), "compiled image stream context restoration");
+    gpu::ensure_cuda_driver_ok(cuCtxPopCurrent(&popped), "compiled image stream context restoration");
 }
 }  // namespace
 struct CompiledImageStream::Buffer::Impl {
@@ -76,7 +69,7 @@ void CompiledImageStream::Buffer::ensure_bytes(const std::size_t bytes) {
     if (state.mapped) {
         if (!state.gdr) {
             CUcontext context{};
-            driver_check(cuCtxGetCurrent(&context), "mapped image owner context");
+            gpu::ensure_cuda_driver_ok(cuCtxGetCurrent(&context), "mapped image owner context");
             state.gdr = std::make_unique<gpu::GdrMappedBuffer>(context, 2U);
         }
         state.lease = {};
@@ -87,7 +80,7 @@ void CompiledImageStream::Buffer::ensure_bytes(const std::size_t bytes) {
     if (state.pinned) {
         if (!state.host) {
             CUcontext context{};
-            driver_check(cuCtxGetCurrent(&context), "local pinned host owner context");
+            gpu::ensure_cuda_driver_ok(cuCtxGetCurrent(&context), "local pinned host owner context");
             state.host = std::make_unique<gpu::PinnedHostBuffer>(context, state.placement, true);
         }
         state.host->ensure_bytes(bytes);
@@ -243,7 +236,7 @@ struct CompiledImageStream::Impl {
     void complete_loop() noexcept {
         try {
             (void)mmltk::common::system::apply_worker_execution_policy({cpus, "compiled-done", config.workers, execution.placement.numa_node, -10, false});
-            driver_check(cuCtxSetCurrent(context), "compiled image completion worker context");
+            gpu::ensure_cuda_driver_ok(cuCtxSetCurrent(context), "compiled image completion worker context");
             {
                 std::lock_guard lock(mutex);
                 completion_started = true;
@@ -327,7 +320,7 @@ CompiledImageStream::CompiledImageStream(Config config, std::shared_ptr<gpu::Ter
 const gpu::DeviceExecution& CompiledImageStream::execution() const noexcept { return impl_->execution; }
 void CompiledImageStream::bind_current_context() {
     CUcontext current = nullptr;
-    driver_check(cuCtxGetCurrent(&current), "compiled image owner context");
+    gpu::ensure_cuda_driver_ok(cuCtxGetCurrent(&current), "compiled image owner context");
     if (current == nullptr) throw std::logic_error("compiled image stream initialization requires the owning context to be current");
     if (impl_->initialized) {
         if (current != impl_->context) throw std::logic_error("compiled image stream cannot change owning CUDA context");
@@ -335,7 +328,7 @@ void CompiledImageStream::bind_current_context() {
     }
     if (impl_->failure) std::rethrow_exception(impl_->failure);
     CUdevice device = -1;
-    driver_check(cuCtxGetDevice(&device), "compiled image owner device");
+    gpu::ensure_cuda_driver_ok(cuCtxGetDevice(&device), "compiled image owner device");
     if (device != impl_->config.device) throw std::logic_error("compiled image stream owning device mismatch");
     impl_->context = current;
     try {

@@ -189,24 +189,19 @@ SystemImageRuntime::Retirement SystemImageRuntime::Retire(std::exception_ptr unp
     std::exception_ptr failure = settled.failure;
     try {
         state_->context->Bind();
+        if (state_->model) {
+            const auto released = state_->model->ReleaseResources();
+            failure = combine_image_failures(failure, released.failure);
+            if (!released.all_released) {
+                if (!failure) failure = missing_retention_failure();
+                return {.failure = failure, .custody = Retain(failure)};
+            }
+            state_->context->Bind();
+            state_->model.reset();
+        }
     } catch (...) {
         failure = combine_image_failures(failure, std::current_exception());
         return {.failure = failure, .custody = Retain(failure)};
-    }
-    if (state_->model) {
-        const auto released = state_->model->ReleaseResources();
-        failure = combine_image_failures(failure, released.failure);
-        if (!released.all_released) {
-            if (!failure) failure = missing_retention_failure();
-            return {.failure = failure, .custody = Retain(failure)};
-        }
-        try {
-            state_->context->Bind();
-        } catch (...) {
-            failure = combine_image_failures(failure, std::current_exception());
-            return {.failure = failure, .custody = Retain(failure)};
-        }
-        state_->model.reset();
     }
     // Release ordinary pool ownership while the runtime can still observe
     // product cleanup. External products, raw aliases and counted reads keep

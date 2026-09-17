@@ -197,15 +197,18 @@ struct ImageWorkspace::State final {
         const auto epoch = gate.load(std::memory_order_relaxed) & ~kWorkspaceAccessMask;
         gate.store(epoch | role, std::memory_order_release);
     }
-    void NotifyDisplayAvailable() const noexcept {
-        if (display_held.load(std::memory_order_acquire)) return;
-        const auto role = std::atomic_ref{access_signal->access}.load(std::memory_order_acquire) & kWorkspaceAccessMask;
-        if (role != kWorkspaceAccessEmpty && role != kWorkspaceAccessAvailable) return;
-        if (const auto sink = display_availability_sink.load(std::memory_order_acquire)) {
+    static void InvokeWake(const std::atomic<std::shared_ptr<const std::function<void()>>>& selected) noexcept {
+        if (const auto sink = selected.load(std::memory_order_acquire)) {
             try {
                 (*sink)();
             } catch (...) {}
         }
+    }
+    void NotifyDisplayAvailable() const noexcept {
+        if (display_held.load(std::memory_order_acquire)) return;
+        const auto role = std::atomic_ref{access_signal->access}.load(std::memory_order_acquire) & kWorkspaceAccessMask;
+        if (role != kWorkspaceAccessEmpty && role != kWorkspaceAccessAvailable) return;
+        InvokeWake(display_availability_sink);
     }
     void Withdraw() noexcept {
         std::scoped_lock lock(access);
@@ -469,11 +472,7 @@ void ImageWorkspace::CancelWrite() noexcept {
         state_->write_reserved = false;
         state_->PublishAccess(state_->revision != 0U ? kWorkspaceAccessAvailable : kWorkspaceAccessEmpty);
     }
-    if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
-        try {
-            (*sink)();
-        } catch (...) {}
-    }
+    State::InvokeWake(state_->availability_sink);
     state_->NotifyDisplayAvailable();
 }
 bool ImageWorkspace::ReserveDisplayWrite() {
@@ -486,11 +485,7 @@ bool ImageWorkspace::ReserveDisplayWrite() {
 void ImageWorkspace::CancelDisplayWrite() noexcept {
     CancelWrite();
     state_->display_held.store(false, std::memory_order_release);
-    if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
-        try {
-            (*sink)();
-        } catch (...) {}
-    }
+    State::InvokeWake(state_->availability_sink);
     state_->NotifyDisplayAvailable();
 }
 std::uint64_t ImageWorkspace::product_owner() const noexcept { return state_->owner->product_owner.load(std::memory_order_acquire); }
@@ -507,11 +502,7 @@ void ImageWorkspace::Detach(std::uint64_t product_owner) {
         } else if (state_->owner->product_owner != 0U)
             throw std::invalid_argument("workspace detachment owner mismatch");
     }
-    if (const auto sink = state_->display_availability_sink.load(std::memory_order_acquire)) {
-        try {
-            (*sink)();
-        } catch (...) {}
-    }
+    State::InvokeWake(state_->display_availability_sink);
 }
 bool ImageWorkspace::Acquired(std::uint64_t generation) const noexcept {
     return generation != 0U &&
@@ -535,11 +526,7 @@ void ImageWorkspace::CompleteRead(std::uint64_t generation) {
             throw std::runtime_error("workspace read settlement lost physical custody");
         state_->display_held.store(false, std::memory_order_release);
     }
-    if (const auto sink = state_->availability_sink.load(std::memory_order_acquire)) {
-        try {
-            (*sink)();
-        } catch (...) {}
-    }
+    State::InvokeWake(state_->availability_sink);
 }
 void ImageWorkspace::SetAvailabilitySink(std::shared_ptr<const std::function<void()>> sink) noexcept {
     state_->availability_sink.store(std::move(sink), std::memory_order_release);
@@ -674,11 +661,7 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
         state_->completion_notified.store(false, std::memory_order_release);
         execution->Notify([state = state_.get()] {
             state->completion_notified.store(true, std::memory_order_release);
-            if (const auto sink = state->availability_sink.load(std::memory_order_acquire)) {
-                try {
-                    (*sink)();
-                } catch (...) {}
-            }
+            State::InvokeWake(state->availability_sink);
         });
         execution->Record(completion);
         state_->completed_event = completion;

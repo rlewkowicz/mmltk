@@ -63,4 +63,5 @@ class CudaError final : public std::runtime_error {
     cudaError_t status_;
 };
 void ensure_cuda_ok(cudaError_t status, const char* context);
+void ensure_cuda_driver_ok(CUresult status, const char* operation);
 }  // namespace mmltk::frameworks::gpu

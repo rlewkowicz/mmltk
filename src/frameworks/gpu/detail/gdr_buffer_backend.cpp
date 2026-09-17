@@ -5,14 +5,9 @@
 #include <system_error>
 #include <stdexcept>
 #include <string>
+#include "src/frameworks/gpu/cuda_error.h"
 namespace mmltk::frameworks::gpu::detail {
 namespace {
-void check_cuda(CUresult result, const char* operation) {
-    if (result == CUDA_SUCCESS) return;
-    const char* text = nullptr;
-    (void)cuGetErrorString(result, &text);
-    throw std::runtime_error(std::string(operation) + ": " + (text ? text : "CUDA driver failure"));
-}
 void check_gdr(int result, const char* operation) {
     if (result != 0) throw std::runtime_error(std::string(operation) + ": GDR status " + std::to_string(result));
 }
@@ -20,17 +15,17 @@ class NativeGdrBackend final : public GdrBufferBackend {
    public:
     CUcontext current_context() override {
         CUcontext result{};
-        check_cuda(cuCtxGetCurrent(&result), "get GDR owner context");
+        ensure_cuda_driver_ok(cuCtxGetCurrent(&result), "get GDR owner context");
         return result;
     }
-    void push_context(CUcontext context) override { check_cuda(cuCtxPushCurrent(context), "bind GDR owner context"); }
+    void push_context(CUcontext context) override { ensure_cuda_driver_ok(cuCtxPushCurrent(context), "bind GDR owner context"); }
     int pop_context() noexcept override {
         CUcontext popped{};
         return static_cast<int>(cuCtxPopCurrent(&popped));
     }
     int current_device() override {
         CUdevice device{};
-        check_cuda(cuCtxGetDevice(&device), "get GDR owner device");
+        ensure_cuda_driver_ok(cuCtxGetDevice(&device), "get GDR owner device");
         return device;
     }
     void* open() override {
@@ -54,23 +49,23 @@ class NativeGdrBackend final : public GdrBufferBackend {
         int supported{};
         if (dmabuf) {
             int version{};
-            check_cuda(cuDriverGetVersion(&version), "query DMA-BUF driver version");
+            ensure_cuda_driver_ok(cuDriverGetVersion(&version), "query DMA-BUF driver version");
             if (version < 13030) throw GdrTransportUnavailable("GDR DMA-BUF mmap requires driver 13.3+");
-            check_cuda(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_MMAP_SUPPORTED, device), "query selected device DMA-BUF mmap support");
+            ensure_cuda_driver_ok(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_DMA_BUF_MMAP_SUPPORTED, device), "query selected device DMA-BUF mmap support");
         } else {
-            check_cuda(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, device), "query selected device GPUDirect support");
+            ensure_cuda_driver_ok(cuDeviceGetAttribute(&supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_SUPPORTED, device), "query selected device GPUDirect support");
         }
         if (!supported) throw GdrTransportUnavailable("selected GPU does not support the required GDR backend");
     }
     int close(void* handle) noexcept override { return gdr_close(static_cast<gdr_t>(handle)); }
     CUdeviceptr allocate(std::size_t bytes) override {
         CUdeviceptr result{};
-        check_cuda(cuMemAlloc(&result, bytes), "allocate GDR device storage");
+        ensure_cuda_driver_ok(cuMemAlloc(&result, bytes), "allocate GDR device storage");
         return result;
     }
     void sync_memops(CUdeviceptr allocation) override {
         unsigned value = 1;
-        check_cuda(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, allocation), "enable synchronous memops on original GDR allocation");
+        ensure_cuda_driver_ok(cuPointerSetAttribute(&value, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, allocation), "enable synchronous memops on original GDR allocation");
     }
     int free(CUdeviceptr allocation) noexcept override { return static_cast<int>(cuMemFree(allocation)); }
     std::uintptr_t pin(void* handle, CUdeviceptr data, std::size_t bytes) override {
@@ -101,13 +96,13 @@ class NativeGdrBackend final : public GdrBufferBackend {
     }
     CUevent create_event() override {
         CUevent event{};
-        check_cuda(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING), "create GDR consumer event");
+        ensure_cuda_driver_ok(cuEventCreate(&event, CU_EVENT_DISABLE_TIMING), "create GDR consumer event");
         return event;
     }
-    void record_event(CUevent event, CUstream stream) override { check_cuda(cuEventRecord(event, stream), "record GDR consumption"); }
-    void wait_event(CUevent event) override { check_cuda(cuEventSynchronize(event), "wait for GDR consumption"); }
+    void record_event(CUevent event, CUstream stream) override { ensure_cuda_driver_ok(cuEventRecord(event, stream), "record GDR consumption"); }
+    void wait_event(CUevent event) override { ensure_cuda_driver_ok(cuEventSynchronize(event), "wait for GDR consumption"); }
     int destroy_event(CUevent event) noexcept override { return static_cast<int>(cuEventDestroy(event)); }
-    void synchronize_context() override { check_cuda(cuCtxSynchronize(), "settle unrecorded GDR consumption"); }
+    void synchronize_context() override { ensure_cuda_driver_ok(cuCtxSynchronize(), "settle unrecorded GDR consumption"); }
 };
 }  // namespace
 std::shared_ptr<GdrBufferBackend> gdr_buffer_backend() {
