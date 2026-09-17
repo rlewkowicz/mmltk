@@ -13,6 +13,15 @@ pub enum Message {
     Visible(Chart, bool), Reset, Selector, Expand(Option<Chart>), Epoch(bool), Log(bool),
     Plot(Chart, iced_plot::PlotUiMessage),
 }
+/// Read-only rendered-view facts, collected only by enabled acceptance workflows.
+#[derive(Debug, Clone)]
+pub(crate) struct ChartView {
+    pub ranges: [[f64; 2]; 2],
+    pub plot_bounds: iced::Rectangle,
+    pub legend_collapsed: bool,
+    pub legend_control: String,
+    pub visible: bool,
+}
 pub struct Component {
     charts: Vec<RetainedChart>,
     metrics: Vec<Metric>,
@@ -35,6 +44,15 @@ impl Default for Component {
     }
 }
 impl Component {
+    pub(crate) fn chart_view(&self, kind: Chart) -> Option<ChartView> {
+        let chart = self.charts.iter().find(|chart| chart.kind == kind)?;
+        Some(ChartView {
+            ranges: chart.plot.view_ranges()?, plot_bounds: chart.plot.view_bounds()?,
+            legend_collapsed: chart.plot.legend_collapsed(),
+            legend_control: chart.plot.legend_control_id(),
+            visible: self.expanded.map_or(chart.visible, |expanded| expanded == kind),
+        })
+    }
     fn invalidate(&mut self) { for chart in &mut self.charts { chart.dirty = true; } }
     fn history(&self) -> &history::History { if self.saved_selected { &self.saved } else { &self.live } }
     pub fn clear(&mut self) { self.live.clear(&self.metrics); self.saved.clear(&self.metrics); self.invalidate(); }

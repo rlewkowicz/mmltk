@@ -160,6 +160,18 @@ impl Default for PlotState {
 }
 
 impl PlotState {
+    pub(crate) fn reset_interaction(&mut self) {
+        self.cursor_position = Vec2::ZERO;
+        self.last_click_time = None;
+        self.last_click_button = None;
+        self.modifiers = keyboard::Modifiers::default();
+        self.press = ButtonPressState::default();
+        self.selection = SelectionState::default();
+        self.pan = PanState::default();
+        self.drag = DragState::default();
+        self.crosshairs_position = Vec2::ZERO;
+    }
+
     pub(crate) fn origin(&self) -> &ProjectionOrigin {
         &self.origin
     }

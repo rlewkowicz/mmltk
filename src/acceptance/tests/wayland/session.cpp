@@ -635,6 +635,7 @@ void WaylandSession::RunWorkflows() {
         }
     }
     CHECK((workflow_steps_ == std::set<std::string>{"train", "validation", "compiled", "image", "video", "stop", "theme", "narrow",
+        "chart_legend", "chart_pan", "chart_retained_expanded", "chart_retained_back", "chart_retained_hidden", "chart_retained_revealed", "chart_retained_navigation",
         "chart_tile_0", "chart_tile_1", "chart_tile_2", "chart_tile_3", "chart_tile_4", "chart_tile_5", "chart_expanded",
         "chart_aspect_0", "chart_aspect_1", "chart_aspect_2", "chart_aspect_3", "chart_aspect_4", "chart_aspect_5",
         "chart_wheel_grid_0", "chart_wheel_grid_1", "chart_wheel_grid_2", "chart_wheel_grid_3", "chart_wheel_grid_4", "chart_wheel_grid_5", "chart_wheel_expanded_0", "chart_wheel_expanded_1", "chart_wheel_expanded_2", "chart_wheel_expanded_3", "chart_wheel_expanded_4", "chart_wheel_expanded_5"}));

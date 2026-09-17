@@ -57,6 +57,15 @@ impl Picture {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Retention { Expanded, Back, Hidden, Revealed, Navigation }
+impl Retention {
+    fn name(self) -> &'static str {
+        match self { Self::Expanded => "expanded", Self::Back => "back", Self::Hidden => "hidden",
+            Self::Revealed => "revealed", Self::Navigation => "navigation" }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Step {
     Train,
     StartTrain,
@@ -69,11 +78,30 @@ pub(super) enum Step {
     TrainAspect,
     ChartBounds,
     ChartTile(u8),
+    ChartLegend,
+    ChartLegendPending,
+    ChartLegendChanged,
+    ChartPan,
+    ChartPanPending,
+    ChartPanned,
+    ChartSettle(Retention),
+    ChartSettlePending(Retention),
+    ChartRetained(Retention),
+    ChartSelector,
+    ChartHide,
+    ChartAbsent,
+    ChartShow,
+    ChartCloseSelector,
+    ChartLeave,
+    ChartAway,
+    ChartReturn,
     ExpandChart,
     ExpandedBounds,
     ExpandedChart,
     ChartWheel(u8, bool),
     ChartWheelPending(u8, bool),
+    ChartWheelSettle(u8, bool),
+    ChartWheelSettling(u8, bool),
     ChartScrolled(u8, bool),
     BackToCharts,
     ChartAspect(u8),
@@ -113,6 +141,8 @@ pub(super) enum Step {
 #[derive(Default)]
 pub(super) struct State {
     chart_bounds: Rectangle,
+    chart_view: Option<crate::view::metrics::ChartView>,
+    chart_sequence: Option<u64>,
     wheel_y: f32,
     hidden_sequence: u64,
     generation: u64,
@@ -142,6 +172,28 @@ mod tests {
     use super::{Picture, Step};
     use crate::integration_control::pixel_checks::ProbeOutcome;
     use crate::integration_control::{Message, Phase};
+
+    #[test]
+    fn chart_input_completion_requires_current_scenario_and_successful_settlement() {
+        let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+        let controller = &mut fixture.controller;
+        controller.driver.phase = Phase::Workflows(Step::ChartPanPending);
+        let completion = |generation, delivered| Message::Scoped {
+            generation, receipt: None,
+            message: Box::new(Message::ChartInputDelivered(delivered)),
+        };
+        let generation = controller.driver.generation;
+        let _ = controller.update(completion(generation.wrapping_sub(1), true));
+        assert_eq!(controller.driver.phase, Phase::Workflows(Step::ChartPanPending));
+        let _ = controller.update(completion(generation, true));
+        assert_eq!(controller.driver.phase, Phase::Workflows(Step::ChartPanned));
+        controller.driver.phase = Phase::Workflows(Step::ChartWheelSettling(1, true));
+        let _ = controller.update(completion(generation, true));
+        assert_eq!(controller.driver.phase, Phase::Workflows(Step::ChartScrolled(1, true)));
+        controller.driver.phase = Phase::Workflows(Step::ChartLegendPending);
+        let _ = controller.update(completion(generation, false));
+        assert_eq!(controller.driver.phase, Phase::Failed);
+    }
 
     #[test]
     fn workflow_completion_requires_current_nonempty_canvas_evidence() {
@@ -176,8 +228,29 @@ mod tests {
 impl State {
     pub(super) fn wheel_delivered(&mut self, driver: &mut Driver) {
         if let Phase::Workflows(Step::ChartWheelPending(index, expanded)) = driver.phase {
-            driver.phase = Phase::Workflows(Step::ChartScrolled(index, expanded));
+            driver.phase = Phase::Workflows(Step::ChartWheelSettle(index, expanded));
         }
+    }
+
+    pub(super) fn chart_input_delivered(&mut self, driver: &mut Driver) {
+        let Phase::Workflows(step) = driver.phase else { return; };
+        let next = match step {
+            Step::ChartLegendPending => Step::ChartLegendChanged,
+            Step::ChartPanPending => Step::ChartPanned,
+            Step::ChartSettlePending(retention) => Step::ChartRetained(retention),
+            Step::ChartWheelSettling(index, expanded) => Step::ChartScrolled(index, expanded),
+            _ => return,
+        };
+        driver.phase = Phase::Workflows(next);
+    }
+
+    fn retained(&self, driver: &mut Driver, view: &crate::view::metrics::ChartView, stage: &str) -> bool {
+        let Some(expected) = &self.chart_view else { driver.fail("Missing chart view baseline"); return false; };
+        if view.ranges != expected.ranges || view.legend_collapsed != expected.legend_collapsed {
+            driver.fail(&format!("Chart camera or legend changed during {stage}")); return false;
+        }
+        reporting::chart_view(stage, view);
+        true
     }
 
     pub(super) fn workflow_step(&mut self, driver: &mut Driver, step: Step) -> Task<RootMessage> {
@@ -199,6 +272,8 @@ impl State {
                 Step::Train
                     | Step::LeaveTrain
                     | Step::ReturnTrain
+                    | Step::ChartLeave
+                    | Step::ChartReturn
                     | Step::Validate
                     | Step::Predict
                     | Step::Theme
@@ -292,6 +367,12 @@ impl State {
             });
             return;
         }
+        if step == Step::ChartAbsent {
+            if bounds.width > 0.0 || bounds.height > 0.0 {
+                driver.fail("Hidden chart remains mounted in the rendered dashboard");
+            } else { driver.phase = Phase::Workflows(Step::ChartShow); }
+            return;
+        }
         if matches!(step, Step::TrainAspect) {
             if bounds.width <= 0.0 || bounds.height <= 0.0 {
                 driver.fail("Train workspace aspect selector is missing");
@@ -307,6 +388,12 @@ impl State {
             return;
         }
         match step {
+            Step::ChartLegend | Step::ChartPan => {
+                driver.phase = Phase::Workflows(if step == Step::ChartLegend { Step::ChartLegendPending } else { Step::ChartPanPending });
+                let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
+                if !widget_ops::chart_input(Some(input), step == Step::ChartPan) { driver.fail("Chart pointer dispatch failed"); }
+                return;
+            }
             Step::ChartBounds | Step::ExpandedBounds => {
                 self.chart_bounds = bounds;
                 driver.phase = Phase::Workflows(if step == Step::ExpandedBounds { Step::ExpandedChart } else { Step::ChartTile(0) });
@@ -341,10 +428,10 @@ impl State {
                         driver.fail("Expanded chart does not fill its workspace"); return;
                     }
                     completed("chart_expanded", [bounds.width as f64, bounds.height as f64, 0.0, 0.0]);
-                    driver.phase = Phase::Workflows(Step::ChartWheel(0, true));
+                    driver.phase = Phase::Workflows(Step::ChartSettle(Retention::Expanded));
                 } else {
                     completed(&format!("chart_tile_{index}"), [index as f64, bounds.width as f64, bounds.height as f64, 0.0]);
-                    driver.phase = Phase::Workflows(if index < 5 { Step::ChartTile(index + 1) } else { Step::ChartWheel(0, false) });
+                    driver.phase = Phase::Workflows(if index < 5 { Step::ChartTile(index + 1) } else { Step::ChartLegend });
                 }
                 return;
             }
@@ -394,7 +481,13 @@ impl State {
         }
         driver.phase = Phase::Workflows(match step {
             Step::ExpandChart => Step::ExpandedBounds,
-            Step::BackToCharts => Step::ChartAspect(0),
+            Step::BackToCharts => Step::ChartSettle(Retention::Back),
+            Step::ChartSelector => Step::ChartHide,
+            Step::ChartHide => Step::ChartSettle(Retention::Hidden),
+            Step::ChartShow => Step::ChartCloseSelector,
+            Step::ChartCloseSelector => Step::ChartSettle(Retention::Revealed),
+            Step::ChartLeave => Step::ChartAway,
+            Step::ChartReturn => Step::ChartSettle(Retention::Navigation),
             Step::ChartAspect(index) => Step::ChartAspectReady(index),
             Step::Train => Step::StartTrain,
             Step::StartTrain => Step::Training,
@@ -431,6 +524,7 @@ impl State {
         settings: &settings::SettingsModel,
         active: FeatureId,
         surface: Option<crate::presentation_surface::Surface>,
+        router: &crate::view::router::Router,
     ) -> Task<RootMessage> {
         let settled = !settings.has_local_edits();
         let train = model.workflow.training.as_ref();
@@ -489,10 +583,90 @@ impl State {
                 );
                 self.workflow_step(driver, Step::Pixels(Picture::Train, 0))
             }
+            Step::ChartLegend | Step::ChartPan | Step::ChartLegendChanged | Step::ChartPanned
+            | Step::ChartRetained(_) | Step::ChartScrolled(_, _) => {
+                // Observation is effect-only and never collected in ordinary quiet runs.
+                if !crate::integration_control::reporting_enabled() {
+                    driver.fail("Chart retained-view acceptance requires reporting"); return Task::none();
+                }
+                let Some(view) = router.train_chart_view(crate::view::metrics::Chart::Loss) else {
+                    return Task::none();
+                };
+                let sequence = record.map(|record| record.sequence);
+                if self.chart_sequence.is_some() && self.chart_sequence != sequence {
+                    driver.fail("Chart retention input overlapped a training data update"); return Task::none();
+                }
+                match step {
+                    Step::ChartLegend => {
+                        self.chart_sequence = sequence;
+                        self.chart_view = Some(view.clone());
+                        self.workflow_control(widgets, driver, view.legend_control)
+                    }
+                    Step::ChartLegendChanged => {
+                        let previous = self.chart_view.as_ref().unwrap();
+                        if previous.legend_collapsed == view.legend_collapsed || previous.ranges != view.ranges {
+                            driver.fail("Ordinary legend input did not change only the legend"); return Task::none();
+                        }
+                        self.chart_view = Some(view);
+                        completed("chart_legend", [1.0, 0.0, 0.0, 0.0]);
+                        self.workflow_step(driver, Step::ChartPan)
+                    }
+                    Step::ChartPan => self.workflow_control(widgets, driver, "train.metrics.chart.Loss"),
+                    Step::ChartPanned => {
+                        let previous = self.chart_view.as_ref().unwrap();
+                        if previous.ranges == view.ranges || previous.legend_collapsed != view.legend_collapsed {
+                            driver.fail("Ordinary chart pan did not change the camera"); return Task::none();
+                        }
+                        reporting::chart_view("panned", &view);
+                        self.chart_view = Some(view);
+                        completed("chart_pan", [1.0, 0.0, 0.0, 0.0]);
+                        self.workflow_step(driver, Step::ChartWheel(0, false))
+                    }
+                    Step::ChartRetained(retention) => {
+                        if !self.retained(driver, &view, retention.name()) { return Task::none(); }
+                        if view.visible == (retention == Retention::Hidden) {
+                            driver.fail("Chart visibility input did not change dashboard membership"); return Task::none();
+                        }
+                        if retention == Retention::Expanded && view.plot_bounds.width <= self.chart_view.as_ref().unwrap().plot_bounds.width {
+                            driver.fail("Expanded chart did not publish its larger plot rectangle"); return Task::none();
+                        }
+                        if retention == Retention::Navigation && active != FeatureId::Train { return Task::none(); }
+                        completed(&format!("chart_retained_{}", retention.name()), [view.plot_bounds.width as f64, view.plot_bounds.height as f64, 0.0, 0.0]);
+                        let next = match retention {
+                            Retention::Expanded => Step::ChartWheel(0, true),
+                            Retention::Back => Step::ChartSelector,
+                            Retention::Hidden => Step::ChartAbsent,
+                            Retention::Revealed => Step::ChartLeave,
+                            Retention::Navigation => { self.chart_sequence = None; Step::ChartAspect(0) },
+                        };
+                        self.workflow_step(driver, next)
+                    }
+                    Step::ChartScrolled(_, _) => {
+                        if !self.retained(driver, &view, "wheel") { return Task::none(); }
+                        if widgets.begin_location() { locate("train.metrics.chart.Loss", driver.generation) } else { Task::none() }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Step::ChartSettle(retention) => {
+                driver.phase = Phase::Workflows(Step::ChartSettlePending(retention));
+                if !widget_ops::chart_input(None, false) { driver.fail("Chart render settlement failed"); }
+                Task::none()
+            }
+            Step::ChartWheelSettle(index, expanded) => {
+                driver.phase = Phase::Workflows(Step::ChartWheelSettling(index, expanded));
+                if !widget_ops::chart_input(None, false) { driver.fail("Chart wheel settlement failed"); }
+                Task::none()
+            }
             Step::ChartWheel(_, _) => self.workflow_control(widgets, driver, "train.metrics.chart.Loss"),
-            Step::ChartScrolled(_, _) => {
+            Step::ChartSelector | Step::ChartCloseSelector => self.workflow_control(widgets, driver, "train.metrics.charts"),
+            Step::ChartAbsent => {
                 if widgets.begin_location() { locate("train.metrics.chart.Loss", driver.generation) } else { Task::none() }
             }
+            Step::ChartHide | Step::ChartShow => self.workflow_control(widgets, driver, "train.metrics.visible.Loss"),
+            Step::ChartLeave => self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Validate)),
+            Step::ChartAway if active == FeatureId::Validate => self.workflow_step(driver, Step::ChartReturn),
+            Step::ChartReturn => self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Train)),
             Step::ChartBounds | Step::ExpandedBounds => self.workflow_control(widgets, driver, "train.metrics.plot"),
             Step::ChartTile(index) => {
                 let names = ["Loss", "Ap50", "Ap", "AverageRecall", "Confidence", "LearningRate"];

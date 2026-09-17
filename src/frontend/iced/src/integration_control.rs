@@ -179,6 +179,7 @@ pub enum Message {
     },
     Advance,
     NumberWheelDelivered,
+    ChartInputDelivered(bool),
     NumberInvalidDelivered,
     NumberClipboardPrepared {
         revision: u64,
@@ -390,6 +391,10 @@ extern "C" {
     fn sweep_js(x: f64, y: f64, width: f64, height: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationWheel)]
     fn wheel_js(x: f64, y: f64, delta: f64, control: bool, pixels: bool) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationChartInput)]
+    fn chart_input_js(x: f64, y: f64, width: f64, height: f64, pan: bool, completed: &wasm_bindgen::JsValue) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationChartSettled)]
+    fn chart_settled_js(completed: &wasm_bindgen::JsValue);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationSliderDrag)]
     fn slider_drag_js(x: f64, y: f64, width: f64, height: f64) -> u32;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReplaceNumber)]
@@ -1625,6 +1630,11 @@ impl Controller {
             Message::Scoped { .. } | Message::ProbeCompleted { .. } | Message::Advance => {
                 return None;
             }
+            Message::ChartInputDelivered(delivered) => {
+                if delivered { self.workflows.chart_input_delivered(&mut self.driver); }
+                else { self.driver.fail("Chart input/render callback was invalidated"); }
+                return None;
+            }
             Message::NumberWheelDelivered => {
                 self.retained.callback(
                     &mut self.driver,
@@ -1769,6 +1779,7 @@ impl Controller {
                 settings,
                 active,
                 surface,
+                router,
             ),
             Phase::AwaitWorkspaceFps
             | Phase::AwaitWorkspaceFpsPixels

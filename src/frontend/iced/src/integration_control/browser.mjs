@@ -854,6 +854,41 @@ export function mmltkIntegrationWheel(x, y, delta = -96, control = false, pixels
   return 1;
 }
 
+// Chart acceptance uses normal pointer events, then the same two presentation
+// opportunities as workflow pixel evidence. No camera or widget state is mutated here.
+export function mmltkIntegrationChartSettled(completed) {
+  const finish = integrationCompletion(completed);
+  integrationFrame(() => integrationFrame(() => finish('observed')));
+}
+export function mmltkIntegrationChartInput(x, y, width, height, pan, completed) {
+  completed = integrationCompletion(completed);
+  const canvas = document.querySelector('canvas');
+  if (!canvas || ![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+    completed('failed'); return 0;
+  }
+  const rect = canvas.getBoundingClientRect();
+  integrationMicrotask(() => {
+    if (!pan) {
+      // The legend container includes entries; the header is its top row.
+      integrationClick(canvas, rect, x + Math.min(30, width * 0.5), y + 12);
+      mmltkIntegrationChartSettled(completed);
+      return;
+    }
+    const startX = x + width * 0.7, startY = y + height * 0.65;
+    const endX = x + width * 0.8, endY = y + height * 0.72;
+    canvas.dispatchEvent(integrationPointer(rect, startX, startY, 'pointermove', 0));
+    canvas.dispatchEvent(integrationPointer(rect, startX, startY, 'pointerdown', 1));
+    integrationFrame(() => {
+      canvas.dispatchEvent(integrationPointer(rect, endX, endY, 'pointermove', 1));
+      integrationFrame(() => {
+        canvas.dispatchEvent(integrationPointer(rect, endX, endY, 'pointerup', 0));
+        mmltkIntegrationChartSettled(completed);
+      });
+    });
+  });
+  return 1;
+}
+
 export function mmltkIntegrationSliderDrag(x, y, width, height) {
   const canvas = document.querySelector('canvas');
   if (!canvas || ![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return 0;

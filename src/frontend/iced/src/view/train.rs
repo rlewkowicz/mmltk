@@ -69,6 +69,9 @@ impl Component {
         self.model_card = Default::default();
         self.metrics.reset(visible);
     }
+    pub(crate) fn chart_view(&self, chart: crate::view::metrics::Chart) -> Option<crate::view::metrics::ChartView> {
+        self.metrics.chart_view(chart)
+    }
     pub fn sync_metrics(&mut self, model: &ApplicationModel, visible: bool) {
         self.metrics.rebase(model, visible);
     }

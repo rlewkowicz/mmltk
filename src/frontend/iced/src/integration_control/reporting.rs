@@ -16,6 +16,11 @@ use crate::view_model::ApplicationModel;
 use iced::Rectangle;
 use std::cell::RefCell;
 
+pub(super) fn chart_view(stage: &str, view: &crate::view::metrics::ChartView) {
+    emit(|sink| sink.record("integration.chart_view", "train.metrics.chart.Loss", stage,
+        [view.ranges[0][0], view.ranges[0][1], view.ranges[1][0], view.ranges[1][1]]));
+}
+
 pub(crate) fn metric_projection(label: &str, positions: &[[f64; 2]]) {
     emit(|sink| {
         let finite = |point: &[f64; 2]| point.iter().all(|value| value.is_finite());

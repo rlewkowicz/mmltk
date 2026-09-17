@@ -402,6 +402,28 @@ pub(super) fn click_number_edge(_bounds: Rectangle, _upper: bool) -> bool {
     false
 }
 
+/// Deliver chart input through the ordinary browser pointer route and let Iced
+/// render the resulting tree before the acceptance driver observes its view.
+pub(super) fn chart_input(bounds: Option<Rectangle>, pan: bool) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let Some(mut output) = scenario_output() else { return false; };
+        output.receipt = None;
+        let completed = wasm_bindgen::closure::Closure::once_into_js(move |outcome: String| {
+            output.send(Message::ChartInputDelivered(outcome == "observed"));
+        });
+        if let Some(bounds) = bounds {
+            crate::integration_control::chart_input_js(bounds.x as f64, bounds.y as f64,
+                bounds.width as f64, bounds.height as f64, pan, &completed) == 1
+        } else {
+            crate::integration_control::chart_settled_js(&completed);
+            true
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = (bounds, pan); false }
+}
+
 /// Exercise the enclosing page's wheel route without changing chart controls.
 pub(super) fn chart_wheel(bounds: Rectangle, index: u8, scale: f32) -> bool {
     #[cfg(target_arch = "wasm32")]

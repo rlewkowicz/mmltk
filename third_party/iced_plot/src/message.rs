@@ -1,4 +1,5 @@
 use iced::Rectangle;
+use std::sync::Arc;
 
 use crate::{camera::Camera, series::ShapeId, ticks::PositionedTick};
 
@@ -73,14 +74,16 @@ pub struct CursorPositionUiPayload {
 #[derive(Debug, Clone)]
 #[doc(hidden)]
 pub struct PlotRenderUpdate {
+    pub(crate) publication: u64,
+    pub(crate) view: crate::plot_widget::SettledView,
     pub hover_pick: Option<HoverPickEvent>,
     pub drag_event: Option<DragEvent>,
     pub clear_cursor_position: bool,
     pub cursor_position_ui: Option<CursorPositionUiPayload>,
-    pub x_ticks: Option<Vec<PositionedTick>>,
-    pub y_ticks: Option<Vec<PositionedTick>>,
+    pub x_ticks: Arc<Vec<PositionedTick>>,
+    pub y_ticks: Arc<Vec<PositionedTick>>,
     /// Internal: Camera and bounds for coordinate conversion (only used internally, not part of public API)
-    pub(crate) camera_bounds: Option<Box<(Camera, Rectangle)>>,
+    pub(crate) camera_bounds: (Camera, Rectangle),
 }
 
 /// Drag interaction event in data/world coordinates.

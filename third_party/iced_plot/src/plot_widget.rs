@@ -55,6 +55,26 @@ pub(crate) type CursorProvider = Arc<dyn Fn(f64, f64) -> String + Send + Sync>;
 pub(crate) type HighlightPointProvider =
     Arc<dyn Fn(TooltipContext<'_>, &mut HighlightPoint) -> Option<String> + Send + Sync>;
 
+/// The exact source incorporated by a published camera. Tree-local projection
+/// versions do not establish that a retained plot has consumed a data update.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ViewSource {
+    instance: u64,
+    data: u64,
+    x_lim: Option<(f64, f64)>,
+    y_lim: Option<(f64, f64)>,
+    x_scale: AxisScale,
+    y_scale: AxisScale,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SettledView {
+    source: ViewSource,
+    prev_data_max_x: Option<f64>,
+    prev_last_point_y: Option<f64>,
+    follow_reset_seen: u64,
+}
+
 /// A plot widget that renders data series with interactive features.
 pub struct PlotWidget {
     pub(crate) instance_id: u64,
@@ -113,11 +133,14 @@ pub struct PlotWidget {
     /// Map of hovered point id to highlight point data & tooltip text.
     pub(crate) hovered_points: IndexMap<PointId, (HighlightPoint, Option<TooltipUiPayload>)>,
     pub(crate) cursor_ui: Option<CursorPositionUiPayload>,
-    pub(crate) x_ticks: Vec<PositionedTick>,
-    pub(crate) y_ticks: Vec<PositionedTick>,
+    pub(crate) x_ticks: Arc<Vec<PositionedTick>>,
+    pub(crate) y_ticks: Arc<Vec<PositionedTick>>,
     pub(crate) shape_overlays_enabled: AtomicBool,
     // Camera and bounds for coordinate conversion (updated when ticks are updated)
     pub(crate) camera_bounds: Option<(Camera, Rectangle)>,
+    settled_view: Option<SettledView>,
+    next_publication: AtomicU64,
+    accepted_publication: u64,
 }
 
 impl Default for PlotWidget {
@@ -174,15 +197,42 @@ impl PlotWidget {
             data_aspect: None,
             style: Arc::new(default_style),
             resolved_style: RwLock::new(PlotStyle::default()),
-            x_ticks: Vec::new(),
-            y_ticks: Vec::new(),
+            x_ticks: Arc::new(Vec::new()),
+            y_ticks: Arc::new(Vec::new()),
             picked_points: IndexMap::new(),
             hovered_points: IndexMap::new(),
             cursor_ui: None,
             shape_overlays_enabled: AtomicBool::new(false),
             camera_bounds: None,
+            settled_view: None,
+            next_publication: AtomicU64::new(1),
+            accepted_publication: 0,
         }
     }
+
+    fn view_source(&self) -> ViewSource {
+        ViewSource { instance: self.instance_id, data: self.data_version,
+            x_lim: self.x_lim, y_lim: self.y_lim,
+            x_scale: self.x_axis_scale, y_scale: self.y_axis_scale }
+    }
+
+    /// Last settled camera ranges in plot coordinates, or None before first render.
+    /// Log axes return logarithmic coordinates. This read does not request rendering.
+    pub fn view_ranges(&self) -> Option<[[f64; 2]; 2]> {
+        self.camera_bounds.map(|(camera, _)| {
+            let (x, y) = camera.axis_ranges();
+            [x, y]
+        })
+    }
+
+    /// Current plot-area rectangle in logical layout coordinates, before scroll translation.
+    pub fn view_bounds(&self) -> Option<Rectangle> { self.camera_bounds.map(|(_, bounds)| bounds) }
+
+    /// Stable identifier of this plot's legend control container.
+    pub fn legend_control_id(&self) -> String { format!("plot.legend.{}", self.instance_id) }
+
+    /// Whether the retained legend is collapsed.
+    pub fn legend_collapsed(&self) -> bool { self.legend_collapsed }
 
     /// Add a data series to the plot.
     /// If there exists a series with the same `item.id` ([ShapeId]), the old one will be replaced.
@@ -633,24 +683,30 @@ impl PlotWidget {
                 self.toggle_visibility(&id);
             }
             PlotUiMessage::RenderUpdate(payload) => {
-                // Update camera and bounds when ticks are updated (camera changed)
-                if let Some(camera_bounds) = payload.camera_bounds
-                    && self.camera_bounds != Some(*camera_bounds)
-                {
-                    self.camera_bounds = Some(*camera_bounds);
-                    // Update tooltip positions when camera/bounds change
-                    self.update_tooltip_positions();
+                // Source validity governs the whole message; freshness only governs
+                // replaceable view state, not explicit pick/clear-pick controls.
+                if payload.view.source != self.view_source() {
+                    return;
+                }
+                let fresh_view = payload.publication > self.accepted_publication;
+                if fresh_view {
+                    self.accepted_publication = payload.publication;
+                    self.settled_view = Some(payload.view);
+                    if self.camera_bounds != Some(payload.camera_bounds) {
+                        self.camera_bounds = Some(payload.camera_bounds);
+                        self.update_tooltip_positions();
+                    }
                 }
 
                 match payload.hover_pick {
-                    Some(HoverPickEvent::Hover(point_id)) => {
+                    Some(HoverPickEvent::Hover(point_id)) if fresh_view => {
                         self.hovered_points.clear();
                         self.handle_hover_pick::<false>(point_id);
                     }
                     Some(HoverPickEvent::Pick(point_id)) => {
                         self.handle_hover_pick::<true>(point_id);
                     }
-                    Some(HoverPickEvent::ClearHover) => {
+                    Some(HoverPickEvent::ClearHover) if fresh_view => {
                         self.hovered_points.clear();
                     }
                     Some(HoverPickEvent::ClearPick) => {
@@ -658,17 +714,15 @@ impl PlotWidget {
                     }
                     _ => {}
                 };
-                if payload.clear_cursor_position {
-                    self.cursor_ui = None;
-                }
-                if let Some(c) = payload.cursor_position_ui {
-                    self.cursor_ui = Some(c);
-                }
-                if let Some(ticks) = payload.x_ticks {
-                    self.x_ticks = ticks;
-                }
-                if let Some(ticks) = payload.y_ticks {
-                    self.y_ticks = ticks;
+                if fresh_view {
+                    if payload.clear_cursor_position {
+                        self.cursor_ui = None;
+                    }
+                    if let Some(c) = payload.cursor_position_ui {
+                        self.cursor_ui = Some(c);
+                    }
+                    self.x_ticks = payload.x_ticks;
+                    self.y_ticks = payload.y_ticks;
                 }
             }
         }
@@ -727,7 +781,7 @@ impl PlotWidget {
         layers.push(self.view_top_right_overlay(has_legend).map(map_plot));
 
         if let Some(legend) = legend {
-            layers.push(legend.map(map_plot));
+            layers.push(container(legend.map(map_plot)).id(self.legend_control_id()).into());
         }
 
         let elements: Element<'a, Message> = stack(layers)
@@ -1170,7 +1224,7 @@ impl PlotWidget {
         };
 
         if let Some(formatter) = &self.x_axis_formatter && !y_axis {
-            for tick in &self.x_ticks {
+            for tick in self.x_ticks.iter() {
                 let label_text = formatter(tick.tick);
                 let centering_offset = 2.0 * (label_text.len() as f32); // A bit of a fudge.
                 let text_widget = tick_text(label_text);
@@ -1186,7 +1240,7 @@ impl PlotWidget {
         }
 
         if let Some(formatter) = &self.y_axis_formatter && y_axis {
-            for tick in &self.y_ticks {
+            for tick in self.y_ticks.iter() {
                 let label_text = formatter(tick.tick);
                 let text_widget = tick_text(label_text);
                 let positioned_label = widget::container(text_widget)
@@ -1491,14 +1545,14 @@ fn consume_gpu_pick_results(
     }
 }
 
-fn update_ticks_and_build_payload(
+fn update_ticks_for_publication(
     widget: &PlotWidget,
     state: &mut PlotState,
     effects: &mut UpdateEffects,
     first_time_widget_view: bool,
-) -> (Option<Vec<PositionedTick>>, Option<Vec<PositionedTick>>) {
+) -> bool {
     if !effects.needs_redraw {
-        return (None, None);
+        return false;
     }
 
     let old_x = state.x_ticks.clone();
@@ -1508,22 +1562,18 @@ fn update_ticks_and_build_payload(
         widget.y_tick_producer.as_ref(),
     );
 
-    let publish_x =
-        (first_time_widget_view || (state.x_ticks != old_x)).then(|| state.x_ticks.as_ref().clone());
-    let publish_y =
-        (first_time_widget_view || (state.y_ticks != old_y)).then(|| state.y_ticks.as_ref().clone());
+    let ticks_changed = first_time_widget_view || state.x_ticks != old_x || state.y_ticks != old_y;
 
     // If tick producers are disabled, ticks might never change. Still publish camera/bounds
     // when overlays need them so screen-space positions stay in sync.
-    if publish_x.is_none()
-        && publish_y.is_none()
+    if !ticks_changed
         && widget_needs_camera_bounds(widget)
         && widget.camera_bounds != Some((state.camera, state.bounds))
     {
         effects.publish_camera_bounds = true;
     }
 
-    (publish_x, publish_y)
+    ticks_changed
 }
 
 fn update_plot_program<const IS_CANVAS: bool>(
@@ -1561,43 +1611,62 @@ fn update_plot_program<const IS_CANVAS: bool>(
         invalidation.overlay_layer();
     }
 
-    // Check if limits have been manually set. This will always trigger an "autoscale"
-    // to apply the new limits.
-    let limits_changed = widget.x_lim != state.x_lim || widget.y_lim != state.y_lim;
     let instance_switched = state.source_instance_id != Some(widget.instance_id);
-    let first_time_widget_view = instance_switched && widget.camera_bounds.is_none();
+    let first_time_widget_view = instance_switched && widget.settled_view.is_none();
+    // Compare configuration to the camera's source, never to a fresh tree's defaults.
+    let previous_source = if instance_switched {
+        widget.settled_view.map(|view| view.source)
+    } else {
+        Some(ViewSource { instance: widget.instance_id, data: state.data_src_version,
+            x_lim: state.x_lim, y_lim: state.y_lim,
+            x_scale: state.x_axis_scale, y_scale: state.y_axis_scale })
+    };
+    let source = widget.view_source();
+    let data_changed = previous_source.is_none_or(|previous| previous.data != source.data);
+    let limits_changed = previous_source.is_some_and(|previous|
+        previous.x_lim != source.x_lim || previous.y_lim != source.y_lim
+        || previous.x_scale != source.x_scale || previous.y_scale != source.y_scale);
 
-    if widget.data_version != state.data_src_version || instance_switched {
-        // Rebuild derived state from widget data.
-        state.rebuild_from_widget(widget);
-
-        if instance_switched && let Some((camera, _)) = widget.camera_bounds {
-            state.camera = camera;
+    if instance_switched {
+        // Keep projection origin/counters and GPU settlement in their existing
+        // owners. Only transient pointer state is discarded on chart replacement.
+        state.reset_interaction();
+        state.x_link_version = 0;
+        state.y_link_version = 0;
+        state.prev_data_max_x = None;
+        state.prev_last_point_y = None;
+        state.follow_reset_seen = widget.follow_reset_counter;
+        if let Some((camera, _)) = widget.camera_bounds { state.camera = camera; }
+        if let Some(view) = widget.settled_view {
+            state.prev_data_max_x = view.prev_data_max_x;
+            state.prev_last_point_y = view.prev_last_point_y;
+            state.follow_reset_seen = view.follow_reset_seen;
         }
+    }
 
-        // Refresh hover after data updates when appropriate.
-        if let Some(position) = state.available_cursor_local_position_inside(cursor) {
-            state.cursor_position = position;
-            maybe_submit_hover_request(widget, state, &mut effects);
+    let projection_changed = widget.data_version != state.data_src_version || instance_switched;
+    if projection_changed || limits_changed {
+        if projection_changed {
+            state.rebuild_from_widget(widget);
+            if let Some(position) = state.available_cursor_local_position_inside(cursor) {
+                state.cursor_position = position;
+                maybe_submit_hover_request(widget, state, &mut effects);
+            } else {
+                clear_hover_effect(widget, state, &mut effects);
+            }
         } else {
-            clear_hover_effect(widget, state, &mut effects);
+            // Limits affect the view, not ordinary series geometry or picking custody.
+            state.x_lim = widget.x_lim;
+            state.y_lim = widget.y_lim;
         }
 
-        // Data has changed, so we may need to autoscale.
-        //
-        // We do so on the first update, if autoscale_on_updates is enabled, or if
-        // limits have been manually set.
-        if widget.autoscale_on_updates || limits_changed || first_time_widget_view {
-            // Initial autoscale shouldn't update axis links.
+        if first_time_widget_view || limits_changed || (data_changed && widget.autoscale_on_updates) {
             state.autoscale(!first_time_widget_view);
-        } else if widget.autoscale_y_on_updates {
-            // Follow mode: only Y is rescaled; the X camera stays where the user left it.
+        } else if data_changed && widget.autoscale_y_on_updates {
             state.autoscale_y_only();
         }
 
-        // Follow mode: shift the camera in X and Y by the data delta so zoom and the
-        // user's chosen position are preserved while the newest data stays in view.
-        if widget.follow_right_edge && !widget.autoscale_on_updates {
+        if data_changed && widget.follow_right_edge && !widget.autoscale_on_updates {
             if state.follow_reset_seen != widget.follow_reset_counter {
                 state.prev_data_max_x = None;
                 state.prev_last_point_y = None;
@@ -1619,12 +1688,8 @@ fn update_plot_program<const IS_CANVAS: bool>(
 
         state.data_src_version = widget.data_version;
         state.source_instance_id = Some(widget.instance_id);
-        effects.needs_redraw = true;
-        invalidation.all();
-    } else if limits_changed {
-        state.x_lim = widget.x_lim;
-        state.y_lim = widget.y_lim;
-        state.autoscale(true);
+        // Even an unchanged numerical camera must publish the source it now represents.
+        effects.publish_camera_bounds = true;
         effects.needs_redraw = true;
         invalidation.all();
     }
@@ -1743,29 +1808,18 @@ fn update_plot_program<const IS_CANVAS: bool>(
         effects.needs_redraw |= state.picking.has_outstanding_gpu_request();
     }
 
-    let (publish_x_ticks, publish_y_ticks) =
-        update_ticks_and_build_payload(widget, state, &mut effects, first_time_widget_view);
-    if publish_x_ticks.is_some() || publish_y_ticks.is_some() {
+    let ticks_changed =
+        update_ticks_for_publication(widget, state, &mut effects, first_time_widget_view);
+    if ticks_changed {
         invalidation.static_layer();
     }
 
     let needs_publish = effects.hover_pick.is_some()
         || effects.drag_event.is_some()
         || effects.cursor_ui.is_some()
-        || publish_x_ticks.is_some()
-        || publish_y_ticks.is_some()
+        || ticks_changed
         || effects.clear_cursor_position
         || effects.publish_camera_bounds;
-
-    let camera_bounds = if effects.hover_pick.is_some()
-        || publish_x_ticks.is_some()
-        || publish_y_ticks.is_some()
-        || effects.publish_camera_bounds
-    {
-        Some((state.camera, state.bounds))
-    } else {
-        None
-    };
 
     if IS_CANVAS {
         invalidation.apply(widget);
@@ -1774,13 +1828,20 @@ fn update_plot_program<const IS_CANVAS: bool>(
     if needs_publish {
         Some(shader::Action::publish(PlotUiMessage::RenderUpdate(
             PlotRenderUpdate {
+                publication: widget.next_publication.fetch_add(1, Ordering::Relaxed),
+                view: SettledView { source,
+                    prev_data_max_x: state.prev_data_max_x,
+                    prev_last_point_y: state.prev_last_point_y,
+                    follow_reset_seen: state.follow_reset_seen },
                 hover_pick: effects.hover_pick,
                 drag_event: effects.drag_event,
                 clear_cursor_position: effects.clear_cursor_position,
                 cursor_position_ui: effects.cursor_ui,
-                x_ticks: publish_x_ticks,
-                y_ticks: publish_y_ticks,
-                camera_bounds: camera_bounds.map(Box::new),
+                x_ticks: Arc::clone(&state.x_ticks),
+                y_ticks: Arc::clone(&state.y_ticks),
+                // Publish one coherent view even for cursor-only messages, so
+                // reordered reductions never settle metadata without its camera.
+                camera_bounds: (state.camera, state.bounds),
             },
         )))
     } else {
@@ -2120,6 +2181,324 @@ pub(crate) fn world_to_screen_position_y(
 #[cfg(test)]
 mod retained_data_tests {
     use super::*;
+    fn bounds() -> Rectangle { Rectangle::with_size(iced::Size::new(640.0, 360.0)) }
+    fn redraw() -> iced::Event {
+        iced::Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now()))
+    }
+    fn publish(plot: &PlotWidget, state: &mut PlotState, event: &iced::Event,
+        bounds: Rectangle, cursor: mouse::Cursor) -> Option<PlotUiMessage> {
+        use iced::widget::shader::Program;
+        Program::update(plot, state, event, bounds, cursor).and_then(|action| action.into_inner().0)
+    }
+    fn update(plot: &mut PlotWidget, state: &mut PlotState, event: &iced::Event,
+        bounds: Rectangle, cursor: mouse::Cursor) {
+        if let Some(message) = publish(plot, state, event, bounds, cursor) { plot.update(message); }
+    }
+    fn mount(plot: &mut PlotWidget, state: &mut PlotState, bounds: Rectangle) {
+        update(plot, state, &redraw(), bounds, mouse::Cursor::Unavailable);
+    }
+    fn fixture() -> (PlotWidget, ShapeId) {
+        let mut plot = crate::PlotWidgetBuilder::new().with_autoscale_on_updates(true).build().unwrap();
+        let series = Series::line_only(vec![[1.0, 2.0], [3.0, 8.0]], crate::LineStyle::solid());
+        let id = series.id;
+        plot.add_series(series).unwrap();
+        (plot, id)
+    }
+    fn pan(plot: &mut PlotWidget, state: &mut PlotState) {
+        for (event, position) in [
+            (mouse::Event::ButtonPressed(mouse::Button::Left), iced::Point::new(320.0, 180.0)),
+            (mouse::Event::CursorMoved { position: iced::Point::new(380.0, 200.0) }, iced::Point::new(380.0, 200.0)),
+            (mouse::Event::ButtonReleased(mouse::Button::Left), iced::Point::new(380.0, 200.0)),
+        ] { update(plot, state, &iced::Event::Mouse(event), bounds(), mouse::Cursor::Available(position)); }
+    }
+
+    #[test]
+    fn published_camera_survives_remount_and_equal_version_tree_reuse() {
+        let (mut plot, id) = fixture();
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        let initial = state.camera;
+        assert_eq!(initial.position, DVec2::new(2.0, 5.0));
+        pan(&mut plot, &mut state);
+        let panned = state.camera;
+        assert_ne!(panned, initial);
+        plot.update(PlotUiMessage::ToggleLegend);
+        let large = Rectangle::with_size(iced::Size::new(900.0, 500.0));
+        let mut remount = PlotState::default();
+        mount(&mut plot, &mut remount, large);
+        assert_eq!(remount.camera, panned);
+        assert!(plot.legend_collapsed());
+        assert_eq!(remount.series[0].id, id);
+        assert!(!state.origin().same_as(remount.origin()));
+        let points = Arc::clone(&remount.points);
+        mount(&mut plot, &mut remount, large);
+        assert_eq!(remount.camera, panned);
+        assert!(Arc::ptr_eq(&points, &remount.points));
+
+        let (mut other, other_id) = fixture();
+        assert_eq!(other.data_version, plot.data_version);
+        // An unfinished gesture belongs to the old chart, not its replacement.
+        update(&mut plot, &mut remount, &iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            large, mouse::Cursor::Available(iced::Point::new(400.0, 300.0)));
+        assert!(remount.pan.active);
+        mount(&mut other, &mut remount, large);
+        assert!(!remount.pan.active && !remount.drag.active && !remount.press.active);
+        assert_eq!(remount.camera, initial);
+        assert_eq!(remount.series[0].id, other_id);
+        mount(&mut plot, &mut remount, large);
+        assert_eq!(remount.camera, panned);
+        assert_eq!(remount.series[0].id, id);
+    }
+
+    #[test]
+    fn hidden_updates_apply_autoscale_and_limits_against_retained_source() {
+        let (mut plot, id) = fixture();
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        pan(&mut plot, &mut state);
+        plot.set_series_positions(&id, &[[10.0, 20.0], [30.0, 80.0]]);
+        let mut remount = PlotState::default();
+        mount(&mut plot, &mut remount, bounds());
+        assert_eq!(remount.camera.position, DVec2::new(20.0, 50.0));
+        plot.autoscale_on_updates(false);
+        pan(&mut plot, &mut remount);
+        plot.set_x_lim(100.0, 200.0);
+        mount(&mut plot, &mut PlotState::default(), bounds());
+        assert_eq!(plot.camera_bounds.unwrap().0.position.x, 150.0);
+        // A non-default limit must not look newly changed on every mount.
+        let mut limited = PlotState::default();
+        mount(&mut plot, &mut limited, bounds());
+        pan(&mut plot, &mut limited);
+        let panned = limited.camera;
+        let mut again = PlotState::default();
+        mount(&mut plot, &mut again, bounds());
+        assert_eq!(again.camera, panned);
+        let points = Arc::clone(&again.points);
+        let markers_version = again.markers_version;
+        plot.clear_x_lim();
+        mount(&mut plot, &mut again, bounds());
+        assert_eq!(again.camera.position.x, 20.0);
+        assert!(Arc::ptr_eq(&points, &again.points));
+        assert_eq!(again.markers_version, markers_version);
+        plot.set_y_axis_scale(AxisScale::Log { base: 10.0 });
+        mount(&mut plot, &mut again, bounds());
+        assert_eq!(again.camera.position.x, 20.0);
+        assert!((again.camera.position.y - (20.0_f64.log10() + 80.0_f64.log10()) / 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn retained_visibility_and_manual_camera_remain_independent_of_projection_lifetime() {
+        let (mut plot, first) = fixture();
+        let second = Series::line_only(vec![[20.0, 30.0], [40.0, 90.0]], crate::LineStyle::solid()).with_label("second");
+        let second_id = second.id;
+        plot.add_series(second).unwrap();
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        plot.update(PlotUiMessage::ToggleSeriesVisibility(second_id));
+        mount(&mut plot, &mut state, bounds());
+        assert_eq!(state.camera.position, DVec2::new(2.0, 5.0));
+        pan(&mut plot, &mut state);
+        let camera = state.camera;
+        plot.autoscale_on_updates(false);
+        plot.set_series_positions(&first, &[[100.0, 200.0], [300.0, 800.0]]);
+        let mut remount = PlotState::default();
+        mount(&mut plot, &mut remount, bounds());
+        assert_eq!(remount.camera, camera);
+        assert_eq!(remount.series.len(), 1);
+        assert_eq!(remount.series[0].id, first);
+        assert!(plot.legend_entries().iter().any(|entry| entry.id == second_id && entry.hidden));
+        plot.update(PlotUiMessage::ToggleSeriesVisibility(second_id));
+        mount(&mut plot, &mut remount, bounds());
+        assert_eq!(remount.series.len(), 2);
+        assert_eq!(remount.camera, camera);
+    }
+
+    #[test]
+    fn stale_publications_cannot_settle_new_data_or_overwrite_newer_gestures() {
+        let (mut plot, id) = fixture();
+        let mut state = PlotState::default();
+        let old = publish(&plot, &mut state, &redraw(), bounds(), mouse::Cursor::Unavailable).unwrap();
+        plot.set_series_positions(&id, &[[10.0, 20.0], [30.0, 80.0]]);
+        plot.update(old);
+        assert!(plot.settled_view.is_none());
+        mount(&mut plot, &mut state, bounds());
+        assert_eq!(state.camera.position, DVec2::new(20.0, 50.0));
+        let delayed = publish(&plot, &mut state, &redraw(), Rectangle::with_size(iced::Size::new(800.0, 400.0)), mouse::Cursor::Unavailable).unwrap();
+        let mut remount = PlotState::default();
+        mount(&mut plot, &mut remount, bounds());
+        pan(&mut plot, &mut remount);
+        let camera = remount.camera;
+        plot.update(delayed);
+        assert_eq!(plot.camera_bounds.unwrap().0, camera);
+        plot.set_y_lim(0.0, 100.0);
+        let stale_limits = publish(&plot, &mut remount, &redraw(), bounds(), mouse::Cursor::Unavailable).unwrap();
+        plot.set_y_lim(200.0, 400.0);
+        plot.update(stale_limits);
+        mount(&mut plot, &mut PlotState::default(), bounds());
+        assert_eq!(plot.camera_bounds.unwrap().0.position.y, 300.0);
+    }
+
+    #[test]
+    fn delayed_explicit_controls_preserve_fresh_view_and_require_matching_source() {
+        for clear in [false, true] {
+            for change_source in [false, true] {
+                let (mut plot, id) = fixture();
+                plot.set_series_positions(&id, &[[1.0, 2.0], [3.0, 8.0], [2.0, 5.0]]);
+                plot.set_pick_highlight_provider(Arc::new(|_, _| Some("picked".into())));
+                plot.set_hover_highlight_provider(Arc::new(|_, _| Some("hovered".into())));
+                plot.set_highlight_on_hover(true);
+                plot.set_cursor_overlay(true);
+                plot.controls.bind_click(mouse::Button::Middle, crate::ClickAction::Pick);
+                let mut state = PlotState::default();
+                mount(&mut plot, &mut state, bounds());
+                let position = |plot: &PlotWidget, index: usize| {
+                    let series = &plot.series[&id];
+                    let [x, y] = PlotWidget::world_to_screen_position(
+                        series.positions[index], &plot.camera_bounds.unwrap(),
+                        plot.x_axis_scale, plot.y_axis_scale, &series.transform,
+                    ).unwrap();
+                    iced::Point::new(x, y)
+                };
+                let click = |plot: &mut PlotWidget, state: &mut PlotState, point| {
+                    let cursor = mouse::Cursor::Available(point);
+                    update(plot, state, &iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)), bounds(), cursor);
+                    publish(plot, state, &iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Middle)), bounds(), cursor).unwrap()
+                };
+                let target = PointId { series_id: id, point_index: 0 };
+                let point = position(&plot, 0);
+                if clear {
+                    let pick = click(&mut plot, &mut state, point);
+                    assert!(matches!(pick.get_hover_pick_event(), Some(HoverPickEvent::Pick(found)) if found == target));
+                    plot.update(pick);
+                    assert!(plot.picked_points.contains_key(&target));
+                    plot.controls.bind_click(mouse::Button::Middle, crate::ClickAction::ClearPick);
+                }
+                let old_hover = publish(&plot, &mut state,
+                    &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    bounds(), mouse::Cursor::Available(point)).unwrap();
+                let delayed = click(&mut plot, &mut state, point);
+                assert!(match delayed.get_hover_pick_event() {
+                    Some(HoverPickEvent::ClearPick) => clear,
+                    Some(HoverPickEvent::Pick(found)) => !clear && found == target,
+                    _ => false,
+                });
+                let old_camera_bounds = plot.camera_bounds;
+                if change_source {
+                    plot.set_x_lim(-2.0, 6.0);
+                    mount(&mut plot, &mut state, bounds());
+                }
+                pan(&mut plot, &mut state);
+                let larger_bounds = Rectangle::with_size(iced::Size::new(800.0, 450.0));
+                mount(&mut plot, &mut state, larger_bounds);
+                let point = position(&plot, 2);
+                update(&mut plot, &mut state,
+                    &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                    larger_bounds, mouse::Cursor::Available(point));
+                let camera_bounds = plot.camera_bounds;
+                assert_ne!(camera_bounds.unwrap().0, old_camera_bounds.unwrap().0);
+                assert_ne!(camera_bounds.unwrap().1, old_camera_bounds.unwrap().1);
+                let ticks = (Arc::clone(&plot.x_ticks), Arc::clone(&plot.y_ticks));
+                let cursor = plot.cursor_ui.as_ref().map(|value| (value.x, value.y, value.text.clone()));
+                let hovered = plot.hovered_points.keys().copied().collect::<Vec<_>>();
+                assert_eq!(hovered, [PointId { series_id: id, point_index: 2 }]);
+                let publication = plot.accepted_publication;
+                for message in [old_hover, delayed] {
+                    plot.update(message);
+                    assert_eq!(plot.camera_bounds, camera_bounds);
+                    assert_eq!(plot.accepted_publication, publication);
+                    assert!(Arc::ptr_eq(&plot.x_ticks, &ticks.0));
+                    assert!(Arc::ptr_eq(&plot.y_ticks, &ticks.1));
+                    assert_eq!(plot.cursor_ui.as_ref().map(|value| (value.x, value.y, value.text.clone())), cursor);
+                    assert_eq!(plot.hovered_points.keys().copied().collect::<Vec<_>>(), hovered);
+                }
+                assert_eq!(plot.picked_points.contains_key(&target), if change_source { clear } else { !clear });
+            }
+        }
+    }
+
+    #[test]
+    fn newer_cursor_publication_contains_its_complete_camera_before_first_reduction() {
+        let (mut plot, _) = fixture();
+        plot.set_cursor_overlay(true);
+        let mut state = PlotState::default();
+        let initial = publish(&plot, &mut state, &redraw(), bounds(), mouse::Cursor::Unavailable).unwrap();
+        let point = iced::Point::new(320.0, 180.0);
+        let cursor = publish(&plot, &mut state,
+            &iced::Event::Mouse(mouse::Event::CursorMoved { position: point }),
+            bounds(), mouse::Cursor::Available(point)).unwrap();
+        plot.update(cursor);
+        assert!(Arc::ptr_eq(&plot.x_ticks, &state.x_ticks));
+        assert!(Arc::ptr_eq(&plot.y_ticks, &state.y_ticks));
+        assert!(!plot.x_ticks.is_empty());
+        let expected = state.camera;
+        plot.update(initial);
+        mount(&mut plot, &mut PlotState::default(), bounds());
+        assert_eq!(plot.camera_bounds.unwrap().0, expected);
+    }
+
+    #[test]
+    fn box_zoom_without_tick_or_cursor_overlays_is_retained() {
+        let (mut plot, id) = fixture();
+        plot.x_tick_producer = None;
+        plot.y_tick_producer = None;
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        let initial = state.camera;
+        for (event, position) in [
+            (mouse::Event::ButtonPressed(mouse::Button::Right), iced::Point::new(150.0, 90.0)),
+            (mouse::Event::CursorMoved { position: iced::Point::new(450.0, 270.0) }, iced::Point::new(450.0, 270.0)),
+            (mouse::Event::ButtonReleased(mouse::Button::Right), iced::Point::new(450.0, 270.0)),
+        ] {
+            update(&mut plot, &mut state, &iced::Event::Mouse(event), bounds(), mouse::Cursor::Available(position));
+        }
+        let zoomed = state.camera;
+        assert!(zoomed.half_extents.x < initial.half_extents.x);
+        assert!(zoomed.half_extents.y < initial.half_extents.y);
+        let mut remount = PlotState::default();
+        mount(&mut plot, &mut remount, Rectangle::with_size(iced::Size::new(900.0, 500.0)));
+        assert_eq!(remount.camera, zoomed);
+        assert_eq!(remount.series[0].id, id);
+    }
+
+    #[test]
+    fn remounted_follow_modes_and_explicit_autoscale_retain_their_policy() {
+        let (mut plot, id) = fixture();
+        plot.autoscale_on_updates(false);
+        plot.set_follow_right_edge(true);
+        let mut state = PlotState::default();
+        mount(&mut plot, &mut state, bounds());
+        pan(&mut plot, &mut state);
+        let camera = state.camera;
+        plot.set_series_positions(&id, &[[2.0, 4.0], [4.0, 10.0]]);
+        let mut remount = PlotState::default();
+        mount(&mut plot, &mut remount, bounds());
+        assert_eq!(remount.camera.position, camera.position + DVec2::new(1.0, 2.0));
+        assert_eq!(remount.camera.half_extents, camera.half_extents);
+        plot.set_follow_right_edge(false);
+        plot.set_autoscale_y_on_updates(true);
+        let x = remount.camera.position.x;
+        plot.set_series_positions(&id, &[[3.0, 10.0], [5.0, 30.0]]);
+        mount(&mut plot, &mut PlotState::default(), bounds());
+        assert_eq!(plot.camera_bounds.unwrap().0.position, DVec2::new(x, 20.0));
+        plot.get_controls_mut().bind_key(keyboard::Key::Named(keyboard::key::Named::Home), KeyAction::Autoscale);
+        mount(&mut plot, &mut remount, bounds());
+        let event = iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Home),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Home),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Home),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::NONE,
+            text: None, repeat: false,
+        });
+        update(&mut plot, &mut remount, &event, bounds(), mouse::Cursor::Available(iced::Point::new(300.0, 150.0)));
+        assert_eq!(remount.camera.position, DVec2::new(4.0, 20.0));
+        let link = AxisLink::new();
+        plot.set_x_axis_link(link.clone());
+        mount(&mut plot, &mut PlotState::default(), bounds());
+        link.set(77.0, 5.0);
+        mount(&mut plot, &mut PlotState::default(), bounds());
+        assert_eq!(plot.camera_bounds.unwrap().0.position.x, 77.0);
+    }
+
     #[test]
     fn shader_draw_shares_tree_projection_origin_but_remount_does_not() {
         use iced::widget::shader::Program;
