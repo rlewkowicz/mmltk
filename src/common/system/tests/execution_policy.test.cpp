@@ -1,3 +1,4 @@
+#include "src/common/system/tests/numa_topology_test_support.h"
 #include "src/common/system/execution_policy.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/tests/denied_syscall.h"
@@ -40,8 +41,9 @@ TEST_CASE("Only genuinely single-node machines resolve unknown GPU locality auto
 }
 TEST_CASE("Scoped boundary verifies effective placement and restores caller policy", "[common][system][policy]") {
     const auto facts = NumaTopology::Capture();
-    const auto cpu = facts.permitted_cpus.front();
-    const auto node = std::ranges::find(facts.cpus, cpu, &CpuTopology::cpu)->node;
+    const auto selected = mmltk::common::system::test_support::first_permitted_cpu(facts);
+    const auto cpu = selected.cpu;
+    const auto node = selected.node;
     const auto before = capture_execution_policy_snapshot();
     {
         ScopedExecutionPolicy policy({{cpu}, {}, 0, node, -10, true});
@@ -65,8 +67,9 @@ TEST_CASE("Denied priority and NUMA policy fail required worker startup", "[comm
     for (const int call : {SYS_setpriority, SYS_set_mempolicy, SYS_ioprio_set}) {
         CHECK(test_support::with_denied_syscall(call, [] {
                   const auto facts = NumaTopology::Capture();
-                  const auto cpu = facts.permitted_cpus.front();
-                  const auto node = std::ranges::find(facts.cpus, cpu, &CpuTopology::cpu)->node;
+                  const auto selected = mmltk::common::system::test_support::first_permitted_cpu(facts);
+                  const auto cpu = selected.cpu;
+                  const auto node = selected.node;
                   try {
                       (void)apply_worker_execution_policy({{cpu}, {}, 0, node, -10, true});
                   } catch (const std::system_error& error) { return error.code().value() == EPERM; }
@@ -80,8 +83,9 @@ TEST_CASE("Synchronous policy failure restores every policy already changed", "[
               using namespace mmltk::common::system;
               const auto before = capture_execution_policy_snapshot();
               const auto topology = NumaTopology::Capture();
-              const auto cpu = topology.permitted_cpus.front();
-              const auto node = std::ranges::find(topology.cpus, cpu, &CpuTopology::cpu)->node;
+              const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
+              const auto cpu = selected.cpu;
+              const auto node = selected.node;
               try {
                   ScopedExecutionPolicy scope({{cpu}, "denied-scope", 0, node, -10, true});
               } catch (const std::system_error&) {

@@ -16,6 +16,7 @@ std::string dataset_dir(const FixtureSpec& spec);
 std::string compiled_dir(const FixtureSpec& spec);
 std::string compiled_bin_path(const FixtureSpec& spec);
 void create_synthetic_dataset(const FixtureSpec& spec);
+void compile_existing_fixture(const FixtureSpec& spec);
 void replace_synthetic_image(const FixtureSpec& spec, int image_index, int width, int height);
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height);
 void assert_image_matches(const float* actual, const std::vector<float>& expected);

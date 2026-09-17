@@ -1,3 +1,4 @@
+#include "src/common/system/tests/numa_topology_test_support.h"
 #include <algorithm>
 #include "src/controller/subsystems/validate/validation_runtime.h"
 #include "src/controller/subsystems/system/predict_system.h"
@@ -134,8 +135,9 @@ TEST_CASE("Local compute admission waits for required worker placement", "[contr
     using namespace mmltk::common::system;
     using namespace mmltk::controller;
     const auto topology = NumaTopology::Capture();
-    const auto cpu = topology.permitted_cpus.front();
-    const auto node = std::ranges::find(topology.cpus, cpu, &CpuTopology::cpu)->node;
+    const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
+    const auto cpu = selected.cpu;
+    const auto node = selected.node;
     const auto before = capture_execution_policy_snapshot();
     direct::LocalRun run;
     std::optional<ExecutionPolicySnapshot> observed;
@@ -160,8 +162,9 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
     for (const auto call : {SYS_setpriority, SYS_set_mempolicy}) {
         CHECK(mmltk::common::system::test_support::with_denied_syscall(call, [] {
                   const auto topology = NumaTopology::Capture();
-                  const auto cpu = topology.permitted_cpus.front();
-                  const auto node = std::ranges::find(topology.cpus, cpu, &CpuTopology::cpu)->node;
+                  const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
+                  const auto cpu = selected.cpu;
+                  const auto node = selected.node;
                   direct::LocalRun run;
                   bool admitted = false;
                   try {

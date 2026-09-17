@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/common/system/tests/numa_topology_test_support.h"
 #include <torch/utils.h>
 #include <torch/nn/functional/vision.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -593,8 +594,8 @@ TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity",
     using namespace mmltk::backend::models::rfdetr;
     using namespace mmltk::common::system;
     const auto topology = NumaTopology::Capture();
-    const auto cpu = topology.permitted_cpus.front();
-    const auto node = std::ranges::find(topology.cpus, cpu, &CpuTopology::cpu)->node;
+    const auto selected = mmltk::common::system::test_support::first_permitted_cpu(topology);
+    const auto node = selected.node;
     NumaMemoryResource memory(node);
     LsapScratch scratch(&memory);
     scratch.costs = {4, 1, 3, 2, 0, 5};

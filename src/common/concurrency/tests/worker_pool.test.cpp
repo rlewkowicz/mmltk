@@ -1,3 +1,4 @@
+#include "src/common/system/tests/numa_topology_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/common/concurrency/worker_pool.h"
 #include <algorithm>
@@ -190,8 +191,8 @@ TEST_CASE("Borrowed worker records reuse bounded queues and preserve task failur
 TEST_CASE("Child pools use immutable placement after the creator is pinned", "[common][concurrency][worker_pool]") {
     using namespace mmltk::common::system;
     const auto topology = NumaTopology::Capture();
-    const auto first = std::ranges::find(topology.cpus, topology.permitted_cpus.front(), &CpuTopology::cpu);
-    const auto placement = resolve_placement(topology, first->node);
+    const auto first = mmltk::common::system::test_support::first_permitted_cpu(topology);
+    const auto placement = resolve_placement(topology, first.node);
     WorkerPool parent(1, placement.cpus, "parent", 1, &placement);
     const auto observed = parent
                               .enqueue([&] {
@@ -207,8 +208,8 @@ TEST_CASE("Child pools use immutable placement after the creator is pinned", "[c
 TEST_CASE("Placed worker budgets overlap one local CPU with stable assignments", "[common][concurrency][worker_pool]") {
     using namespace mmltk::common::system;
     const auto topology = NumaTopology::Capture();
-    const auto first = std::ranges::find(topology.cpus, topology.permitted_cpus.front(), &CpuTopology::cpu);
-    auto placement = resolve_placement(topology, first->node);
+    const auto first = mmltk::common::system::test_support::first_permitted_cpu(topology);
+    auto placement = resolve_placement(topology, first.node);
     placement.cpus.resize(1);
     WorkerPool pool(3, placement.cpus, "overlap", 3, &placement);
     REQUIRE(pool.size() == 3);

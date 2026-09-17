@@ -443,18 +443,9 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
         .value = mmltk::frameworks::serialization::wire::FlatValue{1.0},
     });
     static_cast<void>(settings.Update(std::move(deterministic_augmentation)));
-    NativeExploreAudit audit;
-    const auto diagnostics = audit.diagnostics();
-    const auto native_nproc = controller::normalize_explore_parallelism(2U);
-    controller::ExploreSystem system{
-        settings,
-        {.device = 0, .maximum_width = 256U, .maximum_height = 256U},
-        native_nproc,
-        controller::make_native_explore_runtime_factory({.device = 0, .maximum_width = 256U, .maximum_height = 256U}, native_nproc,
-                                                        {.loading = data::data_loading_options(h2d), .diagnostics = diagnostics}),
-        [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
-        diagnostics,
-    };
+    NativeExploreFixture fixture(settings, h2d);
+    auto& audit = fixture.audit;
+    auto& system = fixture.system;
     const controller::ExploreViewport first_view{
         .extent = {64U, 32U},
         .row_count = 1U,
@@ -823,16 +814,9 @@ void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     policy.overlay.show_boxes = true;
     policy.overlay.show_masks = true;
     static_cast<void>(settings.Update(candidate, {.preferences = policy}));
-    NativeExploreAudit audit;
-    constexpr controller::VisualDeviceSettings device{.device = 0, .maximum_width = 256U, .maximum_height = 256U};
-    const auto nproc = controller::normalize_explore_parallelism(2U);
-    controller::ExploreSystem system{
-        settings,
-        device,
-        nproc,
-        controller::make_native_explore_runtime_factory(device, nproc, {.loading = data::data_loading_options(true), .diagnostics = audit.diagnostics()}),
-        [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
-        audit.diagnostics()};
+    NativeExploreFixture fixture(settings, true);
+    auto& audit = fixture.audit;
+    auto& system = fixture.system;
     static_cast<void>(
         system.Open({.viewport = {.extent = {32U, 32U}, .first_row = 10U, .row_count = 1U, .columns = 1U}, .compiled_source = compiled.string()}));
     wait_for_native_gallery(audit, system, 0U, 0U, 1U);
@@ -1165,16 +1149,11 @@ void test_compiled_explore_cancelled_lane_preserves_atomic_product() {
                                      [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); },
                                      diagnostics};
     // Stop blocked I/O before system destruction, including assertion unwinding.
-    struct StopGate {
-        controller::ExploreAcceptanceGate& gate;
-        mmltk::testsupport::TestGate& lane;
-        mmltk::testsupport::TestGate& prefetch;
-        ~StopGate() {
-            gate.Stop();
-            lane.Release();
-            prefetch.Release();
-        }
-    } stop{*gate, stale_lane, prefetch_lane};
+    const mmltk::testsupport::ScopedTestCleanup stop{[&] {
+        gate->Stop();
+        stale_lane.Release();
+        prefetch_lane.Release();
+    }};
     const auto send = [&](const std::uint8_t command) { REQUIRE(::send(commands.get(), &command, sizeof(command), MSG_NOSIGNAL) == sizeof(command)); };
     const auto viewport = [](const std::uint32_t rows) { return controller::ExploreViewport{.extent = {32U, 32U * rows}, .row_count = rows, .columns = 1U}; };
     static_cast<void>(system.Open({.viewport = viewport(1U), .compiled_source = compiled.string()}));
@@ -1362,10 +1341,7 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     controller::ExploreSystem system{
         settings, device, 1U, controller::make_native_explore_runtime_factory(device, 1U, {.loading = data::data_loading_options(true), .acceptance = gate}),
         [&audit](controller::ExploreSystem::event_type event) { audit.Observe(std::move(event)); }};
-    struct StopGate {
-        controller::ExploreAcceptanceGate& gate;
-        ~StopGate() { gate.Stop(); }
-    } stop{*gate};
+    const mmltk::testsupport::ScopedTestCleanup stop{[&] { gate->Stop(); }};
     const controller::ExploreViewport viewport{.extent = {64U, 32U}, .columns = 2U};
     static_cast<void>(system.Open({.viewport = viewport, .compiled_source = compiled.string()}));
     REQUIRE(audit.Wait([&] { return system.snapshot().ready && !system.snapshot().busy; }));

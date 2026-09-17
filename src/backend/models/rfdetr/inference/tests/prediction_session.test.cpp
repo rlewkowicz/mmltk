@@ -1,4 +1,6 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
+#include "src/test_support/cuda_test_utils.hpp"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
@@ -13,7 +15,6 @@
 #include <nlohmann/json.hpp>
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
-#include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
 #include <array>
@@ -170,9 +171,8 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
         }
     }
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release_stream{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     rfdetr::PredictRequest request;
     request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
     request.onnx_path = root / "rf-detr-nano.onnx";
@@ -472,9 +472,8 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
     }
     write_prediction_model(root / "model.onnx", 300);
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     rfdetr::PredictRequest request;
     request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
     request.image_inputs = {{image, "full HD", 42}};
@@ -507,9 +506,8 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     const mmltk::testsupport::ScopedTestCleanup files{[&] { std::filesystem::remove_all(root); }};
     write_prediction_model(root / "rf-detr-nano.onnx");
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     c10::cuda::CUDAStreamGuard guard(c10::cuda::getStreamFromExternal(stream, 0));
     const auto cuda = torch::TensorOptions().device(torch::kCUDA).dtype(at::kFloat);
     auto input = torch::zeros({1, 3, 8, 8}, cuda);
@@ -688,19 +686,10 @@ TEST_CASE("compiled prediction batch unwind closes shared source custody without
     const mmltk::testsupport::ScopedTempDir root("prediction-batch-custody");
     const FixtureSpec fixture{root.path().string(), "train", 4, 4, 2};
     data::testsupport::create_synthetic_dataset(fixture);
-    data::CompilerConfig config;
-    config.source_dir = data::testsupport::dataset_dir(fixture);
-    config.output_dir = data::testsupport::compiled_dir(fixture);
-    config.split = fixture.split;
-    config.target_width = fixture.width;
-    config.target_height = fixture.height;
-    config.num_workers = 1;
-    const auto plan = data::DatasetCompiler::prepare(config, {config.split});
-    data::DatasetCompiler::compile(plan, 0U);
+    data::testsupport::compile_existing_fixture(fixture);
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup destroy{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     const data::DatasetLoader::Config loading{.compiled_path = data::testsupport::compiled_bin_path(fixture),
                                               .batch_size = 1U,
                                               .shuffle = false,
@@ -777,9 +766,8 @@ TEST_CASE("ONNX metadata survives simplification and same-path prediction rebind
     }
     write_prediction_model(model);
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     rfdetr::PredictRequest request;
     request.source_kind = rfdetr::PredictSourceKind::ImageFiles;
     request.onnx_path = model;
@@ -939,14 +927,7 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
         std::ofstream output(categories);
         output << catalog;
     }
-    data::CompilerConfig config;
-    config.source_dir = data::testsupport::dataset_dir(fixture);
-    config.output_dir = data::testsupport::compiled_dir(fixture);
-    config.split = fixture.split;
-    config.target_width = fixture.width;
-    config.target_height = fixture.height;
-    config.num_workers = 1;
-    data::DatasetCompiler::compile(data::DatasetCompiler::prepare(config, {config.split}), 0U);
+    data::testsupport::compile_existing_fixture(fixture);
     const auto source = root.path() / "rf-detr-nano.onnx";
     write_prediction_model(source, 2, false);
     auto layout = rfdetr::native_training_class_layout(data::catalog::ClassCatalog({"person", "ret"}));
@@ -1044,21 +1025,10 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     CHECK(session.Close() == mmltk::backend::ml::runtime::kRuntimeSuccess);
 }
 TEST_CASE("Stopped synchronous export engine and validation skip production and preserve bundles", "[model][rfdetr][layout][cancellation]") {
-    namespace io = mmltk::common::io;
     const mmltk::testsupport::ScopedTempDir root("rfdetr-stopped-producers");
     const auto output = root.path() / "previous.model";
-    const auto companion = std::filesystem::path(output.string() + ".classes.json");
     const auto layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
-    {
-        std::ofstream file(output);
-        file << "previous complete artifact";
-    }
-    const auto original = io::sha256_file(output);
-    {
-        std::ofstream file(companion);
-        file << rfdetr::encode_class_descriptor({1, io::sha256_hex(original), layout});
-    }
-    const auto original_companion = io::sha256_file(companion);
+    const rfdetr::test_support::ClassArtifactFixture bundle(output, "previous complete artifact", layout);
     std::stop_source source;
     source.request_stop();
     rfdetr::ExportOnnxRequest export_request;
@@ -1081,9 +1051,7 @@ TEST_CASE("Stopped synchronous export engine and validation skip production and 
     CHECK(result.cancelled);
     CHECK(result.processed_images == 0U);
     CHECK(result.backends.empty());
-    CHECK(io::sha256_file(output) == original);
-    CHECK(io::sha256_file(companion) == original_companion);
-    for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
+    bundle.CheckPreserved();
 }
 TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[model][rfdetr][layout][onnx]") {
     namespace io = mmltk::common::io;

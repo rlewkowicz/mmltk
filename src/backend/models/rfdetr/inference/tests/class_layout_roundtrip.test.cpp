@@ -1,4 +1,5 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
+#include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/common/io/file_digest.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
@@ -185,18 +186,8 @@ TEST_CASE("Staged class publication permits old readers and rejects a competing 
 TEST_CASE("A live stop after staging preserves the prior complete class bundle", "[model][rfdetr][layout][publication]") {
     const mmltk::testsupport::ScopedTempDir root("class-bundle-staged-stop");
     const auto artifact = root.path() / "model.engine";
-    const auto companion = std::filesystem::path(artifact.string() + ".classes.json");
     const auto layout = r::native_training_class_layout(c::ClassCatalog({"cat"}));
-    {
-        std::ofstream output(artifact);
-        output << "previous engine";
-    }
-    const auto original = io::sha256_file(artifact);
-    {
-        std::ofstream output(companion);
-        output << r::encode_class_descriptor({1, io::sha256_hex(original), layout});
-    }
-    const auto original_companion = io::sha256_file(companion);
+    const r::test_support::ClassArtifactFixture bundle(artifact, "previous engine", layout);
     std::stop_source source;
     const auto stop = source.get_token();
     {
@@ -208,9 +199,7 @@ TEST_CASE("A live stop after staging preserves the prior complete class bundle",
         source.request_stop();
         CHECK_THROWS_AS(publication.Publish(r::ModelClassDescriptor{1, {}, layout}, [&] { return stop.stop_requested(); }), r::ArtifactPublicationCancelled);
     }
-    CHECK(io::sha256_file(artifact) == original);
-    CHECK(io::sha256_file(companion) == original_companion);
-    for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
+    bundle.CheckPreserved();
 }
 TEST_CASE("Retained class admission rejects changes across model construction", "[model][rfdetr][layout][artifact]") {
     const mmltk::testsupport::ScopedTempDir root("retained-class-admission");

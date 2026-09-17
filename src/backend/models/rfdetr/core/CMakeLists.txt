@@ -151,6 +151,17 @@ set_target_properties(mmltk_backend_models_rfdetr_core PROPERTIES
 mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_core std torch)
 
 function(mmltk_add_backend_models_rfdetr_core_tests)
+    add_library(mmltk_backend_models_rfdetr_class_artifact_test_support INTERFACE)
+    mmltk_register_public_headers(
+        mmltk_backend_models_rfdetr_class_artifact_test_support
+        BASE_DIRS ${CMAKE_SOURCE_DIR}
+        FILES ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/class_artifact_fixture.h)
+    target_link_libraries(mmltk_backend_models_rfdetr_class_artifact_test_support INTERFACE
+        mmltk::backend::models::rfdetr::core
+        mmltk::common::io
+        Catch2::Catch2)
+    mmltk_register_header_isolation(mmltk_backend_models_rfdetr_class_artifact_test_support)
+
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         add_library(
             mmltk_backend_models_rfdetr_checkpoint_test_support
@@ -205,6 +216,7 @@ function(mmltk_add_backend_models_rfdetr_core_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests)
     target_link_libraries(mmltk_backend_models_rfdetr_core_tests PRIVATE
         mmltk::backend::models::rfdetr::augmentation
+        mmltk_common_system_test_support
         mmltk_frameworks_gpu_test_support
         mmltk_backend_ml_torch_test_support
         mmltk::frameworks::serialization

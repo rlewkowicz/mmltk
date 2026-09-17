@@ -35,6 +35,13 @@ namespace mmltk::controller::test_support {
             .max_instances_per_image = 1U,
             .class_names = {{.value = "object"}}};
 }
+[[nodiscard]] inline contracts::ArtifactInspection successful_inspection(
+    const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths) {
+    contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
+    for (const auto& path : paths)
+        if (!path.empty()) result.splits.push_back(split(path));
+    return result;
+}
 class FakeDatasetRuntime final : public DatasetRuntime {
    public:
     FakeDatasetRuntime(std::shared_ptr<mmltk::testsupport::StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
@@ -56,10 +63,7 @@ class FakeDatasetRuntime final : public DatasetRuntime {
     }
     contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths, std::string_view, std::uint32_t,
                                           std::stop_token) override {
-        contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
-        for (const auto& path : paths)
-            if (!path.empty()) result.splits.push_back(split(path));
-        return result;
+        return successful_inspection(paths);
     }
 
    private:
@@ -169,9 +173,7 @@ class BlockingInspectRuntime final : public DatasetRuntime {
         Enter();
         observation_->inspect_started.set_value();
         static_cast<void>(observation_->inspect_gate->Wait(stop));
-        contracts::ArtifactInspection result{.compatible = true, .splits = {}, .detail = {}};
-        for (const auto& path : paths)
-            if (!path.empty()) result.splits.push_back(split(path));
+        auto result = successful_inspection(paths);
         Leave();
         return result;
     }

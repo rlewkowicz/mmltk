@@ -5,6 +5,17 @@
 #include <cstdio>
 #include <cstdlib>
 namespace mmltk::testsupport {
+class ScopedTestStream final {
+   public:
+    ScopedTestStream() { REQUIRE(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking) == cudaSuccess); }
+    ~ScopedTestStream() { static_cast<void>(cudaStreamDestroy(stream_)); }
+    ScopedTestStream(const ScopedTestStream&) = delete;
+    ScopedTestStream& operator=(const ScopedTestStream&) = delete;
+    [[nodiscard]] cudaStream_t get() const noexcept { return stream_; }
+
+   private:
+    cudaStream_t stream_ = nullptr;
+};
 [[nodiscard]] inline std::expected<int, cudaError_t> classify_cuda_device_count(const cudaError_t status, const int count) {
     if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver) { return 0; }
     if (status != cudaSuccess || count < 0) { return std::unexpected(status); }

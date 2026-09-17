@@ -1,3 +1,4 @@
+#include "src/test_support/cuda_test_utils.hpp"
 #include <algorithm>
 #include <array>
 #include <catch2/catch_test_macros.hpp>
@@ -91,9 +92,8 @@ TEST_CASE("local YUV video delivers sequential colors timing and EOF", "[video][
     const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-test", 0, execution.placement.numa_node, -10, false});
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream = nullptr;
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup destroy_stream{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     auto retirement = std::make_shared<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>(1U);
     REQUIRE_THROWS_AS(mmltk::backend::media::video::VideoFileSource("/nonexistent/predict-video", {4U}, 0, 1U, {}, retirement), std::invalid_argument);
     CHECK(retirement->admission_open());
@@ -319,9 +319,8 @@ TEST_CASE("video logging disables callback dispatch and preserves independent pr
 }
 TEST_CASE("local video display rotations preserve decoded pixels and delayed frame drain", "[video][gpu]") {
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream = nullptr;
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release_stream{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     for (int rotation : {0, 90, 180, 270}) {
         const auto path = std::filesystem::temp_directory_path() / ("mmltk-rotated-" + std::to_string(::getpid()) + ".mp4");
         const mmltk::testsupport::ScopedTestCleanup remove{[&] { std::filesystem::remove(path); }};
@@ -381,9 +380,8 @@ TEST_CASE("video resolution growth stays bounded and failed admission preserves 
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-growth", 0, execution.placement.numa_node, -10, false});
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     unsigned context_calls = 0U;
     gpu::CudaContextApi api{&context_calls,
                             [](void* count, CUcontext* context) noexcept {
@@ -498,9 +496,8 @@ TEST_CASE("video probing discovers late streams and preserves decoded timing fac
     const auto execution = mmltk::frameworks::gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-discovery", 0, execution.placement.numa_node, -10, false});
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     mmltk::backend::media::video::VideoFileSource source(path, {64U * 32U}, 0, reinterpret_cast<std::uintptr_t>(stream), {});
     CHECK(source.frame_count() == static_cast<std::uint64_t>(std::max<std::int64_t>(0, track->nb_frames)));
     std::optional<double> previous;
@@ -593,9 +590,8 @@ TEST_CASE("video exact context transitions seal the existing owner before furthe
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     mmltk::common::system::ScopedExecutionPolicy policy({execution.placement.cpus, "video-context", 0, execution.placement.numa_node, -10, false});
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
-    cudaStream_t stream{};
-    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess);
-    const mmltk::testsupport::ScopedTestCleanup release{[&] { static_cast<void>(cudaStreamDestroy(stream)); }};
+    const mmltk::testsupport::ScopedTestStream stream_owner;
+    const auto stream = stream_owner.get();
     struct Driver final {
         bool armed;
         bool query;

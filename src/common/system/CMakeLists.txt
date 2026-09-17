@@ -33,8 +33,9 @@ target_link_libraries(mmltk_common_system
 add_library(mmltk_common_system_test_support INTERFACE)
 mmltk_register_public_headers(mmltk_common_system_test_support
     BASE_DIRS ${CMAKE_SOURCE_DIR}
-    FILES tests/denied_syscall.h)
+    FILES tests/denied_syscall.h tests/numa_topology_test_support.h)
 target_link_libraries(mmltk_common_system_test_support INTERFACE mmltk::common::system)
+mmltk_register_header_isolation(mmltk_common_system_test_support)
 
 function(mmltk_add_common_system_tests)
     add_executable(mmltk_common_system_tests EXCLUDE_FROM_ALL)

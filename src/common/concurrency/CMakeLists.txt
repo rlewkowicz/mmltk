@@ -38,6 +38,7 @@ function(mmltk_add_common_concurrency_tests)
     target_link_libraries(mmltk_common_concurrency_tests
         PRIVATE
             mmltk_test_support
+            mmltk_common_system_test_support
             mmltk::common::concurrency
             mmltk::common::system
     )

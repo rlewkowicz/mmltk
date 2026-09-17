@@ -1,9 +1,9 @@
+#include "src/backend/models/rfdetr/core/tests/class_artifact_fixture.h"
 #include "src/controller/subsystems/train/training_system.h"
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
-#include "src/common/io/file_digest.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/controller/contracts/default_state.h"
@@ -514,21 +514,10 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
 TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior artifacts", "[controller][compute][gpu]") {
     namespace controller = mmltk::controller;
     namespace r = mmltk::backend::models::rfdetr;
-    namespace io = mmltk::common::io;
     const mmltk::testsupport::ScopedTempDir root("compute-stopped-artifact");
     const auto output = root.path() / "model.output";
-    const auto companion = std::filesystem::path(output.string() + ".classes.json");
     const auto layout = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
-    {
-        std::ofstream file(output);
-        file << "completed artifact";
-    }
-    const auto previous = io::sha256_file(output);
-    {
-        std::ofstream file(companion);
-        file << r::encode_class_descriptor({1, io::sha256_hex(previous), layout});
-    }
-    const auto previous_companion = io::sha256_file(companion);
+    const r::test_support::ClassArtifactFixture bundle(output, "completed artifact", layout);
     const controller::DirectComputeConfiguration configuration{
         .execution = mmltk::frameworks::gpu::test_support::selected_test_device(0, mmltk::common::system::NumaTopology::Capture())};
     controller::CudaExportRuntime exporter(configuration);
@@ -549,9 +538,7 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
     validation.compiled_path = root.path() / "not-opened.bin";
     validation.eval_order = "tensorrt";
     CHECK(validator.Run(validation, stop.get_token(), {}, {}).terminal.outcome == controller::contracts::ComputeOperationOutcome::Cancelled);
-    CHECK(io::sha256_file(output) == previous);
-    CHECK(io::sha256_file(companion) == previous_companion);
-    for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
+    bundle.CheckPreserved();
 }
 }  // namespace
 }  // namespace mmltk::controller
