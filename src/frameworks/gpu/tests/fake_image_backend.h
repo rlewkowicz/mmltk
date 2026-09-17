@@ -20,6 +20,7 @@
 #include <vector>
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/image_failure.h"
+#include "src/frameworks/gpu/image_workspace.h"
 #include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 namespace mmltk::frameworks::gpu::test_support {
@@ -96,6 +97,9 @@ struct ImageWorkspaceTestAccess final {
     static inline std::exception_ptr initialize_failure;
     static inline std::exception_ptr alias_failure;
     static inline std::size_t initialized = 0U;
+    static void SetAvailabilitySink(ImageWorkspace& workspace, std::shared_ptr<const std::function<void()>> sink) noexcept {
+        workspace.SetAvailabilitySink(std::move(sink));
+    }
     static std::shared_ptr<ImageWorkspace> Create(DeviceContext display, ImageWorkspaceLayout layout) {
         return ImageWorkspace::Create(std::move(display), std::move(layout), {}, &operations);
     }

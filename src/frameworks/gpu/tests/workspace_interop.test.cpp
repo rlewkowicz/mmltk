@@ -1344,12 +1344,12 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
     CHECK_FALSE(runtime.PrepareDisplay(raw.product_revision, workspace));
     const auto product_wakes = std::make_shared<std::size_t>(0U);
     if (throwing_sinks) {
-        workspace->SetAvailabilitySink(std::make_shared<const std::function<void()>>([product_wakes] {
+        ImageWorkspaceTestAccess::SetAvailabilitySink(*workspace, std::make_shared<const std::function<void()>>([product_wakes] {
             ++*product_wakes;
             throw std::runtime_error("product wake failure");
         }));
     } else {
-        workspace->SetAvailabilitySink({});
+        ImageWorkspaceTestAccess::SetAvailabilitySink(*workspace, {});
     }
     workspace->CancelWrite();
     CHECK(*product_wakes == 0U);
@@ -1379,7 +1379,7 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
     REQUIRE(workspace->ReserveDisplayWrite());
     workspace->CancelDisplayWrite();
     workspace->SetDisplayAvailabilitySink({});
-    workspace->SetAvailabilitySink({});
+    ImageWorkspaceTestAccess::SetAvailabilitySink(*workspace, {});
     CHECK(*reinterpret_cast<const std::byte*>(runtime.BorrowWorkspace().plane().data) == std::byte{37});
     CHECK(runtime.TryAcquireOutput(baseline).valid());
     CHECK(runtime.PrepareDisplay(raw.product_revision, workspace));
@@ -1405,7 +1405,7 @@ TEST_CASE("Workspace cancellation publishes availability before ordered product 
             if (throwing_sinks) throw std::runtime_error("availability wake failure");
         });
     };
-    workspace->SetAvailabilitySink(make_sink(false));
+    ImageWorkspaceTestAccess::SetAvailabilitySink(*workspace, make_sink(false));
     workspace->SetDisplayAvailabilitySink(make_sink(true));
     REQUIRE(workspace->ReserveDisplayWrite());
     CHECK_NOTHROW(workspace->CancelDisplayWrite());
@@ -1430,7 +1430,7 @@ TEST_CASE("Workspace cancellation publishes availability before ordered product 
     REQUIRE(observed->size() == 1U);
     CHECK((*observed)[0].display);
     CHECK_FALSE((*observed)[0].available);
-    workspace->SetAvailabilitySink({});
+    ImageWorkspaceTestAccess::SetAvailabilitySink(*workspace, {});
     workspace->SetDisplayAvailabilitySink({});
     CHECK_NOTHROW(workspace->CancelDisplayWrite());
     CHECK(workspace->WriteAvailable());
