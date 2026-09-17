@@ -1,4 +1,19 @@
 #pragma once
+#include <nlohmann/json.hpp>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <limits>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
 #include "audit_facts.h"
 #include "surface_audit.h"
 namespace mmltk::acceptance::wayland {

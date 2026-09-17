@@ -1,4 +1,17 @@
+#include "audit_facts.h"
 #include "src/controller/contracts/diagnostic_context.h"
+#include <charconv>
+#include <system_error>
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <ranges>
+#include <string>
+#include <string_view>
+#include <utility>
 #include "surface_audit.h"
 namespace mmltk::acceptance::wayland {
 auto SurfaceAudit::source_transition(const std::string& id, const std::string_view event, const bool browser, const std::uint64_t code ) -> void {

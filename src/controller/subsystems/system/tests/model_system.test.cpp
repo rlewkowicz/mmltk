@@ -1,4 +1,5 @@
 #include "src/controller/subsystems/system/tests/application_data_test_support.h"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/controller/subsystems/system/model_system.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
@@ -304,7 +305,7 @@ TEST_CASE("model selection shutdown cancels and joins one active acquisition wit
     SettingsSystem settings;
     REQUIRE(settings.Load(install_settings(root)).applied());
     std::ofstream(root / "weights.pt").put('\0');
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<contracts::ModelUiState> terminal;
     std::atomic_size_t terminals = 0U;
     std::atomic_size_t progress = 0U;

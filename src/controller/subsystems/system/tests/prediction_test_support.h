@@ -1,4 +1,8 @@
 #pragma once
+#include <cuda.h>
+#include <cuda_runtime_api.h>
+#include "src/backend/ml/runtime/analysis_provider.h"
+#include "src/backend/data/catalog/class_catalog.h"
 #include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/validate/validation_system.h"
 #include "src/controller/subsystems/validate/validation_runtime.h"
@@ -17,18 +21,6 @@
 #include <utility>
 #include <vector>
 namespace mmltk::controller::test_support {
-// Stop-aware, reusable admission gate; TestGate instead models one engagement.
-class StopGate final {
-   public:
-    void Release();
-    void Reset();
-    [[nodiscard]] bool Wait(std::stop_token);
-
-   private:
-    std::mutex mutex_;
-    std::condition_variable_any condition_;
-    bool released_ = false;
-};
 // Owns actual source storage. The aliasing custody includes the allocating
 // context, and can be dropped explicitly by a scenario observing weak lifetime.
 class PredictionSource final {
@@ -145,7 +137,7 @@ class PredictionContextFault final {
     static CUresult Set(void*, CUcontext) noexcept;
 };
 struct ComputeScenario final {
-    std::shared_ptr<StopGate> gate;
+    std::shared_ptr<mmltk::testsupport::StopGate> gate;
     bool fail = false;
 };
 class ComputeSequence final {
@@ -172,7 +164,7 @@ struct PredictionScenario final {
     bool refuse_preview = false;
     std::shared_ptr<std::atomic_int64_t> source_index{};
     std::size_t labels = 0U;
-    std::shared_ptr<StopGate> after_product{};
+    std::shared_ptr<mmltk::testsupport::StopGate> after_product{};
     std::shared_ptr<PredictionReceiverFault> receiver_fault{};
 };
 class FakePredictRuntime final : public PredictRuntime {

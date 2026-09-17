@@ -1,5 +1,19 @@
+#include "artifact_cursor.h"
+#include "audit_facts.h"
+#include "browser_audit.h"
+#include "src/test_support/filesystem_test_utils.hpp"
+#include <nlohmann/json.hpp>
+#include <catch2/catch_test_macros.hpp>
+#include <array>
+#include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include "session.h"
 namespace mmltk::acceptance::wayland {
+using mmltk::testsupport::ScopedTempDir;
 TEST_CASE("acceptance artifacts have independent writers and one process-family archive identity", "[workspace][audit]") {
     ScopedTempDir temporary{"mmltk-evidence-ownership"};
     const auto native = temporary.path() / "capture.jsonl";

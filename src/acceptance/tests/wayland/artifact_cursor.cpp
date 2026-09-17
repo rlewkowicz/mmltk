@@ -1,4 +1,7 @@
 #include "artifact_cursor.h"
+#include <cstdint>
+#include <optional>
+#include <stdexcept>
 namespace mmltk::acceptance::wayland {
 auto JsonLineCursor::line() const noexcept -> std::optional<std::uint64_t> { return line_; }
 

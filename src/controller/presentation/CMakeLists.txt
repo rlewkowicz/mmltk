@@ -145,3 +145,5 @@ function(mmltk_add_controller_presentation_tests)
         ADD_TAGS_AS_LABELS)
 
 endfunction()
+
+mmltk_register_header_isolation(mmltk_controller_visual_fixture)

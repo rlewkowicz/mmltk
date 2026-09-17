@@ -77,7 +77,7 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel(contracts::FeatureId::Validate);
     auto [settings, dataset, model] = fixture.systems();
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::atomic_size_t constructions = 0U;
     TerminalSequence<ValidationSystem::event_type> terminals;
     std::atomic_size_t progress = 0U;
@@ -102,7 +102,7 @@ TEST_CASE("model and compute systems use direct facts, progress, Busy, Stop, and
     CHECK(std::get<ValidationChanged>(failed_compute).snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
     CHECK(progress == 0U);
     CHECK_FALSE(validation.snapshot().operation.active);
-    gate = std::make_shared<StopGate>();
+    gate = std::make_shared<mmltk::testsupport::StopGate>();
     static_cast<void>(validation.Start({}));
     static_cast<void>(validation.Stop());
     CHECK(std::holds_alternative<ValidationChanged>(terminals.Second().get()));
@@ -206,7 +206,7 @@ TEST_CASE("Predict materialized routing keeps one producer across input changes 
         static_cast<void>(settings.Update(std::move(update)));
     };
     select((root / "first.input").string());
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     gate->Release();
     auto index = std::make_shared<std::atomic_int64_t>(0);
     std::atomic_size_t constructions = 0U;
@@ -298,9 +298,9 @@ TEST_CASE("Predict compact publication and source observation do not reread reta
     ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-compact-progress")};
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto [settings, dataset, model] = fixture.systems();
-    auto begin = std::make_shared<StopGate>();
+    auto begin = std::make_shared<mmltk::testsupport::StopGate>();
     begin->Release();
-    auto after_image = std::make_shared<StopGate>();
+    auto after_image = std::make_shared<mmltk::testsupport::StopGate>();
     std::atomic<PresentationSystem*> route = nullptr;
     std::atomic_bool scalar_sent = false;
     std::atomic_bool scalar_observed = false;
@@ -375,7 +375,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel(contracts::FeatureId::Export);
     auto [settings, dataset, model] = fixture.systems();
-    auto export_gate = std::make_shared<StopGate>();
+    auto export_gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<ComputeSystemEvent> export_terminal;
     ExportSystem export_system{settings, dataset, model,
                                [export_gate] { return std::make_unique<FakeNonvisualComputeRuntime>(ComputeScenario{.gate = export_gate}); },
@@ -388,7 +388,7 @@ TEST_CASE("export and predict wrappers share Busy Stop and failure isolation", "
     CHECK(std::holds_alternative<ComputeChanged>(export_terminal.get_future().get()));
     CHECK(export_system.snapshot().terminal.outcome == contracts::ComputeOperationOutcome::Cancelled);
     fixture.PrepareModel(contracts::FeatureId::Predict);
-    auto predict_gate = std::make_shared<StopGate>();
+    auto predict_gate = std::make_shared<mmltk::testsupport::StopGate>();
     auto predictions = std::make_shared<std::atomic_size_t>(0U);
     std::atomic_size_t constructions = 0U;
     std::promise<PredictSystem::event_type> predict_failed;

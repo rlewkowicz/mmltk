@@ -69,3 +69,5 @@ mmltk_register_public_headers(mmltk_controller_annotation_test_support
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES tests/support/annotation_system_fixture.h)
 target_link_libraries(mmltk_controller_annotation_test_support INTERFACE mmltk_controller_visual_fixture mmltk::controller::annotation_system)
+
+mmltk_register_header_isolation(mmltk_controller_annotation_test_support)

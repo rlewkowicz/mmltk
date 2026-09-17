@@ -1,5 +1,16 @@
 #pragma once
-#include "audit_facts.h"
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 namespace mmltk::acceptance::wayland {
 struct SurfaceAudit final {
     struct Reconstruction final {

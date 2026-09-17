@@ -5,9 +5,8 @@
 #include <stdexcept>
 #include <stop_token>
 #include <variant>
-#include "prediction_test_support.h"
-#include "src/controller/contracts/default_state.h"
-#include "src/controller/services/settings_store.h"
+#include "src/test_support/async_test_utils.hpp"
+#include "src/controller/services/tests/support/settings_test_fixture.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/subsystems/system/dataset_system.h"
@@ -27,38 +26,6 @@
 #include <utility>
 #include <vector>
 namespace mmltk::controller::test_support {
-[[nodiscard]] inline services::SettingsLocation install_settings(const std::filesystem::path& root) {
-    auto settings = contracts::default_gui_settings_state();
-    settings.workflows.train.dataset_source_dir = root / "source";
-    settings.workflows.train.compiled_dataset_dir = root / "compiled";
-    settings.workflows.train.request.train_compiled_path = root / "train.bin";
-    settings.workflows.train.request.val_compiled_path = root / "val.bin";
-    settings.workflows.train.request.test_compiled_path.clear();
-    settings.workflows.train.request.weights_path = root / "weights.pt";
-    settings.workflows.train.request.output_dir = root / "training";
-    settings.workflows.train.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.train.model_input = contracts::ModelArtifactInputKind::Weights;
-    settings.workflows.train.remote_container_image = "mmltk-test";
-    settings.workflows.train.remote_launch_template = "mmltk-test";
-    settings.workflows.validate.request.compiled_path = root / "val.bin";
-    settings.workflows.validate.request.weights_path = root / "weights.pt";
-    settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.validate.model_input = contracts::ModelArtifactInputKind::Weights;
-    settings.workflows.predict.source.compiled_path = (root / "train.bin").string();
-    settings.workflows.predict.request.output_path = root / "prediction.json";
-    settings.workflows.predict.request.weights_path = root / "weights.pt";
-    settings.workflows.predict.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.predict.model_input = contracts::ModelArtifactInputKind::Weights;
-    settings.workflows.export_state.weights_path = root / "weights.pt";
-    settings.workflows.export_state.onnx_input_path = root / "model-input.onnx";
-    settings.workflows.export_state.onnx_output_path = root / "model-output.onnx";
-    settings.workflows.export_state.model_source = contracts::ModelSelectionSource::Custom;
-    settings.workflows.export_state.model_input = contracts::ModelArtifactInputKind::Onnx;
-    REQUIRE(contracts::gui_settings_valid(settings));
-    const services::SettingsLocation location{(root / "settings.json").string()};
-    REQUIRE(services::SettingsStore::save(location.value(), settings, 1U).succeeded());
-    return location;
-}
 [[nodiscard]] inline contracts::ArtifactSplitFact split(const std::filesystem::path& path) {
     return {.path = path.string(),
             .image_count = 1U,
@@ -70,7 +37,7 @@ namespace mmltk::controller::test_support {
 }
 class FakeDatasetRuntime final : public DatasetRuntime {
    public:
-    FakeDatasetRuntime(std::shared_ptr<StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
+    FakeDatasetRuntime(std::shared_ptr<mmltk::testsupport::StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
     services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest& request, const std::stop_token stop,
                                             const std::function<void(const contracts::ArtifactProgress&)>& progress) override {
         progress(fail_ ? contracts::ArtifactProgress{.phase = static_cast<contracts::ArtifactCompilePhase>(255U),
@@ -96,12 +63,12 @@ class FakeDatasetRuntime final : public DatasetRuntime {
     }
 
    private:
-    std::shared_ptr<StopGate> gate_;
+    std::shared_ptr<mmltk::testsupport::StopGate> gate_;
     bool fail_ = false;
 };
 class BlockingModelRuntime final : public ModelRuntime {
    public:
-    explicit BlockingModelRuntime(std::shared_ptr<StopGate> gate) : gate_(std::move(gate)) {}
+    explicit BlockingModelRuntime(std::shared_ptr<mmltk::testsupport::StopGate> gate) : gate_(std::move(gate)) {}
     ModelArtifactAdmission Acquire(const contracts::ModelSelectionKey&, const std::filesystem::path& custom, int, const std::stop_token stop,
                                    const std::function<void(const contracts::ModelProgress&)>& progress) override {
         progress({.stage = contracts::ModelProgressStage::Verifying, .activity = "verifying fixture model"});
@@ -110,19 +77,19 @@ class BlockingModelRuntime final : public ModelRuntime {
     }
 
    private:
-    std::shared_ptr<StopGate> gate_;
+    std::shared_ptr<mmltk::testsupport::StopGate> gate_;
 };
 class ApplicationDataFixture final {
    public:
     explicit ApplicationDataFixture(std::filesystem::path root)
         : root_(std::move(root)),
           loaded_(root_),
-          dataset_gate_(std::make_shared<StopGate>()),
+          dataset_gate_(std::make_shared<mmltk::testsupport::StopGate>()),
           dataset_(loaded_.settings, [gate = dataset_gate_] { return std::make_unique<FakeDatasetRuntime>(gate, false); }),
           model_(
               loaded_.settings,
               [] {
-                  auto gate = std::make_shared<StopGate>();
+                  auto gate = std::make_shared<mmltk::testsupport::StopGate>();
                   gate->Release();
                   return std::make_unique<BlockingModelRuntime>(std::move(gate));
               },
@@ -171,7 +138,7 @@ class ApplicationDataFixture final {
     };
     std::filesystem::path root_;
     LoadedSettings loaded_;
-    std::shared_ptr<StopGate> dataset_gate_;
+    std::shared_ptr<mmltk::testsupport::StopGate> dataset_gate_;
     DatasetSystem dataset_;
     std::mutex model_mutex_;
     std::condition_variable model_changed_;
@@ -179,7 +146,7 @@ class ApplicationDataFixture final {
     ModelSystem model_;
 };
 struct DatasetRuntimeObservation final {
-    std::shared_ptr<StopGate> inspect_gate = std::make_shared<StopGate>();
+    std::shared_ptr<mmltk::testsupport::StopGate> inspect_gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<void> inspect_started;
     std::atomic_int active_calls = 0;
     std::atomic_int maximum_active_calls = 0;

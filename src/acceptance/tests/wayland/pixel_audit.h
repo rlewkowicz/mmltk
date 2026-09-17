@@ -1,5 +1,18 @@
 #pragma once
-#include "audit_facts.h"
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <ranges>
+#include <set>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
 #include "surface_audit.h"
 namespace mmltk::acceptance::wayland {
 struct PixelBoundaryAudit final {

@@ -1,4 +1,5 @@
 #include "src/controller/subsystems/system/tests/prediction_test_support.h"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/controller/subsystems/validate/detail/validation_samples.h"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include <catch2/catch_test_macros.hpp>
@@ -95,7 +96,7 @@ TEST_CASE("validation admits asynchronous selected-path inspection and cancels b
     auto [settings, unused_dataset, model] = fixture.systems();
     auto observation = std::make_shared<DatasetRuntimeObservation>();
     DatasetSystem dataset{settings, [observation] { return std::make_unique<BlockingInspectRuntime>(observation); }};
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::atomic_size_t constructions = 0;
     std::promise<ValidationSystem::event_type> settled;
     ValidationSystem validation{settings, dataset, model,

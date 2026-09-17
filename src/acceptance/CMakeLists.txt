@@ -143,6 +143,7 @@ if(BUILD_RFDETR_NATIVE)
         tests/workflow_wayland_inputs.cpp)
     mmltk_register_ordinary_sources(mmltk_workspace_wayland_integration
         tests/wayland/session.cpp
+        tests/wayland/audit_facts.cpp
         tests/wayland/artifact_cursor.cpp
         tests/wayland/surface_audit.cpp
         tests/wayland/pixel_audit.cpp
@@ -178,6 +179,13 @@ if(BUILD_RFDETR_NATIVE)
         mmltk_backend_data_test_support
         CUDA::cuda_driver
         nlohmann_json)
+    mmltk_link_declarations(mmltk_workspace_wayland_integration PRIVATE
+        mmltk::backend::imaging::raster
+        mmltk::controller::browser::schema
+        mmltk::controller::explore_system
+        mmltk::controller::presentation_system
+        mmltk::frameworks::serialization)
+    mmltk_register_header_isolation(mmltk_workspace_wayland_integration)
 endif()
 catch_discover_tests(
     mmltk_acceptance

@@ -1,5 +1,15 @@
 #pragma once
-#include "audit_facts.h"
+#include <nlohmann/json.hpp>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <set>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include <sys/types.h>
+#include "src/controller/subsystems/explore/explore_system.h"
 namespace mmltk::acceptance::wayland {
 using mmltk::controller::ExploreAcceptanceGate;
 struct NativeAudit final {

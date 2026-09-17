@@ -1,4 +1,5 @@
 #include <algorithm>
+#include "src/controller/subsystems/validate/validation_runtime.h"
 #include "src/controller/subsystems/system/predict_system.h"
 #include "src/controller/subsystems/export/export_system.h"
 #include <sched.h>
@@ -91,7 +92,7 @@ TEST_CASE("local run linearizes Stop with admission and installed worker", "[con
     launch.get();
     CHECK(observed_stop.get_future().get());
     run.StopAndJoin();
-    auto second_gate = std::make_shared<StopGate>();
+    auto second_gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<void> second_started;
     std::promise<bool> second_cancelled;
     run.Start({

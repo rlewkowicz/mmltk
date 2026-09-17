@@ -1,4 +1,62 @@
+#include "audit_facts.h"
 #include "session.h"
+#include <cstddef>
+#include "src/controller/presentation/annotation_palette.h"
+#include <fcntl.h>
+#include <poll.h>
+#include <sched.h>
+#include <signal.h>
+#include <sys/inotify.h>
+#include <sys/timerfd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <map>
+#include <memory>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <ranges>
+#include <set>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
+#include <cuda.h>
+#include <catch2/catch_test_macros.hpp>
+#include "src/test_support/filesystem_test_utils.hpp"
+#include "src/test_support/linux_process_test_utils.hpp"
+#include "src/acceptance/tests/workflow_wayland_inputs.h"
+#include "src/backend/data/compiled_file_utils.h"
+#include "src/backend/data/dataset_compiler.h"
+#include "src/common/io/scoped_fd.h"
+#include "src/controller/contracts/gui_settings.h"
+#include "src/controller/contracts/integration_control.h"
+#include "src/controller/contracts/annotation.h"
+#include "src/frameworks/serialization/serialization.h"
+#include "src/frameworks/reflection/reflection_metadata.h"
+#include "src/controller/subsystems/explore/explore_system.h"
+#include "src/backend/data/tests/test_fixture.h"
+#include "artifact_cursor.h"
+#include "surface_audit.h"
+#include "pixel_audit.h"
+#include "native_audit.h"
+#include "browser_audit.h"
 namespace mmltk::acceptance::wayland {
 using mmltk::common::io::ScopedFd;
 using mmltk::controller::ExploreAcceptanceGate;
@@ -65,21 +123,6 @@ void rotate_process_log_family(const std::filesystem::path& native, const std::s
         if ((!name.starts_with(prefix) && !name.starts_with(application_prefix)) || !entry.is_regular_file()) continue;
         prepare_latest_log(entry.path(), "process log family", identity);
         std::filesystem::remove(entry.path());
-    }
-}
-void append_acceptance_record(const std::filesystem::path& path, nlohmann::json record) {
-    record["kind"] = "acceptance_runtime";
-    record["owner"] = "acceptance";
-    record["steady_ns"] = std::chrono::steady_clock::now().time_since_epoch().count();
-    const std::string payload = record.dump() + '\n';
-    ScopedFd output{::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC)};
-    if (output.get() < 0) throw std::runtime_error("failed to append workspace Wayland acceptance evidence");
-    std::size_t offset = 0U;
-    while (offset != payload.size()) {
-        ssize_t written = -1;
-        do { written = ::write(output.get(), payload.data() + offset, payload.size() - offset); } while (written < 0 && errno == EINTR);
-        if (written <= 0) throw std::runtime_error("failed to write workspace Wayland acceptance evidence");
-        offset += static_cast<std::size_t>(written);
     }
 }
 [[nodiscard]] std::string read_from(const std::filesystem::path& path, const std::uintmax_t offset) {

@@ -63,7 +63,7 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
     const auto root = mmltk::testsupport::make_temp_root("ordinary-dataset");
     SettingsSystem settings;
     REQUIRE(settings.Load(install_settings(root)).applied());
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::atomic_size_t constructions = 0U;
     TerminalSequence<DatasetSystem::event_type> terminals;
     std::atomic_size_t progress = 0U;
@@ -89,7 +89,7 @@ TEST_CASE("dataset publishes direct progress, returns Busy, stops locally, and r
     CHECK(std::get<DatasetChanged>(failed_dataset).snapshot.terminal.outcome == contracts::ArtifactTerminalOutcome::Failed);
     CHECK(progress == 0U);
     CHECK_FALSE(dataset.snapshot().active);
-    gate = std::make_shared<StopGate>();
+    gate = std::make_shared<mmltk::testsupport::StopGate>();
     static_cast<void>(dataset.Compile({}));
     static_cast<void>(dataset.Stop());
     CHECK(std::holds_alternative<DatasetChanged>(terminals.Second().get()));

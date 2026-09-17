@@ -1,4 +1,23 @@
 #include "src/backend/data/compiled_file_utils.h"
+#include <charconv>
+#include <system_error>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <limits>
+#include <map>
+#include <optional>
+#include <ranges>
+#include <set>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+#include <vector>
 #include "src/backend/imaging/raster/class_palette.h"
 #include "src/controller/contracts/workspace_input.h"
 #include "src/controller/subsystems/explore/explore_system.h"
@@ -439,7 +458,7 @@ auto BrowserAudit::held_placeholder_motion(const std::uint64_t index, const std:
 auto BrowserAudit::consume_gallery_generation(const nlohmann::json& record) -> void {
         const auto generation = scalar(record, "gallery_generation");
         const auto indices = record.find("visible_indices");
-        if (generation == 0U || indices == record.end() || !indices->is_array() || indices->size() > kAcceptanceSlotLimit) {
+        if (generation == 0U || indices == record.end() || !indices->is_array() || indices->size() > mmltk::controller::kExploreVisibleItemCapacity) {
             bounds_valid = false;
             return;
         }
@@ -1051,10 +1070,10 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
                     return;
                 }
                 auto& slots = explore_slots[revision];
-                bounds_valid = bounds_valid && revision < (1ULL << 53U) && slot < kAcceptanceSlotLimit &&
+                bounds_valid = bounds_valid && revision < (1ULL << 53U) && slot < mmltk::controller::kExploreVisibleItemCapacity &&
                                (!slots.contains(slot) || slots.at(slot) == compiled_index) &&
                                (!explore_slot_frames.contains(revision) || explore_slot_frames.at(revision) == frame_revision);
-                if (slot < kAcceptanceSlotLimit) slots.insert_or_assign(slot, compiled_index);
+                if (slot < mmltk::controller::kExploreVisibleItemCapacity) slots.insert_or_assign(slot, compiled_index);
                 explore_slot_frames.insert_or_assign(revision, frame_revision);
                 atlas_identities = true;
             }
@@ -1485,7 +1504,7 @@ auto BrowserAudit::observed_frame_revision_for_slots(const std::map<std::uint64_
 auto BrowserAudit::final_cursor_slots() const noexcept -> const std::map<std::uint64_t, std::uint64_t>* {
         const auto slots = explore_slots.find(final_cursor_revision);
         if (final_cursor_revision == 0U || final_cursor_frame_revision == 0U || final_cursor_generation == 0U || final_cursor_slot_count == 0U ||
-            final_cursor_slot_count > kAcceptanceSlotLimit || slots == explore_slots.end() || slots->second.size() != final_cursor_slot_count ||
+            final_cursor_slot_count > mmltk::controller::kExploreVisibleItemCapacity || slots == explore_slots.end() || slots->second.size() != final_cursor_slot_count ||
             !explore_slot_frames.contains(final_cursor_revision) || explore_slot_frames.at(final_cursor_revision) != final_cursor_frame_revision)
             return nullptr;
         for (std::uint64_t slot = 0U; slot != final_cursor_slot_count; ++slot)

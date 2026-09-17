@@ -1,4 +1,18 @@
+#include "audit_facts.h"
 #include "pixel_audit.h"
+#include "src/controller/presentation/workspace_presentation_types.h"
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <ranges>
+#include <set>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
 namespace mmltk::acceptance::wayland {
 auto PixelBoundaryAudit::probe_failure_evidence(std::string_view expected) const -> ProbeFailureEvidence {
         if (expected.empty() || !failure.empty() || probe_failures.size() != 1U) return {};

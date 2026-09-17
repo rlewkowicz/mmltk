@@ -41,21 +41,6 @@ struct DeviceAllocation final {
     }
 };
 }  // namespace
-void StopGate::Release() {
-    {
-        std::scoped_lock lock(mutex_);
-        released_ = true;
-    }
-    condition_.notify_all();
-}
-void StopGate::Reset() {
-    std::scoped_lock lock(mutex_);
-    released_ = false;
-}
-bool StopGate::Wait(std::stop_token stop) {
-    std::unique_lock lock(mutex_);
-    return condition_.wait(lock, stop, [this] { return released_; });
-}
 PredictionSource::PredictionSource(VisualExtent extent, Catalog classes)
     : extent_(extent), classes_(classes ? std::move(classes) : std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>()) {
     annotations_.source_region = {.width = extent.width, .height = extent.height};

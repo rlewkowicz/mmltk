@@ -74,6 +74,14 @@ set(MMLTK_VAST_BRIDGE_SOURCE
     "${CMAKE_CURRENT_SOURCE_DIR}/vast_bridge.py"
     CACHE INTERNAL "Controller-owned Vast bridge")
 
+add_library(mmltk_controller_settings_test_support INTERFACE)
+mmltk_register_public_headers(mmltk_controller_settings_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/settings_test_fixture.h)
+target_link_libraries(mmltk_controller_settings_test_support INTERFACE
+    mmltk::controller::direct_services mmltk_test_support)
+mmltk_register_header_isolation(mmltk_controller_settings_test_support)
+
 function(mmltk_add_controller_services_tests)
     add_executable(mmltk_controller_services_file_dialog_fixture
         EXCLUDE_FROM_ALL)
@@ -114,6 +122,7 @@ function(mmltk_add_controller_services_tests)
         "MMLTK_FILE_DIALOG_PROCESS_FIXTURE=$<TARGET_FILE:mmltk_controller_services_file_dialog_fixture>"
     )
     target_link_libraries(mmltk_controller_services_tests PRIVATE
+        mmltk_controller_settings_test_support
         mmltk_test_support
         mmltk::backend::data
         mmltk::backend::models::rfdetr::contract

@@ -1,4 +1,28 @@
-#include "session.h"
+#include "audit_facts.h"
+#include <nlohmann/json.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <cctype>
+#include "src/controller/contracts/diagnostic_context.h"
+#include "src/controller/contracts/workspace_input.h"
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <numeric>
+#include <optional>
+#include <ranges>
+#include <set>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <catch2/catch_test_macros.hpp>
+#include "surface_audit.h"
+#include "pixel_audit.h"
+#include "native_audit.h"
+#include "browser_audit.h"
 namespace mmltk::acceptance::wayland {
 TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[workspace][audit][pixel]") {
     const nlohmann::json native{{"event", "presentation.pixel"}, {"surface_high", 1U},         {"surface_low", 2U},

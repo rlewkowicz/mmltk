@@ -1,4 +1,5 @@
-#include "src/controller/subsystems/system/tests/application_data_test_support.h"
+#include "src/controller/services/tests/support/settings_test_fixture.h"
+#include "src/test_support/async_test_utils.hpp"
 #include "src/controller/services/file_dialog_system.h"
 #include "src/controller/services/settings_system.h"
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -34,7 +35,7 @@ void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesyst
 }
 class FakeDialogRuntime final : public FileDialogRuntime {
    public:
-    FakeDialogRuntime(std::shared_ptr<StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
+    FakeDialogRuntime(std::shared_ptr<mmltk::testsupport::StopGate> gate, const bool fail) : gate_(std::move(gate)), fail_(fail) {}
     services::FileDialogSelection Open(const services::ResolvedFileDialog& dialog, const std::stop_token stop) override {
         if (!gate_->Wait(stop)) return {.target = dialog.target};
         if (fail_) throw contracts::FailedError("file dialog failed");
@@ -42,7 +43,7 @@ class FakeDialogRuntime final : public FileDialogRuntime {
     }
 
    private:
-    std::shared_ptr<StopGate> gate_;
+    std::shared_ptr<mmltk::testsupport::StopGate> gate_;
     bool fail_ = false;
 };
 TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, and reconstruction", "[controller][systems][services]") {
@@ -59,7 +60,7 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
     CHECK(explore_preferences.filter.minimum_compiled_index == 0U);
     CHECK(explore_preferences.filter.maximum_compiled_index == std::numeric_limits<std::uint64_t>::max());
     CHECK(explore_preferences.overlay.class_selection.mode == ExploreClassSelectionMode::All);
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::atomic_size_t constructions = 0U;
     std::promise<FileDialogSystem::event_type> first_completion;
     std::promise<FileDialogSystem::event_type> second_completion;
@@ -93,7 +94,7 @@ TEST_CASE("ordinary settings and file dialog expose direct state, Busy, Stop, an
     CHECK_FALSE(dialog.snapshot().active);
     CHECK(dialog.snapshot().valid());
     CHECK_FALSE(dialog.snapshot().selection);
-    gate = std::make_shared<StopGate>();
+    gate = std::make_shared<mmltk::testsupport::StopGate>();
     static_cast<void>(dialog.Open(selector));
     const auto stopping = dialog.Stop();
     CHECK(stopping.generation == 2U);

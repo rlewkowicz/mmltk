@@ -1,6 +1,22 @@
+#include "audit_facts.h"
+#include "src/controller/subsystems/explore/explore_system.h"
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <optional>
+#include <ranges>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "src/controller/browser/application_stable_identity.h"
 #include "src/controller/presentation/workspace_presentation_types.h"
 #include "native_audit.h"
 namespace mmltk::acceptance::wayland {
+constexpr std::uint64_t kUpdateViewportEndpoint = mmltk::controller::browser::application_stable_id("explore", "UpdateViewport");
 auto NativeAudit::reject_causal_evidence(const std::string_view reason) noexcept -> void {
         causal_inconsistent = true;
         if (causal_failure.empty()) causal_failure = reason;
@@ -114,7 +130,7 @@ auto NativeAudit::record_tile_publication(const std::uint64_t generation, const 
     }
 
 auto NativeAudit::join_gallery_publication(const std::uint64_t generation, const std::map<std::uint64_t, std::uint64_t>& complete_slots) -> void {
-        if (complete_slots.empty() || complete_slots.size() > kAcceptanceSlotLimit || complete_slots.rbegin()->first != complete_slots.size() - 1U ||
+        if (complete_slots.empty() || complete_slots.size() > mmltk::controller::kExploreVisibleItemCapacity || complete_slots.rbegin()->first != complete_slots.size() - 1U ||
             generation == 0U)
             return;
         const auto cardinality = placeholder_cardinalities.find(generation);
@@ -281,10 +297,10 @@ auto NativeAudit::consume(const nlohmann::json& record) -> void {
             }
             auto& slots = placeholder_slots[sequence];
             const auto compiled_index = scalar(record, "detail");
-            if (value >= kAcceptanceSlotLimit || (slots.contains(value) && slots.at(value) != compiled_index))
+            if (value >= mmltk::controller::kExploreVisibleItemCapacity || (slots.contains(value) && slots.at(value) != compiled_index))
                 reject_causal_evidence("placeholder slot identity");
-            if (value < kAcceptanceSlotLimit) slots.insert_or_assign(value, compiled_index);
-            if (value < kAcceptanceSlotLimit && scalar(record, "capacity_width") == 1U) initial_cache[sequence].slots.emplace(value);
+            if (value < mmltk::controller::kExploreVisibleItemCapacity) slots.insert_or_assign(value, compiled_index);
+            if (value < mmltk::controller::kExploreVisibleItemCapacity && scalar(record, "capacity_width") == 1U) initial_cache[sequence].slots.emplace(value);
         }
         if (owner == "explore" && event == "acceptance.placeholder.complete") {
             const auto cardinality = static_cast<std::size_t>(value);
@@ -295,11 +311,11 @@ auto NativeAudit::consume(const nlohmann::json& record) -> void {
             }
             const auto& slots = placeholder_slots[sequence];
             const bool invalid_slot = std::ranges::any_of(slots, [cardinality](const auto& slot) { return slot.first >= cardinality; });
-            if (cardinality > kAcceptanceSlotLimit || slots.size() > cardinality || invalid_slot ||
+            if (cardinality > mmltk::controller::kExploreVisibleItemCapacity || slots.size() > cardinality || invalid_slot ||
                 (placeholder_cardinalities.contains(sequence) && placeholder_cardinalities.at(sequence) != cardinality) ||
                 (placeholder_digests.contains(sequence) && placeholder_digests.at(sequence) != digest))
                 reject_causal_evidence("placeholder cardinality");
-            if (cardinality <= kAcceptanceSlotLimit) {
+            if (cardinality <= mmltk::controller::kExploreVisibleItemCapacity) {
                 placeholder_cardinalities.insert_or_assign(sequence, cardinality);
                 placeholder_digests.insert_or_assign(sequence, digest);
                 if (scalar(record, "admission_columns") != 0U) {
@@ -328,8 +344,8 @@ auto NativeAudit::consume(const nlohmann::json& record) -> void {
                 return;
             }
             auto& slots = patched_slots[sequence];
-            if (value >= kAcceptanceSlotLimit || (slots.contains(value) && slots.at(value) != compiled_index)) reject_causal_evidence("patched slot identity");
-            if (value < kAcceptanceSlotLimit) slots.insert_or_assign(value, compiled_index);
+            if (value >= mmltk::controller::kExploreVisibleItemCapacity || (slots.contains(value) && slots.at(value) != compiled_index)) reject_causal_evidence("patched slot identity");
+            if (value < mmltk::controller::kExploreVisibleItemCapacity) slots.insert_or_assign(value, compiled_index);
             last_patch_ordinals.insert_or_assign(sequence, ordinal);
             const auto placeholder = placeholder_slots[sequence].find(value);
             explore_stale_patch = explore_stale_patch || (placeholder != placeholder_slots[sequence].end() && placeholder->second != compiled_index);
@@ -516,7 +532,7 @@ auto NativeAudit::superseding_placeholder_observed() const noexcept -> bool {
 auto NativeAudit::RecordHeldControlObservation(const ExploreAcceptanceGate::ControlObservation observation) noexcept -> void {
         using Event = ExploreAcceptanceGate::ControlEvent;
         if (observation.event == Event::InitialWait) return;
-        const bool valid_identity = observation.generation != 0U && observation.slot < kAcceptanceSlotLimit &&
+        const bool valid_identity = observation.generation != 0U && observation.slot < mmltk::controller::kExploreVisibleItemCapacity &&
                                     observation.compiled_index <= std::numeric_limits<std::uint32_t>::max() && observation.staging_bytes != 0U;
         if (!valid_identity) {
             reject_causal_evidence("held control identity");

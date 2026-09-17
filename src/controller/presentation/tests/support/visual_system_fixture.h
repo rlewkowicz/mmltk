@@ -1,4 +1,6 @@
 #pragma once
+#include <sys/types.h>
+#include "src/common/types/generation.h"
 #include <algorithm>
 #include <array>
 #include <atomic>

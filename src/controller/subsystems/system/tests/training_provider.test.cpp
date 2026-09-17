@@ -35,7 +35,7 @@ namespace {
 }
 class FakeTrainingRuntime final : public TrainingRuntime {
    public:
-    FakeTrainingRuntime(std::shared_ptr<StopGate> gate, const bool fail, const bool inconclusive = false)
+    FakeTrainingRuntime(std::shared_ptr<mmltk::testsupport::StopGate> gate, const bool fail, const bool inconclusive = false)
         : gate_(std::move(gate)), fail_(fail), inconclusive_(inconclusive) {}
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, const std::stop_token stop,
                                      const std::function<void(const services::TrainProcessProgress&)>& progress) override {
@@ -66,11 +66,11 @@ class FakeTrainingRuntime final : public TrainingRuntime {
     }
 
    private:
-    std::shared_ptr<StopGate> gate_;
+    std::shared_ptr<mmltk::testsupport::StopGate> gate_;
     bool fail_ = false;
     bool inconclusive_ = false;
 };
-[[nodiscard]] TrainingSystem::RuntimeFactory reconstructing_training_runtime(std::shared_ptr<StopGate>& gate, std::atomic_size_t& constructions) {
+[[nodiscard]] TrainingSystem::RuntimeFactory reconstructing_training_runtime(std::shared_ptr<mmltk::testsupport::StopGate>& gate, std::atomic_size_t& constructions) {
     return [&gate, &constructions] {
         const bool fail = constructions++ == 0U;
         return std::make_unique<FakeTrainingRuntime>(gate, fail);
@@ -112,7 +112,7 @@ class BlockingCancellationTrainingRuntime final : public TrainingRuntime {
 };  // CLEANUP-IGNORE: Diagnostic compiler and blocking training runtime are separate typed dependency fakes.
 class BlockingRemoteRuntime final : public TrainingRuntime {
    public:
-    explicit BlockingRemoteRuntime(std::shared_ptr<StopGate> remote_gate) : remote_gate_(std::move(remote_gate)) {}
+    explicit BlockingRemoteRuntime(std::shared_ptr<mmltk::testsupport::StopGate> remote_gate) : remote_gate_(std::move(remote_gate)) {}
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
                                      const std::function<void(const services::TrainProcessProgress&)>&) override {
         return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Succeeded);
@@ -131,7 +131,7 @@ class BlockingRemoteRuntime final : public TrainingRuntime {
     }
 
    private:
-    std::shared_ptr<StopGate> remote_gate_;
+    std::shared_ptr<mmltk::testsupport::StopGate> remote_gate_;
 };
 TEST_CASE("provider result materialization enforces reflected bounds and identity", "[controller][systems][provider-materialization]") {
     services::VastOfferSummary offer;
@@ -168,7 +168,7 @@ TEST_CASE("training owns provider offers and remote control with Busy and lazy f
     // CLEANUP-IGNORE: Provider training intentionally starts without the accepted local-model prerequisite used by
     // local training.
     auto [settings, dataset, model] = fixture.systems();
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::atomic_size_t constructions = 0U;
     TerminalSequence<TrainingSystem::event_type> terminals;
     TrainingSystem training{settings, dataset, model, reconstructing_training_runtime(gate, constructions), [&](TrainingSystem::event_type event) {
@@ -205,7 +205,7 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel();
     auto [settings, dataset, model] = fixture.systems();
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     // CLEANUP-IGNORE: Local progress accounting and provider offer sequencing use different event invariants.
     std::atomic_size_t constructions = 0U;
     std::atomic_size_t sequence_one_progress = 0U;
@@ -230,7 +230,7 @@ TEST_CASE("local training resets progress and supports failure Stop and reconstr
     REQUIRE(std::holds_alternative<TrainingChanged>(local_failure));
     CHECK(std::get<TrainingChanged>(local_failure).snapshot.local.terminal.outcome == contracts::ComputeOperationOutcome::Failed);
     CHECK(std::get<TrainingChanged>(local_failure).snapshot.local.generation_frontier == 1U);
-    gate = std::make_shared<StopGate>();
+    gate = std::make_shared<mmltk::testsupport::StopGate>();
     static_cast<void>(training.Start({}));
     first_successful_progress_observed.get();
     const auto before_rejected_clear = training.snapshot();
@@ -251,7 +251,7 @@ TEST_CASE("remote training rejects duplicate starts and reconciles an inconclusi
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-reconcile");
     ApplicationDataFixture fixture{root};
     auto [settings, dataset, model] = fixture.systems();
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     gate->Release();
     std::promise<void> query_done;
     std::promise<void> mutation_done;
@@ -282,7 +282,7 @@ TEST_CASE("provider Clear cancels the active query and clears selection state", 
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-clear");
     ApplicationDataFixture fixture{root};
     auto [settings, dataset, model] = fixture.systems();
-    auto query_gate = std::make_shared<StopGate>();
+    auto query_gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<void> query_done;
     TrainingSystem training{settings, dataset, model, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
                             [&](TrainingSystem::event_type event) {
@@ -327,7 +327,7 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
     const auto root = mmltk::testsupport::make_temp_root("ordinary-training-stop-ownership");
     ApplicationDataFixture fixture{root};
     auto [settings, dataset, model] = fixture.systems();
-    auto query_gate = std::make_shared<StopGate>();
+    auto query_gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<void> query_done;
     TrainingSystem query_training{settings, dataset, model, [query_gate] { return std::make_unique<FakeTrainingRuntime>(query_gate, false); },
                                   [&](TrainingSystem::event_type event) {
@@ -338,7 +338,7 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
     query_gate->Release();
     query_done.get_future().wait();
     CHECK(query_training.snapshot().offers.outcome == contracts::ProviderQueryOutcome::Succeeded);
-    auto remote_gate = std::make_shared<StopGate>();
+    auto remote_gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<void> offers_ready;
     std::promise<void> remote_done;
     std::atomic_size_t changes = 0U;
@@ -362,7 +362,7 @@ TEST_CASE("local Stop does not cancel provider query or remote effect", "[contro
     CHECK(remote_training.snapshot().remote.phase == contracts::RemoteSessionPhase::Running);
     CHECK(remote_training.snapshot().remote.revision > remote_admitted.remote.revision);
 }
-[[nodiscard]] auto release_training_publication_on_exit(TrainingSystem& system, StopGate& runtime, std::promise<void>& publication) {
+[[nodiscard]] auto release_training_publication_on_exit(TrainingSystem& system, mmltk::testsupport::StopGate& runtime, std::promise<void>& publication) {
     return mmltk::testsupport::ScopedTestCleanup{[&system, &runtime, &publication] {
         mmltk::testsupport::release_test_promise(publication);
         runtime.Release();
@@ -374,7 +374,7 @@ TEST_CASE("training completion releases admission before observer publication re
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel();
     auto [settings, dataset, model] = fixture.systems();
-    auto local_gate = std::make_shared<StopGate>();
+    auto local_gate = std::make_shared<mmltk::testsupport::StopGate>();
     local_gate->Release();
     std::promise<void> local_publishing;
     std::promise<void> release_local_publication;
@@ -394,7 +394,7 @@ TEST_CASE("training completion releases admission before observer publication re
     CHECK(local.Stop({}).local.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     CHECK(local.snapshot().local.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
     release_local_publication.set_value();
-    auto query_gate = std::make_shared<StopGate>();
+    auto query_gate = std::make_shared<mmltk::testsupport::StopGate>();
     query_gate->Release();
     std::promise<TrainingSnapshot> query_publishing;
     std::promise<void> release_query_publication;
@@ -428,7 +428,7 @@ TEST_CASE("training admission and matching cancellation do not invert system and
     // do not.
     fixture.PrepareModel();
     auto [settings, dataset, model] = fixture.systems();
-    auto runtime_gate = std::make_shared<StopGate>();
+    auto runtime_gate = std::make_shared<mmltk::testsupport::StopGate>();
     std::promise<void> done;
     TrainingSystem system{settings, dataset, model, [runtime_gate] { return std::make_unique<FakeTrainingRuntime>(runtime_gate, false); },
                           [&](TrainingSystem::event_type event) {

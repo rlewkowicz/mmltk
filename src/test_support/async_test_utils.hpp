@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include <stop_token>
 #include <utility>
 namespace mmltk::testsupport {
 inline void release_test_promise(std::promise<void>& promise) noexcept {
@@ -40,6 +41,30 @@ class ScopedTestCleanup final {
 
    private:
     Cleanup cleanup_;
+};
+// Stop-aware, reusable admission gate; TestGate instead models one engagement.
+class StopGate final {
+   public:
+    void Release() {
+        {
+            std::scoped_lock lock(mutex_);
+            released_ = true;
+        }
+        condition_.notify_all();
+    }
+    void Reset() {
+        std::scoped_lock lock(mutex_);
+        released_ = false;
+    }
+    [[nodiscard]] bool Wait(std::stop_token stop) {
+        std::unique_lock lock(mutex_);
+        return condition_.wait(lock, stop, [this] { return released_; });
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable_any condition_;
+    bool released_ = false;
 };
 // One object is one named engagement. Copies of the receipt retain its storage,
 // never reset a previous engagement, and never assert from a worker thread.

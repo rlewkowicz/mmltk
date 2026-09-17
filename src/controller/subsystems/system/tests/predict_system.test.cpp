@@ -186,7 +186,7 @@ TEST_CASE("late receiver custody seals Predict admission while optional visual f
     ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-late-receiver")};
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto [settings, dataset, model] = fixture.systems();
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     gate->Release();
     auto fault = std::make_shared<PredictionReceiverFault>();
     fault->terminal = terminal;
@@ -262,7 +262,7 @@ TEST_CASE("prediction preview refusal preserves successful inference completion"
     ApplicationDataFixture fixture{root};
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto [settings, dataset, model] = fixture.systems();
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     gate->Release();
     std::promise<PredictSnapshot> completed;
     std::promise<PredictFailed> preview_failed;
@@ -562,7 +562,7 @@ TEST_CASE("Predict replacement pressure coalesces without overwriting its select
     ApplicationDataFixture fixture{mmltk::testsupport::make_temp_root("predict-replacement-pressure")};
     fixture.PrepareModel(contracts::FeatureId::Predict);
     auto [settings, dataset, model] = fixture.systems();
-    auto gate = std::make_shared<StopGate>();
+    auto gate = std::make_shared<mmltk::testsupport::StopGate>();
     gate->Release();
     auto fault = std::make_shared<PredictionReceiverFault>();
     const ScopedPredictionReceiverFault registration{*fault};

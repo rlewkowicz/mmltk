@@ -1,38 +1,19 @@
 #pragma once
-#include <algorithm>
-#include <array>
-#include <cctype>
 #include <charconv>
-#include <cmath>
-#include <cstdint>
 #include <cstddef>
-#include "src/controller/subsystems/explore/explore_system.h"
+#include <cstdint>
 #include <filesystem>
-#include <functional>
-#include <initializer_list>
-#include <limits>
-#include <map>
 #include <optional>
-#include <ranges>
-#include <set>
-#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <tuple>
-#include <unordered_map>
 #include <utility>
-#include <vector>
 #include <nlohmann/json.hpp>
-#include "src/controller/browser/application_stable_identity.h"
-#include "src/controller/contracts/visual_source.h"
 namespace mmltk::acceptance::wayland {
 void append_acceptance_record(const std::filesystem::path& path, nlohmann::json record);
-constexpr std::uint64_t kUpdateViewportEndpoint = mmltk::controller::browser::application_stable_id("explore", "UpdateViewport");
 constexpr std::size_t kAcceptanceGenerationLimit = 128U;
 // Numeric entry observes admission and completion snapshots for each digit.
 constexpr std::size_t kAcceptanceSnapshotLimit = 256U;
-constexpr std::size_t kAcceptanceSlotLimit = mmltk::controller::kExploreVisibleItemCapacity;
 constexpr std::size_t kAcceptanceRecordLimit = 4096U;
 constexpr const char* kExploreGalleryControl = "explore.gallery.workspace";
 [[nodiscard]] constexpr std::string_view first_failed_check() noexcept { return {}; }

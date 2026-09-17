@@ -1,3 +1,8 @@
+#include <catch2/generators/catch_generators.hpp>
+#include <cstdlib>
+#include <string>
+#include <string_view>
+#include <catch2/catch_test_macros.hpp>
 #include "session.h"
 namespace mmltk::acceptance::wayland {
 void workspace_wayland_retained() {

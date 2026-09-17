@@ -41,3 +41,5 @@ function(mmltk_add_controller_upscale_tests)
     catch_discover_tests(mmltk_controller_upscale_tests
         TEST_PREFIX "controller::upscale::" DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)
 endfunction()
+
+mmltk_register_header_isolation(mmltk_controller_upscale_test_support)
