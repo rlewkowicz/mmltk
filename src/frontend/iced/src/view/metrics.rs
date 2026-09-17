@@ -262,6 +262,31 @@ pub(crate) mod tests {
         assert!(ap.buckets.iter().zip(ap.buckets.iter().skip(1)).all(|(a,b)| a.segment != b.segment));
     }
     #[test]
+    fn evaluation_availability_caps_and_nonfinite_leaves_are_honest() {
+        let metrics = catalog::catalog();
+        let mut history = history::History::new(&metrics);
+        let mut sample = record();
+        sample.role = TrainingRecordRole::Epoch;
+        sample.progress.val = Some(evaluation());
+        sample.progress.val.as_mut().unwrap().bbox.available = false;
+        history.ingest(&sample, false, &metrics);
+        assert!(curve(&history, &metrics, Chart::Ap).buckets.is_empty());
+        sample.sequence += 1;
+        sample.progress.epoch += 1;
+        let bbox = &mut sample.progress.val.as_mut().unwrap().bbox;
+        bbox.available = true;
+        bbox.detectionlimits = [2, 23, 456];
+        bbox.confidence.precision = f64::INFINITY;
+        bbox.areaap[0] = Some(f64::NEG_INFINITY);
+        history.ingest(&sample, false, &metrics);
+        assert_eq!(curve(&history, &metrics, Chart::Ap).buckets[0].first.value, 0.42);
+        assert!(curve(&history, &metrics, Chart::Confidence).buckets.is_empty());
+        assert!(curve(&history, &metrics, Chart::Area).buckets.is_empty());
+        let recalls = metrics.iter().zip(&history.curves).filter(|(m, _)| m.chart == Chart::AverageRecall)
+            .map(|(_, c)| c.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(recalls, ["Box AR@2", "Box AR@23", "Box AR@456"]);
+    }
+    #[test]
     fn six_main_charts_retention_controls_and_live_epoch_coordinates() {
         let mut component = Component::default();
         assert_eq!(component.charts.iter().filter(|c| c.visible).count(), 6);

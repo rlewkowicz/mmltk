@@ -1,5 +1,5 @@
 //! Visual grouping only: values and identities are native generated declarations.
-use crate::generated::{MetricSummary, MetricSummaryField, TrainingScalarsField};
+use crate::generated::{MetricSummary, MetricSummaryField, ConfidenceMetricsField, TrainingScalarsField};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chart {
@@ -25,7 +25,7 @@ impl Chart {
 #[derive(Clone, Copy)]
 pub(super) enum Source {
     Scalar(TrainingScalarsField),
-    Evaluation { mask: bool, field: MetricSummaryField, index: usize },
+    Evaluation { mask: bool, field: MetricSummaryField },
 }
 pub(super) struct Metric {
     pub chart: Chart,
@@ -47,44 +47,41 @@ pub(super) fn catalog() -> Vec<Metric> {
     }).collect::<Vec<_>>();
     for mask in [false, true] {
         let prefix = if mask { "Mask" } else { "Box" };
-        for (field, chart, label) in [
-            (MetricSummaryField::Ap, Chart::Ap, "AP50:95"),
-            (MetricSummaryField::Ap50, Chart::Ap50, "AP50"),
-            (MetricSummaryField::Ap75, Chart::Ap75, "AP75"),
-        ] {
-            metrics.push(Metric { chart: if mask { Chart::Mask } else { chart },
-                label: format!("{prefix} {label}"), source: Source::Evaluation { mask, field, index: 0 } });
-        }
-        for index in 0..3 {
-            for (field, chart, label) in [
-                (MetricSummaryField::AverageRecall, Chart::AverageRecall, "AR"),
-                (MetricSummaryField::Confidence, Chart::Confidence, ["precision", "recall", "F1"][index]),
-                (MetricSummaryField::AreaAp, Chart::Area, "AP"),
-                (MetricSummaryField::AreaAr, Chart::Area, "AR"),
-            ] {
-                let suffix = if matches!(field, MetricSummaryField::AreaAp | MetricSummaryField::AreaAr) {
-                    [" small", " medium", " large"][index]
-                } else { "" };
-                metrics.push(Metric { chart: if mask && chart != Chart::Area { Chart::Mask } else { chart },
-                    label: format!("{prefix} {label}{suffix}"), source: Source::Evaluation { mask, field, index } });
-            }
-        }
+        let mut selected = MetricSummary::FIELDS.iter().filter_map(|(field, _)| {
+            let (order, chart, label) = evaluation_presentation(*field)?;
+            Some((order, Metric { chart: if mask && chart != Chart::Area { Chart::Mask } else { chart },
+                label: format!("{prefix} {label}"), source: Source::Evaluation { mask, field: *field } }))
+        }).collect::<Vec<_>>();
+        selected.sort_by_key(|(order, _)| *order);
+        metrics.extend(selected.into_iter().map(|(_, metric)| metric));
     }
     metrics
 }
-pub(super) fn evaluation_value(summary: &MetricSummary, field: MetricSummaryField, index: usize) -> Option<f64> {
-    if !summary.available { return None; }
-    match field {
-        MetricSummaryField::Ap => Some(summary.ap),
-        MetricSummaryField::Ap50 => Some(summary.ap50),
-        MetricSummaryField::Ap75 => Some(summary.ap75),
-        MetricSummaryField::AverageRecall => summary.averagerecall[index],
-        MetricSummaryField::AreaAp => summary.areaap[index],
-        MetricSummaryField::AreaAr => summary.areaar[index],
-        MetricSummaryField::Confidence => Some([summary.confidence.precision, summary.confidence.recall, summary.confidence.f1][index]),
-        MetricSummaryField::Available | MetricSummaryField::DetectionLimits
-        | MetricSummaryField::ConfidenceThreshold => None,
-    }
+// Exhaustive visual policy, deliberately independent of native declaration order.
+// The interleaved order preserves existing series/color identities.
+fn evaluation_presentation(field: MetricSummaryField) -> Option<((usize, usize), Chart, String)> {
+    use MetricSummaryField::*;
+    let (order, chart, label) = match field {
+        Ap => ((0, 0), Chart::Ap, "AP50:95".into()),
+        Ap50 => ((0, 1), Chart::Ap50, "AP50".into()),
+        Ap75 => ((0, 2), Chart::Ap75, "AP75".into()),
+        AverageRecall(index) => ((index + 1, 0), Chart::AverageRecall, "AR".into()),
+        Confidence(field) => {
+            let (order, label) = match field {
+                ConfidenceMetricsField::Precision => (0, "precision"),
+                ConfidenceMetricsField::Recall => (1, "recall"),
+                ConfidenceMetricsField::F1 => (2, "F1"),
+            };
+            ((order + 1, 1), Chart::Confidence, label.into())
+        }
+        AreaAp(index) | AreaAr(index) => {
+            let ap = matches!(field, AreaAp(_));
+            let area = match index { 0 => "small".into(), 1 => "medium".into(), 2 => "large".into(), _ => format!("area {index}") };
+            ((index + 1, if ap { 2 } else { 3 }), Chart::Area, format!("{} {area}", if ap { "AP" } else { "AR" }))
+        }
+        Available | DetectionLimits(_) | ConfidenceThreshold => return None,
+    };
+    Some((order, chart, label))
 }
 
 #[cfg(test)]
@@ -129,38 +126,46 @@ mod tests {
     #[test]
     fn every_summary_identity_has_explicit_projection_or_metadata_policy() {
         use MetricSummaryField::*;
+        use ConfidenceMetricsField::{Precision, Recall, F1};
         let expected = [
-            (Ap, 0, Some(0.42)), (Ap50, 0, Some(0.65)), (Ap75, 0, Some(0.37)),
-            (Available, 0, None),
-            (AverageRecall, 0, Some(0.2)), (AverageRecall, 1, Some(0.4)), (AverageRecall, 2, Some(0.6)),
-            (DetectionLimits, 0, None),
-            (AreaAp, 0, Some(0.1)), (AreaAp, 1, None), (AreaAp, 2, Some(0.7)),
-            (AreaAr, 0, Some(0.2)), (AreaAr, 1, None), (AreaAr, 2, Some(0.8)),
-            (Confidence, 0, Some(0.8)), (Confidence, 1, Some(0.5)), (Confidence, 2, Some(0.615)),
-            (ConfidenceThreshold, 0, None),
+            (Ap, Some(0.42)), (Ap50, Some(0.65)), (Ap75, Some(0.37)),
+            (AverageRecall(0), Some(0.2)), (AverageRecall(1), Some(0.4)), (AverageRecall(2), Some(0.6)),
+            (AreaAp(0), Some(0.1)), (AreaAp(1), None), (AreaAp(2), Some(0.7)),
+            (AreaAr(0), Some(0.2)), (AreaAr(1), None), (AreaAr(2), Some(0.8)),
+            (Confidence(Precision), Some(0.8)), (Confidence(Recall), Some(0.5)), (Confidence(F1), Some(0.615)),
         ];
-        let mut summary = super::super::tests::evaluation().bbox;
-        for (field, index, value) in expected {
-            assert_eq!(evaluation_value(&summary, field, index), value, "{field:?}[{index}]");
-        }
+        let summary = super::super::tests::evaluation().bbox;
         let metrics = catalog();
+        for (field, value) in expected {
+            assert_eq!(summary.value(field), value, "{field:?}");
+        }
+        for (field, _) in MetricSummary::FIELDS {
+            let selected = metrics.iter().filter(|m| matches!(m.source, Source::Evaluation { mask: false, field: candidate } if candidate == field)).count();
+            assert_eq!(selected, usize::from(evaluation_presentation(field).is_some()));
+        }
         for metric in &metrics {
-            if let Source::Evaluation { mask, field, .. } = metric.source {
+            if let Source::Evaluation { mask, field } = metric.source {
                 let expected_chart = match field {
                     Ap => if mask { Chart::Mask } else { Chart::Ap },
                     Ap50 => if mask { Chart::Mask } else { Chart::Ap50 },
                     Ap75 => if mask { Chart::Mask } else { Chart::Ap75 },
-                    AverageRecall => if mask { Chart::Mask } else { Chart::AverageRecall },
-                    Confidence => if mask { Chart::Mask } else { Chart::Confidence },
-                    AreaAp | AreaAr => Chart::Area,
-                    Available | DetectionLimits | ConfidenceThreshold => panic!("metadata entered the plotted catalog"),
+                    AverageRecall(_) => if mask { Chart::Mask } else { Chart::AverageRecall },
+                    Confidence(_) => if mask { Chart::Mask } else { Chart::Confidence },
+                    AreaAp(_) | AreaAr(_) => Chart::Area,
+                    Available | DetectionLimits(_) | ConfidenceThreshold => panic!("metadata entered the plotted catalog"),
                 };
                 assert_eq!(metric.chart, expected_chart);
             }
         }
-        summary.available = false;
-        for (field, index, _) in expected {
-            assert_eq!(evaluation_value(&summary, field, index), None);
+        assert_eq!(metrics.iter().filter(|m| matches!(m.source, Source::Evaluation { mask: false, .. })).count(), expected.len());
+        for field in [Available, DetectionLimits(0), ConfidenceThreshold] {
+            assert!(evaluation_presentation(field).is_none());
         }
+        for field in [AverageRecall(usize::MAX), AreaAp(usize::MAX), AreaAr(usize::MAX), DetectionLimits(usize::MAX)] {
+            assert_eq!(summary.value(field), None);
+        }
+        let selected = metrics.iter().filter_map(|m| match m.source { Source::Evaluation { mask: false, field } => Some(field), _ => None }).collect::<Vec<_>>();
+        assert_eq!(selected, [Ap, Ap50, Ap75, AverageRecall(0), Confidence(Precision), AreaAp(0), AreaAr(0),
+            AverageRecall(1), Confidence(Recall), AreaAp(1), AreaAr(1), AverageRecall(2), Confidence(F1), AreaAp(2), AreaAr(2)]);
     }
 }
