@@ -1,3 +1,4 @@
+use super::annotation_checks::{annotation_layout_scale};
 //! Real model workflows driven through the packaged Iced interface.
 use super::*;
 use crate::generated::{ComputeOperationOutcome, SourceKind};
@@ -110,18 +111,49 @@ fn completed(stage: &str, facts: [f64; 4]) {
     reporting::emit(|sink| sink.record("integration.workflow.completed", "", stage, facts));
 }
 
-impl Controller {
-    fn workflow_step(&mut self, step: Step) -> Task<RootMessage> {
-        self.advance_to(Phase::Workflows(step))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_completion_requires_current_nonempty_canvas_evidence() {
+        let mut fixture = crate::integration_control::tests::ProbeFixture::new("workflows");
+        let controller = &mut fixture.controller;
+        controller.driver.phase = Phase::Workflows(Step::AwaitPixels(Picture::Narrow, 0));
+        let capture = |generation, outcome| Message::Scoped {
+            generation,
+            receipt: None,
+            message: Box::new(Message::WorkflowPixels {
+                picture: Picture::Narrow,
+                index: 0,
+                outcome,
+            }),
+        };
+        let _ = controller.update(capture(
+            controller.driver.generation.wrapping_sub(1),
+            ProbeOutcome::Observed(256, 256),
+        ));
+        assert_eq!(
+            controller.driver.phase,
+            Phase::Workflows(Step::AwaitPixels(Picture::Narrow, 0))
+        );
+        let _ = controller.update(capture(
+            controller.driver.generation,
+            ProbeOutcome::Observed(256, 0),
+        ));
+        assert_eq!(controller.driver.phase, Phase::Failed);
     }
-    fn workflow_control(&mut self, control: impl Into<String>) -> Task<RootMessage> {
-        if self.location_pending {
-            return Task::none();
-        }
-        self.location_pending = true;
+}
+
+impl State {
+    pub(super) fn workflow_step(&mut self, driver: &mut Driver, step: Step) -> Task<RootMessage> {
+        driver.advance_to(Phase::Workflows(step))
+    }
+    pub(super) fn workflow_control(&mut self, widgets: &mut widget_ops::RevealState, driver: &mut Driver, control: impl Into<String>) -> Task<RootMessage> {
+        if !widgets.begin_location() { return Task::none(); }
         let control = control.into();
         if matches!(
-            self.phase,
+            driver.phase,
             Phase::Workflows(
                 Step::Train
                     | Step::LeaveTrain
@@ -136,36 +168,36 @@ impl Controller {
         ) {
             // Navigation sits above the page scroller; absent-control checks
             // also need the unmodified tree result, without scroll clipping.
-            locate(control, self.generation)
+            locate(control, driver.generation)
         } else {
-            reveal_control(control, self.generation, AnnotationReveal::Control)
+            reveal_control(control, driver.generation, AnnotationReveal::Control)
         }
     }
-    pub(super) fn workflow_pixels(&mut self, picture: Picture, index: u8, outcome: ProbeOutcome) {
-        if self.phase != Phase::Workflows(Step::AwaitPixels(picture, index)) {
+    pub(super) fn workflow_pixels(&mut self, driver: &mut Driver, picture: Picture, index: u8, outcome: ProbeOutcome) {
+        if driver.phase != Phase::Workflows(Step::AwaitPixels(picture, index)) {
             return;
         }
         match outcome {
-            ProbeOutcome::Invalidated if self.workflows.pixel_attempts < 32 => {
-                self.workflows.pixel_attempts += 1;
-                self.phase = Phase::Workflows(Step::Pixels(picture, index));
+            ProbeOutcome::Invalidated if self.pixel_attempts < 32 => {
+                self.pixel_attempts += 1;
+                driver.phase = Phase::Workflows(Step::Pixels(picture, index));
             }
             ProbeOutcome::Observed(sampled, visible) if sampled > 0 && visible >= 12 => {
-                self.workflows.pixel_attempts = 0;
+                self.pixel_attempts = 0;
                 reporting::emit(|sink| {
                     sink.record(
                         "integration.workflow.pixels",
                         &picture.control(index),
                         picture.name(),
                         [
-                            self.workflows.pixel_source as f64,
-                            self.workflows.pixel_presentation as f64,
+                            self.pixel_source as f64,
+                            self.pixel_presentation as f64,
                             sampled as f64,
                             visible as f64,
                         ],
                     )
                 });
-                self.phase = Phase::Workflows(match picture {
+                driver.phase = Phase::Workflows(match picture {
                     Picture::Train => Step::NoImageWorkspace,
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
                     Picture::Validation => Step::OpenSample,
@@ -178,21 +210,20 @@ impl Controller {
                     Picture::Narrow => {
                         completed(
                             "narrow",
-                            [f64::from(self.workflows.narrow_scale), 0.0, 0.0, 0.0],
+                            [f64::from(self.narrow_scale), 0.0, 0.0, 0.0],
                         );
-                        self.phase = Phase::Complete;
+                        driver.phase = Phase::Complete;
                         return;
                     }
                 });
             }
-            _ => self.fail(&format!(
+            _ => driver.fail(&format!(
                 "Workflow {picture:?} canvas did not contain its completed image or plot curves: {outcome:?}"
             )),
         }
     }
-
-    pub(super) fn workflow_located(&mut self, control: &str, bounds: Rectangle) {
-        let Phase::Workflows(step) = self.phase else {
+    pub(super) fn workflow_located(&mut self, driver: &mut Driver, control: &str, bounds: Rectangle) {
+        let Phase::Workflows(step) = driver.phase else {
             return;
         };
         if matches!(
@@ -200,10 +231,10 @@ impl Controller {
             Step::NoImageWorkspace | Step::NoTrainAspect | Step::NoValidationAspect
         ) {
             if bounds.width > 0.0 || bounds.height > 0.0 {
-                self.fail("Workflow still exposes a removed image workspace or aspect selector");
+                driver.fail("Workflow still exposes a removed image workspace or aspect selector");
                 return;
             }
-            self.phase = Phase::Workflows(match step {
+            driver.phase = Phase::Workflows(match step {
                 Step::NoImageWorkspace => Step::NoTrainAspect,
                 Step::NoTrainAspect => Step::Validate,
                 _ => Step::Pixels(Picture::Validation, 0),
@@ -211,24 +242,24 @@ impl Controller {
             return;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
-            self.fail(&format!(
+            driver.fail(&format!(
                 "Workflow control {control} is missing from the rendered Iced tree in {step:?}"
             ));
             return;
         }
-        self.reporting
-            .observe(|reporting| reporting.located(&self.phase, control, bounds));
-        let input = crate::presentation_surface::physical_bounds(bounds, self.input_scale);
+        driver.reporting
+            .observe(|reporting| reporting.located(&driver.phase, control, bounds));
+        let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
         if let Step::Pixels(picture, index) = step {
-            self.phase = Phase::Workflows(Step::AwaitPixels(picture, index));
+            driver.phase = Phase::Workflows(Step::AwaitPixels(picture, index));
             #[cfg(not(target_arch = "wasm32"))]
             let _ = (input, picture.chart());
             #[cfg(target_arch = "wasm32")]
             {
                 let output =
-                    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone());
+                    scenario_output();
                 let Some(mut output) = output else {
-                    self.fail("Workflow pixel callback has no live scenario owner");
+                    driver.fail("Workflow pixel callback has no live scenario owner");
                     return;
                 };
                 // This completion belongs to the workflow request. The browser
@@ -251,14 +282,14 @@ impl Controller {
                         f64::from(input.height),
                     ],
                     picture.chart(),
-                    self.workflows.pixel_source as f64,
-                    self.workflows.pixel_presentation as f64,
+                    self.pixel_source as f64,
+                    self.pixel_presentation as f64,
                     &callback,
                 );
             }
             return;
         }
-        self.phase = Phase::Workflows(match step {
+        driver.phase = Phase::Workflows(match step {
             Step::Train => Step::StartTrain,
             Step::StartTrain => Step::Training,
             Step::LeaveTrain => Step::HiddenTrain,
@@ -277,17 +308,16 @@ impl Controller {
             Step::Stop => Step::Stopped,
             Step::Theme => Step::Dark,
             _ => {
-                self.fail("Unexpected workflow click continuation");
+                driver.fail("Unexpected workflow click continuation");
                 return;
             }
         });
         if !click(input) {
-            self.fail("Workflow pointer dispatch failed");
+            driver.fail("Workflow pointer dispatch failed");
         }
     }
-
     pub(super) fn advance_workflows(
-        &mut self,
+        &mut self, widgets: &mut widget_ops::RevealState, driver: &mut Driver,
         step: Step,
         model: &ApplicationModel,
         settings: &settings::SettingsModel,
@@ -304,37 +334,37 @@ impl Controller {
         };
         match step {
             Step::Train | Step::ReturnTrain | Step::Theme => {
-                self.workflow_control(crate::view::navigation::stable_id(FeatureId::Train))
+                self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Train))
             }
             Step::StartTrain if active == FeatureId::Train && settled => {
-                self.workflow_control(primary(FeatureId::Train))
+                self.workflow_control(widgets, driver, primary(FeatureId::Train))
             }
             Step::Training
                 if record.is_some_and(|value| value.progress.globaloptimizerstep > 0) =>
             {
-                self.workflows.hidden_sequence = record.unwrap().sequence;
-                self.workflow_step(Step::LeaveTrain)
+                self.hidden_sequence = record.unwrap().sequence;
+                self.workflow_step(driver, Step::LeaveTrain)
             }
             Step::LeaveTrain | Step::Validate => {
-                self.workflow_control(crate::view::navigation::stable_id(FeatureId::Validate))
+                self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Validate))
             }
             Step::HiddenTrain
                 if active == FeatureId::Validate
                     && record
-                        .is_some_and(|value| value.sequence > self.workflows.hidden_sequence) =>
+                        .is_some_and(|value| value.sequence > self.hidden_sequence) =>
             {
-                self.workflow_step(Step::ReturnTrain)
+                self.workflow_step(driver, Step::ReturnTrain)
             }
             Step::Trained
                 if active == FeatureId::Train
                     && train.is_some_and(|value| success(&value.local)) =>
             {
                 let Some(record) = record else {
-                    self.fail("Completed training has no metric history");
+                    driver.fail("Completed training has no metric history");
                     return Task::none();
                 };
                 if record.progress.globaloptimizerstep <= 1 || record.progress.val.is_none() {
-                    self.fail("Training did not publish loss and validation metrics");
+                    driver.fail("Training did not publish loss and validation metrics");
                     return Task::none();
                 }
                 completed(
@@ -346,12 +376,12 @@ impl Controller {
                         0.0,
                     ],
                 );
-                self.workflow_step(Step::Pixels(Picture::Train, 0))
+                self.workflow_step(driver, Step::Pixels(Picture::Train, 0))
             }
-            Step::NoImageWorkspace => self.arm("workflow.visual.workspace"),
-            Step::NoTrainAspect | Step::NoValidationAspect => self.arm("workflow.workspace.aspect"),
+            Step::NoImageWorkspace => widgets.arm(driver, "workflow.visual.workspace"),
+            Step::NoTrainAspect | Step::NoValidationAspect => widgets.arm(driver, "workflow.workspace.aspect"),
             Step::StartValidate if active == FeatureId::Validate && settled => {
-                self.workflow_control(primary(FeatureId::Validate))
+                self.workflow_control(widgets, driver, primary(FeatureId::Validate))
             }
             Step::Validating if validation.is_some_and(|value| success(&value.operation)) => {
                 let snapshot = validation.unwrap();
@@ -363,7 +393,7 @@ impl Controller {
                         .iter()
                         .all(|id| identities.insert((id.generation, id.datasetindex)))
                 {
-                    self.fail(
+                    driver.fail(
                         "Validation did not produce metrics and six distinct retained samples",
                     );
                     return Task::none();
@@ -377,28 +407,27 @@ impl Controller {
                         0.0,
                     ],
                 );
-                self.workflow_step(Step::NoValidationAspect)
+                self.workflow_step(driver, Step::NoValidationAspect)
             }
-            Step::OpenSample => self.workflow_control("validate.sample.0"),
+            Step::OpenSample => self.workflow_control(widgets, driver, "validate.sample.0"),
             Step::Sample if validation.is_some_and(|value| value.detail) => {
-                self.workflow_step(Step::HideBoxes)
+                self.workflow_step(driver, Step::HideBoxes)
             }
-            Step::HideBoxes => self.workflow_control("validate.pred.boxes"),
+            Step::HideBoxes => self.workflow_control(widgets, driver, "validate.pred.boxes"),
             Step::HiddenBoxes
                 if validation
                     .is_some_and(|value| value.detail && !value.overlays.predictionboxes) =>
             {
-                self.workflow_step(Step::Pixels(Picture::Detail, 0))
+                self.workflow_step(driver, Step::Pixels(Picture::Detail, 0))
             }
-            Step::CloseSample => self.workflow_control("validate.detail.close"),
+            Step::CloseSample => self.workflow_control(widgets, driver, "validate.detail.close"),
             Step::ClosedSample if validation.is_some_and(|value| !value.detail) => {
-                self.workflow_step(Step::Predict)
+                self.workflow_step(driver, Step::Predict)
             }
             Step::Predict => {
-                self.workflow_control(crate::view::navigation::stable_id(FeatureId::Predict))
+                self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Predict))
             }
-            Step::Source(index) if active == FeatureId::Predict && settled => self
-                .workflow_control(
+            Step::Source(index) if active == FeatureId::Predict && settled => self.workflow_control(widgets, driver, 
                     [
                         "predict.source.compiled",
                         "predict.source.image",
@@ -411,27 +440,27 @@ impl Controller {
                         value.workflows.predict.source.kind == source(index)
                     }) =>
             {
-                self.workflows.generation =
+                driver.generation =
                     prediction.map_or(0, |value| value.operation.generationfrontier);
-                self.workflow_step(Step::StartPredict(index))
+                self.workflow_step(driver, Step::StartPredict(index))
             }
             Step::StartPredict(_) | Step::Restart
                 if settings.draft.as_ref().is_some_and(|draft| {
                     model.compute_start_available(draft, FeatureId::Predict)
                 }) =>
             {
-                self.workflow_control(primary(FeatureId::Predict))
+                self.workflow_control(widgets, driver, primary(FeatureId::Predict))
             }
             Step::Predicting(index)
                 if prediction.is_some_and(|value| {
-                    value.operation.generationfrontier > self.workflows.generation
+                    value.operation.generationfrontier > driver.generation
                 }) =>
             {
                 let snapshot = prediction.unwrap();
                 if index == 2 {
                     if snapshot.operation.active && snapshot.operation.progress.completed >= 2 {
-                        self.workflows.video_index = snapshot.operation.progress.completed;
-                        return self.workflow_step(Step::Pause);
+                        self.video_index = snapshot.operation.progress.completed;
+                        return self.workflow_step(driver, Step::Pause);
                     }
                 } else if success(&snapshot.operation) {
                     let picture = if index == 0 {
@@ -440,7 +469,7 @@ impl Controller {
                         Picture::Image
                     };
                     if snapshot.labels.is_empty() {
-                        self.fail("Prediction has no class labels or confidence values");
+                        driver.fail("Prediction has no class labels or confidence values");
                         return Task::none();
                     }
                     completed(
@@ -452,42 +481,42 @@ impl Controller {
                             0.0,
                         ],
                     );
-                    return self.workflow_step(Step::Pixels(picture, 0));
+                    return self.workflow_step(driver, Step::Pixels(picture, 0));
                 }
                 Task::none()
             }
             Step::Pause | Step::Resume if model.predict_pause_available() => {
-                self.workflow_control("predict.pause")
+                self.workflow_control(widgets, driver, "predict.pause")
             }
             Step::Paused
                 if prediction.is_some_and(|value| value.paused && value.operation.active) =>
             {
-                self.workflow_step(Step::Resume)
+                self.workflow_step(driver, Step::Resume)
             }
             Step::VideoEnd if prediction.is_some_and(|value| success(&value.operation)) => {
                 let snapshot = prediction.unwrap();
-                if snapshot.operation.terminal.completed <= self.workflows.video_index {
-                    self.fail("Video did not continue through EOF after resuming");
+                if snapshot.operation.terminal.completed <= self.video_index {
+                    driver.fail("Video did not continue through EOF after resuming");
                     return Task::none();
                 }
                 completed(
                     "video",
                     [snapshot.operation.terminal.completed as f64, 0.0, 0.0, 0.0],
                 );
-                self.workflows.generation = snapshot.operation.generationfrontier;
-                self.workflow_step(Step::Pixels(Picture::Video, 0))
+                driver.generation = snapshot.operation.generationfrontier;
+                self.workflow_step(driver, Step::Pixels(Picture::Video, 0))
             }
             Step::Restarted
                 if prediction.is_some_and(|value| {
-                    value.operation.generationfrontier > self.workflows.generation
+                    value.operation.generationfrontier > driver.generation
                         && value.operation.active
                         && value.operation.progress.completed > 0
                 }) =>
             {
-                self.workflow_step(Step::Stop)
+                self.workflow_step(driver, Step::Stop)
             }
             Step::Stop if model.compute_stop_available(FeatureId::Predict) => {
-                self.workflow_control("predict.stop")
+                self.workflow_control(widgets, driver, "predict.stop")
             }
             Step::Stopped
                 if prediction.is_some_and(|value| {
@@ -504,10 +533,10 @@ impl Controller {
                         0.0,
                     ],
                 );
-                self.workflow_step(Step::Pixels(Picture::Stop, 0))
+                self.workflow_step(driver, Step::Pixels(Picture::Stop, 0))
             }
             Step::Dark if active == FeatureId::Train && settled => {
-                self.phase = Phase::Workflows(Step::DarkReady);
+                driver.phase = Phase::Workflows(Step::DarkReady);
                 Task::done(RootMessage::Settings(settings::Message::DarkModeChanged(
                     true,
                 )))
@@ -520,13 +549,13 @@ impl Controller {
                         .is_some_and(|value| value.ui.darkmode) =>
             {
                 completed("theme", [1.0, 0.0, 0.0, 0.0]);
-                self.workflow_step(Step::Pixels(Picture::Theme, 0))
+                self.workflow_step(driver, Step::Pixels(Picture::Theme, 0))
             }
             Step::Narrow => {
-                match annotation_layout_scale(self.input_scale, model.window_width as f32, true) {
+                match annotation_layout_scale(driver.input_scale, model.window_width as f32, true) {
                     Ok(scale) => {
-                        self.workflows.narrow_scale = scale;
-                        self.phase = Phase::Workflows(Step::NarrowReady);
+                        self.narrow_scale = scale;
+                        driver.phase = Phase::Workflows(Step::NarrowReady);
                         Task::done(RootMessage::Settings(settings::Message::UiScaleChanged(
                             scale,
                         )))
@@ -535,20 +564,20 @@ impl Controller {
                         )))
                     }
                     Err(_) => {
-                        self.fail("Workflow cannot reach its minimum-width layout");
+                        driver.fail("Workflow cannot reach its minimum-width layout");
                         Task::none()
                     }
                 }
             }
             Step::NarrowReady
-                if settled && (self.input_scale - self.workflows.narrow_scale).abs() < 0.001 =>
+                if settled && (driver.input_scale - self.narrow_scale).abs() < 0.001 =>
             {
-                self.workflow_step(Step::Pixels(Picture::Narrow, 0))
+                self.workflow_step(driver, Step::Pixels(Picture::Narrow, 0))
             }
             Step::Pixels(picture, index) => {
                 if picture.chart() {
-                    self.workflows.pixel_source = 0;
-                    self.workflows.pixel_presentation = 0;
+                    self.pixel_source = 0;
+                    self.pixel_presentation = 0;
                 } else {
                     let Some(surface) = surface else {
                         return Task::none();
@@ -563,46 +592,12 @@ impl Controller {
                     let Some(frame) = drawn.and_then(|value| value.frame) else {
                         return Task::none();
                     };
-                    self.workflows.pixel_source = frame.content_sequence;
-                    self.workflows.pixel_presentation = frame.presentation_revision;
+                    self.pixel_source = frame.content_sequence;
+                    self.pixel_presentation = frame.presentation_revision;
                 }
-                self.workflow_control(picture.control(index))
+                self.workflow_control(widgets, driver, picture.control(index))
             }
             _ => Task::none(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn workflow_completion_requires_current_nonempty_canvas_evidence() {
-        let mut fixture = crate::integration_control::tests::ProbeFixture::new("workflows");
-        let controller = &mut fixture.controller;
-        controller.phase = Phase::Workflows(Step::AwaitPixels(Picture::Narrow, 0));
-        let capture = |generation, outcome| Message::Scoped {
-            generation,
-            receipt: None,
-            message: Box::new(Message::WorkflowPixels {
-                picture: Picture::Narrow,
-                index: 0,
-                outcome,
-            }),
-        };
-        let _ = controller.update(capture(
-            controller.generation.wrapping_sub(1),
-            ProbeOutcome::Observed(256, 256),
-        ));
-        assert_eq!(
-            controller.phase,
-            Phase::Workflows(Step::AwaitPixels(Picture::Narrow, 0))
-        );
-        let _ = controller.update(capture(
-            controller.generation,
-            ProbeOutcome::Observed(256, 0),
-        ));
-        assert_eq!(controller.phase, Phase::Failed);
     }
 }

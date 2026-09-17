@@ -51,8 +51,11 @@ function(mmltk_add_controller_annotation_tests)
     mmltk_configure_component(mmltk_controller_annotation_tests PRIVATE_DECLARATIONS)
     mmltk_register_ordinary_sources(
         mmltk_controller_annotation_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/annotation_document.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/annotation_document.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/annotation_system.test.cpp)
     target_link_libraries(mmltk_controller_annotation_tests PRIVATE
+        mmltk_controller_annotation_test_support
+        mmltk_controller_explore_test_support
         mmltk_test_support
         mmltk::controller::annotation_system
         mmltk::controller::visual_runtime)
@@ -62,3 +65,7 @@ function(mmltk_add_controller_annotation_tests)
         DISCOVERY_MODE PRE_TEST
         ADD_TAGS_AS_LABELS)
 endfunction()
+mmltk_register_public_headers(mmltk_controller_annotation_test_support
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/annotation_system_fixture.h)
+target_link_libraries(mmltk_controller_annotation_test_support INTERFACE mmltk_controller_visual_fixture mmltk::controller::annotation_system)

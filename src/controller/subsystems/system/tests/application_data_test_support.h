@@ -1,4 +1,10 @@
 #pragma once
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <stdexcept>
+#include <stop_token>
+#include <variant>
 #include "prediction_test_support.h"
 #include "src/controller/contracts/default_state.h"
 #include "src/controller/services/settings_store.h"
@@ -211,5 +217,26 @@ class BlockingInspectRuntime final : public DatasetRuntime {
     }
     void Leave() noexcept { --observation_->active_calls; }
     std::shared_ptr<DatasetRuntimeObservation> observation_;
+};
+
+template <class Event>
+class TerminalSequence final {
+   public:
+    void Publish(Event event) {
+        switch (next_.fetch_add(1U)) {
+            case 0U: first_.set_value(std::move(event)); break;
+            case 1U: second_.set_value(std::move(event)); break;
+            default: third_.set_value(std::move(event)); break;
+        }
+    }
+    [[nodiscard]] std::future<Event> First() { return first_.get_future(); }
+    [[nodiscard]] std::future<Event> Second() { return second_.get_future(); }
+    [[nodiscard]] std::future<Event> Third() { return third_.get_future(); }
+
+   private:
+    std::promise<Event> first_;
+    std::promise<Event> second_;
+    std::promise<Event> third_;
+    std::atomic_size_t next_ = 0U;
 };
 }  // namespace mmltk::controller::test_support

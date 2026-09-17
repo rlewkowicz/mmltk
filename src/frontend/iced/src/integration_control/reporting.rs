@@ -1,3 +1,5 @@
+use super::retained::{EXPLORE_OPEN};
+use super::lifecycle::{advanced_layout_field, COMPILE_DATASET, DATASET_BROWSE, TRAIN_MODEL_CARD, BENCHMARK_OVERRIDE};
 //! Effect-only integration reporting. Payloads enter here before collection.
 use super::*;
 use std::cell::RefCell;
@@ -52,139 +54,6 @@ pub(super) fn workspace_fps(
     });
 }
 
-#[derive(Debug, Clone)]
-pub struct FpsPixels {
-    pub width: u32,
-    pub height: u32,
-    pub rgba: Vec<u8>,
-}
-
-impl FpsPixels {
-    pub(super) fn valid_extent(width: u32, height: u32, bytes: usize) -> bool {
-        width > 4
-            && height > 4
-            && bytes <= 1_048_576
-            && (width as usize)
-                .checked_mul(height as usize)
-                .and_then(|pixels| pixels.checked_mul(4))
-                == Some(bytes)
-    }
-}
-
-pub(super) fn verify_workspace_fps_pixels(image: &FpsPixels, evidence: FpsEvidence) -> bool {
-    if !reporting_enabled() {
-        return false;
-    }
-    let bounds = evidence.bounds;
-    let clip = evidence.clip;
-    if ![
-        bounds.x,
-        bounds.y,
-        bounds.width,
-        bounds.height,
-        clip.x,
-        clip.y,
-        clip.width,
-        clip.height,
-    ]
-    .into_iter()
-    .all(f32::is_finite)
-        || bounds.width <= 0.0
-        || bounds.height <= 0.0
-        || clip.width <= 0.0
-        || clip.height <= 0.0
-        || bounds.x < clip.x
-        || bounds.y < clip.y
-        || bounds.x + bounds.width > clip.x + clip.width
-        || bounds.y + bounds.height > clip.y + clip.height
-        || (clip.x + clip.width - bounds.x - bounds.width - 6.0).abs() > 0.01
-        || (bounds.y - clip.y - 6.0).abs() > 0.01
-        || !FpsPixels::valid_extent(image.width, image.height, image.rgba.len())
-        || evidence.frames == 0
-        || !evidence.seconds.is_finite()
-        || evidence.seconds < 0.5
-    {
-        return false;
-    }
-    let mut background = 0;
-    let mut foreground = 0;
-    let mut border = 0;
-    let mut border_background = 0;
-    for y in 0..image.height {
-        for x in 0..image.width {
-            let offset = (y as usize * image.width as usize + x as usize) * 4;
-            let pixel = &image.rgba[offset..offset + 4];
-            if pixel[3] != 255 {
-                return false;
-            }
-            let low = pixel[..3].iter().copied().min().unwrap();
-            let high = pixel[..3].iter().copied().max().unwrap();
-            let back = if evidence.dark { high <= 8 } else { low >= 247 };
-            let front = if evidence.dark {
-                low >= 160
-            } else {
-                high <= 95
-            };
-            background += usize::from(back);
-            foreground += usize::from(front);
-            if x == 0 || x + 1 == image.width || y == 0 || y + 1 == image.height {
-                border += 1;
-                border_background += usize::from(back);
-            }
-        }
-    }
-    let valid = background > foreground && foreground >= 12 && border_background * 10 >= border * 9;
-    emit(|sink| {
-        sink.record(
-            "integration.workspace_fps_pixels",
-            EXPLORE_GALLERY,
-            if valid {
-                "visible-counter"
-            } else {
-                "invalid-counter"
-            },
-            [
-                evidence.frames as f64,
-                evidence.seconds,
-                foreground as f64,
-                border_background as f64,
-            ],
-        )
-    });
-    valid
-}
-
-#[cfg(test)]
-pub(super) fn fps_pixel_fixture(dark: bool, scale: f32) -> (FpsPixels, FpsEvidence) {
-    let width = (74.0 * scale) as u32;
-    let height = (22.0 * scale) as u32;
-    let mut rgba = vec![if dark { 0 } else { 255 }; width as usize * height as usize * 4];
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel[3] = 255;
-    }
-    // Representative contrasting glyph stroke, safely inside the padded border.
-    for y in (8.0 * scale) as u32..(18.0 * scale) as u32 {
-        for x in (48.0 * scale) as u32..(51.0 * scale) as u32 {
-            let offset = (y as usize * width as usize + x as usize) * 4;
-            rgba[offset..offset + 3].fill(if dark { 255 } else { 0 });
-        }
-    }
-    (
-        FpsPixels {
-            width,
-            height,
-            rgba,
-        },
-        FpsEvidence {
-            bounds: Rectangle::new(iced::Point::new(20.0, 6.0), iced::Size::new(74.0, 22.0)),
-            clip: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 60.0)),
-            dark,
-            frames: 30,
-            seconds: 0.5,
-        },
-    )
-}
-
 pub(super) struct Owner {
     state: RefCell<Option<State>>,
 }
@@ -230,16 +99,19 @@ pub(super) fn emit(payload: impl FnOnce(&Sink)) {
 }
 
 pub(super) fn upscale_settlement(
-    controller: &Controller,
+    driver: &Driver,
+    retained: &retained::State,
+    probes: &probe::Requests,
     model: &ApplicationModel,
     frame: Option<crate::presentation_surface::FrameReady>,
     blocker: &'static str,
 ) {
     emit(|sink| {
-        let Phase::AwaitUpscale { kernel, .. } = controller.phase else {
+        let Phase::AwaitUpscale { kernel, .. } = driver.phase else {
             return;
         };
         let native = model.upscale_snapshot.as_ref();
+        let observed = retained.upscale_observation();
         // Read only real frontiers here. The controller reports the branch that
         // blocked; reporting neither repeats its predicates nor settles work.
         sink.record(
@@ -247,7 +119,7 @@ pub(super) fn upscale_settlement(
             EXPLORE_UPSCALE_ACTIONS[kernel],
             &format!(
                 "blocked={blocker}; phase={:?}; foreground={:?}; viewed_frame={:?}; native(revision,busy,ready,kernel,frame)={:?}; presentation(completed,publication,ready,browser_sample)={:?}; received={frame:?}; displayed_kernel={:?}; drawn={:?}; probe_current={:?}; probe_pending={:?}; probe_pixels={:?}; button={:?}; repeat(revision,observed)={:?}; requested={:?}; native_input={:?}; native_pending={:?}; native_method={:?}; explore(mode,selected,requested_selection,frame,document)={:?}",
-                controller.phase,
+                driver.phase,
                 model.foreground_visual(),
                 model.viewed_explore_frame(),
                 native.map(|state| (
@@ -260,15 +132,12 @@ pub(super) fn upscale_settlement(
                 frame.and_then(|frame| crate::presentation_surface::metadata::product(frame)
                     .map(|product| (product, frame.presentation_revision))),
                 model.displayed_upscale_kernel(),
-                controller.viewer_drawn,
+                probes.draws().viewer,
                 current_receipt(explore::DETAIL_WORKSPACE_ID),
-                controller.upscale_pixel_pending,
-                controller.upscale_pixels,
-                controller.upscale_button,
-                (
-                    controller.upscale_repeat_revision,
-                    controller.upscale_repeat_observed,
-                ),
+                (*probes.upscale_pending()),
+                observed.pixels,
+                observed.button,
+                observed.repeat,
                 model.explore.requested_upscale,
                 native.map(|state| &state.input),
                 native.and_then(|state| state.pending.as_ref()),
@@ -878,111 +747,6 @@ mod tests {
     use crate::generated::{ExploreMode, ExploreOrder, IntegrationControlKind};
     use std::cell::Cell;
 
-    // Captures exist only within these fixtures; ordinary enabled execution
-    // retains neither records nor instrumentation counters in Rust.
-    struct Capture;
-    impl Capture {
-        fn new(enabled: bool) -> Self {
-            initialize_reporting(enabled, false);
-            RECORDS.with(|records| *records.borrow_mut() = Some(Vec::new()));
-            STYLES.with(|styles| *styles.borrow_mut() = Some(Vec::new()));
-            Self
-        }
-
-        fn records(&self) -> Vec<(String, String, String, [f64; 4])> {
-            RECORDS.with(|records| std::mem::take(records.borrow_mut().as_mut().unwrap()))
-        }
-    }
-    impl Drop for Capture {
-        fn drop(&mut self) {
-            RECORDS.with(|records| *records.borrow_mut() = None);
-            STYLES.with(|styles| *styles.borrow_mut() = None);
-            initialize_reporting(false, false);
-        }
-    }
-
-    #[test]
-    fn workspace_fps_pixel_acceptance_uses_the_visible_counter_at_each_scale_and_theme() {
-        let capture = Capture::new(true);
-        for scale in [1.0, 1.25, 1.5, 2.25] {
-            for dark in [false, true] {
-                let (pixels, evidence) = fps_pixel_fixture(dark, scale);
-                assert!(verify_workspace_fps_pixels(&pixels, evidence));
-            }
-        }
-        let records = capture.records();
-        assert_eq!(records.len(), 8);
-        assert!(records.iter().all(|(event, control, detail, values)| {
-            event == "integration.workspace_fps_pixels"
-                && control == EXPLORE_GALLERY
-                && detail == "visible-counter"
-                && values[0] == 30.0
-                && values[1] == 0.5
-        }));
-    }
-
-    #[test]
-    fn fps_pixels_require_opaque_text_background_complete_extent_and_unclipped_placement() {
-        let _capture = Capture::new(true);
-        for dark in [false, true] {
-            let (pixels, evidence) = fps_pixel_fixture(dark, 1.0);
-            let mut missing = pixels.clone();
-            missing.rgba.clear();
-            assert!(!verify_workspace_fps_pixels(&missing, evidence));
-            let mut background = pixels.clone();
-            for pixel in background.rgba.chunks_exact_mut(4) {
-                pixel[..3].fill(if dark { 0 } else { 255 });
-            }
-            assert!(!verify_workspace_fps_pixels(&background, evidence));
-            let mut transparent = pixels.clone();
-            transparent.rgba[3] = 0;
-            assert!(!verify_workspace_fps_pixels(&transparent, evidence));
-            let mut incomplete = pixels.clone();
-            incomplete.rgba.pop();
-            assert!(!verify_workspace_fps_pixels(&incomplete, evidence));
-            let mut border = pixels.clone();
-            for pixel in border.rgba[..border.width as usize * 4].chunks_exact_mut(4) {
-                pixel[..3].fill(if dark { 255 } else { 0 });
-            }
-            assert!(!verify_workspace_fps_pixels(&border, evidence));
-            assert!(!verify_workspace_fps_pixels(
-                &pixels,
-                FpsEvidence {
-                    dark: !dark,
-                    ..evidence
-                }
-            ));
-            for seconds in [0.0, 0.499, f64::NAN, f64::INFINITY] {
-                assert!(!verify_workspace_fps_pixels(
-                    &pixels,
-                    FpsEvidence {
-                        seconds,
-                        ..evidence
-                    }
-                ));
-            }
-            assert!(!verify_workspace_fps_pixels(
-                &pixels,
-                FpsEvidence {
-                    frames: 0,
-                    ..evidence
-                }
-            ));
-            for x in [f32::NAN, -1.0, 21.0, 100.0] {
-                assert!(!verify_workspace_fps_pixels(
-                    &pixels,
-                    FpsEvidence {
-                        bounds: Rectangle {
-                            x,
-                            ..evidence.bounds
-                        },
-                        ..evidence
-                    }
-                ));
-            }
-        }
-    }
-
     #[test]
     fn snapshot_conflict_reporting_projects_fields_and_retains_installed_state() {
         let capture = Capture::new(true);
@@ -1065,11 +829,11 @@ mod tests {
                 FeatureId::Explore,
                 Some(surface),
             ));
-            assert_eq!(driver.phase, Phase::SettingsOpen);
-            assert_eq!(driver.input_scale, 1.5);
-            assert!(driver.location_pending);
-            driver.report_phase_progress();
-            driver.report_phase_progress();
+            assert_eq!(driver.driver.phase, Phase::SettingsOpen);
+            assert_eq!(driver.driver.input_scale, 1.5);
+            assert!(driver.widgets.fixture().location_pending);
+            driver.driver.report_phase_progress();
+            driver.driver.report_phase_progress();
             let records = capture.records();
             if enabled {
                 assert_eq!(
@@ -1159,7 +923,7 @@ mod tests {
                     records[count + 6],
                     (
                         "integration.phase_progress".into(),
-                        driver.phase.deadline_class().into(),
+                        driver.driver.phase.deadline_class().into(),
                         "SettingsOpen".into(),
                         [0.0; 4]
                     )
@@ -1167,7 +931,7 @@ mod tests {
                 assert_eq!(records.len(), count + 7);
             } else {
                 assert!(records.is_empty());
-                assert!(driver.reporting.state_is_absent());
+                assert!(driver.driver.reporting.state_is_absent());
             }
 
             // The same and older revisions do not report or rescan. A newer
@@ -1212,16 +976,16 @@ mod tests {
 
             let bounds = Rectangle::new(iced::Point::new(12.0, 24.0), iced::Size::new(96.0, 32.0));
             for _ in 0..2 {
-                driver.phase = Phase::ExploreOpen;
-                driver.location_pending = true;
+                driver.driver.phase = Phase::ExploreOpen;
+                driver.widgets.configure_fixture(|fixture| fixture.location_pending = true);
                 driver.update(Message::Located {
                     control: EXPLORE_OPEN.into(),
                     bounds,
                 });
                 // The native fixture has no Firefox click adapter. Its existing
                 // failure behavior still follows the real located-style route.
-                assert_eq!(driver.phase, Phase::Failed);
-                assert!(!driver.location_pending);
+                assert_eq!(driver.driver.phase, Phase::Failed);
+                assert!(!driver.widgets.fixture().location_pending);
                 assert!(COMPLETION_WITHOUT_INPUT.with(Cell::get));
                 let records = capture.records();
                 if enabled {
@@ -1265,7 +1029,7 @@ mod tests {
                     );
                 }
             });
-            driver.phase = Phase::Complete;
+            driver.driver.phase = Phase::Complete;
             driver
                 .reset_scenario(
                     "source".into(),
@@ -1274,9 +1038,9 @@ mod tests {
                     "quiet".into(),
                 )
                 .unwrap();
-            assert_eq!(driver.phase, Phase::AwaitBootstrap);
-            assert_eq!(driver.reporting.state_is_absent(), !enabled);
-            driver.reporting.observe(|state| {
+            assert_eq!(driver.driver.phase, Phase::AwaitBootstrap);
+            assert_eq!(driver.driver.reporting.state_is_absent(), !enabled);
+            driver.driver.reporting.observe(|state| {
                 assert_eq!(state.reported_phase, None);
                 assert_eq!(state.explore_snapshot_revision, 0);
                 assert_eq!(state.reopen_wait_revision, 0);
@@ -1293,12 +1057,12 @@ mod tests {
                 FeatureId::Explore,
                 Some(surface),
             ));
-            assert_eq!(driver.phase, Phase::TrainNavigation);
+            assert_eq!(driver.driver.phase, Phase::TrainNavigation);
             if !enabled {
                 assert!(capture.records().is_empty());
             }
             for dark in [false, true] {
-                driver.phase = Phase::Complete;
+                driver.driver.phase = Phase::Complete;
                 driver
                     .reset_scenario(
                         "source".into(),
@@ -1318,9 +1082,9 @@ mod tests {
                     FeatureId::Explore,
                     Some(surface),
                 ));
-                assert_eq!(driver.phase, Phase::TrainNavigation);
+                assert_eq!(driver.driver.phase, Phase::TrainNavigation);
                 STYLES.with(|styles| styles.borrow_mut().as_mut().unwrap().clear());
-                driver.reporting.observe(|state| {
+                driver.driver.reporting.observe(|state| {
                     state.style(EXPLORE_OPEN, bounds);
                     state.style(EXPLORE_OPEN, bounds);
                     state.style(BENCHMARK_OVERRIDE, bounds);
@@ -1347,7 +1111,7 @@ mod tests {
                 });
                 if !enabled {
                     assert!(capture.records().is_empty());
-                    assert!(driver.reporting.state_is_absent());
+                    assert!(driver.driver.reporting.state_is_absent());
                 }
             }
         }
@@ -1410,19 +1174,19 @@ mod tests {
                 state.reopen_wait(Some(frame), snapshot, 0, 0, false, None);
                 state.located(&Phase::AdvancedField(2), "field", Rectangle::default());
             });
-            driver.fail_detail(|| {
+            driver.driver.fail_detail(|| {
                 query_count.set(query_count.get() + 1);
                 format!("failure {}", 7).into()
             });
-            assert_eq!(driver.phase, Phase::Failed);
-            driver.report_phase_progress();
-            driver.report_phase_progress();
+            assert_eq!(driver.driver.phase, Phase::Failed);
+            driver.driver.report_phase_progress();
+            driver.driver.report_phase_progress();
             driver.observe_reporting(|_| panic!("failed controller ran passive reporting"));
             assert_eq!(query_count.get(), if enabled { 3 } else { 1 });
             let records = capture.records();
             if !enabled {
                 assert!(records.is_empty());
-                assert!(driver.reporting.state_is_absent());
+                assert!(driver.driver.reporting.state_is_absent());
                 STYLES.with(|styles| assert!(styles.borrow().as_ref().unwrap().is_empty()));
                 continue;
             }
@@ -1575,7 +1339,7 @@ mod tests {
             wire.last().unwrap(),
             &expected(IntegrationControlKind::PressureEntered, 0, 0, "")
         );
-        driver.phase = Phase::Complete;
+        driver.driver.phase = Phase::Complete;
         assert!(connection.integration_pressure_settled());
         wire.clear();
         driver.publish_control(&mut connection);
@@ -1590,8 +1354,8 @@ mod tests {
             vec![expected(IntegrationControlKind::Settled, 10, 0, "")]
         );
         let failure_line = line!() + 1;
-        driver.fail("Protocol: Invalid snapshot: inconsistent frame revision");
-        assert_eq!(driver.failure_line, failure_line);
+        driver.driver.fail("Protocol: Invalid snapshot: inconsistent frame revision");
+        assert_eq!(driver.driver.failure_line, failure_line);
         driver.publish_control(&mut connection);
         wire.clear();
         connection
@@ -1610,21 +1374,47 @@ mod tests {
             )]
         );
         let forwarded_line = line!() + 1;
-        driver.fail("static quiet failure");
-        assert_eq!(driver.failure_line, forwarded_line);
+        driver.driver.fail("static quiet failure");
+        assert_eq!(driver.driver.failure_line, forwarded_line);
         assert!(
             driver
                 .reset_scenario(String::new(), String::new(), String::new(), "quiet".into())
                 .is_err()
         );
-        driver.phase = Phase::Complete;
+        driver.driver.phase = Phase::Complete;
         driver
             .reset_scenario(String::new(), String::new(), String::new(), "quiet".into())
             .unwrap();
-        assert_eq!(driver.control_progress, 0);
-        assert_eq!(driver.failure_line, 0);
-        assert_eq!(driver.control_phase, None);
-        assert!(driver.reporting.state_is_absent());
+        assert_eq!(driver.driver.control_progress, 0);
+        assert_eq!(driver.driver.failure_line, 0);
+        assert_eq!(driver.driver.control_phase, None);
+        assert!(driver.driver.reporting.state_is_absent());
         assert!(capture.records().is_empty());
     }
 }
+// Captures exist only within these fixtures; ordinary enabled execution
+// retains neither records nor instrumentation counters in Rust.
+#[cfg(test)]
+pub(super) struct Capture;
+#[cfg(test)]
+impl Capture {
+    pub(super) fn new(enabled: bool) -> Self {
+        initialize_reporting(enabled, false);
+        RECORDS.with(|records| *records.borrow_mut() = Some(Vec::new()));
+        STYLES.with(|styles| *styles.borrow_mut() = Some(Vec::new()));
+        Self
+    }
+
+    pub(super) fn records(&self) -> Vec<(String, String, String, [f64; 4])> {
+        RECORDS.with(|records| std::mem::take(records.borrow_mut().as_mut().unwrap()))
+    }
+}
+#[cfg(test)]
+impl Drop for Capture {
+    fn drop(&mut self) {
+        RECORDS.with(|records| *records.borrow_mut() = None);
+        STYLES.with(|styles| *styles.borrow_mut() = None);
+        initialize_reporting(false, false);
+    }
+}
+

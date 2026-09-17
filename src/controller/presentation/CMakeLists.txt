@@ -88,18 +88,42 @@ mmltk_register_public_headers(mmltk_controller_presentation_test_support
     FILES tests/support/workspace_surface_socket_test_utils.hpp detail/native_presentation_writer_test_access.h)
 target_link_libraries(mmltk_controller_presentation_test_support INTERFACE mmltk::controller::presentation_system)
 
+add_library(mmltk_controller_visual_fixture STATIC EXCLUDE_FROM_ALL)
+mmltk_configure_component(mmltk_controller_visual_fixture PUBLIC_DECLARATIONS)
+mmltk_register_public_headers(mmltk_controller_visual_fixture
+    BASE_DIRS ${CMAKE_SOURCE_DIR}
+    FILES tests/support/visual_system_fixture.h tests/support/visual_runtime_fixture.h)
+mmltk_register_ordinary_sources(mmltk_controller_visual_fixture tests/support/visual_system_fixture.cpp)
+target_link_libraries(mmltk_controller_visual_fixture PUBLIC
+    mmltk_controller_presentation_test_support
+    mmltk_frameworks_gpu_test_support
+    mmltk_test_support
+    mmltk::controller::visual_runtime
+    mmltk::controller::direct_services
+    nlohmann_json)
+
 function(mmltk_add_controller_presentation_tests)
     add_executable(
         mmltk_controller_visual_systems_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_controller_visual_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/visual_systems.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/native_gallery.test.cpp)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/presentation_contract.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/visual_runtime.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/native_gallery.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/workspace_acceptance_gate.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/allocation_tracking.cpp)
+    mmltk_register_private_headers(mmltk_controller_visual_systems_tests
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/support/allocation_tracking.h)
     mmltk_configure_component(
         mmltk_controller_visual_systems_tests PRIVATE_DECLARATIONS)
     target_link_libraries(
         mmltk_controller_visual_systems_tests PRIVATE
         mmltk_controller_annotation_test_support
+        mmltk_controller_visual_fixture
+        mmltk_controller_explore_test_support
+        mmltk_controller_upscale_test_support
+        mmltk_controller_live_test_support
         mmltk_controller_presentation_test_support
         mmltk_test_support
         mmltk::controller::browser::protocol_v17

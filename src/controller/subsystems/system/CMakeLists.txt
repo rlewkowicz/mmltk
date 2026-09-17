@@ -71,6 +71,11 @@ function(mmltk_add_controller_subsystems_system_tests)
     mmltk_register_ordinary_sources(
         mmltk_controller_data_compute_systems_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_data_compute_systems.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/dataset_system.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/model_system.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/predict_system.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_provider.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/runtime_placement.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../validate/tests/validation_system.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_compute_services.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/prediction_playback.test.cpp

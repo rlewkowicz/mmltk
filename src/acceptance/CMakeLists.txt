@@ -98,7 +98,8 @@ add_executable(mmltk_acceptance EXCLUDE_FROM_ALL)
 add_executable(mmltk::acceptance ALIAS mmltk_acceptance)
 mmltk_configure_component(mmltk_acceptance PRIVATE_DECLARATIONS)
 mmltk_register_ordinary_sources(
-    mmltk_acceptance tests/vendored_helpers.test.cpp)
+    mmltk_acceptance tests/reporter_logging.test.cpp
+        tests/workspace_registration.test.cpp)
 target_include_directories(mmltk_acceptance PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
 )
@@ -117,8 +118,7 @@ if(BUILD_RFDETR_NATIVE)
     )
     mmltk_register_ordinary_sources(
         mmltk_acceptance
-        tests/compile_progress_presentation.test.cpp
-        tests/direct_browser_runtime.test.cpp)
+        tests/compile_progress_presentation.test.cpp)
     target_link_libraries(mmltk_acceptance PRIVATE
         mmltk::backend::data
         mmltk::backend::imaging::explore
@@ -140,11 +140,29 @@ if(BUILD_RFDETR_NATIVE)
         mmltk_workspace_wayland_integration PRIVATE_DECLARATIONS)
     mmltk_register_retained_module_importers(
         mmltk_workspace_wayland_integration
-        tests/workspace_wayland_integration.test.cpp
         tests/workflow_wayland_inputs.cpp)
+    mmltk_register_ordinary_sources(mmltk_workspace_wayland_integration
+        tests/wayland/session.cpp
+        tests/wayland/artifact_cursor.cpp
+        tests/wayland/surface_audit.cpp
+        tests/wayland/pixel_audit.cpp
+        tests/wayland/native_audit.cpp
+        tests/wayland/browser_audit.cpp
+        tests/wayland/scenarios.cpp
+        tests/wayland/artifact_cursor.test.cpp
+        tests/wayland/audits.test.cpp
+    )
     mmltk_register_private_headers(
         mmltk_workspace_wayland_integration
-        tests/workflow_wayland_inputs.h)
+        tests/workflow_wayland_inputs.h
+        tests/wayland/session.h
+        tests/wayland/artifact_cursor.h
+        tests/wayland/audit_facts.h
+        tests/wayland/surface_audit.h
+        tests/wayland/pixel_audit.h
+        tests/wayland/native_audit.h
+        tests/wayland/browser_audit.h
+    )
         target_compile_definitions(mmltk_workspace_wayland_integration PRIVATE
         MMLTK_TEST_MMLTK_GUI_LAUNCHER="/opt/mmltk/bin/mmltk-browser-host")
     target_link_libraries(mmltk_workspace_wayland_integration PRIVATE
@@ -190,6 +208,9 @@ if(BUILD_RFDETR_NATIVE)
     mmltk_add_backend_media_live_tests()
     mmltk_add_controller_presentation_tests()
     mmltk_add_controller_annotation_tests()
+    mmltk_add_controller_explore_tests()
+    mmltk_add_controller_upscale_tests()
+    mmltk_add_controller_live_tests()
     mmltk_add_backend_models_rfdetr_core_tests()
     mmltk_add_backend_models_rfdetr_augmentation_tests()
     mmltk_add_backend_models_rfdetr_training_tests()

@@ -91,6 +91,7 @@ function(mmltk_add_controller_services_tests)
     set(mmltk_controller_services_ordinary_test_sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_services.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/settings.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/settings_persistence.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/vast_runtime.test.cpp
     )
     if(TARGET mmltk_backend_models_rfdetr_training)

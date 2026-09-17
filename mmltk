@@ -3277,6 +3277,9 @@ run_tests() {
         mmltk_controller_annotation_tests
         mmltk_controller_browser_tests
         mmltk_controller_visual_systems_tests
+        mmltk_controller_explore_tests
+        mmltk_controller_upscale_tests
+        mmltk_controller_live_tests
         mmltk_controller_services_tests
         mmltk_test_support_tests
         mmltk_controller_shell_tests
@@ -3300,12 +3303,16 @@ run_tests() {
     case "${suite}" in
         application-systems)
             targets=(
+                mmltk_controller_annotation_tests
                 mmltk_controller_browser_tests
                 mmltk_controller_services_tests
                 mmltk_test_support_tests
                 mmltk_controller_shell_tests
                 mmltk_controller_data_compute_systems_tests
                 mmltk_controller_visual_systems_tests
+                mmltk_controller_explore_tests
+                mmltk_controller_upscale_tests
+                mmltk_controller_live_tests
                 mmltk_frameworks_gpu_tests
                 mmltk_backend_media_live_tests
                 mmltk_backend_media_video_tests
@@ -3314,10 +3321,14 @@ run_tests() {
             ;;
         application-contracts)
             targets=(
+                mmltk_controller_annotation_tests
                 mmltk_controller_browser_tests
                 mmltk_controller_services_tests
                 mmltk_test_support_tests
                 mmltk_controller_visual_systems_tests
+                mmltk_controller_explore_tests
+                mmltk_controller_upscale_tests
+                mmltk_controller_live_tests
                 mmltk_frameworks_serialization_tests
             )
             executables=("${targets[@]}")
@@ -3342,6 +3353,7 @@ run_tests() {
             ;;
         core)
             targets=(
+                mmltk_controller_visual_systems_tests
                 mmltk_acceptance
                 mmltk_backend_data_tests
                 mmltk_backend_imaging_resample_tests

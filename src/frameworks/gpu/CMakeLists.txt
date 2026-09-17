@@ -87,7 +87,10 @@ function(mmltk_add_frameworks_gpu_tests)
     add_executable(mmltk_frameworks_gpu_tests EXCLUDE_FROM_ALL)
     mmltk_register_ordinary_sources(
         mmltk_frameworks_gpu_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_buffer.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/product_transaction.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/receiver_copy.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/workspace_interop.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_execution_retirement.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/device_execution.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/pinned_host_buffer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/gdr_mapped_buffer.test.cpp)
