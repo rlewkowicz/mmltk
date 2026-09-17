@@ -262,8 +262,7 @@ struct Transfer {
         prepare_easy();
     }
     void prepare_partial() {
-        const std::filesystem::path parent = request.destination.parent_path().empty() ? std::filesystem::path{"."} : request.destination.parent_path();
-        std::filesystem::create_directories(parent);
+        (void)mmltk::common::io::ensure_parent_directory(request.destination);
         const std::filesystem::path part_path = partial_path(request);
         bool metadata_matches = false;
         const std::filesystem::path metadata_path = partial_metadata_path(request);
@@ -793,8 +792,7 @@ struct SegmentTransfer {
     const std::size_t segment_count = checked_cast<std::size_t>(
         std::max<std::uint64_t>(1U, std::min(checked_cast<std::uint64_t>(maximum_concurrency, "segmented concurrency overflow"), segments_for_size)),
         "segmented download count overflow");
-    const std::filesystem::path parent = request.destination.parent_path().empty() ? std::filesystem::path{"."} : request.destination.parent_path();
-    std::filesystem::create_directories(parent);
+    (void)mmltk::common::io::ensure_parent_directory(request.destination);
     const int descriptor = ::open(partial_path(request).c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (descriptor < 0) { throw errno_error("cannot open segmented benchmark download", partial_path(request).string()); }
     ScopedFd partial(descriptor);

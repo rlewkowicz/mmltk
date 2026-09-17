@@ -11,6 +11,7 @@
 namespace mmltk::common::io {
 [[nodiscard]] std::runtime_error errno_error(const char* action, const std::string& path = {});
 void remove_path_recursively_best_effort(const std::filesystem::path& path) noexcept;
+[[nodiscard]] std::filesystem::path ensure_parent_directory(const std::filesystem::path& path);
 void sync_parent_directory(const std::filesystem::path& path);
 [[nodiscard]] bool remove_tree_no_follow(const std::filesystem::path& path, std::error_code& error) noexcept;
 void publish_staged_path_atomically(const std::filesystem::path& staging, const std::filesystem::path& destination, bool overwrite = true);

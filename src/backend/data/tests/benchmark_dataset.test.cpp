@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <vector>
 #include "src/test_support/async_test_utils.hpp"
+#include "src/common/io/staging_directory.h"
 #include "detail/benchmark_annotations.h"
 #include "detail/benchmark_cache.h"
 #include "detail/benchmark_compiler.h"
@@ -363,12 +364,42 @@ void test_benchmark_annotation_indexes() {
     REQUIRE(parsed.rejected.duplicate_boxes == 1U);
     REQUIRE(parsed.rejected.degenerate_boxes == 1U);
     REQUIRE(parsed.rejected.unmapped_categories == 1U);
+    parsed.rejected = {.raw_records = 101U, .unmapped_categories = 23U, .unknown_images = 37U,
+                       .malformed_records = 41U, .degenerate_boxes = 53U, .duplicate_boxes = 67U};
     const fs::path index_path = root.path() / "mini-coco.index";
     store_normalized_annotation_index(index_path, parsed, {});
     auto loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
     if (!loaded.has_value()) { throw std::runtime_error("stored normalized annotation index did not reload"); }
     REQUIRE(loaded.value().images.size() == 2U);
     REQUIRE(loaded.value().boxes.size() == 1U);
+    CHECK(loaded->rejected.raw_records == 101U);
+    CHECK(loaded->rejected.unmapped_categories == 23U);
+    CHECK(loaded->rejected.unknown_images == 37U);
+    CHECK(loaded->rejected.malformed_records == 41U);
+    CHECK(loaded->rejected.degenerate_boxes == 53U);
+    CHECK(loaded->rejected.duplicate_boxes == 67U);
+    // Independent version-2 byte offsets and values protect the persisted format.
+    std::ifstream persisted(index_path, std::ios::binary);
+    std::uint32_t version = 0U;
+    persisted.seekg(8);
+    persisted.read(reinterpret_cast<char*>(&version), sizeof(version));
+    REQUIRE(persisted.good());
+    CHECK(version == 2U);
+    std::uint64_t image_offset = 0U;
+    persisted.seekg(36);
+    persisted.read(reinterpret_cast<char*>(&image_offset), sizeof(image_offset));
+    REQUIRE(persisted.good());
+    CHECK(image_offset == 256U);
+    std::array<std::uint64_t, 6> slots{};
+    persisted.seekg(196);
+    persisted.read(reinterpret_cast<char*>(slots.data()), sizeof(slots));
+    REQUIRE(persisted.good());
+    CHECK((slots == std::array<std::uint64_t, 6>{101U, 23U, 37U, 41U, 53U, 67U}));
+    const nlohmann::json expected_rejections{{"raw_records", 101U}, {"unmapped_categories", 23U}, {"unknown_images", 37U},
+                                             {"malformed_records", 41U}, {"degenerate_boxes", 53U}, {"duplicate_boxes", 67U}};
+    const auto manifest_path = root.path() / "manifest" / "rejections.json";
+    write_json_atomically(manifest_path, {{"rejected_records", reject_json(parsed.rejected)}}, {});
+    CHECK(read_json_file(manifest_path).at("rejected_records") == expected_rejections);
     corrupt_byte(index_path, 0U);
     loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
     REQUIRE(!loaded);
@@ -818,6 +849,51 @@ void test_benchmark_cli_source_status_preserves_active_transfer_state() {
     REQUIRE(format_benchmark_source_status(active, "extracting") == "Cache hit");
 }
 }  // namespace
+TEST_CASE("benchmark destination preparation preserves parent and obstruction behavior", "[backend][data][benchmark][cache]") {
+    mmltk::testsupport::ScopedTempDir root{"benchmark-parent"};
+    const auto bare = root.path().filename().string() + ".json";
+    const mmltk::testsupport::ScopedTestCleanup remove_bare([&] {
+        for (const auto suffix : {"", ".lock", ".part", ".part.json", ".download.json"}) {
+            std::error_code ignored;
+            fs::remove(bare + suffix, ignored);
+        }
+    });
+    const auto payload = make_payload(4096U);
+    HttpServer server(payload);
+    const std::array<fs::path, 3> paths{bare, fs::relative(root.path()) / "relative" / "value.json", root.path() / "absolute" / "value.json"};
+    for (const auto& path : paths) {
+        write_json_atomically(path, {{"value", 19U}}, {});
+        CHECK(read_json_file(path).at("value") == 19U);
+        auto lease = ArtifactLease::acquire(path.string() + ".lock", {});
+        lease.release();
+        fs::remove(path.string() + ".lock");
+        fs::path staged;
+        {
+            mmltk::common::io::StagingDirectory staging(path, ".", ".next.XXXXXX", "test staging creation");
+            staged = staging.path();
+            CHECK(fs::is_directory(staged));
+            write_text(staged / "partial", "partial publication");
+        }
+        CHECK_FALSE(fs::exists(staged));
+        auto request = request_for(root.path(), "parent", server.url("parent"), payload);
+        request.destination = path;
+        const auto downloaded = download_artifacts({request}, 1U, {});
+        REQUIRE(downloaded.size() == 1U);
+        CHECK(mmltk::common::io::sha256_file(path) == mmltk::common::io::sha256_bytes(payload));
+    }
+    const auto obstruction = root.path() / "file-parent";
+    write_text(obstruction, "unchanged");
+    const auto before = mmltk::common::io::sha256_file(obstruction);
+    CHECK_THROWS_AS(write_json_atomically(obstruction / "value.json", {{"value", 23U}}, {}), fs::filesystem_error);
+    CHECK_THROWS_AS(ArtifactLease::acquire(obstruction / "value.lock", {}), fs::filesystem_error);
+    CHECK_THROWS_AS(mmltk::common::io::StagingDirectory(obstruction / "output", ".", ".next.XXXXXX", "test staging creation"), fs::filesystem_error);
+    auto request = request_for(root.path(), "obstructed", server.url("obstructed"), payload);
+    request.destination = obstruction / "download.bin";
+    request.maximum_attempts = 1U;
+    CHECK_THROWS(download_artifacts({request}, 1U, {}));
+    CHECK(mmltk::common::io::sha256_file(obstruction) == before);
+    server.Check();
+}
 TEST_CASE("benchmark download cache lifecycle", "[backend][data][benchmark][download]") { test_benchmark_download_cache_lifecycle(); }
 TEST_CASE("benchmark annotation indexes", "[backend][data][benchmark][annotations]") { test_benchmark_annotation_indexes(); }
 TEST_CASE("benchmark supplemental sampling", "[backend][data][benchmark][sampling]") { test_benchmark_supplemental_sampling(); }

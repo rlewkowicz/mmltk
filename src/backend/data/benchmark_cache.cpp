@@ -59,8 +59,7 @@ ArtifactLease& ArtifactLease::operator=(ArtifactLease&& other) noexcept {
 }
 ArtifactLease::~ArtifactLease() { release(); }
 ArtifactLease ArtifactLease::acquire(const std::filesystem::path& lock_path, mmltk::common::concurrency::CancellationObservation cancel_requested) {
-    const std::filesystem::path parent = lock_path.parent_path().empty() ? std::filesystem::path{"."} : lock_path.parent_path();
-    std::filesystem::create_directories(parent);
+    (void)mmltk::common::io::ensure_parent_directory(lock_path);
     const int descriptor = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0644);
     if (descriptor < 0) { throw errno_error("cannot open benchmark cache lock", lock_path.string()); }
     mmltk::common::io::ScopedFd owned(descriptor);
@@ -83,8 +82,7 @@ void throw_if_benchmark_cancelled(mmltk::common::concurrency::CancellationObserv
 }
 void write_json_atomically(const std::filesystem::path& path, const nlohmann::json& value,
                            const mmltk::common::concurrency::CancellationObservation cancellation) {
-    const std::filesystem::path parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
-    std::filesystem::create_directories(parent);
+    (void)mmltk::common::io::ensure_parent_directory(path);
     const std::string serialized = value.dump(2);
     std::string staging_text = path.string() + ".next.XXXXXX";
     FileHandle staging = FileHandle::create_unique_output(staging_text, serialized.size());

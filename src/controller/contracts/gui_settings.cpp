@@ -262,23 +262,13 @@ template <typename State, typename FieldVisitor>
     fields(state, JsonFieldWriter{json});
     return json;
 }
-constexpr auto source_fields = [](auto& state, const auto& visit) {
-    visit("kind", state.kind);
-    visit("compiled_path", state.compiled_path);
-    visit("single_image_path", state.single_image_path);
-    visit("video_file_path", state.video_file_path);
-    visit("image_directory", state.image_directory);
-    visit("recursive", state.recursive);
-    visit("device_index", state.device_index);
-    visit("capture_width", state.capture_width);
-    visit("capture_height", state.capture_height);
-    visit("capture_fps", state.capture_fps);
-    visit("v4l2_buffer_count", state.v4l2_buffer_count);
-    visit("crop_x", state.crop_x);
-    visit("crop_y", state.crop_y);
-    visit("crop_width", state.crop_width);
-    visit("crop_height", state.crop_height);
-};
+template <class Record, class State, class Visitor>
+void visit_record_fields(State& state, const Visitor& visit) {
+    mmltk::frameworks::reflection::visit_materialized_bases<Record>([&]<class Base>() { visit_record_fields<Base>(state, visit); });
+    mmltk::frameworks::reflection::visit_materialized_members<Record>(
+        [&]<class Declaration>(const auto& field) { visit(field.member_name.data(), state.*Declaration::pointer); });
+}
+constexpr auto source_fields = [](auto& state, const auto& visit) { visit_record_fields<SourceSelectionState>(state, visit); };
 constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
     visit("source_dir", state.dataset_source_dir);
     visit("compiled_directory", state.compiled_dataset_dir);
@@ -295,12 +285,7 @@ constexpr auto validate_dataset_fields = [](auto& request, const auto& visit) {
     visit("compiled_path", request.compiled_path);
     visit("source_dir", request.source_dir);
 };
-constexpr auto train_execution_target_fields = [](auto& state, const auto& visit) {
-    visit("execution_target", state.execution_target);
-    visit("remote_family_enabled", state.remote_family_enabled);
-    visit("remote_container_image", state.remote_container_image);
-    visit("remote_launch_template", state.remote_launch_template);
-};
+constexpr auto train_execution_target_fields = [](auto& state, const auto& visit) { visit_record_fields<TrainExecutionPaneState>(state, visit); };
 // Recipe scalars persisted under the same JSON keys by both the train pane and the per-preset recipe
 // overrides. Both visitors below delegate here so the key/member pairs cannot drift apart.
 constexpr auto recipe_scalar_fields = [](auto& state, const auto& visit) {
@@ -402,15 +387,9 @@ constexpr auto model_artifact_fields = [](auto& state, const ModelArtifactsShape
     if (shape.onnx) { visit(shape.onnx_key, state.onnx_path); }
     if (shape.tensorrt) { visit("tensorrt_path", state.tensorrt_path); }
 };
-template <class Options, class State, class Visitor>
-void visit_option_fields(State& state, const Visitor& visit) {
-    mmltk::frameworks::reflection::visit_materialized_bases<Options>([&]<class Base>() { visit_option_fields<Base>(state, visit); });
-    mmltk::frameworks::reflection::visit_materialized_members<Options>(
-        [&]<class Declaration>(const auto& field) { visit(field.member_name.data(), state.*Declaration::pointer); });
-}
 constexpr auto train_execution_fields = [](auto& request, const auto& visit) {
     visit("numa_nodes", request.numa_nodes);
-    visit_option_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
+    visit_record_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
     visit("cpu_affinity", request.cpu_affinity);
     visit("workers", request.workers);
     visit("lanes", request.lanes);
@@ -418,14 +397,14 @@ constexpr auto train_execution_fields = [](auto& request, const auto& visit) {
     visit("compile_mode", request.compilation_mode);
 };
 constexpr auto validate_execution_fields = [](auto& request, const auto& visit) {
-    visit_option_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
+    visit_record_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
     visit("cpu_affinity", request.cpu_affinity);
     visit("device_id", request.device_id);
     visit("workers", request.workers);
     visit("allow_fp16", request.allow_fp16);
 };
 constexpr auto predict_execution_fields = [](auto& request, const auto& visit) {
-    visit_option_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
+    visit_record_fields<mmltk::backend::data::DataLoadingOptions>(request, visit);
     visit("cpu_affinity", request.cpu_affinity);
     visit("device_id", request.device_id);
     visit("workers", request.workers);
@@ -486,7 +465,7 @@ constexpr auto train_flat_fields = [](auto& state, auto& artifact_state, const a
     visit("compile_benchmark_dataset_override", state.compile_benchmark_dataset_override);
     visit("weights_path", artifact_state.weights_path);
     visit("class_layout_path", artifact_state.class_layout_path);
-    visit_option_fields<mmltk::backend::data::DataLoadingOptions>(state.request, visit);
+    visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state.request, visit);
     visit("cpu_affinity", state.request.cpu_affinity);
     visit("workers", state.request.workers);
     visit("lanes", state.request.lanes);
@@ -515,7 +494,7 @@ constexpr auto validation_fields = [](auto& state, const auto& visit) {
     visit("log_mode", state.log_mode);
 };
 constexpr auto validate_flat_fields = [](auto& state, const auto& visit) {
-    visit_option_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
+    visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
     visit("compiled_path", state.compiled_path);
     visit("source_dir", state.source_dir);
     visit("weights_path", state.weights_path);
@@ -536,7 +515,7 @@ constexpr auto predict_fields = [](auto& state, const auto& visit) {
     visit("threshold", state.threshold);
 };
 constexpr auto predict_flat_fields = [](auto& state, const auto& visit) {
-    visit_option_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
+    visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
     visit("weights_path", state.weights_path);
     if constexpr (requires { state.class_layout_path; }) visit("class_layout_path", state.class_layout_path);
     visit("onnx_path", state.onnx_path);
@@ -584,23 +563,9 @@ constexpr auto export_flat_fields = [](auto& state, const auto& visit) {
     visit("allow_fp16", state.allow_fp16);
     export_fields(state, visit);
 };
-constexpr auto ui_settings_fields = [](auto& state, const auto& visit) {
-    visit("dark_mode", state.dark_mode);
-    visit("show_workspace_performance", state.show_workspace_performance);
-    visit("ui_scale", state.ui_scale);
-    visit("font_size", state.font_size);
-    visit("secondary_font_size", state.secondary_font_size);
-    visit("mono_font_size", state.mono_font_size);
-    visit("text_input_font_size", state.text_input_font_size);
-    visit("crop_edge_hit_half_width", state.crop_edge_hit_half_width);
-    visit("crop_corner_hit_size", state.crop_corner_hit_size);
-    visit("crop_handle_radius", state.crop_handle_radius);
-    visit("workspace_aspect_ratio", state.workspace_aspect_ratio);
-    visit("annotation_brush_radius", state.annotation_brush_radius);
-    visit("mask_cleanup_radius", state.mask_cleanup_radius);
-};
+constexpr auto ui_settings_fields = [](auto& state, const auto& visit) { visit_record_fields<UiSettingsState>(state, visit); };
 constexpr auto explore_fields = [](auto& state, const auto& visit) {
-    visit_option_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
+    visit_record_fields<mmltk::backend::data::DataLoadingOptions>(state, visit);
     visit("dataset_source", state.dataset_source);
     visit("custom_compiled_path", state.custom_compiled_path);
     visit("device_id", state.device_id);

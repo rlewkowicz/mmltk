@@ -26,6 +26,11 @@ std::runtime_error errno_error(const char* action, const std::string& path) {
     message += std::strerror(error);
     return std::runtime_error(message);
 }
+std::filesystem::path ensure_parent_directory(const std::filesystem::path& path) {
+    const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
+    std::filesystem::create_directories(parent);
+    return parent;
+}
 void sync_parent_directory(const std::filesystem::path& path) {
     const auto parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
     const ScopedFd directory(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));

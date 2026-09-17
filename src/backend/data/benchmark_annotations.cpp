@@ -1,4 +1,6 @@
 #include <simdjson.h>
+#include <nlohmann/json.hpp>
+#include <type_traits>
 #include <sys/mman.h>
 #include <atomic>
 #include <charconv>
@@ -32,6 +34,13 @@ using mmltk::common::io::FileHandle;
 using mmltk::common::io::publish_staged_path_atomically;
 using mmltk::common::io::sync_parent_directory;
 using mmltk::common::math::checked_cast;
+nlohmann::json reject_json(const AnnotationRejectCounts& rejected) {
+    nlohmann::json result = nlohmann::json::object();
+    mmltk::frameworks::reflection::visit_materialized_members<AnnotationRejectCounts>([&]<class Declaration>(const auto& field) {
+        result[field.member_name] = rejected.*Declaration::pointer;
+    });
+    return result;
+}
 namespace {
 constexpr std::uint64_t kNormalizedIndexMagic = 0x4D4D4C544B4E4931ULL;
 constexpr std::uint32_t kNormalizedIndexVersion = 2U;
@@ -53,17 +62,18 @@ struct __attribute__((packed)) NormalizedIndexHeader {
     std::array<std::uint64_t, 6> rejected{};
     std::array<std::uint8_t, 12> reserved{};
 };
+static_assert(kNormalizedIndexVersion == 2U);
 static_assert(sizeof(NormalizedIndexHeader) == 256U);
+using RejectFields = std::remove_cvref_t<decltype(mmltk::frameworks::reflection::field_declarations<AnnotationRejectCounts>())>;
 [[nodiscard]] AnnotationRejectCounts decode_rejected(const std::array<std::uint64_t, 6>& rejected) noexcept {
-    return AnnotationRejectCounts{
-        rejected[0], rejected[1], rejected[2], rejected[3], rejected[4], rejected[5],
-    };
+    AnnotationRejectCounts result;
+    RejectFields::Visit([&]<class Declaration, std::size_t Index>() { result.*Declaration::pointer = rejected[Index]; });
+    return result;
 }
 [[nodiscard]] std::array<std::uint64_t, 6> encode_rejected(const AnnotationRejectCounts& rejected) noexcept {
-    return {
-        rejected.raw_records,       rejected.unmapped_categories, rejected.unknown_images,
-        rejected.malformed_records, rejected.degenerate_boxes,    rejected.duplicate_boxes,
-    };
+    std::array<std::uint64_t, 6> result{};
+    RejectFields::Visit([&]<class Declaration, std::size_t Index>() { result[Index] = rejected.*Declaration::pointer; });
+    return result;
 }
 struct ByteRange {
     std::size_t begin = 0U;
@@ -1206,8 +1216,7 @@ void store_normalized_annotation_index(const std::filesystem::path& path, const 
     std::memcpy(header.split.data(), index.split.data(), index.split.size());
     std::memcpy(header.mapping_revision.data(), kBenchmarkMappingRevision.data(), kBenchmarkMappingRevision.size());
     header.rejected = encode_rejected(index.rejected);
-    const std::filesystem::path parent = path.parent_path().empty() ? std::filesystem::path{"."} : path.parent_path();
-    std::filesystem::create_directories(parent);
+    (void)mmltk::common::io::ensure_parent_directory(path);
     std::string staging_text = path.string() + ".tmp.XXXXXX";
     FileHandle staging = FileHandle::create_unique_output(staging_text, checked_cast<std::size_t>(total_size, "normalized index size overflow"));
     const std::filesystem::path staging_path(staging_text);

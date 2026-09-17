@@ -685,11 +685,6 @@ void write_split_with_progress(const BenchmarkWriteRequest& request, ProgressRep
                               {"eta_seconds", 0.0}};
     });
 }
-[[nodiscard]] nlohmann::json reject_json(const AnnotationRejectCounts& rejected) {
-    return nlohmann::json{{"raw_records", rejected.raw_records},           {"unmapped_categories", rejected.unmapped_categories},
-                          {"unknown_images", rejected.unknown_images},     {"malformed_records", rejected.malformed_records},
-                          {"degenerate_boxes", rejected.degenerate_boxes}, {"duplicate_boxes", rejected.duplicate_boxes}};
-}
 [[nodiscard]] nlohmann::json mapping_manifest() {
     nlohmann::json mappings;
     mappings["coco"] = nlohmann::json::array();

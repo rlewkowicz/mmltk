@@ -284,8 +284,7 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
     if (used_rle != rle_bytes) { throw std::runtime_error("benchmark labels do not reference the complete mask block"); }
     validate_compiled_rle_pairs(request.split.labels, request.split.rle_pairs, static_cast<std::size_t>(request.resolution) * request.resolution,
                                 request.cancel_requested);
-    const std::filesystem::path output_parent = request.output_path.parent_path().empty() ? std::filesystem::path{"."} : request.output_path.parent_path();
-    std::filesystem::create_directories(output_parent);
+    (void)mmltk::common::io::ensure_parent_directory(request.output_path);
     std::string staging_path_text = request.output_path.string() + ".tmp.XXXXXX";
     common_io::FileHandle output = common_io::FileHandle::create_unique_output(staging_path_text, total_size);
     const std::filesystem::path staging_path(staging_path_text);

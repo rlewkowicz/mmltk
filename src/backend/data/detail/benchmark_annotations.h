@@ -1,6 +1,11 @@
 #pragma once  // backend.data private implementation boundary
 #include <atomic>
+#include <array>
+#include <type_traits>
+#include <nlohmann/json_fwd.hpp>
+#include "src/frameworks/reflection/reflected_field_policy.h"
 #include <cstdint>
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -41,6 +46,22 @@ struct AnnotationRejectCounts {
     std::uint64_t degenerate_boxes = 0U;
     std::uint64_t duplicate_boxes = 0U;
 };
+MMLTK_REFLECT_FIELDS(AnnotationRejectCounts)
+// The version-2 normalized index persists declaration order as six uint64 slots.
+static_assert([] consteval {
+    constexpr const auto& fields = mmltk::frameworks::reflection::field_declarations<AnnotationRejectCounts>();
+    constexpr std::array<std::string_view, 6> names{
+        "raw_records", "unmapped_categories", "unknown_images", "malformed_records", "degenerate_boxes", "duplicate_boxes"};
+    static_assert(fields.size() == names.size());
+    mmltk::frameworks::reflection::visit_materialized_members<AnnotationRejectCounts>([]<class Declaration>(const auto&) {
+        static_assert(std::is_same_v<typename Declaration::member_type, std::uint64_t>);
+    });
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        if (fields[index].member_name != names[index]) return false;
+    }
+    return true;
+}());
+[[nodiscard]] nlohmann::json reject_json(const AnnotationRejectCounts& rejected);
 struct NormalizedAnnotationIndex {
     BenchmarkDatasetSource source = BenchmarkDatasetSource::kCoco2017;
     std::string split;

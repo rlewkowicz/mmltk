@@ -6,8 +6,7 @@
 namespace mmltk::common::io {
 StagingDirectory::StagingDirectory(const std::filesystem::path& destination, const std::string_view prefix, const std::string_view suffix,
                                    const char* const failure_action) {
-    const std::filesystem::path parent = destination.parent_path().empty() ? std::filesystem::path{"."} : destination.parent_path();
-    std::filesystem::create_directories(parent);
+    const std::filesystem::path parent = mmltk::common::io::ensure_parent_directory(destination);
     const std::string pattern = (parent / (std::string(prefix) + destination.filename().string() + std::string(suffix))).string();
     std::vector<char> writable(pattern.begin(), pattern.end());
     writable.push_back('\0');
