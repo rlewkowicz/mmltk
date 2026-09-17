@@ -1,7 +1,17 @@
 use crate::generated::FeatureId;
-use crate::integration_control::{ANNOTATION_SURFACE, Controller, DRIVER_ENABLED, EXPLORE_GALLERY, Message, Phase, annotation_checks, initialize_reporting, notify_driver_draw, reporting, reporting_enabled, retained};
-use crate::integration_control::pixel_checks::{AtlasDraw, ProbeOutcome, atlas_pixel_rectangles, displayed_detail, pixel_fixture_enabled, sampleable_presentation};
-use crate::integration_control::probe::{SURFACE_DRAW_OBSERVER, ScenarioOutput, SurfaceDrawSubscription, ViewerDraw, current_receipt, probe_output, record_probe_draw, report_surface_draw};
+use crate::integration_control::pixel_checks::{
+    AtlasDraw, ProbeOutcome, atlas_pixel_rectangles, displayed_detail, pixel_fixture_enabled,
+    sampleable_presentation,
+};
+use crate::integration_control::probe::{
+    SURFACE_DRAW_OBSERVER, ScenarioOutput, SurfaceDrawSubscription, ViewerDraw, current_receipt,
+    probe_output, record_probe_draw, report_surface_draw,
+};
+use crate::integration_control::{
+    ANNOTATION_SURFACE, Controller, DRIVER_ENABLED, EXPLORE_GALLERY, Message, Phase,
+    annotation_checks, initialize_reporting, notify_driver_draw, reporting, reporting_enabled,
+    retained,
+};
 use crate::view::explore;
 use iced::Rectangle;
 pub(crate) struct ProbeFixture {
@@ -45,9 +55,11 @@ impl Drop for ProbeFixture {
     }
 }
 
-
 impl ProbeFixture {
-    pub(in crate::integration_control) fn fps_draw_output(&self, evidence: reporting::FpsEvidence) -> ScenarioOutput {
+    pub(in crate::integration_control) fn fps_draw_output(
+        &self,
+        evidence: reporting::FpsEvidence,
+    ) -> ScenarioOutput {
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
             observer.fps_draw = Some(evidence);
@@ -59,14 +71,17 @@ impl ProbeFixture {
         SURFACE_DRAW_OBSERVER.with(|observer| {
             let mut observer = observer.borrow_mut();
             let draw = observer.fps_draw.as_mut().unwrap();
-            if change == 2 { draw.bounds.x += 1.0; } else { draw.frames += 1; }
+            if change == 2 {
+                draw.bounds.x += 1.0;
+            } else {
+                draw.frames += 1;
+            }
         });
     }
 }
 
 #[test]
-fn first_native_gallery_draw_reports_placeholders_and_retains_pixels_in_enabled_and_quiet_modes()
- {
+fn first_native_gallery_draw_reports_placeholders_and_retains_pixels_in_enabled_and_quiet_modes() {
     use crate::presentation_surface as surface;
     use iced::advanced::{
         Layout, layout,
@@ -103,9 +118,10 @@ fn first_native_gallery_draw_reports_placeholders_and_retains_pixels_in_enabled_
         surface::complete_sample(frame);
         let received = surface::metadata::surface(frame).unwrap();
         let _renderer_cleanup = surface::TestRendererCleanup;
-        let mut renderer = iced::futures::executor::block_on(
-            <iced::Renderer as Headless>::new(Default::default(), Some("wgpu")),
-        )
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(),
+            Some("wgpu"),
+        ))
         .expect("first native gallery draw acceptance requires the container GPU backend");
         let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(128.0, 96.0));
         let viewport =
@@ -172,7 +188,11 @@ fn first_native_gallery_draw_reports_placeholders_and_retains_pixels_in_enabled_
         let mut atlas_drawn = false;
         let mut gallery_drawn = false;
         while let Ok(message) = fixture.receiver.try_recv() {
-            assert!(fixture.controller.probes.accepts_message(&fixture.controller.driver, &fixture.controller.pixel_checks, &message));
+            assert!(fixture.controller.probes.accepts_message(
+                &fixture.controller.driver,
+                &fixture.controller.pixel_checks,
+                &message
+            ));
             if let Message::Scoped { message, .. } = &message {
                 match message.as_ref() {
                     Message::AtlasDrawn { receipt, .. } => {
@@ -256,13 +276,9 @@ fn quiet_driver_and_disabled_frontend_collect_no_probe_state() {
         )
         .is_some()
     );
-    assert!(
-        displayed_detail(Some(surface), model.explore.snapshot.as_ref().unwrap()).is_none()
-    );
+    assert!(displayed_detail(Some(surface), model.explore.snapshot.as_ref().unwrap()).is_none());
     assert!(crate::presentation_surface::accept_publication(frame));
-    assert!(
-        displayed_detail(Some(surface), model.explore.snapshot.as_ref().unwrap()).is_some()
-    );
+    assert!(displayed_detail(Some(surface), model.explore.snapshot.as_ref().unwrap()).is_some());
     crate::presentation_surface::clear_drawn_detail();
     let stale = crate::view_model::test_support::physical_surface(
         crate::presentation_surface::FrameReady {
@@ -393,7 +409,9 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
         viewer,
     );
     controller.widgets.begin_location();
-    controller.driver.reporting
+    controller
+        .driver
+        .reporting
         .observe(|reporting| reporting.reported_style_bits = 7);
     controller.probes.annotation_pixels_receipt = Some(old_receipt.clone());
     controller.probes.upscale_pixel_pending = Some(old_receipt);
@@ -401,7 +419,9 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
     assert!(!controller.widgets.location_pending());
     assert!(controller.probes.upscale_pixel_pending.is_none());
     assert!(controller.probes.annotation_pixels_receipt.is_none());
-    controller.driver.reporting
+    controller
+        .driver
+        .reporting
         .observe(|reporting| assert_eq!(reporting.reported_style_bits, 0));
     assert!(current_receipt(EXPLORE_GALLERY).is_none());
     assert_eq!(
@@ -443,7 +463,11 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
         let queued = receiver.try_recv().unwrap();
         let moved = Rectangle { x: 17.0, ..bounds };
         record_probe_draw(control, surface, bounds, moved, bounds);
-        assert!(!controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &queued));
+        assert!(!controller.probes.accepts_message(
+            &controller.driver,
+            &controller.pixel_checks,
+            &queued
+        ));
         controller.update(queued);
         assert!(controller.probes.annotation_drawn.is_none());
         assert!(controller.probes.viewer_drawn.is_none());
@@ -451,7 +475,11 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
         // Unchanged revisions and viewer fields must not suppress a new geometry receipt.
         report_surface_draw(control, 5, 1, true, 640, 480, 2, viewer);
         let queued = receiver.try_recv().unwrap();
-        assert!(controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &queued));
+        assert!(controller.probes.accepts_message(
+            &controller.driver,
+            &controller.pixel_checks,
+            &queued
+        ));
         controller.update(queued);
         match control {
             EXPLORE_GALLERY => assert_eq!(controller.probes.gallery_drawn.take(), Some((5, 1))),
@@ -482,7 +510,11 @@ fn scenario_reset_isolates_queued_messages_geometry_and_obsolete_subscription_te
         })
         .unwrap();
     assert!(
-        !controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &receiver.try_recv().unwrap()),
+        !controller.probes.accepts_message(
+            &controller.driver,
+            &controller.pixel_checks,
+            &receiver.try_recv().unwrap()
+        ),
         "physical messages cannot use a generation-only output"
     );
     let replacement_subscription = std::sync::Arc::new(());
@@ -529,7 +561,8 @@ fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence(
             }
             2 => {
                 controller.driver.phase = Phase::CopyProductWait;
-                assert!(controller.probes.prepare_annotation_probe(&controller.widgets,
+                assert!(controller.probes.prepare_annotation_probe(
+                    &controller.widgets,
                     frame.content_sequence,
                     frame.presentation_revision,
                     [frame.content_width, frame.content_height],
@@ -539,7 +572,10 @@ fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence(
             }
             _ => {
                 controller.driver.phase = Phase::AwaitExploreReady;
-                controller.retained.prepare_upscale_probe(&mut controller.probes,
+                controller
+                    .retained
+                    .prepare_upscale_probe(
+                        &mut controller.probes,
                         image,
                         frame.content_sequence,
                         frame.presentation_revision,
@@ -583,7 +619,11 @@ fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence(
         old.try_send(message(ProbeOutcome::Invalidated)).unwrap();
         let stale = receiver.try_recv().unwrap();
         assert!(
-            !controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &stale),
+            !controller.probes.accepts_message(
+                &controller.driver,
+                &controller.pixel_checks,
+                &stale
+            ),
             "a new request can own the same physical receipt"
         );
         controller.update(stale);
@@ -603,7 +643,11 @@ fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence(
         ] {
             old.try_send(message(outcome)).unwrap();
             let stale = receiver.try_recv().unwrap();
-            assert!(!controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &stale));
+            assert!(!controller.probes.accepts_message(
+                &controller.driver,
+                &controller.pixel_checks,
+                &stale
+            ));
             controller.update(stale);
         }
         assert_eq!(controller.driver.phase, phase);
@@ -623,7 +667,10 @@ fn annotation_and_upscale_consumers_retire_invalidations_without_pixel_evidence(
         match consumer {
             0 => annotation_checks::tests::assert_copy_completion(controller, true, false),
             1 => annotation_checks::tests::assert_copy_completion(controller, false, true),
-            2 => assert_eq!(controller.probes.annotation_pixels_receipt, replacement.receipt),
+            2 => assert_eq!(
+                controller.probes.annotation_pixels_receipt,
+                replacement.receipt
+            ),
             _ => assert_eq!(
                 controller.retained.upscale_observation().pixels,
                 Some((frame.content_sequence, frame.presentation_revision, 1, 1))
@@ -699,7 +746,8 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
                     [frame.content_width + 1, frame.content_height],
                 ),
             ] {
-                assert!(!controller.probes.prepare_annotation_probe(&controller.widgets,
+                assert!(!controller.probes.prepare_annotation_probe(
+                    &controller.widgets,
                     source,
                     presentation,
                     extent,
@@ -708,7 +756,8 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
                 assert!(controller.probes.annotation_probe.is_none());
                 assert!(controller.probes.annotation_pixels_pending.is_none());
             }
-            assert!(controller.probes.prepare_annotation_probe(&controller.widgets,
+            assert!(controller.probes.prepare_annotation_probe(
+                &controller.widgets,
                 frame.content_sequence,
                 frame.presentation_revision,
                 [frame.content_width, frame.content_height],
@@ -724,7 +773,13 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
         let moved = Rectangle { x: 17.0, ..bounds };
         record_probe_draw("workflow.visual.workspace", surface, bounds, moved, bounds);
         assert!(
-            !controller.probes.prepare_annotation_probe(&controller.widgets, 999, 999, [1, 1], Vec::new()),
+            !controller.probes.prepare_annotation_probe(
+                &controller.widgets,
+                999,
+                999,
+                [1, 1],
+                Vec::new()
+            ),
             "pending location cannot be overwritten"
         );
         assert!(!annotation_checks::tests::prepare_control_probe(controller));
@@ -737,7 +792,10 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
         });
         assert_eq!(controller.driver.phase, phase);
         assert!(!controller.widgets.location_pending());
-        assert!(controller.probes.annotation_probe.is_none() && controller.probes.control_probe.is_none());
+        assert!(
+            controller.probes.annotation_probe.is_none()
+                && controller.probes.control_probe.is_none()
+        );
         assert!(
             controller.probes.annotation_pixels_pending.is_none()
                 && controller.probes.control_probe_receipt.is_none()
@@ -745,7 +803,9 @@ fn probe_preparation_keeps_original_frame_through_widget_location() {
     }
 }
 
-pub(in crate::integration_control) fn atlas_observation_matches(expected: Option<&AtlasDraw>) -> bool {
+pub(in crate::integration_control) fn atlas_observation_matches(
+    expected: Option<&AtlasDraw>,
+) -> bool {
     SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().atlas.as_ref() == expected)
 }
 
@@ -868,7 +928,8 @@ fn atlas_pixel_evidence_covers_only_ready_interiors_inside_the_real_clip() {
     controller.driver.phase = Phase::AwaitExploreReady;
     let (sender, mut receiver) = iced::futures::channel::mpsc::channel(8);
     SURFACE_DRAW_OBSERVER.with(|observer| {
-        observer.borrow_mut().output = Some(ScenarioOutput::new(controller.driver.generation, sender))
+        observer.borrow_mut().output =
+            Some(ScenarioOutput::new(controller.driver.generation, sender))
     });
     retained::tests::check_atlas_pixel_callbacks(&mut controller, &mut receiver, draw);
     SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().output = None);

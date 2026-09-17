@@ -46,8 +46,6 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
-
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -1869,9 +1867,8 @@ TEST_CASE("Presentation worker failure rejects later direct selection") {
     CHECK(writer_state->browser_terminals.load(std::memory_order_acquire) == 1U);
     CHECK(writer_state->retirements.load(std::memory_order_acquire) == 1U);
 }
-}
-}
-
+}  // namespace
+}  // namespace mmltk::controller
 namespace {
 TEST_CASE("test_direct_presentation_descriptor", "[browser_runtime][direct][presentation]") {
     const mmltk::controller::PresentationPublication publication{

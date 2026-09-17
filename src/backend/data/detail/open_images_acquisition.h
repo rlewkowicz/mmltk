@@ -29,4 +29,4 @@ struct AcquiredOpenImages {
                                                      mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress,
                                                      const int num_workers, const std::size_t cache_workers, const BenchmarkTraceSink& trace,
                                                      const std::optional<JpegDecodeProbe> decode_probe = std::nullopt);
-}
+}  // namespace mmltk::backend::data::benchmark_internal

@@ -2193,5 +2193,5 @@ TEST_CASE("Native submitted GPU work settles after Stop without publication or n
     static_cast<void>(gallery.algorithm->AdvanceGallery());
     CHECK(gallery.evidence.Count(VisualDiagnosticOperation::GalleryReadStarted) == reads);
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

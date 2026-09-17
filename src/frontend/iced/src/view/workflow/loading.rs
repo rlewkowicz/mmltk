@@ -100,11 +100,16 @@ mod tests {
                 before.numanode.constraint.stable_field_id
             );
             if feature == FeatureId::Live {
-                let predict = binding(FeatureId::Predict, settings.draft.as_ref().unwrap()).unwrap();
-                assert_eq!(after.h2ddataloader.constraint.stable_field_id,
-                    predict.h2ddataloader.constraint.stable_field_id);
-                assert_eq!(after.numanode.constraint.stable_field_id,
-                    predict.numanode.constraint.stable_field_id);
+                let predict =
+                    binding(FeatureId::Predict, settings.draft.as_ref().unwrap()).unwrap();
+                assert_eq!(
+                    after.h2ddataloader.constraint.stable_field_id,
+                    predict.h2ddataloader.constraint.stable_field_id
+                );
+                assert_eq!(
+                    after.numanode.constraint.stable_field_id,
+                    predict.numanode.constraint.stable_field_id
+                );
             }
         }
     }

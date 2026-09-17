@@ -159,8 +159,7 @@ int main(int argc, char** argv) {
         for (int index = 1; index < argc; ++index) arguments.emplace_back(argv[index]);
         auto runtime = parse_browser_runtime_options(arguments);
         mmltk::controller::shell::ApplicationShellConfig config;
-        config.training_executable =
-            mmltk::controller::services::resolve_sibling_mmltk_cli(mmltk::common::system::runtime_paths::current_executable_path());
+        config.training_executable = mmltk::controller::services::resolve_sibling_mmltk_cli(mmltk::common::system::runtime_paths::current_executable_path());
         const char* const pixel_trace = std::getenv("MMLTK_GUI_PIXEL_TRACE");
         const char* const lifecycle_trace = std::getenv("MMLTK_GUI_TRACE_FILE");
         const bool pixel_probes = pixel_trace != nullptr && std::string_view{pixel_trace} == "1" && lifecycle_trace != nullptr && *lifecycle_trace != '\0';

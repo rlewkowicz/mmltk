@@ -122,7 +122,6 @@ NativeRfDetrConfig native_config_from_preset(const PresetCatalogEntry& preset) {
     };
 }
 }  // namespace mmltk::backend::models::rfdetr
-
 #include "src/backend/models/rfdetr/contract/contract.h"
 namespace mmltk::backend::models::rfdetr {
 std::string_view infer_artifact_preset(const std::filesystem::path& path) {

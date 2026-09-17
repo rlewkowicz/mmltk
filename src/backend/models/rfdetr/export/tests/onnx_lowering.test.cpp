@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/ml/cuda/tensor_readback.h"
 #include "src/backend/ml/runtime/onnx_environment.h"
 #include "src/common/system/numa_memory.h"
@@ -29,10 +30,6 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
-#undef CHECK
-#endif
-#include <catch2/catch_test_macros.hpp>
 #include "src/test_support/error_expectation_test_utils.hpp"
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.model_export.onnx_lowering;
@@ -296,8 +293,7 @@ TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfd
         for (const bool align_corners : {false, true}) {
             CAPTURE(size, align_corners);
             const auto interpolate = [&](const torch::Tensor& value) {
-                return F::interpolate(value, F::InterpolateFuncOptions().size(size).mode(torch::kBicubic)
-                                                 .align_corners(align_corners).antialias(true));
+                return F::interpolate(value, F::InterpolateFuncOptions().size(size).mode(torch::kBicubic).align_corners(align_corners).antialias(true));
             };
             auto graph = trace_unary_graph(input, interpolate);
             if (align_corners) {
@@ -308,12 +304,10 @@ TEST_CASE("test_antialiased_bicubic_resize_preserves_torch_values", "[model][rfd
             if (graph->inputs().front()->type()->kind() == c10::TypeKind::ClassType) graph->eraseInput(0);
             graph->inputs().front()->setDebugName("image");
             graph->outputs().front()->setDebugName("resized");
-            auto exported = torch::jit::export_onnx(graph, {}, 19, {}, false, ::torch::onnx::OperatorExportTypes::ONNX,
-                                                   true, false, {}, true, false, "");
+            auto exported = torch::jit::export_onnx(graph, {}, 19, {}, false, ::torch::onnx::OperatorExportTypes::ONNX, true, false, {}, true, false, "");
             const auto bytes = torch::jit::serialize_model_proto_to_string(std::get<0>(exported));
             Ort::Session session(environment.get(), bytes.data(), bytes.size(), options);
-            auto value = Ort::Value::CreateTensor<float>(memory, input.data_ptr<float>(), input.numel(),
-                                                         input.sizes().data(), input.dim());
+            auto value = Ort::Value::CreateTensor<float>(memory, input.data_ptr<float>(), input.numel(), input.sizes().data(), input.dim());
             const char* input_name = "image";
             const char* output_name = "resized";
             auto output = session.Run(Ort::RunOptions{}, &input_name, &value, 1, &output_name, 1);

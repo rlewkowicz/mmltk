@@ -21,11 +21,13 @@ class GalleryStream;
 class GalleryReadScheduler final {
     friend class GalleryStream;
     friend class GalleryStreamProbe;
-public:
+
+   public:
     GalleryReadScheduler(std::size_t, const mmltk::frameworks::gpu::DeviceExecution&, const ExploreNativeConfiguration&);
     GalleryReadScheduler(const GalleryReadScheduler&) = delete;
     GalleryReadScheduler& operator=(const GalleryReadScheduler&) = delete;
-private:
+
+   private:
     enum class LaneState : std::uint8_t {
         Idle,
         Preparing,
@@ -106,8 +108,9 @@ private:
     mmltk::backend::data::CompiledImageStream::CompletionObserver LaneCompletion() noexcept;
     void SubmitRead(Lane& lane, const bool observed);
     PayloadLayout LayoutFor(const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor,
-                                                                  const std::size_t donor_rle_count) const;
-    void PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot, const std::uint64_t generation);
+                            const std::size_t donor_rle_count) const;
+    void PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot,
+                            const std::uint64_t generation);
     void Prioritize(GalleryProductState& product);
     bool ReserveInput(const GalleryProductState& product, Lane& lane);
     void DiscardSettledInput(const GalleryProductState& product, Lane& lane);
@@ -161,4 +164,4 @@ private:
     std::vector<std::size_t> priority_rank_;
     std::size_t next_priority_ = 0U;
 };
-}
+}  // namespace mmltk::controller::explore_detail

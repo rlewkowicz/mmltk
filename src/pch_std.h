@@ -1,5 +1,4 @@
 #pragma once
-
 // Shared by ordinary implementation units; declaration headers stay complete.
 #include <algorithm>
 #include <array>

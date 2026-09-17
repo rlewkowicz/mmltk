@@ -16,12 +16,14 @@ class GalleryDescriptorStorage final {
     friend class GalleryStream;
     friend struct NativeExploreStorageTestAccess;
     friend class GalleryStreamProbe;
-public:
+
+   public:
     GalleryDescriptorStorage();
     ~GalleryDescriptorStorage();
     GalleryDescriptorStorage(const GalleryDescriptorStorage&) = delete;
     GalleryDescriptorStorage& operator=(const GalleryDescriptorStorage&) = delete;
-private:
+
+   private:
     using Buffer = mmltk::backend::imaging::explore::ExploreHighWaterBuffer;
     using Memory = mmltk::backend::imaging::explore::ExploreBufferMemory;
     struct Family final {
@@ -59,4 +61,4 @@ private:
     void UploadDescriptors(cudaStream_t, bool, const ExploreDemandCheck&, std::uint64_t);
     void UploadDescriptor(Buffer&, std::size_t, std::size_t, cudaStream_t, const ExploreDemandCheck&, std::uint64_t);
 };
-}
+}  // namespace mmltk::controller::explore_detail

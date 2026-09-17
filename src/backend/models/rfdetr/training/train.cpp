@@ -85,14 +85,13 @@
 // CLEANUP-IGNORE: Training directly imports its own pipeline dependencies; shared module names are not duplicated
 // logic.
 #include "src/backend/models/rfdetr/core/runtime.h"
-
 #include "src/backend/ml/cuda/shared_cuda_event.h"
 #include "detail/gpu_augment_private.h"
 #include "detail/native_optimizer_private.h"
 #include "detail/target_builder_private.h"
 #include "detail/training_ops_private.h"
 #include "detail/evaluation_runtime.h"
-import mmltk.backend.models.rfdetr.training.checkpoint;
+#include "checkpoint.h"
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution; // CLEANUP-IGNORE: Training directly imports its dataset policy owner.
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
@@ -458,14 +457,14 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     NativeRfDetrModel model(artifacts.config, artifacts.class_layout);
     model.initialize_training_supervision(static_cast<std::uint64_t>(options.seed));
     model.to(mmltk::backend::ml::cuda::cuda_device(options.device_id));
-    model.configure_supervision_timing(SupervisionTimingSetup{
-        mmltk::backend::ml::cuda::cuda_device(options.device_id), static_cast<std::size_t>(std::max(1, options.grad_accum_steps)), mmltk::common::logging::profile_enabled()});
+    model.configure_supervision_timing(SupervisionTimingSetup{mmltk::backend::ml::cuda::cuda_device(options.device_id),
+                                                              static_cast<std::size_t>(std::max(1, options.grad_accum_steps)),
+                                                              mmltk::common::logging::profile_enabled()});
     const auto resolved_route = supervision_route(options.training_supervision);
     std::optional<detail::NormalizedModelStateCandidate> resume_model_candidate;
     ModelStateLoadSummary load_summary;
     if (!options.resume_path.empty()) {
-        resume_model_candidate = model.stage_normalized_state(admitted.model_state.entries(),
-                                                                                          detail::NormalizedModelStateAdmission::Exact);
+        resume_model_candidate = model.stage_normalized_state(admitted.model_state.entries(), detail::NormalizedModelStateAdmission::Exact);
         load_summary = resume_model_candidate->summary;
     } else {
         load_summary = load_training_model_weights(model, admitted.model_state, resolved_route);
@@ -534,9 +533,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 "eval_lanes={} loader_threads={} gather_threads={} cpu_threads={} effective_batch_per_rank={} "
                 "effective_batch_global={} train_max_instances={} val_max_instances={} test_max_instances={} "
                 "query_source={} num_queries={} automatic_query_cap={} query_override={}",
-                TORCH_VERSION, evaluation_precision_name(autocast_dtype), optimizer.kind_name(), optimizer.backend_name(),
-                grad_scaler.enabled() ? "on" : "off", train_lane_count, train_runtime.split().lane_threads, train_runtime.split().loader_threads,
-                train_runtime.split().gather_threads, train_runtime.split().cpu_threads, effective_batch_per_rank(options, train_lane_count),
+                TORCH_VERSION, evaluation_precision_name(autocast_dtype), optimizer.kind_name(), optimizer.backend_name(), grad_scaler.enabled() ? "on" : "off",
+                train_lane_count, train_runtime.split().lane_threads, train_runtime.split().loader_threads, train_runtime.split().gather_threads,
+                train_runtime.split().cpu_threads, effective_batch_per_rank(options, train_lane_count),
                 effective_batch_global(options, distributed, train_lane_count), dataset_limits.train_max_instances, dataset_limits.val_max_instances,
                 dataset_limits.test_max_instances.value_or(0U), dataset_limits.query_source, dataset_limits.resolved_num_queries,
                 dataset_limits.automatic_num_queries_cap, dataset_limits.requested_override ? "true" : "false");
@@ -839,7 +838,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 std::optional<DeviceLossNormalizer> active_normalizer;
                 if (route_is_active(training_route)) {
                     auto target_count = torch::tensor({static_cast<float>(prepared_target_count(prepared))},
-                                                          torch::TensorOptions().dtype(torch::kFloat32).device(normalized.device()));
+                                                      torch::TensorOptions().dtype(torch::kFloat32).device(normalized.device()));
                     distributed_all_reduce_tensor(distributed, target_count);
                     target_count.div_(static_cast<double>(std::max(1, distributed.world_size)));
                     active_normalizer = DeviceLossNormalizer{target_count.select(0, 0)};
@@ -852,10 +851,9 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                     if (route_uses_denoising(training_route)) {
                         mmltk::common::logging::ScopedProfile profile_rfdetr_train_targets_handoff{"rfdetr.train.targets_handoff"};
                         target_consumer.handoff();
-                        outputs = model.forward_with_denoising(
-                            NestedTensor{normalized, prepared.nested_mask}, prepared,
-                            TrainingStepIdentity{static_cast<std::uint64_t>(options.seed), static_cast<std::uint64_t>(epoch),
-                                                 static_cast<std::uint32_t>(distributed.rank), local_full_batches - 1});
+                        outputs = model.forward_with_denoising(NestedTensor{normalized, prepared.nested_mask}, prepared,
+                                                               TrainingStepIdentity{static_cast<std::uint64_t>(options.seed), static_cast<std::uint64_t>(epoch),
+                                                                                    static_cast<std::uint32_t>(distributed.rank), local_full_batches - 1});
                     } else {
                         mmltk::common::logging::ScopedProfile profile_rfdetr_train_forward{"rfdetr.train.forward"};
                         outputs = model.forward_for_match_free(NestedTensor{normalized, prepared.nested_mask});
@@ -917,11 +915,11 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
                 for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
                     auto batch = next_train_full_batch();
                     if (!batch.has_value()) { throw std::runtime_error("native RF-DETR training ended an epoch with an incomplete parallel train wave"); }
-                    wave.add(train_lanes.enqueue(&train_runtime, train_loader, *batch, params_ready ? &*params_ready : nullptr,
-                                                training_events.pool(), scaled_loss_factor, parameter_version, detection_config, model, options.device_id,
-                                                static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()),
-                                                static_cast<std::uint64_t>(options.seed), epoch, distributed.rank, local_full_batches - 1, amp_enabled,
-                                                autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index)));
+                    wave.add(train_lanes.enqueue(&train_runtime, train_loader, *batch, params_ready ? &*params_ready : nullptr, training_events.pool(),
+                                                 scaled_loss_factor, parameter_version, detection_config, model, options.device_id,
+                                                 static_cast<int>(train_loader.image_height()), static_cast<int>(train_loader.image_width()),
+                                                 static_cast<std::uint64_t>(options.seed), epoch, distributed.rank, local_full_batches - 1, amp_enabled,
+                                                 autocast_dtype, training_route, wave.normalizer(), static_cast<std::size_t>(lane_index)));
                 }
                 wave.settle(mmltk::backend::ml::cuda::cuda_device(options.device_id), [&](TrainLaneResult& lane_result) {
                     train_lanes.merge(lane_result, all_params, options.device_id);

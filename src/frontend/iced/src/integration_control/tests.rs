@@ -1,7 +1,7 @@
 use crate::generated::FeatureId;
-use crate::integration_control::{Controller, Message, Phase, initialize_reporting};
 use crate::integration_control::probe::ViewerDraw;
 use crate::integration_control::retained::EXPLORE_CARD;
+use crate::integration_control::{Controller, Message, Phase, initialize_reporting};
 use crate::view_model::ApplicationModel;
 use iced::Rectangle;
 pub(super) fn advance_receipt(sequence: u64) -> crate::generated::IntegrationControlReceipt {
@@ -15,7 +15,6 @@ pub(super) fn advance_receipt(sequence: u64) -> crate::generated::IntegrationCon
         compiledindex: 0,
     }
 }
-
 
 #[test]
 fn delivered_gallery_mouse_advances_placeholder_selection_for_the_current_driver() {
@@ -91,14 +90,16 @@ fn destructive_profile_continues_viewer_completion_into_annotation() {
         assert_eq!(driver.driver.session.scenario(1), None);
         assert!(driver.driver.reuse_compiled);
         driver.driver.phase = Phase::ViewerNoAspect;
-        driver.probes.record_surface_draw(7, 3, Some(
-            ViewerDraw {
+        driver.probes.record_surface_draw(
+            7,
+            3,
+            Some(ViewerDraw {
                 crop: [0, 0, 512, 512],
                 container: Rectangle::default(),
                 image: Rectangle::default(),
                 fit_revision: 1,
-            },
-        ));
+            }),
+        );
         driver.update(Message::Located {
             control: "explore.detail.aspect".into(),
             bounds: Rectangle::default(),
@@ -129,9 +130,7 @@ fn destructive_profile_continues_viewer_completion_into_annotation() {
             },
             31,
         );
-        for (epoch, busy, imported) in
-            [(31, false, false), (32, true, false), (32, false, true)]
-        {
+        for (epoch, busy, imported) in [(31, false, false), (32, true, false), (32, false, true)] {
             let snapshot = model.annotation.snapshot.as_mut().unwrap();
             snapshot.inputdocumentepoch = epoch;
             snapshot.busy = busy;
@@ -157,7 +156,6 @@ fn destructive_profile_continues_viewer_completion_into_annotation() {
         }
     }
 }
-
 
 #[test]
 fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
@@ -188,9 +186,13 @@ fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
         assert_eq!(driver.driver.phase, Phase::Failed);
         assert!(driver.driver.failure.starts_with("Protocol: "));
         assert!(driver.driver.failure.len() <= crate::generated::INTEGRATION_FAILURE_MAX_BYTES);
-        assert!(driver.driver.failure.is_char_boundary(driver.driver.failure.len()));
-        let (mut connection, _capture) =
-            crate::transport_connection::Connection::test_channel();
+        assert!(
+            driver
+                .driver
+                .failure
+                .is_char_boundary(driver.driver.failure.len())
+        );
+        let (mut connection, _capture) = crate::transport_connection::Connection::test_channel();
         driver.publish_control(&mut connection);
         let mut wire = Vec::new();
         connection
@@ -202,8 +204,7 @@ fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
         assert_eq!(wire.len(), 1);
         let envelope = crate::protocol::decode_envelope(&wire[0]).unwrap();
         let control =
-            crate::generated::IntegrationControl::from_application_value(envelope.payload)
-                .unwrap();
+            crate::generated::IntegrationControl::from_application_value(envelope.payload).unwrap();
         assert_eq!(control.receipt.failure, driver.driver.failure);
         assert_eq!(
             control.receipt.kind,
@@ -235,7 +236,9 @@ fn quiet_failure_receipts_preserve_ui_error_kind_and_bounded_utf8() {
         String::new(),
         String::new(),
     );
-    disabled.driver.fail_detail(|| panic!("disabled driver evaluated failure data"));
+    disabled
+        .driver
+        .fail_detail(|| panic!("disabled driver evaluated failure data"));
     assert!(disabled.driver.failure.is_empty());
 }
 

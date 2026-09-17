@@ -20,7 +20,6 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-
 void queue_failed_dark_mode_update(SettingsSystem& settings, const std::filesystem::path& root) {
     const auto settings_path = root / "settings.json";
     REQUIRE(std::filesystem::remove(settings_path));
@@ -230,7 +229,8 @@ TEST_CASE("failed Explore catalog persistence preserves the exact pending Settin
     queue_failed_dark_mode_update(settings, root);
     constexpr ExploreClassCatalogIdentity rejected_identity = 0x8765'4321U;
     const auto candidate = settings.explore_settings_candidate();
-    CHECK_THROWS_AS(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = rejected_identity}), contracts::FailedError);
+    CHECK_THROWS_AS(settings.Update(candidate, {.preferences = candidate.preferences.policy, .class_catalog_identity = rejected_identity}),
+                    contracts::FailedError);
     REQUIRE(std::filesystem::remove(root / "settings.json"));
     REQUIRE(settings.Retry().applied());
     const auto recovered = settings.snapshot();
@@ -277,5 +277,5 @@ TEST_CASE("settings retry cannot overwrite a newer committed update", "[controll
     CHECK_FALSE(snapshot.settings_state.ui.dark_mode);
     CHECK(snapshot.settings_state.ui.annotation_brush_radius == 9);
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

@@ -2,8 +2,8 @@
 #include <filesystem>
 #include <string>
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/train_recipe.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
-import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 TEST_CASE("training recipe resolves upstream and legacy checkpoint names", "[model][rfdetr][checkpoint_resolution]") {
     const auto* upstream = rfdetr::infer_model_preset_from_path("/tmp/rf-detr-nano.pth");

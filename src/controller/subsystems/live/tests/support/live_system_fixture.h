@@ -17,7 +17,6 @@ namespace mmltk::controller::visual_test_support {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-
 class TestLiveAlgorithm final : public LiveAlgorithm {
    public:
     explicit TestLiveAlgorithm(std::shared_ptr<std::atomic<std::uint64_t>> captures, std::shared_ptr<std::atomic_bool> token_changed = {})
@@ -42,10 +41,11 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
     std::shared_ptr<std::atomic_bool> token_changed_;
     std::optional<std::stop_token> first_stop_;
 };
-[[nodiscard]] inline VisualRuntimeFactory test_live_runtime_factory(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<std::atomic<std::uint64_t>> captures,
-                                                             std::shared_ptr<std::atomic_bool> token_changed = {}) {
+[[nodiscard]] inline VisualRuntimeFactory test_live_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
+                                                                    std::shared_ptr<std::atomic<std::uint64_t>> captures,
+                                                                    std::shared_ptr<std::atomic_bool> token_changed = {}) {
     return RuntimeFactory(
         0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::Clean,
         [captures = std::move(captures), token_changed = std::move(token_changed)] { return std::make_unique<TestLiveAlgorithm>(captures, token_changed); });
 }
-}
+}  // namespace mmltk::controller::visual_test_support

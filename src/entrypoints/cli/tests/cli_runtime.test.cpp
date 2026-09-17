@@ -259,7 +259,7 @@ void test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_pres
     REQUIRE((kInheritedCliOptions[0].terminal_member.name() == "inherited_limit"));
     REQUIRE((kInheritedCliOptions[1].terminal_member == derived_identity));
     REQUIRE((kInheritedCliExclusions[0].identity ==
-                 mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<InheritedCliRequest, &InheritedCliRequest::boundary_owned>()));
+             mmltk::frameworks::reflection::ReflectedMemberIdentity::from_path<InheritedCliRequest, &InheritedCliRequest::boundary_owned>()));
     const auto absent = mmltk::frameworks::reflection::parse<InheritedCliRequest>({}, kInheritedCliOptions);
     REQUIRE((absent));
     REQUIRE((absent->request.inherited_limit == 4));
@@ -760,18 +760,28 @@ void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
 }
 }  // namespace
 TEST_CASE("test_subprocess_capture_keeps_stdout_and_stderr_separate", "[core][cli][subprocess]") { test_subprocess_capture_keeps_stdout_and_stderr_separate(); }
-TEST_CASE("test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_presence", "[core][cli][reflected][inheritance]") { test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_presence(); }
+TEST_CASE("test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_presence", "[core][cli][reflected][inheritance]") {
+    test_reflected_cli_inheritance_preserves_identity_order_exclusions_and_presence();
+}
 TEST_CASE("test_reflected_cli_policy_boundaries_and_diagnostics", "[core][cli][reflected]") { test_reflected_cli_policy_boundaries_and_diagnostics(); }
-TEST_CASE("test_reflected_cli_optional_repeatable_negation_positionals_environment_and_roundtrip", "[core][cli][reflected]") { test_reflected_cli_optional_repeatable_negation_positionals_environment_and_roundtrip(); }
-TEST_CASE("test_reflected_cli_scalar_success_has_no_parser_owned_allocation", "[core][cli][reflected][allocation]") { test_reflected_cli_scalar_success_has_no_parser_owned_allocation(); }
+TEST_CASE("test_reflected_cli_optional_repeatable_negation_positionals_environment_and_roundtrip", "[core][cli][reflected]") {
+    test_reflected_cli_optional_repeatable_negation_positionals_environment_and_roundtrip();
+}
+TEST_CASE("test_reflected_cli_scalar_success_has_no_parser_owned_allocation", "[core][cli][reflected][allocation]") {
+    test_reflected_cli_scalar_success_has_no_parser_owned_allocation();
+}
 TEST_CASE("test_log_file_flag_creates_requested_log_file", "[core][cli][logging]") { test_log_file_flag_creates_requested_log_file(); }
 TEST_CASE("test_log_dir_flag_creates_default_log_file", "[core][cli][logging]") { test_log_dir_flag_creates_default_log_file(); }
 TEST_CASE("test_env_log_file_creates_requested_log_file", "[core][cli][logging]") { test_env_log_file_creates_requested_log_file(); }
 TEST_CASE("test_env_log_dir_creates_default_log_file", "[core][cli][logging]") { test_env_log_dir_creates_default_log_file(); }
 TEST_CASE("test_invalid_log_level_flag_reports_error_on_stderr", "[core][cli][logging]") { test_invalid_log_level_flag_reports_error_on_stderr(); }
 TEST_CASE("test_invalid_log_level_env_reports_error_on_stderr", "[core][cli][logging]") { test_invalid_log_level_env_reports_error_on_stderr(); }
-TEST_CASE("test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec", "[core][cli][logging][wrapper]") { test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec(); }
-TEST_CASE("test_wrapper_cli_logging_flags_are_forwarded_to_container_command", "[core][cli][logging][wrapper]") { test_wrapper_cli_logging_flags_are_forwarded_to_container_command(); }
+TEST_CASE("test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec", "[core][cli][logging][wrapper]") {
+    test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec();
+}
+TEST_CASE("test_wrapper_cli_logging_flags_are_forwarded_to_container_command", "[core][cli][logging][wrapper]") {
+    test_wrapper_cli_logging_flags_are_forwarded_to_container_command();
+}
 TEST_CASE("test_wrapper_gui_tmpfs_uses_target_uid_gid", "[core][cli][wrapper][gui]") { test_wrapper_gui_tmpfs_uses_target_uid_gid(); }
 TEST_CASE("negative reflected flags preserve canonical defaults and round trip polarity", "[cli][reflection]") {
     namespace reflection = mmltk::frameworks::reflection;

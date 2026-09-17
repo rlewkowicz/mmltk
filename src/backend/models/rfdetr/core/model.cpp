@@ -42,8 +42,7 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
     ModelOutputs forward(const NestedTensor& batch, bool include_masks = true);
     ModelOutputs forward_for_match_free(const NestedTensor& batch);
     void initialize_training_supervision(std::uint64_t request_seed);
-    TrainingLoss supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer,
-                                  bool training_mode);
+    TrainingLoss supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer, bool training_mode);
     void configure_supervision_timing(const SupervisionTimingSetup& setup);
     void begin_supervised_step_timing();
     void end_supervised_step_timing();
@@ -60,7 +59,6 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
     void set_force_pytorch_deformable_attn(bool value);
     [[nodiscard]] const NativeRfDetrConfig& config() const noexcept { return config_; }
     [[nodiscard]] bool is_compiled(const bool for_training) const noexcept { return for_training ? is_compiled_train_ : is_compiled_eval_; }
-
     struct TrainingSupervisionRuntimeState {
         TrainingSupervisionConfig config;
         bool has_owner = false;
@@ -68,7 +66,6 @@ struct NativeRfDetrModel::Impl final : torch::nn::Module {
     };
     TrainingSupervisionRuntimeState export_training_supervision_runtime() const;
     void import_training_supervision_runtime(const TrainingSupervisionRuntimeState& state);
-
     [[nodiscard]] std::vector<detail::ClassTensorAxis> class_axes() const;
     ModelOutputs forward_impl(const NestedTensor& batch, bool include_masks, bool capture_match_free_features, const DenoisingQueryBatch* denoising = nullptr);
     ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity);
@@ -1617,16 +1614,24 @@ void NativeRfDetrModel::replicate_training_supervision_runtime_from(const Native
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, bool include_masks) { return impl_->forward(batch, include_masks); }
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward_for_match_free(const NestedTensor& batch) { return impl_->forward_for_match_free(batch); }
 [[nodiscard]] ModelOutputs NativeRfDetrModel::forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets,
-                                                              const TrainingStepIdentity& identity) { return impl_->forward_with_denoising(batch, targets, identity); }
+                                                                     const TrainingStepIdentity& identity) {
+    return impl_->forward_with_denoising(batch, targets, identity);
+}
 void NativeRfDetrModel::initialize_training_supervision(std::uint64_t request_seed) { impl_->initialize_training_supervision(request_seed); }
-[[nodiscard]] TrainingLoss NativeRfDetrModel::supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer,
-                                                        bool training_mode) { return impl_->supervision_loss(outputs, targets, normalizer, training_mode); }
+[[nodiscard]] TrainingLoss NativeRfDetrModel::supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets,
+                                                               const DeviceLossNormalizer& normalizer, bool training_mode) {
+    return impl_->supervision_loss(outputs, targets, normalizer, training_mode);
+}
 void NativeRfDetrModel::configure_supervision_timing(const SupervisionTimingSetup& setup) { impl_->configure_supervision_timing(setup); }
 [[nodiscard]] ModelStateLoadSummary NativeRfDetrModel::load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict,
-                                                                      const ModelClassLayout* admitted_layout) { return impl_->load_normalized_state(state, strict, admitted_layout); }
+                                                                             const ModelClassLayout* admitted_layout) {
+    return impl_->load_normalized_state(state, strict, admitted_layout);
+}
 [[nodiscard]] detail::NormalizedModelStateCandidate NativeRfDetrModel::stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state,
-                                                                               detail::NormalizedModelStateAdmission admission,
-                                                                               const ResolvedClassLayout* source_layout) { return impl_->stage_normalized_state(state, admission, source_layout); }
+                                                                                              detail::NormalizedModelStateAdmission admission,
+                                                                                              const ResolvedClassLayout* source_layout) {
+    return impl_->stage_normalized_state(state, admission, source_layout);
+}
 void NativeRfDetrModel::commit_normalized_state(detail::NormalizedModelStateCandidate candidate) { impl_->commit_normalized_state(std::move(candidate)); }
 void NativeRfDetrModel::set_force_pytorch_deformable_attn(bool value) { impl_->set_force_pytorch_deformable_attn(value); }
 void NativeRfDetrModel::begin_supervised_step_timing() { impl_->begin_supervised_step_timing(); }

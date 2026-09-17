@@ -17,4 +17,4 @@ void Fill(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::uint8_t
     }();
     return {std::move(pixels), document};
 }
-}
+}  // namespace mmltk::controller::visual_test_support

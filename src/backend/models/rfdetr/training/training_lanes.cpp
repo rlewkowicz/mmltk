@@ -116,8 +116,9 @@ struct TrainingLanes::Impl {
     std::unique_ptr<mmltk::common::concurrency::WorkerPool> pool;
 };
 TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_runtime, mmltk::backend::data::DatasetLoader& train_loader,
-                            NativeRfDetrModel& model, const std::vector<std::string>& all_param_names, int train_lane_count,
-                            const mmltk::frameworks::gpu::DeviceContext& augmentation_context) : impl_(std::make_unique<Impl>()) {
+                             NativeRfDetrModel& model, const std::vector<std::string>& all_param_names, int train_lane_count,
+                             const mmltk::frameworks::gpu::DeviceContext& augmentation_context)
+    : impl_(std::make_unique<Impl>()) {
     auto& train_lane_pool = impl_->pool;
     auto& train_lanes = impl_->lanes;
     if (train_lane_count > 1) {
@@ -136,20 +137,22 @@ TrainingLanes::TrainingLanes(const TrainRequest& options, RuntimeContext& train_
                 .configure_supervision_timing(SupervisionTimingSetup{mmltk::backend::ml::cuda::cuda_device(options.device_id),
                                                                      static_cast<std::size_t>(std::max(1, options.grad_accum_steps)),
                                                                      mmltk::common::logging::profile_enabled()});
-            lane.model->optimize_for_inference(checked_cast<int>(std::max<std::size_t>(1, options.batch_size), "batch_size exceeds supported inference compilation range"), true, options.compilation_mode);
+            lane.model->optimize_for_inference(
+                checked_cast<int>(std::max<std::size_t>(1, options.batch_size), "batch_size exceeds supported inference compilation range"), true,
+                options.compilation_mode);
             lane.grad_params = lane_grad_parameters(*lane.model, all_param_names);
         }
     }
 }
 TrainingLanes::~TrainingLanes() = default;
-std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime,
-                                                mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
-                                                const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready,
-                                                mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,
-                                                const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height,
-                                                int image_width, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
-                                                at::ScalarType autocast_dtype, TrainingSupervisionRoute route,
-                                                std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index) {
+std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader,
+                                                    const mmltk::backend::data::Batch& batch,
+                                                    const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready,
+                                                    mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,
+                                                    const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height,
+                                                    int image_width, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence,
+                                                    bool amp_enabled, at::ScalarType autocast_dtype, TrainingSupervisionRoute route,
+                                                    std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index) {
     auto& lane = impl_->lanes.at(lane_index);
     auto& lane_pool = *impl_->pool;
     return lane_pool.enqueue([runtime, &loader, &lane, batch, params_ready, &event_pool, scaled_loss_factor, parameter_version, &detection_config, &model,
@@ -210,9 +213,8 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime,
                                       TrainingStepIdentity{seed, static_cast<std::uint64_t>(epoch), static_cast<std::uint32_t>(rank), augmentation_sequence});
                 } else {
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_forward{"rfdetr.train.parallel.forward"};
-                    outputs = route_uses_match_free(route)
-                                  ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask})
-                                  : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
+                    outputs = route_uses_match_free(route) ? (*lane.model).forward_for_match_free(NestedTensor{normalized, prepared.nested_mask})
+                                                           : (*lane.model).forward(NestedTensor{normalized, prepared.nested_mask}, true);
                 }
                 if (!route_uses_denoising(route)) {
                     mmltk::common::logging::ScopedProfile profile_rfdetr_train_parallel_targets_handoff{"rfdetr.train.parallel.targets_handoff"};
@@ -268,7 +270,13 @@ std::future<TrainLaneResult> TrainingLanes::enqueue(RuntimeContext* runtime,
         }
     });
 }
-void TrainingLanes::merge(TrainLaneResult& result, std::vector<torch::Tensor>& parameters, int device_id) { merge_lane_gradients(result, parameters, device_id); }
-void TrainingLanes::harvest_timing() { for (auto& lane : impl_->lanes) static_cast<void>(lane.model->harvest_supervision_timing()); }
-void TrainingLanes::settle_targets() { for (auto& lane : impl_->lanes) lane.target_scratch.wait_for_pending_copy(); }
+void TrainingLanes::merge(TrainLaneResult& result, std::vector<torch::Tensor>& parameters, int device_id) {
+    merge_lane_gradients(result, parameters, device_id);
 }
+void TrainingLanes::harvest_timing() {
+    for (auto& lane : impl_->lanes) static_cast<void>(lane.model->harvest_supervision_timing());
+}
+void TrainingLanes::settle_targets() {
+    for (auto& lane : impl_->lanes) lane.target_scratch.wait_for_pending_copy();
+}
+}  // namespace mmltk::backend::models::rfdetr

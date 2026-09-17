@@ -1,12 +1,22 @@
 use crate::generated::FeatureId;
-use crate::integration_control::{EXPLORE_GALLERY, Message, PIXEL_FIXTURE_ENABLED, Phase, ProbeFixture, initialize_reporting, pixel_checks, reporting};
-use crate::integration_control::pixel_checks::{ATLAS_GRID_SAMPLES, AtlasDraw, FpsPixelOutcome, FpsPixels, ProbeOutcome, WORKSPACE_FPS_PIXEL_FAILURE, atlas_composition_samples, atlas_scroll_window, verify_workspace_fps_pixels};
+use crate::integration_control::pixel_checks::{
+    ATLAS_GRID_SAMPLES, AtlasDraw, FpsPixelOutcome, FpsPixels, ProbeOutcome,
+    WORKSPACE_FPS_PIXEL_FAILURE, atlas_composition_samples, atlas_scroll_window,
+    verify_workspace_fps_pixels,
+};
 use crate::integration_control::probe::{ScenarioOutput, record_probe_draw, same_probe};
 use crate::integration_control::reporting::{Capture, FpsEvidence};
+use crate::integration_control::{
+    EXPLORE_GALLERY, Message, PIXEL_FIXTURE_ENABLED, Phase, ProbeFixture, initialize_reporting,
+    pixel_checks, reporting,
+};
 use crate::message::Message as RootMessage;
 use crate::view_model::ApplicationModel;
 use iced::{Rectangle, Task};
-pub(in crate::integration_control) fn fps_pixel_fixture(dark: bool, scale: f32) -> (FpsPixels, reporting::FpsEvidence) {
+pub(in crate::integration_control) fn fps_pixel_fixture(
+    dark: bool,
+    scale: f32,
+) -> (FpsPixels, reporting::FpsEvidence) {
     let width = (74.0 * scale) as u32;
     let height = (22.0 * scale) as u32;
     let mut rgba = vec![if dark { 0 } else { 255 }; width as usize * height as usize * 4];
@@ -35,7 +45,6 @@ pub(in crate::integration_control) fn fps_pixel_fixture(dark: bool, scale: f32) 
         },
     )
 }
-
 
 #[test]
 fn workspace_fps_pixel_acceptance_uses_the_visible_counter_at_each_scale_and_theme() {
@@ -119,7 +128,8 @@ fn fps_pixels_require_opaque_text_background_complete_extent_and_unclipped_place
     }
 }
 
-pub(in crate::integration_control) fn fps_settings() -> (ApplicationModel, crate::view::settings::SettingsModel) {
+pub(in crate::integration_control) fn fps_settings()
+-> (ApplicationModel, crate::view::settings::SettingsModel) {
     let mut model = crate::view_model::test_support::bootstrapped();
     model
         .settings_snapshot
@@ -162,7 +172,11 @@ impl ProbeFixture {
             None,
         ));
         assert_eq!(self.controller.driver.phase, Phase::AwaitWorkspaceFpsPixels);
-        self.controller.pixel_checks.workspace_fps_probe.clone().unwrap()
+        self.controller
+            .pixel_checks
+            .workspace_fps_probe
+            .clone()
+            .unwrap()
     }
     pub(crate) fn prepare_app_fps(
         &mut self,
@@ -195,7 +209,11 @@ impl ProbeFixture {
             .try_send(Message::WorkspaceFpsPixels(outcome))
             .unwrap();
         let message = self.receiver.try_recv().unwrap();
-        if !self.controller.probes.accepts_message(&self.controller.driver, &self.controller.pixel_checks, &message) {
+        if !self.controller.probes.accepts_message(
+            &self.controller.driver,
+            &self.controller.pixel_checks,
+            &message,
+        ) {
             return Task::none();
         }
         self.controller.update(message);
@@ -212,12 +230,17 @@ impl ProbeFixture {
     fn assert_pending_fps(&self, output: &ScenarioOutput) {
         assert_eq!(self.controller.driver.phase, Phase::AwaitWorkspaceFpsPixels);
         assert!(same_probe(
-            &self.controller.pixel_checks.workspace_fps_probe.as_ref().unwrap().probe,
+            &self
+                .controller
+                .pixel_checks
+                .workspace_fps_probe
+                .as_ref()
+                .unwrap()
+                .probe,
             output.probe.as_ref()
         ));
     }
 }
-
 
 #[test]
 fn fps_capture_success_and_recoverable_failures_restore_both_canonical_baselines() {
@@ -341,7 +364,13 @@ fn fps_capture_invalidation_rearms_and_obsolete_callbacks_cannot_finish_replacem
         drop(fixture.complete_fps(&mut old, outcome, &model, &settings));
         assert_eq!(fixture.controller.driver.phase, Phase::AwaitWorkspaceFps);
         assert!(!fixture.controller.pixel_checks.workspace_fps_verified);
-        assert!(fixture.controller.pixel_checks.workspace_fps_failure.is_none());
+        assert!(
+            fixture
+                .controller
+                .pixel_checks
+                .workspace_fps_failure
+                .is_none()
+        );
         let mut replacement = fixture.request_fps(&model, &settings);
         drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Cancelled, &model, &settings));
         fixture.assert_pending_fps(&replacement);
@@ -351,8 +380,17 @@ fn fps_capture_invalidation_rearms_and_obsolete_callbacks_cannot_finish_replacem
             &model,
             &settings,
         ));
-        assert_eq!(fixture.controller.driver.phase, Phase::AwaitWorkspaceFpsRestored);
-        assert!(fixture.controller.pixel_checks.workspace_fps_failure.is_none());
+        assert_eq!(
+            fixture.controller.driver.phase,
+            Phase::AwaitWorkspaceFpsRestored
+        );
+        assert!(
+            fixture
+                .controller
+                .pixel_checks
+                .workspace_fps_failure
+                .is_none()
+        );
     }
 }
 
@@ -376,8 +414,17 @@ fn fps_capture_from_a_prior_scenario_cannot_settle_the_replacement() {
         &model,
         &settings,
     ));
-    assert_eq!(fixture.controller.driver.phase, Phase::AwaitWorkspaceFpsRestored);
-    assert!(fixture.controller.pixel_checks.workspace_fps_failure.is_none());
+    assert_eq!(
+        fixture.controller.driver.phase,
+        Phase::AwaitWorkspaceFpsRestored
+    );
+    assert!(
+        fixture
+            .controller
+            .pixel_checks
+            .workspace_fps_failure
+            .is_none()
+    );
 }
 
 #[test]

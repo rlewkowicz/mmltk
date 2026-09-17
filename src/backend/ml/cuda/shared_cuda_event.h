@@ -6,7 +6,6 @@
 #include <optional>
 #include "src/frameworks/gpu/cuda_device_scope.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
-
 namespace mmltk::backend::ml::cuda {
 class CudaEventPool final {
    public:

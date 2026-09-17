@@ -31,8 +31,8 @@
 namespace mmltk::frameworks::gpu {
 namespace {
 using test_support::FakeImageBackend;
-using test_support::RuntimeFactory;
 using test_support::make_clean_semantic_runtime;
+using test_support::RuntimeFactory;
 class CleanSemanticRuntime final {
    public:
     explicit CleanSemanticRuntime(const std::size_t output_buffer_count = 2U)
@@ -523,6 +523,5 @@ TEST_CASE("held current display leaves replaceable overflow and exact readers cl
     current = {};
     CHECK(runtime.TryAcquireOutput(baseline).valid());
 }
-
-} // namespace
-} // namespace mmltk::frameworks::gpu
+}  // namespace
+}  // namespace mmltk::frameworks::gpu

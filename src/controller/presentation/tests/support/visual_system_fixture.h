@@ -26,6 +26,7 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
 #include "src/controller/presentation/visual_runtime_owner.h"
+#include "src/controller/presentation/visual_document.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/services/diagnostics_client.h"
 #include "src/controller/services/runtime_diagnostics.h"
@@ -37,7 +38,6 @@ namespace mmltk::controller::visual_test_support {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-
 void Fill(const mmltk::frameworks::gpu::ImagePlaneView plane, const std::uint8_t value);
 struct MutationCommitProbe final {
     std::promise<void> committed;
@@ -484,4 +484,4 @@ class ProductPresentationSources final {
     std::vector<std::unique_ptr<mmltk::frameworks::gpu::SystemImageRuntime>> runtimes_;
     std::vector<VisualSourceReader> sources_;
 };
-}
+}  // namespace mmltk::controller::visual_test_support

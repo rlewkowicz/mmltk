@@ -14,6 +14,7 @@
 #include "src/controller/subsystems/explore/tests/support/explore_system_fixture.h"
 #include "src/controller/subsystems/live/tests/support/live_system_fixture.h"
 #include "src/frameworks/gpu/device_execution.h"
+#include "src/frameworks/gpu/gdr_mapped_buffer.h"
 #include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
@@ -22,6 +23,7 @@
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <fcntl.h>
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -47,8 +49,6 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
-
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -1168,8 +1168,6 @@ TEST_CASE("Visual diagnostic boundaries capture immutable observations without o
     CHECK_FALSE(collected);
     CHECK_FALSE(sink.pixel_probes_enabled());
 }
-
-
 TEST_CASE("recoverable visual failure restores creator policy before rebuilding placed runtime") {
     using namespace mmltk::common::system;
     const auto topology = NumaTopology::Capture();
@@ -1402,5 +1400,5 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     CHECK(backend->planes_allocated == backend->planes_freed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }
-}
-}
+}  // namespace
+}  // namespace mmltk::controller

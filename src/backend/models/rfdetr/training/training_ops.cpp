@@ -1,5 +1,4 @@
 #include "src/backend/models/rfdetr/core/detection_ops.h"
-
 #include <torch/torch.h>
 #include <cmath>
 #include <numbers>

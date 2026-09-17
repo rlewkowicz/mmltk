@@ -47,13 +47,13 @@ void LogContext(const char* operation, const void* owner, std::uintptr_t context
     CUcontext current = nullptr;
     const auto status = cuCtxGetCurrent(&current);
     char record[384];
-    const int size = std::snprintf(record, sizeof(record),
-                                   "{\"event\":\"image_context\",\"operation\":\"%s\",\"owner\":%llu,\"context\":%llu,"
-                                   "\"current\":%llu,\"current_status\":%d,\"device\":%d,\"mode\":\"%s\",\"thread\":%d}\n",
-                                   operation, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(owner)),
-                                   static_cast<unsigned long long>(context),
-                                   static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(current)), static_cast<int>(status), device,
-                                   mode == DeviceContextMode::PrimaryInterop ? "primary" : "isolated", static_cast<int>(::gettid()));
+    const int size =
+        std::snprintf(record, sizeof(record),
+                      "{\"event\":\"image_context\",\"operation\":\"%s\",\"owner\":%llu,\"context\":%llu,"
+                      "\"current\":%llu,\"current_status\":%d,\"device\":%d,\"mode\":\"%s\",\"thread\":%d}\n",
+                      operation, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(owner)), static_cast<unsigned long long>(context),
+                      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(current)), static_cast<int>(status), device,
+                      mode == DeviceContextMode::PrimaryInterop ? "primary" : "isolated", static_cast<int>(::gettid()));
     trace.Write(record, size, sizeof(record));
 }
 void LogStaging(const DeviceContext& receiver, int source_device, std::size_t bytes) noexcept {

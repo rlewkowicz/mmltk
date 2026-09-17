@@ -33,7 +33,6 @@ namespace mmltk::controller::visual_test_support {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-
 struct ExploreRenderGate final {
     std::atomic<std::size_t> calls{0U};
     std::promise<void> entered;
@@ -536,7 +535,8 @@ class ControlledStreamingExploreAlgorithm final : public ExploreAlgorithm {
     std::uint64_t candidate_generation_ = 0U;
     std::optional<PublicationCheckpoint> checkpoint_;
 };
-[[nodiscard]] inline VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<StreamingExploreProbe> probe) {
+[[nodiscard]] inline VisualRuntimeFactory streaming_explore_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
+                                                                            std::shared_ptr<StreamingExploreProbe> probe) {
     return RuntimeFactory(
         0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
         [probe = std::move(probe)] { return std::make_unique<ControlledStreamingExploreAlgorithm>(probe); }, 3U);
@@ -768,4 +768,4 @@ class StreamingExploreFixture final {
         return test_document(borrow_matching_visual_product(frame, explore.BorrowFrame()));
     };
 }
-}
+}  // namespace mmltk::controller::visual_test_support

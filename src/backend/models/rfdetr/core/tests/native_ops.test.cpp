@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <torch/utils.h>
 #include <torch/nn/functional/vision.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -29,16 +30,12 @@
 #include "src/backend/models/rfdetr/core/model.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
-#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
-#undef CHECK
-#endif
-#include <catch2/catch_test_macros.hpp>
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/frameworks/gpu/tests/device_execution_fixture.h"
 #include "src/backend/models/rfdetr/core/runtime.h"
 namespace mmltk::backend::models::rfdetr {
 torch::Tensor sample_packed_masks_cuda(const torch::Tensor& packed_mask_bits, int64_t height, int64_t width, const torch::Tensor& mask_indices,
-                                           const torch::Tensor& point_coords);
+                                       const torch::Tensor& point_coords);
 }
 namespace {
 using namespace torch::indexing;
@@ -48,7 +45,6 @@ template <typename T>
     if (!value.has_value()) throw std::runtime_error(std::string(message));
     return *value;
 }
-
 TEST_CASE("Cardinality measures computed sigmoid confidence and actual target counts", "[model][rfdetr][criterion]") {
     using mmltk::backend::models::rfdetr::cardinality_error;
     for (const auto dtype : {torch::kFloat32, torch::kFloat16, torch::kBFloat16}) {
@@ -87,8 +83,7 @@ mmltk::backend::models::rfdetr::PackedTargetMasks pack_dense_masks(const torch::
     return mmltk::backend::models::rfdetr::PackedTargetMasks{bits, height, width};
 }
 // Builds a 100x100 single-image target set from per-instance boxes, labels, and areas.
-mmltk::backend::models::rfdetr::PreparedTargets make_single_image_targets(const torch::Tensor& boxes, const torch::Tensor& labels,
-                                                                          const torch::Tensor& area) {
+mmltk::backend::models::rfdetr::PreparedTargets make_single_image_targets(const torch::Tensor& boxes, const torch::Tensor& labels, const torch::Tensor& area) {
     const int64_t instance_count = labels.size(0);
     mmltk::backend::models::rfdetr::PreparedTarget target;
     target.image_id = torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64));
@@ -116,10 +111,9 @@ mmltk::backend::models::rfdetr::PreparedTargets make_targets() {
                                      torch::tensor({400.0f}, torch::TensorOptions().dtype(torch::kFloat32)));
 }
 mmltk::backend::models::rfdetr::PreparedTargets make_multi_targets() {
-    return make_single_image_targets(
-        torch::tensor({{0.5f, 0.5f, 0.2f, 0.2f}, {0.2f, 0.2f, 0.1f, 0.12f}}, torch::TensorOptions().dtype(torch::kFloat32)),
-        torch::tensor({1, 2}, torch::TensorOptions().dtype(torch::kInt64)),
-        torch::tensor({400.0f, 120.0f}, torch::TensorOptions().dtype(torch::kFloat32)));
+    return make_single_image_targets(torch::tensor({{0.5f, 0.5f, 0.2f, 0.2f}, {0.2f, 0.2f, 0.1f, 0.12f}}, torch::TensorOptions().dtype(torch::kFloat32)),
+                                     torch::tensor({1, 2}, torch::TensorOptions().dtype(torch::kInt64)),
+                                     torch::tensor({400.0f, 120.0f}, torch::TensorOptions().dtype(torch::kFloat32)));
 }
 mmltk::backend::models::rfdetr::DetectionConfig make_config() {
     mmltk::backend::models::rfdetr::DetectionConfig config;
@@ -170,7 +164,7 @@ mmltk::backend::models::rfdetr::ModelOutputs make_multi_match_outputs() {
     outputs.main.pred_logits =
         torch::tensor({{{-5.0f, 8.0f, -5.0f}, {-5.0f, -5.0f, 8.0f}, {7.0f, -5.0f, -5.0f}}}, torch::TensorOptions().dtype(torch::kFloat32));
     outputs.main.pred_boxes = torch::tensor({{{0.52f, 0.48f, 0.22f, 0.18f}, {0.18f, 0.22f, 0.12f, 0.08f}, {0.9f, 0.9f, 0.05f, 0.05f}}},
-                                                torch::TensorOptions().dtype(torch::kFloat32));
+                                            torch::TensorOptions().dtype(torch::kFloat32));
     return outputs;
 }
 mmltk::backend::models::rfdetr::ModelOutputs make_mask_outputs(int64_t height, int64_t width) {
@@ -437,8 +431,8 @@ void test_sparse_mask_loss_matches_dense_reference() {
     constexpr int64_t kChannels = 2;
     auto targets = make_packed_mask_targets(kHeight, kWidth, {{2, 2}, {2, 3}, {2, 4}, {3, 2}, {3, 3}, {3, 4}});
     auto config = make_mask_loss_config();
-    auto spatial_features = torch::linspace(0.05f, 1.28f, kChannels * kHeight * kWidth, torch::TensorOptions().dtype(torch::kFloat32))
-                                .view({1, kChannels, kHeight, kWidth});
+    auto spatial_features =
+        torch::linspace(0.05f, 1.28f, kChannels * kHeight * kWidth, torch::TensorOptions().dtype(torch::kFloat32)).view({1, kChannels, kHeight, kWidth});
     auto query_features = torch::tensor({{{0.35f, -0.15f}, {-0.2f, 0.4f}}}, torch::TensorOptions().dtype(torch::kFloat32));
     auto bias = torch::tensor({0.05f}, torch::TensorOptions().dtype(torch::kFloat32));
     auto dense_masks = torch::einsum("bchw,bnc->bnhw", {spatial_features, query_features}).add(bias);
@@ -579,14 +573,20 @@ void test_postprocess_cuda_stream_replacement() {
 }  // namespace
 TEST_CASE("test_weight_dict_population", "[model][rfdetr][native_ops]") { test_weight_dict_population(); }
 TEST_CASE("test_matcher_and_losses", "[model][rfdetr][native_ops]") { test_matcher_and_losses(); }
-TEST_CASE("test_batched_matcher_transfer_matches_single_layer_losses", "[model][rfdetr][native_ops]") { test_batched_matcher_transfer_matches_single_layer_losses(); }
+TEST_CASE("test_batched_matcher_transfer_matches_single_layer_losses", "[model][rfdetr][native_ops]") {
+    test_batched_matcher_transfer_matches_single_layer_losses();
+}
 TEST_CASE("test_multi_match_box_losses", "[model][rfdetr][native_ops]") { test_multi_match_box_losses(); }
 TEST_CASE("test_matcher_sanitizes_nonfinite_costs", "[model][rfdetr][native_ops]") { test_matcher_sanitizes_nonfinite_costs(); }
 TEST_CASE("test_rectangular_matcher_layers_preserve_all_targets", "[model][rfdetr][native_ops]") { test_rectangular_matcher_layers_preserve_all_targets(); }
 TEST_CASE("test_cpu_mask_loss_uses_upstream_keys", "[model][rfdetr][native_ops]") { test_cpu_mask_loss_uses_upstream_keys(); }
 TEST_CASE("test_sparse_mask_loss_matches_dense_reference", "[model][rfdetr][native_ops]") { test_sparse_mask_loss_matches_dense_reference(); }
-TEST_CASE("test_matcher_mask_cost_handles_zero_point_sampling_on_cuda", "[model][rfdetr][native_ops]") { test_matcher_mask_cost_handles_zero_point_sampling_on_cuda(); }
-TEST_CASE("test_packed_mask_sampling_matches_grid_sample_nearest_boundaries", "[model][rfdetr][native_ops]") { test_packed_mask_sampling_matches_grid_sample_nearest_boundaries(); }
+TEST_CASE("test_matcher_mask_cost_handles_zero_point_sampling_on_cuda", "[model][rfdetr][native_ops]") {
+    test_matcher_mask_cost_handles_zero_point_sampling_on_cuda();
+}
+TEST_CASE("test_packed_mask_sampling_matches_grid_sample_nearest_boundaries", "[model][rfdetr][native_ops]") {
+    test_packed_mask_sampling_matches_grid_sample_nearest_boundaries();
+}
 TEST_CASE("test_postprocess", "[model][rfdetr][native_ops]") { test_postprocess(); }
 TEST_CASE("test_postprocess_cuda_stream_replacement", "[model][rfdetr][native_ops][cuda]") { test_postprocess_cuda_stream_replacement(); }
 TEST_CASE("LSAP solver arrays use the owning node resource and retain capacity", "[rfdetr][lsap][numa]") {

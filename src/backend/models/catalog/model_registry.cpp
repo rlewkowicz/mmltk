@@ -72,7 +72,6 @@ static_assert(catalog_is_valid());
 }  // namespace
 std::span<const ModelDescriptor> models() noexcept { return kModels; }
 }  // namespace mmltk::backend::models::catalog
-
 #include <filesystem>
 #include <string_view>
 namespace mmltk::backend::models::catalog {

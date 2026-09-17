@@ -1,10 +1,9 @@
-
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <array>
 #include <limits>
 #include <string>
 #include <vector>
 #include <utility>
-#include <catch2/catch_test_macros.hpp>
 #include "src/backend/ml/torch/archive.h"
 #include "detail/checkpoint_private.h"
 #include "detail/model_ema.h"

@@ -25,8 +25,6 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
-
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -157,5 +155,5 @@ TEST_CASE("Live failure publishes its newer settled snapshot") {
     CHECK_FALSE(failed.snapshot.frame.valid());
     CHECK_FALSE(live.BorrowFrame().valid());
 }
-}
-}
+}  // namespace
+}  // namespace mmltk::controller

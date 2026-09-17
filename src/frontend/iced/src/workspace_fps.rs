@@ -132,7 +132,11 @@ impl Meter {
             meter.seconds = elapsed.as_secs_f64();
             use std::fmt::Write;
             meter.text_scratch.clear();
-            let _ = write!(meter.text_scratch, "{:.0} FPS", meter.frames as f64 / meter.seconds);
+            let _ = write!(
+                meter.text_scratch,
+                "{:.0} FPS",
+                meter.frames as f64 / meter.seconds
+            );
             if meter.text_scratch != meter.text {
                 std::mem::swap(&mut meter.text, &mut meter.text_scratch);
                 meter.paragraph = Self::paragraph(&meter.text);

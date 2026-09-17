@@ -463,11 +463,10 @@ pub(super) fn geometry_key(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
+    use super::super::{same_allocation, surface_for_content_session};
     use super::*;
-    use super::super::surface_for_content_session;
     use crate::view_model::test_support::physical_frame as frame_ready;
     #[test]
     fn viewport_keeps_fit_pan_and_zoom_local() {
@@ -1516,5 +1515,4 @@ mod tests {
         assert_eq!(contain.gallery, 0);
         assert_eq!(contain.grid, [0, 0]);
     }
-
 }

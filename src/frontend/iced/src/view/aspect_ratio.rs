@@ -2,9 +2,7 @@ use crate::fluent_theme::Element;
 use iced::widget::{button, container, row, text};
 use iced::{Center, Length};
 
-pub const fn option_id(
-    aspect: crate::generated::WorkspaceAspectRatio,
-) -> &'static str {
+pub const fn option_id(aspect: crate::generated::WorkspaceAspectRatio) -> &'static str {
     match aspect {
         crate::generated::WorkspaceAspectRatio::Widescreen => "workflow.aspect.widescreen",
         crate::generated::WorkspaceAspectRatio::Portrait => "workflow.aspect.portrait",

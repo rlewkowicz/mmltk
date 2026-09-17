@@ -358,7 +358,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             palette_source_ = scene.palette;
             for (std::size_t index = 0U; index < scene.categories.size(); ++index)
                 raster::color::hsv_to_rgb(scene.palette[index].hue, scene.palette[index].saturation, scene.palette[index].value, palette_[index].r,
-                                                  palette_[index].g, palette_[index].b);
+                                          palette_[index].g, palette_[index].b);
         }
         for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
             const auto& object = description.DrawingObjectAt(index);

@@ -78,5 +78,4 @@ class JsonLineCursor final {
     std::optional<std::uint64_t> line_;
     std::string pending_;
 };
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

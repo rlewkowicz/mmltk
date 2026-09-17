@@ -219,9 +219,14 @@ impl Component {
             "Training status",
             "Native dataset, local training, and provider facts.",
             column![
-                container(text(crate::view::workflow::status::artifact_status(dataset)))
-                    .id(DATASET_STATUS_ID),
-                container(text(crate::view::workflow::status::compute_status(training))).id("train.progress"),
+                container(text(crate::view::workflow::status::artifact_status(
+                    dataset
+                )))
+                .id(DATASET_STATUS_ID),
+                container(text(crate::view::workflow::status::compute_status(
+                    training
+                )))
+                .id("train.progress"),
                 button("Stop training").on_press_maybe(
                     model
                         .training_stop_available()

@@ -57,5 +57,4 @@ TEST_CASE("workspace_wayland_terminal", "[workspace_hardware][workspace_wayland_
 TEST_CASE("workspace_wayland_probe_recovery", "[workspace_hardware][workspace_wayland_integration][probe_recovery]") { workspace_wayland_probe_recovery(); }
 TEST_CASE("workspace_wayland_gdr", "[workspace_hardware][workspace_wayland_integration][gdr]") { workspace_wayland_gdr(); }
 TEST_CASE("workspace_wayland_quiet", "[workspace_hardware][workspace_wayland_integration][quiet]") { workspace_wayland_quiet(); }
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

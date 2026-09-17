@@ -15,7 +15,7 @@ struct TrainingMetricSnapshot {
     bool gradients_finite = true;
 };
 class TrainingMetricHandoff final {
- public:
+   public:
     explicit TrainingMetricHandoff(int device_id);
     ~TrainingMetricHandoff();
     TrainingMetricHandoff(const TrainingMetricHandoff&) = delete;
@@ -30,8 +30,9 @@ class TrainingMetricHandoff final {
     void begin_validation();
     void accumulate_validation(const torch::Tensor& loss);
     double validation_average(std::size_t count);
- private:
+
+   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-}
+}  // namespace mmltk::backend::models::rfdetr

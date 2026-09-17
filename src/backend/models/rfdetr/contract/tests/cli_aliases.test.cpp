@@ -208,10 +208,18 @@ TEST_CASE("test_predict_help_lists_model_inputs", "[model][rfdetr][cli_aliases][
 TEST_CASE("test_info_requires_exactly_one_model_input", "[model][rfdetr][cli_aliases][cli]") { test_info_requires_exactly_one_model_input(); }
 TEST_CASE("test_normalize_weights_requires_paths", "[model][rfdetr][cli_aliases][cli]") { test_normalize_weights_requires_paths(); }
 TEST_CASE("test_train_help_lists_optimizer_controls", "[model][rfdetr][cli_aliases][cli]") { test_train_help_lists_optimizer_controls(); }
-TEST_CASE("test_train_help_lists_canonical_supervision_controls", "[model][rfdetr][cli_aliases][cli][training_supervision]") { test_train_help_lists_canonical_supervision_controls(); }
-TEST_CASE("test_train_assignment_spellings_parse_through_the_canonical_descriptor", "[model][rfdetr][cli_aliases][cli][training_supervision]") { test_train_assignment_spellings_parse_through_the_canonical_descriptor(); }
-TEST_CASE("test_train_supervision_values_parse_as_one_nested_configuration", "[model][rfdetr][cli_aliases][cli][training_supervision]") { test_train_supervision_values_parse_as_one_nested_configuration(); }
-TEST_CASE("test_train_device_grammar_and_conflicts_are_preserved", "[model][rfdetr][cli_aliases][cli]") { test_train_device_grammar_and_conflicts_are_preserved(); }
+TEST_CASE("test_train_help_lists_canonical_supervision_controls", "[model][rfdetr][cli_aliases][cli][training_supervision]") {
+    test_train_help_lists_canonical_supervision_controls();
+}
+TEST_CASE("test_train_assignment_spellings_parse_through_the_canonical_descriptor", "[model][rfdetr][cli_aliases][cli][training_supervision]") {
+    test_train_assignment_spellings_parse_through_the_canonical_descriptor();
+}
+TEST_CASE("test_train_supervision_values_parse_as_one_nested_configuration", "[model][rfdetr][cli_aliases][cli][training_supervision]") {
+    test_train_supervision_values_parse_as_one_nested_configuration();
+}
+TEST_CASE("test_train_device_grammar_and_conflicts_are_preserved", "[model][rfdetr][cli_aliases][cli]") {
+    test_train_device_grammar_and_conflicts_are_preserved();
+}
 TEST_CASE("compiled image commands expose opt-in GDRCopy and reject the removed H2D flag", "[cli][transport]") {
     for (const std::string command : {"bench", "train", "evaluate", "validate", "predict"}) {
         std::vector<std::string> arguments{mmltk_cli_path()};

@@ -15,7 +15,6 @@
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 namespace {
 bool train_recipe_value_matches(double lhs, double rhs, double eps = 1.0e-12) { return std::abs(lhs - rhs) <= eps; }
-
 using namespace mmltk::controller::services;
 using TrainRecipeRelation = mmltk::frameworks::reflection::catalog_provider_relation<mmltk::backend::models::rfdetr::TrainRecipeCatalog>;
 template <auto Member>
@@ -232,13 +231,21 @@ TEST_CASE("test_single_device_builds_device_id", "[gui][train_command]") { test_
 TEST_CASE("test_multi_device_builds_device_ids", "[gui][train_command]") { test_multi_device_builds_device_ids(); }
 TEST_CASE("test_zero_device_rejected", "[gui][train_command]") { test_zero_device_rejected(); }
 TEST_CASE("test_optimizer_arguments_are_forwarded", "[gui][train_command]") { test_optimizer_arguments_are_forwarded(); }
-TEST_CASE("test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata", "[gui][train_command]") { test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata(); }
+TEST_CASE("test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata", "[gui][train_command]") {
+    test_scheduler_spelling_is_stable_for_cli_and_checkpoint_metadata();
+}
 TEST_CASE("test_recipe_defaults_are_not_serialized_as_overrides", "[gui][train_command]") { test_recipe_defaults_are_not_serialized_as_overrides(); }
 TEST_CASE("test_progress_flag_enabled_is_forwarded", "[gui][train_command]") { test_progress_flag_enabled_is_forwarded(); }
 TEST_CASE("test_progress_flag_disabled_is_forwarded", "[gui][train_command]") { test_progress_flag_disabled_is_forwarded(); }
 TEST_CASE("test_resume_input_is_serialized_without_weights", "[gui][train_command]") { test_resume_input_is_serialized_without_weights(); }
-TEST_CASE("test_supervision_combinations_are_forwarded_with_exact_values", "[gui][train_command][training_supervision]") { test_supervision_combinations_are_forwarded_with_exact_values(); }
-TEST_CASE("test_supervision_float_arguments_round_trip_at_representable_boundaries", "[gui][train_command][training_supervision]") { test_supervision_float_arguments_round_trip_at_representable_boundaries(); }
+TEST_CASE("test_supervision_combinations_are_forwarded_with_exact_values", "[gui][train_command][training_supervision]") {
+    test_supervision_combinations_are_forwarded_with_exact_values();
+}
+TEST_CASE("test_supervision_float_arguments_round_trip_at_representable_boundaries", "[gui][train_command][training_supervision]") {
+    test_supervision_float_arguments_round_trip_at_representable_boundaries();
+}
 TEST_CASE("test_muon_recipe_defaults_are_resolved", "[gui][train_command]") { test_muon_recipe_defaults_are_resolved(); }
 TEST_CASE("test_recipe_application_respects_overrides", "[gui][train_command]") { test_recipe_application_respects_overrides(); }
-TEST_CASE("test_perceptual_selection_is_independent_in_child_arguments", "[gui][train_command][perceptual]") { test_perceptual_selection_is_independent_in_child_arguments(); }
+TEST_CASE("test_perceptual_selection_is_independent_in_child_arguments", "[gui][train_command][perceptual]") {
+    test_perceptual_selection_is_independent_in_child_arguments();
+}

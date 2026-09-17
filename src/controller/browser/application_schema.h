@@ -34,8 +34,10 @@
 namespace mmltk::frameworks::gpu {
 class BorrowedImageWorkspace;
 struct ImageWorkspaceObservation;
+}  // namespace mmltk::frameworks::gpu
+namespace mmltk::controller {
+struct VisualWorkspaceRequest;
 }
-namespace mmltk::controller { struct VisualWorkspaceRequest; }
 namespace mmltk::controller::browser {
 struct ApplicationRequestFieldFact final {
     std::uint64_t endpoint_id = 0U;

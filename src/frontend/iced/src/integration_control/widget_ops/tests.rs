@@ -1,4 +1,6 @@
-use crate::integration_control::widget_ops::{AnnotationReveal, ControlBounds, contains_rectangle, reveal_axis};
+use crate::integration_control::widget_ops::{
+    AnnotationReveal, ControlBounds, contains_rectangle, reveal_axis,
+};
 use iced::Rectangle;
 #[test]
 fn measured_reveal_handles_both_edges_visible_and_oversized_controls() {

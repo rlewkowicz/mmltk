@@ -282,8 +282,8 @@ class BindingEmitter final {
 
    public:
     explicit BindingEmitter(std::ostream& output) : output_(output) {
-        for (const std::string_view symbol : {"Cow", "Value", "IntoApplicationValue", "FromApplicationValue", "object",
-                                              "take_field", "take_optional_field", "application_value_within_limits"})
+        for (const std::string_view symbol :
+             {"Cow", "Value", "IntoApplicationValue", "FromApplicationValue", "object", "take_field", "take_optional_field", "application_value_within_limits"})
             symbols_.Reserve("module", symbol, "codec foundation");
     }
     void Emit() {
@@ -926,8 +926,7 @@ class BindingEmitter final {
             output_ << "Value::Object(vec![\n";
             VisitRustFields<Type>([&]<class Field, class>(const auto& fact, const std::string& member) {
                 output_ << "(\"" << fact.member_name << "\".into(), ";
-                constexpr bool client = std::same_as<Type, mmltk::controller::browser::Intent> ||
-                                        std::same_as<Type, mmltk::controller::browser::IntentField> ||
+                constexpr bool client = std::same_as<Type, mmltk::controller::browser::Intent> || std::same_as<Type, mmltk::controller::browser::IntentField> ||
                                         std::same_as<Type, mmltk::controller::browser::Interaction>;
                 if (client && fact.member_name == "protocol_version")
                     output_ << "BROWSER_PROTOCOL_VERSION.into_application_value()";
@@ -940,7 +939,6 @@ class BindingEmitter final {
             output_ << expression << ".clone().into_application_value()";
         }
     }
-
     void EmitDataLoadingBindings() {
         using Loading = mmltk::backend::data::DataLoadingOptions;
         ReserveGeneratedStruct("DataLoadingField", "canonical loading field binding", {"value", "constraint", "edit"});
@@ -1141,7 +1139,9 @@ class BindingEmitter final {
             symbols_.Reserve("module", function, "endpoint encoder " + std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name));
             if constexpr (Endpoint::interaction) {
                 output_ << "pub fn " << function << "(request: " << rust_type<typename Endpoint::request_type>()
-                        << ") -> Result<crate::protocol::client_records::ScheduledInteraction, crate::protocol::ProtocolError> { Ok(crate::protocol::client_records::ScheduledInteraction { record: Interaction { endpoint_id: " << Endpoint::stable_id
+                        << ") -> Result<crate::protocol::client_records::ScheduledInteraction, crate::protocol::ProtocolError> { "
+                           "Ok(crate::protocol::client_records::ScheduledInteraction { record: Interaction { endpoint_id: "
+                        << Endpoint::stable_id
                         << ", value: crate::application_codec::ByteBuffer(crate::protocol::client_records::compact_bytes(&request)?) }, replaceable: "
                         << (Endpoint::replaceable ? "true" : "false") << " }) }\n";
                 symbols_.Reserve("module", function + "_into", "retained compact endpoint encoder " + std::string(Endpoint::name));

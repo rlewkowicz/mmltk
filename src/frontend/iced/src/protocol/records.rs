@@ -108,7 +108,11 @@ impl Interaction {
             return Err(ProtocolError("interaction byte capacity exceeded".into()));
         }
         let mut bytes = Vec::new();
-        super::client_records::encode_interaction_bytes(self.endpoint_id, &self.value.0, &mut bytes)?;
+        super::client_records::encode_interaction_bytes(
+            self.endpoint_id,
+            &self.value.0,
+            &mut bytes,
+        )?;
         Ok(bytes)
     }
 }
@@ -435,7 +439,9 @@ mod tests {
             Interaction {
                 endpoint_id: 1,
                 value: crate::application_codec::ByteBuffer(vec![
-                    0; crate::generated::MAX_INTENT_VALUE_BYTES + 1
+                    0;
+                    crate::generated::MAX_INTENT_VALUE_BYTES
+                        + 1
                 ]),
             }
             .encode()

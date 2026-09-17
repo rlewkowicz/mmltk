@@ -1,15 +1,17 @@
 //! Real widget discovery, visibility and input operations.
-use crate::integration_control::{Driver, Message, reporting};
 #[cfg(target_arch = "wasm32")]
 use crate::integration_control::probe::scenario_output;
-use crate::message::Message as RootMessage;
-use iced::{Rectangle, Task, Vector};
-use iced::advanced::widget::{Id, Operation};
-use iced::advanced::widget as widget;
-use iced::advanced::widget::operation::Outcome;
-use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
+use crate::integration_control::{Driver, Message, reporting};
 #[cfg(target_arch = "wasm32")]
-use crate::integration_control::{click_after_surface_draw_js, click_js, paste_number_js, replace_number_js, wheel_js};
+use crate::integration_control::{
+    click_after_surface_draw_js, click_js, paste_number_js, replace_number_js, wheel_js,
+};
+use crate::message::Message as RootMessage;
+use iced::advanced::widget;
+use iced::advanced::widget::operation::Outcome;
+use iced::advanced::widget::{Id, Operation};
+use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
+use iced::{Rectangle, Task, Vector};
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct ControlBounds {
     pub(super) target: Rectangle,
@@ -209,7 +211,10 @@ impl ControlBounds {
     }
 }
 
-pub(super) fn scroll_control_into_view(control: String, reveal: AnnotationReveal) -> Task<RootMessage> {
+pub(super) fn scroll_control_into_view(
+    control: String,
+    reveal: AnnotationReveal,
+) -> Task<RootMessage> {
     measure_control(control).then(move |bounds| {
         let Some(target) = bounds.requested(reveal) else {
             return Task::none();
@@ -232,7 +237,11 @@ pub(super) fn scroll_control_into_view(control: String, reveal: AnnotationReveal
     })
 }
 
-pub(super) fn reveal_control(control: String, generation: u64, reveal: AnnotationReveal) -> Task<RootMessage> {
+pub(super) fn reveal_control(
+    control: String,
+    generation: u64,
+    reveal: AnnotationReveal,
+) -> Task<RootMessage> {
     measure_control(control.clone()).then(move |before| {
         let control = control.clone();
         scroll_control_into_view(control.clone(), reveal).chain(
@@ -364,7 +373,12 @@ pub(super) fn click_after_surface_draw(
     ) == 1
 }
 
-pub(super) fn gallery_slot_bounds(bounds: Rectangle, columns: u32, slot: u32, clipped_top: f32) -> Rectangle {
+pub(super) fn gallery_slot_bounds(
+    bounds: Rectangle,
+    columns: u32,
+    slot: u32,
+    clipped_top: f32,
+) -> Rectangle {
     let columns = columns.max(1);
     let card_extent = bounds.width / columns as f32;
     Rectangle {
@@ -397,7 +411,11 @@ pub(super) fn wheel_number_input(bounds: Rectangle) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(super) fn replace_number_input(bounds: Rectangle, value: &str, selection_length: usize) -> bool {
+pub(super) fn replace_number_input(
+    bounds: Rectangle,
+    value: &str,
+    selection_length: usize,
+) -> bool {
     let Ok(selection_length) = u32::try_from(selection_length) else {
         return false;
     };
@@ -411,8 +429,7 @@ pub(super) fn replace_number_input(bounds: Rectangle, value: &str, selection_len
 
 #[cfg(target_arch = "wasm32")]
 pub(super) fn paste_number_input(bounds: Rectangle) -> bool {
-    let Some(mut output) = scenario_output()
-    else {
+    let Some(mut output) = scenario_output() else {
         return false;
     };
     let completed = wasm_bindgen::closure::Closure::once_into_js(move |delivered: bool| {
@@ -431,7 +448,11 @@ pub(super) fn paste_number_input(_bounds: Rectangle) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(super) fn replace_number_input(_bounds: Rectangle, _value: &str, _selection_length: usize) -> bool {
+pub(super) fn replace_number_input(
+    _bounds: Rectangle,
+    _value: &str,
+    _selection_length: usize,
+) -> bool {
     false
 }
 
@@ -473,7 +494,8 @@ impl Default for RevealState {
 
 impl RevealState {
     pub(super) fn arm_revealed(
-        &mut self, driver: &mut Driver,
+        &mut self,
+        driver: &mut Driver,
         scrollable: &'static str,
         control: impl Into<String>,
     ) -> Task<RootMessage> {
@@ -488,7 +510,9 @@ impl RevealState {
 
 impl RevealState {
     pub(super) fn arm(&mut self, driver: &Driver, control: impl Into<String>) -> Task<RootMessage> {
-        if self.location_pending { return Task::none(); }
+        if self.location_pending {
+            return Task::none();
+        }
         self.location_pending = true;
         locate(control.into(), driver.generation)
     }
@@ -496,11 +520,14 @@ impl RevealState {
 
 impl RevealState {
     pub(super) fn arm_scrolled(
-        &mut self, driver: &Driver,
+        &mut self,
+        driver: &Driver,
         control: impl Into<String>,
         offset: RelativeOffset,
     ) -> Task<RootMessage> {
-        if self.location_pending { return Task::none(); }
+        if self.location_pending {
+            return Task::none();
+        }
         self.location_pending = true;
         iced::widget::operation::snap_to(crate::view::PAGE_SCROLL_ID, offset)
             .chain(locate(control.into(), driver.generation))
@@ -508,20 +535,29 @@ impl RevealState {
 }
 
 impl RevealState {
-    pub(super) fn location_completed(&mut self) { self.location_pending = false; }
-    pub(super) fn location_pending(&self) -> bool { self.location_pending }
+    pub(super) fn location_completed(&mut self) {
+        self.location_pending = false;
+    }
+    pub(super) fn location_pending(&self) -> bool {
+        self.location_pending
+    }
     pub(super) fn begin_location(&mut self) -> bool {
-        if self.location_pending { return false; }
+        if self.location_pending {
+            return false;
+        }
         self.location_pending = true;
         true
     }
-    pub(super) fn replace_numeric_value(&mut self, replacement: String) { self.numeric_replacement = replacement; }
+    pub(super) fn replace_numeric_value(&mut self, replacement: String) {
+        self.numeric_replacement = replacement;
+    }
     pub(super) fn replace_numeric_input(&self, bounds: Rectangle, selection: usize) -> bool {
         replace_number_input(bounds, &self.numeric_replacement, selection)
     }
-    pub(super) fn measured_reveal(&mut self, offset: AbsoluteOffset) { self.reveal_offset = offset; }
+    pub(super) fn measured_reveal(&mut self, offset: AbsoluteOffset) {
+        self.reveal_offset = offset;
+    }
 }
-
 
 #[cfg(test)]
 pub(in crate::integration_control) mod tests;

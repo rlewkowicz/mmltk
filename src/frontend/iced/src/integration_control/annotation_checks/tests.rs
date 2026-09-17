@@ -1,5 +1,5 @@
-use crate::integration_control::{Controller, CopyScaleStage, Phase};
 use crate::integration_control::annotation_checks::annotation_layout_scale;
+use crate::integration_control::{Controller, CopyScaleStage, Phase};
 use crate::view_model::ApplicationModel;
 #[test]
 fn annotation_layout_sequence_supports_initially_wide_and_narrow_scales() {
@@ -29,8 +29,16 @@ fn annotation_layout_sequence_supports_initially_wide_and_narrow_scales() {
         );
         controller.annotation_scenario.copy_original_scale = original;
         let model = ApplicationModel::default();
-        drop(controller.annotation_scenario.copy_scale_transition(&mut controller.driver, &model, narrow, CopyScaleStage::Restore));
-        assert_eq!(controller.annotation_scenario.copy_requested_scale, original);
+        drop(controller.annotation_scenario.copy_scale_transition(
+            &mut controller.driver,
+            &model,
+            narrow,
+            CopyScaleStage::Restore,
+        ));
+        assert_eq!(
+            controller.annotation_scenario.copy_requested_scale,
+            original
+        );
         assert_eq!(
             controller.driver.phase,
             Phase::CopyAwaitScale(CopyScaleStage::Restore)
@@ -59,7 +67,11 @@ fn annotation_narrow_scale_obeys_native_bounds_at_packaged_dpi_widths() {
 
 pub(in crate::integration_control) fn prepare_control_probe(controller: &mut Controller) -> bool {
     let state = &controller.annotation_scenario;
-    controller.probes.prepare_control_probe(&controller.widgets, state.copy_swatch_color, state.copy_capability_available)
+    controller.probes.prepare_control_probe(
+        &controller.widgets,
+        state.copy_swatch_color,
+        state.copy_capability_available,
+    )
 }
 
 pub(in crate::integration_control) fn prepare_available_swatch(controller: &mut Controller) {
@@ -68,7 +80,11 @@ pub(in crate::integration_control) fn prepare_available_swatch(controller: &mut 
     state.copy_capability_available = true;
 }
 
-pub(in crate::integration_control) fn assert_copy_completion(controller: &Controller, capability: bool, swatch: bool) {
+pub(in crate::integration_control) fn assert_copy_completion(
+    controller: &Controller,
+    capability: bool,
+    swatch: bool,
+) {
     let state = &controller.annotation_scenario;
     assert_eq!(state.copy_capability_ready, capability);
     assert_eq!(state.copy_swatch_ready, swatch);

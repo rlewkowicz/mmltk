@@ -44,7 +44,6 @@ struct ExternalGraphicsTimelineTestAccess final {
     }
 };
 }  // namespace test_support
-
 namespace {
 using test_support::FakeImageBackend;
 using test_support::RuntimeFactory;
@@ -458,33 +457,33 @@ TEST_CASE("isolated CUDA contexts preserve stack depth across rebinding and reti
     // A fresh thread gives the driver stack a known empty baseline without
     // disturbing CUDA state retained by other hardware fixtures.
     auto observed = std::async(std::launch::async, [nested] {
-        const auto check = [](CUresult status) {
-            if (status != CUDA_SUCCESS) throw std::runtime_error("CUDA context stack operation failed");
-        };
-        DeviceContext caller(0, cuda_image_copy_backend());
-        CUcontext caller_handle = nullptr;
-        check(cuCtxGetCurrent(&caller_handle));
-        if (nested) check(cuCtxPushCurrent(caller_handle));
-        bool created_current = false;
-        {
-            DeviceContext candidate(0, cuda_image_copy_backend());
-            CUcontext current = nullptr;
-            check(cuCtxGetCurrent(&current));
-            created_current = current && current != caller_handle;
-            caller.Bind();
-        }
-        CUcontext current = nullptr;
-        check(cuCtxGetCurrent(&current));
-        const bool caller_current = current == caller_handle;
-        unsigned entries = 0U;
-        while (current && entries < 4U) {
-            CUcontext popped = nullptr;
-            check(cuCtxPopCurrent(&popped));
-            ++entries;
-            check(cuCtxGetCurrent(&current));
-        }
-        return std::tuple{created_current, caller_current, entries, current == nullptr};
-    }).get();
+                        const auto check = [](CUresult status) {
+                            if (status != CUDA_SUCCESS) throw std::runtime_error("CUDA context stack operation failed");
+                        };
+                        DeviceContext caller(0, cuda_image_copy_backend());
+                        CUcontext caller_handle = nullptr;
+                        check(cuCtxGetCurrent(&caller_handle));
+                        if (nested) check(cuCtxPushCurrent(caller_handle));
+                        bool created_current = false;
+                        {
+                            DeviceContext candidate(0, cuda_image_copy_backend());
+                            CUcontext current = nullptr;
+                            check(cuCtxGetCurrent(&current));
+                            created_current = current && current != caller_handle;
+                            caller.Bind();
+                        }
+                        CUcontext current = nullptr;
+                        check(cuCtxGetCurrent(&current));
+                        const bool caller_current = current == caller_handle;
+                        unsigned entries = 0U;
+                        while (current && entries < 4U) {
+                            CUcontext popped = nullptr;
+                            check(cuCtxPopCurrent(&popped));
+                            ++entries;
+                            check(cuCtxGetCurrent(&current));
+                        }
+                        return std::tuple{created_current, caller_current, entries, current == nullptr};
+                    }).get();
     CHECK(std::get<0>(observed));
     CHECK(std::get<1>(observed));
     CHECK(std::get<2>(observed) == (nested ? 2U : 1U));

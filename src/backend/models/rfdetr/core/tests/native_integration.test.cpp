@@ -1,4 +1,4 @@
-
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 // RF-DETR core integration coverage.
 #include <cstddef>
@@ -9,7 +9,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <catch2/catch_test_macros.hpp>
 #include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 // Import-bearing support follows every textual standard-library and POSIX test helper.
@@ -120,7 +119,9 @@ void test_native_rfdetr_cached_nano_export_pipeline() {
 }
 }  // namespace
 TEST_CASE("test_native_rfdetr_cli_checkpoint_smoke", "[model][rfdetr][native_integration][cli][integration]") { test_native_rfdetr_cli_checkpoint_smoke(); }
-TEST_CASE("test_native_rfdetr_cached_nano_export_pipeline", "[model][rfdetr][native_integration][cli][integration]") { test_native_rfdetr_cached_nano_export_pipeline(); }
+TEST_CASE("test_native_rfdetr_cached_nano_export_pipeline", "[model][rfdetr][native_integration][cli][integration]") {
+    test_native_rfdetr_cached_nano_export_pipeline();
+}
 TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names raw after renaming", "[model][rfdetr][layout][python]") {
     namespace r = mmltk::backend::models::rfdetr;
     namespace c = mmltk::backend::data::catalog;

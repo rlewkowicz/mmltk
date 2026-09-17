@@ -35,7 +35,8 @@ struct PredictionBatchMetadata {
     std::int64_t image_id = 0;
     std::string source_name;
 };
-void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch, const std::vector<int>& image_ids);
+void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch,
+                                       const std::vector<int>& image_ids);
 struct EvaluationRunConfig final {
     EvaluationMetricSet metric_set = EvaluationMetricSet::BBox;
     std::size_t batch_capacity = 1U;
@@ -238,8 +239,8 @@ struct EvaluationPredictionLane {
     std::shared_ptr<PredictionBufferSlotPool> slot_pool;
 };
 using EvaluationLaneWork = std::move_only_function<StagedPredictionBatch(EvaluationPredictionLane&)>;
-StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count,
-                                             size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle);
+StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease,
+                                             int device_id, void* stream_handle);
 PendingPredictionBatchEncoding enqueue_prediction_batch_encoding(mmltk::common::concurrency::WorkerPool& cpu_pool, StagedPredictionBatch&& staged,
                                                                  EvaluationProfileRecord* profile = nullptr,
                                                                  const EvaluationDatasetOwner* evaluation_dataset = nullptr);
@@ -289,29 +290,30 @@ struct EvalPassResult {
 enum class EvaluationPurpose : std::uint8_t { ScheduledValidation, FinalTest };
 PhaseTiming elapsed_timing(std::chrono::steady_clock::time_point start, std::size_t images);
 class TrainingValidationRuntime final {
- public:
+   public:
     TrainingValidationRuntime(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader,
                               size_t batch_size, bool enable_loss, EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name,
                               const bool query_count_automatic);
     ~TrainingValidationRuntime();
-    void begin_pass() ;
-    torch::Tensor preprocess(const mmltk::backend::data::Batch& batch) ;
-    void record_preprocess_consumer(cudaStream_t stream) ;
-    RuntimeContext& runtime() ;
+    void begin_pass();
+    torch::Tensor preprocess(const mmltk::backend::data::Batch& batch);
+    void record_preprocess_consumer(cudaStream_t stream);
+    RuntimeContext& runtime();
     size_t batch_size() const;
-    mmltk::backend::data::DatasetLoader& loader() ;
+    mmltk::backend::data::DatasetLoader& loader();
     const std::vector<int>& image_ids() const;
     bool amp_enabled() const noexcept;
     at::ScalarType inference_dtype() const noexcept;
     torch::Tensor nested_mask() const;
-    TargetScratch& target_scratch() ;
-    mmltk::common::concurrency::WorkerPool& lane_pool() ;
+    TargetScratch& target_scratch();
+    mmltk::common::concurrency::WorkerPool& lane_pool();
     TrainingEvaluationRunOwner& evaluation_run() noexcept;
     std::string_view split_name() const noexcept;
     std::size_t detection_limit() const noexcept;
     bool automatic_detection_limit() const noexcept;
     bool query_count_automatic() const noexcept;
- private:
+
+   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

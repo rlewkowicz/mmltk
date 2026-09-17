@@ -564,7 +564,6 @@ struct WorkspaceTestFixture final {
     };
 }
 }  // namespace mmltk::frameworks::gpu::test_support
-
 namespace mmltk::frameworks::gpu::test_support {
 [[nodiscard]] inline SystemImageRuntime make_clean_semantic_runtime(const std::shared_ptr<FakeImageBackend>& backend) {
     return SystemImageRuntime{{
@@ -573,4 +572,4 @@ namespace mmltk::frameworks::gpu::test_support {
         .output_layout = ImageProductLayout::CleanAndSemantic,
     }};
 }
-}
+}  // namespace mmltk::frameworks::gpu::test_support

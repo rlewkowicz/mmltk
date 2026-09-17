@@ -306,8 +306,8 @@ void PinnedPredictionBuffers::transition(const PredictionSlotState expected, con
     }
 }
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
-StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count,
-                                             size_t max_dets_per_image, PredictionBufferLease lease, int device_id, void* stream_handle) {
+StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t category_count, size_t max_dets_per_image, PredictionBufferLease lease,
+                                             int device_id, void* stream_handle) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_stage_prediction_batch{"rfdetr.native.eval.stage_prediction_batch"};
     if (!lease.buffers) { throw std::runtime_error("stage_prediction_batch requires a valid prediction buffer lease"); }
     if (!batch.scores.defined() || batch.scores.dim() != 2 || !batch.labels.defined() || batch.labels.dim() != 2 || !batch.boxes.defined() ||
@@ -536,7 +536,8 @@ inline int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int
 // Projects a loader batch onto the per-image metadata every prediction and evaluation path consumes.
 // Batch slot -> dataset index -> image id is one mapping; it lives here rather than being rebuilt at
 // each call site.
-void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch, const std::vector<int>& image_ids) {
+void prepare_prediction_batch_metadata(std::vector<PredictionBatchMetadata>& metadata, const mmltk::backend::data::Batch& batch,
+                                       const std::vector<int>& image_ids) {
     metadata.clear();
     metadata.reserve(batch.num_images);
     for (size_t image_index = 0; image_index < batch.num_images; ++image_index) {

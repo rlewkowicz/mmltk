@@ -214,8 +214,8 @@ struct GpuAugmentationExecutor::Impl final {
     };
     struct ReductionHash final {
         std::size_t operator()(ReductionKey value) const noexcept {
-            return static_cast<std::size_t>(
-                mmltk::common::math::deterministic_mix64(reinterpret_cast<std::uintptr_t>(value.source) ^ (std::uint64_t(value.width) << 32U) ^ std::uint64_t(value.height)));
+            return static_cast<std::size_t>(mmltk::common::math::deterministic_mix64(reinterpret_cast<std::uintptr_t>(value.source) ^
+                                                                                     (std::uint64_t(value.width) << 32U) ^ std::uint64_t(value.height)));
         }
     };
     Impl(const GpuAugmentationConfig& input_config, const std::size_t input_capacity, const int input_height, const int input_width,
@@ -439,11 +439,11 @@ struct GpuAugmentationExecutor::Impl final {
             prepared->pixels.ensure(total);
         }
         const mmltk::backend::imaging::resample::RgbImageLayout source_layout{std::uint32_t(width),
-                                           std::uint32_t(height),
-                                           std::size_t(width) * sizeof(float),
-                                           std::size_t(width) * std::size_t(height) * sizeof(float),
-                                           image_bytes,
-                                           mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
+                                                                              std::uint32_t(height),
+                                                                              std::size_t(width) * sizeof(float),
+                                                                              std::size_t(width) * std::size_t(height) * sizeof(float),
+                                                                              image_bytes,
+                                                                              mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32};
         for (const auto& reduction : reductions) {
             const auto values = std::size_t(reduction.width) * std::size_t(reduction.height);
             const mmltk::backend::imaging::resample::RgbImageLayout destination_layout{

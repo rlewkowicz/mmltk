@@ -8,6 +8,7 @@
 #include "src/controller/services/settings_system.h"
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <cstdint>
 #include <fstream>
 #include <future>
@@ -20,7 +21,6 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-
 [[nodiscard]] contracts::ModelSelection export_model_selection(const contracts::GuiSettingsState& settings, const contracts::ModelArtifactInputKind input,
                                                                std::string artifact) {
     auto projection = contracts::model_settings_projection(settings, contracts::FeatureId::Export);
@@ -360,5 +360,5 @@ TEST_CASE("artifact model inspection observes cancellation before each opaque in
         CHECK(verified);
     }
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

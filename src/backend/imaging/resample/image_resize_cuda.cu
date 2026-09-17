@@ -262,14 +262,12 @@ struct GpuPerceptualDownscaler::Impl {
         const auto address = static_cast<CUdeviceptr>(reinterpret_cast<std::uintptr_t>(pointer));
         CUpointer_attribute attributes[]{CU_POINTER_ATTRIBUTE_CONTEXT, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
                                          CU_POINTER_ATTRIBUTE_MEMPOOL_HANDLE};
-        void* results[]{static_cast<void*>(&allocation_context), &memory_type, &allocation_device, &pool};
+        void* results[]{static_cast<void*>(&allocation_context), &memory_type, &allocation_device, static_cast<void*>(&pool)};
         const auto pointer_status = cuPointerGetAttributes(4, attributes, results, address);
         // Stream-ordered pool allocations belong to a device, not a context.
         // Their retained owner and caller stream still supply execution order.
-        const bool own_allocation = allocation_context == native_context ||
-                                    (!allocation_context && pool && allocation_device == context.device());
-        if (pointer_status != CUDA_SUCCESS || memory_type != CU_MEMORYTYPE_DEVICE || !own_allocation)
-            return {pointer_status, false, AdmissionQuery::Pointer};
+        const bool own_allocation = allocation_context == native_context || (!allocation_context && pool && allocation_device == context.device());
+        if (pointer_status != CUDA_SUCCESS || memory_type != CU_MEMORYTYPE_DEVICE || !own_allocation) return {pointer_status, false, AdmissionQuery::Pointer};
         // RANGE_START_ADDR/RANGE_SIZE can include unmapped reserved VA.
         const auto range_status = cuMemGetAddressRange(&base, &bytes, address);
         return {range_status,

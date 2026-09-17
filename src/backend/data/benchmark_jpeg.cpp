@@ -1,6 +1,5 @@
 #include <sys/mman.h>
 #include "src/common/io/file_memory.h"
-
 #include "detail/benchmark_jpeg.h"
 #include <turbojpeg.h>
 #include <span>
@@ -127,17 +126,16 @@ class MappedJpeg {
     void* data_ = nullptr;
 };
 [[nodiscard]] static MappedJpeg map_file(const std::filesystem::path& path) { return MappedJpeg(path); }
-
-}
+}  // namespace
 std::pair<std::uint32_t, std::uint32_t> JpegValidator::read_header(const std::span<const std::uint8_t> encoded, const std::uint32_t expected_width,
-                                                                  const std::uint32_t expected_height) {
+                                                                   const std::uint32_t expected_height) {
     try {
         const BenchmarkJpegHeader header = decoder_.read_header(encoded, expected_width, expected_height);
         return {header.width, header.height};
     } catch (const BenchmarkJpegError& error) { throw InvalidJpegError(error.what()); }
 }
 std::pair<std::uint32_t, std::uint32_t> JpegValidator::validate_file(const std::filesystem::path& path, const std::uint32_t expected_width,
-                                                                    const std::uint32_t expected_height) {
+                                                                     const std::uint32_t expected_height) {
     const MappedJpeg mapped = map_file(path);
     return read_header(mapped.bytes(), expected_width, expected_height);
 }

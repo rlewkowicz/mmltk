@@ -74,15 +74,20 @@ void test_catch2_tap_reporter_formats_shared_assertion_details() {
     REQUIRE((result.output_text.find("for: 1 == 2") != std::string::npos));
     REQUIRE((result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos));
 }
-} // namespace
-
+}  // namespace
 TEST_CASE("vendored_catch2_reporter_fixture", "[.][core][vendored][reporter_fixture]") {
     const int fixture_value = 1;
     INFO("vendored reporter info");
     // NOLINTNEXTLINE(bugprone-chained-comparison): Catch2 decomposes REQUIRE through operator<=.
     REQUIRE(fixture_value == 2);
 }
-TEST_CASE("test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting", "[core][vendored]") { test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting(); }
-TEST_CASE("test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max", "[core][vendored]") { test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max(); }
-TEST_CASE("test_catch2_compact_reporter_formats_shared_assertion_details", "[core][vendored]") { test_catch2_compact_reporter_formats_shared_assertion_details(); }
+TEST_CASE("test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting", "[core][vendored]") {
+    test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting();
+}
+TEST_CASE("test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max", "[core][vendored]") {
+    test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max();
+}
+TEST_CASE("test_catch2_compact_reporter_formats_shared_assertion_details", "[core][vendored]") {
+    test_catch2_compact_reporter_formats_shared_assertion_details();
+}
 TEST_CASE("test_catch2_tap_reporter_formats_shared_assertion_details", "[core][vendored]") { test_catch2_tap_reporter_formats_shared_assertion_details(); }

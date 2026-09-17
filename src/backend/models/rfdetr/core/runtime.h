@@ -9,7 +9,6 @@
 #include "src/frameworks/gpu/device_execution.h"
 #include "src/common/system/numa_memory.h"
 #include "src/backend/models/rfdetr/core/detail/runtime_workspace_fwd.h"
-
 namespace mmltk::backend::models::rfdetr {
 struct RuntimeConfig {
     bool h2d_dataloader = true;

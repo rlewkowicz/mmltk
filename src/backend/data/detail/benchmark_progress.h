@@ -40,4 +40,4 @@ class ProgressReporter {
     std::uint64_t pixel_completed_before_ = 0U;
     std::mutex mutex_;
 };
-}
+}  // namespace mmltk::backend::data::benchmark_internal

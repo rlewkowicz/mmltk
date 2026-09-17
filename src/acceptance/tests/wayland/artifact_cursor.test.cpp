@@ -181,5 +181,4 @@ TEST_CASE("evidence reads cross chunk boundaries and failure tails select actual
         }
     }
 }
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

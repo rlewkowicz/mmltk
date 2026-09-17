@@ -117,4 +117,4 @@ __device__ __forceinline__ float point_to_segment_distance_sq(const float px, co
     const float t = fminf(1.0f, fmaxf(0.0f, (apx * abx + apy * aby) / ab_len_sq));
     return point_distance_sq(px, py, ax + abx * t, ay + aby * t);
 }
-}
+}  // namespace mmltk::backend::imaging::raster::math

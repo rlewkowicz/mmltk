@@ -31,11 +31,13 @@ using mmltk::common::math::checked_cast;
 namespace {
 void hwc_uint8_to_nchw_float(const uint8_t* src, float* dst, int height, int width) {
     mmltk::common::logging::ScopedProfile profile{"compiler.pixels.convert.avx2"};
-    mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(src, dst, checked_cast<uint32_t>(width, "image width too large"), checked_cast<uint32_t>(height, "image height too large"));
+    mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(src, dst, checked_cast<uint32_t>(width, "image width too large"),
+                                                              checked_cast<uint32_t>(height, "image height too large"));
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePixelRange& pixel_blob, uint32_t image_index, uint32_t target_width,
-                        uint32_t target_height, mmltk::backend::imaging::resample::RgbImageResizer& image_resizer, size_t image_stride, std::vector<uint8_t>& resize_scratch) {
+                        uint32_t target_height, mmltk::backend::imaging::resample::RgbImageResizer& image_resizer, size_t image_stride,
+                        std::vector<uint8_t>& resize_scratch) {
     const int width = checked_cast<int>(target_width, "image width too large");
     const int height = checked_cast<int>(target_height, "image height too large");
     const std::filesystem::path img_path = image_path(split_dir, image_index);
@@ -56,7 +58,8 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
         hwc_uint8_to_nchw_float(raw_pixels.get(), dst, height, width);
         return;
     }
-    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(source_width, source_height, target_width, target_height);
+    const mmltk::backend::imaging::resample::RgbLetterbox letterbox =
+        mmltk::backend::imaging::resample::compute_rgb_letterbox(source_width, source_height, target_width, target_height);
     const uint8_t* src_pixels = raw_pixels.get();
     if (static_cast<uint32_t>(raw_width) != letterbox.resized_width || static_cast<uint32_t>(raw_height) != letterbox.resized_height) {
         const size_t resized_bytes = static_cast<size_t>(letterbox.resized_width) * letterbox.resized_height * 3U;
@@ -80,8 +83,8 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
         mmltk::common::logging::profile_add_value("compiler.pixels.letterbox_count", 1);
         {
             mmltk::common::logging::ScopedProfile profile{"compiler.pixels.convert.letterbox_avx2"};
-            mmltk::backend::imaging::resample::letterboxed_rgb_hwc_u8_to_nchw_f32(src_pixels, dst, letterbox.resized_width, letterbox.resized_height, target_width, target_height,
-                                               letterbox.offset_x, letterbox.offset_y);
+            mmltk::backend::imaging::resample::letterboxed_rgb_hwc_u8_to_nchw_f32(src_pixels, dst, letterbox.resized_width, letterbox.resized_height,
+                                                                                  target_width, target_height, letterbox.offset_x, letterbox.offset_y);
         }
     } else {
         hwc_uint8_to_nchw_float(src_pixels, dst, height, width);
@@ -119,7 +122,8 @@ void write_pixel_blob(const FileHandle& fd, const PixelBlobWriteRequest& request
     mmltk::common::logging::profile_set_value("compiler.pixels.total_bytes", pixel_bytes);
     WritablePixelRange pixel_blob(fd.get(), request.pixel_offset, pixel_bytes);
     if (request.num_images == 0) { return; }
-    const mmltk::backend::imaging::resample::ResizeWorkerPlan resize_plan = mmltk::backend::imaging::resample::plan_rgb_resize_workers(request.num_workers, request.any_resize, request.any_downscale);
+    const mmltk::backend::imaging::resample::ResizeWorkerPlan resize_plan =
+        mmltk::backend::imaging::resample::plan_rgb_resize_workers(request.num_workers, request.any_resize, request.any_downscale);
     mmltk::common::logging::profile_set_value("compiler.pixels.worker.count", static_cast<size_t>(resize_plan.image_workers));
     mmltk::common::logging::profile_set_value("compiler.pixels.image_workers", static_cast<size_t>(resize_plan.image_workers));
     mmltk::common::logging::profile_set_value("compiler.pixels.resize_threads_per_image", static_cast<size_t>(resize_plan.resize_threads_per_image));

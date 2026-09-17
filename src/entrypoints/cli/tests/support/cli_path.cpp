@@ -4,7 +4,6 @@
 #include <filesystem>
 #include <system_error>
 #include <unistd.h>
-
 namespace mmltk::testsupport {
 std::string mmltk_cli_path() {
 #ifndef MMLTK_TEST_MMLTK_CLI_PATH

@@ -26,8 +26,6 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
-
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -398,5 +396,5 @@ TEST_CASE("Annotation color sampling completes before following document command
     }
     held = {};
 }
-}
-}
+}  // namespace
+}  // namespace mmltk::controller

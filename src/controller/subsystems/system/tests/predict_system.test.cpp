@@ -39,8 +39,6 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-
-
 TEST_CASE("Predict revision capacity preserves cancellation and terminal observations", "[controller][systems][predict]") {
     using Revision = detail::PredictRevision;
     constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
@@ -486,7 +484,6 @@ TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact"
     CHECK(rgba[2] == 0U);
     CHECK(rgba[3] == 255U);
 }
-
 TEST_CASE("preview context failure retains initialized state and source before returning", "[controller][gpu][context]") {
     namespace gpu = mmltk::frameworks::gpu;
     const bool query_failure = GENERATE(false, true);
@@ -697,5 +694,5 @@ TEST_CASE("preview context construction publishes only after exact caller restor
         CHECK(cuCtxGetApiVersion(driver.candidate, &version) == CUDA_SUCCESS);
     }
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

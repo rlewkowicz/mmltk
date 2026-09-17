@@ -74,5 +74,4 @@ class FirstAuditFailure final {
     nlohmann::json record_;
     bool reported_ = false;
 };
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

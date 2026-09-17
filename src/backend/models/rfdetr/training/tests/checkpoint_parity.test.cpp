@@ -1,13 +1,13 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <torch/utils.h>
-
 #include <filesystem>
 #include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/training/checkpoint.h"
 // RF-DETR training checkpoint parity coverage.
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <catch2/catch_test_macros.hpp>
 #include "src/test_support/filesystem_test_utils.hpp"
 // Import-bearing support follows every textual standard-library test helper.
 #include "checkpoint_fixture_support.h"
@@ -18,7 +18,6 @@
 #include "parity_fixture_support.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
-import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace fs = std::filesystem;
 // CLEANUP-IGNORE: The parity fixture's namespace aliases are independent of the optimizer fixture's typed inventory.
 namespace model_detail = mmltk::backend::models::rfdetr::detail;
@@ -60,7 +59,7 @@ void assert_clean_summary(const ModelStateLoadSummary& summary, const std::strin
 void write_module_upstream_checkpoint(const fs::path& path, const NativeRfDetrModel& module) {
     mmltk::backend::models::rfdetr::DecodedNativeModelState state;
     const auto& technical_module = (module);
-    set_synthetic_model_state(state, clone_normalized_model_state(technical_module, true));
+    mmltk::backend::models::rfdetr::testsupport::set_synthetic_model_state(state, clone_normalized_model_state(technical_module, true));
     mmltk::backend::models::rfdetr::write_upstream_model_state(path, state);
 }
 [[nodiscard]] bool same_shape(const torch::Tensor& left, const torch::Tensor& right) {
@@ -131,4 +130,6 @@ void test_checkpoint_parity_matches_for_all_registered_fixtures() {
     const auto& fixtures = parity_fixture_cases();
     for (size_t index = 0; index < fixtures.size(); ++index) { run_checkpoint_parity_case(fixtures[index], index + 1, fixtures.size()); }
 }
-TEST_CASE("test_checkpoint_parity_matches_for_all_registered_fixtures", "[model][rfdetr][checkpoint_parity][integration]") { test_checkpoint_parity_matches_for_all_registered_fixtures(); }
+TEST_CASE("test_checkpoint_parity_matches_for_all_registered_fixtures", "[model][rfdetr][checkpoint_parity][integration]") {
+    test_checkpoint_parity_matches_for_all_registered_fixtures();
+}

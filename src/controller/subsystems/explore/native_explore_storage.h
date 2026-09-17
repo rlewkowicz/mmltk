@@ -17,10 +17,11 @@ class NativeExploreStorage final {
         std::array<Buffer, 2U> cached_semantic_;
     };
     GalleryBufferFamily<Family> storage_;
-public:
+
+   public:
     using Release = GalleryBufferFamily<Family>::Release;
     void Bind(mmltk::backend::imaging::explore::ExploreCudaAllocationApi) noexcept;
     [[nodiscard]] Release ResetChecked() noexcept;
     [[nodiscard]] bool OwnsAllocation() const noexcept;
 };
-}
+}  // namespace mmltk::controller::explore_detail

@@ -9,4 +9,4 @@ class BrowserAssetDirectory final {
    private:
     ScopedTempDir root_;
 };
-}
+}  // namespace mmltk::testsupport

@@ -9,8 +9,8 @@
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/training/tests/model_state_fixture.h"
+#include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/controller/contracts/gui_settings.h"
-import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace mmltk::testsupport {
 namespace data = mmltk::backend::data;
 namespace rfdetr = mmltk::backend::models::rfdetr;
@@ -21,12 +21,12 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
       video_(root / "workflow.y4m") {
     data::testsupport::create_synthetic_dataset(fixture_);
     const auto plan = data::DatasetCompiler::prepare({.source_dir = data::testsupport::dataset_dir(fixture_),
-                                                     .output_dir = data::testsupport::compiled_dir(fixture_),
-                                                     .split = fixture_.split,
-                                                     .target_width = 64,
-                                                     .target_height = 64,
-                                                     .worker_cpus = {}},
-                                                    {fixture_.split});
+                                                      .output_dir = data::testsupport::compiled_dir(fixture_),
+                                                      .split = fixture_.split,
+                                                      .target_width = 64,
+                                                      .target_height = 64,
+                                                      .worker_cpus = {}},
+                                                     {fixture_.split});
     data::DatasetCompiler::compile(plan, 0U);
     const auto compiled = data::CompiledDataset::open(data::testsupport::compiled_bin_path(fixture_));
     auto config = rfdetr::native_config_from_preset(rfdetr::model_presets().front());
@@ -44,10 +44,8 @@ WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
     checkpoint.metadata.class_layout = model.class_layout()->record();
     checkpoint.metadata.num_queries = config.num_queries;
     checkpoint.metadata.num_select = config.num_select;
-    checkpoint.entries() =
-        rfdetr::testsupport::clone_normalized_model_state((model));
+    checkpoint.replace_entries(rfdetr::testsupport::clone_normalized_model_state(model));
     rfdetr::save_native_checkpoint(weights_, checkpoint);
-
     std::ofstream video{video_, std::ios::binary};
     video.exceptions(std::ios::badbit | std::ios::failbit);
     video << "YUV4MPEG2 W64 H64 F2:1 Ip A1:1 C420jpeg\n";

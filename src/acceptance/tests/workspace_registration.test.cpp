@@ -60,8 +60,16 @@ void test_workspace_slot_release_registration_handles_window_death_and_system_te
     REQUIRE((registrations.DeviceCount() == 0U));
     REQUIRE((registrations.WindowCount() == 0U));
 }
+}  // namespace
+TEST_CASE("test_workspace_slot_release_registration_shares_one_window_listener_until_last_device", "[core][vendored]") {
+    test_workspace_slot_release_registration_shares_one_window_listener_until_last_device();
 }
-TEST_CASE("test_workspace_slot_release_registration_shares_one_window_listener_until_last_device", "[core][vendored]") { test_workspace_slot_release_registration_shares_one_window_listener_until_last_device(); }
-TEST_CASE("test_workspace_slot_release_registration_tracks_windows_independently", "[core][vendored]") { test_workspace_slot_release_registration_tracks_windows_independently(); }
-TEST_CASE("test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister", "[core][vendored]") { test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister(); }
-TEST_CASE("test_workspace_slot_release_registration_handles_window_death_and_system_teardown", "[core][vendored]") { test_workspace_slot_release_registration_handles_window_death_and_system_teardown(); }
+TEST_CASE("test_workspace_slot_release_registration_tracks_windows_independently", "[core][vendored]") {
+    test_workspace_slot_release_registration_tracks_windows_independently();
+}
+TEST_CASE("test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister", "[core][vendored]") {
+    test_workspace_slot_release_registration_tolerates_duplicate_and_reordered_unregister();
+}
+TEST_CASE("test_workspace_slot_release_registration_handles_window_death_and_system_teardown", "[core][vendored]") {
+    test_workspace_slot_release_registration_handles_window_death_and_system_teardown();
+}

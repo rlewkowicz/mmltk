@@ -547,8 +547,9 @@ TEST_CASE("browser audit exposes distinct integration phases for progress deadli
 // startup-latched faults + two quiet paths + model workflows = 11 H2D lifetimes. Optional GDR
 // adds one focused lifetime. The former matrix used 23 per transport (46
 // with GDR), recompiling/relaunching ordinary coverage for each case.
-TEST_CASE("rendered_probe_audit_rejects_mismatched_identity", "[workspace_wayland_integration][rendered_probe_audit]") { rendered_probe_audit_rejects_mismatched_identity(); }
-
+TEST_CASE("rendered_probe_audit_rejects_mismatched_identity", "[workspace_wayland_integration][rendered_probe_audit]") {
+    rendered_probe_audit_rejects_mismatched_identity();
+}
 [[nodiscard]] nlohmann::json native_surface_record(const char* event, const std::uint64_t low = 12U) {
     const std::string_view name{event};
     const bool copying = name.starts_with("presentation.source_borrow.") || name == "presentation.source.read_submitted";
@@ -1232,7 +1233,6 @@ TEST_CASE("surface join rejects otherwise complete traces for different physical
     CHECK_FALSE(audit.joined_failure().empty());
     CHECK_FALSE(audit.pending_supersession_completed());
 }
-
 enum class MissingHandoffEvidence {
     PendingDiscard,
     Reconstruction,
@@ -2332,5 +2332,4 @@ TEST_CASE("cached viewport evidence joins initial readiness before new read admi
         }
     }
 }
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

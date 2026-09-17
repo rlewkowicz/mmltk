@@ -31,8 +31,8 @@
 namespace mmltk::frameworks::gpu {
 namespace {
 using test_support::FakeImageBackend;
-using test_support::RuntimeFactory;
 using test_support::make_clean_semantic_runtime;
+using test_support::RuntimeFactory;
 TEST_CASE("receiver selects same peer and reusable staged copy paths") {
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime source{{.device = 0, .backend = backend}};
@@ -443,6 +443,5 @@ TEST_CASE("admitted image copies preserve readers and refuse full capacity witho
     available = {};
     CHECK(receiver.Completed().revision() == latest.revision());
 }
-
-} // namespace
-} // namespace mmltk::frameworks::gpu
+}  // namespace
+}  // namespace mmltk::frameworks::gpu

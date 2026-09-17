@@ -40,7 +40,7 @@ void TerminalCudaRetirementOwner::Release(const std::size_t index, const std::ui
     --reservations_;
 }
 void TerminalCudaRetirementOwner::Install(const std::size_t index, const std::uint64_t generation, TerminalCudaCustody&& custody,
-                                                 const cudaError_t failure) noexcept {
+                                          const cudaError_t failure) noexcept {
     std::lock_guard lock(mutex_);
     if (index >= capacity_ || !custody) std::terminate();
     Slot& slot = slots_[index];
@@ -59,4 +59,4 @@ TerminalCudaRetirementFact TerminalCudaRetirementOwner::fact() const noexcept {
     std::lock_guard lock(mutex_);
     return {.terminal = terminal_.load(std::memory_order_acquire), .occupancy = occupancy_, .reservations = reservations_, .first_failure = first_failure_};
 }
-}
+}  // namespace mmltk::frameworks::gpu

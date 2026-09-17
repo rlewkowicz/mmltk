@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <torch/cuda.h>
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
@@ -19,6 +20,7 @@
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "detail/checkpoint_private.h"
+#include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "model_state_fixture.h"
@@ -26,21 +28,12 @@
 #include "src/common/io/file_memory.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
-#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
-#undef CHECK
-#endif
-#include <catch2/catch_test_macros.hpp>
-import mmltk.backend.models.rfdetr.training.checkpoint;
 import mmltk.backend.models.rfdetr.model_export;
 namespace fs = std::filesystem;
 namespace {
 using namespace mmltk::backend::models::rfdetr::testsupport;
-auto& state_entries(mmltk::backend::models::rfdetr::DecodedNativeModelState& state) {
-    return state.entries();
-}
-const auto& state_entries(const mmltk::backend::models::rfdetr::DecodedNativeModelState& state) {
-    return state.entries();
-}
+auto& state_entries(mmltk::backend::models::rfdetr::DecodedNativeModelState& state) { return state.entries(); }
+const auto& state_entries(const mmltk::backend::models::rfdetr::DecodedNativeModelState& state) { return state.entries(); }
 void populate_detection_metadata(mmltk::backend::models::rfdetr::NativeCheckpointMetadata& metadata) {
     std::size_t index = 0;
     metadata.for_each_detection_field([&]<class Optional>(const char*, Optional& field) {
@@ -190,8 +183,7 @@ void test_native_checkpoint_tensor_preparation() {
     synthetic_entries.push_back({"cpu_non_contiguous", cpu_non_contiguous});
     const bool has_cuda = torch::cuda::is_available();
     if (has_cuda) {
-        synthetic_entries
-            .push_back({"cuda_tensor", torch::arange(6, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)).view({2, 3})});
+        synthetic_entries.push_back({"cuda_tensor", torch::arange(6, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)).view({2, 3})});
     }
     set_synthetic_model_state(checkpoint, std::move(synthetic_entries));
     mmltk::backend::models::rfdetr::save_native_checkpoint(output_path, checkpoint);
@@ -247,8 +239,7 @@ void test_cuda_upstream_raw_state_preserves_logical_values() {
     mmltk::backend::models::rfdetr::DecodedNativeModelState state;
     std::vector<mmltk::backend::models::rfdetr::NormalizedModelStateEntry> entries;
     entries = {
-        {"query_feat.weight",
-         torch::ones({4, kParityFixtureHiddenDim}, torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA))},
+        {"query_feat.weight", torch::ones({4, kParityFixtureHiddenDim}, torch::TensorOptions().dtype(torch::kFloat16).device(torch::kCUDA))},
         {"refpoint_embed.weight", torch::zeros({4, 4}, torch::TensorOptions().device(torch::kCUDA))},
         {"class_embed.weight", torch::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim}, torch::TensorOptions().device(torch::kCUDA))},
         {"class_embed.bias", torch::arange(kParityFixtureNumClasses, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA))},
@@ -324,8 +315,7 @@ void test_training_supervision_checkpoint_blob_admission() {
     };
     for (const auto& variant : variants) { REQUIRE(round_trip_training_supervision_config(path, variant) == variant); }
     torch::serialize::OutputArchive trailing_output;
-    trailing_output.write("training_supervision_config_cbor",
-                          torch::cat({encoded, torch::zeros({1}, torch::TensorOptions().dtype(torch::kUInt8))}));
+    trailing_output.write("training_supervision_config_cbor", torch::cat({encoded, torch::zeros({1}, torch::TensorOptions().dtype(torch::kUInt8))}));
     trailing_output.save_to(path.string());
     torch::serialize::InputArchive trailing_input;
     trailing_input.load_from(path.string());
@@ -413,8 +403,7 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
     require_rejected_without_mutation(missing);
     auto valid_candidate_state = state;
     valid_candidate_state.front().tensor = torch::full_like(valid_candidate_state.front().tensor, 9.0);
-    auto candidate =
-        model.stage_normalized_state(valid_candidate_state, rfdetr::detail::NormalizedModelStateAdmission::Exact);
+    auto candidate = model.stage_normalized_state(valid_candidate_state, rfdetr::detail::NormalizedModelStateAdmission::Exact);
     REQUIRE(torch::equal(module.named_parameters(true).begin()->value(), first_before));
     model.commit_normalized_state(std::move(candidate));
     REQUIRE(torch::equal(module.named_parameters(true).begin()->value(), torch::full_like(first_before, 9.0)));
@@ -428,12 +417,10 @@ void test_strict_model_state_admission_is_duplicate_free_and_atomic() {
     auto* class_head_destination = current_parameters.find(class_head->name);
     REQUIRE(class_head_destination != nullptr);
     const auto class_head_before = class_head_destination->detach().clone();
-    REQUIRE_THROWS(
-        model.stage_normalized_state(mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::Exact));
+    REQUIRE_THROWS(model.stage_normalized_state(mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::Exact));
     REQUIRE(torch::equal(*class_head_destination, class_head_before));
     const auto source_layout = rfdetr::ResolvedClassLayout(model.class_layout()->record());
-    REQUIRE_THROWS(model.stage_normalized_state(
-        mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
+    REQUIRE_THROWS(model.stage_normalized_state(mismatched_class_head, rfdetr::detail::NormalizedModelStateAdmission::FreshTransfer, &source_layout));
     REQUIRE(torch::equal(*class_head_destination, class_head_before));
 }
 }  // namespace
@@ -459,7 +446,9 @@ void test_checkpoint_tensor_and_legacy_support() {
     test_strict_model_state_admission_is_duplicate_free_and_atomic();
 }
 TEST_CASE("test_checkpoint_roundtrip_and_fixture_loading", "[model][rfdetr][checkpoint]") { test_checkpoint_roundtrip_and_fixture_loading(); }
-TEST_CASE("test_cuda_upstream_raw_state_preserves_logical_values", "[model][rfdetr][checkpoint][cuda]") { test_cuda_upstream_raw_state_preserves_logical_values(); }
+TEST_CASE("test_cuda_upstream_raw_state_preserves_logical_values", "[model][rfdetr][checkpoint][cuda]") {
+    test_cuda_upstream_raw_state_preserves_logical_values();
+}
 TEST_CASE("test_checkpoint_tensor_and_legacy_support", "[model][rfdetr][checkpoint][training_supervision]") { test_checkpoint_tensor_and_legacy_support(); }
 TEST_CASE("Fresh transfer maps actual classifier and supervision axes by class identity", "[model][rfdetr][checkpoint][layout]") {
     namespace r = mmltk::backend::models::rfdetr;

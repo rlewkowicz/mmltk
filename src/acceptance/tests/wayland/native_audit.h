@@ -172,5 +172,4 @@ struct NativeAudit final {
 };
 // Acceptance consumes bounded records only when lifecycle reporting is enabled.
 // Retain one offending record and its causal context, independently of verdicts.
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

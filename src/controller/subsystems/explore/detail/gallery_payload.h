@@ -9,10 +9,10 @@
 #include <span>
 #include <type_traits>
 namespace mmltk::controller::explore_detail {
-    struct StorageSpan final {
-        std::size_t offset = 0U;
-        std::size_t count = 0U;
-    };
+struct StorageSpan final {
+    std::size_t offset = 0U;
+    std::size_t count = 0U;
+};
 [[nodiscard]] constexpr std::size_t align_up(const std::size_t value, const std::size_t alignment) noexcept {
     return (value + alignment - 1U) / alignment * alignment;
 }
@@ -37,7 +37,9 @@ inline void ensure_gallery_cuda(cudaError_t status, const char* detail) {
     if (status != cudaSuccess) throw std::runtime_error(detail);
 }
 [[nodiscard]] inline mmltk::backend::imaging::explore::detail::ExploreRenderTargetViewAbi gallery_target(mmltk::frameworks::gpu::ImagePlaneView target) {
-    return {.data = reinterpret_cast<std::uint8_t*>(target.data), .pitch_bytes = target.descriptor.pitch_bytes,
-            .width = target.descriptor.width, .height = target.descriptor.height};
+    return {.data = reinterpret_cast<std::uint8_t*>(target.data),
+            .pitch_bytes = target.descriptor.pitch_bytes,
+            .width = target.descriptor.width,
+            .height = target.descriptor.height};
 }
-}
+}  // namespace mmltk::controller::explore_detail

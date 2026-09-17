@@ -18,8 +18,6 @@ namespace mmltk::controller::visual_test_support {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-
-
 struct AnnotationRenderProbe final {
     std::atomic_uint64_t calls{0U};
     std::atomic_uint64_t samples{0U};
@@ -80,7 +78,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
     std::shared_ptr<AnnotationRenderProbe> probe_;
 };
 [[nodiscard]] inline mmltk::frameworks::gpu::BorrowedImageProductReadView hold_annotation_frame(AnnotationSystem& annotation, EventGate& events,
-                                                                                         contracts::AnnotationTool tool) {
+                                                                                                contracts::AnnotationTool tool) {
     const auto edit = annotation.Edit({.edit = {.value = AnnotationToolEdit{tool}}});
     mmltk::testsupport::await_annotation_command(annotation, events, edit.revision);
     mmltk::testsupport::await_annotation_render(annotation, events);
@@ -88,4 +86,4 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
     REQUIRE(retained.valid());
     return retained;
 }
-}
+}  // namespace mmltk::controller::visual_test_support

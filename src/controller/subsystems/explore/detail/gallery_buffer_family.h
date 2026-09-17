@@ -8,7 +8,7 @@
 #include "src/backend/imaging/explore/explore_render_storage.h"
 #include "mmltk/frameworks/reflection/materializer.h"
 namespace mmltk::controller::explore_detail {
-template<class Family>
+template <class Family>
 class GalleryBufferFamily final {
     using Buffer = mmltk::backend::imaging::explore::ExploreHighWaterBuffer;
     template <auto... Members>
@@ -41,15 +41,24 @@ class GalleryBufferFamily final {
         }
     };
     [[nodiscard]] static consteval auto traversal() { return mmltk::frameworks::reflection::materialize<Family>(Materializer{}); }
-public:
+
+   public:
     Family buffers_;
     struct Release final {
         bool all_released = true;
         mmltk::backend::imaging::explore::ExploreStorageStatus failure = 0;
     };
-    template<class Visitor> void Visit(Visitor&& visitor) { traversal().Visit(buffers_, visitor); }
-    template<class Visitor> void Visit(Visitor&& visitor) const { traversal().Visit(buffers_, visitor); }
-    void Bind(mmltk::backend::imaging::explore::ExploreCudaAllocationApi api) noexcept { Visit([api](auto& buffer) { buffer.bind(api); }); }
+    template <class Visitor>
+    void Visit(Visitor&& visitor) {
+        traversal().Visit(buffers_, visitor);
+    }
+    template <class Visitor>
+    void Visit(Visitor&& visitor) const {
+        traversal().Visit(buffers_, visitor);
+    }
+    void Bind(mmltk::backend::imaging::explore::ExploreCudaAllocationApi api) noexcept {
+        Visit([api](auto& buffer) { buffer.bind(api); });
+    }
     [[nodiscard]] Release ResetChecked() noexcept {
         Release result;
         Visit([&result](auto& buffer) {
@@ -65,4 +74,4 @@ public:
         return owned;
     }
 };
-}
+}  // namespace mmltk::controller::explore_detail

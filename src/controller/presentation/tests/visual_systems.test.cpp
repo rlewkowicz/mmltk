@@ -35,8 +35,6 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
-
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -516,5 +514,5 @@ TEST_CASE("Explore Annotation Live and Upscale endpoints complete retained works
     CHECK(backend->contexts_created == backend->contexts_destroyed);
     CHECK(backend->events_created == backend->events_destroyed);
 }
-}
-}
+}  // namespace
+}  // namespace mmltk::controller

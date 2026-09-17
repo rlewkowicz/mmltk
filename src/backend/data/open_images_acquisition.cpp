@@ -479,7 +479,7 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
             {"root", image_root.string()}, {"identity", identity}, {"images", available_image_ids.size()}, {"quarantined", quarantined.size()}};
     });
 }
-}
+}  // namespace
 [[nodiscard]] AcquiredOpenImages acquire_open_images(const BenchmarkCacheLayout& cache, NormalizedAnnotationIndex& index,
                                                      std::vector<QuarantinedImage>* quarantined,
                                                      mmltk::common::concurrency::CancellationObservation cancel_requested, ProgressReporter* progress,
@@ -632,4 +632,4 @@ void complete_open_images_group(const std::filesystem::path& image_root, const s
                                                    {}},
                               std::move(available)};
 }
-}
+}  // namespace mmltk::backend::data::benchmark_internal

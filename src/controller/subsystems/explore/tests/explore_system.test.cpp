@@ -47,8 +47,6 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
-
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -1582,20 +1580,22 @@ TEST_CASE("Explore installs and atomically persists typed live filter preference
     LoadedSettings settings{[settings_events](SettingsSystem::event_type) { settings_events->fetch_add(1U, std::memory_order_acq_rel); }};
     persist_explore_catalog(settings.system(), test_explore_catalog_identity());
     const auto initial_events = settings_events->load(std::memory_order_acquire);
-    (void)settings.system().Update(settings.system().explore_settings_candidate(), {.preferences = mmltk::controller::ExploreFilterUpdate{
-            .filter =
-                {
-                    .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
-                    .minimum_instances = 1U,
-                    .maximum_instances = 9U,
-                    .minimum_compiled_index = 0U,
-                    .maximum_compiled_index = 2U,
-                    .order = ExploreOrder::Shuffled,
-                    .shuffle_seed = 41U,
-                    .require_boxes = true,
-                },
-            .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}}, .show_boxes = false, .show_masks = true},
-        }});
+    (void)settings.system().Update(
+        settings.system().explore_settings_candidate(),
+        {.preferences = mmltk::controller::ExploreFilterUpdate{
+             .filter =
+                 {
+                     .class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}},
+                     .minimum_instances = 1U,
+                     .maximum_instances = 9U,
+                     .minimum_compiled_index = 0U,
+                     .maximum_compiled_index = 2U,
+                     .order = ExploreOrder::Shuffled,
+                     .shuffle_seed = 41U,
+                     .require_boxes = true,
+                 },
+             .overlay = {.class_selection = {.mode = ExploreClassSelectionMode::Subset, .classes = {1U}}, .show_boxes = false, .show_masks = true},
+         }});
     CHECK(settings_events->load(std::memory_order_acquire) == initial_events + 1U);
     auto backend = std::make_shared<FakeImageBackend>();
     auto commits = std::make_shared<std::atomic_uint64_t>(0U);
@@ -2441,8 +2441,8 @@ TEST_CASE("queued Explore cancellation is finalized by the scheduler callback") 
     auto entered = gate->entered.get_future();
     LoadedSettings settings;
     (void)settings.system().Update(settings.system().explore_settings_candidate(), {.preferences = mmltk::controller::ExploreFilterUpdate{
-                                                       .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 17U},
-                                                   }});
+                                                                                        .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 17U},
+                                                                                    }});
     ExploreScenario scenario{settings, backend,
                              [observed_nproc, commits, gate] { return std::make_unique<TestExploreAlgorithm>(observed_nproc, gate, commits); }};
     auto& explore = scenario.system();
@@ -2473,8 +2473,8 @@ TEST_CASE("post-render Explore cancellation restores the committed gallery produ
         auto commits = std::make_shared<std::atomic_uint64_t>(0U);
         LoadedSettings settings;
         (void)settings.system().Update(settings.system().explore_settings_candidate(), {.preferences = mmltk::controller::ExploreFilterUpdate{
-                                                           .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 19U},
-                                                       }});
+                                                                                            .filter = {.order = ExploreOrder::Shuffled, .shuffle_seed = 19U},
+                                                                                        }});
         ExploreScenario scenario{settings, backend, ExploreScenario::GateAfterRender(gate, commits)};
         auto& explore = scenario.system();
         auto settle_explore = settle_explore_on_exit(explore, gate->release);
@@ -2803,5 +2803,5 @@ TEST_CASE("Explore locality selects automatic budget and preserves explicit over
     CHECK(normalize_explore_parallelism(0, placement) == 2U);
     CHECK(normalize_explore_parallelism(8, placement) == 8U);
 }
-}
-}
+}  // namespace
+}  // namespace mmltk::controller

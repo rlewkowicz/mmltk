@@ -43,12 +43,6 @@ target_link_libraries(mmltk_backend_ml_cuda
 )
 mmltk_enable_torch(mmltk_backend_ml_cuda PRIVATE)
 mmltk_link_declarations(mmltk_backend_ml_cuda PUBLIC mmltk::backend::ml::torch_dependencies)
-set_target_properties(mmltk_backend_ml_cuda PROPERTIES
-    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    CUDA_SEPARABLE_COMPILATION ON
-)
-
 mmltk_target_precompiled_headers(mmltk_backend_ml_cuda std torch)
 
 function(mmltk_add_backend_ml_cuda_tests)
@@ -65,7 +59,7 @@ function(mmltk_add_backend_ml_cuda_tests)
     )
     target_link_libraries(mmltk_backend_ml_cuda_tests PRIVATE
         mmltk_frameworks_gpu_test_support
-        mmltk_test_support
+        mmltk_backend_ml_torch_test_support
         mmltk::backend::ml::cuda
         CUDA::cudart
     )

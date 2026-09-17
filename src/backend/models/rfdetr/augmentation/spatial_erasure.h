@@ -7,7 +7,6 @@
 #include "src/backend/imaging/sampling.h"
 namespace mmltk::backend::models::rfdetr::augment_math {
 inline constexpr std::uint64_t kGoldenRatio = 0x9e3779b97f4a7c15ULL;
-
 [[nodiscard]] __host__ __device__ __forceinline__ float uniform01(const std::uint64_t key, const std::uint64_t counter) {
     return static_cast<float>((mmltk::common::math::deterministic_mix64(key + counter * kGoldenRatio) >> 40U) & 0xFFFFFFULL) * (1.0F / 16777216.0F);
 }

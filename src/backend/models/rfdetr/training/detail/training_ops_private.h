@@ -240,5 +240,6 @@ struct RoutedTrainingLoss {
 };
 torch::Tensor loss_value_or_zero(const TensorMap&, const torch::Device&, std::string_view);
 scalar_packet::Tensors ordinary_scalar_tensors(const TensorMap&, const torch::Tensor&, const torch::Tensor&);
-RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel&, TrainingSupervisionRoute, const ModelOutputs&, const PreparedTargets&, const DeviceLossNormalizer&, const DetectionConfig&);
+RoutedTrainingLoss compute_routed_training_loss(NativeRfDetrModel&, TrainingSupervisionRoute, const ModelOutputs&, const PreparedTargets&,
+                                                const DeviceLossNormalizer&, const DetectionConfig&);
 }  // namespace mmltk::backend::models::rfdetr

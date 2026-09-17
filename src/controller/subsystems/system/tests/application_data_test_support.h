@@ -185,7 +185,6 @@ class BlockingInspectRuntime final : public DatasetRuntime {
     void Leave() noexcept { --observation_->active_calls; }
     std::shared_ptr<DatasetRuntimeObservation> observation_;
 };
-
 template <class Event>
 class TerminalSequence final {
    public:

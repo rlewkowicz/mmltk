@@ -19,7 +19,6 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-
 class UnusedWeightOperations final : public services::ArtifactWeightOperations {
    public:
     [[nodiscard]] std::optional<services::ArtifactWeightAsset> find(std::string_view) const override { return std::nullopt; }
@@ -147,5 +146,5 @@ TEST_CASE("compilation captures its perceptual selection independently of augmen
     CHECK_FALSE(next->perceptual_downscale);
     CHECK(captured->perceptual_downscale);
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

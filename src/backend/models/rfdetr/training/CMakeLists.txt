@@ -26,28 +26,20 @@ mmltk_register_public_headers(
         telemetry_writer.h
         checkpoint.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_training detail/evaluation_runtime.h)
-foreach(_mmltk_training_partition IN ITEMS
-        checkpoint.cppm)
-    mmltk_register_retained_module_providers(
-        mmltk_backend_models_rfdetr_training "${_mmltk_training_partition}")
-endforeach()
-mmltk_register_retained_module_implementation_units(
-    mmltk_backend_models_rfdetr_training
-    checkpoint.cpp
-)
 mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_training
+    checkpoint.cpp
     checkpoint_io.cpp
     evaluation_run_owner.cpp
     evaluation_runtime.cpp
     gpu_augment.cpp
-    native_optimizer.cpp
     target_builder.cpp
     train.cpp
     training_lanes.cpp
     training_snapshot.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_training
+    native_optimizer.cpp
     training_partition.cpp
     training_metrics.cpp
     training_ops.cpp
@@ -100,11 +92,13 @@ mmltk_target_precompiled_headers(mmltk_backend_models_rfdetr_training std torch)
 function(mmltk_add_backend_models_rfdetr_training_tests)
     set(sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/distributed_placement.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_supervision.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_supervision.test.cpp)
+    set(ordinary_sources
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/weight_artifact_resolution.test.cpp)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         list(APPEND sources
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint.test.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint.test.cpp)
+        list(APPEND ordinary_sources
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/checkpoint_parity.test.cpp)
     endif()
     add_executable(mmltk_backend_models_rfdetr_training_tests
@@ -119,6 +113,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk_backend_models_rfdetr_training_tests ${sources})
     mmltk_register_ordinary_sources(
         mmltk_backend_models_rfdetr_training_tests
+        ${ordinary_sources}
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/evaluation_runtime.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/telemetry_writer.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/training_continuation.test.cpp)
@@ -132,7 +127,7 @@ function(mmltk_add_backend_models_rfdetr_training_tests)
         mmltk_backend_models_rfdetr_training_tests PRIVATE
         mmltk_backend_models_rfdetr_augmentation_test_support
         mmltk::backend::models::rfdetr::export
-        mmltk_test_support
+        mmltk_backend_ml_torch_test_support
         mmltk::backend::models::rfdetr::augmentation
         mmltk::backend::models::rfdetr::contract
         mmltk::backend::models::rfdetr::training

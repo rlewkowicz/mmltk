@@ -1,5 +1,4 @@
 module;
-
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "prediction_capacity.h"
@@ -445,14 +444,12 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                         const auto cuda_options = torch::TensorOptions().device(torch::kCUDA, bound_device);
                         const std::array<std::int64_t, 2> boxes_shape{static_cast<std::int64_t>(count), 4};
                         const std::array<std::int64_t, 1> values_shape{static_cast<std::int64_t>(count)};
-                        torch::from_blob(reinterpret_cast<void*>(annotation.boxes_xyxy.address), at::IntArrayRef{boxes_shape},
-                                              cuda_options.dtype(at::kFloat))
+                        torch::from_blob(reinterpret_cast<void*>(annotation.boxes_xyxy.address), at::IntArrayRef{boxes_shape}, cuda_options.dtype(at::kFloat))
                             .copy_(xyxy);
                         torch::from_blob(reinterpret_cast<void*>(annotation.class_references.address), at::IntArrayRef{values_shape},
-                                              cuda_options.dtype(at::kInt))
+                                         cuda_options.dtype(at::kInt))
                             .copy_(labels);
-                        torch::from_blob(reinterpret_cast<void*>(annotation.confidences.address), at::IntArrayRef{values_shape},
-                                              cuda_options.dtype(at::kFloat))
+                        torch::from_blob(reinterpret_cast<void*>(annotation.confidences.address), at::IntArrayRef{values_shape}, cuda_options.dtype(at::kFloat))
                             .copy_(scores.to(at::kFloat));
                         if (processed.masks && annotation.masks.address != 0U) {
                             const auto bytes = count * region.width * region.height;
@@ -461,8 +458,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                             if (annotation.masks.shape.extents[1] != region.height || annotation.masks.shape.extents[2] != region.width)
                                 throw std::invalid_argument("RF-DETR mask storage has wrong geometry");
                             const std::array<std::int64_t, 3> mask_shape{static_cast<std::int64_t>(count), region.height, region.width};
-                            torch::from_blob(reinterpret_cast<void*>(annotation.masks.address), at::IntArrayRef{mask_shape},
-                                                  cuda_options.dtype(torch::kUInt8))
+                            torch::from_blob(reinterpret_cast<void*>(annotation.masks.address), at::IntArrayRef{mask_shape}, cuda_options.dtype(torch::kUInt8))
                                 .copy_((*processed.masks)[0]);
                             annotation.masks_available = true;
                         }

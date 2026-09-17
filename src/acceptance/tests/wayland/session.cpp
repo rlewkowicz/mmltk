@@ -423,8 +423,8 @@ class ArtifactNotifications final {
 }
 void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution) {
     using namespace mmltk::backend::data;
-    const auto plan = DatasetCompiler::prepare({.source_dir = testsupport::dataset_dir(fixture),
-                                                .output_dir = testsupport::compiled_dir(fixture),
+    const auto plan = DatasetCompiler::prepare({.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
+                                                .output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture),
                                                 .split = fixture.split,
                                                 .target_width = resolution,
                                                 .target_height = resolution,
@@ -432,67 +432,66 @@ void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpe
                                                {fixture.split});
     DatasetCompiler::compile(plan, 0U);
 }
-    PreparedWaylandInputs::PreparedWaylandInputs()
-        : root_("mmltk-wayland-inputs"),
-          square_{.root_dir = (root_.path() / "square").string(),
-                  .split = "train",
-                  .width = 768,
-                  .height = 384,
-                  .num_images = 128,
-                  .background_images = 10,
-                  .pixel_evidence = true},
-          mixed_{.root_dir = (root_.path() / "mixed").string(),
-                 .split = "train",
-                 .width = 768,
-                 .height = 384,
-                 .num_images = 300,
-                 .background_images = 10,
-                 .pixel_evidence = true},
-          probe_{.root_dir = (root_.path() / "probe").string(),
-                 .split = "train",
-                 .width = 768,
-                 .height = 384,
-                 .num_images = 3,
-                 .background_images = 0,
-                 .pixel_evidence = true} {
-        using namespace mmltk::backend::data::testsupport;
-        for (const auto* fixture : {&square_, &mixed_}) {
-            create_synthetic_dataset(*fixture);
-            // The top grid edge's image-side sample uses this unpadded background card.
-            replace_synthetic_image(*fixture, 2, 384, 384);
-            replace_synthetic_image(*fixture, 8, 192, 384);
-            replace_synthetic_image(*fixture, 9, 384, 192);
-            replace_synthetic_image(*fixture, 11, 192, 384);
-            const auto split = std::filesystem::path(dataset_dir(*fixture)) / fixture->split;
-            std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
-            std::ofstream dropped_instance{split / "000013.jsonl", std::ios::app};
-            if (!dropped_instance) throw std::runtime_error("cannot prepare dropped-instance compiler evidence");
-            dropped_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
-                             << fixture->width << ',' << fixture->height << "]}\n";
-        }
-        replace_synthetic_image(square_, 1, 384, 384);
-        // This small prerequisite is compiled once. The primary browser owns
-        // the one real 512-pixel compile/control/error workflow.
-        compile_wayland_fixture(square_, 384U);
+PreparedWaylandInputs::PreparedWaylandInputs()
+    : root_("mmltk-wayland-inputs"),
+      square_{.root_dir = (root_.path() / "square").string(),
+              .split = "train",
+              .width = 768,
+              .height = 384,
+              .num_images = 128,
+              .background_images = 10,
+              .pixel_evidence = true},
+      mixed_{.root_dir = (root_.path() / "mixed").string(),
+             .split = "train",
+             .width = 768,
+             .height = 384,
+             .num_images = 300,
+             .background_images = 10,
+             .pixel_evidence = true},
+      probe_{.root_dir = (root_.path() / "probe").string(),
+             .split = "train",
+             .width = 768,
+             .height = 384,
+             .num_images = 3,
+             .background_images = 0,
+             .pixel_evidence = true} {
+    using namespace mmltk::backend::data::testsupport;
+    for (const auto* fixture : {&square_, &mixed_}) {
+        create_synthetic_dataset(*fixture);
+        // The top grid edge's image-side sample uses this unpadded background card.
+        replace_synthetic_image(*fixture, 2, 384, 384);
+        replace_synthetic_image(*fixture, 8, 192, 384);
+        replace_synthetic_image(*fixture, 9, 384, 192);
+        replace_synthetic_image(*fixture, 11, 192, 384);
+        const auto split = std::filesystem::path(dataset_dir(*fixture)) / fixture->split;
+        std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
+        std::ofstream dropped_instance{split / "000013.jsonl", std::ios::app};
+        if (!dropped_instance) throw std::runtime_error("cannot prepare dropped-instance compiler evidence");
+        dropped_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
+                         << fixture->width << ',' << fixture->height << "]}\n";
     }
-
+    replace_synthetic_image(square_, 1, 384, 384);
+    // This small prerequisite is compiled once. The primary browser owns
+    // the one real 512-pixel compile/control/error workflow.
+    compile_wayland_fixture(square_, 384U);
+}
 const mmltk::testsupport::WorkflowWaylandInputs& PreparedWaylandInputs::workflows() {
-        if (!workflows_) workflows_ = std::make_unique<mmltk::testsupport::WorkflowWaylandInputs>(root_.path() / "workflows");
-        return *workflows_;
-    }
+    if (!workflows_) workflows_ = std::make_unique<mmltk::testsupport::WorkflowWaylandInputs>(root_.path() / "workflows");
+    return *workflows_;
+}
 const mmltk::backend::data::testsupport::FixtureSpec& PreparedWaylandInputs::probe() {
-        using namespace mmltk::backend::data::testsupport;
-        if (!std::filesystem::is_regular_file(compiled_bin_path(probe_))) {
-            create_synthetic_dataset(probe_);
-            // Preserve the selected image's exact annotation and six-class
-            // catalog while keeping every input in the initial measured row.
-            std::filesystem::copy_file(std::filesystem::path(dataset_dir(mixed_)) / mixed_.split / "000001.jsonl",
-                                       std::filesystem::path(dataset_dir(probe_)) / probe_.split / "000001.jsonl",
-                                       std::filesystem::copy_options::overwrite_existing);
-            compile_wayland_fixture(probe_, kCompiledResolution);
-        }
-        return probe_;
+    using namespace mmltk::backend::data::testsupport;
+    if (!std::filesystem::is_regular_file(compiled_bin_path(probe_))) {
+        create_synthetic_dataset(probe_);
+        // Preserve the selected image's exact annotation and six-class
+        // catalog while keeping every input in the initial measured row.
+        std::filesystem::copy_file(std::filesystem::path(dataset_dir(mixed_)) / mixed_.split / "000001.jsonl",
+                                   std::filesystem::path(dataset_dir(probe_)) / probe_.split / "000001.jsonl",
+                                   std::filesystem::copy_options::overwrite_existing);
+        compile_wayland_fixture(probe_, kCompiledResolution);
     }
+    return probe_;
+}
 WaylandSession::WaylandSession(std::shared_ptr<PreparedWaylandInputs> inputs, const TerminationMode terminal, std::string profile,
                                const bool diagnostics_enabled, const bool dpi, const bool host_to_device, std::string fault, const bool pixels_enabled,
                                const mmltk::backend::data::testsupport::FixtureSpec* ordinary_fixture)
@@ -593,8 +592,7 @@ void WaylandSession::RunWorkflows() {
         if (frontend_settled_ && surface_audit.evidence_settled()) break;
         if (browser.phase_progress_revision != progress) {
             progress = browser.phase_progress_revision;
-            arm_timerfd(deadline.get(), browser.phase_progress_class == "work" ? kWaylandWorkDeadline : kWaylandInteractionDeadline,
-                        "workflow phase progress");
+            arm_timerfd(deadline.get(), browser.phase_progress_class == "work" ? kWaylandWorkDeadline : kWaylandInteractionDeadline, "workflow phase progress");
         }
         std::array<pollfd, 4U> waits{{
             {.fd = process.pidfd(), .events = POLLIN, .revents = 0},
@@ -1624,7 +1622,5 @@ void WaylandSession::AdvanceScenario() {
     }
     return inputs;
 }
-
 WaylandSession::~WaylandSession() = default;
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

@@ -1,16 +1,20 @@
 //! Effect-only integration reporting. Payloads enter here before collection.
+use super::lifecycle::{
+    BENCHMARK_OVERRIDE, COMPILE_DATASET, DATASET_BROWSE, TRAIN_MODEL_CARD, advanced_layout_field,
+};
+use super::retained::EXPLORE_OPEN;
 use crate::generated::FeatureId;
-use crate::integration_control::{Driver, EXPLORE_GALLERY, EXPLORE_UPSCALE_ACTIONS, Phase, probe, reporting_enabled, retained};
+#[cfg(test)]
+use crate::integration_control::initialize_reporting;
 use crate::integration_control::pixel_checks::sampleable_presentation;
 use crate::integration_control::probe::current_receipt;
+use crate::integration_control::{
+    Driver, EXPLORE_GALLERY, EXPLORE_UPSCALE_ACTIONS, Phase, probe, reporting_enabled, retained,
+};
 use crate::view::explore;
 use crate::view_model::ApplicationModel;
 use iced::Rectangle;
-use super::retained::EXPLORE_OPEN;
-use super::lifecycle::{advanced_layout_field, COMPILE_DATASET, DATASET_BROWSE, TRAIN_MODEL_CARD, BENCHMARK_OVERRIDE};
 use std::cell::RefCell;
-#[cfg(test)]
-use crate::integration_control::initialize_reporting;
 
 pub(crate) fn metric_projection(label: &str, positions: &[[f64; 2]]) {
     emit(|sink| {
@@ -752,13 +756,15 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::{Capture, STYLES};
-    use crate::integration_control::retained::EXPLORE_OPEN;
-    use crate::integration_control::lifecycle::{BENCHMARK_OVERRIDE, TRAIN_MODEL_CARD};
-    use crate::view::explore;
-    use crate::integration_control::{COMPLETION_WITHOUT_INPUT, Controller, EXPLORE_GALLERY, Message, Phase};
     use crate::generated::FeatureId;
-    use iced::Rectangle;
     use crate::generated::{ExploreMode, ExploreOrder, IntegrationControlKind};
+    use crate::integration_control::lifecycle::{BENCHMARK_OVERRIDE, TRAIN_MODEL_CARD};
+    use crate::integration_control::retained::EXPLORE_OPEN;
+    use crate::integration_control::{
+        COMPLETION_WITHOUT_INPUT, Controller, EXPLORE_GALLERY, Message, Phase,
+    };
+    use crate::view::explore;
+    use iced::Rectangle;
     use std::cell::Cell;
 
     #[test]
@@ -1368,7 +1374,9 @@ mod tests {
             vec![expected(IntegrationControlKind::Settled, 10, 0, "")]
         );
         let failure_line = line!() + 1;
-        driver.driver.fail("Protocol: Invalid snapshot: inconsistent frame revision");
+        driver
+            .driver
+            .fail("Protocol: Invalid snapshot: inconsistent frame revision");
         assert_eq!(driver.driver.failure_line, failure_line);
         driver.publish_control(&mut connection);
         wire.clear();
@@ -1431,4 +1439,3 @@ impl Drop for Capture {
         initialize_reporting(false, false);
     }
 }
-

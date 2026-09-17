@@ -1,9 +1,9 @@
 #include "src/backend/models/rfdetr/contract/cli.h"
+#include "checkpoint.h"
 #include "detail/training_snapshot.h"
 #include "detail/checkpoint_private.h"
 #include "src/backend/ml/torch/archive.h"
 #include <stdexcept>
-import mmltk.backend.models.rfdetr.training.checkpoint;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
 namespace torch_cuda = mmltk::backend::ml::cuda;
@@ -46,8 +46,8 @@ ModelStateLoadSummary load_training_model_weights(NativeRfDetrModel& model, cons
     return summary;
 }
 void save_collected_checkpoint(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, const NativeRfDetrModel& model,
-                               const std::unordered_map<std::string, torch::Tensor>* parameter_overrides, const char* save_profile,
-                               const char* collect_profile, const std::filesystem::path& explicit_descriptor) {
+                               const std::unordered_map<std::string, torch::Tensor>* parameter_overrides, const char* save_profile, const char* collect_profile,
+                               const std::filesystem::path& explicit_descriptor) {
     mmltk::common::logging::ScopedProfile save{save_profile};
     DecodedNativeModelState checkpoint;
     checkpoint.metadata = metadata;
@@ -188,14 +188,20 @@ void TrainingSnapshot::prepare_ema(const std::vector<std::string>& names, const 
     if (ema) ema_ = ema_state_entries(names, *ema);
     detail::reserve_state_archive(ema_, readback_, ordinary_.size());
 }
-void TrainingSnapshot::save_weights(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, bool selected, const std::filesystem::path& descriptor) {
+void TrainingSnapshot::save_weights(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, bool selected,
+                                    const std::filesystem::path& descriptor) {
     static const std::vector<NormalizedModelStateEntry> no_ema;
     save_snapshot_checkpoint(path, metadata, ordinary_, selected ? ema_ : no_ema, readback_, descriptor);
 }
 void TrainingSnapshot::save_resume(const std::filesystem::path& path, const NativeCheckpointMetadata& metadata, const NativeOptimizer& optimizer,
-                                  const GradScaler& scaler, const TrainRequest& options, int epoch, double best_regular, double best_ema,
-                                  int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor) {
-    save_resume_checkpoint(path, metadata, optimizer, scaler, options, epoch, best_regular, best_ema, ema_completed_updates, ordinary_, ema_, attempt_id, descriptor, readback_);
+                                   const GradScaler& scaler, const TrainRequest& options, int epoch, double best_regular, double best_ema,
+                                   int64_t ema_completed_updates, std::string_view attempt_id, const std::filesystem::path& descriptor) {
+    save_resume_checkpoint(path, metadata, optimizer, scaler, options, epoch, best_regular, best_ema, ema_completed_updates, ordinary_, ema_, attempt_id,
+                           descriptor, readback_);
 }
-void TrainingSnapshot::release() { readback_.Release(); ordinary_.clear(); ema_.clear(); }
+void TrainingSnapshot::release() {
+    readback_.Release();
+    ordinary_.clear();
+    ema_.clear();
 }
+}  // namespace mmltk::backend::models::rfdetr

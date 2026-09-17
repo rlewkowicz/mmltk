@@ -1,5 +1,4 @@
-module;
-
+#include "checkpoint.h"
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -14,7 +13,6 @@ module;
 #include <torch/types.h>
 #include <torch/serialize.h>
 #include "detail/checkpoint_private.h"
-module mmltk.backend.models.rfdetr.training.checkpoint;
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {

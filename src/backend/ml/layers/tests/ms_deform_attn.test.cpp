@@ -1,9 +1,6 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/ml/layers/ms_deform_attn.h"
 #include <torch/torch.h>
-#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
-#undef CHECK
-#endif
-#include <catch2/catch_test_macros.hpp>
 #include "src/test_support/cuda_test_utils.hpp"
 namespace {
 void test_cuda_ms_deform_attn_matches_reference() {

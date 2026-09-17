@@ -6,7 +6,6 @@
 #include <utility>
 #include "src/backend/models/rfdetr/contract/model_config.h"
 #include "src/backend/models/rfdetr/core/class_layout.h"
-
 #include "model_state_load.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include "src/backend/models/rfdetr/contract/training_supervision.h"
@@ -20,7 +19,6 @@ struct NestedTensor {
     [[nodiscard]] std::pair<torch::Tensor, torch::Tensor> decompose() const;
 };
 NestedTensor nested_tensor_from_tensor_list(const std::vector<torch::Tensor>& tensor_list);
-
 class NativeRfDetrModel final {
    public:
     explicit NativeRfDetrModel(const NativeRfDetrConfig& config = {}, ModelClassLayout layout = {});
@@ -35,12 +33,11 @@ class NativeRfDetrModel final {
     void optimize_for_inference(std::int32_t batch_size = 1, bool for_training = false, CompilationMode mode = CompilationMode::kSelective);
     [[nodiscard]] ModelOutputs forward(const NestedTensor& batch, bool include_masks);
     [[nodiscard]] ModelOutputs forward_for_match_free(const NestedTensor& batch);
-    [[nodiscard]] ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets,
-                                                              const TrainingStepIdentity& identity);
+    [[nodiscard]] ModelOutputs forward_with_denoising(const NestedTensor& batch, const PreparedTargets& targets, const TrainingStepIdentity& identity);
     void initialize_training_supervision(std::uint64_t request_seed);
     void replicate_training_supervision_runtime_from(const NativeRfDetrModel& source);
     [[nodiscard]] TrainingLoss supervision_loss(const ModelOutputs& outputs, const PreparedTargets& targets, const DeviceLossNormalizer& normalizer,
-                                                        bool training_mode);
+                                                bool training_mode);
     void configure_supervision_timing(const SupervisionTimingSetup& setup);
     void begin_supervised_step_timing();
     void end_supervised_step_timing();
@@ -48,13 +45,12 @@ class NativeRfDetrModel final {
     void end_criterion_timing();
     [[nodiscard]] SupervisionTimingHandoff harvest_supervision_timing();
     [[nodiscard]] ModelStateLoadSummary load_normalized_state(const std::vector<NormalizedModelStateEntry>& state, bool strict,
-                                                                      const ModelClassLayout* admitted_layout = nullptr);
+                                                              const ModelClassLayout* admitted_layout = nullptr);
     [[nodiscard]] detail::NormalizedModelStateCandidate stage_normalized_state(const std::vector<NormalizedModelStateEntry>& state,
                                                                                detail::NormalizedModelStateAdmission admission,
                                                                                const ResolvedClassLayout* source_layout = nullptr);
     void commit_normalized_state(detail::NormalizedModelStateCandidate candidate);
     void set_force_pytorch_deformable_attn(bool value);
-
     void train(bool enabled = true);
     void eval();
     [[nodiscard]] bool is_training() const noexcept;

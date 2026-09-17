@@ -284,8 +284,7 @@ bool LiveManualOverlayWorker::render_snapshot(const ManualOverlayDocumentSnapsho
                                               .stream = slot.stream}));
             has_content = true;
         }
-        if (snapshot.renderer_mode != SemanticRenderer::Iced && !instance.skeleton_edges.empty() && !instance.points.empty() &&
-            status == cudaSuccess) {
+        if (snapshot.renderer_mode != SemanticRenderer::Iced && !instance.skeleton_edges.empty() && !instance.points.empty() && status == cudaSuccess) {
             status = scope.Record(raster::raster_skeleton_rgba(
                 {.overlay = target,
                  .points = {reinterpret_cast<const int*>(slot.points.device + packed.point_value_offset * sizeof(int)),

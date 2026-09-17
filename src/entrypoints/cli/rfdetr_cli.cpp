@@ -33,21 +33,21 @@
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/models/rfdetr/contract/cli.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
+#include "src/backend/models/rfdetr/core/model_state.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/models/rfdetr/training/training_partition.h"
 #include "src/backend/models/rfdetr/training/train.h"
+#include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/common/system/runtime_paths.h"
 #include "src/controller/services/train_command.h"
 #include "src/frameworks/reflection/field_policy.h"
 #include "src/frameworks/reflection/reflected_descriptors.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
-
 import mmltk.backend.models.rfdetr.model_export;
 import mmltk.backend.models.rfdetr.inference.analysis_provider;
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.inference.runtime_backend;
-import mmltk.backend.models.rfdetr.training.checkpoint;
 import mmltk.common.logging.mmltk_logging;
 namespace data = mmltk::backend::data;
 namespace logging = mmltk::common::logging;

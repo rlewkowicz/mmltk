@@ -10,25 +10,26 @@ namespace mmltk::controller::services {
 namespace {
 using FileDialogDescriptorStorage = std::inplace_vector<FileDialogDescriptor, kFileDialogCatalogCapacity>;
 void append_model_artifact_dialogs(FileDialogDescriptorStorage& dialogs) {
-    mmltk::controller::contracts::ModelSelectionRelation::VisitRows([&]<class Relation>(
-                                                                        const mmltk::controller::contracts::ModelSelectionCompatibility& compatibility) {
-        if (!compatibility.custom_allowed) return;
-        constexpr auto artifact_path = mmltk::frameworks::reflection::reflected_member_path<mmltk::controller::contracts::GuiSettingsState, Relation::artifact>();
-        const std::uint64_t stable_id = mmltk::controller::browser::application_settings_field_stable_id(artifact_path.view());
-        if (std::ranges::any_of(dialogs, [stable_id](const auto& dialog) { return dialog.stable_id == stable_id; })) return;
-        if (dialogs.size() == dialogs.capacity()) throw std::logic_error("file-dialog declarations exceed fixed catalog capacity");
-        FileDialogDescriptor descriptor{};
-        descriptor.stable_id = stable_id;
-        descriptor.field_path = decltype(descriptor.field_path)::From(artifact_path.view());
-        descriptor.workflows.workflows[0] = compatibility.workflow;
-        descriptor.workflows.count = 1U;
-        descriptor.mode = mmltk::controller::contracts::FileDialogMode::OpenFile;
-        descriptor.model_input = compatibility.input;
-        descriptor.title = decltype(descriptor.title)::From(compatibility.dialog_title);
-        descriptor.filter.name = decltype(descriptor.filter.name)::From(compatibility.dialog_filter);
-        descriptor.filter.pattern = decltype(descriptor.filter.pattern)::From(compatibility.dialog_pattern);
-        dialogs.push_back(std::move(descriptor));
-    });
+    mmltk::controller::contracts::ModelSelectionRelation::VisitRows(
+        [&]<class Relation>(const mmltk::controller::contracts::ModelSelectionCompatibility& compatibility) {
+            if (!compatibility.custom_allowed) return;
+            constexpr auto artifact_path =
+                mmltk::frameworks::reflection::reflected_member_path<mmltk::controller::contracts::GuiSettingsState, Relation::artifact>();
+            const std::uint64_t stable_id = mmltk::controller::browser::application_settings_field_stable_id(artifact_path.view());
+            if (std::ranges::any_of(dialogs, [stable_id](const auto& dialog) { return dialog.stable_id == stable_id; })) return;
+            if (dialogs.size() == dialogs.capacity()) throw std::logic_error("file-dialog declarations exceed fixed catalog capacity");
+            FileDialogDescriptor descriptor{};
+            descriptor.stable_id = stable_id;
+            descriptor.field_path = decltype(descriptor.field_path)::From(artifact_path.view());
+            descriptor.workflows.workflows[0] = compatibility.workflow;
+            descriptor.workflows.count = 1U;
+            descriptor.mode = mmltk::controller::contracts::FileDialogMode::OpenFile;
+            descriptor.model_input = compatibility.input;
+            descriptor.title = decltype(descriptor.title)::From(compatibility.dialog_title);
+            descriptor.filter.name = decltype(descriptor.filter.name)::From(compatibility.dialog_filter);
+            descriptor.filter.pattern = decltype(descriptor.filter.pattern)::From(compatibility.dialog_pattern);
+            dialogs.push_back(std::move(descriptor));
+        });
 }
 }  // namespace
 FileDialogCatalog FileDialogCatalog::Build() {

@@ -18,7 +18,10 @@ bool remove_directory_entries(DIR* directory, CleanupPolicy policy, Remove remov
         errno = 0;
         dirent* entry = ::readdir(directory);
         if (entry == nullptr) {
-            if (errno != 0) { assign_errno(error); return false; }
+            if (errno != 0) {
+                assign_errno(error);
+                return false;
+            }
             return true;
         }
         if (is_dot_entry(entry->d_name)) continue;
@@ -77,8 +80,8 @@ bool remove_directory_entries(DIR* directory, CleanupPolicy policy, Remove remov
         assign_errno(error, ESTALE);
         return false;
     }
-    if (!remove_directory_entries(directory, CleanupPolicy::FailFast,
-            [&](const char* child) { return remove_entry_at(directory_fd, child, root_device, error); }, error)) {
+    if (!remove_directory_entries(
+            directory, CleanupPolicy::FailFast, [&](const char* child) { return remove_entry_at(directory_fd, child, root_device, error); }, error)) {
         const std::error_code saved = error;
         ::closedir(directory);
         error = saved;
@@ -117,11 +120,15 @@ void remove_path_recursively_best_effort(const std::filesystem::path& path) noex
         }
         DIR* directory = ::opendir(path.c_str());
         if (directory != nullptr) {
-            static_cast<void>(remove_directory_entries(directory, CleanupPolicy::BestEffort,
+            static_cast<void>(remove_directory_entries(
+                directory, CleanupPolicy::BestEffort,
                 [&](const char* child) noexcept {
-                    try { remove_path_recursively_best_effort(path / child); return true; }
-                    catch (...) { return false; }
-                }, error));
+                    try {
+                        remove_path_recursively_best_effort(path / child);
+                        return true;
+                    } catch (...) { return false; }
+                },
+                error));
             static_cast<void>(::closedir(directory));
         }
         static_cast<void>(::rmdir(path.c_str()));

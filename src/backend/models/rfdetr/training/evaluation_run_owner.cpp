@@ -9,7 +9,6 @@
 #include <random>
 #include <spdlog/spdlog.h>
 #include "spdmon/spdmon.hpp"
-
 #include "src/backend/models/rfdetr/core/evaluator.h"
 #include <ATen/Context.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -54,7 +53,6 @@ import mmltk.common.logging.profile_utils;
 import mmltk.common.logging.mmltk_logging;
 namespace mmltk::backend::models::rfdetr {
 using mmltk::common::math::checked_cast;
-
 struct TrainingEvaluationRunOwner::Impl final {
     explicit Impl(EvaluationRunConfig value) : config(std::move(value)) {
         if (config.batch_capacity == 0U || config.prediction_capacity == 0U || config.lane_count == 0U || config.slots_per_lane == 0U ||
@@ -420,9 +418,8 @@ ModelOutputs narrow_model_outputs_batch(const ModelOutputs& outputs, int64_t cou
 }
 struct TrainingValidationRuntime::Impl {
    public:
-    Impl(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader,
-                              size_t batch_size, bool enable_loss, EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name,
-                              const bool query_count_automatic)
+    Impl(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader, size_t batch_size, bool enable_loss,
+         EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name, const bool query_count_automatic)
         : runtime_(runtime),
           loader_(std::move(loader)),
           batch_size_(std::max<size_t>(1, batch_size)),
@@ -495,22 +492,25 @@ struct TrainingValidationRuntime::Impl {
     bool query_count_automatic_ = false;
     bool amp_enabled_ = false;
 };
-TrainingValidationRuntime::TrainingValidationRuntime(const TrainRequest& options, RuntimeContext& runtime, std::unique_ptr<mmltk::backend::data::DatasetLoader> loader,
-                              size_t batch_size, bool enable_loss, EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name,
-                              const bool query_count_automatic) : impl_(std::make_unique<Impl>(options, runtime, std::move(loader), batch_size, enable_loss, metric_set, prediction_capacity, std::move(split_name), query_count_automatic)) {}
+TrainingValidationRuntime::TrainingValidationRuntime(const TrainRequest& options, RuntimeContext& runtime,
+                                                     std::unique_ptr<mmltk::backend::data::DatasetLoader> loader, size_t batch_size, bool enable_loss,
+                                                     EvaluationMetricSet metric_set, const int64_t prediction_capacity, std::string split_name,
+                                                     const bool query_count_automatic)
+    : impl_(std::make_unique<Impl>(options, runtime, std::move(loader), batch_size, enable_loss, metric_set, prediction_capacity, std::move(split_name),
+                                   query_count_automatic)) {}
 TrainingValidationRuntime::~TrainingValidationRuntime() = default;
-void TrainingValidationRuntime::begin_pass()  { impl_->begin_pass(); }
-torch::Tensor TrainingValidationRuntime::preprocess(const mmltk::backend::data::Batch& batch)  { return impl_->preprocess(batch); }
-void TrainingValidationRuntime::record_preprocess_consumer(cudaStream_t stream)  { impl_->record_preprocess_consumer(stream); }
-RuntimeContext& TrainingValidationRuntime::runtime()  { return impl_->runtime(); }
+void TrainingValidationRuntime::begin_pass() { impl_->begin_pass(); }
+torch::Tensor TrainingValidationRuntime::preprocess(const mmltk::backend::data::Batch& batch) { return impl_->preprocess(batch); }
+void TrainingValidationRuntime::record_preprocess_consumer(cudaStream_t stream) { impl_->record_preprocess_consumer(stream); }
+RuntimeContext& TrainingValidationRuntime::runtime() { return impl_->runtime(); }
 size_t TrainingValidationRuntime::batch_size() const { return impl_->batch_size(); }
-mmltk::backend::data::DatasetLoader& TrainingValidationRuntime::loader()  { return impl_->loader(); }
+mmltk::backend::data::DatasetLoader& TrainingValidationRuntime::loader() { return impl_->loader(); }
 const std::vector<int>& TrainingValidationRuntime::image_ids() const { return impl_->image_ids(); }
 bool TrainingValidationRuntime::amp_enabled() const noexcept { return impl_->amp_enabled(); }
 at::ScalarType TrainingValidationRuntime::inference_dtype() const noexcept { return impl_->inference_dtype(); }
 torch::Tensor TrainingValidationRuntime::nested_mask() const { return impl_->nested_mask(); }
-TargetScratch& TrainingValidationRuntime::target_scratch()  { return impl_->target_scratch(); }
-mmltk::common::concurrency::WorkerPool& TrainingValidationRuntime::lane_pool()  { return impl_->lane_pool(); }
+TargetScratch& TrainingValidationRuntime::target_scratch() { return impl_->target_scratch(); }
+mmltk::common::concurrency::WorkerPool& TrainingValidationRuntime::lane_pool() { return impl_->lane_pool(); }
 TrainingEvaluationRunOwner& TrainingValidationRuntime::evaluation_run() noexcept { return impl_->evaluation_run(); }
 std::string_view TrainingValidationRuntime::split_name() const noexcept { return impl_->split_name(); }
 std::size_t TrainingValidationRuntime::detection_limit() const noexcept { return impl_->detection_limit().as_size; }
@@ -677,10 +677,8 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
                                                     SupervisionTimingLease::Kind::Criterion);
             if (match_free_loss) {
                 const auto target_count = torch::tensor({static_cast<float>(prepared_target_count(*prepared))},
-                                                            torch::TensorOptions().dtype(torch::kFloat32).device(inference_input.device()));
-                loss = (model)
-                           .supervision_loss(*evaluated_outputs, *prepared, DeviceLossNormalizer{target_count.select(0, 0)}, false)
-                           .total;
+                                                        torch::TensorOptions().dtype(torch::kFloat32).device(inference_input.device()));
+                loss = (model).supervision_loss(*evaluated_outputs, *prepared, DeviceLossNormalizer{target_count.select(0, 0)}, false).total;
             } else {
                 TensorMap loss_dict;
                 {

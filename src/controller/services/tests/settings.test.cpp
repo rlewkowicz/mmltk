@@ -1451,7 +1451,8 @@ void test_explore_preview_candidate_is_atomic_and_persists_native_modes() {
     CHECK(detail.augmentation_preview_enabled);
     CHECK(detail.show_original_dimensions);
     CHECK_THROWS_AS(settings.Update(initial, {.preferences = mmltk::controller::ExploreFilterUpdate{}}), mmltk::controller::contracts::BusyError);
-    const auto filtered = settings.Update(detail, {.preferences = mmltk::controller::ExploreFilterUpdate{.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false}}});
+    const auto filtered =
+        settings.Update(detail, {.preferences = mmltk::controller::ExploreFilterUpdate{.filter = {.minimum_instances = 1U}, .overlay = {.show_boxes = false}}});
     CHECK(filtered.version > detail.version);
     CHECK(filtered.preferences.policy.filter.minimum_instances == 1U);
     CHECK_FALSE(filtered.preferences.policy.overlay.show_boxes);
@@ -1505,28 +1506,60 @@ void test_apply_current_copy_paste_preference() {
 }  // namespace
 TEST_CASE("test_ui_settings_round_trip", "[gui][settings]") { test_ui_settings_round_trip(); }
 TEST_CASE("test_schema_v8_recipe_golden_shape_and_round_trip", "[gui][settings]") { test_schema_v8_recipe_golden_shape_and_round_trip(); }
-TEST_CASE("test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved", "[gui][settings]") { test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved(); }
-TEST_CASE("test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically", "[gui][settings]") { test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically(); }
+TEST_CASE("test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved", "[gui][settings]") {
+    test_schema_v8_nonuniform_recipe_and_every_missing_member_are_preserved();
+}
+TEST_CASE("test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically", "[gui][settings]") {
+    test_schema_v8_recipe_placement_and_unknown_fields_repair_canonically();
+}
 TEST_CASE("test_schema_v8_recipe_scheduler_compatibility", "[gui][settings]") { test_schema_v8_recipe_scheduler_compatibility(); }
 TEST_CASE("test_schema_v8_recipe_optimizer_compatibility", "[gui][settings]") { test_schema_v8_recipe_optimizer_compatibility(); }
-TEST_CASE("test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic", "[gui][settings]") { test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic(); }
+TEST_CASE("test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic", "[gui][settings]") {
+    test_schema_v8_recipe_malformed_and_constraint_rejection_is_atomic();
+}
 TEST_CASE("test_fresh_defaults_use_capture_only_annotate", "[gui][settings]") { test_fresh_defaults_use_capture_only_annotate(); }
 TEST_CASE("test_model_input_load_normalizes_invalid_values_by_workflow", "[gui][settings]") { test_model_input_load_normalizes_invalid_values_by_workflow(); }
-TEST_CASE("test_persistence_rejects_unsupported_schema_and_malformed_files", "[gui][settings]") { test_persistence_rejects_unsupported_schema_and_malformed_files(); }
+TEST_CASE("test_persistence_rejects_unsupported_schema_and_malformed_files", "[gui][settings]") {
+    test_persistence_rejects_unsupported_schema_and_malformed_files();
+}
 // CLEANUP-IGNORE: Each named settings behavior remains independently registered with the native test inventory.
-TEST_CASE("test_persistence_repairs_catalog_and_compiled_directory_defaults", "[gui][settings]") { test_persistence_repairs_catalog_and_compiled_directory_defaults(); }
+TEST_CASE("test_persistence_repairs_catalog_and_compiled_directory_defaults", "[gui][settings]") {
+    test_persistence_repairs_catalog_and_compiled_directory_defaults();
+}
 TEST_CASE("test_bounded_flat_settings_mutation_is_atomic", "[gui][settings]") { test_bounded_flat_settings_mutation_is_atomic(); }
-TEST_CASE("test_catalog_source_transition_normalizes_model_input_at_the_native_boundary", "[gui][settings]") { test_catalog_source_transition_normalizes_model_input_at_the_native_boundary(); }
-TEST_CASE("test_model_selection_settings_validation_exhausts_canonical_compatibility", "[gui][settings]") { test_model_selection_settings_validation_exhausts_canonical_compatibility(); }
+TEST_CASE("test_catalog_source_transition_normalizes_model_input_at_the_native_boundary", "[gui][settings]") {
+    test_catalog_source_transition_normalizes_model_input_at_the_native_boundary();
+}
+TEST_CASE("test_model_selection_settings_validation_exhausts_canonical_compatibility", "[gui][settings]") {
+    test_model_selection_settings_validation_exhausts_canonical_compatibility();
+}
 TEST_CASE("test_gui_json_persistence_enforces_reflected_field_policies", "[gui][settings]") { test_gui_json_persistence_enforces_reflected_field_policies(); }
-TEST_CASE("test_explore_class_capacity_is_canonical_across_persistence_and_reflection", "[gui][settings]") { test_explore_class_capacity_is_canonical_across_persistence_and_reflection(); }
-TEST_CASE("test_explore_settings_projection_covers_every_scalar_in_both_directions", "[gui][settings]") { test_explore_settings_projection_covers_every_scalar_in_both_directions(); }
-TEST_CASE("test_explore_class_catalog_identity_is_ordered_and_deterministic", "[gui][settings]") { test_explore_class_catalog_identity_is_ordered_and_deterministic(); }
-TEST_CASE("test_explore_class_catalog_identity_rejects_generic_settings_mutation", "[gui][settings]") { test_explore_class_catalog_identity_rejects_generic_settings_mutation(); }
-TEST_CASE("test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically", "[gui][settings]") { test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically(); }
-TEST_CASE("test_training_supervision_relation_is_enforced_by_generic_settings_validity", "[gui][settings][training_supervision]") { test_training_supervision_relation_is_enforced_by_generic_settings_validity(); }
-TEST_CASE("test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection", "[gui][settings][training_supervision]") { test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection(); }
-TEST_CASE("test_startup_transport_override_is_session_local_in_both_directions", "[gui][settings]") { test_startup_transport_override_is_session_local_in_both_directions(); }
-TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", "[gui][settings][explore]") { test_explore_preview_candidate_is_atomic_and_persists_native_modes(); }
+TEST_CASE("test_explore_class_capacity_is_canonical_across_persistence_and_reflection", "[gui][settings]") {
+    test_explore_class_capacity_is_canonical_across_persistence_and_reflection();
+}
+TEST_CASE("test_explore_settings_projection_covers_every_scalar_in_both_directions", "[gui][settings]") {
+    test_explore_settings_projection_covers_every_scalar_in_both_directions();
+}
+TEST_CASE("test_explore_class_catalog_identity_is_ordered_and_deterministic", "[gui][settings]") {
+    test_explore_class_catalog_identity_is_ordered_and_deterministic();
+}
+TEST_CASE("test_explore_class_catalog_identity_rejects_generic_settings_mutation", "[gui][settings]") {
+    test_explore_class_catalog_identity_rejects_generic_settings_mutation();
+}
+TEST_CASE("test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically", "[gui][settings]") {
+    test_opaque_recipe_mask_rejects_generic_settings_mutation_atomically();
+}
+TEST_CASE("test_training_supervision_relation_is_enforced_by_generic_settings_validity", "[gui][settings][training_supervision]") {
+    test_training_supervision_relation_is_enforced_by_generic_settings_validity();
+}
+TEST_CASE("test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection", "[gui][settings][training_supervision]") {
+    test_schema_v8_training_supervision_round_trip_defaults_and_atomic_rejection();
+}
+TEST_CASE("test_startup_transport_override_is_session_local_in_both_directions", "[gui][settings]") {
+    test_startup_transport_override_is_session_local_in_both_directions();
+}
+TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", "[gui][settings][explore]") {
+    test_explore_preview_candidate_is_atomic_and_persists_native_modes();
+}
 TEST_CASE("test_copy_paste_default_and_persisted_overrides", "[gui][settings][copy_paste]") { test_copy_paste_default_and_persisted_overrides(); }
 TEST_CASE("test_apply_current_copy_paste_preference", "[.][acceptance][settings]") { test_apply_current_copy_paste_preference(); }

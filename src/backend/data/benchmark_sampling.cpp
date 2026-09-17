@@ -43,7 +43,6 @@ struct ShardSummary {
     std::uint64_t images = 0U;
     std::array<std::uint64_t, kClassCount> class_images{};
 };
-
 [[nodiscard]] std::uint64_t sampling_hash(const BenchmarkDatasetSource source, const std::uint64_t image_id) noexcept {
     constexpr std::uint64_t kRevisionSeed = 0xC080BA1A6CED0002ULL;
     const std::uint64_t source_seed = static_cast<std::uint64_t>(source) * 0xD6E8FEB86659FD93ULL;

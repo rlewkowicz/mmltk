@@ -1,4 +1,4 @@
-#include <catch2/catch_test_macros.hpp>
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <catch2/matchers/catch_matchers.hpp>
 #include <atomic>
 #include <exception>

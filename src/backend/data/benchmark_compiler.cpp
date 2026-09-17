@@ -564,7 +564,8 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
         }
         image_labels.clear();
         image_labels.reserve(image.box_count);
-        const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(image.width, image.height, resolution, resolution);
+        const mmltk::backend::imaging::resample::RgbLetterbox letterbox =
+            mmltk::backend::imaging::resample::compute_rgb_letterbox(image.width, image.height, resolution, resolution);
         for (std::uint64_t box_index = image.first_box; box_index < image.first_box + image.box_count; ++box_index) {
             const NormalizedBox& box = index.boxes[common_math::checked_cast<std::size_t>(box_index, "box index overflow")];
             PackedInstance label = benchmark_letterbox_box(box.class_id, box.x1, box.y1, box.x2, box.y2, letterbox);

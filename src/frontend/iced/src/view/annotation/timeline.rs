@@ -83,9 +83,7 @@ fn action_id(action: crate::generated::AnnotationSetupAction) -> String {
     format!("annotation.timeline.{action:?}").to_ascii_lowercase()
 }
 
-fn action_available(
-    state: &crate::generated::AnnotationUiState,
-) -> bool {
+fn action_available(state: &crate::generated::AnnotationUiState) -> bool {
     state.sourcenavigationavailable
 }
 

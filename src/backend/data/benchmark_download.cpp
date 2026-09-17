@@ -27,8 +27,8 @@
 #include "detail/benchmark_download.h"
 namespace mmltk::backend::data::benchmark_internal {
 using mmltk::common::io::errno_error;
-using mmltk::common::io::sync_parent_directory;
 using mmltk::common::io::ScopedFd;
+using mmltk::common::io::sync_parent_directory;
 using mmltk::common::math::checked_add;
 using mmltk::common::math::checked_cast;
 using mmltk::common::types::trim_http_field_value;

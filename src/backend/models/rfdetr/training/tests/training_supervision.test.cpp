@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -26,7 +27,6 @@
 #include <vector>
 #include "src/backend/ml/torch/archive.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-#include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/cuda_test_utils.hpp"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
@@ -51,7 +51,6 @@
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "detail/gpu_augment_private.h"
 import mmltk.backend.models.rfdetr.augmentation.augmentation_metadata;
-import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace mmltk::backend::models::rfdetr::test_support {
 struct GpuBatchAugmenterTestAccess final {
     static void FailCacheWait(GpuBatchAugmenter& owner) {
@@ -397,8 +396,7 @@ void test_target_scratch_reuse_waits_for_consumer_retirement() {
         published.target_counts = torch::tensor({1, 2}, integer);
         published.target_indices = torch::tensor({0, 1, 2}, integer);
         published.packed_masks = rfdetr::PackedTargetMasks{
-            torch::full({3, 1}, 11, integer),    8, 8, torch::full({3, 6}, 13.0F, floating), torch::full({3}, 17, integer),
-            torch::full({3, 6}, 19.0F, floating)};
+            torch::full({3, 1}, 11, integer), 8, 8, torch::full({3, 6}, 13.0F, floating), torch::full({3}, 17, integer), torch::full({3, 6}, 19.0F, floating)};
         scratch.record_pending_copy_on_stream(scratch.copy_stream_handle());
     }
     {
@@ -802,9 +800,9 @@ void check_copy_paste_targets(const rfdetr::PreparedTargets& targets, const std:
     REQUIRE(preview.size() == static_cast<std::size_t>(expected_count));
     torch::Tensor sampled;
     if (targets.packed_masks && expected_count != 0)
-        sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(expected_count, points.options().dtype(torch::kInt64)), points,
-                                              "ring support")
-                      .cpu();
+        sampled =
+            rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(expected_count, points.options().dtype(torch::kInt64)), points, "ring support")
+                .cpu();
     for (std::int64_t i = 0; i < expected_count; ++i) {
         REQUIRE(id[i] >= 0);
         REQUIRE(static_cast<std::size_t>(id[i]) < support_by_class.size());
@@ -1194,8 +1192,8 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
         }
     }
     const auto points = torch::tensor(centers, floats).view({1, extent * extent, 2});
-    const auto sampled = rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(static_cast<int64_t>(count), floats.dtype(torch::kInt64)),
-                                                     points, "training erasure");
+    const auto sampled =
+        rfdetr::sample_target_masks(*targets.packed_masks, torch::arange(static_cast<int64_t>(count), floats.dtype(torch::kInt64)), points, "training erasure");
     const auto visible = image.ne(0.0F).any(1).reshape({static_cast<int64_t>(count), extent * extent});
     REQUIRE(torch::equal(sampled.to(torch::kBool), visible));
     CHECK(visible.any().item<bool>());
@@ -1465,7 +1463,8 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                 for (int64_t index = 0; index < count; ++index) {
                     torch::serialize::InputArchive entry;
                     shadows.read(mmltk::backend::ml::serialization::archive_entry_name(static_cast<std::size_t>(index)), entry);
-                    expected_best.at(mmltk::backend::ml::serialization::require_string(entry, "name")) = mmltk::backend::ml::serialization::require_tensor(entry, "tensor");
+                    expected_best.at(mmltk::backend::ml::serialization::require_string(entry, "name")) =
+                        mmltk::backend::ml::serialization::require_tensor(entry, "tensor");
                 }
             }
             for (const auto& entry : deployment_state.entries()) {
@@ -1590,24 +1589,58 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
     std::filesystem::remove_all(root, ignored);
 }
 }  // namespace
-TEST_CASE("test_training_supervision_runtime_replication_is_one_shot", "[model][rfdetr][training][supervision][training_supervision]") { test_training_supervision_runtime_replication_is_one_shot(); }
-TEST_CASE("test_checkpoint_supervision_config_and_deployment_pruning", "[model][rfdetr][training][supervision][training_supervision]") { test_checkpoint_supervision_config_and_deployment_pruning(); }
-TEST_CASE("test_feature_active_host_target_invariants", "[model][rfdetr][training][supervision][training_supervision]") { test_feature_active_host_target_invariants(); }
-TEST_CASE("test_ema_shadow_admission_is_transactional", "[model][rfdetr][training][supervision][training_supervision]") { test_ema_shadow_admission_is_transactional(); }
-TEST_CASE("test_native_optimizer_late_failure_preserves_live_state", "[model][rfdetr][training][supervision][training_supervision]") { test_native_optimizer_late_failure_preserves_live_state(); }
-TEST_CASE("test_resume_continuation_manifest_is_exact", "[model][rfdetr][training][supervision][training_supervision]") { test_resume_continuation_manifest_is_exact(); }
-TEST_CASE("test_target_scratch_reuse_waits_for_consumer_retirement", "[model][rfdetr][training][supervision][training_supervision]") { test_target_scratch_reuse_waits_for_consumer_retirement(); }
-TEST_CASE("test_target_staging_ring_recycles_completed_slots_without_host_wait", "[model][rfdetr][training][supervision][training_supervision]") { test_target_staging_ring_recycles_completed_slots_without_host_wait(); }
-TEST_CASE("test_target_scratch_retires_cross_device_events_on_their_owner", "[model][rfdetr][training][supervision][training_supervision]") { test_target_scratch_retires_cross_device_events_on_their_owner(); }
-TEST_CASE("test_build_targets_recovers_after_staging_growth_and_failure", "[model][rfdetr][training][supervision][training_supervision]") { test_build_targets_recovers_after_staging_growth_and_failure(); }
-TEST_CASE("test_training_adapter_matches_raw_augmentation_executor", "[model][rfdetr][training][supervision][training_supervision]") { test_training_adapter_matches_raw_augmentation_executor(); }
-TEST_CASE("test_training_mask_targets_follow_spatial_image_erasure", "[model][rfdetr][training][supervision][training_supervision]") { test_training_mask_targets_follow_spatial_image_erasure(); }
-TEST_CASE("test_parallel_wave_drains_failures_and_cancellation", "[model][rfdetr][training][supervision][training_supervision]") { test_parallel_wave_drains_failures_and_cancellation(); }
-TEST_CASE("test_all_supervision_routes_execute_fixture_backed_training", "[model][rfdetr][training][supervision][training_supervision]") { test_all_supervision_routes_execute_fixture_backed_training(); }
-TEST_CASE("test_native_augmentation_preview_target_support_parity", "[model][rfdetr][training][augmentation][support]") { test_native_augmentation_preview_target_support_parity(); }
+TEST_CASE("test_training_supervision_runtime_replication_is_one_shot", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_training_supervision_runtime_replication_is_one_shot();
+}
+TEST_CASE("test_checkpoint_supervision_config_and_deployment_pruning", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_checkpoint_supervision_config_and_deployment_pruning();
+}
+TEST_CASE("test_feature_active_host_target_invariants", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_feature_active_host_target_invariants();
+}
+TEST_CASE("test_ema_shadow_admission_is_transactional", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_ema_shadow_admission_is_transactional();
+}
+TEST_CASE("test_native_optimizer_late_failure_preserves_live_state", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_native_optimizer_late_failure_preserves_live_state();
+}
+TEST_CASE("test_resume_continuation_manifest_is_exact", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_resume_continuation_manifest_is_exact();
+}
+TEST_CASE("test_target_scratch_reuse_waits_for_consumer_retirement", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_target_scratch_reuse_waits_for_consumer_retirement();
+}
+TEST_CASE("test_target_staging_ring_recycles_completed_slots_without_host_wait", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_target_staging_ring_recycles_completed_slots_without_host_wait();
+}
+TEST_CASE("test_target_scratch_retires_cross_device_events_on_their_owner", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_target_scratch_retires_cross_device_events_on_their_owner();
+}
+TEST_CASE("test_build_targets_recovers_after_staging_growth_and_failure", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_build_targets_recovers_after_staging_growth_and_failure();
+}
+TEST_CASE("test_training_adapter_matches_raw_augmentation_executor", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_training_adapter_matches_raw_augmentation_executor();
+}
+TEST_CASE("test_training_mask_targets_follow_spatial_image_erasure", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_training_mask_targets_follow_spatial_image_erasure();
+}
+TEST_CASE("test_parallel_wave_drains_failures_and_cancellation", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_parallel_wave_drains_failures_and_cancellation();
+}
+TEST_CASE("test_all_supervision_routes_execute_fixture_backed_training", "[model][rfdetr][training][supervision][training_supervision]") {
+    test_all_supervision_routes_execute_fixture_backed_training();
+}
+TEST_CASE("test_native_augmentation_preview_target_support_parity", "[model][rfdetr][training][augmentation][support]") {
+    test_native_augmentation_preview_target_support_parity();
+}
 TEST_CASE("test_tiny_mask_training_outer_edges", "[model][rfdetr][training][augmentation][support]") { test_tiny_mask_training_outer_edges(); }
-TEST_CASE("test_copy_paste_ring_support_and_cache_cycles", "[model][rfdetr][training_supervision][augmentation][copy_paste]") { test_copy_paste_ring_support_and_cache_cycles(); }
-TEST_CASE("test_copy_paste_cache_publication_recovers_without_targets", "[model][rfdetr][training_supervision][augmentation][copy_paste]") { test_copy_paste_cache_publication_recovers_without_targets(); }
+TEST_CASE("test_copy_paste_ring_support_and_cache_cycles", "[model][rfdetr][training_supervision][augmentation][copy_paste]") {
+    test_copy_paste_ring_support_and_cache_cycles();
+}
+TEST_CASE("test_copy_paste_cache_publication_recovers_without_targets", "[model][rfdetr][training_supervision][augmentation][copy_paste]") {
+    test_copy_paste_cache_publication_recovers_without_targets();
+}
 TEST_CASE("test_ema_selection_restores_identity_and_mode", "[model][rfdetr][training][ema]") { test_ema_selection_restores_identity_and_mode(); }
 TEST_CASE("test_ema_tau_updates_continue_after_restore", "[model][rfdetr][training][ema]") { test_ema_tau_updates_continue_after_restore(); }
 TEST_CASE("perceptual augmentation admits actual Torch suballocations and rejects logical overreads",
@@ -1621,9 +1654,9 @@ TEST_CASE("perceptual augmentation admits actual Torch suballocations and reject
         c10::cuda::CUDAStream stream;
         torch::Tensor input, output;
     };
-    auto images = std::make_shared<TensorImages>(TensorImages{execution.context, stream,
-                                                              torch::full({20, 3, 9, 9}, .25F, torch::TensorOptions().device(torch::kCUDA)),
-                                                              torch::full({20, 3, 9, 9}, -.75F, torch::TensorOptions().device(torch::kCUDA))});
+    auto images =
+        std::make_shared<TensorImages>(TensorImages{execution.context, stream, torch::full({20, 3, 9, 9}, .25F, torch::TensorOptions().device(torch::kCUDA)),
+                                                    torch::full({20, 3, 9, 9}, -.75F, torch::TensorOptions().device(torch::kCUDA))});
     auto config = rfdetr::test_support::isolated_augmentation_config();
     config.resize = {.probability = 1.F, .min_strength = 1.F, .max_strength = 1.F};
     config.perceptual_downscale = true;

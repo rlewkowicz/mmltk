@@ -49,8 +49,6 @@
 namespace mmltk::controller {
 namespace {
 using namespace visual_test_support;
-
-
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
@@ -1546,5 +1544,5 @@ TEST_CASE("Shared Upscale execution failure invalidates every resident product a
     CHECK(mmltk::frameworks::gpu::CudaError(cudaErrorIllegalAddress, "shared").shared_failure());
     CHECK_FALSE(mmltk::frameworks::gpu::CudaError(cudaErrorMemoryAllocation, "local").shared_failure());
 }
-}
-}
+}  // namespace
+}  // namespace mmltk::controller

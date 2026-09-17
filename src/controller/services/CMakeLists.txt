@@ -158,7 +158,7 @@ function(mmltk_add_controller_firefox_process_tests)
     mmltk_register_ordinary_sources(mmltk_controller_firefox_process_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/firefox_process_owner.test.cpp)
     target_compile_definitions(mmltk_controller_firefox_process_tests PRIVATE
-        "MMLTK_BROWSER_RUNTIME_CHILD_FIXTURE=$<TARGET_FILE:mmltk_entrypoints_desktop_child_fixture>")
+        "MMLTK_BROWSER_RUNTIME_CHILD_FIXTURE=\"$<TARGET_FILE:mmltk_entrypoints_desktop_child_fixture>\"")
     target_link_libraries(mmltk_controller_firefox_process_tests PRIVATE
         mmltk_test_support mmltk::controller::direct_services)
     add_dependencies(mmltk_controller_firefox_process_tests mmltk_entrypoints_desktop_child_fixture)

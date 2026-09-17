@@ -7,4 +7,4 @@ struct Scope final {
     Scope();
     ~Scope();
 };
-}
+}  // namespace native_gallery_allocations

@@ -14,17 +14,22 @@ import mmltk.backend.imaging.explore.explore_render_core;
 namespace mmltk::controller::explore_detail {
 namespace explore = mmltk::backend::imaging::explore;
 GalleryStreamProbe::GalleryStreamProbe(int device, VisualDiagnosticSink diagnostics, std::shared_ptr<ExploreAcceptanceGate> acceptance)
- : device_(device), diagnostics_(diagnostics), acceptance_(std::move(acceptance)) { storage_.Bind(host_allocations_.api()); }
-void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, const GalleryDescriptorStorage& descriptors, const mmltk::frameworks::gpu::ImagePlaneView reference_plane, const GalleryThumbnailCache* incumbent, const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
-                                           const std::uintptr_t stream, const std::uint64_t generation, const std::uint64_t slot,
-                                           const std::uint32_t compiled_index, const std::optional<std::size_t> card_index, const std::uint32_t x,
-                                           const std::uint32_t y, const std::uint32_t width, const std::uint32_t height) try {
+    : device_(device), diagnostics_(diagnostics), acceptance_(std::move(acceptance)) {
+    storage_.Bind(host_allocations_.api());
+}
+void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, const GalleryDescriptorStorage& descriptors,
+                                          const mmltk::frameworks::gpu::ImagePlaneView reference_plane, const GalleryThumbnailCache* incumbent,
+                                          const mmltk::frameworks::gpu::ImagePlaneView clean, const mmltk::frameworks::gpu::ImagePlaneView semantic,
+                                          const std::uintptr_t stream, const std::uint64_t generation, const std::uint64_t slot,
+                                          const std::uint32_t compiled_index, const std::optional<std::size_t> card_index, const std::uint32_t x,
+                                          const std::uint32_t y, const std::uint32_t width, const std::uint32_t height) try {
     if (!diagnostics_.pixel_probes_enabled() || probes_disabled_) return;
     if (acceptance_) acceptance_->CheckProbe();
     std::optional<explore::ExploreRenderCardDescriptor> card;
     if (card_index)
-        card = load_payload<explore::ExploreRenderCardDescriptor>(descriptors.storage_.buffers_.descriptors_.data(),
-                                                                  descriptors.descriptor_layout_.cards.offset + *card_index * sizeof(explore::ExploreRenderCardDescriptor));
+        card = load_payload<explore::ExploreRenderCardDescriptor>(
+            descriptors.storage_.buffers_.descriptors_.data(),
+            descriptors.descriptor_layout_.cards.offset + *card_index * sizeof(explore::ExploreRenderCardDescriptor));
     const auto* sample_card = card ? &*card : nullptr;
     if (!sample_card && width != 0U && product.plan.mode == ExploreMode::Gallery && slot < product.tile_meanings.size()) {
         const auto& meaning = product.tile_meanings[slot];
@@ -64,9 +69,9 @@ void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, co
     }
     if (probes_pending_.load(std::memory_order_acquire) || probe_count_ == probes_.size() || !InitializeProbes()) return;
     ensure_gallery_buffer(storage_.buffers_.semantic_count_device_, probes_.size() * kProbeFacts * sizeof(std::uint64_t),
-                 "Explore rendered diagnostic device allocation failed", diagnostics_, device_, product.plan.generation);
+                          "Explore rendered diagnostic device allocation failed", diagnostics_, device_, product.plan.generation);
     ensure_gallery_buffer(storage_.buffers_.semantic_count_pinned_, probes_.size() * kProbeFacts * sizeof(std::uint64_t),
-                 "Explore rendered diagnostic staging allocation failed", diagnostics_, device_, product.plan.generation);
+                          "Explore rendered diagnostic staging allocation failed", diagnostics_, device_, product.plan.generation);
     auto* const cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     auto count_target = gallery_target(semantic);
     auto checksum_target = gallery_target(clean);
@@ -341,7 +346,8 @@ void GalleryStreamProbe::EmitCardSamples(const RenderedProbe& record, const std:
 } catch (...) {
     // Diagnostic serialization runs on the existing probe completion callback.
 }
-auto GalleryStreamProbe::ReleaseProbesChecked(decltype(&cudaStreamSynchronize) stream_wait_, cudaError_t& unsettled) noexcept -> mmltk::frameworks::gpu::SystemImageModel::Release {
+auto GalleryStreamProbe::ReleaseProbesChecked(decltype(&cudaStreamSynchronize) stream_wait_, cudaError_t& unsettled) noexcept
+    -> mmltk::frameworks::gpu::SystemImageModel::Release {
     std::exception_ptr failure;
     const auto record = [&](const cudaError_t status, const char* message) {
         if (status == cudaSuccess) return;
@@ -378,9 +384,10 @@ auto GalleryStreamProbe::ReleaseProbesChecked(decltype(&cudaStreamSynchronize) s
 }
 namespace {
 [[nodiscard]] std::uint32_t diagnostic_coordinate(const float value) noexcept { return static_cast<std::uint32_t>(std::clamp(value, 0.0F, 1.0F) * 65535.0F); }
-}
-void GalleryStreamProbe::DiagnoseDescriptors(const GalleryDescriptorStorage& descriptors_, VisualDiagnosticSink diagnostics_, int device_, const std::uint64_t generation, const std::uint64_t slot, const std::size_t first, const std::size_t count,
-                                              const std::size_t rle_count) {
+}  // namespace
+void GalleryStreamProbe::DiagnoseDescriptors(const GalleryDescriptorStorage& descriptors_, VisualDiagnosticSink diagnostics_, int device_,
+                                             const std::uint64_t generation, const std::uint64_t slot, const std::size_t first, const std::size_t count,
+                                             const std::size_t rle_count) {
     if (!diagnostics_.valid()) return;
     float minimum_x = 1.0F;
     float minimum_y = 1.0F;
@@ -409,10 +416,11 @@ void GalleryStreamProbe::DiagnoseDescriptors(const GalleryDescriptorStorage& des
                 .staging_bytes = count == 0U ? 0U : (static_cast<std::size_t>(diagnostic_coordinate(maximum_x)) << 32U) | diagnostic_coordinate(maximum_y)}};
     });
 }
-void GalleryStreamProbe::DiagnosePreparedImage(const ExploreRenderPlan& plan, const GalleryReadScheduler& scheduler_, const mmltk::backend::models::rfdetr::GpuAugmentationExecutor& augmenter, VisualDiagnosticSink diagnostics_, const GalleryReadScheduler::Lane& lane, const std::size_t image, const std::size_t staging_slot) noexcept try {
+void GalleryStreamProbe::DiagnosePreparedImage(const ExploreRenderPlan& plan, const GalleryReadScheduler& scheduler_,
+                                               const mmltk::backend::models::rfdetr::GpuAugmentationExecutor& augmenter, VisualDiagnosticSink diagnostics_,
+                                               const GalleryReadScheduler::Lane& lane, const std::size_t image, const std::size_t staging_slot) noexcept try {
     if (!diagnostics_.valid()) return;
-    const auto payload = "{\"dataset_identity\":" + std::to_string(plan.dataset_identity) +
-                         ",\"augmentation_seed\":" + std::to_string(plan.augmentation.seed) +
+    const auto payload = "{\"dataset_identity\":" + std::to_string(plan.dataset_identity) + ",\"augmentation_seed\":" + std::to_string(plan.augmentation.seed) +
                          ",\"compiled_index\":" + std::to_string(lane.compiled_index) + ",\"slot\":" + std::to_string(lane.destination_slot) +
                          ",\"lane\":" + std::to_string(lane.index) +
                          ",\"output_domain\":\"UnitRgb\",\"prepared\":" + augmenter.prepared_image_diagnostic(image, staging_slot) + "}";
@@ -422,4 +430,4 @@ void GalleryStreamProbe::DiagnosePreparedImage(const ExploreRenderPlan& plan, co
 } catch (...) {
     // Collecting optional plan details cannot change augmentation submission.
 }
-}
+}  // namespace mmltk::controller::explore_detail

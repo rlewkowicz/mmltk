@@ -41,24 +41,25 @@ struct TrainLaneResult {
 std::optional<mmltk::backend::ml::cuda::CudaEventPool::Lease> record_current_stream_event(mmltk::backend::ml::cuda::CudaEventPool&, int, const char*);
 void ensure_train_lane_model_supported(NativeRfDetrModel&, int);
 class TrainingLanes final {
- public:
-    TrainingLanes(const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, NativeRfDetrModel&, const std::vector<std::string>&, int lane_count, const mmltk::frameworks::gpu::DeviceContext&);
+   public:
+    TrainingLanes(const TrainRequest&, RuntimeContext&, mmltk::backend::data::DatasetLoader&, NativeRfDetrModel&, const std::vector<std::string>&,
+                  int lane_count, const mmltk::frameworks::gpu::DeviceContext&);
     ~TrainingLanes();
     TrainingLanes(const TrainingLanes&) = delete;
     TrainingLanes& operator=(const TrainingLanes&) = delete;
-    std::future<TrainLaneResult> enqueue(RuntimeContext* runtime,
-                                                mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
-                                                const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready,
-                                                mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,
-                                                const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height,
-                                                int image_width, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
-                                                at::ScalarType autocast_dtype, TrainingSupervisionRoute route,
-                                                std::shared_ptr<WaveTargetNormalizer> wave_normalizer, std::size_t lane_index);
+    std::future<TrainLaneResult> enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
+                                         const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready,
+                                         mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,
+                                         const DetectionConfig& detection_config, const NativeRfDetrModel& model, int device_id, int image_height,
+                                         int image_width, std::uint64_t seed, int epoch, int rank, std::uint64_t augmentation_sequence, bool amp_enabled,
+                                         at::ScalarType autocast_dtype, TrainingSupervisionRoute route, std::shared_ptr<WaveTargetNormalizer> wave_normalizer,
+                                         std::size_t lane_index);
     void merge(TrainLaneResult&, std::vector<torch::Tensor>&, int device_id);
     void harvest_timing();
     void settle_targets();
- private:
+
+   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
-}
+}  // namespace mmltk::backend::models::rfdetr

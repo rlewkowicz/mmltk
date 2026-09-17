@@ -91,6 +91,8 @@ void test_onnx_failure_diagnostics_are_lazy() {
     CHECK(text.find("onnx-info-test: observed model operation failure") != std::string::npos);
 }
 }  // namespace
-TEST_CASE("test_onnx_tool_main_routes_one_model_after_logging_options", "[entrypoints][tools][onnx]") { test_onnx_tool_main_routes_one_model_after_logging_options(); }
+TEST_CASE("test_onnx_tool_main_routes_one_model_after_logging_options", "[entrypoints][tools][onnx]") {
+    test_onnx_tool_main_routes_one_model_after_logging_options();
+}
 TEST_CASE("test_onnx_tool_main_rejects_a_missing_model", "[entrypoints][tools][onnx]") { test_onnx_tool_main_rejects_a_missing_model(); }
 TEST_CASE("test_onnx_failure_diagnostics_are_lazy", "[entrypoints][tools][onnx]") { test_onnx_failure_diagnostics_are_lazy(); }

@@ -23,11 +23,13 @@ class GalleryThumbnailCache;
 class GalleryStreamProbe final {
     friend class GalleryStream;
     friend struct NativeExploreStorageTestAccess;
-public:
+
+   public:
     GalleryStreamProbe(int, VisualDiagnosticSink, std::shared_ptr<ExploreAcceptanceGate>);
     GalleryStreamProbe(const GalleryStreamProbe&) = delete;
     GalleryStreamProbe& operator=(const GalleryStreamProbe&) = delete;
-private:
+
+   private:
     using Buffer = mmltk::backend::imaging::explore::ExploreHighWaterBuffer;
     using Memory = mmltk::backend::imaging::explore::ExploreBufferMemory;
     struct Family final {
@@ -58,7 +60,8 @@ private:
     };
     static constexpr std::size_t kCardSamplesOffset = 7U;
     static constexpr std::size_t kProbeFacts =
-        kCardSamplesOffset + mmltk::backend::imaging::explore::detail::ExploreRenderedCardSampleGridAbi::kSampleCount * mmltk::backend::imaging::explore::detail::ExploreRenderedCardSampleGridAbi::kWordsPerSample;
+        kCardSamplesOffset + mmltk::backend::imaging::explore::detail::ExploreRenderedCardSampleGridAbi::kSampleCount *
+                                 mmltk::backend::imaging::explore::detail::ExploreRenderedCardSampleGridAbi::kWordsPerSample;
     std::array<RenderedProbe, kExploreVisibleItemCapacity> probes_{};
     std::size_t probe_count_ = 0U;
     std::size_t submitted_probes_ = 0U;
@@ -67,11 +70,12 @@ private:
     cudaEvent_t probes_ready_ = nullptr;
     bool probes_disabled_ = false;
     void DiagnoseRendered(const GalleryProductState&, const GalleryDescriptorStorage&, mmltk::frameworks::gpu::ImagePlaneView, const GalleryThumbnailCache*,
-                          mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t,
-                          std::uint64_t, std::uint64_t, std::uint32_t, std::optional<std::size_t>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
-    static void DiagnoseDescriptors(const GalleryDescriptorStorage&, VisualDiagnosticSink, int, std::uint64_t, std::uint64_t, std::size_t, std::size_t, std::size_t);
+                          mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t, std::uint64_t, std::uint64_t,
+                          std::uint32_t, std::optional<std::size_t>, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+    static void DiagnoseDescriptors(const GalleryDescriptorStorage&, VisualDiagnosticSink, int, std::uint64_t, std::uint64_t, std::size_t, std::size_t,
+                                    std::size_t);
     static void DiagnosePreparedImage(const ExploreRenderPlan&, const GalleryReadScheduler&, const mmltk::backend::models::rfdetr::GpuAugmentationExecutor&,
-                                     VisualDiagnosticSink, const GalleryReadScheduler::Lane&, std::size_t, std::size_t) noexcept;
+                                      VisualDiagnosticSink, const GalleryReadScheduler::Lane&, std::size_t, std::size_t) noexcept;
     void FlushProbes(std::uintptr_t);
     bool InitializeProbes() noexcept;
     void CollectProbes() noexcept;
@@ -82,4 +86,4 @@ private:
         return {.system = contracts::DiagnosticOwner::Explore, .operation = operation, .device = device_, .generation = generation};
     }
 };
-}
+}  // namespace mmltk::controller::explore_detail

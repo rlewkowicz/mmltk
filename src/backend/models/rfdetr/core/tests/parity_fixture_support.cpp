@@ -1,5 +1,4 @@
 #include "checkpoint_fixture_support/checkpoint_fixture_support.h"
-
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "checkpoint_fixture_support/parity_fixture_support.h"
 #include <stdexcept>
@@ -15,7 +14,7 @@ const std::array<ParityFixtureCase, 2>& parity_fixture_cases() noexcept {
 }
 at::Tensor make_fixture_image(const ParityFixtureCase& fixture) {
     return torch::linspace(-1.0F + fixture.offset, 1.0F + fixture.offset, 3 * fixture.input_size * fixture.input_size,
-                               torch::TensorOptions().dtype(torch::kFloat32))
+                           torch::TensorOptions().dtype(torch::kFloat32))
         .reshape({3, fixture.input_size, fixture.input_size});
 }
 at::Tensor make_fixture_query_feat(const ParityFixtureCase& fixture) {

@@ -1,10 +1,14 @@
 use crate::generated::FeatureId;
-use crate::integration_control::{Controller, EXPLORE_GALLERY, Message, Phase, ProbeFixture, initialize_reporting, probe};
-use crate::integration_control::pixel_checks::{AtlasDraw, ProbeOutcome, report_atlas_draw};
 use crate::integration_control::pixel_checks::tests::fps_settings;
+use crate::integration_control::pixel_checks::{AtlasDraw, ProbeOutcome, report_atlas_draw};
 use crate::integration_control::probe::{atlas_probe_output, record_probe_draw};
-use crate::integration_control::retained::{cold_gallery_scroll_offset, explore_integer_id, explore_scenario_preparation};
+use crate::integration_control::retained::{
+    cold_gallery_scroll_offset, explore_integer_id, explore_scenario_preparation,
+};
 use crate::integration_control::tests::advance_receipt;
+use crate::integration_control::{
+    Controller, EXPLORE_GALLERY, Message, Phase, ProbeFixture, initialize_reporting, probe,
+};
 use crate::view_model::{ApplicationModel, ConnectionState};
 use iced::Rectangle;
 #[test]
@@ -126,7 +130,12 @@ fn clipboard_preparation_and_reads_belong_to_the_active_numeric_round_trip() {
         driver.driver.generation,
         Message::NumberPasteDelivered(false),
     ));
-    assert!(driver.driver.failure.contains("paste shortcut delivery failed"));
+    assert!(
+        driver
+            .driver
+            .failure
+            .contains("paste shortcut delivery failed")
+    );
     driver.update(scoped(
         driver.driver.generation,
         Message::NumberClipboardPrepared {
@@ -168,7 +177,12 @@ fn clipboard_rejection_preserves_the_underlying_error_and_fails_only_its_active_
             message: Box::new(message),
         });
         assert_eq!(driver.driver.phase, Phase::Failed);
-        assert!(driver.driver.failure.contains("clipboard permission rejected"));
+        assert!(
+            driver
+                .driver
+                .failure
+                .contains("clipboard permission rejected")
+        );
     }
 }
 
@@ -236,12 +250,19 @@ fn cold_gallery_walk_waits_for_new_complete_viewports_and_exact_held_receipts() 
         matches!(driver.driver.phase, Phase::GalleryColdRead(17)),
         "a sampleable publication must actually draw before a disjoint jump"
     );
-    driver.probes.record_gallery_draw(frame.presentation_revision, frame.content_sequence - 1);
+    driver
+        .probes
+        .record_gallery_draw(frame.presentation_revision, frame.content_sequence - 1);
     drive(&mut driver, &model);
     assert!(matches!(driver.driver.phase, Phase::GalleryColdRead(17)));
-    driver.probes.record_gallery_draw(frame.presentation_revision, frame.content_sequence);
+    driver
+        .probes
+        .record_gallery_draw(frame.presentation_revision, frame.content_sequence);
     drive(&mut driver, &model);
-    assert!(matches!(driver.driver.phase, Phase::AwaitGalleryColdRead(17, 5)));
+    assert!(matches!(
+        driver.driver.phase,
+        Phase::AwaitGalleryColdRead(17, 5)
+    ));
     let receipt = IntegrationControlReceipt {
         kind: Kind::GalleryReadCompletionHeld,
         sequence: 1,
@@ -413,11 +434,18 @@ fn atlas_invalidation_cannot_retire_a_replacement_request_on_the_same_draw() {
     ] {
         output.try_send(message).unwrap();
         let stale = receiver.try_recv().unwrap();
-        assert!(!controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &stale));
+        assert!(!controller.probes.accepts_message(
+            &controller.driver,
+            &controller.pixel_checks,
+            &stale
+        ));
         controller.update(stale);
     }
     assert!(probe::tests::atlas_observation_matches(Some(&draw)));
-    assert!(controller.retained.atlas_pixels.is_none() && controller.retained.atlas_composition.is_none());
+    assert!(
+        controller.retained.atlas_pixels.is_none()
+            && controller.retained.atlas_composition.is_none()
+    );
     pixels
         .try_send(Message::AtlasPixels {
             receipt: draw.clone(),
@@ -435,7 +463,6 @@ fn atlas_invalidation_cannot_retire_a_replacement_request_on_the_same_draw() {
     assert_eq!(controller.retained.atlas_pixels, Some(draw.clone()));
     assert_eq!(controller.retained.atlas_composition, Some(draw));
 }
-
 
 #[test]
 fn retained_workflows_require_the_unique_settled_control_owner() {
@@ -562,8 +589,7 @@ fn retained_workflows_require_the_unique_settled_control_owner() {
             crate::presentation_surface::metadata::retire(frame);
             crate::presentation_surface::metadata::install_explore(frame, &gallery);
             // A new Gallery composition can precede logical Close settlement too.
-            model.explore.snapshot.as_mut().unwrap().mode =
-                crate::generated::ExploreMode::Detail;
+            model.explore.snapshot.as_mut().unwrap().mode = crate::generated::ExploreMode::Detail;
             drive(&mut driver, &model);
             assert_eq!(driver.driver.phase, Phase::AwaitExploreGallery);
             assert!(!driver.widgets.location_pending());
@@ -583,9 +609,15 @@ fn retained_workflows_require_the_unique_settled_control_owner() {
         .detail
         .showoriginaldimensions = true;
     drive(&mut driver, &model);
-    assert_eq!(driver.driver.phase, Phase::AwaitExplorePreparation(revision));
+    assert_eq!(
+        driver.driver.phase,
+        Phase::AwaitExplorePreparation(revision)
+    );
     drive(&mut driver, &model);
-    assert_eq!(driver.driver.phase, Phase::AwaitExplorePreparation(revision));
+    assert_eq!(
+        driver.driver.phase,
+        Phase::AwaitExplorePreparation(revision)
+    );
     {
         let snapshot = model.explore.snapshot.as_mut().unwrap();
         snapshot.revision += 1;
@@ -601,7 +633,9 @@ fn retained_workflows_require_the_unique_settled_control_owner() {
     snapshot.labels.clear();
     let revision = snapshot.revision;
     let source = snapshot.frame.revision;
-    driver.probes.record_gallery_draw(frame.presentation_revision, source);
+    driver
+        .probes
+        .record_gallery_draw(frame.presentation_revision, source);
     for (indices, slots, timeline, ready) in [
         (vec![0, 8], vec![true, true], 1, false),
         (vec![7, 8], vec![true, false], 1, false),
@@ -721,7 +755,9 @@ fn retained_workflows_require_the_unique_settled_control_owner() {
     );
 }
 
-pub(in crate::integration_control) fn replace_scenario_with_retained_baseline(controller: &mut Controller) {
+pub(in crate::integration_control) fn replace_scenario_with_retained_baseline(
+    controller: &mut Controller,
+) {
     controller.retained.atlas_baseline = Some((1, 5));
     assert!(
         controller
@@ -761,12 +797,20 @@ pub(in crate::integration_control) fn check_reset_atlas_callbacks(
         ..draw
     };
     record_probe_draw(EXPLORE_GALLERY, surface, bounds, moved_draw.image, bounds);
-    assert!(!controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &queued));
+    assert!(!controller.probes.accepts_message(
+        &controller.driver,
+        &controller.pixel_checks,
+        &queued
+    ));
     controller.update(queued);
     assert!(controller.retained.atlas_receipt.is_none());
     report_atlas_draw(moved_draw.clone(), true, 1.0);
     let queued = receiver.try_recv().unwrap();
-    assert!(controller.probes.accepts_message(&controller.driver, &controller.pixel_checks, &queued));
+    assert!(controller.probes.accepts_message(
+        &controller.driver,
+        &controller.pixel_checks,
+        &queued
+    ));
     controller.update(queued);
     assert_eq!(controller.retained.atlas_receipt, Some(moved_draw));
 }

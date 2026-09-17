@@ -12,7 +12,6 @@ namespace mmltk::controller::visual_test_support {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-
 [[nodiscard]] inline auto settle_visual_on_exit(detail::VisualRuntimeOwner& owner, std::promise<void>& release) {
     return mmltk::testsupport::ScopedTestCleanup{[&owner, &release] {
         mmltk::testsupport::release_test_promise(release);
@@ -49,4 +48,4 @@ struct ProducerWorkspaceRequest final {
         CHECK(borrowed.plane().data == workspace->plane(borrowed.plane().descriptor.width, borrowed.plane().descriptor.height).data);
     }
 };
-}
+}  // namespace mmltk::controller::visual_test_support

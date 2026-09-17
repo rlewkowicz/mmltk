@@ -1,4 +1,4 @@
-
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/inference/evaluation.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
-#include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/sample_output.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "stb_image.h"

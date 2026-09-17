@@ -78,7 +78,6 @@ class DecodedNativeModelState {
     void release_admission() noexcept;
     void replace_entries(std::vector<NormalizedModelStateEntry> entries);
 
-
    private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

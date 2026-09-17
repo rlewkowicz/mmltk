@@ -113,8 +113,8 @@ void ProgressReporter::rejected(const std::uint64_t dropped, const std::uint64_t
     state_.quarantined_images = quarantined;
     emit();
 }
-void ProgressReporter::source_bytes(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total, const std::uint32_t retry_count,
-                      const bool cache_hit, const bool resumed) {
+void ProgressReporter::source_bytes(const BenchmarkDatasetSource source, const std::uint64_t completed, const std::uint64_t total,
+                                    const std::uint32_t retry_count, const bool cache_hit, const bool resumed) {
     if (!callback_) { return; }
     const std::lock_guard lock(mutex_);
     BenchmarkSourceProgress& progress = source_progress(source);
@@ -204,4 +204,4 @@ void ProgressReporter::update_source_phase_progress() {
 void ProgressReporter::emit() const {
     if (callback_) { callback_(state_); }
 }
-}
+}  // namespace mmltk::backend::data::benchmark_internal

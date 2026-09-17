@@ -25,5 +25,5 @@ enum class NormalizedModelStateAdmission {
     FreshTransfer,
     PartialFreshTransfer,
 };
-}
-} // namespace mmltk::backend::models::rfdetr
+}  // namespace detail
+}  // namespace mmltk::backend::models::rfdetr

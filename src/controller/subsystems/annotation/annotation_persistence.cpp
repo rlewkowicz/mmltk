@@ -23,8 +23,7 @@ class PosixAtomicSaveBackend final {
         });
     }
     [[nodiscard]] bool write_all(const std::span<const std::byte> bytes) noexcept {
-        return mmltk::common::io::try_write_all_noexcept(descriptor_.get(),
-            {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+        return mmltk::common::io::try_write_all_noexcept(descriptor_.get(), {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
     }
     [[nodiscard]] bool sync_file() noexcept { return ::fsync(descriptor_.get()) == 0; }
     [[nodiscard]] bool close_file() noexcept {
@@ -69,8 +68,8 @@ class PosixAtomicSaveBackend final {
     }
     mmltk::common::io::ScopedFd descriptor_;
 };
-[[nodiscard]] DocumentSaveEffect atomic_save(const std::span<const std::byte> bytes, const std::string_view destination,
-                                            const std::uint64_t document_revision, const std::uint64_t generation) noexcept {
+[[nodiscard]] DocumentSaveEffect atomic_save(const std::span<const std::byte> bytes, const std::string_view destination, const std::uint64_t document_revision,
+                                             const std::uint64_t generation) noexcept {
     PosixAtomicSaveBackend backend;
     if (bytes.empty() || destination.empty() || generation == 0U) return DocumentSaveEffect::NotApplied;
     constexpr std::string_view marker{".mmltk-annotation-"};

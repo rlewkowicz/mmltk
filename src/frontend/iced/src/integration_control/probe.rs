@@ -1,13 +1,17 @@
 //! Exact receipt and asynchronous callback custody.
-use crate::integration_control::{Driver, EXPLORE_GALLERY, Message, Phase, pixel_checks, reporting, reporting_enabled, widget_ops};
-use crate::integration_control::pixel_checks::{AtlasDraw, FpsPixelOutcome, ProbeOutcome, SampleablePresentation, sampleable_presentation};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::pixel_checks::pixel_result_callback;
+use crate::integration_control::pixel_checks::{
+    AtlasDraw, FpsPixelOutcome, ProbeOutcome, SampleablePresentation, sampleable_presentation,
+};
+use crate::integration_control::{
+    Driver, EXPLORE_GALLERY, Message, Phase, pixel_checks, reporting, reporting_enabled, widget_ops,
+};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{annotation_swatch_js, capture_probe_js, fps_draw_js, receipt_js};
 use crate::view::explore;
 use crate::view_model::ApplicationModel;
 use iced::Rectangle;
-#[cfg(target_arch = "wasm32")]
-use crate::integration_control::{annotation_swatch_js, capture_probe_js, fps_draw_js, receipt_js};
-#[cfg(target_arch = "wasm32")]
-use crate::integration_control::pixel_checks::pixel_result_callback;
 #[derive(Clone)]
 pub(super) struct ControlProbe {
     pub(super) output: ScenarioOutput,
@@ -100,7 +104,10 @@ pub(super) struct ScenarioOutput {
 }
 
 impl ScenarioOutput {
-    pub(super) fn new(generation: u64, sender: iced::futures::channel::mpsc::Sender<Message>) -> Self {
+    pub(super) fn new(
+        generation: u64,
+        sender: iced::futures::channel::mpsc::Sender<Message>,
+    ) -> Self {
         Self {
             generation,
             receipt: None,
@@ -313,7 +320,10 @@ pub(super) fn atlas_probe_output(composition: bool) -> Option<ScenarioOutput> {
     Some(output)
 }
 
-pub(super) fn same_probe(owner: &Option<std::sync::Arc<()>>, request: Option<&std::sync::Arc<()>>) -> bool {
+pub(super) fn same_probe(
+    owner: &Option<std::sync::Arc<()>>,
+    request: Option<&std::sync::Arc<()>>,
+) -> bool {
     match (owner, request) {
         (Some(owner), Some(request)) => std::sync::Arc::ptr_eq(owner, request),
         _ => false,
@@ -403,7 +413,12 @@ impl Default for Requests {
 }
 
 impl Requests {
-    pub(super) fn accepts_message(&self, driver: &Driver, pixel_checks: &pixel_checks::State, message: &Message) -> bool {
+    pub(super) fn accepts_message(
+        &self,
+        driver: &Driver,
+        pixel_checks: &pixel_checks::State,
+        message: &Message,
+    ) -> bool {
         if !driver.running() {
             return false;
         }
@@ -486,7 +501,8 @@ impl Requests {
         }
     }
     pub(super) fn observe_presentation(
-        &mut self, driver: &mut Driver,
+        &mut self,
+        driver: &mut Driver,
         model: &ApplicationModel,
         frame: Option<crate::presentation_surface::FrameReady>,
     ) {
@@ -552,7 +568,12 @@ impl Requests {
 }
 
 impl Requests {
-    pub(super) fn prepare_control_probe(&mut self, widgets: &widget_ops::RevealState, color: [f64; 3], available: bool) -> bool {
+    pub(super) fn prepare_control_probe(
+        &mut self,
+        widgets: &widget_ops::RevealState,
+        color: [f64; 3],
+        available: bool,
+    ) -> bool {
         if widgets.location_pending() {
             return false;
         }
@@ -572,7 +593,8 @@ impl Requests {
 
 impl Requests {
     pub(super) fn prepare_annotation_probe(
-        &mut self, widgets: &widget_ops::RevealState,
+        &mut self,
+        widgets: &widget_ops::RevealState,
         source: u64,
         presentation: u64,
         extent: [u32; 2],
@@ -628,47 +650,123 @@ pub(super) struct AnnotationObservation<'a> {
     pub(super) control_receipt: &'a Option<ProbeReceipt>,
 }
 impl Requests {
-    pub(super) fn draws(&self) -> Draws { Draws { annotation: self.annotation_drawn, viewer: self.viewer_drawn, gallery: self.gallery_drawn } }
+    pub(super) fn draws(&self) -> Draws {
+        Draws {
+            annotation: self.annotation_drawn,
+            viewer: self.viewer_drawn,
+            gallery: self.gallery_drawn,
+        }
+    }
     pub(super) fn annotation_observation(&self) -> AnnotationObservation<'_> {
-        AnnotationObservation { sample_baseline: self.annotation_sample_baseline, frame_ready: self.annotation_frame_ready, prepared: self.annotation_probe.as_ref(), pending: &self.annotation_pixels_pending, receipt: &self.annotation_pixels_receipt, control_receipt: &self.control_probe_receipt }
+        AnnotationObservation {
+            sample_baseline: self.annotation_sample_baseline,
+            frame_ready: self.annotation_frame_ready,
+            prepared: self.annotation_probe.as_ref(),
+            pending: &self.annotation_pixels_pending,
+            receipt: &self.annotation_pixels_receipt,
+            control_receipt: &self.control_probe_receipt,
+        }
     }
-    pub(super) fn record_gallery_draw(&mut self, presentation: u64, source: u64) { self.gallery_drawn = Some((presentation, source)); }
-    pub(super) fn record_surface_draw(&mut self, presentation: u64, source: u64, viewer: Option<ViewerDraw>) {
-        if let Some(viewer) = viewer { self.viewer_drawn = Some((presentation, source, viewer)); }
-        else { self.annotation_drawn = Some((presentation, source)); }
+    pub(super) fn record_gallery_draw(&mut self, presentation: u64, source: u64) {
+        self.gallery_drawn = Some((presentation, source));
     }
-    pub(super) fn await_viewer_draw(&mut self) { self.viewer_drawn = None; }
-    pub(super) fn await_annotation_sample(&mut self, baseline: u64) { self.annotation_sample_baseline = baseline; }
-    pub(super) fn restart_annotation_sampling(&mut self, baseline: u64) { self.annotation_sample_baseline = baseline; self.annotation_frame_ready = None; }
-    pub(super) fn take_control_probe(&mut self) -> Option<ControlProbe> { self.control_probe.take() }
-    pub(super) fn take_annotation_probe(&mut self) -> Option<AnnotationProbe> { self.annotation_probe.take() }
+    pub(super) fn record_surface_draw(
+        &mut self,
+        presentation: u64,
+        source: u64,
+        viewer: Option<ViewerDraw>,
+    ) {
+        if let Some(viewer) = viewer {
+            self.viewer_drawn = Some((presentation, source, viewer));
+        } else {
+            self.annotation_drawn = Some((presentation, source));
+        }
+    }
+    pub(super) fn await_viewer_draw(&mut self) {
+        self.viewer_drawn = None;
+    }
+    pub(super) fn await_annotation_sample(&mut self, baseline: u64) {
+        self.annotation_sample_baseline = baseline;
+    }
+    pub(super) fn restart_annotation_sampling(&mut self, baseline: u64) {
+        self.annotation_sample_baseline = baseline;
+        self.annotation_frame_ready = None;
+    }
+    pub(super) fn take_control_probe(&mut self) -> Option<ControlProbe> {
+        self.control_probe.take()
+    }
+    pub(super) fn take_annotation_probe(&mut self) -> Option<AnnotationProbe> {
+        self.annotation_probe.take()
+    }
     pub(super) fn begin_upscale_probe(&mut self, output: &ScenarioOutput) {
         self.upscale_pixel_owner = output.probe.clone();
         self.upscale_pixel_pending = output.receipt.clone();
     }
-    pub(super) fn upscale_pending(&self) -> &Option<ProbeReceipt> { &self.upscale_pixel_pending }
-    pub(super) fn rearm_upscale_probe(&mut self) { self.upscale_pixel_pending = None; }
-    pub(super) fn complete_upscale_probe(&mut self, receipt: &Option<ProbeReceipt>, outcome: &ProbeOutcome) -> bool {
-        if &self.upscale_pixel_pending != receipt { return false; }
+    pub(super) fn upscale_pending(&self) -> &Option<ProbeReceipt> {
+        &self.upscale_pixel_pending
+    }
+    pub(super) fn rearm_upscale_probe(&mut self) {
+        self.upscale_pixel_pending = None;
+    }
+    pub(super) fn complete_upscale_probe(
+        &mut self,
+        receipt: &Option<ProbeReceipt>,
+        outcome: &ProbeOutcome,
+    ) -> bool {
+        if &self.upscale_pixel_pending != receipt {
+            return false;
+        }
         self.upscale_pixel_owner = None;
-        if matches!(outcome, ProbeOutcome::Invalidated) { self.upscale_pixel_pending = None; }
+        if matches!(outcome, ProbeOutcome::Invalidated) {
+            self.upscale_pixel_pending = None;
+        }
         true
     }
-    pub(super) fn complete_capability_probe(&mut self, receipt: &Option<ProbeReceipt>, outcome: &ProbeOutcome) -> bool {
-        if &self.control_probe_receipt != receipt { return false; }
+    pub(super) fn complete_capability_probe(
+        &mut self,
+        receipt: &Option<ProbeReceipt>,
+        outcome: &ProbeOutcome,
+    ) -> bool {
+        if &self.control_probe_receipt != receipt {
+            return false;
+        }
         self.control_probe_owner = None;
-        if matches!(outcome, ProbeOutcome::Invalidated) { self.control_probe_receipt = None; }
+        if matches!(outcome, ProbeOutcome::Invalidated) {
+            self.control_probe_receipt = None;
+        }
         true
     }
-    pub(super) fn take_annotation_completion(&mut self, revision: u64, receipt: &Option<ProbeReceipt>) -> bool {
-        let pending = if revision == 0 { &mut self.control_probe_receipt } else { &mut self.annotation_pixels_pending };
-        if &*pending != receipt { return false; }
+    pub(super) fn take_annotation_completion(
+        &mut self,
+        revision: u64,
+        receipt: &Option<ProbeReceipt>,
+    ) -> bool {
+        let pending = if revision == 0 {
+            &mut self.control_probe_receipt
+        } else {
+            &mut self.annotation_pixels_pending
+        };
+        if &*pending != receipt {
+            return false;
+        }
         *pending = None;
-        if revision == 0 { self.control_probe_owner = None; } else { self.annotation_pixels_owner = None; }
+        if revision == 0 {
+            self.control_probe_owner = None;
+        } else {
+            self.annotation_pixels_owner = None;
+        }
         true
     }
-    pub(super) fn accept_annotation_pixels(&mut self, revision: u64, receipt: Option<ProbeReceipt>) {
-        if revision == 0 { self.control_probe_receipt = receipt; } else { self.annotation_pixels_receipt = receipt; }
+    pub(super) fn accept_annotation_pixels(
+        &mut self,
+        revision: u64,
+        receipt: Option<ProbeReceipt>,
+    ) {
+        if revision == 0 {
+            self.control_probe_receipt = receipt;
+        } else {
+            self.annotation_pixels_receipt = receipt;
+        }
     }
 }
 
@@ -813,21 +911,37 @@ pub(super) fn observe_atlas_draw(draw: &AtlasDraw, visibility: u8, scale: f32) -
         } else {
             false
         }
-        })
+    })
 }
-pub(super) fn scenario_output() -> Option<ScenarioOutput> { SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone()) }
-pub(super) fn observer_generation() -> u64 { SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation) }
-pub(super) fn current_fps_draw() -> Option<reporting::FpsEvidence> { SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().fps_draw) }
-pub(super) fn rearm_fps_sampling() { SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().fps_sample = None); }
-pub(super) fn rearm_viewer_observation() { SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().viewer = None); }
-pub(super) fn invalidate_atlas_observation() { SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas = None); }
+pub(super) fn scenario_output() -> Option<ScenarioOutput> {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().output.clone())
+}
+#[cfg(target_arch = "wasm32")]
+pub(super) fn observer_generation() -> u64 {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().generation)
+}
+pub(super) fn current_fps_draw() -> Option<reporting::FpsEvidence> {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow().fps_draw)
+}
+pub(super) fn rearm_fps_sampling() {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().fps_sample = None);
+}
+pub(super) fn rearm_viewer_observation() {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().viewer = None);
+}
+pub(super) fn invalidate_atlas_observation() {
+    SURFACE_DRAW_OBSERVER.with(|observer| observer.borrow_mut().atlas = None);
+}
 pub(super) fn complete_atlas_probe(composition: bool) {
     SURFACE_DRAW_OBSERVER.with(|observer| {
         let mut observer = observer.borrow_mut();
-        if composition { observer.atlas_composition_owner = None; } else { observer.atlas_pixels_owner = None; }
+        if composition {
+            observer.atlas_composition_owner = None;
+        } else {
+            observer.atlas_pixels_owner = None;
+        }
     });
 }
-
 
 #[cfg(test)]
 pub(in crate::integration_control) mod tests;

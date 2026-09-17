@@ -14,8 +14,7 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/detection_types.h"
 #include <torch/types.h>
-namespace mmltk::backend::models::rfdetr {
-}
+namespace mmltk::backend::models::rfdetr {}
 namespace mmltk::backend::models::rfdetr {
 class ClassPostprocessLane final {
    public:

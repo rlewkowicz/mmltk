@@ -1,21 +1,21 @@
-use crate::integration_control::widget_ops::click;
 use crate::generated::FeatureId;
 use crate::integration_control::probe::{reset_observer, surface_draw_stream};
+use crate::integration_control::widget_ops::click;
 use crate::message::Message as RootMessage;
 use crate::view::{annotation, explore, train};
 use crate::view_model::{ApplicationModel, ConnectionState};
 use iced::{Rectangle, Task};
-mod retained;
 mod lifecycle;
-mod widget_ops;
-mod probe;
 mod pixel_checks;
-pub use probe::{ProbeReceipt, ViewerDraw};
+mod probe;
+mod retained;
+mod widget_ops;
 pub use pixel_checks::{AtlasDraw, FpsPixelOutcome, ProbeOutcome};
-pub(crate) use probe::{record_probe_draw, report_surface_draw, report_workspace_fps};
+pub(crate) use pixel_checks::{report_atlas_draw, sample_boundary_pixels};
 #[cfg(test)]
 pub(crate) use probe::tests::ProbeFixture;
-pub(crate) use pixel_checks::{report_atlas_draw, sample_boundary_pixels};
+pub use probe::{ProbeReceipt, ViewerDraw};
+pub(crate) use probe::{record_probe_draw, report_surface_draw, report_workspace_fps};
 mod annotation_checks;
 mod annotation_product;
 mod reporting;
@@ -72,14 +72,11 @@ pub(crate) fn notify_driver_draw(
     let _ = (control, source_revision, presentation_revision);
 }
 
-
 pub const EXPLORE_DATASET_PANE: &str = explore::DATASET_PANE_ID;
 pub const EXPLORE_DETAILS_PANE: &str = explore::DETAILS_PANE_ID;
 pub const EXPLORE_DETAIL_CLOSE: &str = explore::DETAIL_CLOSE_ID;
 
-
 const EXPLORE_GALLERY: &str = explore::GALLERY_WORKSPACE_ID;
-
 
 fn annotation_message(message: annotation::Message) -> Task<RootMessage> {
     Task::done(RootMessage::Workspace(
@@ -92,7 +89,6 @@ fn explore_message(message: explore::Message) -> Task<RootMessage> {
         crate::view::router::Message::Explore(message),
     ))
 }
-
 
 pub(crate) fn report_viewer_label(
     category: u16,
@@ -156,13 +152,10 @@ pub const EXPLORE_UPSCALE_ACTIONS: [&str; 3] = [
     explore::DETAIL_UPSCALE_NEURAL_ID,
 ];
 
-
 // Fixture demand windows are disjoint and separated beyond the native four
 // neighbour rows. This does not change the producer's admission/cache policy.
 
-
 const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
-
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -434,7 +427,6 @@ pub(crate) fn report_snapshot_conflict(family: &str, revision: u64, fields: &str
         )
     });
 }
-
 
 pub(crate) fn report_surface_geometry(
     control: &'static str,
@@ -1019,7 +1011,6 @@ impl Phase {
     }
 }
 
-
 fn route_edit_available(
     model: &ApplicationModel,
     settings: &crate::view::settings::SettingsModel,
@@ -1172,30 +1163,28 @@ impl Controller {
             probes: probe::Requests::default(),
             widgets: widget_ops::RevealState::default(),
             driver: Driver {
-
-            reporting: reporting::Owner::new(),
-            generation,
-            phase: if enabled {
-                Phase::AwaitBootstrap
-            } else {
-                Phase::Disabled
+                reporting: reporting::Owner::new(),
+                generation,
+                phase: if enabled {
+                    Phase::AwaitBootstrap
+                } else {
+                    Phase::Disabled
+                },
+                window_close,
+                dataset_source,
+                compiled_directory,
+                resolution,
+                viewer_scenario,
+                session: SessionInputs::default(),
+                control_sequence: 1,
+                control_phase: None,
+                control_progress: 0,
+                failure_line: 0,
+                failure: String::new(),
+                desired_dark: None,
+                reuse_compiled: false,
+                input_scale: 1.0,
             },
-            window_close,
-            dataset_source,
-            compiled_directory,
-            resolution,
-            viewer_scenario,
-            session: SessionInputs::default(),
-            control_sequence: 1,
-            control_phase: None,
-            control_progress: 0,
-            failure_line: 0,
-            failure: String::new(),
-            desired_dark: None,
-            reuse_compiled: false,
-            input_scale: 1.0,
-
-                    },
         }
     }
 
@@ -1271,7 +1260,9 @@ impl Controller {
                 return Err("invalid capacity control identity");
             }
             if receipt.kind == Kind::GalleryReadCompletionHeld {
-                return self.retained.hold_gallery_completion(&mut self.driver, &receipt);
+                return self
+                    .retained
+                    .hold_gallery_completion(&mut self.driver, &receipt);
             }
             self.driver.phase = match (receipt.kind, &self.driver.phase) {
                 (Kind::VisibleReadArmed, Phase::AwaitVisibleReadArm(index)) => {
@@ -1287,7 +1278,8 @@ impl Controller {
                     Phase::AwaitCapacityRetry
                 }
                 _ => {
-                    self.driver.fail("duplicate, stale, or reordered capacity control");
+                    self.driver
+                        .fail("duplicate, stale, or reordered capacity control");
                     return Err("duplicate, stale, or reordered capacity control");
                 }
             };
@@ -1299,7 +1291,8 @@ impl Controller {
             || !matches!(self.driver.phase, Phase::Complete)
             || self.driver.control_phase.as_ref() != Some(&Phase::Complete)
         {
-            self.driver.fail("premature, duplicate or stale scenario advance");
+            self.driver
+                .fail("premature, duplicate or stale scenario advance");
             return Err("premature, duplicate or stale scenario advance");
         }
         let index = usize::try_from(receipt.sequence - 1).map_err(|_| "scenario index overflow")?;
@@ -1336,7 +1329,8 @@ impl Controller {
         document_epoch: u64,
     ) {
         if self.driver.running() {
-            self.annotation_scenario.observe_open(request, document_epoch);
+            self.annotation_scenario
+                .observe_open(request, document_epoch);
         }
     }
 
@@ -1351,7 +1345,9 @@ impl Controller {
         &mut self,
         connection: &mut crate::transport_connection::Connection,
     ) {
-        if self.driver.generation == 0 || self.driver.control_phase.as_ref() == Some(&self.driver.phase) {
+        if self.driver.generation == 0
+            || self.driver.control_phase.as_ref() == Some(&self.driver.phase)
+        {
             return;
         }
         if self.driver.viewer_scenario == "quiet"
@@ -1375,7 +1371,9 @@ impl Controller {
             "work" => 2,
             _ => 3,
         };
-        let Some(progress) = self.driver.control_progress
+        let Some(progress) = self
+            .driver
+            .control_progress
             .checked_add(4)
             .and_then(|value| value.checked_add(class))
         else {
@@ -1410,20 +1408,27 @@ impl Controller {
         }
     }
 
-
     pub(crate) fn observe_upscale_request(&mut self, kernel: crate::generated::UpscaleKernel) {
         self.retained.observe_upscale_request(&self.driver, kernel);
     }
 
-    pub(super) fn update_location(&mut self, control: String, bounds: Rectangle) -> Option<train::Message> {
+    pub(super) fn update_location(
+        &mut self,
+        control: String,
+        bounds: Rectangle,
+    ) -> Option<train::Message> {
         self.widgets.location_completed();
         if matches!(self.driver.phase, Phase::Workflows(_)) {
-            self.workflows.workflow_located(&mut self.driver, &control, bounds);
+            self.workflows
+                .workflow_located(&mut self.driver, &control, bounds);
             return None;
         }
-        if !self.probes.accept_location() { return None; }
+        if !self.probes.accept_location() {
+            return None;
+        }
         if matches!(self.driver.phase, Phase::ViewerNoAspect) {
-            self.retained.viewer_selector_located(&mut self.driver, &self.probes, bounds);
+            self.retained
+                .viewer_selector_located(&mut self.driver, &self.probes, bounds);
             return None;
         }
         if bounds.width <= 0.0 || bounds.height <= 0.0 {
@@ -1435,25 +1440,35 @@ impl Controller {
                     [0.0; 4],
                 )
             });
-            self.driver.fail("Iced widget operation could not locate the stable identity");
+            self.driver
+                .fail("Iced widget operation could not locate the stable identity");
             return None;
         }
-        self.driver.reporting
+        self.driver
+            .reporting
             .observe(|reporting| reporting.located(&self.driver.phase, &control, bounds));
-        let expected = self.lifecycle.expected_lifecycle(&self.driver)
+        let expected = self
+            .lifecycle
+            .expected_lifecycle(&self.driver)
             .or_else(|| self.retained.expected_retained(&self.driver))
-            .or_else(|| self.annotation_scenario.expected_annotation_checks(&self.driver));
+            .or_else(|| {
+                self.annotation_scenario
+                    .expected_annotation_checks(&self.driver)
+            });
         let Some(expected) = expected else {
             self.driver.fail("unexpected Iced widget operation result");
             return None;
-        }
+        };
         if control != expected {
-            self.driver.fail("Iced widget operation returned the wrong stable identity");
+            self.driver
+                .fail("Iced widget operation returned the wrong stable identity");
             return None;
         }
-        self.driver.reporting
+        self.driver
+            .reporting
             .observe(|reporting| reporting.style(&control, bounds));
-        let input_bounds = crate::presentation_surface::physical_bounds(bounds, self.driver.input_scale);
+        let input_bounds =
+            crate::presentation_surface::physical_bounds(bounds, self.driver.input_scale);
         match self.driver.phase {
             Phase::SettingsOpen
             | Phase::SettingsModal
@@ -1461,19 +1476,19 @@ impl Controller {
             | Phase::SettingsScaleDrag
             | Phase::SettingsShowFps
             | Phase::SettingsRestoreShowFps
-            | Phase::SettingsNumeric{ .. }
+            | Phase::SettingsNumeric { .. }
             | Phase::SettingsFooter
             | Phase::SettingsReset
             | Phase::SettingsClose
             | Phase::TrainNavigation
             | Phase::PageNavigation(..)
-            | Phase::PageRegion{ .. }
+            | Phase::PageRegion { .. }
             | Phase::TrainModelCard
             | Phase::TrainModelPart(..)
             | Phase::TrainModelProgress
             | Phase::ReturnTrain
             | Phase::AdvancedField(..)
-            | Phase::AdvancedSpinnerEdge{ .. }
+            | Phase::AdvancedSpinnerEdge { .. }
             | Phase::AdvancedSpinnerWheel(..)
             | Phase::AdvancedNumericEdit(..)
             | Phase::AdvancedAssignment
@@ -1496,27 +1511,32 @@ impl Controller {
             | Phase::Compile
             | Phase::CompileActionWithProgress
             | Phase::CompileProgress
-            | Phase::DatasetStatus => self.lifecycle.located_lifecycle(&mut self.driver, &mut self.widgets, control, bounds, input_bounds),
+            | Phase::DatasetStatus => self.lifecycle.located_lifecycle(
+                &mut self.driver,
+                &mut self.widgets,
+                bounds,
+                input_bounds,
+            ),
             Phase::ExploreNavigation
             | Phase::ExploreOpen
             | Phase::ExploreCloseDetail
             | Phase::ExploreDatasetPane
             | Phase::ExploreDetailsPane
-            | Phase::ExploreNumericControl{ .. }
-            | Phase::ExploreNumericReveal{ .. }
+            | Phase::ExploreNumericControl { .. }
+            | Phase::ExploreNumericReveal { .. }
             | Phase::ExplorePolicyOrder(..)
             | Phase::ExplorePolicyRange(..)
             | Phase::ExplorePolicyRangeVisible(..)
             | Phase::ExplorePolicyOverlay(..)
             | Phase::ExplorePolicyOverlayVisible(..)
-            | Phase::ExploreAugmentationToggle{ .. }
-            | Phase::ExploreAugmentationReroll{ .. }
-            | Phase::ExploreReshuffle{ .. }
-            | Phase::ExploreCard{ .. }
+            | Phase::ExploreAugmentationToggle { .. }
+            | Phase::ExploreAugmentationReroll { .. }
+            | Phase::ExploreReshuffle { .. }
+            | Phase::ExploreCard { .. }
             | Phase::GallerySweep
             | Phase::GalleryLater(..)
             | Phase::GalleryImage(..)
-            | Phase::DetailOriginal{ .. }
+            | Phase::DetailOriginal { .. }
             | Phase::DetailFit
             | Phase::ViewerSelect
             | Phase::AtlasReturnSelect
@@ -1527,34 +1547,50 @@ impl Controller {
             | Phase::AtlasOverlay(..)
             | Phase::ViewerOverlay(..)
             | Phase::ViewerNoAspect
-            | Phase::StartUpscale{ .. }
+            | Phase::StartUpscale { .. }
             | Phase::DetailNext(..)
             | Phase::DetailPrevious(..)
             | Phase::DetailCloseEvidence
-            | Phase::ExploreDatasetReopen{ .. }
-            | Phase::GalleryReselect => self.retained.located_retained(&mut self.driver, &mut self.probes, &mut self.widgets, control, bounds, input_bounds),
-            Phase::CopyUndo{ .. }
-            | Phase::CopyRedo{ .. }
+            | Phase::ExploreDatasetReopen { .. }
+            | Phase::GalleryReselect => self.retained.located_retained(
+                &mut self.driver,
+                &mut self.probes,
+                &mut self.widgets,
+                control,
+                bounds,
+                input_bounds,
+            ),
+            Phase::CopyUndo { .. }
+            | Phase::CopyRedo { .. }
             | Phase::CopySave
             | Phase::CopyCapability
             | Phase::CopyLayout(..)
             | Phase::OpenAnnotation
-            | Phase::AnnotationSidebar{ .. }
-            | Phase::AnnotationTimeline{ .. }
-            | Phase::AnnotationOperation{ .. }
-            | Phase::AnnotationStop{ .. }
-            | Phase::AnnotationBrush{ .. }
-            | Phase::AnnotationTool{ .. }
+            | Phase::AnnotationSidebar { .. }
+            | Phase::AnnotationTimeline { .. }
+            | Phase::AnnotationOperation { .. }
+            | Phase::AnnotationStop { .. }
+            | Phase::AnnotationBrush { .. }
+            | Phase::AnnotationTool { .. }
             | Phase::AnnotationSurface(..)
             | Phase::AnnotationPointer(..)
             | Phase::AwaitPointer(..)
-            | Phase::CopyProductWait => self.annotation_scenario.located_annotation_checks(&mut self.driver, &mut self.probes, control, bounds, input_bounds),
+            | Phase::CopyProductWait => self.annotation_scenario.located_annotation_checks(
+                &mut self.driver,
+                &mut self.probes,
+                control,
+                bounds,
+                input_bounds,
+            ),
             _ => self.driver.click_located(input_bounds),
         }
     }
 
     pub(super) fn update_probe_message(&mut self, message: Message) -> Option<train::Message> {
-        if !self.probes.accepts_message(&self.driver, &self.pixel_checks, &message) {
+        if !self
+            .probes
+            .accepts_message(&self.driver, &self.pixel_checks, &message)
+        {
             return None;
         }
         let (message, request_receipt) = match message {
@@ -1573,7 +1609,8 @@ impl Controller {
                 index,
                 outcome,
             } => {
-                self.workflows.workflow_pixels(&mut self.driver, picture, index, outcome);
+                self.workflows
+                    .workflow_pixels(&mut self.driver, picture, index, outcome);
                 return None;
             }
             Message::ReportingDisabled => {
@@ -1589,32 +1626,74 @@ impl Controller {
                 return None;
             }
             Message::NumberWheelDelivered => {
-                self.retained.callback(&mut self.driver, &mut self.probes, Message::NumberWheelDelivered, request_receipt);
+                self.retained.callback(
+                    &mut self.driver,
+                    &mut self.probes,
+                    Message::NumberWheelDelivered,
+                    request_receipt,
+                );
                 self.lifecycle.wheel_delivered(&mut self.driver);
                 return None;
-            },
+            }
 
             Message::Located { control, bounds } => (control, bounds),
-            message @ Message::GalleryDrawn { .. } => { self.retained.callback(&mut self.driver, &mut self.probes, message, request_receipt); return None; },
-            message @ Message::SurfaceDrawn { .. } => { self.retained.callback(&mut self.driver, &mut self.probes, message, request_receipt); return None; },
-            message @ (Message::AtlasComposition { .. }  | Message::AtlasDrawn { .. }  | Message::AtlasPixels { .. }  | Message::GalleryMouseDelivered  | Message::NumberClipboardPrepared { .. }  | Message::NumberInvalidDelivered  | Message::NumberPasteDelivered(_)  | Message::NumberPasteRead { .. }  | Message::UpscalePixels { .. } ) => {
-                self.retained.callback(&mut self.driver, &mut self.probes, message, request_receipt);
+            message @ Message::GalleryDrawn { .. } => {
+                self.retained.callback(
+                    &mut self.driver,
+                    &mut self.probes,
+                    message,
+                    request_receipt,
+                );
                 return None;
-            },
-            message @ (Message::AnnotationControlPixels { .. }  | Message::AnnotationPixels { .. } ) => {
-                self.annotation_scenario.callback(&mut self.driver, &mut self.probes, message, request_receipt);
+            }
+            message @ Message::SurfaceDrawn { .. } => {
+                self.retained.callback(
+                    &mut self.driver,
+                    &mut self.probes,
+                    message,
+                    request_receipt,
+                );
                 return None;
-            },
-            message @ (Message::WorkspaceFpsDrawn(_)  | Message::WorkspaceFpsPixels(_) ) => {
-                self.pixel_checks.callback(&mut self.driver, message, request_receipt);
+            }
+            message @ (Message::AtlasComposition { .. }
+            | Message::AtlasDrawn { .. }
+            | Message::AtlasPixels { .. }
+            | Message::GalleryMouseDelivered
+            | Message::NumberClipboardPrepared { .. }
+            | Message::NumberInvalidDelivered
+            | Message::NumberPasteDelivered(_)
+            | Message::NumberPasteRead { .. }
+            | Message::UpscalePixels { .. }) => {
+                self.retained.callback(
+                    &mut self.driver,
+                    &mut self.probes,
+                    message,
+                    request_receipt,
+                );
                 return None;
-            },};
+            }
+            message @ (Message::AnnotationControlPixels { .. }
+            | Message::AnnotationPixels { .. }) => {
+                self.annotation_scenario.callback(
+                    &mut self.driver,
+                    &mut self.probes,
+                    message,
+                    request_receipt,
+                );
+                return None;
+            }
+            message @ (Message::WorkspaceFpsDrawn(_) | Message::WorkspaceFpsPixels(_)) => {
+                self.pixel_checks
+                    .callback(&mut self.driver, message, request_receipt);
+                return None;
+            }
+        };
         self.update_location(control, bounds)
     }
     pub(crate) fn accepts_message(&self, message: &Message) -> bool {
-        self.probes.accepts_message(&self.driver, &self.pixel_checks, message)
+        self.probes
+            .accepts_message(&self.driver, &self.pixel_checks, message)
     }
-
 
     fn advance_transition(
         &mut self,
@@ -1653,8 +1732,10 @@ impl Controller {
             self.pixel_checks.cancel_workspace_fps(&mut self.driver);
         }
         self.driver.input_scale = applied_scale;
-        self.probes.observe_presentation(&mut self.driver, model, frame);
-        self.driver.reporting
+        self.probes
+            .observe_presentation(&mut self.driver, model, frame);
+        self.driver
+            .reporting
             .observe(|reporting| reporting.explore_snapshot(model, settings));
         if let Some(error) = model.error.as_ref()
             && !matches!(
@@ -1679,11 +1760,24 @@ impl Controller {
         }
         match self.driver.phase.clone() {
             Phase::AwaitBootstrap => self.driver.bootstrap(&mut self.widgets, model, settings),
-            Phase::Workflows(step) => self.workflows.advance_workflows(&mut self.widgets, &mut self.driver, step, model, settings, active, surface),
+            Phase::Workflows(step) => self.workflows.advance_workflows(
+                &mut self.widgets,
+                &mut self.driver,
+                step,
+                model,
+                settings,
+                active,
+                surface,
+            ),
             Phase::AwaitWorkspaceFps
             | Phase::AwaitWorkspaceFpsPixels
             | Phase::RestoreWorkspaceFps
-            | Phase::AwaitWorkspaceFpsRestored => self.pixel_checks.advance_pixel_checks(&mut self.driver, model, settings, applied_scale),
+            | Phase::AwaitWorkspaceFpsRestored => self.pixel_checks.advance_pixel_checks(
+                &mut self.driver,
+                model,
+                settings,
+                applied_scale,
+            ),
             Phase::AtlasPixelColumns(..)
             | Phase::AtlasPixelRestore
             | Phase::ViewerConfirmSettings
@@ -1695,7 +1789,6 @@ impl Controller {
             | Phase::Disabled
             | Phase::Complete
             | Phase::Failed
-
             | Phase::ExploreNavigation
             | Phase::AwaitExplore
             | Phase::ExploreCloseDetail
@@ -1703,15 +1796,15 @@ impl Controller {
             | Phase::AwaitExplorePreparation(..)
             | Phase::ExploreOpen
             | Phase::AwaitExploreReady
-            | Phase::AwaitExploreInitialPatch{ .. }
-            | Phase::AwaitExploreExactGridPatch{ .. }
+            | Phase::AwaitExploreInitialPatch { .. }
+            | Phase::AwaitExploreExactGridPatch { .. }
             | Phase::AwaitExploreExactGrid(..)
             | Phase::ExploreDatasetPane
             | Phase::ExploreDetailsPane
             | Phase::ExploreNumericStart(..)
-            | Phase::ExploreNumericControl{ .. }
-            | Phase::ExploreNumericReveal{ .. }
-            | Phase::AwaitExploreNumeric{ .. }
+            | Phase::ExploreNumericControl { .. }
+            | Phase::ExploreNumericReveal { .. }
+            | Phase::AwaitExploreNumeric { .. }
             | Phase::ExplorePolicyOrderReady
             | Phase::ExplorePolicyOrder(..)
             | Phase::AwaitExplorePolicyOrder(..)
@@ -1726,14 +1819,14 @@ impl Controller {
             | Phase::AwaitExploreOverlayAll(..)
             | Phase::AwaitExploreOverlaySubset(..)
             | Phase::AwaitExploreOverlayRestored(..)
-            | Phase::ExploreAugmentationToggle{ .. }
-            | Phase::AwaitExploreAugmentationToggle{ .. }
-            | Phase::ExploreAugmentationReroll{ .. }
-            | Phase::AwaitExploreAugmentationReroll{ .. }
-            | Phase::ExploreReshuffle{ .. }
-            | Phase::AwaitExploreReshuffle{ .. }
-            | Phase::ExploreCard{ .. }
-            | Phase::AwaitGalleryPatch{ .. }
+            | Phase::ExploreAugmentationToggle { .. }
+            | Phase::AwaitExploreAugmentationToggle { .. }
+            | Phase::ExploreAugmentationReroll { .. }
+            | Phase::AwaitExploreAugmentationReroll { .. }
+            | Phase::ExploreReshuffle { .. }
+            | Phase::AwaitExploreReshuffle { .. }
+            | Phase::ExploreCard { .. }
+            | Phase::AwaitGalleryPatch { .. }
             | Phase::GalleryColdRead(..)
             | Phase::AwaitGalleryColdRead(..)
             | Phase::GallerySweep
@@ -1743,8 +1836,8 @@ impl Controller {
             | Phase::AwaitGalleryScroll(..)
             | Phase::GalleryImage(..)
             | Phase::AwaitDetail(..)
-            | Phase::DetailOriginal{ .. }
-            | Phase::AwaitDetailOriginal{ .. }
+            | Phase::DetailOriginal { .. }
+            | Phase::AwaitDetailOriginal { .. }
             | Phase::DetailFit
             | Phase::ViewerSelect
             | Phase::AtlasReturnSelect
@@ -1792,18 +1885,28 @@ impl Controller {
             | Phase::ViewerRapidGallery
             | Phase::ViewerRapidSelection(..)
             | Phase::AwaitDetailFit
-            | Phase::StartUpscale{ .. }
-            | Phase::AwaitUpscale{ .. }
+            | Phase::StartUpscale { .. }
+            | Phase::AwaitUpscale { .. }
             | Phase::DetailNext(..)
             | Phase::AwaitNext(..)
             | Phase::DetailPrevious(..)
             | Phase::AwaitPrevious(..)
             | Phase::DetailCloseEvidence
             | Phase::AwaitDetailClose
-            | Phase::ExploreDatasetReopen{ .. }
-            | Phase::AwaitExploreDatasetReopen{ .. }
+            | Phase::ExploreDatasetReopen { .. }
+            | Phase::AwaitExploreDatasetReopen { .. }
             | Phase::GalleryReselect
-            | Phase::AwaitDetailAgain => self.retained.advance_retained(&mut self.driver, &mut self.pixel_checks, &mut self.probes, &mut self.widgets, model, settings, router, active, surface),
+            | Phase::AwaitDetailAgain => self.retained.advance_retained(
+                &mut self.driver,
+                &mut self.pixel_checks,
+                &mut self.probes,
+                &mut self.widgets,
+                model,
+                settings,
+                router,
+                active,
+                surface,
+            ),
             Phase::SettingsOpen
             | Phase::AwaitSettings
             | Phase::SettingsModal
@@ -1820,7 +1923,7 @@ impl Controller {
             | Phase::SettingsRestoreShowFps
             | Phase::AwaitSettingsShowFpsRestored
             | Phase::AwaitSettingsShowFpsSnapshot
-            | Phase::SettingsNumeric{ .. }
+            | Phase::SettingsNumeric { .. }
             | Phase::SettingsFooter
             | Phase::SettingsReset
             | Phase::SettingsClose
@@ -1829,16 +1932,16 @@ impl Controller {
             | Phase::AwaitTrain
             | Phase::PageNavigation(..)
             | Phase::AwaitPage(..)
-            | Phase::PageRegion{ .. }
+            | Phase::PageRegion { .. }
             | Phase::TrainModelCard
             | Phase::TrainModelPart(..)
             | Phase::TrainModelProgress
             | Phase::ReturnTrain
             | Phase::AwaitReturnTrain
             | Phase::AdvancedField(..)
-            | Phase::AdvancedSpinnerEdge{ .. }
+            | Phase::AdvancedSpinnerEdge { .. }
             | Phase::AdvancedSpinnerWheel(..)
-            | Phase::AdvancedSpinnerVerify{ .. }
+            | Phase::AdvancedSpinnerVerify { .. }
             | Phase::AdvancedSpinnerWheelVerify(..)
             | Phase::AdvancedNumericEdit(..)
             | Phase::AwaitAdvancedNumericDraft(..)
@@ -1883,15 +1986,22 @@ impl Controller {
             | Phase::AwaitCompileCompletion
             | Phase::CompileProgress
             | Phase::CompileActionWithProgress
-            | Phase::DatasetStatus => self.lifecycle.advance_lifecycle(&mut self.driver, &mut self.widgets, model, settings, applied_scale, router, active),
+            | Phase::DatasetStatus => self.lifecycle.advance_lifecycle(
+                &mut self.driver,
+                &mut self.widgets,
+                model,
+                settings,
+                applied_scale,
+                active,
+            ),
             Phase::OpenAnnotation
-            | Phase::CopyAwaitObject{ .. }
-            | Phase::CopyUndo{ .. }
-            | Phase::CopyRedo{ .. }
-            | Phase::CopyAwaitUndo{ .. }
-            | Phase::CopyAwaitRedo{ .. }
-            | Phase::CopyAwaitClass{ .. }
-            | Phase::CopyListSetup{ .. }
+            | Phase::CopyAwaitObject { .. }
+            | Phase::CopyUndo { .. }
+            | Phase::CopyRedo { .. }
+            | Phase::CopyAwaitUndo { .. }
+            | Phase::CopyAwaitRedo { .. }
+            | Phase::CopyAwaitClass { .. }
+            | Phase::CopyListSetup { .. }
             | Phase::CopyLayout(..)
             | Phase::CopySwatchWait
             | Phase::CopyCapability
@@ -1902,18 +2012,27 @@ impl Controller {
             | Phase::CopySave
             | Phase::CopyAwaitSave
             | Phase::AwaitAnnotation
-            | Phase::AnnotationSidebar{ .. }
-            | Phase::AnnotationTimeline{ .. }
-            | Phase::AnnotationOperation{ .. }
-            | Phase::AnnotationStop{ .. }
-            | Phase::AnnotationBrush{ .. }
-            | Phase::AnnotationTool{ .. }
-            | Phase::AwaitTool{ .. }
+            | Phase::AnnotationSidebar { .. }
+            | Phase::AnnotationTimeline { .. }
+            | Phase::AnnotationOperation { .. }
+            | Phase::AnnotationStop { .. }
+            | Phase::AnnotationBrush { .. }
+            | Phase::AnnotationTool { .. }
+            | Phase::AwaitTool { .. }
             | Phase::AnnotationSurface(..)
             | Phase::AwaitAnnotationFrame(..)
             | Phase::AnnotationPointer(..)
             | Phase::AwaitPointer(..)
-            | Phase::CopyProductWait => self.annotation_scenario.advance_annotation_checks(&mut self.widgets, &mut self.driver, &mut self.probes, model, settings, applied_scale, active, surface),
+            | Phase::CopyProductWait => self.annotation_scenario.advance_annotation_checks(
+                &mut self.widgets,
+                &mut self.driver,
+                &mut self.probes,
+                model,
+                settings,
+                applied_scale,
+                active,
+                surface,
+            ),
             _ => Task::none(),
         }
     }
@@ -1957,12 +2076,10 @@ impl Driver {
         self.phase = Phase::Failed;
     }
     pub(super) fn click_located(&mut self, input_bounds: Rectangle) -> Option<train::Message> {
-
-                if !click(input_bounds) {
-                    self.fail("Firefox click dispatch failed");
-                }
-                None
-
+        if !click(input_bounds) {
+            self.fail("Firefox click dispatch failed");
+        }
+        None
     }
     pub(super) fn advance_to(&mut self, phase: Phase) -> Task<RootMessage> {
         reporting::emit(|sink| {
@@ -1987,12 +2104,15 @@ impl Driver {
         self.reporting
             .observe(|reporting| reporting.phase_progress(&self.phase));
     }
-
-
 }
 
 impl Driver {
-    fn bootstrap(&mut self, widgets: &mut widget_ops::RevealState, model: &ApplicationModel, settings: &crate::view::settings::SettingsModel) -> Task<RootMessage> {
+    fn bootstrap(
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        model: &ApplicationModel,
+        settings: &crate::view::settings::SettingsModel,
+    ) -> Task<RootMessage> {
         match self.phase.clone() {
             Phase::AwaitBootstrap
                 if model.connection == ConnectionState::Connected
@@ -2045,7 +2165,10 @@ impl Controller {
 }
 
 impl Controller {
-    pub(crate) fn receive_control(&mut self, receipt: crate::generated::IntegrationControlReceipt) -> Result<(), &'static str> {
+    pub(crate) fn receive_control(
+        &mut self,
+        receipt: crate::generated::IntegrationControlReceipt,
+    ) -> Result<(), &'static str> {
         let result = self.receive_control_transition(receipt);
         self.finish_transition();
         result
@@ -2063,7 +2186,8 @@ impl Controller {
         surface: Option<crate::presentation_surface::Surface>,
     ) -> Task<RootMessage> {
         let running = self.driver.running();
-        let result = self.advance_transition(model, settings, applied_scale, router, active, surface);
+        let result =
+            self.advance_transition(model, settings, applied_scale, router, active, surface);
         if running {
             self.finish_transition();
         }

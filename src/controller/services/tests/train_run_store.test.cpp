@@ -65,4 +65,6 @@ void test_current_training_history_pages_and_attempt_configuration() {
     REQUIRE(std::filesystem::is_empty(fresh));
 }
 }  // namespace
-TEST_CASE("test_current_training_history_pages_and_attempt_configuration", "[gui][train][history]") { test_current_training_history_pages_and_attempt_configuration(); }
+TEST_CASE("test_current_training_history_pages_and_attempt_configuration", "[gui][train][history]") {
+    test_current_training_history_pages_and_attempt_configuration();
+}

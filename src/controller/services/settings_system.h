@@ -29,7 +29,6 @@ struct SettingsMutationResult final {
     [[nodiscard]] bool applied() const noexcept { return terminal == SettingsTerminal::Applied; }
 };
 }  // namespace mmltk::controller::services
-
 namespace mmltk::controller {
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] SettingsChanged final {
     contracts::SettingsUiState snapshot{};

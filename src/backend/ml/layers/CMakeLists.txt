@@ -46,7 +46,7 @@ function(mmltk_add_backend_ml_layers_tests)
     target_include_directories(mmltk_backend_ml_layers_tests PRIVATE
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/detail)
     target_link_libraries(mmltk_backend_ml_layers_tests PRIVATE
-        mmltk_test_support
+        mmltk_backend_ml_torch_test_support
         mmltk::backend::ml::layers
         CUDA::cudart
     )

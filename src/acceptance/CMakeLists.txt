@@ -138,10 +138,8 @@ if(BUILD_RFDETR_NATIVE)
     add_executable(mmltk_workspace_wayland_integration EXCLUDE_FROM_ALL)
     mmltk_configure_component(
         mmltk_workspace_wayland_integration PRIVATE_DECLARATIONS)
-    mmltk_register_retained_module_importers(
-        mmltk_workspace_wayland_integration
-        tests/workflow_wayland_inputs.cpp)
     mmltk_register_ordinary_sources(mmltk_workspace_wayland_integration
+        tests/workflow_wayland_inputs.cpp
         tests/wayland/session.cpp
         tests/wayland/audit_facts.cpp
         tests/wayland/artifact_cursor.cpp

@@ -1488,10 +1488,9 @@ auto extract_ranked_axis_args(torch::jit::Node* node, const char* error_context,
         if (!dim) missing.emplace_back("axis");
         if (!second) missing.emplace_back("operand");
         const auto* input = node->input(0);
-        throw_lowering_error(node,
-                             std::format("{}; input={}, producer={}, type={}",
-                                         format_missing_parameters(std::format("{} parameters must be compile-time constants", error_context), missing),
-                                         input->debugName(), input->node()->kind().toQualString(), input->type()->str()));
+        throw_lowering_error(node, std::format("{}; input={}, producer={}, type={}",
+                                               format_missing_parameters(std::format("{} parameters must be compile-time constants", error_context), missing),
+                                               input->debugName(), input->node()->kind().toQualString(), input->type()->str()));
     }
     return RankedAxisArgs<std::remove_cvref_t<decltype(*second)>>{*input_rank, *dim, *second};
 }

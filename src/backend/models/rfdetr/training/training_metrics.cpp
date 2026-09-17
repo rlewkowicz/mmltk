@@ -13,8 +13,7 @@ struct TrainingMetricHandoff::Impl {
    public:
     explicit Impl(int device_id)
         : device_id_(device_id),
-          event_pool_(mmltk::frameworks::gpu::make_cuda_device_owner<Impl, &Impl::record_failure>(this, device_id), 1U,
-                      retirement_owner_) {
+          event_pool_(mmltk::frameworks::gpu::make_cuda_device_owner<Impl, &Impl::record_failure>(this, device_id), 1U, retirement_owner_) {
         const auto device_options = torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id_));
         device_values_ = torch::zeros({10 + static_cast<int64_t>(scalar_packet::size)}, device_options);
         device_values_.select(0, 6).fill_(1.0f);
@@ -39,8 +38,7 @@ struct TrainingMetricHandoff::Impl {
         device_values_.select(0, 6).fill_(1.0f);
     }
     void begin_wave() { device_values_.narrow(0, 3, 3).zero_(); }
-    void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss,
-                    const scalar_packet::Tensors& scalars) {
+    void accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const scalar_packet::Tensors& scalars) {
         for (std::size_t i = 0; i < scalar_packet::size; ++i) scalar_sources_[i] = scalars[i].defined() ? scalars[i] : unavailable_;
         at::stack_out(scalar_values_, scalar_sources_);
         device_values_.narrow(0, 10, scalar_packet::size).add_(scalar_values_);
@@ -117,12 +115,17 @@ TrainingMetricHandoff::TrainingMetricHandoff(int device_id) : impl_(std::make_un
 TrainingMetricHandoff::~TrainingMetricHandoff() = default;
 void TrainingMetricHandoff::reset_epoch() { impl_->reset_epoch(); }
 void TrainingMetricHandoff::begin_wave() { impl_->begin_wave(); }
-void TrainingMetricHandoff::accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss, const scalar_packet::Tensors& scalars) { impl_->accumulate(loss, class_loss, box_loss, scalars); }
-TrainingMetricSnapshot TrainingMetricHandoff::complete_step(const torch::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches) { return impl_->complete_step(found_inf, wave_micro_batches, epoch_micro_batches); }
+void TrainingMetricHandoff::accumulate(const torch::Tensor& loss, const torch::Tensor& class_loss, const torch::Tensor& box_loss,
+                                       const scalar_packet::Tensors& scalars) {
+    impl_->accumulate(loss, class_loss, box_loss, scalars);
+}
+TrainingMetricSnapshot TrainingMetricHandoff::complete_step(const torch::Tensor& found_inf, int64_t wave_micro_batches, int64_t epoch_micro_batches) {
+    return impl_->complete_step(found_inf, wave_micro_batches, epoch_micro_batches);
+}
 torch::Tensor TrainingMetricHandoff::loss_sum() const { return impl_->loss_sum(); }
 torch::Tensor TrainingMetricHandoff::epoch_count(std::int64_t count) { return impl_->epoch_count(count); }
 double TrainingMetricHandoff::epoch_average() { return impl_->epoch_average(); }
 void TrainingMetricHandoff::begin_validation() { impl_->begin_validation(); }
 void TrainingMetricHandoff::accumulate_validation(const torch::Tensor& loss) { impl_->accumulate_validation(loss); }
 double TrainingMetricHandoff::validation_average(std::size_t count) { return impl_->validation_average(count); }
-}
+}  // namespace mmltk::backend::models::rfdetr

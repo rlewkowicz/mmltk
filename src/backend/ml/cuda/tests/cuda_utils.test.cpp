@@ -1,4 +1,4 @@
-#include <catch2/catch_test_macros.hpp>
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <cmath>
 #include <cstdint>
 #include <vector>

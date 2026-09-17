@@ -82,11 +82,9 @@ pub(super) fn view(
         image
     };
     column![
-        crate::view::aspect_ratio::selector(
-            aspect,
-            settings_available,
-            |aspect| super::Message::Workspace(workspace::Message::AspectSelected(aspect))
-        ),
+        crate::view::aspect_ratio::selector(aspect, settings_available, |aspect| {
+            super::Message::Workspace(workspace::Message::AspectSelected(aspect))
+        }),
         container(
             container(image)
                 .id(workspace::STABLE_ID)

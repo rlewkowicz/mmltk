@@ -146,7 +146,8 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
     }
 }
 EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
-                                          const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds) {
+                                          const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, MaskResizeScratch* scratch,
+                                          RowMajorMaskBounds* source_bounds) {
     if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U ||
         letterbox.offset_x + letterbox.resized_width > target_dimensions.width || letterbox.offset_y + letterbox.resized_height > target_dimensions.height) {
         throw std::invalid_argument("mask resize parameters are invalid");

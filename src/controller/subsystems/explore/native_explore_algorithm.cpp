@@ -580,8 +580,8 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
             target.length = static_cast<std::uint8_t>(std::min<std::size_t>(name.size(), 31U));
             std::memcpy(target.name, name.data(), target.length);
             target.visible = 1U;
-            mmltk::backend::imaging::raster::color::class_color(static_cast<int>(index), static_cast<int>(classes.size()), target.color[0],
-                                                                        target.color[1], target.color[2]);
+            mmltk::backend::imaging::raster::color::class_color(static_cast<int>(index), static_cast<int>(classes.size()), target.color[0], target.color[1],
+                                                                target.color[2]);
         }
         ExploreDatasetFacts dataset{
             .image_count = static_cast<std::uint32_t>(store.image_entries().size()),

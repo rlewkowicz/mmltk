@@ -1,38 +1,40 @@
 use iced::widget::shader;
 use iced::{Event, Rectangle, mouse};
-mod geometry;
-mod renderer;
 pub(crate) mod gallery;
+mod geometry;
 pub(crate) mod labels;
 pub(crate) mod metadata;
 pub(crate) mod pixel_trace;
+mod renderer;
 
-pub use renderer::{FrameReady, Notification};
-#[cfg(any(target_arch = "wasm32", test))]
-pub use renderer::subscription;
-pub use geometry::{SurfaceGesture, SurfaceGestureKind};
 pub(crate) use geometry::{Placement, SurfaceSample, ViewportOwner, physical_bounds};
 use geometry::{PlacementGeometry, placement_geometry};
+pub use geometry::{SurfaceGesture, SurfaceGestureKind};
 #[cfg(test)]
 use geometry::{ViewTransform, inverse_content_point};
-pub(crate) use renderer::{
-    initialize_diagnostics, surface_trace_enabled, trace_surface, trace_frame,
-    trace_atlas_stage, accept_publication, retire_publication, begin_capacity_acceptance,
-    capacity_acceptance_slots, release_capacity_sample, end_capacity_acceptance, drawn_detail,
-    clear_drawn_detail, record_drawn_detail, viewer_annotation_request, same_mailbox_slot,
-    invalidate_drawn_slot, Primitive, authorize_draw, reset_reconstruction_probe,
-    retire_samples, retained_surface, ExploreDisplay, explore_display,
-    drawable_annotation, drawable_prediction, drawable_validation,
-    AnnotationContent, DetailContent, complete_sample, discard_sample,
-    reconcile_completed, same_allocation, release,
-};
-use renderer::{SampleRead, PendingImage, copy_completed, SAMPLE_CAPACITY, trace_gallery_source};
-#[cfg(target_arch = "wasm32")]
-pub(crate) use renderer::{surface_trace_fields, gallery_trace_fields, emit_surface_trace};
-#[cfg(test)]
-pub(crate) use renderer::{TestRendererCleanup, reset_test_releases, test_sample_read, test_releases};
 #[cfg(test)]
 use renderer::ImagePublication;
+#[cfg(any(target_arch = "wasm32", test))]
+pub use renderer::subscription;
+pub(crate) use renderer::{
+    AnnotationContent, DetailContent, ExploreDisplay, Primitive, accept_publication,
+    authorize_draw, begin_capacity_acceptance, capacity_acceptance_slots, clear_drawn_detail,
+    complete_sample, discard_sample, drawable_annotation, drawable_prediction, drawable_validation,
+    drawn_detail, end_capacity_acceptance, explore_display, initialize_diagnostics,
+    invalidate_drawn_slot, reconcile_completed, release, release_capacity_sample,
+    reset_reconstruction_probe, retained_surface, retire_publication, retire_samples,
+    same_allocation, trace_atlas_stage, trace_surface, viewer_annotation_request,
+};
+pub use renderer::{FrameReady, Notification};
+use renderer::{PendingImage, SAMPLE_CAPACITY, SampleRead, copy_completed, trace_gallery_source};
+#[cfg(test)]
+pub(crate) use renderer::{
+    TestRendererCleanup, record_drawn_detail, reset_test_releases, test_releases, test_sample_read,
+};
+#[cfg(target_arch = "wasm32")]
+pub(crate) use renderer::{
+    emit_surface_trace, gallery_trace_fields, surface_trace_enabled, surface_trace_fields,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Surface {
@@ -201,7 +203,11 @@ fn surface_for_content_session(content_session: u64) -> Surface {
         width: 640,
         height: 480,
         frame: Some(crate::view_model::test_support::physical_frame(
-            content_session, 1, 1, 640, 480,
+            content_session,
+            1,
+            1,
+            640,
+            480,
         )),
         crop: None,
         viewer_identity: None,

@@ -21,7 +21,6 @@
 namespace mmltk::backend::models::rfdetr {
 inline constexpr std::size_t kMaximumCliImageInputs = 4096U;
 inline constexpr std::size_t kMaximumTrainingDevices = 16U;
-
 struct ModelArtifactRequest {
     // CLEANUP-IGNORE: Each canonical artifact path carries the same reflected path capacity for generated consumers.
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path weights_path;

@@ -328,8 +328,10 @@ ExploreSettingsCandidate SettingsSystem::Update(const ExploreSettingsCandidate& 
         if (edit.class_catalog_identity) candidate.workflows.explore.class_catalog_identity = *edit.class_catalog_identity;
         if (!contracts::gui_settings_valid(candidate)) {
             const auto detail = edit.class_catalog_identity ? "Explore preferences are invalid"
-                : edit.preferences ? (edit.augmentation_enabled ? "Explore product preferences are invalid" : "Explore filter preferences are invalid")
-                : edit.show_original_dimensions ? "Explore detail settings are invalid" : "Explore augmentation settings are invalid";
+                                : edit.preferences
+                                    ? (edit.augmentation_enabled ? "Explore product preferences are invalid" : "Explore filter preferences are invalid")
+                                : edit.show_original_dimensions ? "Explore detail settings are invalid"
+                                                                : "Explore augmentation settings are invalid";
             throw contracts::InvalidIntentError(detail);
         }
         result = persist(std::move(candidate), edit.class_catalog_identity.has_value());

@@ -1,4 +1,5 @@
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/presentation/presentation_system.h"
 #include "src/common/io/scoped_fd.h"
 #include "src/test_support/async_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>

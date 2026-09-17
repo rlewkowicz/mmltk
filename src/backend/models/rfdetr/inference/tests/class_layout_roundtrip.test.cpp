@@ -1,7 +1,7 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include "src/common/io/file_digest.h"
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
-#include <catch2/catch_test_macros.hpp>
 #include <filesystem>
 #include <fstream>
 #include <future>

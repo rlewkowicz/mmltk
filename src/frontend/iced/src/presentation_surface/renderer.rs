@@ -1,13 +1,13 @@
-use super::{Surface, gallery, labels, metadata, pixel_trace};
-#[cfg(test)]
-use super::{Program, WorkspaceViewport};
 use super::geometry::*;
 #[cfg(test)]
 use super::surface_for_content_session;
+#[cfg(test)]
+use super::{Program, WorkspaceViewport};
+use super::{Surface, gallery, labels, metadata, pixel_trace};
 use iced::widget::shader::{self, Viewport};
-use iced::{Rectangle, wgpu};
 #[cfg(test)]
 use iced::{Event, Point, mouse};
+use iced::{Rectangle, wgpu};
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_arch = "wasm32")]
@@ -2345,7 +2345,11 @@ impl ImagePublication {
         }
     }
 
-    pub(super) fn promote(&mut self, frame: FrameReady, _model: &crate::view_model::ApplicationModel) -> bool {
+    pub(super) fn promote(
+        &mut self,
+        frame: FrameReady,
+        _model: &crate::view_model::ApplicationModel,
+    ) -> bool {
         let authorized = self
             .pending_sample
             .as_ref()

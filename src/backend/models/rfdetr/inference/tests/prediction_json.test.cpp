@@ -11,6 +11,7 @@
 #include <fstream>
 #include <nlohmann/json.hpp>
 #include <string>
+import mmltk.backend.models.rfdetr.inference.prediction;
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 namespace {

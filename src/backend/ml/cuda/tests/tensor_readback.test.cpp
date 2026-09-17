@@ -1,11 +1,8 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <ATen/ATen.h>
 #include <cuda.h>
 #include <ATen/ops/_neg_view.h>
 #include <torch/serialize.h>
-#if defined(CHECK) && !defined(CATCH_TEST_MACROS_HPP_INCLUDED)
-#undef CHECK
-#endif
-#include <catch2/catch_test_macros.hpp>
 #include <array>
 #include <atomic>
 #include <sstream>

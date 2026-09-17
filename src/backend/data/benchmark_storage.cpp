@@ -17,7 +17,7 @@ namespace {
     if (::statvfs(probe.c_str(), &status) != 0) { throw common_io::errno_error("cannot inspect benchmark storage", probe.string()); }
     return common_math::checked_multiply(status.f_bavail, status.f_frsize, "available storage byte count overflow");
 }
-}
+}  // namespace
 void require_storage(const std::filesystem::path& path, const std::uint64_t required, const char* description, const BenchmarkTraceSink& trace) {
     const std::uint64_t available = available_bytes(path);
     trace_benchmark_event(trace, "benchmark.storage.preflight", [&] {
@@ -47,4 +47,4 @@ void StorageReservationPool::release(const std::uint64_t bytes) noexcept {
     const std::lock_guard lock(mutex_);
     reserved_ = bytes <= reserved_ ? reserved_ - bytes : 0U;
 }
-}
+}  // namespace mmltk::backend::data::benchmark_internal

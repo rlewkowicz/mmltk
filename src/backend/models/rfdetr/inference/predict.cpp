@@ -56,13 +56,12 @@ module;
 #include <torch/types.h>
 #include <torch/serialize.h>
 // CLEANUP-IGNORE: This module declaration terminates Prediction's private global fragment.
-#include "src/backend/models/rfdetr/core/model_state.h" // CLEANUP-IGNORE: Prediction directly imports its concrete RF-DETR implementation owners.
+#include "src/backend/models/rfdetr/core/model_state.h"  // CLEANUP-IGNORE: Prediction directly imports its concrete RF-DETR implementation owners.
 #include "src/backend/models/rfdetr/core/runtime.h"
 module mmltk.backend.models.rfdetr.inference.prediction;
 // CLEANUP-IGNORE: This inference implementation imports the concrete owners used by its typed prediction boundary.
 import mmltk.backend.ml.cuda.torch_scope;
 import mmltk.backend.models.rfdetr.core.dataset_limit_resolution;
-
 import mmltk.backend.models.rfdetr.inference.loader;
 namespace mmltk::backend::models::rfdetr {
 namespace runtime = mmltk::backend::ml::runtime;
@@ -242,15 +241,13 @@ class PredictionBackend final {
                     continue;
                 }
                 const auto view = [&](const runtime::RuntimeTensorBuffer& buffer, at::ScalarType type) {
-                    return torch::from_blob(buffer.device_data, at::IntArrayRef(buffer.shape.extents.data(), buffer.shape.rank),
-                                                 input.options().dtype(type));
+                    return torch::from_blob(buffer.device_data, at::IntArrayRef(buffer.shape.extents.data(), buffer.shape.rank), input.options().dtype(type));
                 };
                 auto& destination = annotations.selections[index];
                 destination = {.query_indices = view(selected.query_indices, at::kLong)};
                 if (annotations.want_masks && selected.mask_logits)
                     destination.mask_logits =
-                        view(*selected.mask_logits,
-                             selected.mask_logits->element_type == runtime::RuntimeElementType::Float16 ? at::kHalf : at::kFloat);
+                        view(*selected.mask_logits, selected.mask_logits->element_type == runtime::RuntimeElementType::Float16 ? at::kHalf : at::kFloat);
             }
             return;
         }
@@ -649,12 +646,10 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
                                                        PredictionReadback& readback, AnnotationBatch& annotations, const PredictionDelivery& delivery) {
     const auto resolution = static_cast<int>(backend.resolution());
     auto host = mmltk::backend::ml::cuda::numa_empty({1, 3, resolution, resolution}, at::kFloat, options.device_id);
-    auto device = torch::empty(
-        host.sizes(), torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, static_cast<c10::DeviceIndex>(options.device_id)));
+    auto device = torch::empty(host.sizes(), torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, static_cast<c10::DeviceIndex>(options.device_id)));
     const auto mean = torch::tensor({0.485F, 0.456F, 0.406F}, device.options()).view({1, 3, 1, 1});
     const auto deviation = torch::tensor({0.229F, 0.224F, 0.225F}, device.options()).view({1, 3, 1, 1});
-    auto converted =
-        backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(host.sizes(), device.options().dtype(backend.input_type()));
+    auto converted = backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(host.sizes(), device.options().dtype(backend.input_type()));
     mmltk::backend::imaging::resample::RgbImageResizer resizer(1);
     std::vector<std::uint8_t> resized(static_cast<std::size_t>(resolution) * resolution * 3U);
     const auto started = std::chrono::steady_clock::now();
@@ -712,8 +707,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
     const auto deviation = torch::tensor({0.229F, 0.224F, 0.225F}, cuda).view({1, 3, 1, 1});
     const auto resolution = static_cast<std::int64_t>(backend.resolution());
     auto normalized = torch::empty({1, 3, resolution, resolution}, cuda);
-    auto converted =
-        backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(normalized.sizes(), cuda.dtype(backend.input_type()));
+    auto converted = backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(normalized.sizes(), cuda.dtype(backend.input_type()));
     while (!delivery.stop.stop_requested() && (options.limit_images == 0U || result.processed_images < options.limit_images)) {
         auto frame = source->Next();
         if (!frame) break;

@@ -37,19 +37,15 @@ torch::Tensor fixed_box_scale(const torch::Tensor& boxes, const int64_t height, 
         return cache.scale;
     }
     FixedBoxScaleCacheEntry candidate{
-        boxes.device(),
-        stream,
-        height,
-        width,
-        torch::tensor({width, height, width, height}, boxes.options().dtype(torch::kFloat32)).view({1, 1, 4}),
+        boxes.device(), stream, height, width, torch::tensor({width, height, width, height}, boxes.options().dtype(torch::kFloat32)).view({1, 1, 4}),
     };
     // Never rewrite storage still read by queued work. Torch retires the old
     // allocation on its own stream; construction failure leaves the cache intact.
     cache = std::move(candidate);
     return cache.scale;
 }
-PostprocessCore postprocess_core(const OutputTensors& outputs, const torch::Tensor* target_sizes,
-                                 std::optional<std::pair<int64_t, int64_t>> fixed_size, int64_t num_select, ClassPostprocessLane* classes) {
+PostprocessCore postprocess_core(const OutputTensors& outputs, const torch::Tensor* target_sizes, std::optional<std::pair<int64_t, int64_t>> fixed_size,
+                                 int64_t num_select, ClassPostprocessLane* classes) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_total{"rfdetr.native.postprocess.total"};
     const auto out_logits = (classes ? classes->Gather(outputs.pred_logits) : outputs.pred_logits).to(torch::kFloat32);
     const auto out_bbox = outputs.pred_boxes.to(torch::kFloat32);
@@ -160,8 +156,7 @@ void SelectedMaskWorkspace::ResetSettled() {
     expanded_ = torch::Tensor{};
     masks_ = torch::Tensor{};
 }
-torch::Tensor SelectedMaskWorkspace::Materialize(const torch::Tensor& logits, const torch::Tensor& query_indices,
-                                                              int64_t height, int64_t width) {
+torch::Tensor SelectedMaskWorkspace::Materialize(const torch::Tensor& logits, const torch::Tensor& query_indices, int64_t height, int64_t width) {
     const auto batch = logits.size(0);
     const auto count = query_indices.size(1);
     if (count == 0) return torch::empty({batch, 0, height, width}, logits.options().dtype(torch::kBool));
@@ -184,8 +179,7 @@ torch::Tensor SelectedMaskWorkspace::Materialize(const torch::Tensor& logits, co
     at::gt_out(masks_, expanded_, 0.0);
     return masks_.view({batch, count, height, width});
 }
-torch::Tensor materialize_selected_masks(const torch::Tensor& logits, const torch::Tensor& query_indices, int64_t height,
-                                                      int64_t width) {
+torch::Tensor materialize_selected_masks(const torch::Tensor& logits, const torch::Tensor& query_indices, int64_t height, int64_t width) {
     SelectedMaskWorkspace workspace;
     return workspace.Materialize(logits, query_indices, height, width);
 }
@@ -222,8 +216,7 @@ PostprocessedBatch postprocessed_batch_from_result(const TensorMap& result) {
     }
     return batch;
 }
-std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const torch::Tensor& target_sizes, int64_t num_select,
-                                           ClassPostprocessLane* classes) {
+std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const torch::Tensor& target_sizes, int64_t num_select, ClassPostprocessLane* classes) {
     PostprocessCore core = postprocess_core(outputs, &target_sizes, std::nullopt, num_select, classes);
     std::vector<TensorMap> results;
     results.reserve(static_cast<size_t>(outputs.pred_logits.size(0)));

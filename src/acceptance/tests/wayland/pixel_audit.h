@@ -102,5 +102,4 @@ struct PixelBoundaryAudit final {
     [[nodiscard]] bool composition_complete() const;
     [[nodiscard]] bool continuity_complete(bool require_gallery = true) const;
 };
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

@@ -1,13 +1,22 @@
 //! Independent canvas pixel and FPS observations.
-use crate::integration_control::{COMPLETION_WITHOUT_INPUT, Driver, EXPLORE_GALLERY, Message, PIXEL_FIXTURE_ENABLED, Phase, pixel_checks, reporting, reporting_enabled};
-use crate::integration_control::probe::{ProbeReceipt, ScenarioOutput, current_fps_draw, current_receipt, observe_atlas_draw, probe_output, rearm_fps_sampling, same_probe};
+use crate::integration_control::probe::{
+    ProbeReceipt, ScenarioOutput, current_fps_draw, current_receipt, observe_atlas_draw,
+    probe_output, rearm_fps_sampling, same_probe,
+};
 #[cfg(target_arch = "wasm32")]
 use crate::integration_control::probe::{atlas_probe_output, observer_generation};
+use crate::integration_control::{
+    COMPLETION_WITHOUT_INPUT, Driver, EXPLORE_GALLERY, Message, PIXEL_FIXTURE_ENABLED, Phase,
+    pixel_checks, reporting, reporting_enabled,
+};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{
+    atlas_composition_js, atlas_pixels_js, boundary_pixels_js, fps_current_js, fps_pixels_js,
+    upscale_pixels_js,
+};
 use crate::message::Message as RootMessage;
 use crate::view_model::ApplicationModel;
 use iced::{Rectangle, Task};
-#[cfg(target_arch = "wasm32")]
-use crate::integration_control::{atlas_composition_js, atlas_pixels_js, boundary_pixels_js, fps_current_js, fps_pixels_js, upscale_pixels_js};
 #[derive(Debug, Clone)]
 pub enum FpsPixelOutcome {
     Invalidated,
@@ -406,16 +415,16 @@ pub(super) fn pixel_fixture_enabled() -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(super) fn pixel_result_callback(completed: impl FnOnce(ProbeOutcome) + 'static) -> wasm_bindgen::JsValue {
+pub(super) fn pixel_result_callback(
+    completed: impl FnOnce(ProbeOutcome) + 'static,
+) -> wasm_bindgen::JsValue {
     // JsValue parameters keep malformed adapter values observable before conversion.
     let generation = observer_generation();
     wasm_bindgen::closure::Closure::once_into_js(
         move |status: wasm_bindgen::JsValue,
               first: wasm_bindgen::JsValue,
               second: wasm_bindgen::JsValue| {
-            if observer_generation() != generation
-                || !reporting_enabled()
-            {
+            if observer_generation() != generation || !reporting_enabled() {
                 return;
             }
             let status = status.as_string();
@@ -437,7 +446,11 @@ pub(super) fn pixel_result_callback(completed: impl FnOnce(ProbeOutcome) + 'stat
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(super) fn sample_workspace_fps(mut output: ScenarioOutput, evidence: reporting::FpsEvidence, scale: f32) {
+pub(super) fn sample_workspace_fps(
+    mut output: ScenarioOutput,
+    evidence: reporting::FpsEvidence,
+    scale: f32,
+) {
     use wasm_bindgen::JsCast;
     let receipt = output.canvas_probe.clone();
     let completed = wasm_bindgen::closure::Closure::once_into_js(
@@ -445,9 +458,7 @@ pub(super) fn sample_workspace_fps(mut output: ScenarioOutput, evidence: reporti
               extent: wasm_bindgen::JsValue,
               pixels: wasm_bindgen::JsValue| {
             // Reset/disable still settles the once callback. It never copies stale bytes.
-            let current = reporting_enabled()
-                && observer_generation()
-                    == output.generation;
+            let current = reporting_enabled() && observer_generation() == output.generation;
             let status = status.as_string();
             let outcome = if !current {
                 FpsPixelOutcome::Cancelled
@@ -875,7 +886,10 @@ impl FpsPixels {
     }
 }
 
-pub(super) fn verify_workspace_fps_pixels(image: &FpsPixels, evidence: reporting::FpsEvidence) -> bool {
+pub(super) fn verify_workspace_fps_pixels(
+    image: &FpsPixels,
+    evidence: reporting::FpsEvidence,
+) -> bool {
     if !reporting_enabled() {
         return false;
     }
@@ -960,13 +974,13 @@ pub(super) fn verify_workspace_fps_pixels(image: &FpsPixels, evidence: reporting
 
 impl State {
     pub(super) fn advance_pixel_checks(
-        &mut self, driver: &mut Driver,
+        &mut self,
+        driver: &mut Driver,
         model: &ApplicationModel,
         settings: &crate::view::settings::SettingsModel,
         applied_scale: f32,
     ) -> Task<RootMessage> {
         match driver.phase.clone() {
-
             Phase::AwaitWorkspaceFps => {
                 if self.workspace_fps_evidence.is_none()
                     || settings.has_local_edits()
@@ -1077,9 +1091,13 @@ impl State {
 }
 
 impl State {
-    pub(super) fn callback(&mut self, driver: &mut Driver, message: Message, request_receipt: Option<ProbeReceipt>) {
+    pub(super) fn callback(
+        &mut self,
+        driver: &mut Driver,
+        message: Message,
+        request_receipt: Option<ProbeReceipt>,
+    ) {
         match message {
-
             Message::WorkspaceFpsDrawn(evidence) => {
                 if driver.phase == Phase::AwaitWorkspaceFps
                     && request_receipt
@@ -1103,31 +1121,47 @@ impl State {
                     self.workspace_fps_result = Some(outcome);
                 }
                 return;
-            }            _ => unreachable!("callback routed to the wrong scenario owner"),
+            }
+            _ => unreachable!("callback routed to the wrong scenario owner"),
         }
     }
 }
 
 impl State {
-    pub(super) fn accepts_fps_completion(&self, driver: &Driver, cancellation: bool, owner: Option<&std::sync::Arc<()>>) -> bool {
+    pub(super) fn accepts_fps_completion(
+        &self,
+        driver: &Driver,
+        cancellation: bool,
+        owner: Option<&std::sync::Arc<()>>,
+    ) -> bool {
         driver.phase == Phase::AwaitWorkspaceFpsPixels
             && (cancellation || self.workspace_fps_result.is_none())
-            && self.workspace_fps_probe.as_ref().is_some_and(|output| same_probe(&output.probe, owner))
+            && self
+                .workspace_fps_probe
+                .as_ref()
+                .is_some_and(|output| same_probe(&output.probe, owner))
     }
-    pub(super) fn begin_workspace_fps(&mut self, driver: &mut Driver, settings: &crate::view::settings::SettingsModel) -> Option<Task<RootMessage>> {
-        if !reporting_enabled() || self.workspace_fps_verified { return None; }
+    pub(super) fn begin_workspace_fps(
+        &mut self,
+        driver: &mut Driver,
+        settings: &crate::view::settings::SettingsModel,
+    ) -> Option<Task<RootMessage>> {
+        if !reporting_enabled() || self.workspace_fps_verified {
+            return None;
+        }
         self.workspace_fps_baseline = crate::workspace_fps::enabled(settings);
         self.workspace_fps_evidence = None;
         self.workspace_fps_failure = None;
         rearm_fps_sampling();
         driver.phase = Phase::AwaitWorkspaceFps;
-        Some(Task::done(RootMessage::Settings(crate::view::settings::Message::PerformanceChanged(true))))
+        Some(Task::done(RootMessage::Settings(
+            crate::view::settings::Message::PerformanceChanged(true),
+        )))
     }
 }
 
 pub(super) const WORKSPACE_FPS_PIXEL_FAILURE: &str =
     "Workspace FPS canvas capture did not contain its upper-right counter background and text";
-
 
 #[cfg(test)]
 pub(in crate::integration_control) mod tests;

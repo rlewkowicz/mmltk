@@ -524,14 +524,13 @@ TEST_CASE("settings leaf traversal retains every reflected constraint dimension"
     std::size_t leaves = 0U;
     bool observed_byte_bound = false;
     bool observed_item_bound = false;
-    VisitSettingsLeaves<mmltk::controller::contracts::GuiSettingsState>(
-        [&]<class, class, class>(const ApplicationSettingsLeafFact& fact) {
-            ++leaves;
-            observed_byte_bound = observed_byte_bound || fact.constraint.minimum_bytes != 0U || fact.constraint.maximum_bytes != 0U;
-            observed_item_bound = observed_item_bound || fact.constraint.maximum_items != 0U;
-            CHECK((fact.constraint.maximum_bytes == 0U || fact.constraint.minimum_bytes <= fact.constraint.maximum_bytes));
-            CHECK((!fact.constraint.has_minimum || !fact.constraint.has_maximum || fact.constraint.minimum <= fact.constraint.maximum));
-        });
+    VisitSettingsLeaves<mmltk::controller::contracts::GuiSettingsState>([&]<class, class, class>(const ApplicationSettingsLeafFact& fact) {
+        ++leaves;
+        observed_byte_bound = observed_byte_bound || fact.constraint.minimum_bytes != 0U || fact.constraint.maximum_bytes != 0U;
+        observed_item_bound = observed_item_bound || fact.constraint.maximum_items != 0U;
+        CHECK((fact.constraint.maximum_bytes == 0U || fact.constraint.minimum_bytes <= fact.constraint.maximum_bytes));
+        CHECK((!fact.constraint.has_minimum || !fact.constraint.has_maximum || fact.constraint.minimum <= fact.constraint.maximum));
+    });
     CHECK(leaves != 0U);
     CHECK(observed_byte_bound);
     CHECK(observed_item_bound);

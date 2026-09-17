@@ -399,5 +399,5 @@ struct BrowserAudit final {
     static constexpr std::array<std::string_view, 5> SETTINGS_NUMERIC_CONTROLS{
         "settings.ui_scale", "settings.font_size", "settings.secondary_font_size", "settings.mono_font_size", "settings.text_input_font_size",
     };
-
-} // namespace mmltk::acceptance::wayland
+};
+}  // namespace mmltk::acceptance::wayland

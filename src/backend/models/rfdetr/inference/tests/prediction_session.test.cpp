@@ -1,3 +1,4 @@
+#include "src/backend/ml/torch/tests/catch_support.h"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
@@ -26,7 +27,6 @@
 #include "src/backend/models/rfdetr/inference/inference_preprocessor.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
-#include <catch2/catch_test_macros.hpp>
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.model_export;
 namespace rfdetr = mmltk::backend::models::rfdetr;

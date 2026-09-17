@@ -41,4 +41,4 @@ class StorageReservationPool {
     std::uint64_t reserved_ = 0U;
 };
 inline constexpr std::uint64_t kEstimatedJpegBytes = std::uint64_t{256U} * 1024U;
-}
+}  // namespace mmltk::backend::data::benchmark_internal

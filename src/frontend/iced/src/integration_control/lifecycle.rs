@@ -1,14 +1,17 @@
-use crate::integration_control::widget_ops::{click, click_number_edge, wheel_number_input};
 use crate::generated::FeatureId;
-use crate::integration_control::{Driver, Phase, reporting, route_edit_available, settled_settings_snapshot, ui_scale_evidence, widget_ops};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::slider_drag_js;
 use crate::integration_control::widget_ops::{AnnotationReveal, reveal_control};
+use crate::integration_control::widget_ops::{click, click_number_edge, wheel_number_input};
+use crate::integration_control::{
+    Driver, Phase, reporting, route_edit_available, settled_settings_snapshot, ui_scale_evidence,
+    widget_ops,
+};
 use crate::message::Message as RootMessage;
 use crate::view::train;
 use crate::view_model::ApplicationModel;
-use iced::{Rectangle, Task};
 use iced::widget::operation::RelativeOffset;
-#[cfg(target_arch = "wasm32")]
-use crate::integration_control::slider_drag_js;
+use iced::{Rectangle, Task};
 
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
@@ -42,7 +45,9 @@ impl Default for State {
 
 impl State {
     pub(super) fn begin_advanced_numeric_edit(
-        &mut self, driver: &mut Driver, widgets: &mut widget_ops::RevealState,
+        &mut self,
+        driver: &mut Driver,
+        widgets: &mut widget_ops::RevealState,
         model: &ApplicationModel,
         settings: &crate::view::settings::SettingsModel,
         index: usize,
@@ -63,15 +68,15 @@ impl State {
         widgets.arm_scrolled(driver, advanced_field_id(index), RelativeOffset::END)
     }
     pub(super) fn advance_lifecycle(
-        &mut self, driver: &mut Driver, widgets: &mut widget_ops::RevealState,
+        &mut self,
+        driver: &mut Driver,
+        widgets: &mut widget_ops::RevealState,
         model: &ApplicationModel,
         settings: &crate::view::settings::SettingsModel,
         applied_scale: f32,
-        router: &crate::view::router::Router,
         active: FeatureId,
     ) -> Task<RootMessage> {
         match driver.phase.clone() {
-
             Phase::SettingsOpen => widgets.arm(driver, "navigation.settings"),
             Phase::AwaitSettings if settings.open => {
                 driver.phase = Phase::SettingsModal;
@@ -117,7 +122,8 @@ impl State {
                     });
                     return Task::none();
                 }
-                if self.ui_scale_first
+                if self
+                    .ui_scale_first
                     .is_some_and(|first| same_numeric_value(f64::from(first), f64::from(current)))
                 {
                     return Task::none();
@@ -281,7 +287,9 @@ impl State {
                 driver.phase = Phase::SettingsNumeric { index: 0, part: 0 };
                 widgets.arm(driver, settings_numeric_id(0, 0))
             }
-            Phase::SettingsNumeric { index, part } => widgets.arm(driver, settings_numeric_id(index, part)),
+            Phase::SettingsNumeric { index, part } => {
+                widgets.arm(driver, settings_numeric_id(index, part))
+            }
             Phase::SettingsFooter => widgets.arm(driver, SETTINGS_FOOTER),
             Phase::SettingsReset => widgets.arm(driver, SETTINGS_RESET),
             Phase::SettingsClose => widgets.arm(driver, SETTINGS_CLOSE),
@@ -335,7 +343,9 @@ impl State {
                 }
                 widgets.arm(driver, advanced_field_id(index))
             }
-            Phase::AdvancedSpinnerEdge { index, .. } => widgets.arm(driver, advanced_field_id(index)),
+            Phase::AdvancedSpinnerEdge { index, .. } => {
+                widgets.arm(driver, advanced_field_id(index))
+            }
             Phase::AdvancedSpinnerWheel(index) => widgets.arm(driver, advanced_field_id(index)),
             Phase::AdvancedSpinnerVerify { index, upper } => {
                 let value = advanced_control_value(settings, index, self.spinner_baseline);
@@ -713,7 +723,10 @@ impl State {
                 });
                 if driver.reuse_compiled {
                     driver.phase = Phase::ExploreNavigation;
-                    widgets.arm(driver, crate::view::navigation::stable_id(FeatureId::Explore))
+                    widgets.arm(
+                        driver,
+                        crate::view::navigation::stable_id(FeatureId::Explore),
+                    )
                 } else {
                     driver.phase = Phase::Compile;
                     widgets.arm_scrolled(driver, COMPILE_DATASET, RelativeOffset::END)
@@ -837,9 +850,14 @@ impl State {
             _ => return None,
         })
     }
-    pub(super) fn located_lifecycle(&mut self, driver: &mut Driver, widgets: &mut widget_ops::RevealState, control: String, bounds: Rectangle, input_bounds: Rectangle) -> Option<train::Message> {
+    pub(super) fn located_lifecycle(
+        &mut self,
+        driver: &mut Driver,
+        widgets: &mut widget_ops::RevealState,
+        bounds: Rectangle,
+        input_bounds: Rectangle,
+    ) -> Option<train::Message> {
         match driver.phase.clone() {
-
             Phase::SettingsOpen => {
                 driver.phase = Phase::AwaitSettings;
                 if !click(input_bounds) {
@@ -1150,14 +1168,21 @@ impl State {
                     _ => driver.phase.clone(),
                 };
                 driver.click_located(input_bounds)
-            },
+            }
         }
     }
 }
 
 impl State {
-    pub(super) fn arm_perceptual_control(&mut self, driver: &mut Driver, widgets: &mut widget_ops::RevealState, index: usize) -> Task<RootMessage> {
-        if !widgets.begin_location() { return Task::none(); }
+    pub(super) fn arm_perceptual_control(
+        &mut self,
+        driver: &mut Driver,
+        widgets: &mut widget_ops::RevealState,
+        index: usize,
+    ) -> Task<RootMessage> {
+        if !widgets.begin_location() {
+            return Task::none();
+        }
         reveal_control(
             perceptual_control_id(index),
             driver.generation,
@@ -1168,18 +1193,17 @@ impl State {
 
 impl State {
     pub(super) fn wheel_delivered(&mut self, driver: &mut Driver) {
-                if let Phase::AwaitAdvancedSpinnerWheel(index) = driver.phase {
-                    driver.phase = Phase::AdvancedSpinnerWheelVerify(index);
-                    reporting::emit(|sink| {
-                        sink.record(
-                            "integration.number_wheel_delivered",
-                            &advanced_field_id(index),
-                            "iced-widget-update-complete",
-                            [0.0; 4],
-                        )
-                    });
-                }
-
+        if let Phase::AwaitAdvancedSpinnerWheel(index) = driver.phase {
+            driver.phase = Phase::AdvancedSpinnerWheelVerify(index);
+            reporting::emit(|sink| {
+                sink.record(
+                    "integration.number_wheel_delivered",
+                    &advanced_field_id(index),
+                    "iced-widget-update-complete",
+                    [0.0; 4],
+                )
+            });
+        }
     }
 }
 

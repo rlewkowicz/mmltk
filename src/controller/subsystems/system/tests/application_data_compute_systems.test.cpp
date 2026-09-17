@@ -51,7 +51,6 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-
 TEST_CASE("production direct adapters reject unavailable physical dependencies", "[controller][systems][production-adapters]") {
     const auto root = mmltk::testsupport::make_temp_root("ordinary-production-adapters");
     SettingsSystem settings;
@@ -554,5 +553,5 @@ TEST_CASE("CUDA export and validation preserve cancelled outcomes and prior arti
     CHECK(io::sha256_file(companion) == previous_companion);
     for (const auto& entry : std::filesystem::directory_iterator(root.path())) CHECK_FALSE(entry.is_directory());
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

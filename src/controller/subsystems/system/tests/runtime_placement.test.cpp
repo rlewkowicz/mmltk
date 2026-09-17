@@ -34,7 +34,6 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-
 TEST_CASE("compute runtime admission preserves valid progress and reports malformed or failed work", "[controller][systems][compute]") {
     const auto scenario = GENERATE(0, 1, 2, 3);
     std::vector<std::uint64_t> delivered;
@@ -191,5 +190,5 @@ TEST_CASE("Compute policy denial precedes admission and CUDA construction", "[co
               }) == 0);
     }
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

@@ -153,7 +153,9 @@ void append_bridge_option(std::vector<std::string>& args, const std::string_view
     args.emplace_back(name);
     args.push_back(std::to_string(*value));
 }
-void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const bool enabled) { if (enabled) args.emplace_back(name); }
+void append_bridge_option(std::vector<std::string>& args, const std::string_view name, const bool enabled) {
+    if (enabled) args.emplace_back(name);
+}
 void require_vast_api_key(const VastBridgeConfig& config, const std::string_view context) {
     if (config.api_key.empty()) { throw std::runtime_error(std::string(context) + " requires --vast-api-key or VAST_API_KEY"); }
 }

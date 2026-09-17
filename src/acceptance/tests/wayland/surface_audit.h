@@ -196,5 +196,4 @@ struct SurfaceAudit final {
     [[nodiscard]] const Draw* pending_fallback(const std::string& candidate) const;
     [[nodiscard]] bool pending_supersession_completed() const;
 };
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

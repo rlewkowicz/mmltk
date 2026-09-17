@@ -5,8 +5,7 @@
 #include <torch/serialize.h>
 namespace mmltk::backend::models::rfdetr::testsupport {
 // Preserve nested optimizer/state archives while changing one top-level fact.
-inline void copy_checkpoint_archive(torch::serialize::InputArchive& source, torch::serialize::OutputArchive& destination,
-                                    std::string_view omitted = {}) {
+inline void copy_checkpoint_archive(torch::serialize::InputArchive& source, torch::serialize::OutputArchive& destination, std::string_view omitted = {}) {
     for (const auto& key : source.keys()) {
         if (key == omitted) continue;
         torch::serialize::InputArchive child;

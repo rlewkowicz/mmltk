@@ -1,19 +1,37 @@
-use crate::integration_control::widget_ops::{click, click_after_surface_draw, click_number_edge, paste_number_input, wheel_number_input};
-use crate::integration_control::pixel_checks::sample_upscale_pixels;
+use crate::generated::FeatureId;
 #[cfg(target_arch = "wasm32")]
 use crate::integration_control::pixel_checks::atlas_resize_dimensions;
-use crate::generated::FeatureId;
-use crate::integration_control::{COMPLETION_WITHOUT_INPUT, Driver, EXPLORE_AUGMENTATION_REROLL, EXPLORE_AUGMENTATION_TOGGLE, EXPLORE_DATASET_PANE, EXPLORE_DETAILS_PANE, EXPLORE_DETAIL_CLOSE, EXPLORE_DETAIL_ORIGINAL, EXPLORE_GALLERY, EXPLORE_RESHUFFLE, EXPLORE_UPSCALE_ACTIONS, Message, Phase, explore_message, pixel_checks, probe, reporting, route_edit_available, settled_settings_snapshot, widget_ops};
-use crate::integration_control::pixel_checks::{AtlasDraw, ProbeOutcome, atlas_scroll_window, displayed_detail, fully_drawn_gallery, pixel_fixture_enabled, sampleable_presentation};
-use crate::integration_control::probe::{ProbeReceipt, ScenarioOutput, complete_atlas_probe, current_receipt, invalidate_atlas_observation, probe_output, rearm_viewer_observation};
-use crate::integration_control::widget_ops::{gallery_slot_bounds, sidebar_control_visible, sidebar_reveal_offset};
+use crate::integration_control::pixel_checks::sample_upscale_pixels;
+use crate::integration_control::pixel_checks::{
+    AtlasDraw, ProbeOutcome, atlas_scroll_window, displayed_detail, fully_drawn_gallery,
+    pixel_fixture_enabled, sampleable_presentation,
+};
+use crate::integration_control::probe::{
+    ProbeReceipt, ScenarioOutput, complete_atlas_probe, current_receipt,
+    invalidate_atlas_observation, probe_output, rearm_viewer_observation,
+};
+use crate::integration_control::widget_ops::{
+    click, click_after_surface_draw, click_number_edge, paste_number_input, wheel_number_input,
+};
+use crate::integration_control::widget_ops::{
+    gallery_slot_bounds, sidebar_control_visible, sidebar_reveal_offset,
+};
+use crate::integration_control::{
+    COMPLETION_WITHOUT_INPUT, Driver, EXPLORE_AUGMENTATION_REROLL, EXPLORE_AUGMENTATION_TOGGLE,
+    EXPLORE_DATASET_PANE, EXPLORE_DETAIL_CLOSE, EXPLORE_DETAIL_ORIGINAL, EXPLORE_DETAILS_PANE,
+    EXPLORE_GALLERY, EXPLORE_RESHUFFLE, EXPLORE_UPSCALE_ACTIONS, Message, Phase, explore_message,
+    pixel_checks, probe, reporting, route_edit_available, settled_settings_snapshot, widget_ops,
+};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{
+    canvas_size_js, canvas_size_settled_js, fullscreen_js, fullscreen_settled_js,
+    hover_after_surface_draw_js, restore_canvas_size_js, sweep_js,
+};
 use crate::message::Message as RootMessage;
 use crate::view::{explore, train};
 use crate::view_model::ApplicationModel;
-use iced::{Rectangle, Task};
 use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
-#[cfg(target_arch = "wasm32")]
-use crate::integration_control::{canvas_size_js, canvas_size_settled_js, fullscreen_js, fullscreen_settled_js, hover_after_surface_draw_js, restore_canvas_size_js, sweep_js};
+use iced::{Rectangle, Task};
 
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
@@ -99,7 +117,8 @@ impl Default for State {
 
 impl State {
     pub(super) fn prepare_upscale_probe(
-        &mut self, probes: &mut probe::Requests,
+        &mut self,
+        probes: &mut probe::Requests,
         image: Rectangle,
         source: u64,
         presentation: u64,
@@ -118,7 +137,11 @@ impl State {
         Some(output)
     }
     pub(super) fn advance_retained(
-        &mut self, driver: &mut Driver, pixel_checks: &mut pixel_checks::State, probes: &mut probe::Requests, widgets: &mut widget_ops::RevealState,
+        &mut self,
+        driver: &mut Driver,
+        pixel_checks: &mut pixel_checks::State,
+        probes: &mut probe::Requests,
+        widgets: &mut widget_ops::RevealState,
         model: &ApplicationModel,
         settings: &crate::view::settings::SettingsModel,
         router: &crate::view::router::Router,
@@ -127,7 +150,6 @@ impl State {
     ) -> Task<RootMessage> {
         let frame = surface.and_then(|surface| surface.frame);
         match driver.phase.clone() {
-
             Phase::AtlasPixelColumns(columns) => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
@@ -189,7 +211,8 @@ impl State {
                     || snapshot.overlay.showlabels != self.atlas_fixture_labels
                     || snapshot.overlay.showmasks != self.atlas_fixture_masks
                     || snapshot.overlay.showboxes != self.atlas_fixture_boxes
-                    || self.atlas_pixels
+                    || self
+                        .atlas_pixels
                         .as_ref()
                         .is_none_or(|draw| draw.snapshot.frame != snapshot.frame)
                 {
@@ -360,7 +383,9 @@ impl State {
                     || model.displayed_upscale_kernel()
                         != Some(crate::generated::UpscaleKernel::Default)
                     || self.upscale_cached_frames[0].as_ref() != Some(&upscale.frame)
-                    || probes.draws().viewer
+                    || probes
+                        .draws()
+                        .viewer
                         .is_none_or(|(_, source, _)| source != upscale.frame.revision)
                 {
                     return Task::none();
@@ -382,7 +407,9 @@ impl State {
                 ) else {
                     return Task::none();
                 };
-                if probes.draws().viewer
+                if probes
+                    .draws()
+                    .viewer
                     .is_none_or(|(drawn, _, _)| drawn != sampleable.presentation_revision)
                 {
                     return Task::none();
@@ -514,9 +541,10 @@ impl State {
                 widgets.arm(driver, control)
             }
             Phase::Disabled | Phase::Complete | Phase::Failed => Task::none(),
-            Phase::ExploreNavigation => {
-                widgets.arm(driver, crate::view::navigation::stable_id(FeatureId::Explore))
-            }
+            Phase::ExploreNavigation => widgets.arm(
+                driver,
+                crate::view::navigation::stable_id(FeatureId::Explore),
+            ),
             Phase::AwaitExplore
                 if active == FeatureId::Explore
                     && !settings.has_local_edits()
@@ -837,9 +865,14 @@ impl State {
                             EXPLORE_GALLERY,
                             "drawn-and-sampleable-publication",
                             [
-                                probes.draws().gallery
+                                probes
+                                    .draws()
+                                    .gallery
                                     .map_or(0.0, |(presentation, _)| presentation as f64),
-                                probes.draws().gallery.map_or(0.0, |(_, source)| source as f64),
+                                probes
+                                    .draws()
+                                    .gallery
+                                    .map_or(0.0, |(_, source)| source as f64),
                                 sampleable
                                     .map_or(0.0, |sample| sample.presentation_revision as f64),
                                 sampleable.map_or(0.0, |sample| sample.source_revision as f64),
@@ -930,7 +963,8 @@ impl State {
                     || snapshot.viewport.extent.width / columns
                         != snapshot.viewport.extent.height / rows
                 {
-                    driver.fail("oversized Explore measurement did not produce an exact square grid");
+                    driver
+                        .fail("oversized Explore measurement did not produce an exact square grid");
                     return Task::none();
                 }
                 reporting::emit(|sink| {
@@ -1016,10 +1050,14 @@ impl State {
                 driver.phase = Phase::ExploreNumericControl { index, step: 0 };
                 widgets.arm(driver, explore_integer_id(index))
             }
-            Phase::ExploreNumericControl { index, .. } => widgets.arm(driver, explore_integer_id(index)),
-            Phase::ExploreNumericReveal { index, .. } => {
-                widgets.arm_revealed(driver, explore::DATASET_SCROLL_ID, explore_integer_id(index))
+            Phase::ExploreNumericControl { index, .. } => {
+                widgets.arm(driver, explore_integer_id(index))
             }
+            Phase::ExploreNumericReveal { index, .. } => widgets.arm_revealed(
+                driver,
+                explore::DATASET_SCROLL_ID,
+                explore_integer_id(index),
+            ),
             Phase::AwaitExploreNumeric { index, step } => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
@@ -1200,9 +1238,11 @@ impl State {
                 widgets.arm(driver, explore::RANGE_START_ONE_ID)
             }
             Phase::ExplorePolicyRange(_) => widgets.arm(driver, explore::RANGE_START_ONE_ID),
-            Phase::ExplorePolicyRangeVisible(_) => {
-                widgets.arm_revealed(driver, explore::DATASET_SCROLL_ID, explore::RANGE_START_ONE_ID)
-            }
+            Phase::ExplorePolicyRangeVisible(_) => widgets.arm_revealed(
+                driver,
+                explore::DATASET_SCROLL_ID,
+                explore::RANGE_START_ONE_ID,
+            ),
             Phase::AwaitExplorePolicyRange(revision) => {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
@@ -1298,7 +1338,9 @@ impl State {
                 };
                 widgets.arm(driver, EXPLORE_AUGMENTATION_TOGGLE)
             }
-            Phase::ExploreAugmentationToggle { .. } => widgets.arm(driver, EXPLORE_AUGMENTATION_TOGGLE),
+            Phase::ExploreAugmentationToggle { .. } => {
+                widgets.arm(driver, EXPLORE_AUGMENTATION_TOGGLE)
+            }
             Phase::AwaitExploreAugmentationToggle {
                 revision,
                 frame_revision,
@@ -1337,7 +1379,9 @@ impl State {
                 };
                 widgets.arm(driver, EXPLORE_AUGMENTATION_REROLL)
             }
-            Phase::ExploreAugmentationReroll { .. } => widgets.arm(driver, EXPLORE_AUGMENTATION_REROLL),
+            Phase::ExploreAugmentationReroll { .. } => {
+                widgets.arm(driver, EXPLORE_AUGMENTATION_REROLL)
+            }
             Phase::AwaitExploreAugmentationReroll {
                 revision,
                 frame_revision,
@@ -1600,7 +1644,9 @@ impl State {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                driver.reporting.observe(|reporting| reporting.reset_scroll());
+                driver
+                    .reporting
+                    .observe(|reporting| reporting.reset_scroll());
                 driver.phase = Phase::GalleryLater(snapshot.viewport.firstrow);
                 widgets.arm(driver, EXPLORE_LATER)
             }
@@ -1616,7 +1662,8 @@ impl State {
                 {
                     return Task::none();
                 }
-                driver.reporting
+                driver
+                    .reporting
                     .observe(|reporting| reporting.scroll_placeholder(snapshot));
                 if sampleable_presentation(
                     frame,
@@ -1624,7 +1671,9 @@ impl State {
                     snapshot.frame.revision,
                 )
                 .is_none()
-                    || probes.draws().gallery
+                    || probes
+                        .draws()
+                        .gallery
                         .is_none_or(|(_, source)| source != snapshot.frame.revision)
                 {
                     return Task::none();
@@ -1893,7 +1942,9 @@ impl State {
                 if !snapshot.ready
                     || snapshot.busy
                     || snapshot.order.matchingcount == 0
-                    || probes.draws().gallery
+                    || probes
+                        .draws()
+                        .gallery
                         .is_none_or(|(_, source)| source != snapshot.frame.revision)
                 {
                     return Task::none();
@@ -1916,7 +1967,9 @@ impl State {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                let gallery_matches = probes.draws().gallery
+                let gallery_matches = probes
+                    .draws()
+                    .gallery
                     .is_some_and(|(_, source)| source == snapshot.frame.revision);
                 let viewport_matches = router
                     .explore_measured_viewport(
@@ -2133,7 +2186,8 @@ impl State {
                 {
                     return Task::none();
                 }
-                let Some(draw) = self.confirmed_atlas(snapshot)
+                let Some(draw) = self
+                    .confirmed_atlas(snapshot)
                     .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
                 else {
                     return Task::none();
@@ -2306,7 +2360,9 @@ impl State {
                     || model.has_explore_pending()
                     || snapshot.frame.revision == baseline
                     || crate::presentation_surface::capacity_acceptance_slots() != 2
-                    || probes.draws().gallery
+                    || probes
+                        .draws()
+                        .gallery
                         .is_none_or(|(_, source)| source != snapshot.frame.revision)
                 {
                     return Task::none();
@@ -2433,7 +2489,8 @@ impl State {
                     });
                     return Task::none();
                 }
-                let Some(draw) = self.confirmed_atlas(snapshot)
+                let Some(draw) = self
+                    .confirmed_atlas(snapshot)
                     .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
                 else {
                     reporting::emit(|sink| {
@@ -2589,7 +2646,8 @@ impl State {
                 {
                     return Task::none();
                 }
-                let Some(draw) = self.confirmed_atlas(snapshot)
+                let Some(draw) = self
+                    .confirmed_atlas(snapshot)
                     .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
                 else {
                     return Task::none();
@@ -2631,7 +2689,8 @@ impl State {
                 {
                     return Task::none();
                 }
-                let Some(draw) = self.confirmed_atlas(snapshot)
+                let Some(draw) = self
+                    .confirmed_atlas(snapshot)
                     .filter(|draw| draw.snapshot.viewport == snapshot.viewport)
                 else {
                     return Task::none();
@@ -2667,7 +2726,8 @@ impl State {
                 };
                 if snapshot.busy
                     || model.has_explore_pending()
-                    || self.atlas_drawn
+                    || self
+                        .atlas_drawn
                         .is_none_or(|(source, _)| source != snapshot.frame.revision)
                 {
                     return Task::none();
@@ -2739,7 +2799,8 @@ impl State {
                 match stage {
                     0..=5 => self.scroll_atlas(driver, stage + 1),
                     _ => {
-                        if driver.session.profile == "retained" && driver.viewer_scenario == "rapid" {
+                        if driver.session.profile == "retained" && driver.viewer_scenario == "rapid"
+                        {
                             if !crate::presentation_surface::begin_capacity_acceptance() {
                                 driver.fail("capacity acceptance lacks retained fallback");
                                 return Task::none();
@@ -2905,7 +2966,9 @@ impl State {
                             || draw.snapshot.dataset.identity != snapshot.dataset.identity
                             || draw.surface.frame != frame
                     })
-                    || probes.draws().gallery
+                    || probes
+                        .draws()
+                        .gallery
                         .is_none_or(|(_, source)| source != snapshot.frame.revision)
                 {
                     return Task::none();
@@ -2992,11 +3055,14 @@ impl State {
                     } else {
                         Phase::ViewerNoAspect
                     };
-                    return widgets.arm(driver, if driver.viewer_scenario == "semantics" {
-                        overlay_control(0, true)
-                    } else {
-                        "explore.detail.aspect"
-                    });
+                    return widgets.arm(
+                        driver,
+                        if driver.viewer_scenario == "semantics" {
+                            overlay_control(0, true)
+                        } else {
+                            "explore.detail.aspect"
+                        },
+                    );
                 }
                 if driver.viewer_scenario == "rapid" {
                     driver.phase = Phase::ViewerRapidSelection(
@@ -3031,7 +3097,9 @@ impl State {
                 });
                 self.begin_upscale_series(widgets, driver, model, &snapshot.frame)
             }
-            Phase::StartUpscale { kernel, .. } => widgets.arm(driver, EXPLORE_UPSCALE_ACTIONS[kernel]),
+            Phase::StartUpscale { kernel, .. } => {
+                widgets.arm(driver, EXPLORE_UPSCALE_ACTIONS[kernel])
+            }
             Phase::AwaitUpscale {
                 kernel,
                 source_width,
@@ -3041,11 +3109,25 @@ impl State {
                 presentation_revision,
             } => {
                 let Some(upscale) = model.current_upscale() else {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "current_upscale_missing");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "current_upscale_missing",
+                    );
                     return Task::none();
                 };
                 if upscale.kernel != crate::generated::UPSCALE_KERNEL_VALUES[kernel] {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "requested_kernel_mismatch");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "requested_kernel_mismatch",
+                    );
                     return Task::none();
                 }
                 let Some(sampleable) = sampleable_presentation(
@@ -3053,7 +3135,10 @@ impl State {
                     crate::generated::PresentationSourceKind::Upscale,
                     upscale.frame.revision,
                 ) else {
-                    reporting::upscale_settlement(driver, self, probes,
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
                         model,
                         frame,
                         "sampleable_presentation_mismatch",
@@ -3061,13 +3146,23 @@ impl State {
                     return Task::none();
                 };
                 if upscale.busy || !upscale.ready {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "native_work_pending");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "native_work_pending",
+                    );
                     return Task::none();
                 }
                 if upscale.frame.revision != upscale_frame_revision
                     && sampleable.presentation_revision <= presentation_revision
                 {
-                    reporting::upscale_settlement(driver, self, probes,
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
                         model,
                         frame,
                         "presentation_not_newer_than_baseline",
@@ -3123,7 +3218,14 @@ impl State {
                     )
                 });
                 if model.displayed_upscale_kernel() != Some(upscale.kernel) {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "displayed_kernel_mismatch");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "displayed_kernel_mismatch",
+                    );
                     return Task::none();
                 }
                 let Some((drawn, source, viewer)) =
@@ -3132,7 +3234,10 @@ impl State {
                             && *source == upscale.frame.revision
                     })
                 else {
-                    reporting::upscale_settlement(driver, self, probes,
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
                         model,
                         frame,
                         "matching_viewer_draw_missing",
@@ -3140,32 +3245,67 @@ impl State {
                     return Task::none();
                 };
                 let Some(button) = self.upscale_button else {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "method_button_missing");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "method_button_missing",
+                    );
                     return Task::none();
                 };
                 let Some(receipt) = current_receipt(explore::DETAIL_WORKSPACE_ID) else {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "draw_probe_receipt_missing");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "draw_probe_receipt_missing",
+                    );
                     return Task::none();
                 };
                 if (*probes.upscale_pending()).as_ref() != Some(&receipt) {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "probe_receipt_not_current");
-                    if let Some(output) = self.prepare_upscale_probe(probes, viewer.image, source, drawn) {
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "probe_receipt_not_current",
+                    );
+                    if let Some(output) =
+                        self.prepare_upscale_probe(probes, viewer.image, source, drawn)
+                    {
                         sample_upscale_pixels(output, viewer.image, button, source, drawn);
                     }
                     return Task::none();
                 }
                 let Some((pixel_source, pixel_presentation, checksum, blue)) = self.upscale_pixels
                 else {
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "probe_pixels_pending");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "probe_pixels_pending",
+                    );
                     return Task::none();
                 };
                 if pixel_source != source || pixel_presentation != drawn {
-                    reporting::upscale_settlement(driver, self, probes,
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
                         model,
                         frame,
                         "probe_pixels_frontier_mismatch",
                     );
-                    if let Some(output) = self.prepare_upscale_probe(probes, viewer.image, source, drawn) {
+                    if let Some(output) =
+                        self.prepare_upscale_probe(probes, viewer.image, source, drawn)
+                    {
                         sample_upscale_pixels(output, viewer.image, button, source, drawn);
                     }
                     return Task::none();
@@ -3184,7 +3324,10 @@ impl State {
                 });
                 if let Some(revision) = self.upscale_repeat_revision {
                     if !self.upscale_repeat_observed {
-                        reporting::upscale_settlement(driver, self, probes,
+                        reporting::upscale_settlement(
+                            driver,
+                            self,
+                            probes,
                             model,
                             frame,
                             "repeat_request_not_observed",
@@ -3210,7 +3353,14 @@ impl State {
                     if !click(button) {
                         driver.fail("Upscale completed method re-click failed");
                     }
-                    reporting::upscale_settlement(driver, self, probes, model, frame, "repeat_request_dispatched");
+                    reporting::upscale_settlement(
+                        driver,
+                        self,
+                        probes,
+                        model,
+                        frame,
+                        "repeat_request_dispatched",
+                    );
                     return Task::none();
                 }
                 if self.upscale_cache_pass {
@@ -3235,7 +3385,10 @@ impl State {
                         && self.viewer_continuity_request.is_none()
                     {
                         let Some(snapshot) = model.settings_snapshot.as_ref() else {
-                            reporting::upscale_settlement(driver, self, probes,
+                            reporting::upscale_settlement(
+                                driver,
+                                self,
+                                probes,
                                 model,
                                 frame,
                                 "continuity_settings_missing",
@@ -3243,7 +3396,10 @@ impl State {
                             return Task::none();
                         };
                         if !route_edit_available(model, settings) {
-                            reporting::upscale_settlement(driver, self, probes,
+                            reporting::upscale_settlement(
+                                driver,
+                                self,
+                                probes,
                                 model,
                                 frame,
                                 "continuity_route_unavailable",
@@ -3288,7 +3444,10 @@ impl State {
                         drawn != sampleable.presentation_revision
                             || source != upscale.frame.revision
                     }) {
-                        reporting::upscale_settlement(driver, self, probes,
+                        reporting::upscale_settlement(
+                            driver,
+                            self,
+                            probes,
                             model,
                             frame,
                             "annotation_handoff_draw_missing",
@@ -3305,7 +3464,10 @@ impl State {
                         drawn != sampleable.presentation_revision
                             || source != upscale.frame.revision
                     }) {
-                        reporting::upscale_settlement(driver, self, probes,
+                        reporting::upscale_settlement(
+                            driver,
+                            self,
+                            probes,
                             model,
                             frame,
                             "semantic_handoff_draw_missing",
@@ -3320,7 +3482,10 @@ impl State {
                         drawn != sampleable.presentation_revision
                             || source != upscale.frame.revision
                     }) {
-                        reporting::upscale_settlement(driver, self, probes,
+                        reporting::upscale_settlement(
+                            driver,
+                            self,
+                            probes,
                             model,
                             frame,
                             "rapid_completion_draw_missing",
@@ -3403,7 +3568,9 @@ impl State {
                 ) else {
                     return Task::none();
                 };
-                if sampleable.presentation_revision <= probes.annotation_observation().sample_baseline {
+                if sampleable.presentation_revision
+                    <= probes.annotation_observation().sample_baseline
+                {
                     return Task::none();
                 }
                 reporting::emit(|sink| {
@@ -3435,9 +3602,11 @@ impl State {
                 {
                     return Task::none();
                 }
-                probes.restart_annotation_sampling(crate::presentation_surface::retained_surface()
-                    .and_then(|surface| surface.frame)
-                    .map_or(0, |frame| frame.presentation_revision));
+                probes.restart_annotation_sampling(
+                    crate::presentation_surface::retained_surface()
+                        .and_then(|surface| surface.frame)
+                        .map_or(0, |frame| frame.presentation_revision),
+                );
                 driver.phase = Phase::DetailCloseEvidence;
                 widgets.arm(driver, EXPLORE_DETAIL_CLOSE)
             }
@@ -3560,12 +3729,16 @@ impl State {
                 {
                     return Task::none();
                 }
-                if probes.draws().viewer.is_none_or(|(presentation, source, _)| {
-                    model
-                        .viewed_explore_frame()
-                        .is_none_or(|viewed| source != viewed.revision)
-                        || frame.is_none_or(|frame| frame.presentation_revision != presentation)
-                }) {
+                if probes
+                    .draws()
+                    .viewer
+                    .is_none_or(|(presentation, source, _)| {
+                        model
+                            .viewed_explore_frame()
+                            .is_none_or(|viewed| source != viewed.revision)
+                            || frame.is_none_or(|frame| frame.presentation_revision != presentation)
+                    })
+                {
                     return Task::none();
                 }
                 driver.phase = Phase::OpenAnnotation;
@@ -3574,7 +3747,12 @@ impl State {
             _ => Task::none(),
         }
     }
-    pub(super) fn require_original_crop(&mut self, driver: &mut Driver, probes: &mut probe::Requests, frame: &crate::generated::VisualFrame) -> bool {
+    pub(super) fn require_original_crop(
+        &mut self,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        frame: &crate::generated::VisualFrame,
+    ) -> bool {
         let content = &frame.content;
         if probes.draws().viewer.is_none_or(|(_, _, draw)| {
             draw.crop != [content.x, content.y, content.width, content.height]
@@ -3585,7 +3763,9 @@ impl State {
         true
     }
     pub(super) fn begin_upscale_series(
-        &mut self, widgets: &mut widget_ops::RevealState, driver: &mut Driver,
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        driver: &mut Driver,
         model: &ApplicationModel,
         source: &crate::generated::VisualFrame,
     ) -> Task<RootMessage> {
@@ -3634,13 +3814,17 @@ impl State {
             ),
         }
     }
-    pub(super) fn confirmed_atlas(&self, snapshot: &crate::generated::ExploreSnapshot) -> Option<&AtlasDraw> {
+    pub(super) fn confirmed_atlas(
+        &self,
+        snapshot: &crate::generated::ExploreSnapshot,
+    ) -> Option<&AtlasDraw> {
         self.atlas_pixels.as_ref().filter(|draw| {
             draw.snapshot.frame == snapshot.frame && self.atlas_receipt.as_ref() == Some(*draw)
         })
     }
     pub(super) fn detail_drawn(
-        &self, probes: &probe::Requests,
+        &self,
+        probes: &probe::Requests,
         frame: Option<crate::presentation_surface::FrameReady>,
         snapshot: &crate::generated::ExploreSnapshot,
     ) -> bool {
@@ -3651,15 +3835,17 @@ impl State {
                 snapshot.frame.revision,
             )
             .is_some_and(|sampleable| {
-                probes.draws().viewer.is_some_and(|(presentation, source, _)| {
-                    source == sampleable.source_revision
-                        && presentation == sampleable.presentation_revision
-                })
+                probes
+                    .draws()
+                    .viewer
+                    .is_some_and(|(presentation, source, _)| {
+                        source == sampleable.source_revision
+                            && presentation == sampleable.presentation_revision
+                    })
             })
     }
     pub(super) fn expected_retained(&self, driver: &Driver) -> Option<String> {
         Some(match driver.phase {
-
             Phase::ExploreNavigation => {
                 crate::view::navigation::stable_id(FeatureId::Explore).to_owned()
             }
@@ -3667,7 +3853,8 @@ impl State {
             Phase::ExploreCloseDetail => EXPLORE_DETAIL_CLOSE.to_owned(),
             Phase::ExploreDatasetPane => EXPLORE_DATASET_PANE.to_owned(),
             Phase::ExploreDetailsPane => EXPLORE_DETAILS_PANE.to_owned(),
-            Phase::ExploreNumericControl { index, .. } | Phase::ExploreNumericReveal { index, .. } => explore_integer_id(index),
+            Phase::ExploreNumericControl { index, .. }
+            | Phase::ExploreNumericReveal { index, .. } => explore_integer_id(index),
             Phase::ExplorePolicyOrder(_) => explore::ORDER_SHUFFLED_ID.to_owned(),
             Phase::ExplorePolicyRange(_) | Phase::ExplorePolicyRangeVisible(_) => {
                 explore::RANGE_START_ONE_ID.to_owned()
@@ -3684,7 +3871,10 @@ impl State {
             Phase::GalleryImage(_) => EXPLORE_GALLERY.to_owned(),
             Phase::DetailOriginal { .. } => EXPLORE_DETAIL_ORIGINAL.to_owned(),
             Phase::DetailFit => explore::DETAIL_FIT_ID.to_owned(),
-            Phase::ViewerSelect | Phase::AtlasReturnSelect | Phase::AtlasResizeSelect(_) | Phase::AtlasAwaySelect(_) => EXPLORE_GALLERY.to_owned(),
+            Phase::ViewerSelect
+            | Phase::AtlasReturnSelect
+            | Phase::AtlasResizeSelect(_)
+            | Phase::AtlasAwaySelect(_) => EXPLORE_GALLERY.to_owned(),
             Phase::AtlasCapacity => explore::GALLERY_CAPACITY_ID.to_owned(),
             Phase::AtlasEmpty => explore::GALLERY_EMPTY_ID.to_owned(),
             Phase::AtlasOverlay(index) => overlay_control(index, false).to_owned(),
@@ -3699,9 +3889,16 @@ impl State {
             _ => return None,
         })
     }
-    pub(super) fn located_retained(&mut self, driver: &mut Driver, probes: &mut probe::Requests, widgets: &mut widget_ops::RevealState, control: String, bounds: Rectangle, input_bounds: Rectangle) -> Option<train::Message> {
+    pub(super) fn located_retained(
+        &mut self,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        widgets: &mut widget_ops::RevealState,
+        control: String,
+        bounds: Rectangle,
+        input_bounds: Rectangle,
+    ) -> Option<train::Message> {
         match driver.phase.clone() {
-
             Phase::ExploreCard {
                 revision,
                 frame_revision,
@@ -3897,7 +4094,11 @@ impl State {
                 let Some((columns, _rows, _, _, revision)) = self.selection_grid else {
                     return None;
                 };
-                let index = if driver.viewer_scenario == "tall" { 7 } else { 0 };
+                let index = if driver.viewer_scenario == "tall" {
+                    7
+                } else {
+                    0
+                };
                 let side = input_bounds.width / columns as f32;
                 let selected = Rectangle {
                     x: input_bounds.x + (index % columns) as f32 * side,
@@ -4131,19 +4332,24 @@ impl State {
                     Phase::ExploreOpen => {
                         COMPLETION_WITHOUT_INPUT.with(|active| active.set(true));
                         Phase::AwaitExploreReady
-                    },
+                    }
                     _ => driver.phase.clone(),
                 };
                 driver.click_located(input_bounds)
-            },
+            }
         }
     }
 }
 
 impl State {
-    pub(super) fn callback(&mut self, driver: &mut Driver, probes: &mut probe::Requests, message: Message, request_receipt: Option<ProbeReceipt>) {
+    pub(super) fn callback(
+        &mut self,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        message: Message,
+        request_receipt: Option<ProbeReceipt>,
+    ) {
         match message {
-
             Message::GalleryMouseDelivered => {
                 if let Phase::AwaitVisibleReadHover(index, generation) = driver.phase {
                     driver.phase = Phase::VisibleReadSelect(index, generation);
@@ -4181,7 +4387,8 @@ impl State {
                 return;
             }
             Message::NumberPasteDelivered(delivered) => {
-                if !delivered && driver.phase == (Phase::AwaitExploreNumeric { index: 2, step: 6 }) {
+                if !delivered && driver.phase == (Phase::AwaitExploreNumeric { index: 2, step: 6 })
+                {
                     driver.fail("Explore clipboard paste shortcut delivery failed");
                 }
                 return;
@@ -4197,9 +4404,11 @@ impl State {
                 presentation,
                 outcome,
             } => {
-                if !probes.complete_upscale_probe(&request_receipt, &outcome) { return; }
+                if !probes.complete_upscale_probe(&request_receipt, &outcome) {
+                    return;
+                }
                 match outcome {
-                    ProbeOutcome::Invalidated => {},
+                    ProbeOutcome::Invalidated => {}
                     ProbeOutcome::Observed(checksum, blue) => {
                         self.upscale_pixels = Some((source, presentation, checksum, blue))
                     }
@@ -4270,7 +4479,7 @@ impl State {
                     driver.phase = Phase::AwaitExploreNumeric { index, step: 2 };
                 }
                 return;
-            },
+            }
 
             Message::GalleryDrawn {
                 presentation_revision,
@@ -4307,32 +4516,44 @@ impl State {
                     // Returning to a retained gallery still requires a draw
                     // after Detail; an earlier receipt cannot prove that return.
                     self.invalidate_atlas_draw();
-                    probes.record_surface_draw(presentation_revision, source_revision, Some(viewer));
+                    probes.record_surface_draw(
+                        presentation_revision,
+                        source_revision,
+                        Some(viewer),
+                    );
                 } else {
                     probes.record_surface_draw(presentation_revision, source_revision, None);
                 }
                 return;
-            }            _ => unreachable!("callback routed to the wrong scenario owner"),
+            }
+            _ => unreachable!("callback routed to the wrong scenario owner"),
         }
     }
 }
 
 impl State {
-    pub(super) fn hold_gallery_completion(&mut self, driver: &mut Driver, receipt: &crate::generated::IntegrationControlReceipt) -> Result<(), &'static str> {
-                if self.gallery_completion_held.is_some()
-                    || matches!(driver.phase, Phase::Disabled | Phase::Failed)
-                {
-                    driver.fail("duplicate or inactive gallery completion hold");
-                    return Err("duplicate or inactive gallery completion hold");
-                }
-                self.gallery_completion_held =
-                    Some((receipt.readgeneration, receipt.compiledindex));
-                return Ok(());
+    pub(super) fn hold_gallery_completion(
+        &mut self,
+        driver: &mut Driver,
+        receipt: &crate::generated::IntegrationControlReceipt,
+    ) -> Result<(), &'static str> {
+        if self.gallery_completion_held.is_some()
+            || matches!(driver.phase, Phase::Disabled | Phase::Failed)
+        {
+            driver.fail("duplicate or inactive gallery completion hold");
+            return Err("duplicate or inactive gallery completion hold");
+        }
+        self.gallery_completion_held = Some((receipt.readgeneration, receipt.compiledindex));
+        return Ok(());
     }
 }
 
 impl State {
-    pub(super) fn observe_upscale_request(&mut self, driver: &Driver, kernel: crate::generated::UpscaleKernel) {
+    pub(super) fn observe_upscale_request(
+        &mut self,
+        driver: &Driver,
+        kernel: crate::generated::UpscaleKernel,
+    ) {
         if let Phase::AwaitUpscale {
             kernel: selected, ..
         } = driver.phase
@@ -4345,31 +4566,35 @@ impl State {
 }
 
 impl State {
-    pub(super) fn cancel_input(&mut self) { self.explore_paste_read = false; }
+    pub(super) fn cancel_input(&mut self) {
+        self.explore_paste_read = false;
+    }
 }
 
 impl State {
-    pub(super) fn viewer_selector_located(&mut self, driver: &mut Driver, probes: &probe::Requests, bounds: Rectangle) {
-
-            if bounds.width > 0.0 || bounds.height > 0.0 {
-                driver.fail("Explore still renders an aspect-ratio selector");
-            } else if let Some((presentation, source, _)) = probes.draws().viewer {
-                reporting::emit(|sink| {
-                    sink.record(
-                        "integration.viewer_complete",
-                        "explore.detail.aspect",
-                        &driver.viewer_scenario,
-                        [presentation as f64, source as f64, 1.0, 0.0],
-                    )
-                });
-                driver.phase = if driver.viewer_scenario == "terminal" {
-                    Phase::OpenAnnotation
-                } else {
-                    Phase::Complete
-                };
-            }
-
-
+    pub(super) fn viewer_selector_located(
+        &mut self,
+        driver: &mut Driver,
+        probes: &probe::Requests,
+        bounds: Rectangle,
+    ) {
+        if bounds.width > 0.0 || bounds.height > 0.0 {
+            driver.fail("Explore still renders an aspect-ratio selector");
+        } else if let Some((presentation, source, _)) = probes.draws().viewer {
+            reporting::emit(|sink| {
+                sink.record(
+                    "integration.viewer_complete",
+                    "explore.detail.aspect",
+                    &driver.viewer_scenario,
+                    [presentation as f64, source as f64, 1.0, 0.0],
+                )
+            });
+            driver.phase = if driver.viewer_scenario == "terminal" {
+                Phase::OpenAnnotation
+            } else {
+                Phase::Complete
+            };
+        }
     }
 }
 
@@ -4380,7 +4605,11 @@ pub(super) struct UpscaleObservation {
 }
 impl State {
     pub(super) fn upscale_observation(&self) -> UpscaleObservation {
-        UpscaleObservation { pixels: self.upscale_pixels, button: self.upscale_button, repeat: (self.upscale_repeat_revision, self.upscale_repeat_observed) }
+        UpscaleObservation {
+            pixels: self.upscale_pixels,
+            button: self.upscale_button,
+            repeat: (self.upscale_repeat_revision, self.upscale_repeat_observed),
+        }
     }
 }
 
@@ -4516,7 +4745,10 @@ pub(super) fn explore_seed_target(baseline: u64) -> u64 {
     }
 }
 
-pub(super) fn explore_integer_value(snapshot: &crate::generated::ExploreSnapshot, index: u8) -> u64 {
+pub(super) fn explore_integer_value(
+    snapshot: &crate::generated::ExploreSnapshot,
+    index: u8,
+) -> u64 {
     match index {
         0 => u64::from(snapshot.filter.minimuminstances),
         1 => u64::from(snapshot.filter.maximuminstances),
@@ -4555,7 +4787,6 @@ pub(super) const EXPLORE_NEXT: &str = explore::DETAIL_NEXT_ID;
 pub(super) const EXPLORE_PREVIOUS: &str = explore::DETAIL_PREVIOUS_ID;
 
 pub(super) const EXPLORE_ANNOTATE: &str = explore::DETAIL_ANNOTATE_ID;
-
 
 #[cfg(test)]
 pub(in crate::integration_control) mod tests;

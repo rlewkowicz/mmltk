@@ -17,7 +17,6 @@ namespace mmltk::controller::visual_test_support {
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
-
 class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
@@ -79,4 +78,4 @@ class ExtentUpscaleAlgorithm final : public UpscaleAlgorithm {
     request.document = test_document({}).document->facts();
     return request;
 }
-}
+}  // namespace mmltk::controller::visual_test_support

@@ -98,29 +98,17 @@ class WaylandSession final {
     std::set<std::string> workflow_steps_;
     std::set<std::string> workflow_pixels_;
 };
-
 [[nodiscard]] std::shared_ptr<PreparedWaylandInputs> wayland_inputs(bool require_compiled);
 [[nodiscard]] bool execution_requested() noexcept;
 [[nodiscard]] bool gdr_transport_available() noexcept;
 [[nodiscard]] std::filesystem::path configured_path(const char* const name, const std::filesystem::path& fallback);
-
 [[nodiscard]] std::filesystem::path latest_wayland_artifact(const std::string_view filename);
-
 void prepare_latest_log(const std::filesystem::path& path, const std::string_view description, const std::string& identity);
-
 [[nodiscard]] std::filesystem::path artifact_sibling(const std::filesystem::path& native, const std::string_view suffix);
-
 void require_independent_artifacts(const std::span<const std::filesystem::path> paths);
-
 void rotate_process_log_family(const std::filesystem::path& native, const std::string& identity);
-
-
 [[nodiscard]] std::string read_from(const std::filesystem::path& path, const std::uintmax_t offset);
-
 [[nodiscard]] std::string read_tail(const std::filesystem::path& path);
-
 [[nodiscard]] std::size_t permitted_cpu_count() noexcept;
-
 [[nodiscard]] std::string process_status_text(const int status);
-
-} // namespace mmltk::acceptance::wayland
+}  // namespace mmltk::acceptance::wayland

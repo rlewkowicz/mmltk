@@ -1,5 +1,4 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-
 #include "src/common/math/deterministic_sampling.h"
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <cuda_runtime.h>
@@ -139,7 +138,9 @@ void set_packed_mask_range(int64_t* words_data, size_t start, size_t length) {
 bool reservoir_select(const float choice, const std::int64_t candidate_count, const std::int64_t instance_index) {
     if (candidate_count <= 1) { return true; }
     const std::uint64_t key = static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(choice));
-    return mmltk::common::math::deterministic_mix64(key ^ (static_cast<std::uint64_t>(instance_index) * 0xd2b74407b1ce6e93ULL)) % static_cast<std::uint64_t>(candidate_count) == 0;
+    return mmltk::common::math::deterministic_mix64(key ^ (static_cast<std::uint64_t>(instance_index) * 0xd2b74407b1ce6e93ULL)) %
+               static_cast<std::uint64_t>(candidate_count) ==
+           0;
 }
 }  // namespace
 std::int64_t packed_mask_words_for_shape(const int height, const int width) noexcept {
@@ -161,8 +162,7 @@ void BatchStaticTensors::ensure(int64_t batch_size, int height, int width, int t
                               nested_mask.size(0) >= requested_capacity && nested_mask.size(1) == height && nested_mask.size(2) == width;
     if (metadata_matches && sizes_match && mask_matches) { return; }
     auto replacement_sizes = make_size_tensor(requested_capacity, static_cast<int64_t>(height), static_cast<int64_t>(width), requested_device);
-    auto replacement_mask =
-        torch::zeros({requested_capacity, height, width}, torch::TensorOptions().dtype(torch::kBool).device(requested_device));
+    auto replacement_mask = torch::zeros({requested_capacity, height, width}, torch::TensorOptions().dtype(torch::kBool).device(requested_device));
     static_assert(std::is_nothrow_move_assignable_v<torch::Tensor>);
     sizes = std::move(replacement_sizes);
     nested_mask = std::move(replacement_mask);
@@ -228,8 +228,7 @@ void TargetScratch::ensure_batch(size_t batch_size, int height, int width, int t
     const auto target_device = mmltk::backend::ml::cuda::cuda_device(target_device_id);
     const int64_t capacity = std::max<int64_t>(batch.batch_capacity, static_cast<int64_t>(batch_size));
     const auto metadata_tensor_matches = [&](const torch::Tensor& tensor) {
-        return tensor.defined() && tensor.device() == target_device && tensor.scalar_type() == torch::kInt64 && tensor.dim() == 1 &&
-               tensor.size(0) >= capacity;
+        return tensor.defined() && tensor.device() == target_device && tensor.scalar_type() == torch::kInt64 && tensor.dim() == 1 && tensor.size(0) >= capacity;
     };
     if (!metadata_tensor_matches(offsets_gpu) || !metadata_tensor_matches(counts_gpu)) {
         const auto device_int64 = torch::TensorOptions().dtype(torch::kInt64).device(target_device);
@@ -321,8 +320,7 @@ TargetStagingSlot& TargetScratch::acquire_staging_slot(const std::size_t batch_s
                 replacement.occluder_mask_indices = allocate_staging({slot_instance_capacity}, torch::kInt64);
                 replacement.occluder_inverse_transforms = allocate_staging({slot_instance_capacity, 6}, torch::kFloat32);
                 if (include_masks) {
-                    replacement.erasure =
-                        allocate_staging({slot_instance_capacity, static_cast<int64_t>(sizeof(AugmentationSpatialErasure))}, torch::kUInt8);
+                    replacement.erasure = allocate_staging({slot_instance_capacity, static_cast<int64_t>(sizeof(AugmentationSpatialErasure))}, torch::kUInt8);
                 }
                 replacement.instance_capacity = slot_instance_capacity;
             }
@@ -492,7 +490,7 @@ torch::Tensor make_size_tensor(int64_t batch_size, int64_t image_height, int64_t
 torch::Tensor make_device_batch_tensor(const mmltk::backend::data::Batch& batch, int device_id, int64_t image_height, int64_t image_width) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_pybind_device_batch_tensor{"rfdetr.pybind.device_batch_tensor"};
     return torch::from_blob(const_cast<float*>(batch.device_images), {static_cast<int64_t>(batch.num_images), 3, image_height, image_width},
-                                  torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id)));
+                            torch::TensorOptions().dtype(torch::kFloat32).device(mmltk::backend::ml::cuda::cuda_device(device_id)));
 }
 void validate_feature_active_target(const int64_t label, const std::span<const float, 4> normalized_cxcywh, const int64_t object_classes) {
     if (object_classes < 1 || label < 0 || label >= object_classes) {
@@ -705,12 +703,9 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
                     staging.packed_masks.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false),
                     image_height,
                     image_width,
-                    transformed ? staging.inverse_transforms.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false)
-                                : torch::Tensor{},
-                    transformed ? staging.occluder_mask_indices.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false)
-                                : torch::Tensor{},
-                    transformed ? staging.occluder_inverse_transforms.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false)
-                                : torch::Tensor{},
+                    transformed ? staging.inverse_transforms.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false) : torch::Tensor{},
+                    transformed ? staging.occluder_mask_indices.narrow(0, 0, total_instances).to(device, torch::kInt64, true, false) : torch::Tensor{},
+                    transformed ? staging.occluder_inverse_transforms.narrow(0, 0, total_instances).to(device, torch::kFloat32, true, false) : torch::Tensor{},
                     augmentation_plan != nullptr && augmentation_plan->erases_spatial_support
                         ? staging.erasure.narrow(0, 0, total_instances).to(device, torch::kUInt8, true, false)
                         : torch::Tensor{},

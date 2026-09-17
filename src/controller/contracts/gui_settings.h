@@ -17,14 +17,12 @@ consteval bool adapter_type() {
     bool supported = std::same_as<T, GuiSettingsState>;
     mmltk::frameworks::reflection::visit_materialized_members<GuiSettingsState>([&]<class Declaration>(const auto&) {
         using Member = typename Declaration::member_type;
-        if constexpr (std::is_class_v<Member> && !std::same_as<Member, WorkflowSettingsState>)
-            supported = supported || std::same_as<T, Member>;
+        if constexpr (std::is_class_v<Member> && !std::same_as<Member, WorkflowSettingsState>) supported = supported || std::same_as<T, Member>;
     });
     mmltk::frameworks::reflection::visit_materialized_members<WorkflowSettingsState>([&]<class Declaration>(const auto&) {
         using Workflow = typename Declaration::member_type;
         supported = supported || std::same_as<T, Workflow>;
-        if constexpr (requires(Workflow value) { value.source; })
-            supported = supported || std::same_as<T, decltype(Workflow::source)>;
+        if constexpr (requires(Workflow value) { value.source; }) supported = supported || std::same_as<T, decltype(Workflow::source)>;
     });
     return supported;
 }

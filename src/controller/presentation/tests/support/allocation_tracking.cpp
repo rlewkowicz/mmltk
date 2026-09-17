@@ -4,7 +4,10 @@
 namespace native_gallery_allocations {
 thread_local bool enabled = false;
 thread_local std::size_t count = 0U;
-Scope::Scope() { count = 0U; enabled = true; }
+Scope::Scope() {
+    count = 0U;
+    enabled = true;
+}
 Scope::~Scope() { enabled = false; }
 [[nodiscard]] void* Allocate(std::size_t bytes, const std::size_t alignment) {
     if (enabled) ++count;

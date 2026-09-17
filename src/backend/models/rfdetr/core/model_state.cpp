@@ -29,12 +29,17 @@ DecodedNativeModelState::~DecodedNativeModelState() = default;
 DecodedNativeModelState::DecodedNativeModelState(DecodedNativeModelState&&) noexcept = default;
 DecodedNativeModelState& DecodedNativeModelState::operator=(DecodedNativeModelState&&) noexcept = default;
 std::size_t DecodedNativeModelState::tensor_count() const noexcept { return impl_->entries.size(); }
-DecodedNativeModelState::DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries) : DecodedNativeModelState() { impl_->entries = std::move(entries); }
+DecodedNativeModelState::DecodedNativeModelState(std::vector<NormalizedModelStateEntry> entries) : DecodedNativeModelState() {
+    impl_->entries = std::move(entries);
+}
 const std::vector<NormalizedModelStateEntry>& DecodedNativeModelState::entries() const noexcept { return impl_->entries; }
 torch::serialize::InputArchive* DecodedNativeModelState::admitted_archive() const noexcept { return impl_->native_archive.get(); }
 void DecodedNativeModelState::retain_admitted_archive(std::unique_ptr<torch::serialize::InputArchive> archive) { impl_->native_archive = std::move(archive); }
 std::vector<NormalizedModelStateEntry> DecodedNativeModelState::consume_entries() { return std::move(impl_->entries); }
-void DecodedNativeModelState::release_admission() noexcept { impl_->entries.clear(); impl_->native_archive.reset(); }
+void DecodedNativeModelState::release_admission() noexcept {
+    impl_->entries.clear();
+    impl_->native_archive.reset();
+}
 void DecodedNativeModelState::replace_entries(std::vector<NormalizedModelStateEntry> entries) { impl_->entries = std::move(entries); }
 namespace {
 [[nodiscard]] std::filesystem::path canonical_path(const std::filesystem::path& path) {
@@ -125,7 +130,9 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
     auto admitted_archive = std::make_unique<model_state_detail::InputArchive>();
     auto& archive = *admitted_archive;
     archive.load_from(path, torch::Device(torch::kCPU));
-    if (!supported_format(mmltk::backend::ml::serialization::require_string(archive, "format"))) { throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path); }
+    if (!supported_format(mmltk::backend::ml::serialization::require_string(archive, "format"))) {
+        throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path);
+    }
     const auto version = mmltk::backend::ml::serialization::require_int(archive, "format_version");
     if (version != kNativeCheckpointFormatVersion) {
         throw std::runtime_error("unsupported RF-DETR native checkpoint format version " + std::to_string(version) + ": " + path);

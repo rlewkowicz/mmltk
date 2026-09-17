@@ -148,7 +148,7 @@ function(mmltk_add_backend_models_rfdetr_export_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}
 )
     target_link_libraries(mmltk_backend_models_rfdetr_export_tests PRIVATE
-        mmltk_test_support
+        mmltk_backend_ml_torch_test_support
         mmltk::backend::models::rfdetr::export
         mmltk::vendor::onnxruntime
         mmltk::backend::ml::torch_dependencies)

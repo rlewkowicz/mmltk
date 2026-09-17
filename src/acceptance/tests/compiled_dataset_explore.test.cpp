@@ -1439,9 +1439,21 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     }
 }
 }  // namespace
-TEST_CASE("test_compiled_dataset_explore_projection_navigation_and_streaming", "[acceptance][backend-data][explore]") { test_compiled_dataset_explore_projection_navigation_and_streaming(); }
-TEST_CASE("test_compiled_explore_optional_donors_respect_source_capacity", "[acceptance][backend-data][explore][capacity]") { test_compiled_explore_optional_donors_respect_source_capacity(); }
-TEST_CASE("test_compiled_explore_cancelled_lane_preserves_atomic_product", "[acceptance][backend-data][explore][completion]") { test_compiled_explore_cancelled_lane_preserves_atomic_product(); }
-TEST_CASE("test_native_explore_transaction_faults_and_inactive_release", "[acceptance][backend-data][explore][transaction]") { test_native_explore_transaction_faults_and_inactive_release(); }
-TEST_CASE("test_compiled_explore_magnified_tiny_mask_and_transfer", "[acceptance][backend-data][explore][support]") { test_compiled_explore_magnified_tiny_mask_and_transfer(); }
-TEST_CASE("test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer", "[acceptance][explore][copy_paste]") { test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer(); }
+TEST_CASE("test_compiled_dataset_explore_projection_navigation_and_streaming", "[acceptance][backend-data][explore]") {
+    test_compiled_dataset_explore_projection_navigation_and_streaming();
+}
+TEST_CASE("test_compiled_explore_optional_donors_respect_source_capacity", "[acceptance][backend-data][explore][capacity]") {
+    test_compiled_explore_optional_donors_respect_source_capacity();
+}
+TEST_CASE("test_compiled_explore_cancelled_lane_preserves_atomic_product", "[acceptance][backend-data][explore][completion]") {
+    test_compiled_explore_cancelled_lane_preserves_atomic_product();
+}
+TEST_CASE("test_native_explore_transaction_faults_and_inactive_release", "[acceptance][backend-data][explore][transaction]") {
+    test_native_explore_transaction_faults_and_inactive_release();
+}
+TEST_CASE("test_compiled_explore_magnified_tiny_mask_and_transfer", "[acceptance][backend-data][explore][support]") {
+    test_compiled_explore_magnified_tiny_mask_and_transfer();
+}
+TEST_CASE("test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer", "[acceptance][explore][copy_paste]") {
+    test_compiled_explore_ring_holes_survive_hidden_donor_and_transfer();
+}

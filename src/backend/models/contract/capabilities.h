@@ -8,4 +8,4 @@ struct ModelCapabilities final {
     bool live = false;
     constexpr bool operator==(const ModelCapabilities&) const noexcept = default;
 };
-}
+}  // namespace mmltk::backend::models

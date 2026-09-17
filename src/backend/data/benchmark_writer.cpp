@@ -188,7 +188,8 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                     } catch (const std::bad_alloc&) { throw; } catch (const BenchmarkImageReadError&) {
                         throw;
                     } catch (const std::exception& error) { throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what()); }
-                    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(image.source_width, image.source_height, request.resolution, request.resolution);
+                    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(
+                        image.source_width, image.source_height, request.resolution, request.resolution);
                     const std::uint8_t* source_pixels = decoded.data();
                     if (image.source_width != letterbox.resized_width || image.source_height != letterbox.resized_height) {
                         resized.resize(checked_rgb_bytes(letterbox.resized_width, letterbox.resized_height));
@@ -202,8 +203,9 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                         letterbox.offset_y == 0U) {
                         mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(source_pixels, destination, request.resolution, request.resolution);
                     } else {
-                        mmltk::backend::imaging::resample::letterboxed_rgb_hwc_u8_to_nchw_f32(source_pixels, destination, letterbox.resized_width, letterbox.resized_height, request.resolution,
-                                                           request.resolution, letterbox.offset_x, letterbox.offset_y);
+                        mmltk::backend::imaging::resample::letterboxed_rgb_hwc_u8_to_nchw_f32(source_pixels, destination, letterbox.resized_width,
+                                                                                              letterbox.resized_height, request.resolution, request.resolution,
+                                                                                              letterbox.offset_x, letterbox.offset_y);
                     }
                     if (request.progress) { request.progress(); }
                 }

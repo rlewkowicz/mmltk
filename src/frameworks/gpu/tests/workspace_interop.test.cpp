@@ -31,8 +31,8 @@
 namespace mmltk::frameworks::gpu {
 namespace {
 using test_support::FakeImageBackend;
-using test_support::RuntimeFactory;
 using test_support::make_clean_semantic_runtime;
+using test_support::RuntimeFactory;
 TEST_CASE("Display context rebinding shares same-device custody and cleans partial event construction", "[gpu][workspace]") {
     auto backend = std::make_shared<FakeImageBackend>();
     {
@@ -1584,6 +1584,5 @@ TEST_CASE("Workspace damage accumulates skipped raw revisions for each display b
     CHECK(damage.Since({7U, 9U}, {7U, 99U}, 102U).full_image);
     CHECK_FALSE(damage.Since({7U, 98U}, {7U, 99U}, 102U).full_image);
 }
-
-} // namespace
-} // namespace mmltk::frameworks::gpu
+}  // namespace
+}  // namespace mmltk::frameworks::gpu

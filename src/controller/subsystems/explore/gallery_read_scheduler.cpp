@@ -32,16 +32,18 @@ void pack_rle_mask(const std::span<const data::RLEPair> runs, const std::span<st
         }
     }
 }
-}
-GalleryReadScheduler::GalleryReadScheduler(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution, const ExploreNativeConfiguration& configuration)
-    : acceptance_(configuration.acceptance), diagnostics_(configuration.diagnostics), device_(execution.device),
+}  // namespace
+GalleryReadScheduler::GalleryReadScheduler(std::size_t nproc, const mmltk::frameworks::gpu::DeviceExecution& execution,
+                                           const ExploreNativeConfiguration& configuration)
+    : acceptance_(configuration.acceptance),
+      diagnostics_(configuration.diagnostics),
+      device_(execution.device),
       image_stream_({.slots = nproc + 1U, .workers = nproc, .device = execution.device, .loading = configuration.loading, .execution = execution}) {
     if (image_stream_.workers().size() != nproc) throw contracts::InvalidIntentError("Explore nproc exceeds the current Linux CPU affinity");
     lanes_.reserve(nproc);
     for (std::size_t index = 0U; index != nproc; ++index) lanes_.push_back(std::make_unique<Lane>(index, image_stream_.metadata_storage(index)));
     detail_lane_ = std::make_unique<Lane>(nproc, image_stream_.metadata_storage(nproc));
 }
-
 bool GalleryReadScheduler::BeginReadLane(const std::size_t lane_index) {
     Lane& lane = LaneAt(lane_index);
     std::uint64_t demand = 0U;
@@ -290,8 +292,8 @@ void GalleryReadScheduler::SubmitRead(Lane& lane, const bool observed) {
                               static_cast<GalleryReadScheduler*>(context)->FinishTransfer(index, error);
                           }});
 }
-GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(const GalleryProductState& product, const std::uint32_t compiled_index, const bool has_donor,
-                                                                  const std::size_t donor_rle_count) const {
+GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(const GalleryProductState& product, const std::uint32_t compiled_index,
+                                                                    const bool has_donor, const std::size_t donor_rle_count) const {
     const auto& header = product.store->header();
     PayloadLayout result;
     constexpr std::size_t channels_bytes = 3U * sizeof(float);
@@ -325,7 +327,8 @@ GalleryReadScheduler::PayloadLayout GalleryReadScheduler::LayoutFor(const Galler
     result.bytes = result.donor_mask + result.donor_mask_words * sizeof(std::uint64_t);
     return result;
 }
-void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot, const std::uint64_t generation) {
+void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product, Lane& lane, const std::uint32_t compiled_index, const std::uint32_t slot,
+                                              const std::uint64_t generation) {
     image_stream_.bind_current_context();
     lane.store = product.store;
     lane.identity = {.incarnation = lane.store.get(),
@@ -467,13 +470,14 @@ void GalleryReadScheduler::RebindInput(const GalleryProductState& product, const
     lane.semantic_bank = product.cache.WritableBank(lane.position, incumbent, true);
     lane.state = LaneState::InputReady;
     scheduled_slots_[product.cache.Slot(lane.position)] = generation;
-    const explore::ExploreRenderTileDescriptor tile{.card_index = lane.destination_slot,
-                                                    .destination_x = lane.prefetch ? 0U : lane.destination_slot % lane.columns * lane.card_extent,
-                                                    .destination_y = lane.prefetch ? static_cast<std::uint32_t>(product.cache.PhysicalRow(product.cache.Slot(lane.position), lane.cache_bank))
-                                                                                   : lane.destination_slot / lane.columns * lane.card_extent,
-                                                    .destination_width = lane.card_extent,
-                                                    .destination_height = lane.card_extent,
-                                                    .generation = {.viewport = generation, .tile = ++next_tile_generation_}};
+    const explore::ExploreRenderTileDescriptor tile{
+        .card_index = lane.destination_slot,
+        .destination_x = lane.prefetch ? 0U : lane.destination_slot % lane.columns * lane.card_extent,
+        .destination_y = lane.prefetch ? static_cast<std::uint32_t>(product.cache.PhysicalRow(product.cache.Slot(lane.position), lane.cache_bank))
+                                       : lane.destination_slot / lane.columns * lane.card_extent,
+        .destination_width = lane.card_extent,
+        .destination_height = lane.card_extent,
+        .generation = {.viewport = generation, .tile = ++next_tile_generation_}};
     store_payload(lane.pinned.data(), lane.layout.tile, tile);
 }
 void GalleryReadScheduler::StartIdleLanes(const GalleryProductState& product, const GalleryThumbnailCache* incumbent) {
@@ -666,7 +670,5 @@ void GalleryReadScheduler::ResetLogical() {
         lane->failure = {};
     }
 }
-void GalleryReadScheduler::ReleaseLane(Lane& lane, cudaStream_t stream) {
-    image_stream_.release(lane.index, stream, LaneCompletion());
-}
-}
+void GalleryReadScheduler::ReleaseLane(Lane& lane, cudaStream_t stream) { image_stream_.release(lane.index, stream, LaneCompletion()); }
+}  // namespace mmltk::controller::explore_detail

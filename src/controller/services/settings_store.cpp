@@ -110,25 +110,21 @@ PersistenceLoadResult SettingsStore::load(const std::string_view location) noexc
         return {.terminal = PersistenceTerminal::Succeeded,
                 .settings = std::make_unique<contracts::GuiSettingsState>(std::move(record.settings)),
                 .revision_frontier = record.revision_frontier};
-    } catch (const SettingsStoreError& error) {
-        return {.detail = bounded_detail(error), .stage = error.stage};
-    } catch (const std::exception& error) {
+    } catch (const SettingsStoreError& error) { return {.detail = bounded_detail(error), .stage = error.stage}; } catch (const std::exception& error) {
         return {.detail = bounded_detail(error)};
     } catch (...) { return {.detail = "settings load failed"}; }
 }
-PersistenceSaveResult SettingsStore::save(const std::string_view location, const contracts::GuiSettingsState& settings,
-                                         const std::uint64_t revision) noexcept {
+PersistenceSaveResult SettingsStore::save(const std::string_view location, const contracts::GuiSettingsState& settings, const std::uint64_t revision) noexcept {
     try {
         const std::filesystem::path path{location};
         const auto current = load_record(path);
-        if (revision <= current.revision_frontier)
-            return {.revision = revision, .detail = "settings revision is not newer than durable frontier"};
+        if (revision <= current.revision_frontier) return {.revision = revision, .detail = "settings revision is not newer than durable frontier"};
         save_record(path, settings, revision);
         return {.terminal = PersistenceTerminal::Succeeded, .revision = revision};
     } catch (const SettingsStoreError& error) {
         return {.revision = revision, .detail = bounded_detail(error), .stage = error.stage};
-    } catch (const std::exception& error) {
-        return {.revision = revision, .detail = bounded_detail(error)};
-    } catch (...) { return {.revision = revision, .detail = "settings save failed"}; }
+    } catch (const std::exception& error) { return {.revision = revision, .detail = bounded_detail(error)}; } catch (...) {
+        return {.revision = revision, .detail = "settings save failed"};
+    }
 }
 }  // namespace mmltk::controller::services

@@ -78,7 +78,7 @@ function(mmltk_add_backend_models_rfdetr_inference_tests)
         mmltk_backend_models_rfdetr_inference_tests PRIVATE_DECLARATIONS)
             target_link_libraries(
         mmltk_backend_models_rfdetr_inference_tests PRIVATE
-        mmltk_test_support
+        mmltk_backend_ml_torch_test_support
         mmltk_backend_data_test_support
         mmltk::backend::ml::cuda
         mmltk::backend::ml::runtime

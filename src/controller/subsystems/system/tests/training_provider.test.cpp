@@ -22,7 +22,6 @@
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
 namespace {
-
 [[nodiscard]] contracts::ProviderOffer provider_offer() {
     return {.offer_id = 17,
             .gpu_name = "A100",
@@ -70,7 +69,8 @@ class FakeTrainingRuntime final : public TrainingRuntime {
     bool fail_ = false;
     bool inconclusive_ = false;
 };
-[[nodiscard]] TrainingSystem::RuntimeFactory reconstructing_training_runtime(std::shared_ptr<mmltk::testsupport::StopGate>& gate, std::atomic_size_t& constructions) {
+[[nodiscard]] TrainingSystem::RuntimeFactory reconstructing_training_runtime(std::shared_ptr<mmltk::testsupport::StopGate>& gate,
+                                                                             std::atomic_size_t& constructions) {
     return [&gate, &constructions] {
         const bool fail = constructions++ == 0U;
         return std::make_unique<FakeTrainingRuntime>(gate, fail);
@@ -474,5 +474,5 @@ TEST_CASE("training admission and matching cancellation do not invert system and
     REQUIRE(terminal.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
     terminal.get();
 }
-} // namespace
-} // namespace mmltk::controller
+}  // namespace
+}  // namespace mmltk::controller

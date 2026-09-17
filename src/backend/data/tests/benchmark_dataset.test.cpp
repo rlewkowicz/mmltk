@@ -600,7 +600,8 @@ void test_benchmark_cached_image_writer_and_loader() {
     split.name = "validation";
     split.class_names = {"person"};
     split.sources.push_back(CachedImageSource{image_root});
-    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(16U, 8U, kNanoResolution, kNanoResolution);
+    const mmltk::backend::imaging::resample::RgbLetterbox letterbox =
+        mmltk::backend::imaging::resample::compute_rgb_letterbox(16U, 8U, kNanoResolution, kNanoResolution);
     REQUIRE(letterbox.resized_width == kNanoResolution);
     REQUIRE(letterbox.resized_height == 192U);
     REQUIRE(letterbox.offset_x == 0U);

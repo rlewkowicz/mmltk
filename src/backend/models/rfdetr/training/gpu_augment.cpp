@@ -1,5 +1,4 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
-
 #include "src/backend/ml/cuda/numa_host_tensor.h"
 #include <algorithm>
 #include <cstdint>
@@ -50,7 +49,8 @@ GpuBatchPreprocessor::GpuBatchPreprocessor(const std::int64_t batch_capacity, co
     require(batch_capacity_ > 0 && height_ > 0 && width_ > 0, "invalid GPU preprocessing tensor shape");
     (void)preprocess_output_type(output_type_);
     TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
-    output_ = torch::empty({batch_capacity_, 3, height_, width_}, torch::TensorOptions().dtype(output_type_).device(mmltk::backend::ml::cuda::cuda_device(device_id_)));
+    output_ = torch::empty({batch_capacity_, 3, height_, width_},
+                           torch::TensorOptions().dtype(output_type_).device(mmltk::backend::ml::cuda::cuda_device(device_id_)));
     ensure_cuda_ok(cudaEventCreateWithFlags(&consumer_complete_, cudaEventDisableTiming), "cudaEventCreateWithFlags for GPU preprocessing consumer");
 }
 GpuBatchPreprocessor::~GpuBatchPreprocessor() {
@@ -208,7 +208,7 @@ cudaError_t GpuBatchAugmenter::release_copy_paste_resources() noexcept {
     return cudaSuccess;
 }
 torch::Tensor GpuBatchAugmenter::run(const mmltk::backend::data::Batch& batch, const std::uint64_t seed, const int epoch, const int rank,
-                                           const std::uint64_t sequence) {
+                                     const std::uint64_t sequence) {
     RequireActive();
     require(static_cast<std::int64_t>(batch.num_images) <= batch_capacity_, "GPU augmentation batch exceeds preallocated capacity");
     require(batch.num_images == 0U || (batch.device_images != nullptr && batch.image_indices != nullptr),

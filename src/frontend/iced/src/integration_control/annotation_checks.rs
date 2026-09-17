@@ -1,21 +1,29 @@
-use crate::integration_control::widget_ops::click;
+use super::lifecycle::same_numeric_value;
+use super::retained::EXPLORE_ANNOTATE;
 use crate::generated::FeatureId;
-use crate::integration_control::{ANNOTATION_SURFACE, CopyScaleStage, Driver, Message, Phase, annotation_checks, annotation_product, annotation_message, probe, reporting, settled_settings_snapshot, widget_ops};
+use crate::generated::{AnnotationMask, AnnotationShape, AnnotationUiState};
 use crate::integration_control::pixel_checks::ProbeOutcome;
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::pixel_checks::pixel_result_callback;
 use crate::integration_control::probe::{ProbeReceipt, current_receipt};
-use crate::integration_control::widget_ops::{AnnotationReveal, locate, reveal_control, scroll_control_into_view};
+use crate::integration_control::widget_ops::click;
+use crate::integration_control::widget_ops::{
+    AnnotationReveal, locate, reveal_control, scroll_control_into_view,
+};
+use crate::integration_control::{
+    ANNOTATION_SURFACE, CopyScaleStage, Driver, Message, Phase, annotation_checks,
+    annotation_message, annotation_product, probe, reporting, settled_settings_snapshot,
+    widget_ops,
+};
+#[cfg(target_arch = "wasm32")]
+use crate::integration_control::{
+    annotation_pixels_js, annotation_pointer_js, annotation_release_js,
+};
 use crate::message::Message as RootMessage;
 use crate::view::{annotation, train};
 use crate::view_model::ApplicationModel;
-use iced::{Rectangle, Task};
 use iced::widget::operation::RelativeOffset;
-#[cfg(target_arch = "wasm32")]
-use crate::integration_control::{annotation_pixels_js, annotation_pointer_js, annotation_release_js};
-#[cfg(target_arch = "wasm32")]
-use crate::integration_control::pixel_checks::pixel_result_callback;
-use super::retained::EXPLORE_ANNOTATE;
-use super::lifecycle::same_numeric_value;
-use crate::generated::{AnnotationMask, AnnotationShape, AnnotationUiState};
+use iced::{Rectangle, Task};
 
 pub(super) fn mask_contains(mask: &AnnotationMask, [x, y]: [u16; 2]) -> bool {
     mask.runs
@@ -241,7 +249,10 @@ impl Default for State {
 
 impl State {
     pub(super) fn advance_annotation_checks(
-        &mut self, widgets: &mut widget_ops::RevealState, driver: &mut Driver, probes: &mut probe::Requests,
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
         model: &ApplicationModel,
         settings: &crate::view::settings::SettingsModel,
         applied_scale: f32,
@@ -250,7 +261,6 @@ impl State {
     ) -> Task<RootMessage> {
         let frame = surface.and_then(|surface| surface.frame);
         match driver.phase.clone() {
-
             Phase::OpenAnnotation => self.annotation_arm(widgets, driver, probes, EXPLORE_ANNOTATE),
             Phase::CopyAwaitObject { index, mask } => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
@@ -261,10 +271,22 @@ impl State {
                 {
                     return Task::none();
                 }
-                self.begin_copy_object_edit(driver, probes, snapshot, index, mask)
+                self.begin_copy_object_edit(widgets, driver, probes, snapshot, index, mask)
             }
-            Phase::CopyUndo { .. } => self.annotation_arm_scrolled(widgets, driver, probes, "annotation.undo", RelativeOffset::END),
-            Phase::CopyRedo { .. } => self.annotation_arm_scrolled(widgets, driver, probes, "annotation.redo", RelativeOffset::END),
+            Phase::CopyUndo { .. } => self.annotation_arm_scrolled(
+                widgets,
+                driver,
+                probes,
+                "annotation.undo",
+                RelativeOffset::END,
+            ),
+            Phase::CopyRedo { .. } => self.annotation_arm_scrolled(
+                widgets,
+                driver,
+                probes,
+                "annotation.redo",
+                RelativeOffset::END,
+            ),
             Phase::CopyAwaitUndo { index, mask } => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
                     return Task::none();
@@ -275,7 +297,13 @@ impl State {
                     return Task::none();
                 }
                 driver.phase = Phase::CopyRedo { index, mask };
-                self.annotation_arm_scrolled(widgets, driver, probes, "annotation.redo", RelativeOffset::END)
+                self.annotation_arm_scrolled(
+                    widgets,
+                    driver,
+                    probes,
+                    "annotation.redo",
+                    RelativeOffset::END,
+                )
             }
             Phase::CopyAwaitRedo { index, mask: _ } => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
@@ -324,7 +352,10 @@ impl State {
                         revision: snapshot.ui.interactionrevision,
                         tool: crate::generated::AnnotationTool::Point,
                     };
-                    return self.annotation_arm_scrolled(widgets, driver, probes,
+                    return self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
                         annotation::tool_id(crate::generated::AnnotationTool::Point),
                         RelativeOffset::START,
                     );
@@ -334,7 +365,9 @@ impl State {
                     if self.copy_step == 1 {
                         self.copy_before = Some(snapshot.ui.scene.objects[index as usize].clone());
                         self.copy_after = None;
-                        return self.begin_copy_object_edit(driver, probes, snapshot, index, false);
+                        return self.begin_copy_object_edit(
+                            widgets, driver, probes, snapshot, index, false,
+                        );
                     }
                     let Some((index, object)) =
                         snapshot
@@ -352,7 +385,14 @@ impl State {
                     };
                     self.copy_before = Some(object.clone());
                     self.copy_after = None;
-                    self.begin_copy_object_edit(driver, probes, snapshot, index as u16, true)
+                    self.begin_copy_object_edit(
+                        widgets,
+                        driver,
+                        probes,
+                        snapshot,
+                        index as u16,
+                        true,
+                    )
                 }
             }
             Phase::CopyAwaitClass { index } => {
@@ -368,7 +408,13 @@ impl State {
                 }
                 self.copy_after = Some(snapshot.ui.scene.objects[index as usize].clone());
                 driver.phase = Phase::CopyUndo { index, mask: true };
-                self.annotation_arm_scrolled(widgets, driver, probes, "annotation.undo", RelativeOffset::START)
+                self.annotation_arm_scrolled(
+                    widgets,
+                    driver,
+                    probes,
+                    "annotation.undo",
+                    RelativeOffset::START,
+                )
             }
             Phase::CopyListSetup { stage, .. } => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
@@ -445,7 +491,8 @@ impl State {
                             driver.fail("Annotation long-list setup did not preserve its exact bounded inventory");
                             return Task::none();
                         }
-                        return self.copy_scale_transition(driver,
+                        return self.copy_scale_transition(
+                            driver,
                             model,
                             applied_scale,
                             CopyScaleStage::Wide,
@@ -481,24 +528,48 @@ impl State {
                     }
                 }
                 if step == 0 {
-                    self.annotation_arm_scrolled(widgets, driver, probes, "workflow.workspace_and_advanced", RelativeOffset::START)
+                    self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        "workflow.workspace_and_advanced",
+                        RelativeOffset::START,
+                    )
                 } else if step == 1 {
                     self.annotation_arm(widgets, driver, probes, "workflow.diagnostics")
                 } else if step < 7 {
-                    self.annotation_arm_scrolled(widgets, driver, probes, self.copy_layout_control(step), RelativeOffset::START)
+                    self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        self.copy_layout_control(step),
+                        RelativeOffset::START,
+                    )
                 } else {
                     if widgets.location_pending() {
                         return Task::none();
                     }
-                    if !probes.prepare_control_probe(widgets, self.copy_swatch_color, self.copy_capability_available) {
+                    if !probes.prepare_control_probe(
+                        widgets,
+                        self.copy_swatch_color,
+                        self.copy_capability_available,
+                    ) {
                         return Task::none();
                     }
                     self.copy_swatch_ready = false;
-                    self.annotation_arm_scrolled(widgets, driver, probes, "annotation.class.active.swatch", RelativeOffset::START)
+                    self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        "annotation.class.active.swatch",
+                        RelativeOffset::START,
+                    )
                 }
             }
             Phase::CopySwatchWait => {
-                if (*probes.annotation_observation().control_receipt) != current_receipt("workflow.visual.workspace") {
+                if (*probes.annotation_observation().control_receipt)
+                    != current_receipt("workflow.visual.workspace")
+                {
                     self.copy_swatch_ready = false;
                     return advance_annotation(driver, Phase::CopyLayout(7));
                 }
@@ -543,17 +614,26 @@ impl State {
                     f64::from(color.g) * 255.0,
                     f64::from(color.b) * 255.0,
                 ];
-                if !probes.prepare_control_probe(widgets, self.copy_swatch_color, self.copy_capability_available) {
+                if !probes.prepare_control_probe(
+                    widgets,
+                    self.copy_swatch_color,
+                    self.copy_capability_available,
+                ) {
                     return Task::none();
                 }
                 self.copy_capability_ready = false;
-                self.annotation_arm_scrolled(widgets, driver, probes,
+                self.annotation_arm_scrolled(
+                    widgets,
+                    driver,
+                    probes,
                     annotation::tool_id(crate::generated::AnnotationTool::ColorSample),
                     RelativeOffset::START,
                 )
             }
             Phase::CopyCapabilityWait => {
-                if (*probes.annotation_observation().control_receipt) != current_receipt("workflow.visual.workspace") {
+                if (*probes.annotation_observation().control_receipt)
+                    != current_receipt("workflow.visual.workspace")
+                {
                     self.copy_capability_ready = false;
                     return advance_annotation(driver, Phase::CopyCapability);
                 }
@@ -620,7 +700,8 @@ impl State {
                         return Task::none();
                     }
                     self.copy_product_gesture = None;
-                    return self.copy_scale_transition(driver,
+                    return self.copy_scale_transition(
+                        driver,
                         model,
                         applied_scale,
                         if self.copy_narrow {
@@ -643,10 +724,22 @@ impl State {
                         revision: snapshot.ui.interactionrevision,
                         tool,
                     };
-                    self.annotation_arm_scrolled(widgets, driver, probes, annotation::tool_id(tool), RelativeOffset::START)
+                    self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        annotation::tool_id(tool),
+                        RelativeOffset::START,
+                    )
                 } else if action.gesture.is_some() {
                     driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-                    self.annotation_arm_scrolled(widgets, driver, probes, ANNOTATION_SURFACE, RelativeOffset::START)
+                    self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        ANNOTATION_SURFACE,
+                        RelativeOffset::START,
+                    )
                 } else {
                     let completion = advance_annotation(driver, Phase::CopyProductWait);
                     action
@@ -669,9 +762,21 @@ impl State {
                     return Task::none();
                 }
                 driver.phase = Phase::CopySave;
-                self.annotation_arm_scrolled(widgets, driver, probes, VIEWER_SAVE, RelativeOffset::END)
+                self.annotation_arm_scrolled(
+                    widgets,
+                    driver,
+                    probes,
+                    VIEWER_SAVE,
+                    RelativeOffset::END,
+                )
             }
-            Phase::CopySave => self.annotation_arm_scrolled(widgets, driver, probes, VIEWER_SAVE, RelativeOffset::END),
+            Phase::CopySave => self.annotation_arm_scrolled(
+                widgets,
+                driver,
+                probes,
+                VIEWER_SAVE,
+                RelativeOffset::END,
+            ),
             Phase::CopyAwaitSave => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
                     return Task::none();
@@ -704,7 +809,8 @@ impl State {
                     || snapshot.busy
                     || snapshot.frame.revision == 0
                     || !model.annotation_edit_available()
-                    || self.annotation_open
+                    || self
+                        .annotation_open
                         .as_ref()
                         .is_none_or(|(_, before)| snapshot.inputdocumentepoch <= *before)
                 {
@@ -730,7 +836,10 @@ impl State {
                         revision: snapshot.ui.interactionrevision,
                         tool: crate::generated::AnnotationTool::Box,
                     };
-                    return self.annotation_arm_scrolled(widgets, driver, probes,
+                    return self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
                         annotation::tool_id(crate::generated::AnnotationTool::Box),
                         RelativeOffset::START,
                     );
@@ -778,7 +887,14 @@ impl State {
                     self.copy_before = Some(object.clone());
                     self.copy_objects = scene.objects.len();
                     self.copy_categories = scene.categories.clone();
-                    return self.begin_copy_object_edit(driver, probes, snapshot, index as u16, false);
+                    return self.begin_copy_object_edit(
+                        widgets,
+                        driver,
+                        probes,
+                        snapshot,
+                        index as u16,
+                        false,
+                    );
                 }
                 let Some(tool) = crate::generated::ANNOTATION_TOOL_VALUES
                     .iter()
@@ -816,7 +932,13 @@ impl State {
             }
             Phase::AnnotationTool { revision, tool } => {
                 driver.phase = Phase::AnnotationTool { revision, tool };
-                self.annotation_arm_scrolled(widgets, driver, probes, annotation::tool_id(tool), RelativeOffset::START)
+                self.annotation_arm_scrolled(
+                    widgets,
+                    driver,
+                    probes,
+                    annotation::tool_id(tool),
+                    RelativeOffset::START,
+                )
             }
             Phase::AwaitTool { revision, tool } => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
@@ -869,18 +991,32 @@ impl State {
                     advance_annotation(driver, Phase::CopyProductWait)
                 } else {
                     driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-                    self.annotation_arm_scrolled(widgets, driver, probes, ANNOTATION_SURFACE, RelativeOffset::START)
+                    self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        ANNOTATION_SURFACE,
+                        RelativeOffset::START,
+                    )
                 }
             }
             Phase::AnnotationSurface(revision) => {
                 driver.phase = Phase::AnnotationSurface(revision);
-                self.annotation_arm_scrolled(widgets, driver, probes, ANNOTATION_SURFACE, RelativeOffset::START)
+                self.annotation_arm_scrolled(
+                    widgets,
+                    driver,
+                    probes,
+                    ANNOTATION_SURFACE,
+                    RelativeOffset::START,
+                )
             }
             Phase::AwaitAnnotationFrame(revision) => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
                     return Task::none();
                 };
-                if !probes.annotation_observation().frame_ready
+                if !probes
+                    .annotation_observation()
+                    .frame_ready
                     .is_some_and(|sampleable| sampleable.source_revision == snapshot.frame.revision)
                 {
                     return Task::none();
@@ -1024,7 +1160,9 @@ impl State {
                 if driver.viewer_scenario == "copy"
                     && (receipt.is_none() || (*probes.annotation_observation().receipt) != receipt)
                 {
-                    if widgets.location_pending() || (*probes.annotation_observation().pending) == receipt {
+                    if widgets.location_pending()
+                        || (*probes.annotation_observation().pending) == receipt
+                    {
                         return Task::none();
                     }
                     let samples = annotation_checks::probes(&snapshot.ui);
@@ -1039,7 +1177,8 @@ impl State {
                         driver.fail("Annotation pixel inventory lost its next expected sample");
                         return Task::none();
                     };
-                    if !probes.prepare_annotation_probe(widgets,
+                    if !probes.prepare_annotation_probe(
+                        widgets,
                         snapshot.frame.revision,
                         presentation_revision,
                         [snapshot.frame.extent.width, snapshot.frame.extent.height],
@@ -1087,10 +1226,13 @@ impl State {
                                     ],
                                 )
                             });
-                            return advance_annotation(driver, match step {
-                                annotation_product::Step::Select(_) => Phase::CopyCapability,
-                                _ => Phase::CopyProductStart,
-                            });
+                            return advance_annotation(
+                                driver,
+                                match step {
+                                    annotation_product::Step::Select(_) => Phase::CopyCapability,
+                                    _ => Phase::CopyProductStart,
+                                },
+                            );
                         }
                         Err(detail) => {
                             driver.fail(detail);
@@ -1112,7 +1254,8 @@ impl State {
                         || snapshot.ui.scene.objects.len()
                             != self.copy_objects + usize::from(self.copy_step - 4)
                     {
-                        driver.fail("annotation shape creation did not publish its rendered object");
+                        driver
+                            .fail("annotation shape creation did not publish its rendered object");
                         return Task::none();
                     }
                     self.copy_shape_points += 1;
@@ -1120,7 +1263,13 @@ impl State {
                         || (self.copy_step == 7 && self.copy_shape_points < 2)
                     {
                         driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-                        return self.annotation_arm_scrolled(widgets, driver, probes, ANNOTATION_SURFACE, RelativeOffset::START);
+                        return self.annotation_arm_scrolled(
+                            widgets,
+                            driver,
+                            probes,
+                            ANNOTATION_SURFACE,
+                            RelativeOffset::START,
+                        );
                     }
                     reporting::emit(|sink| {
                         sink.record(
@@ -1152,10 +1301,13 @@ impl State {
                         self.copy_list_object_target = snapshot.ui.scene.objects.len() + 32;
                         self.copy_list_class_target = snapshot.ui.scene.categories.len() + 32;
                         self.copy_list_revision = snapshot.uirevision.saturating_sub(1);
-                        return advance_annotation(driver, Phase::CopyListSetup {
-                            stage: 0,
-                            revision: snapshot.uirevision,
-                        });
+                        return advance_annotation(
+                            driver,
+                            Phase::CopyListSetup {
+                                stage: 0,
+                                revision: snapshot.uirevision,
+                            },
+                        );
                     }
                     self.copy_step += 1;
                     self.copy_shape_points = 0;
@@ -1168,7 +1320,13 @@ impl State {
                         revision: snapshot.ui.interactionrevision,
                         tool,
                     };
-                    return self.annotation_arm_scrolled(widgets, driver, probes, annotation::tool_id(tool), RelativeOffset::START);
+                    return self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        annotation::tool_id(tool),
+                        RelativeOffset::START,
+                    );
                 }
                 if driver.viewer_scenario == "copy" {
                     let Some(index) = snapshot.ui.editor.selectedobject else {
@@ -1194,12 +1352,19 @@ impl State {
                             object.box_ == before.box_
                         }
                     }) {
-                        driver.fail("editing imported geometry changed its independent counterpart");
+                        driver
+                            .fail("editing imported geometry changed its independent counterpart");
                         return Task::none();
                     }
                     self.copy_after = Some(object.clone());
                     driver.phase = Phase::CopyUndo { index, mask };
-                    return self.annotation_arm_scrolled(widgets, driver, probes, "annotation.undo", RelativeOffset::END);
+                    return self.annotation_arm_scrolled(
+                        widgets,
+                        driver,
+                        probes,
+                        "annotation.undo",
+                        RelativeOffset::END,
+                    );
                 }
                 reporting::emit(|sink| {
                     sink.record(
@@ -1225,7 +1390,10 @@ impl State {
         }
     }
     pub(super) fn begin_copy_object_edit(
-        &mut self, driver: &mut Driver, probes: &mut probe::Requests,
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
         snapshot: &crate::generated::AnnotationSnapshot,
         index: u16,
         mask: bool,
@@ -1247,17 +1415,30 @@ impl State {
         };
         if snapshot.ui.editor.tool == tool {
             driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-            return self.annotation_arm_scrolled(widgets, driver, probes, ANNOTATION_SURFACE, RelativeOffset::START);
+            return self.annotation_arm_scrolled(
+                widgets,
+                driver,
+                probes,
+                ANNOTATION_SURFACE,
+                RelativeOffset::START,
+            );
         }
         driver.phase = Phase::AnnotationTool {
             revision: snapshot.ui.interactionrevision,
             tool,
         };
-        self.annotation_arm_scrolled(widgets, driver, probes, annotation::tool_id(tool), RelativeOffset::START)
+        self.annotation_arm_scrolled(
+            widgets,
+            driver,
+            probes,
+            annotation::tool_id(tool),
+            RelativeOffset::START,
+        )
     }
     pub(super) fn annotation_points(&self, driver: &Driver, width: f64, height: f64) -> [f64; 4] {
         self.copy_product_gesture.unwrap_or_else(|| {
-            if let Some(object) = self.copy_before
+            if let Some(object) = self
+                .copy_before
                 .as_ref()
                 .filter(|_| driver.viewer_scenario == "copy")
             {
@@ -1305,7 +1486,12 @@ impl State {
             }
         })
     }
-    pub(super) fn annotation_reveal(&self, driver: &Driver, probes: &probe::Requests, control: &str) -> AnnotationReveal {
+    pub(super) fn annotation_reveal(
+        &self,
+        driver: &Driver,
+        probes: &probe::Requests,
+        control: &str,
+    ) -> AnnotationReveal {
         if matches!(driver.phase, Phase::CopyLayout(2 | 3)) {
             return AnnotationReveal::Tail {
                 count: if matches!(driver.phase, Phase::CopyLayout(2)) {
@@ -1343,7 +1529,8 @@ impl State {
         if matches!(driver.phase, Phase::AnnotationPointer(_)) {
             if let Some(frame) = probes.annotation_observation().frame_ready {
                 let extent = [frame.content_width as f32, frame.content_height as f32];
-                let [x, y, ex, ey] = self.annotation_points(driver, f64::from(extent[0]), f64::from(extent[1]))
+                let [x, y, ex, ey] = self
+                    .annotation_points(driver, f64::from(extent[0]), f64::from(extent[1]))
                     .map(|value| value as f32);
                 return AnnotationReveal::Source {
                     extent,
@@ -1360,7 +1547,8 @@ impl State {
         AnnotationReveal::Geometry
     }
     pub(super) fn copy_scale_transition(
-        &mut self, driver: &mut Driver,
+        &mut self,
+        driver: &mut Driver,
         model: &ApplicationModel,
         applied_scale: f32,
         stage: CopyScaleStage,
@@ -1421,7 +1609,10 @@ impl State {
             _ => "annotation.class.active.swatch".into(),
         }
     }
-    pub(super) fn copy_product_settled(&self, snapshot: &crate::generated::AnnotationSnapshot) -> bool {
+    pub(super) fn copy_product_settled(
+        &self,
+        snapshot: &crate::generated::AnnotationSnapshot,
+    ) -> bool {
         // Command admission advances the UI revision while the operation still
         // owns work. Check its result only after the native owner settles it.
         if snapshot.busy {
@@ -1438,13 +1629,14 @@ impl State {
     }
     pub(super) fn expected_annotation_checks(&self, driver: &Driver) -> Option<String> {
         Some(match driver.phase {
-
             Phase::CopyUndo { .. } => "annotation.undo".to_owned(),
             Phase::CopyRedo { .. } => "annotation.redo".to_owned(),
             Phase::CopySave => VIEWER_SAVE.to_owned(),
-            Phase::CopyCapability=>annotation::tool_id(crate::generated::AnnotationTool::ColorSample),
-            Phase::CopyLayout(0)=>"workflow.workspace_and_advanced".into(),
-            Phase::CopyLayout(1)=>"workflow.diagnostics".into(),
+            Phase::CopyCapability => {
+                annotation::tool_id(crate::generated::AnnotationTool::ColorSample)
+            }
+            Phase::CopyLayout(0) => "workflow.workspace_and_advanced".into(),
+            Phase::CopyLayout(1) => "workflow.diagnostics".into(),
             Phase::CopyLayout(step) => self.copy_layout_control(step),
             Phase::OpenAnnotation => EXPLORE_ANNOTATE.to_owned(),
             Phase::AnnotationSidebar { .. } => ANNOTATION_SIDEBAR.to_owned(),
@@ -1453,15 +1645,22 @@ impl State {
             Phase::AnnotationStop { .. } => ANNOTATION_STOP.to_owned(),
             Phase::AnnotationBrush { .. } => ANNOTATION_BRUSH_RADIUS.to_owned(),
             Phase::AnnotationTool { tool, .. } => annotation::tool_id(tool),
-            Phase::AnnotationSurface(_) | Phase::AnnotationPointer(_) | Phase::AwaitPointer(_) | Phase::CopyProductWait => {
-                ANNOTATION_SURFACE.to_owned()
-            }
+            Phase::AnnotationSurface(_)
+            | Phase::AnnotationPointer(_)
+            | Phase::AwaitPointer(_)
+            | Phase::CopyProductWait => ANNOTATION_SURFACE.to_owned(),
             _ => return None,
         })
     }
-    pub(super) fn located_annotation_checks(&mut self, driver: &mut Driver, probes: &mut probe::Requests, control: String, bounds: Rectangle, input_bounds: Rectangle) -> Option<train::Message> {
+    pub(super) fn located_annotation_checks(
+        &mut self,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        control: String,
+        bounds: Rectangle,
+        input_bounds: Rectangle,
+    ) -> Option<train::Message> {
         match driver.phase.clone() {
-
             Phase::CopyCapability => {
                 driver.phase = Phase::CopyCapabilityWait;
                 if let Some(probe) = probes.take_control_probe() {
@@ -1528,7 +1727,9 @@ impl State {
                 }
                 None
             }
-            Phase::AwaitPointer(_) | Phase::CopyProductWait if probes.annotation_observation().prepared.is_some() => {
+            Phase::AwaitPointer(_) | Phase::CopyProductWait
+                if probes.annotation_observation().prepared.is_some() =>
+            {
                 if let Some(probe) = probes.take_annotation_probe() {
                     #[cfg(not(target_arch = "wasm32"))]
                     let _ = probe;
@@ -1585,7 +1786,9 @@ impl State {
             Phase::AnnotationPointer(revision) => {
                 #[cfg(target_arch = "wasm32")]
                 let gesture = {
-                    let frame = probes.annotation_observation().frame_ready
+                    let frame = probes
+                        .annotation_observation()
+                        .frame_ready
                         .expect("sampleable annotation frame");
                     let (width, height) = (
                         f64::from(frame.content_width),
@@ -1661,11 +1864,19 @@ impl State {
                     _ => driver.phase.clone(),
                 };
                 driver.click_located(input_bounds)
-            },
+            }
         }
     }
-    pub(super) fn annotation_arm(&mut self, widgets: &mut widget_ops::RevealState, driver: &mut Driver, probes: &mut probe::Requests, control: impl Into<String>) -> Task<RootMessage> {
-        if !widgets.begin_location() { return Task::none(); }
+    pub(super) fn annotation_arm(
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        control: impl Into<String>,
+    ) -> Task<RootMessage> {
+        if !widgets.begin_location() {
+            return Task::none();
+        }
         let control = control.into();
         if control.starts_with("annotation.") {
             reveal_control(
@@ -1678,11 +1889,16 @@ impl State {
         }
     }
     pub(super) fn annotation_arm_scrolled(
-        &mut self, widgets: &mut widget_ops::RevealState, driver: &mut Driver, probes: &mut probe::Requests,
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
         control: impl Into<String>,
         offset: RelativeOffset,
     ) -> Task<RootMessage> {
-        if !widgets.begin_location() { return Task::none(); }
+        if !widgets.begin_location() {
+            return Task::none();
+        }
         let control = control.into();
         if control.starts_with("annotation.") {
             let reveal = self.annotation_reveal(driver, probes, &control);
@@ -1702,25 +1918,34 @@ impl State {
                 .chain(locate(control, driver.generation))
         }
     }
-
-
 }
 
 impl State {
-    pub(super) fn callback(&mut self, driver: &mut Driver, probes: &mut probe::Requests, message: Message, request_receipt: Option<ProbeReceipt>) {
+    pub(super) fn callback(
+        &mut self,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        message: Message,
+        request_receipt: Option<ProbeReceipt>,
+    ) {
         match message {
-
             Message::AnnotationControlPixels { outcome } => {
-                if !probes.complete_capability_probe(&request_receipt, &outcome) { return; }
+                if !probes.complete_capability_probe(&request_receipt, &outcome) {
+                    return;
+                }
                 match outcome {
-                    ProbeOutcome::Invalidated => {},
+                    ProbeOutcome::Invalidated => {}
                     ProbeOutcome::Observed(1, 1) => self.copy_capability_ready = true,
-                    _ => driver.fail("Rendered tool availability differs from the native capability"),
+                    _ => {
+                        driver.fail("Rendered tool availability differs from the native capability")
+                    }
                 }
                 return;
             }
             Message::AnnotationPixels { revision, outcome } => {
-                if !probes.take_annotation_completion(revision, &request_receipt) { return; }
+                if !probes.take_annotation_completion(revision, &request_receipt) {
+                    return;
+                }
                 match outcome {
                     ProbeOutcome::Invalidated => {}
                     ProbeOutcome::Observed(expected, matched)
@@ -1737,21 +1962,29 @@ impl State {
                             }
                         }
                     }
-                    _ => driver.fail("Annotation pixels do not match source geometry and native palette"),
+                    _ => driver
+                        .fail("Annotation pixels do not match source geometry and native palette"),
                 }
                 return;
-            }            _ => unreachable!("callback routed to the wrong scenario owner"),
+            }
+            _ => unreachable!("callback routed to the wrong scenario owner"),
         }
     }
 }
 
 impl State {
-    pub(super) fn observe_open(&mut self, request: crate::generated::AnnotationOpen, document_epoch: u64) {
+    pub(super) fn observe_open(
+        &mut self,
+        request: crate::generated::AnnotationOpen,
+        document_epoch: u64,
+    ) {
         self.annotation_open = Some((request, document_epoch));
     }
     #[cfg(test)]
     pub(super) fn open_for_test(&self) -> Option<(&crate::generated::AnnotationOpen, u64)> {
-        self.annotation_open.as_ref().map(|(request, epoch)| (request, *epoch))
+        self.annotation_open
+            .as_ref()
+            .map(|(request, epoch)| (request, *epoch))
     }
 }
 
@@ -1789,8 +2022,9 @@ pub(super) fn annotation_layout_scale(
     Ok(scale)
 }
 
-pub(super) const VIEWER_SAVE: &str = crate::view::workflow::Composition::new(FeatureId::Annotate, 0.0)
-    .stable_id(crate::view::workflow::Region::PrimaryAction);
+pub(super) const VIEWER_SAVE: &str =
+    crate::view::workflow::Composition::new(FeatureId::Annotate, 0.0)
+        .stable_id(crate::view::workflow::Region::PrimaryAction);
 
 pub(super) const ANNOTATION_SIDEBAR: &str = annotation::SIDEBAR_ID;
 
@@ -1807,8 +2041,11 @@ fn advance_annotation(driver: &mut Driver, phase: Phase) -> Task<RootMessage> {
     let continuation = driver.advance_to(phase);
     if reveal {
         // Restore both axes before waiting for a completed canvas draw.
-        scroll_control_into_view(ANNOTATION_SURFACE.into(), AnnotationReveal::Geometry).chain(continuation)
-    } else { continuation }
+        scroll_control_into_view(ANNOTATION_SURFACE.into(), AnnotationReveal::Geometry)
+            .chain(continuation)
+    } else {
+        continuation
+    }
 }
 
 #[cfg(test)]

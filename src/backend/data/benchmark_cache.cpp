@@ -65,9 +65,7 @@ ArtifactLease ArtifactLease::acquire(const std::filesystem::path& lock_path, mml
     if (descriptor < 0) { throw errno_error("cannot open benchmark cache lock", lock_path.string()); }
     mmltk::common::io::ScopedFd owned(descriptor);
     while (::flock(owned.get(), LOCK_EX | LOCK_NB) != 0) {
-        if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            throw errno_error("cannot acquire benchmark cache lock", lock_path.string());
-        }
+        if (errno != EWOULDBLOCK && errno != EAGAIN) { throw errno_error("cannot acquire benchmark cache lock", lock_path.string()); }
         throw_if_benchmark_cancelled(cancel_requested);
         // flock has no readiness fd; this bounded retry exists solely to retain cancellation responsiveness.
         std::this_thread::sleep_for(std::chrono::milliseconds{100});

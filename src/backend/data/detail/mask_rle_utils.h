@@ -39,5 +39,6 @@ void fill_center_scale_lookup(std::span<std::uint32_t> lookup, std::uint32_t tar
 void materialize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions dimensions, std::vector<std::uint8_t>* dense,
                                 RowMajorMaskBounds* bounds = nullptr);
 [[nodiscard]] EncodedRowMajorMask resize_row_major_mask(std::span<const RLEPair> pairs, MaskDimensions source_dimensions, MaskDimensions target_dimensions,
-                                                        const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, MaskResizeScratch* scratch, RowMajorMaskBounds* source_bounds = nullptr);
+                                                        const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, MaskResizeScratch* scratch,
+                                                        RowMajorMaskBounds* source_bounds = nullptr);
 }  // namespace mmltk::backend::data::dataset

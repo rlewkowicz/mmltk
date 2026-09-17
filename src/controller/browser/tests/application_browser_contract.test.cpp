@@ -925,19 +925,18 @@ TEST_CASE("native application schema flattens inherited request and settings dec
     };
     std::vector<SettingsFact> settings;
     bool inherited_settings_owner = false;
-    VisitSettingsLeaves<InheritedSettings>(
-        [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
-            settings.push_back({std::string(field.path), field.stable_id, field.mutable_leaf});
-            if constexpr (std::same_as<Owner, InheritedSettingsBase>) {
-                if (field.path == "inherited_limit") {
-                    inherited_settings_owner = true;
-                    CHECK(field.constraint.has_minimum);
-                    CHECK(field.constraint.minimum == 2.0L);
-                    CHECK(field.constraint.has_maximum);
-                    CHECK(field.constraint.maximum == 12.0L);
-                }
+    VisitSettingsLeaves<InheritedSettings>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+        settings.push_back({std::string(field.path), field.stable_id, field.mutable_leaf});
+        if constexpr (std::same_as<Owner, InheritedSettingsBase>) {
+            if (field.path == "inherited_limit") {
+                inherited_settings_owner = true;
+                CHECK(field.constraint.has_minimum);
+                CHECK(field.constraint.minimum == 2.0L);
+                CHECK(field.constraint.has_maximum);
+                CHECK(field.constraint.maximum == 12.0L);
             }
-        });
+        }
+    });
     REQUIRE(settings.size() == 3U);
     CHECK(settings[0].path == "inherited_limit");
     CHECK(settings[0].stable_id == application_settings_field_stable_id("inherited_limit"));
@@ -949,10 +948,9 @@ TEST_CASE("native application schema flattens inherited request and settings dec
     CHECK(settings[2].mutable_leaf);
     CHECK(inherited_settings_owner);
     std::uint64_t direct_settings_id = 0U;
-    VisitSettingsLeaves<DirectInheritanceSettings>(
-        [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
-            if (field.path == "inherited_limit") direct_settings_id = field.stable_id;
-        });
+    VisitSettingsLeaves<DirectInheritanceSettings>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+        if (field.path == "inherited_limit") direct_settings_id = field.stable_id;
+    });
     CHECK(settings.front().stable_id == direct_settings_id);
     std::vector<std::uint64_t> settings_default_ids;
     std::vector<std::uint64_t> integer_defaults;
@@ -1072,13 +1070,12 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
             constexpr auto source = mmltk::frameworks::reflection::reflected_member_path<contracts::GuiSettingsState, Entry::source>();
             constexpr auto destination = mmltk::frameworks::reflection::reflected_member_path<contracts::ModelSelectionKey, Entry::destination>();
             std::size_t matches = 0U;
-            VisitSettingsLeaves<contracts::GuiSettingsState>(
-                [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
-                    if (field.path == source.view()) {
-                        ++matches;
-                        CHECK(field.stable_id == application_settings_field_stable_id(source.view()));
-                    }
-                });
+            VisitSettingsLeaves<contracts::GuiSettingsState>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+                if (field.path == source.view()) {
+                    ++matches;
+                    CHECK(field.stable_id == application_settings_field_stable_id(source.view()));
+                }
+            });
             CHECK(matches == 1U);
             CHECK_FALSE(destination.view().empty());
             ++projected_fields;
@@ -1090,13 +1087,12 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
         ++row_index;
         if (!compatibility.custom_allowed) return;
         std::size_t leaf_matches = 0U;
-        VisitSettingsLeaves<contracts::GuiSettingsState>(
-            [&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
-                if (field.path == typed_path.view()) {
-                    ++leaf_matches;
-                    CHECK(field.stable_id == application_settings_field_stable_id(typed_path.view()));
-                }
-            });
+        VisitSettingsLeaves<contracts::GuiSettingsState>([&]<class Owner, class Declaration, class Member>(const ApplicationSettingsLeafFact& field) {
+            if (field.path == typed_path.view()) {
+                ++leaf_matches;
+                CHECK(field.stable_id == application_settings_field_stable_id(typed_path.view()));
+            }
+        });
         CHECK(leaf_matches == 1U);
         const auto found = std::ranges::find_if(entries, [&](const services::FileDialogDescriptor& entry) {
             return entry.workflows.allows(compatibility.workflow) && entry.model_input == compatibility.input;

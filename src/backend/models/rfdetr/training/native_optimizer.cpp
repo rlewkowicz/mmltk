@@ -5,17 +5,11 @@
 #include <unordered_set>
 #include <meta>
 #include <type_traits>
-#include <algorithm>
 #include <cmath>
-#include <cstdint>
 #include <map>
 #include <sstream>
-#include <stdexcept>
-#include <string>
 #include <string_view>
-#include <utility>
 #include <variant>
-#include <vector>
 #include "src/backend/ml/torch/archive.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/contract/train_recipe.h"
@@ -24,7 +18,6 @@
 #include <torch/serialize.h>
 #include "detail/checkpoint_private.h"
 #include "detail/native_optimizer_private.h"
-import mmltk.backend.models.rfdetr.training.checkpoint;
 namespace mmltk::backend::models::rfdetr {
 bool muon_parameter_eligible(const std::string_view name, const torch::Tensor& parameter) {
     if ((parameter.dim() != 2 && parameter.dim() != 4) || name.find(".weight") == std::string_view::npos) { return false; }
@@ -115,8 +108,8 @@ void validate_group_indices(const Group& group, const size_t param_count, const 
     }
 }
 template <typename NamedParameterCollection>
-void populate_named_parameter_views(const NamedParameterCollection& params, std::vector<torch::Tensor>& all_params,
-                                    std::vector<std::string>& all_param_names, const char* undefined_param_message) {
+void populate_named_parameter_views(const NamedParameterCollection& params, std::vector<torch::Tensor>& all_params, std::vector<std::string>& all_param_names,
+                                    const char* undefined_param_message) {
     all_params.reserve(params.size());
     all_param_names.reserve(params.size());
     for (const auto& param : params) {
@@ -157,12 +150,14 @@ void read_indexed_optimizer_archive(torch::serialize::InputArchive& archive, con
         read_entry(index, entry_archive);
     }
 }
-void write_named_parameter_archive(torch::serialize::OutputArchive& archive, const std::string& name) { mmltk::backend::ml::serialization::write_string(archive, "name", name); }
+void write_named_parameter_archive(torch::serialize::OutputArchive& archive, const std::string& name) {
+    mmltk::backend::ml::serialization::write_string(archive, "name", name);
+}
 void validate_named_parameter_archive(torch::serialize::InputArchive& archive, const std::string& expected_name, const char* mismatch_message) {
     if (mmltk::backend::ml::serialization::require_string(archive, "name") != expected_name) { throw std::runtime_error(mismatch_message); }
 }
 torch::Tensor require_parameter_state_tensor(torch::serialize::InputArchive& archive, const char* entry_name, const torch::Tensor& param,
-                                                 const char* shape_mismatch_message) {
+                                             const char* shape_mismatch_message) {
     auto state_tensor = mmltk::backend::ml::serialization::require_tensor(archive, entry_name);
     if (state_tensor.sizes() != param.sizes() || !state_tensor.device().is_cpu() || !state_tensor.is_floating_point() ||
         state_tensor.scalar_type() != param.scalar_type() || state_tensor.layout() != param.layout() || !torch::isfinite(state_tensor).all().item<bool>()) {
@@ -182,7 +177,8 @@ template <typename ParamIndexCollection>
 void write_group_param_indices(torch::serialize::OutputArchive& archive, const ParamIndexCollection& param_indices) {
     mmltk::backend::ml::serialization::write_int(archive, "param_index_count", static_cast<int64_t>(param_indices.size()));
     for (size_t param_index = 0; param_index < param_indices.size(); ++param_index) {
-        mmltk::backend::ml::serialization::write_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str(), static_cast<int64_t>(param_indices[param_index]));
+        mmltk::backend::ml::serialization::write_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str(),
+                                                     static_cast<int64_t>(param_indices[param_index]));
     }
 }
 template <typename GroupConfig>
@@ -210,7 +206,8 @@ void validate_group_param_indices(torch::serialize::InputArchive& archive, const
     const auto param_index_count = mmltk::backend::ml::serialization::require_int(archive, "param_index_count");
     if (param_index_count != static_cast<int64_t>(param_indices.size())) { throw std::runtime_error(size_mismatch_message); }
     for (size_t param_index = 0; param_index < param_indices.size(); ++param_index) {
-        const auto stored_param_index = mmltk::backend::ml::serialization::require_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str());
+        const auto stored_param_index =
+            mmltk::backend::ml::serialization::require_int(archive, mmltk::backend::ml::serialization::archive_entry_name("param_index", param_index).c_str());
         if (stored_param_index != static_cast<int64_t>(param_indices[param_index])) { throw std::runtime_error(order_mismatch_message); }
     }
 }
@@ -272,15 +269,13 @@ void validate_adamw_param_for_backend(const torch::Tensor& param, const torch::T
     if (grad.is_sparse()) { throw std::runtime_error("native AdamW does not support sparse gradients"); }
     if (backend == NativeOptimizerBackend::fused) {
         if (!param.device().is_cuda()) { throw std::runtime_error("fused native AdamW requires CUDA parameters"); }
-        if (!param.is_floating_point() || torch::is_complex(param)) {
-            throw std::runtime_error("fused native AdamW requires real floating-point parameters");
-        }
+        if (!param.is_floating_point() || torch::is_complex(param)) { throw std::runtime_error("fused native AdamW requires real floating-point parameters"); }
         return;
     }
     if (torch::is_complex(param)) { throw std::runtime_error("native AdamW does not support complex parameters"); }
 }
-void align_adamw_state_tensors(torch::Tensor& step, torch::Tensor& exp_avg, torch::Tensor& exp_avg_sq, torch::Tensor& max_exp_avg_sq,
-                               torch::Tensor& grad, const torch::Tensor& param, const NativeOptimizerBackend backend, const bool amsgrad) {
+void align_adamw_state_tensors(torch::Tensor& step, torch::Tensor& exp_avg, torch::Tensor& exp_avg_sq, torch::Tensor& max_exp_avg_sq, torch::Tensor& grad,
+                               const torch::Tensor& param, const NativeOptimizerBackend backend, const bool amsgrad) {
     const auto step_device = step_device_for_backend(param, backend);
     if (!step.defined() || step.device() != step_device) { step = step.to(step_device, torch::kFloat32).contiguous(); }
     if (step.scalar_type() != torch::kFloat32) { step = step.to(step_device, torch::kFloat32).contiguous(); }
@@ -290,8 +285,8 @@ void align_adamw_state_tensors(torch::Tensor& step, torch::Tensor& exp_avg, torc
     if (amsgrad) { ensure_aligned(max_exp_avg_sq, param); }
 }
 void collect_adamw_batch(std::map<std::pair<int, int>, AdamWBatch>& batches, const torch::Tensor& param, const torch::Tensor& grad,
-                         const torch::Tensor& exp_avg, const torch::Tensor& exp_avg_sq, const torch::Tensor& max_exp_avg_sq,
-                         const torch::Tensor& step, const bool amsgrad) {
+                         const torch::Tensor& exp_avg, const torch::Tensor& exp_avg_sq, const torch::Tensor& max_exp_avg_sq, const torch::Tensor& step,
+                         const bool amsgrad) {
     const auto device_index = static_cast<int>(param.device().index());
     const auto key = std::make_pair(device_index, static_cast<int>(param.scalar_type()));
     auto& batch = batches[key];
@@ -341,8 +336,8 @@ void apply_foreach_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& 
 }
 void apply_fused_adamw_batch(AdamWBatch& batch, const NativeAdamWGroupConfig& config) {
     torch::_foreach_add_(batch.steps, 1.0);
-    at::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr, kAdamBeta1,
-                             kAdamBeta2, config.weight_decay, kAdamEps, config.amsgrad, false, std::nullopt, std::nullopt);
+    at::_fused_adamw_(batch.params, batch.grads, batch.exp_avgs, batch.exp_avg_sqs, batch.max_exp_avg_sqs, batch.steps, config.lr, kAdamBeta1, kAdamBeta2,
+                      config.weight_decay, kAdamEps, config.amsgrad, false, std::nullopt, std::nullopt);
 }
 template <typename Params, typename States, typename Group>
 void step_adamw_group_batched(Params& params, States& states, const Group& group, const NativeOptimizerBackend backend) {
@@ -399,7 +394,8 @@ void read_inspection_layout(torch::serialize::InputArchive& archive, const std::
         auto& indices = groups[index].param_indices;
         indices.reserve(static_cast<std::size_t>(members));
         for (int64_t ordinal = 0; ordinal < members; ++ordinal) {
-            const auto value = mmltk::backend::ml::serialization::require_int(group, mmltk::backend::ml::serialization::archive_entry_name("param_index", ordinal).c_str());
+            const auto value =
+                mmltk::backend::ml::serialization::require_int(group, mmltk::backend::ml::serialization::archive_entry_name("param_index", ordinal).c_str());
             if (value < 0 || value >= count || assigned[static_cast<std::size_t>(value)])
                 throw std::runtime_error("optimizer groups do not partition the parameter inventory");
             assigned[static_cast<std::size_t>(value)] = true;
@@ -411,8 +407,8 @@ void read_inspection_layout(torch::serialize::InputArchive& archive, const std::
 }  // namespace
 template <typename GroupConfig, typename ParamStateT>
 template <class Optimizer>
-std::vector<std::string> NativeOptimizerStorage<GroupConfig, ParamStateT>::inspect_checkpoint(
-    torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors) {
+std::vector<std::string> NativeOptimizerStorage<GroupConfig, ParamStateT>::inspect_checkpoint(torch::serialize::InputArchive& archive,
+                                                                                              const std::unordered_map<std::string, torch::Tensor>& tensors) {
     Optimizer candidate;
     read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_);
     populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
@@ -561,12 +557,13 @@ void NativeAdamW::load(torch::serialize::InputArchive& archive) {
     }
     validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native AdamW archive layout does not match the current optimizer");
     auto candidate_groups = groups_;
-    read_optimizer_group_archives(archive, candidate_groups,
-                                  "native AdamW archive parameter group size does not match the "
-                                  "current optimizer",
-                                  "native AdamW archive parameter group order does not match the "
-                                  "current optimizer",
-                                  [](auto& group_archive, auto& config) { config.amsgrad = mmltk::backend::ml::serialization::require_int(group_archive, "amsgrad") != 0; });
+    read_optimizer_group_archives(
+        archive, candidate_groups,
+        "native AdamW archive parameter group size does not match the "
+        "current optimizer",
+        "native AdamW archive parameter group order does not match the "
+        "current optimizer",
+        [](auto& group_archive, auto& config) { config.amsgrad = mmltk::backend::ml::serialization::require_int(group_archive, "amsgrad") != 0; });
     for (const auto& group : candidate_groups) {
         if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0) {
             throw std::runtime_error("native AdamW archive parameter group does not match the current optimizer");
@@ -603,7 +600,8 @@ void NativeAdamW::load(torch::serialize::InputArchive& archive) {
     groups_.swap(candidate_groups);
     state_.swap(candidate_state);
 }
-std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors) {
+std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputArchive& archive,
+                                                        const std::unordered_map<std::string, torch::Tensor>& tensors) {
     return inspect_checkpoint<NativeAdamW>(archive, tensors);
 }
 void NativeAdamW::commit(NativeAdamW candidate) noexcept {
@@ -668,7 +666,8 @@ void NativeMuonWithAuxAdam::step() {
 void NativeMuonWithAuxAdam::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     reserve_optimizer_readback(state_, readback, first_slot);
 }
-void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
+void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
+                                 std::size_t first_slot) const {
     mmltk::backend::ml::serialization::write_string(archive, "format", kNativeMuonFormat);
     mmltk::backend::ml::serialization::write_int(archive, "format_version", kNativeMuonFormatVersion);
     mmltk::backend::ml::serialization::write_int(archive, "ns_steps", kMuonNsSteps);
@@ -697,10 +696,14 @@ void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk
 }
 void NativeMuonWithAuxAdam::load(torch::serialize::InputArchive& archive) {
     validate_optimizer_archive_format(archive, kNativeMuonFormat, kNativeMuonFormatVersion, "Muon");
-    if (mmltk::backend::ml::serialization::require_int(archive, "ns_steps") != kMuonNsSteps || !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_a"), kMuonCoeffA) ||
-        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_b"), kMuonCoeffB) || !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_c"), kMuonCoeffC) ||
-        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_eps"), kMuonNormEps) || !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "aux_adam_beta1"), kAuxAdamBeta1) ||
-        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "aux_adam_beta2"), kAuxAdamBeta2) || !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "aux_adam_eps"), kAuxAdamEps)) {
+    if (mmltk::backend::ml::serialization::require_int(archive, "ns_steps") != kMuonNsSteps ||
+        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_a"), kMuonCoeffA) ||
+        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_b"), kMuonCoeffB) ||
+        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_coeff_c"), kMuonCoeffC) ||
+        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "muon_eps"), kMuonNormEps) ||
+        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "aux_adam_beta1"), kAuxAdamBeta1) ||
+        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "aux_adam_beta2"), kAuxAdamBeta2) ||
+        !finite_equal(mmltk::backend::ml::serialization::require_double(archive, "aux_adam_eps"), kAuxAdamEps)) {
         throw std::runtime_error(
             "native Muon archive hyperparameters do not match "
             "the compiled optimizer");
