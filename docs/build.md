@@ -50,6 +50,18 @@ replacement source checkout. Its host toolchain and sysroot have separate
 cached preparation. Validation uses the repository's first-party browser
 suites and packaged application acceptance, as described in [validation](validation.md).
 
+The required Firefox runtime inventory is
+[firefox_runtime_files.txt](../src/entrypoints/desktop/firefox_runtime_files.txt).
+CMake derives runtime byproducts from it, and
+[build_firefox_runtime.sh](../src/entrypoints/desktop/build_firefox_runtime.sh)
+uses it for completeness and its successful-build fingerprint. That script
+passes the required `--runtime-manifest` to Firefox's
+[`mmltk-stage-runtime`](../third_party/firefox/python/mozbuild/mozbuild/mach_commands.py).
+The staging command reads the manifest once, checks both the current and
+candidate runtime against that inventory, and includes its bytes in the inner
+staging fingerprint before atomic publication. The wrapper's outer Firefox
+input fingerprint also includes the manifest.
+
 ## Toolchain and image inputs
 
 First-party ordinary C++ uses GCC 16.2 and C++26 reflection. CUDA uses NVCC
@@ -105,6 +117,49 @@ Inspect public header selection with:
 image without rebuilding it. Supply public filenames, not directory paths.
 Reports include locations, package ownership, direct includes, and selection.
 
+## Target declarations and precompiled headers
+
+Component `CMakeLists.txt` files register sources, ordinary declaration headers,
+retained module units, and dependency visibility through
+[MmltkSourceRegistration.cmake](../cmake/MmltkSourceRegistration.cmake).
+Declaration-only projections use the owner's compile usage requirements
+without linking its implementation. Registered header-isolation targets
+compile each header in a generated one-include translation unit using the
+owner's usage requirements. They run as dependencies of that owner, with
+unity and PCH disabled and no forced includes; selected boundaries also
+register both include orders.
+
+The normal product graph uses target-local PCHs for these ordinary C++ sources:
+
+| Owner | Shared header contents |
+| --- | --- |
+| `mmltk_backend_data`, `mmltk_controller_direct_services` | `src/pch_std.h`, `src/pch_json.h` |
+| `mmltk_backend_ml_cuda`, `mmltk_backend_models_rfdetr_core`, `mmltk_backend_models_rfdetr_training` | `src/pch_std.h`, `src/pch_torch.h` |
+
+The standard group contains common standard-library headers; the JSON group
+contains nlohmann JSON; the Torch group contains only C10 CUDA stream/guard
+declarations. These headers supply reusable parsing work, not missing
+declaration dependencies. Each owner creates its own compiled artifact with
+its own compiler, options, definitions, and include environment. C, CUDA,
+retained module providers/implementations/importers, header-isolation units,
+and sources with distinct per-source compile settings do not consume it.
+For example, ordinary `native_optimizer.cpp` uses the training owner's PCH;
+that target's module importers do not.
+
+[MmltkComponent.cmake](../cmake/MmltkComponent.cmake) derives
+`CMakeFiles/<target>.dir/mmltk-pch-policy.txt` from the target registration.
+The generated `cmake_pch.hxx` and `.gch` live beside it under that component's
+build directory.
+[check_toolchain_invariants.py](../tools/check_toolchain_invariants.py) checks
+the compilation database against this policy, including creation/use
+environment equality, exclusions, and fatal invalid-PCH diagnostics.
+The analysis graph keeps the same PCH registrations: tidy builds exact GCC
+objects for reflection units, while supported non-reflection units use
+clang-tidy. Header-isolation checks remain independent of PCHs in the same
+graph. PCH consumption and declaration isolation belong to the single normal
+product build. No performance benchmarking acceptance or measured speedup
+claim accompanies this configuration. See [static analysis](validation.md#formatting-and-static-analysis).
+
 ## Cache and output locations
 
 These are the default repository-local locations:
@@ -143,9 +198,12 @@ operations in [validation](validation.md).
 ./mmltk --update-firefox-lock
 ```
 
-The first builds typed application bindings in its dedicated
-`.cache/cmake/application-bindings-release` graph. The second selects the
-Release protocol-generation target and its cross-language fixtures.
+Both generation commands select `mmltk_protocol_v17_generation` and produce
+the bindings, package marker, graphics ABI, and both cross-language fixtures.
+`--generate-application-bindings` uses the dedicated
+`.cache/cmake/application-bindings-release` graph with browser-host and
+Firefox runtime builds disabled. `--generate-protocol` uses the shared
+`.cache/cmake/release` graph.
 
 Under the selected graph's `generated/frontend/iced/`, generation owns:
 
@@ -157,14 +215,14 @@ Under the selected graph's `generated/frontend/iced/`, generation owns:
 | `protocol_v17_server_records.cbor` | Native-to-Rust application fixture |
 | `workspace_graphics_abi.rs` | Data-only native graphics ABI projection for Firefox; current ABI version 14 |
 
-Application-binding generation produces the bindings, marker, and graphics
-artifact; protocol generation also produces the two application fixtures.
 The current [typed boundary](gui-interaction.md#typed-application-boundary) must be
 packaged together with the native host and browser bundle. Generating
-bindings alone does not update the complete runtime package.
+these artifacts does not update the complete runtime package or run the
+application test suites.
 
 The graphics artifact derives records, enum wire values, field offsets, sizes,
-and alignments from the native workspace import and frame-signal declarations.
+and alignments from the native workspace import and frame-signal declarations
+in [presentation/abi](../src/controller/presentation/abi).
 Firefox includes it through `MMLTK_WORKSPACE_GRAPHICS_ABI`. CMake makes its
 generation a direct Firefox build dependency. The wrapper's
 `.cache/firefox/build-input.sha256` includes the canonical graphics declarations,

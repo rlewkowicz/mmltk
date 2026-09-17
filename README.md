@@ -54,7 +54,7 @@ policy, generated bindings, and build timing.
 Train prepares the selected model and starts the run from its primary action.
 Its center shows persistent training plots; the Output card opens saved runs
 and inspects full checkpoints for resume. EMA is optional and off by default.
-Validate combines detailed metrics with six sample previews. Predict is a
+Validate combines detailed metrics with up to six sample previews. Predict is a
 quick visual check for compiled data, an image, or a local video, with
 Pause/Resume/Stop for video.
 

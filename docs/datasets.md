@@ -227,6 +227,20 @@ This benchmark reads data and performs loader work.
 `./mmltk --diagnose-io ./compiled/train.bin` is a separate read-only capability
 inspection that does not read dataset contents or benchmark transfers.
 
+## Benchmark-source acquisition
+
+The separate [benchmark dataset compiler](../src/backend/data/benchmark_dataset_compiler.h)
+prepares COCO 2017, Objects365 v2, and Open Images v7 inputs through the
+backend data layer. [benchmark_compiler.cpp](../src/backend/data/benchmark_compiler.cpp)
+owns orchestration, normalized annotations, split selection, and compiled
+publication. [open_images_acquisition.cpp](../src/backend/data/open_images_acquisition.cpp)
+owns Open Images acquisition and quarantine decisions;
+[benchmark_storage.cpp](../src/backend/data/benchmark_storage.cpp) owns storage
+checks and concurrent reservations; and
+[benchmark_progress.cpp](../src/backend/data/benchmark_progress.cpp) owns
+source/phase progress projection. Download/cache identity stays with the data
+layer while resizing uses the shared imaging owners below.
+
 ## Optional perceptual downscaling
 
 Compilation and GPU augmentation each expose an independent
@@ -237,10 +251,10 @@ resizing path and its pixels remain unchanged when the option is off.
 The option affects shrinking RGB pixels, not categorical masks, boxes, class
 identity, letterbox geometry, or compiled format 7.
 
-[RgbImageResizer](../src/backend/data/image_resize.h) owns CPU execution and
-[GpuPerceptualDownscaler](../src/backend/data/image_resize_cuda.h) owns reusable
+[RgbImageResizer](../src/backend/imaging/resample/image_resize.h) owns CPU execution and
+[GpuPerceptualDownscaler](../src/backend/imaging/resample/image_resize_cuda.h) owns reusable
 CUDA workspace. Both implement the SSIM local-moment method attributed in
-[perceptual_downscale_math.h](../src/backend/data/detail/perceptual_downscale_math.h).
+[perceptual_downscale_math.h](../src/backend/imaging/resample/detail/perceptual_downscale_math.h).
 They accept checked RGB8, straight-alpha RGBA8, or planar unit-sRGB float views
 with explicit byte strides and capacities. sRGB is decoded once, the filter
 works in linear-light Y/Cb/Cr, and the output is encoded once. RGBA filtering
@@ -390,11 +404,22 @@ capability inspection, and functional GDR checks.
 
 Explore uses
 [CompiledImageStream](../src/backend/data/compiled_image_stream.h) for reusable
-disk-read, host-transfer, and device lanes. It has a separate detail lane in
-the same stream owner, so selecting a full-resolution image can progress
+disk-read, host-transfer, and device lanes. Explore's read scheduler retains a
+separate detail lane, so selecting a full-resolution image can progress
 independently of unrelated gallery reads. The default H2D path retains pinned
 host pixels and descriptor storage through asynchronous transfers; GDRCopy
 uses the explicitly selected mapped-device route described above.
+
+Within Explore, [GalleryReadScheduler](../src/controller/subsystems/explore/detail/gallery_read_scheduler.h)
+owns that stream, lane state, read/transfer callbacks, demand priority, and
+ingress settlement.
+[GalleryDescriptorStorage](../src/controller/subsystems/explore/detail/gallery_descriptor_storage.h)
+owns pinned descriptor staging, device descriptor arrays, and augmentation
+working storage.
+[ExploreHostAllocations](../src/controller/subsystems/explore/detail/gallery_host_allocations.h)
+retains the pinned allocation owners. `GalleryStream` coordinates their
+transactions with the thumbnail cache and physical atlas; its public surface
+does not expose their mutable storage.
 
 The [gallery stream](../src/controller/subsystems/explore/gallery_stream.cpp)
 first places completed cached visible thumbnails. Disk admission and ready
@@ -446,6 +471,11 @@ Smaller demand does not shrink storage or clear useful cached entries. Cache
 pixels, clean/semantic banks, lanes, descriptors, and retained metadata all
 consume storage; diagnostic byte categories include their existing subsets
 and must not be added twice.
+
+`GalleryThumbnailCache::PhysicalRow` owns the physical slot/bank row
+calculation used by rendering, atlas copies, and probes. Callers combine that
+row with the actual buffer pitch; demand size and vector capacity do not
+define physical tile addresses.
 
 Host-page pinning and device-cache residency describe different resources.
 Host pages remain registered through H2D/D2H completion. Cached GPU pixels stay

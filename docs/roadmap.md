@@ -12,7 +12,7 @@ The project's stated future directions include:
 - Keypoint and pose workflows.
 
 These are directions, not supported-feature or delivery-date commitments.
-The [native model catalog](../src/backend/models/catalog/module.cpp) and exposed
+The [native model catalog](../src/backend/models/catalog/model_registry.cpp) and exposed
 CLI/UI operations describe current capabilities; see the
 [command reference](commands.md). Use the relevant
 [validation suites](validation.md) to establish acceptance for a workflow.

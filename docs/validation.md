@@ -18,9 +18,14 @@ for the required stage ordering.
 ./mmltk --tidy
 ```
 
-The full configured suite formats tracked first-party C/C++/CUDA files,
-refreshes `.cache/cmake/analysis`, runs clang-tidy where supported, and
-validates reflection translation units through GCC compiler objects.
+The full configured suite formats tracked first-party C/C++/CUDA files and
+runs containerized `cargo fmt` for the first-party `mmltk-browser-app` package.
+It refreshes `.cache/cmake/analysis`, runs clang-tidy where supported, and
+validates reflection translation units through their exact GCC compiler
+objects. Native `--file` selections skip the package-wide Rust formatting;
+`--start-at` retains it. This Rust step is formatting, not a Rust static-analysis
+suite. The [build reference](build.md#target-declarations-and-precompiled-headers)
+owns PCH and header-isolation handling in the analysis graph.
 CUDA clang-tidy covers host/device code at `sm_86`. Cppcheck is currently
 disabled because its parser does not support the repository's reflection
 syntax; `--cppcheck-only` is unavailable.
@@ -60,6 +65,7 @@ resolution rules in `AGENTS.md`; reports do not themselves change product code.
 ./mmltk --test list
 ./mmltk --test core
 ./mmltk --test application-systems --executable mmltk_controller_visual_systems_tests
+./mmltk --test application-systems --executable mmltk_controller_explore_tests
 ./mmltk --test browser-app
 ```
 
@@ -75,12 +81,12 @@ packaged application. Neither is a Firefox-specific test runner.
 
 | Suite | Selection |
 | --- | --- |
-| `application-systems` | Browser, service, shell, data/compute, visual, GPU, and Live suites |
-| `application-contracts` | Browser, service, visual, and serialization suites |
+| `application-systems` | Annotation, browser, service, shared test-support, shell, data/compute, presentation, Explore, Upscale, Live, GPU, and media Live/video suites |
+| `application-contracts` | Annotation, browser, service, shared test-support, presentation, Explore, Upscale, Live, and serialization suites |
 | `transport` | Physical browser transport and attachment |
 | `browser-runtime` | Desktop entrypoint and Firefox process-owner fixtures |
-| `core` | Core acceptance, dataset, model catalog, system/concurrency, CLI, and tool tests |
-| `rfdetr` | Native RF-DETR model, training, inference, export, CUDA, and layer suites |
+| `core` | Core acceptance, presentation, dataset, image resampling, model catalog, system/concurrency, CLI, and tool tests |
+| `rfdetr` | Native RF-DETR contract, core, augmentation, training, inference, export, ML CUDA/layers, raster, and video suites |
 | `rfdetr-profile` | Instrumented training profile runner; selects `dev` |
 | `browser-app` | Rust/Iced protocol, workflow state, plots, transport, image-custody, and integration-driver tests, vendored `iced_plot` tests, plus direct JavaScript adapter tests |
 | `workspace-wayland` | Packaged Firefox/NVIDIA hardware acceptance |
@@ -152,7 +158,7 @@ shutdown waits. The packaged Wayland harness currently uses these deadlines:
 Only actual progress in the relevant phase renews its deadline. A timeout is
 a failure, never successful EOF or inferred completion. Source constants and
 phase selection live in
-[workspace_wayland_integration.test.cpp](../src/acceptance/tests/workspace_wayland_integration.test.cpp).
+[wayland/session.cpp](../src/acceptance/tests/wayland/session.cpp).
 Compositor startup and process-group teardown have their own bounded waits in
 [headless Wayland](headless-wayland.md).
 
@@ -264,7 +270,8 @@ The private path adds a
 GPU-rendered Weston output and retains the same product assertions.
 Build the package first with `./mmltk --build`.
 
-The wrapper enumerates and verifies the seven registered hardware entrypoints
+The wrapper enumerates and verifies the seven hardware entrypoints registered
+in [wayland/scenarios.cpp](../src/acceptance/tests/wayland/scenarios.cpp)
 before executing the requested selection. Use one comma-separated Catch2
 filter to select alternatives, as above. The executable also contains
 standalone evidence-audit cases.
@@ -286,7 +293,8 @@ coverage enables lifecycle diagnostics with pixel probes off. Quiet coverage
 keeps real typed control, input pressure, and settlement while leaving
 diagnostic owners inactive.
 
-`WaylandSession` owns the process, fixtures, artifact cursors, deadlines, and
+[WaylandSession](../src/acceptance/tests/wayland/session.h) owns the process,
+fixtures, artifact cursors, deadlines, and
 lifetime-wide physical-custody evidence. Advance requires both typed frontend
 settlement and the complete independent native/browser evidence. Scenario
 entry closes a surviving detail overlay, restores scenario-specific settings
@@ -294,6 +302,26 @@ through normal UI messages, and waits for those operations before reopening.
 It resets scenario-local expectations while retaining physical allocations,
 claims, and release history. The primary compile workflow owns a private
 output directory; other lifetimes reuse prepared source and compiled assets.
+
+The native harness is split by evidence responsibility under
+[tests/wayland](../src/acceptance/tests/wayland):
+
+| Owner | Responsibility |
+| --- | --- |
+| [session.cpp](../src/acceptance/tests/wayland/session.cpp) | Process/fixture lifetime, scenario advancement, deadlines, and final drain |
+| [artifact_cursor.h](../src/acceptance/tests/wayland/artifact_cursor.h) | Bounded incremental JSONL reads and retained incomplete records |
+| [native_audit.cpp](../src/acceptance/tests/wayland/native_audit.cpp) | Native command, operation, input, and product evidence |
+| [browser_audit.cpp](../src/acceptance/tests/wayland/browser_audit.cpp) | Browser interaction, displayed geometry, and rendered UI evidence |
+| [surface_audit.cpp](../src/acceptance/tests/wayland/surface_audit.cpp) | Physical allocation, acquisition, draw, and settlement ledger |
+| [pixel_audit.cpp](../src/acceptance/tests/wayland/pixel_audit.cpp) | Independent native/browser pixel-boundary joins |
+
+[audits.test.cpp](../src/acceptance/tests/wayland/audits.test.cpp) and
+[artifact_cursor.test.cpp](../src/acceptance/tests/wayland/artifact_cursor.test.cpp)
+exercise those evidence owners in the same executable. The Rust
+[integration driver](../src/frontend/iced/src/integration_control.rs) retains
+separate `lifecycle`, `retained`, `annotation_product`, and `workflows`
+scenario modules, with shared widget, pixel, and probe helpers. Its private
+reporting owner remains effect-only.
 
 The workflow case uses
 [native model/video fixtures](../src/acceptance/tests/workflow_wayland_inputs.cpp)
@@ -398,24 +426,41 @@ sessions retain ordinary clipboard permissions.
 | `mmltk_controller_data_compute_systems_tests` | Start/input admission, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
-| `mmltk_controller_visual_systems_tests` and `mmltk_frameworks_gpu_tests` | Retained thumbnail identity and viewport priority, augmentation refresh with paired meaning, allocation-local atlas rollback, independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, receiver/device transfers, acquisition/release/settlement, pressure, failure, and retirement |
+| `mmltk_controller_explore_tests` | Explore domain admission, settings/filter persistence, thumbnail identity, viewport priority, augmentation refresh, staged replacement, cancellation, and failure |
+| `mmltk_controller_upscale_tests` | Exact receiver copies, retained derived results, method selection/warmup, activation, cancellation, and resource retirement |
+| `mmltk_controller_live_tests` | Live receiver completion/failure, queued cancellation, and settled snapshots |
+| `mmltk_controller_visual_systems_tests` | Shared visual runtime, presentation protocol/custody, native gallery cache/priority/atlas integration, acceptance gates, and cross-system workspace behavior |
+| `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, receiver/device transfers, acquisition/release/settlement, pressure, failure, and retirement |
 | `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, and independent prepared/released artifacts |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
+| `mmltk_backend_imaging_resample_tests` | Independent CPU/CUDA perceptual-resampling values, checked views, completion, and resource custody |
+| `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation and planar float pixel conversion |
 | `browser-app` | Primary-action preparation, retained chart summaries/gaps and plot picking cancellation, validation viewer and video-control admission, shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
 | `workspace-wayland` | Real training/validation/prediction workflows and actual chart/sample/preview pixels, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
 
 RF-DETR backend evidence is separately owned by the core evaluator/matcher/class
 layout cases, training checkpoint/continuation/EMA/telemetry cases, inference
 session/JSON cases, and ML CUDA readback/context cases selected by `--test rfdetr`.
-`mmltk_backend_data_tests` owns the independent CPU/CUDA perceptual-resampling
-and exact compiled-catalog cases selected by `--test core`. These checks cover
-functional values, boundaries, failure, and custody; they do not substitute for
-the real rendered workflow case.
+`mmltk_backend_data_tests` owns compilation, loading, acquisition, and exact
+compiled-catalog cases; `--test core` also selects the separate resampling
+target above. These checks cover functional values, boundaries, failure, and
+custody; they do not substitute for the real rendered workflow case.
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
 The source/CMake registrations and wrapper inventory define executable
-membership; `--test core` does not include the imaging test executables.
+membership; `--test core` includes image resampling, while the imaging
+Annotation, Explore, and Upscale executables require `all` or explicit
+`all --executable` selection. Raster is also in `rfdetr`.
+
+Neutral fixtures and the shared Catch runner belong to
+[src/test_support](../src/test_support). Domain fixture targets live with
+their owning components and publish their own declaration dependencies.
+Torch-backed test consumers use
+[`mmltk_backend_ml_torch_test_support`](../src/backend/ml/torch/CMakeLists.txt),
+whose [catch_support.h](../src/backend/ml/torch/tests/catch_support.h) admits
+Torch declarations while preserving Catch2's `CHECK` assertion. Production
+Torch usage has no test-support dependency.
 
 Native fixtures use causal entered receipts and release/stop-before-join
 cleanup. Borrowed GPU locks are acquired and released on their owning thread;

@@ -213,7 +213,7 @@ acceptance canvas probe have separate activation and ownership.
 
 The opt-in [browser driver](../src/frontend/iced/src/integration_control.rs),
 its [JavaScript adapter](../src/frontend/iced/src/integration_control/browser.mjs),
-and the independent [native audit](../src/acceptance/tests/workspace_wayland_integration.test.cpp)
+and the independent [browser-evidence audit](../src/acceptance/tests/wayland/browser_audit.cpp)
 record UI interaction and pixels separately from physical resource custody:
 
 | Records | Evidence |

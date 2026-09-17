@@ -608,9 +608,11 @@ tidy/build/cleanup/tidy/final-build/tests order. Run both builds with
 review before the final build. Final build/test/acceptance success leads directly
 to documentation and commits under the Final Validation workflow.
 
-The suite formats first-party C/C++/CUDA, runs clang-tidy on supported
-translation units, and validates reflection units through GCC compiler objects.
-Cppcheck is gated off because its parser lacks C++26 reflection support.
+The full suite formats first-party C/C++/CUDA and the Iced application Rust
+package, runs clang-tidy on supported native translation units, and validates
+reflection units through GCC compiler objects. Targeted native `--file` runs
+remain scoped. Cppcheck is gated off because its parser lacks C++26 reflection
+support.
 
 For follow-ups, audit the entire prior tidy log, group failures by root cause,
 fix the whole known batch including blocked downstream importers, and rerun

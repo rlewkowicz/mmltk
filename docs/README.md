@@ -5,7 +5,8 @@
 ## Getting started and reference
 
 - [Build and reusable state](build.md): prerequisites, container toolchains,
-  package outputs, generated bindings, caches, and build timing.
+  package outputs, Firefox staging, declaration isolation, target-local PCHs,
+  generated bindings, caches, and build timing.
 - [Commands](commands.md): wrapper operations, native CLI, desktop options,
   and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
@@ -15,7 +16,8 @@
 ## Architecture and frameworks
 
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
-  generated boundaries, frontend components, and vendor ownership.
+  shared Linux/image facilities, generated boundaries, frontend components,
+  and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, numeric editing, shared immediate
   mouse input, native command settlement, retained Explore measurements, paired
@@ -33,8 +35,9 @@
 
 ## Engineering, validation, and operations
 
-- [Validation](validation.md): tidy, cleanup, test selection, standalone
-  CUDA/Vulkan and native-link diagnostics, rendered workflow/layout/input and
+- [Validation](validation.md): native/Rust formatting, cleanup, domain test
+  ownership and selection, standalone CUDA/Vulkan and native-link diagnostics,
+  rendered workflow/layout/input and
   retained browser acceptance, evidence, and debugging.
 - [Headless Wayland](headless-wayland.md): the private NVIDIA Weston session,
   input seat, readiness, deadlines, shutdown, and artifacts.

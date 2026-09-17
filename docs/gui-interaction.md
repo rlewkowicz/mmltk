@@ -114,6 +114,9 @@ derive the application boundary. The bootstrap supplies the schema
 fingerprint, current snapshots, and input peer epoch. The client validates
 agreement before installing native state. Compact workspace mouse and Explore
 interactions travel on the existing session-bound CBOR/WebSocket connection.
+System/endpoint routing, snapshot/event/reply variants, and visual observations
+also derive from the native schema; the [source guide](architecture.md#nativerust-boundary)
+locates their emitters and the handwritten presentation-state reducers.
 
 Application output objects in snapshots, replies, and events use positional
 CBOR arrays in canonical reflected member order. Each declared field has a
@@ -233,7 +236,7 @@ outline; the gesture, mask content, selection, and damage processing remain
 valid.
 
 All six visual producers use the shared
-[VisualRuntimeOwner](../src/controller/presentation/detail/visual_runtime_owner.h).
+[VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h).
 Content/input changes, workspace admission, and actual GPU/storage completion
 wake dirty work. Clean and semantic planes, allocation-local damage, geometry,
 and staging retain reusable capacity. An idle native renderer has no repeating
@@ -242,7 +245,7 @@ upscaling, decoding, capture, or document edits.
 
 Producer events notify native Presentation directly through
 [ApplicationEventPublisher](../src/controller/browser/application_event_publisher.h)
-and [the shell wiring](../src/controller/shell/direct_visual_systems.cpp).
+and [the shell wiring](../src/controller/shell/application_system_storage.cpp).
 `PresentationSystem::SourceChanged` schedules the currently selected source.
 The frontend selects a source when the viewed product changes; it does not
 reselect that source for each new frame.

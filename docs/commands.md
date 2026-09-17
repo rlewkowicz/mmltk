@@ -15,11 +15,11 @@ reuse a repository-scoped container and stream the application output.
 | `./mmltk --build-gui` | Format/check Iced and rebuild the canonical browser bundle in the GUI graph |
 | `./mmltk --gui` | Launch the packaged browser host with the canonical bundle |
 | `./mmltk --prepare-gui-container` | Prepare the GUI runtime container without starting the app |
-| `./mmltk --generate-application-bindings` | Generate typed application bindings and the data-only graphics ABI |
-| `./mmltk --generate-protocol` | Generate those artifacts and the application cross-language fixtures |
+| `./mmltk --generate-application-bindings` | Generate bindings, marker, graphics ABI, and cross-language fixtures in the dedicated generation graph |
+| `./mmltk --generate-protocol` | Generate the same artifacts in the shared Release graph |
 | `./mmltk --update-gui-lock` | Refresh the Cargo lock inputs for browser tests |
 | `./mmltk --update-firefox-lock` | Refresh Firefox's Cargo lock from its vendored sources, offline |
-| `./mmltk --tidy` | Run configured formatting and static analysis |
+| `./mmltk --tidy` | Format native sources and Iced application Rust; run configured native analysis |
 | `./mmltk --cleanup-report cpp\|frontend\|all` | Generate the selected deduplication reports |
 | `./mmltk --test list` | List supported suites and test options |
 | `./mmltk --test cuda-vulkan -- --help` | Build/select the standalone CUDA/Vulkan diagnostic and show its positional options |

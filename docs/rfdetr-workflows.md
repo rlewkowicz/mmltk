@@ -14,6 +14,30 @@ Predict own independent native sessions, GPU work, cancellation, and retained
 image products. See the [source guide](architecture.md#native-domain-work) for
 their locations.
 
+## Backend ownership
+
+The backend keeps model execution and decoded-state admission in
+[ordinary core declarations](architecture.md#native-domain-work). Within
+`src/backend/models/rfdetr/training/`, the training loop coordinates these
+execution and state boundaries through typed APIs:
+
+| Declaration | Responsibility |
+| --- | --- |
+| [detail/training_lanes.h](../src/backend/models/rfdetr/training/detail/training_lanes.h) | Training lanes, queued work, gradient handoff, and event custody |
+| [detail/training_metrics.h](../src/backend/models/rfdetr/training/detail/training_metrics.h) | GPU scalar accumulation and the completed metric handoff |
+| [detail/training_snapshot.h](../src/backend/models/rfdetr/training/detail/training_snapshot.h) | Ordinary/EMA serialization snapshots and continuation save/load coordination |
+| [detail/native_optimizer_private.h](../src/backend/models/rfdetr/training/detail/native_optimizer_private.h) | Typed AdamW/Muon state, parameter groups, update, and archive operations |
+| [detail/target_builder_private.h](../src/backend/models/rfdetr/training/detail/target_builder_private.h) | Target staging, scratch storage, and consumer leases |
+| [detail/evaluation_runtime.h](../src/backend/models/rfdetr/training/detail/evaluation_runtime.h) | Evaluation lanes, prediction buffers, and scheduled validation lifetime |
+| [checkpoint.h](../src/backend/models/rfdetr/training/checkpoint.h) | Ordinary checkpoint application, normalization, weight loading, and continuation inspection API |
+
+Runtime definitions stay in the corresponding ordinary source files; sources
+that consume retained modules remain registered importers. Canonical
+[training metric declarations](../src/backend/models/rfdetr/contract/training_metrics.h)
+own persisted/browser record structure, independently of these resource owners.
+The [build reference](build.md#target-declarations-and-precompiled-headers)
+describes compilation and header isolation.
+
 ## Class identity and model admission
 
 The immutable [ClassCatalog](../src/backend/data/catalog/class_catalog.h) owns
@@ -113,7 +137,8 @@ Inspection validates the current archive, continuation, optimizer inventory,
 and required EMA state before exposing **Resume**. Resume restores saved
 training settings and passes the same continuation admission used by CLI
 training. A path or run-history manifest alone cannot make an artifact resumable.
-See [checkpoint I/O](../src/backend/models/rfdetr/training/checkpoint_io.cpp)
+See the [checkpoint API](../src/backend/models/rfdetr/training/checkpoint.h),
+[checkpoint I/O](../src/backend/models/rfdetr/training/checkpoint_io.cpp),
 and [continuation validation](../src/backend/models/rfdetr/training/training_continuation.cpp).
 
 ## Saved history and plots
