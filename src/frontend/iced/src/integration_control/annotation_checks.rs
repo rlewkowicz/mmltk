@@ -348,16 +348,12 @@ impl State {
                     self.copy_step = 5;
                     self.copy_shape_points = 0;
                     self.copy_before = None;
-                    driver.phase = Phase::AnnotationTool {
-                        revision: snapshot.ui.interactionrevision,
-                        tool: crate::generated::AnnotationTool::Point,
-                    };
-                    return self.annotation_arm_scrolled(
+                    return self.annotation_arm_tool(
                         widgets,
                         driver,
                         probes,
-                        annotation::tool_id(crate::generated::AnnotationTool::Point),
-                        RelativeOffset::START,
+                        snapshot.ui.interactionrevision,
+                        crate::generated::AnnotationTool::Point,
                     );
                 }
                 {
@@ -720,25 +716,19 @@ impl State {
                 self.copy_product_cancel = action.cancel;
                 self.copy_product_cancelled = false;
                 if let Some(tool) = action.tool {
-                    driver.phase = Phase::AnnotationTool {
-                        revision: snapshot.ui.interactionrevision,
-                        tool,
-                    };
-                    self.annotation_arm_scrolled(
+                    self.annotation_arm_tool(
                         widgets,
                         driver,
                         probes,
-                        annotation::tool_id(tool),
-                        RelativeOffset::START,
+                        snapshot.ui.interactionrevision,
+                        tool,
                     )
                 } else if action.gesture.is_some() {
-                    driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-                    self.annotation_arm_scrolled(
+                    self.annotation_arm_surface(
                         widgets,
                         driver,
                         probes,
-                        ANNOTATION_SURFACE,
-                        RelativeOffset::START,
+                        snapshot.ui.interactionrevision,
                     )
                 } else {
                     let completion = advance_annotation(driver, Phase::CopyProductWait);
@@ -832,16 +822,12 @@ impl State {
                 if matches!(driver.viewer_scenario.as_str(), "quiet" | "terminal") {
                     self.bounded_document_revision = snapshot.ui.documentrevision;
                     self.bounded_object_count = snapshot.ui.scene.objects.len();
-                    driver.phase = Phase::AnnotationTool {
-                        revision: snapshot.ui.interactionrevision,
-                        tool: crate::generated::AnnotationTool::Box,
-                    };
-                    return self.annotation_arm_scrolled(
+                    return self.annotation_arm_tool(
                         widgets,
                         driver,
                         probes,
-                        annotation::tool_id(crate::generated::AnnotationTool::Box),
-                        RelativeOffset::START,
+                        snapshot.ui.interactionrevision,
+                        crate::generated::AnnotationTool::Box,
                     );
                 }
                 if driver.viewer_scenario == "copy" {
@@ -931,14 +917,7 @@ impl State {
                 self.annotation_arm(widgets, driver, probes, ANNOTATION_BRUSH_RADIUS)
             }
             Phase::AnnotationTool { revision, tool } => {
-                driver.phase = Phase::AnnotationTool { revision, tool };
-                self.annotation_arm_scrolled(
-                    widgets,
-                    driver,
-                    probes,
-                    annotation::tool_id(tool),
-                    RelativeOffset::START,
-                )
+                self.annotation_arm_tool(widgets, driver, probes, revision, tool)
             }
             Phase::AwaitTool { revision, tool } => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
@@ -990,25 +969,16 @@ impl State {
                 if self.copy_step == 8 {
                     advance_annotation(driver, Phase::CopyProductWait)
                 } else {
-                    driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-                    self.annotation_arm_scrolled(
+                    self.annotation_arm_surface(
                         widgets,
                         driver,
                         probes,
-                        ANNOTATION_SURFACE,
-                        RelativeOffset::START,
+                        snapshot.ui.interactionrevision,
                     )
                 }
             }
             Phase::AnnotationSurface(revision) => {
-                driver.phase = Phase::AnnotationSurface(revision);
-                self.annotation_arm_scrolled(
-                    widgets,
-                    driver,
-                    probes,
-                    ANNOTATION_SURFACE,
-                    RelativeOffset::START,
-                )
+                self.annotation_arm_surface(widgets, driver, probes, revision)
             }
             Phase::AwaitAnnotationFrame(revision) => {
                 let Some(snapshot) = model.annotation.snapshot.as_ref() else {
@@ -1262,13 +1232,11 @@ impl State {
                     if (self.copy_step == 6 && self.copy_shape_points < 3)
                         || (self.copy_step == 7 && self.copy_shape_points < 2)
                     {
-                        driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-                        return self.annotation_arm_scrolled(
+                        return self.annotation_arm_surface(
                             widgets,
                             driver,
                             probes,
-                            ANNOTATION_SURFACE,
-                            RelativeOffset::START,
+                            snapshot.ui.interactionrevision,
                         );
                     }
                     reporting::emit(|sink| {
@@ -1316,16 +1284,12 @@ impl State {
                     } else {
                         crate::generated::AnnotationTool::Skeleton
                     };
-                    driver.phase = Phase::AnnotationTool {
-                        revision: snapshot.ui.interactionrevision,
-                        tool,
-                    };
-                    return self.annotation_arm_scrolled(
+                    return self.annotation_arm_tool(
                         widgets,
                         driver,
                         probes,
-                        annotation::tool_id(tool),
-                        RelativeOffset::START,
+                        snapshot.ui.interactionrevision,
+                        tool,
                     );
                 }
                 if driver.viewer_scenario == "copy" {
@@ -1414,25 +1378,19 @@ impl State {
             crate::generated::AnnotationTool::Select
         };
         if snapshot.ui.editor.tool == tool {
-            driver.phase = Phase::AnnotationSurface(snapshot.ui.interactionrevision);
-            return self.annotation_arm_scrolled(
+            return self.annotation_arm_surface(
                 widgets,
                 driver,
                 probes,
-                ANNOTATION_SURFACE,
-                RelativeOffset::START,
+                snapshot.ui.interactionrevision,
             );
         }
-        driver.phase = Phase::AnnotationTool {
-            revision: snapshot.ui.interactionrevision,
-            tool,
-        };
-        self.annotation_arm_scrolled(
+        self.annotation_arm_tool(
             widgets,
             driver,
             probes,
-            annotation::tool_id(tool),
-            RelativeOffset::START,
+            snapshot.ui.interactionrevision,
+            tool,
         )
     }
     pub(super) fn annotation_points(&self, driver: &Driver, width: f64, height: f64) -> [f64; 4] {
@@ -1887,6 +1845,39 @@ impl State {
         } else {
             locate(control, driver.generation)
         }
+    }
+    fn annotation_arm_tool(
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        revision: u64,
+        tool: crate::generated::AnnotationTool,
+    ) -> Task<RootMessage> {
+        driver.phase = Phase::AnnotationTool { revision, tool };
+        self.annotation_arm_scrolled(
+            widgets,
+            driver,
+            probes,
+            annotation::tool_id(tool),
+            RelativeOffset::START,
+        )
+    }
+    fn annotation_arm_surface(
+        &mut self,
+        widgets: &mut widget_ops::RevealState,
+        driver: &mut Driver,
+        probes: &mut probe::Requests,
+        revision: u64,
+    ) -> Task<RootMessage> {
+        driver.phase = Phase::AnnotationSurface(revision);
+        self.annotation_arm_scrolled(
+            widgets,
+            driver,
+            probes,
+            ANNOTATION_SURFACE,
+            RelativeOffset::START,
+        )
     }
     pub(super) fn annotation_arm_scrolled(
         &mut self,

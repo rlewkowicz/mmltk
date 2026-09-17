@@ -498,12 +498,13 @@ void NativeAdamW::step_group_eager(const Group& group) {
 }
 void NativeAdamW::step_group_foreach(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::foreach); }
 void NativeAdamW::step_group_fused(const Group& group) { step_adamw_group_batched(params_, state_, group, NativeOptimizerBackend::fused); }
-namespace {
-template <class State>
-void reserve_optimizer_readback(const std::vector<State>& states, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) {
+template <typename GroupConfig, typename ParamStateT>
+void NativeOptimizerStorage<GroupConfig, ParamStateT>::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
+                                                                          std::size_t first_slot) const {
     std::vector<torch::Tensor> tensors;
-    for (const auto& state : states) {
-        template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^State, std::meta::access_context::current()))) {
+    for (const auto& state : state_) {
+        template for (constexpr auto member :
+                      std::define_static_array(std::meta::nonstatic_data_members_of(^^ParamStateT, std::meta::access_context::current()))) {
             if constexpr (std::is_same_v<std::remove_cvref_t<decltype(state.[:member:])>, torch::Tensor>) {
                 if (state.[:member:].defined()) tensors.push_back(state.[:member:]);
             }
@@ -511,6 +512,9 @@ void reserve_optimizer_readback(const std::vector<State>& states, mmltk::backend
     }
     readback.Reserve(tensors, first_slot);
 }
+template class NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState>;
+template class NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState>;
+namespace {
 template <class State>
 void write_optimizer_state(torch::serialize::OutputArchive& archive, const State& state, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
                            std::size_t& slot) {
@@ -521,9 +525,6 @@ void write_optimizer_state(torch::serialize::OutputArchive& archive, const State
     }
 }
 }  // namespace
-void NativeAdamW::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
-    reserve_optimizer_readback(state_, readback, first_slot);
-}
 void NativeAdamW::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
     mmltk::backend::ml::serialization::write_string(archive, "format", kNativeAdamWFormat);
     mmltk::backend::ml::serialization::write_int(archive, "format_version", kNativeAdamWFormatVersion);
@@ -604,10 +605,6 @@ std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputA
                                                         const std::unordered_map<std::string, torch::Tensor>& tensors) {
     return inspect_checkpoint<NativeAdamW>(archive, tensors);
 }
-void NativeAdamW::commit(NativeAdamW candidate) noexcept {
-    groups_.swap(candidate.groups_);
-    state_.swap(candidate.state_);
-}
 NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params)
     : NativeOptimizerStorage(std::move(groups), std::move(params)) {
     populate_named_parameter_views(params_, all_params_, all_param_names_, "native Muon received an undefined parameter tensor");
@@ -662,9 +659,6 @@ void NativeMuonWithAuxAdam::step() {
             param.add_(update, -group.config.lr);
         }
     }
-}
-void NativeMuonWithAuxAdam::reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const {
-    reserve_optimizer_readback(state_, readback, first_slot);
 }
 void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback,
                                  std::size_t first_slot) const {
@@ -769,10 +763,6 @@ void NativeMuonWithAuxAdam::load(torch::serialize::InputArchive& archive) {
 std::vector<std::string> NativeMuonWithAuxAdam::InspectCheckpoint(torch::serialize::InputArchive& archive,
                                                                   const std::unordered_map<std::string, torch::Tensor>& tensors) {
     return inspect_checkpoint<NativeMuonWithAuxAdam>(archive, tensors);
-}
-void NativeMuonWithAuxAdam::commit(NativeMuonWithAuxAdam candidate) noexcept {
-    groups_.swap(candidate.groups_);
-    state_.swap(candidate.state_);
 }
 NativeOptimizer::NativeOptimizer(NativeAdamW optimizer) : storage_(std::move(optimizer)) {}
 NativeOptimizer::NativeOptimizer(NativeMuonWithAuxAdam optimizer) : storage_(std::move(optimizer)) {}

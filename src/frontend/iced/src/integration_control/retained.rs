@@ -3439,59 +3439,36 @@ impl State {
                         return widgets.arm(driver, EXPLORE_UPSCALE_ACTIONS[0]);
                     }
                 }
-                if driver.viewer_scenario == "copy" && kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len() {
+                let pending_draw = match driver.viewer_scenario.as_str() {
+                    "copy" if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len() => {
+                        Some("annotation_handoff_draw_missing")
+                    }
+                    "semantics" if kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len() => {
+                        Some("semantic_handoff_draw_missing")
+                    }
+                    "rapid" => Some("rapid_completion_draw_missing"),
+                    _ => None,
+                };
+                if let Some(reason) = pending_draw {
                     if probes.draws().viewer.is_none_or(|(drawn, source, _)| {
                         drawn != sampleable.presentation_revision
                             || source != upscale.frame.revision
                     }) {
-                        reporting::upscale_settlement(
-                            driver,
-                            self,
-                            probes,
-                            model,
-                            frame,
-                            "annotation_handoff_draw_missing",
-                        );
+                        reporting::upscale_settlement(driver, self, probes, model, frame, reason);
                         return Task::none();
                     }
+                }
+                if driver.viewer_scenario == "copy" && kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len() {
                     driver.phase = Phase::OpenAnnotation;
                     return widgets.arm(driver, EXPLORE_ANNOTATE);
                 }
                 if driver.viewer_scenario == "semantics"
                     && kernel + 1 == EXPLORE_UPSCALE_ACTIONS.len()
                 {
-                    if probes.draws().viewer.is_none_or(|(drawn, source, _)| {
-                        drawn != sampleable.presentation_revision
-                            || source != upscale.frame.revision
-                    }) {
-                        reporting::upscale_settlement(
-                            driver,
-                            self,
-                            probes,
-                            model,
-                            frame,
-                            "semantic_handoff_draw_missing",
-                        );
-                        return Task::none();
-                    }
                     driver.phase = Phase::ViewerNoAspect;
                     return widgets.arm(driver, "explore.detail.aspect");
                 }
                 if driver.viewer_scenario == "rapid" {
-                    if probes.draws().viewer.is_none_or(|(drawn, source, _)| {
-                        drawn != sampleable.presentation_revision
-                            || source != upscale.frame.revision
-                    }) {
-                        reporting::upscale_settlement(
-                            driver,
-                            self,
-                            probes,
-                            model,
-                            frame,
-                            "rapid_completion_draw_missing",
-                        );
-                        return Task::none();
-                    }
                     reporting::emit(|sink| {
                         sink.record(
                             "integration.viewer_complete",

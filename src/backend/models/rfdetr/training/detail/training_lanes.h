@@ -47,6 +47,7 @@ class TrainingLanes final {
     ~TrainingLanes();
     TrainingLanes(const TrainingLanes&) = delete;
     TrainingLanes& operator=(const TrainingLanes&) = delete;
+    // CLEANUP-IGNORE: This API declaration repeats its out-of-line definition's parameter types, not implementation.
     std::future<TrainLaneResult> enqueue(RuntimeContext* runtime, mmltk::backend::data::DatasetLoader& loader, const mmltk::backend::data::Batch& batch,
                                          const mmltk::backend::ml::cuda::CudaEventPool::Lease* params_ready,
                                          mmltk::backend::ml::cuda::CudaEventPool& event_pool, double scaled_loss_factor, size_t parameter_version,

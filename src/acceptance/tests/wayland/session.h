@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -8,6 +9,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <poll.h>
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/acceptance/tests/workflow_wayland_inputs.h"
 #include "src/backend/data/tests/test_fixture.h"
@@ -65,6 +67,7 @@ class WaylandSession final {
     void AdvanceScenario();
     void ConsumeRecords(bool final = false);
     void RunWorkflows();
+    int PollEvents(std::array<pollfd, 4U>& events) const;
     std::shared_ptr<PreparedWaylandInputs> inputs_;
     const mmltk::backend::data::testsupport::FixtureSpec& ordinary_fixture_;
     TerminationMode termination;

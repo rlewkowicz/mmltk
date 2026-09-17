@@ -61,6 +61,11 @@ class NativeOptimizerStorage {
     [[nodiscard]] const std::vector<torch::Tensor>& parameters() const { return all_params_; }
     [[nodiscard]] const std::vector<std::string>& parameter_names() const { return all_param_names_; }
     [[nodiscard]] const std::vector<Group>& groups() const { return groups_; }
+    void reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
+    void commit(NativeOptimizerStorage candidate) noexcept {
+        groups_.swap(candidate.groups_);
+        state_.swap(candidate.state_);
+    }
 
    protected:
     using ParamState = ParamStateT;
@@ -84,10 +89,8 @@ class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, Native
     void zero_grad(bool set_to_none);
     void set_lrs(const std::vector<double>& base_lrs, double scale);
     void step();
-    void reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
     void save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
     void load(torch::serialize::InputArchive& archive);
-    void commit(NativeAdamW candidate) noexcept;
 
    private:
     void initialize_state();
@@ -110,10 +113,8 @@ class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfi
     void set_lrs(const std::vector<double>& base_lrs, double scale);
     void set_muon_momentum(double momentum);
     void step();
-    void reserve_checkpoint(mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
     void save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
     void load(torch::serialize::InputArchive& archive);
-    void commit(NativeMuonWithAuxAdam candidate) noexcept;
 
    private:
     void initialize_state();

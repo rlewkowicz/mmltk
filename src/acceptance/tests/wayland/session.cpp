@@ -576,6 +576,17 @@ void WaylandSession::ConsumeRecords(const bool final) {
         native.join_gallery_publication(generation, evidence.slots);
     }
 }
+int WaylandSession::PollEvents(std::array<pollfd, 4U>& events) const {
+    events = {{
+        {.fd = process_->pidfd(), .events = POLLIN, .revents = 0},
+        {.fd = notifications_->descriptor(), .events = POLLIN, .revents = 0},
+        {.fd = process_->control_fd(), .events = POLLIN, .revents = 0},
+        {.fd = deadline.get(), .events = POLLIN, .revents = 0},
+    }};
+    int ready = -1;
+    do { ready = ::poll(events.data(), events.size(), -1); } while (ready < 0 && errno == EINTR);
+    return ready;
+}
 void WaylandSession::RunWorkflows() {
     auto& process = *process_;
     arm_timerfd(deadline.get(), kWaylandStartupDeadline, "workflow browser startup");
@@ -594,14 +605,8 @@ void WaylandSession::RunWorkflows() {
             progress = browser.phase_progress_revision;
             arm_timerfd(deadline.get(), browser.phase_progress_class == "work" ? kWaylandWorkDeadline : kWaylandInteractionDeadline, "workflow phase progress");
         }
-        std::array<pollfd, 4U> waits{{
-            {.fd = process.pidfd(), .events = POLLIN, .revents = 0},
-            {.fd = notifications_->descriptor(), .events = POLLIN, .revents = 0},
-            {.fd = process.control_fd(), .events = POLLIN, .revents = 0},
-            {.fd = deadline.get(), .events = POLLIN, .revents = 0},
-        }};
-        int ready = -1;
-        do { ready = ::poll(waits.data(), waits.size(), -1); } while (ready < 0 && errno == EINTR);
+        std::array<pollfd, 4U> waits;
+        const int ready = PollEvents(waits);
         REQUIRE(ready >= 0);
         if (waits[1].revents) notifications_->consume();
         if (waits[2].revents & POLLIN) {
@@ -975,16 +980,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
             process.terminate();
             FAIL("workspace Wayland browser terminal evidence is incomplete");
         }
-        // CLEANUP-IGNORE: This acceptance loop polls process, JSONL, and deadline descriptors; production polls
-        // independent child-custody, stop, and timer descriptors.
-        std::array<pollfd, 4U> descriptors{{
-            {.fd = process.pidfd(), .events = POLLIN, .revents = 0},
-            {.fd = notifications.descriptor(), .events = POLLIN, .revents = 0},
-            {.fd = process.control_fd(), .events = POLLIN, .revents = 0},
-            {.fd = deadline.get(), .events = POLLIN, .revents = 0},
-        }};
-        int ready = -1;
-        do { ready = ::poll(descriptors.data(), descriptors.size(), -1); } while (ready < 0 && errno == EINTR);
+        std::array<pollfd, 4U> descriptors;
+        const int ready = PollEvents(descriptors);
         if (ready < 0) {
             std::cerr << "workspace-wayland failed to poll product evidence: " << std::strerror(errno);
             record_acceptance_state("acceptance.poll.failed", true);

@@ -12,8 +12,6 @@
 #include "src/frameworks/gpu/cuda_error.h"
 #include <torch/types.h>
 #include <torch/serialize.h>
-// CLEANUP-IGNORE: The augmentation implementation declares its own logging and CUDA module dependencies.
-// CLEANUP-IGNORE: Profiling and CUDA imports are owned directly by this augmentation implementation.
 #include "detail/gpu_augment_private.h"
 #include "detail/target_builder_private.h"
 import mmltk.common.logging.mmltk_logging;

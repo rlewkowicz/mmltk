@@ -15,7 +15,7 @@ usage() {
 Usage: tools/run_static_analysis.sh [--third_party] [--file <source>...] [--start-at <translation-unit>] [--cppcheck-only]
 
 Runs the Docker-backed static-analysis pass for this repo:
-1. Runs clang-format -i over tracked first-party C/C++/CUDA source and module files
+1. Formats tracked first-party C/C++/CUDA files and, on full passes, the owned Rust frontend
 2. Refreshes the cached Docker-side Ninja analysis compile database
 3. Runs clang-tidy over tracked first-party C/C++/CUDA translation units
 4. Reports cppcheck disabled while its parser lacks C++26 reflection support
@@ -248,6 +248,11 @@ format_source_files() {
 }
 
 format_source_files
+if ((${#target_files[@]} == 0)); then
+    command -v cargo >/dev/null 2>&1 || die "cargo is unavailable; rebuild the analysis image"
+    log "running cargo fmt over the first-party Iced frontend"
+    cargo fmt --manifest-path "${repo_root}/src/frontend/iced/Cargo.toml" --package mmltk-browser-app
+fi
 
 mkdir -p "${build_dir}" "${cppcheck_build_dir}"
 

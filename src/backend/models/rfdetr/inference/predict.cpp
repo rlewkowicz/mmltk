@@ -55,8 +55,6 @@ module;
 #include <ATen/ops/index_select.h>
 #include <torch/types.h>
 #include <torch/serialize.h>
-// CLEANUP-IGNORE: This module declaration terminates Prediction's private global fragment.
-#include "src/backend/models/rfdetr/core/model_state.h"  // CLEANUP-IGNORE: Prediction directly imports its concrete RF-DETR implementation owners.
 #include "src/backend/models/rfdetr/core/runtime.h"
 module mmltk.backend.models.rfdetr.inference.prediction;
 // CLEANUP-IGNORE: This inference implementation imports the concrete owners used by its typed prediction boundary.

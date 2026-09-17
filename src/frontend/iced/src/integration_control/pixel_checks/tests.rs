@@ -240,6 +240,29 @@ impl ProbeFixture {
             output.probe.as_ref()
         ));
     }
+
+    fn settle_replacement_fps(
+        &mut self,
+        old: &mut ScenarioOutput,
+        pixels: FpsPixels,
+        model: &ApplicationModel,
+        settings: &crate::view::settings::SettingsModel,
+    ) {
+        let mut replacement = self.request_fps(model, settings);
+        drop(self.complete_fps(old, FpsPixelOutcome::Cancelled, model, settings));
+        self.assert_pending_fps(&replacement);
+        drop(self.complete_fps(
+            &mut replacement,
+            FpsPixelOutcome::Captured(pixels),
+            model,
+            settings,
+        ));
+        assert_eq!(
+            self.controller.driver.phase,
+            Phase::AwaitWorkspaceFpsRestored
+        );
+        assert!(self.controller.pixel_checks.workspace_fps_failure.is_none());
+    }
 }
 
 #[test]
@@ -371,26 +394,7 @@ fn fps_capture_invalidation_rearms_and_obsolete_callbacks_cannot_finish_replacem
                 .workspace_fps_failure
                 .is_none()
         );
-        let mut replacement = fixture.request_fps(&model, &settings);
-        drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Cancelled, &model, &settings));
-        fixture.assert_pending_fps(&replacement);
-        drop(fixture.complete_fps(
-            &mut replacement,
-            FpsPixelOutcome::Captured(pixels),
-            &model,
-            &settings,
-        ));
-        assert_eq!(
-            fixture.controller.driver.phase,
-            Phase::AwaitWorkspaceFpsRestored
-        );
-        assert!(
-            fixture
-                .controller
-                .pixel_checks
-                .workspace_fps_failure
-                .is_none()
-        );
+        fixture.settle_replacement_fps(&mut old, pixels, &model, &settings);
     }
 }
 
@@ -404,27 +408,8 @@ fn fps_capture_from_a_prior_scenario_cannot_settle_the_replacement() {
         .controller
         .reset_scenario(String::new(), String::new(), "512".into(), "square".into())
         .unwrap();
-    let mut replacement = fixture.request_fps(&model, &settings);
-    drop(fixture.complete_fps(&mut old, FpsPixelOutcome::Cancelled, &model, &settings));
-    fixture.assert_pending_fps(&replacement);
     let (pixels, _) = pixel_checks::tests::fps_pixel_fixture(false, 1.0);
-    drop(fixture.complete_fps(
-        &mut replacement,
-        FpsPixelOutcome::Captured(pixels),
-        &model,
-        &settings,
-    ));
-    assert_eq!(
-        fixture.controller.driver.phase,
-        Phase::AwaitWorkspaceFpsRestored
-    );
-    assert!(
-        fixture
-            .controller
-            .pixel_checks
-            .workspace_fps_failure
-            .is_none()
-    );
+    fixture.settle_replacement_fps(&mut old, pixels, &model, &settings);
 }
 
 #[test]
