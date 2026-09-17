@@ -9,6 +9,8 @@ reporting state, or pixel-probe owner. Disabled paths skip diagnostic payload
 collection, formatting, clock reads, counter updates, and I/O. Application
 state, ordered input, resource custody, and physical completion still work.
 Diagnostic identities never determine their behavior.
+Fatal operation and process failures have a separate
+[stderr reporting path](#fatal-stderr-reports) that remains active.
 
 Training run history and incomplete-history notices are product output,
 independent of diagnostic activation. `run.json`/`metrics.jsonl`, progress
@@ -42,12 +44,47 @@ Explicit file/directory overrides retain their destination and host-path
 rewriting. Native logs use the application name, a 10 MiB rotation threshold,
 and five archived files.
 
-The ONNX inspection and simplification tools remain silent by default and
-with `off`, including failures; inspect their exit status. Request diagnostics
-explicitly when consuming model metadata. `rfdetr info --onnx` forwards the
-CLI logging overrides to its sibling ONNX inspection tool. Ordinary CLI result
-stdout, such as compiled-dataset `info`, remains available independently of
-diagnostics.
+The ONNX inspection and simplification tools suppress routine output by default
+and with `off`; fatal failures still report to stderr and return failure.
+Request diagnostics explicitly when consuming model metadata.
+`rfdetr info --onnx` forwards the CLI logging overrides to its sibling ONNX
+inspection tool. Ordinary CLI result stdout, such as compiled-dataset `info`,
+remains available independently of diagnostics.
+
+## Fatal stderr reports
+
+Native CLI errors, RF-DETR command errors, ONNX tool failures, and desktop
+startup/runtime failures use the common bounded reporter. Each report is a
+single line:
+
+```text
+fatal: <component>: <detail> (status=<available status>)
+```
+
+The status suffix is omitted when no status is supplied. Component and detail
+are capped at 160 and 800 bytes, with truncation markers; control bytes become
+spaces. The fixed 1024-byte buffer bounds the complete report independently of
+optional logger state. A disabled, uninitialized, or failed diagnostic sink does
+not hide the stderr attempt. The reporter preserves `errno`; a broken stderr
+pipe does not terminate reporting through SIGPIPE or consume a signal already
+pending on the calling thread.
+
+When enabled, the rotating file sink receives a best-effort critical copy
+without emitting a second stderr copy. RF-DETR and ONNX tools retain their
+named diagnostic identities. Routine successful execution and requested
+healthy shutdown remain quiet when diagnostics are disabled.
+
+Desktop failure context comes from the owning boundary. Firefox launch and
+process-infrastructure failures retain the OS error separately from the mapped
+process status. An unsuccessful child exit preserves its exit status; an
+unexpected child signal is reported by number and yields `128 + signal` as the
+desktop exit status. This does not turn an intentional healthy SIGINT/SIGTERM
+shutdown into a failure.
+
+The [logging module](../src/common/logging/mmltk_logging.cppm) and
+[implementation](../src/common/logging/mmltk_logging.cpp) own this path.
+`report_fatal` is for ordinary terminal boundaries, **not signal handlers**;
+it must not be called from a fatal signal handler.
 
 ## Capture one reproduction
 
@@ -224,10 +261,13 @@ record UI interaction and pixels separately from physical resource custody:
 | `integration.number_replace`, `integration.number_paste`, `integration.number_key_stage` | Synthetic focus, selection, modifier, and key-delivery stages; delivery alone does not prove native persistence |
 | `integration.annotation_layout`, `integration.annotation_reachable`, `integration.annotation_tail` | Shared columns, wide/narrow viewport behavior, fully revealed controls, and long-list final entries |
 | `integration.annotation_pixel` | Native geometry/palette expectation and actual canvas pixel at the current image scale |
-| `integration.workflow.completed` | Typed Train, Validate, compiled/image/video Predict, Stop, theme, and narrow-layout stage completion |
-| `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for chart, validation atlas/detail, and prediction stages; image captures retain the expected source/presentation revisions |
+| `integration.workflow.completed` | Typed Train, dashboard interaction/aspect, Validate, compiled/image/video Predict, Stop, theme, and narrow-layout stage completion |
+| `integration.workflow.pixels` | Actual sampled/visible canvas pixel counts for charts, the live progress bar, validation atlas/detail, and prediction stages; image captures retain the expected source/presentation revisions |
+| `integration.workflow.progress` | Native completed/total image counts and epoch facts at the live progress capture |
 | `integration.metric_projection` | Finite sample count, connected-segment count, and total projected entries for a Train curve |
-| `integration.workflow.plot_evidence` | On failed curve visibility, a bounded 64×36 RGBA overview from the same captured canvas snapshot |
+| `integration.metric_values` | First and last finite projected points for the named curve |
+| `integration.chart_view` | Settled camera ranges at retained-view interaction stages |
+| `integration.workflow.plot_evidence`, `integration.workflow.progress_evidence` | On failed curve/bar visibility, a bounded 64×36 RGBA overview from the same captured canvas snapshot |
 
 ```bash
 ./mmltk --logs --family latest-wayland-test \
@@ -237,18 +277,21 @@ record UI interaction and pixels separately from physical resource custody:
   -q '@event:integration.atlas_resize OR @event=integration.atlas_ready_cell' \
   --format jsonl --limit 40
 ./mmltk --logs --family latest-wayland-test \
-  -q '@event:integration.workflow OR @event=integration.metric_projection' \
+  -q '@event:integration.workflow OR @event:integration.metric_ OR @event=integration.chart_view' \
   --format jsonl --limit 60
 ```
 
 Workflow chart sampling checks a middle strip away from the legend and vertical
-axis and counts saturated curve pixels. Image sampling requires the current
-draw identity and visible geometry; stale asynchronous captures are retried
-within the driver bound. A typed completion, finite metric, or allocated chart
-buffer does not prove pixels were drawn. The workflow case requires both
-semantic completion and actual canvas observations. A sparse chart can
-legitimately have finite samples but no connected segments when records are
-missing; its markers preserve those observations without joining gaps.
+axis and counts saturated curve pixels. Progress sampling covers the isolated
+bar's full extent and requires visible saturated fill. Widget samples wait for
+browser presentation opportunities after layout. Image sampling requires
+the current draw identity, paired metadata, and visible geometry; stale
+asynchronous captures are retried within the driver bound. A typed completion,
+finite metric, or allocated chart buffer does not prove pixels were drawn. The
+workflow case requires both semantic completion and actual canvas observations.
+A sparse chart can legitimately have finite samples but no connected segments
+when records are missing; its markers preserve those observations without
+joining gaps.
 
 Atlas canvas sampling uses one snapshot of the current canvas. For each ready
 tile, its interior is intersected with the actual draw clip; at most nine

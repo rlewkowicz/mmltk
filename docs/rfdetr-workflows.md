@@ -86,6 +86,33 @@ match-free class axes. Unmatched destination state keeps its initialized value.
 Resume instead requires the exact native class layout and compatible saved
 state; it does not perform transfer remapping.
 
+## Training inputs and output destination
+
+Train requires compiled train and validation splits. **Infer train/validation
+splits** resolves `train.bin` and `val.bin` from the compiled output directory.
+The optional test split remains independently selectable and clearable in that
+mode; it is not inferred from `test.bin`. Clearing it disables the final test.
+An absent test split does not block training. A selected test split must be a
+readable compiled artifact with the same ordered class catalog as train and
+validation, or native admission rejects the start. The
+[request materializer](../src/controller/subsystems/system/compute_intent_materializer.cpp)
+and [dataset inspection](../src/controller/subsystems/system/dataset_system.cpp)
+own these checks.
+
+The Output card's **Output directory** field is editable. Typing a destination
+or using **Select training output** updates settings; **Open saved run** is the
+separate inspection action. Neither editing nor browsing starts training or
+loads history.
+
+On a GUI start, an absent or empty output directory can become the run directory.
+Resume reuses a populated current run directory only when its full
+`checkpoint.pt`, attempt identity, selected weights, and class layout agree.
+A fresh start, or a resume that does not match that directory, creates a new
+`run-*` child when the selected directory is nonempty. The resolved destination
+is shown after it exists. This GUI directory policy belongs to
+[TrainRunStore](../src/controller/services/train_run_store.cpp); the CLI uses
+its explicit `--output-dir`.
+
 ## Training and query limits
 
 An image may contain more targets than the resolved query count. All targets
@@ -141,16 +168,41 @@ See the [checkpoint API](../src/backend/models/rfdetr/training/checkpoint.h),
 [checkpoint I/O](../src/backend/models/rfdetr/training/checkpoint_io.cpp),
 and [continuation validation](../src/backend/models/rfdetr/training/training_continuation.cpp).
 
+## Live training progress
+
+The separate progress card follows the active local run even while the dashboard
+shows saved history. It disappears when that run completes, fails, or is
+cancelled. Preparing a model remains a separate stage in the model card.
+
+During the Train phase, the card uses native `completed_images` and
+`total_images` from the current epoch. These are **rank-local image counts**,
+not optimizer steps or world-wide totals. The native loader derives the total
+from usable full microbatches after tail, distributed, accumulation, and lane
+constraints; completion advances with processed local microbatches. The GUI
+does not reconstruct either count from dataset size or editable batch settings.
+See [train.cpp](../src/backend/models/rfdetr/training/train.cpp) and the
+[progress declaration](../src/backend/models/rfdetr/contract/training_metrics.h).
+
+A positive known total supports the image progress bar. The card shows the
+native epoch elapsed time and measured images/second; ETA estimates the
+remaining epoch images from that rate. Rate and ETA remain unavailable until
+there is a loss observation, completed work, and positive finite elapsed time
+and rate. Total, classification, and box losses likewise show only available
+finite observations. Starting, validation, stopping, and other non-Train phases
+show their phase without a stale image bar or loss/rate display.
+
 ## Saved history and plots
 
-Current history uses **format version 1**. There is no history reader or
-migration for older output directories.
+Current manifests and metric records use **format version 2**, including the
+native image-count fields. Version-1 history and other older output directories
+are rejected; there is no compatibility reader or migration. Checkpoint version
+3 and compiled dataset format 7 are independent formats.
 
 | File | Authority |
 | --- | --- |
 | `run.json` | Run/attempt identity, training configuration, execution/query facts, class layout, selected evaluation weights, and resume provenance |
 | `metrics.jsonl` | Append-only typed metric records, including sequence, attempt, role, missing-record count, and progress |
-| `progress.json` | Latest progress projection consumed by the training process client |
+| `progress.json` | Latest progress projection, including the typed metric record, consumed by the training process client |
 | `log.txt` | Epoch summary projections |
 | `results.json` | Final result projection |
 
@@ -174,25 +226,20 @@ correspondence is an overlapping breakdown. Only total represents the complete
 optimized objective, so these displayed components must not simply be summed.
 
 **Open saved run** inspects the selected output directory without starting
-training. **Load history / More history** fetch bounded pages; **Current live
-run** returns to live data. The reader uses generation and byte-boundary cursors,
-rejects replaced/truncated streams, and retries an incomplete trailing append.
-Resume can reuse the selected current run directory only when its full
-`checkpoint.pt`, attempt identity, selected weights, and class layout agree.
-A fresh start, or a resume that does not match that directory, creates a new
-`run-*` child when the selected directory is nonempty.
-This GUI directory policy belongs to
-[TrainRunStore](../src/controller/services/train_run_store.cpp).
+training. **Load history / More history** fetch pages of at most 32 records;
+**Current live run** returns the dashboard to live data. The reader uses
+generation and byte-boundary cursors, rejects replaced/truncated streams, and
+does not advance past an incomplete trailing append. Opening history requires
+both a valid current manifest and its `metrics.jsonl`.
 
-The retained Iced chart groups losses, AP, precision/recall/F1, learning rates,
-and throughput. It offers step/epoch axes and a log-loss scale. Bounded summaries
-retain endpoints and extrema; missing records, unavailable metrics, and attempt
-changes remain disconnected. Sparse observations have markers so they remain
-visible without bridging gaps. Hidden Train views keep ingesting current
-records without rebuilding chart geometry and prepare their retained summaries
-when shown. Plot objects, series, and GPU buffers retain useful capacity.
-These are implementation properties, not a measured overhead or throughput
-guarantee.
+Scheduled evaluation contributes one sparse observation per recorded epoch
+for the selected weight set. Live and terminal records carrying the latest
+evaluation do not add duplicate observations. Missing or unavailable
+measurements remain gaps; a final test stays in the Output summary rather than
+joining the validation trajectory. The
+[training dashboard](gui-interaction.md#training-dashboard) owns chart selection,
+axes, retained interaction, bounded summaries, and rendering behavior. Throughput
+belongs to live progress rather than a dashboard curve.
 
 ## Evaluation metrics and retained samples
 

@@ -83,8 +83,10 @@ For example, with existing input artifacts:
 See [datasets](datasets.md) for compilation and annotation requirements.
 `rfdetr compile --perceptual-downscale` selects optional perceptual shrinking;
 training exposes the independent `--aug-perceptual-downscale` option.
-Training also exposes `--use-ema`/`--no-ema` and `--resume`. Model-input commands
-accept `--class-layout` for a digest-bound class descriptor.
+Training also exposes `--use-ema`/`--no-ema`, `--resume`, and `--output-dir`.
+`--test-compiled` supplies an optional final-test split; train and validation
+remain required. Model-input commands accept `--class-layout` for a digest-bound
+class descriptor.
 `rfdetr predict` accepts repeatable `--image` inputs as an alternative to
 `--compiled`, and retains CLI batch-size selection. Local video belongs to the
 GUI prediction workflow. `rfdetr evaluate` selects one backend; `rfdetr validate`
@@ -95,6 +97,8 @@ current checkpoints, metrics, and saved history.
 The native CLI also accepts `--log-level`, `--log-file`, and `--log-dir`.
 See [logging activation](logging.md#activation-and-quiet-execution), especially
 for ONNX metadata commands whose output requires explicit diagnostics.
+Fatal operation failures still produce a concise
+[stderr report](logging.md#fatal-stderr-reports) with diagnostics disabled.
 
 ## Desktop options and environment
 

@@ -37,13 +37,16 @@ editor widget identities survive ordinary layout and native-state updates.
 
 ## Training, validation, and prediction
 
-Train uses an ordinary retained Iced plot in the center column, fixed to 16:9.
-It has no native GPU image workspace or aspect selector. Its Output card opens
-current-format saved history, pages through records, inspects checkpoints, and
-prepares resume. Advanced includes **Exponential moving average**, disabled by
-default, and separate augmentation/perceptual-downscaling settings. The
+Train uses the [retained dashboard](#training-dashboard) in the center column,
+with the shared workspace aspect selector and a separate live progress card.
+It has no native GPU image workspace. Its Dataset card keeps the optional test
+split independent of inferred train/validation paths. Its Output card edits
+the destination, explicitly opens current-format saved history, pages through
+records, inspects checkpoints, and prepares resume. Advanced includes
+**Exponential moving average**, disabled by default, and separate
+augmentation/perceptual-downscaling settings. The
 [workflow reference](rfdetr-workflows.md) owns the metric conventions, current
-file formats, and continuation requirements.
+file formats, input admission, live progress, and continuation requirements.
 
 Validate preserves the outer setup/status columns and divides the center
 equally between metrics and sample viewing. Its micro atlas always has three
@@ -68,11 +71,63 @@ operation's completed work; unknown totals stay indeterminate. Video controls
 use the same pending-system admission as their typed requests, including an
 event arriving before its reply.
 
-The [metrics component](../src/frontend/iced/src/view/metrics.rs) keeps bounded
-extrema-preserving summaries and retained plot/series objects. Navigation keeps
-useful chart state; hidden views do not rebuild geometry. Sequence gaps,
-unavailable values, and new attempts break lines, while isolated points remain
-visible as markers. Vendored
+## Training dashboard
+
+The dashboard fits the center column's available width and page-body height
+using the selected workspace aspect ratio. The default is 16:9; the shared
+selector also offers 9:16, 4:3, 3:2, 1:1, and 16:10. Charts fit this bounded
+region without an internal scrollbar. Clicking a chart title expands that
+chart in the same region; **Back to charts** restores the grid. Setup, status,
+and the [live progress card](rfdetr-workflows.md#live-training-progress) remain
+part of the page.
+
+**Charts** opens the multi-select list:
+
+| Initially selected | Additional charts |
+| --- | --- |
+| Training loss | Loss components |
+| AP50 | AP75 |
+| AP50:95 | Class / cardinality errors |
+| Average recall | Mask metrics |
+| Precision / recall / F1 | Area breakdowns |
+| Learning rates | |
+
+**Reset to main charts** restores the six initial selections and closes an
+expanded chart. Selecting no charts leaves an explicit empty-selection state.
+Charts with no measurements show a waiting/empty state instead of fabricated zero values.
+Average-recall labels use the recorded detection caps. Mask and area values
+remain unavailable when the selected evaluation did not produce them.
+
+**Epoch axis** is on initially and uses fractional epoch positions for live
+training; turning it off selects the global optimizer-step axis.
+**Log loss scale** changes only training-loss and loss-component charts. There
+is no validation loss curve; images/second belongs to the live progress card. The
+[workflow guide](rfdetr-workflows.md#saved-history-and-plots) explains sparse
+validation observations, loss conventions, and saved-history selection.
+
+Each chart retains its plot, series, camera, and legend interaction through
+expansion, hiding/revealing, and navigation. A remount with unchanged data and
+axis configuration preserves the settled view; actual data, limit, or scale
+changes still follow the plot's autoscale policy. Wheel and trackpad scrolling,
+including modified wheel input over the plot, axes, or legend, belongs to the
+ordinary page scroller and does not zoom or pan the chart. Other plot gestures
+remain available.
+
+The [metrics component](../src/frontend/iced/src/view/metrics.rs) owns separate
+live and saved histories. Each curve retains at most 128 summary buckets with
+endpoints and extrema. Sequence gaps, unavailable values, missing records, and
+new attempts break lines, while isolated points remain visible as markers.
+When older disconnected summaries must be retired, the Output card reports
+chart omissions; saved history is unchanged. Hidden views continue ingesting
+records without rebuilding geometry; only visible changed charts prepare their
+retained summaries. Plot objects, series, and GPU buffers retain useful
+capacity.
+
+The vendored [plot widget](../third_party/iced_plot/src/plot_widget.rs) keeps
+settled view state independently of the temporary Iced widget tree. Axis labels
+sit outside the shader region, with a rotated Y title and theme-aware text.
+These ownership and bounded-work properties are not measured overhead or
+throughput guarantees. Vendored
 [plot picking](../third_party/iced_plot/src/picking.rs) bounds pending GPU
 readbacks and settles cancellation without reusing an unsettled mapping.
 

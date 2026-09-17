@@ -209,7 +209,7 @@ Under the selected graph's `generated/frontend/iced/`, generation owns:
 
 | Artifact | Purpose |
 | --- | --- |
-| `application_bindings.rs` | Typed native domain projection, codecs, schema fingerprint, and interaction limits |
+| `application_bindings.rs` | Typed native domain projection, codecs, schema fingerprint, interaction limits, and reflected metric scalar selectors |
 | `browser_protocol.marker` | Application package marker for the [current typed boundary](gui-interaction.md#typed-application-boundary), `MMLTK_HOST_API_PROTOCOL_17` |
 | `protocol_v17_client_records.hex` | Rust-to-native application fixture |
 | `protocol_v17_server_records.cbor` | Native-to-Rust application fixture |

@@ -52,15 +52,17 @@ policy, generated bindings, and build timing.
 ## Training, validation, and prediction
 
 Train prepares the selected model and starts the run from its primary action.
-Its center shows persistent training plots; the Output card opens saved runs
-and inspects full checkpoints for resume. EMA is optional and off by default.
+Its center shows a selectable chart dashboard with a separate live progress
+card. Train and validation inputs are required; the final-test split is optional.
+The Output card edits the destination, explicitly opens saved runs, and inspects
+full checkpoints for resume. EMA is optional and off by default.
 Validate combines detailed metrics with up to six sample previews. Predict is a
 quick visual check for compiled data, an image, or a local video, with
 Pause/Resume/Stop for video.
 
 The [RF-DETR workflow guide](docs/rfdetr-workflows.md) covers class identity,
 metrics, output files, and continuation. Current native checkpoints use version
-3 and saved plots require the current run format; older application checkpoints
+3 and saved plots require run format 2; older application checkpoints
 and old output-directory history are unsupported. Upstream weights and compiled
 dataset format 7 keep their own supported input routes.
 

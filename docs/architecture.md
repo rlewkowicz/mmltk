@@ -132,6 +132,15 @@ wait, console, and CLI-option helpers live under
 [src/test_support](../src/test_support); domain fixtures remain with their
 components.
 
+The retained
+[logging module](../src/common/logging/mmltk_logging.cppm) owns optional native
+logging and bounded fatal reporting at ordinary terminal boundaries. Its
+[implementation](../src/common/logging/mmltk_logging.cpp) keeps stderr failure
+visibility independent of logger initialization and optional file sinks.
+Entrypoints choose the failure context and exit policy; the
+[logging guide](logging.md#fatal-stderr-reports) defines the report and process
+status behavior.
+
 ## Native/Rust boundary
 
 Start at
@@ -155,6 +164,15 @@ declares each producer's frame/revision relation and image projection;
 schema materialization derives native readers and
 [generated Rust observations](../src/controller/browser/application_visual_projection_emitter.h)
 from the same facts.
+
+The [application binding generator](../src/controller/browser/application_binding_generator.cpp)
+also derives typed scalar selectors and inventories from canonical training
+and evaluation declarations. Nested reflected objects and fixed arrays retain
+their field identity; generated access checks array bounds and preserves
+optional values. Boolean/integer metadata participates in the inventory without
+being converted into floating-point chart values. The Rust chart catalog
+selects generated identities and owns visual grouping, labels, and ordering;
+it does not mirror native member access or introduce a runtime string registry.
 
 The separate
 [application_workspace_abi_emitter.h](../src/controller/browser/application_workspace_abi_emitter.h)
@@ -183,6 +201,18 @@ width, scrolling, and ordinary column composition, including Annotate.
 typed numeric widgets; Explore's local controls retain their domain-specific
 filter editing. The [interaction guide](gui-interaction.md#workflow-layout-and-navigation)
 owns the layout and input policies.
+
+Train's [metrics component](../src/frontend/iced/src/view/metrics.rs) owns chart
+selection and expansion. Its [catalog](../src/frontend/iced/src/view/metrics/catalog.rs)
+owns visual metric policy, [history](../src/frontend/iced/src/view/metrics/history.rs)
+owns independent bounded live/saved summaries and gaps, and
+[chart](../src/frontend/iced/src/view/metrics/chart.rs) owns retained plot/series
+projection. The separate
+[progress card](../src/frontend/iced/src/view/train/progress.rs) presents current
+native operation facts independently of selected history. The
+[GUI guide](gui-interaction.md#training-dashboard) owns interaction and rendering
+details; [RF-DETR workflows](rfdetr-workflows.md#live-training-progress) owns
+the native counts and timing semantics.
 
 The [GUI interaction guide](gui-interaction.md#typed-application-boundary)
 owns the current protocol, compact input representation, native command

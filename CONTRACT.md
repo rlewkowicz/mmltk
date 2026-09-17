@@ -148,16 +148,18 @@ Training owns current-format history and validated checkpoint continuation;
 Rust/Iced owns a bounded retained chart dashboard in the aspect-selected center
 workspace, defaulting to 16:9. Selected charts fit the available workspace without
 internal scrolling and expand within that same region; wheel input belongs to
-the ordinary page scroller. Live training progress appears in a separate card
-below the charts, using current native image counts and measured rates independently
-of explicitly selected saved history. Sparse scheduled evaluation observations
-remain separate from live training samples and final-test products. Only the
-selected evaluation weights are plotted; validation loss is not calculated or
-plotted by the GUI. Validation owns
-detailed metrics and up to six retained samples from its evaluation pass, with
-paired prediction/ground-truth geometry and a detail viewer. Prediction
-incrementally processes compiled images, ordinary images, and local video,
-retaining the latest completed preview through completion or cancellation.
+the ordinary page scroller. Retained chart interaction survives expansion,
+hiding, and navigation. Live training progress appears in a separate card
+below the charts, using current native image counts and measured rates
+independently of explicitly selected saved history. Sparse scheduled evaluation
+observations remain separate from live training samples and final-test products.
+Only the selected evaluation weights are plotted; validation loss is not
+calculated or plotted by the GUI.
+
+Validation owns detailed metrics and up to six retained samples from its
+evaluation pass, with paired prediction/ground-truth geometry and a detail viewer.
+Prediction incrementally processes compiled images, ordinary images, and local
+video, retaining the latest completed preview through completion or cancellation.
 GUI prediction uses one image per batch; video has pause, resume, and stop.
 
 Training admits target populations above the model's query count while retaining

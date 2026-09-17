@@ -315,7 +315,7 @@ standalone evidence-audit cases.
 | Hardware entrypoint | Process lifetimes and required behavior |
 | --- | --- |
 | `workspace_wayland_retained` | One H2D browser: square/capacity growth, full controls including integer typing/paste, cached and held-miss gallery/detail returns, Detail-open resizing in both orientations, augmentation retention, fractional rows, circular wrap, partial final row, wide/tall layouts, local labels/native semantics, light/dark copy with shared Annotate layout and long lists, FPS, rapid changes, then SIGINT |
-| `workspace_wayland_workflows` | One H2D browser: actual Train start and hidden-tab progress, rendered chart data, validation metrics and six sample/detail previews, compiled/image/video prediction, Pause/Resume/EOF/Stop, light/dark and minimum-width chart pixels, then SIGINT |
+| `workspace_wayland_workflows` | One H2D browser: actual Train start, live progress pixels and hidden-tab progress, chart data/selection/aspects and retained camera/legend interaction, validation metrics and six sample/detail previews, compiled/image/video prediction, Pause/Resume/EOF/Stop, light/dark and minimum-width chart pixels, then SIGINT |
 | `workspace_wayland_dpi` | One H2D browser at DPI 1.5: light/dark copy and rapid changes |
 | `workspace_wayland_terminal` | Two H2D browsers: a real window close and abrupt browser-peer loss after an Annotation edit, exact completed draw, and independent redraw |
 | `workspace_wayland_probe_recovery` | Four H2D browsers with startup-latched allocation, reset, begin, or end probe failure; exact-content recovery and complete final pixel/semantic evidence |
@@ -364,12 +364,20 @@ The workflow case uses
 and the real packaged desktop's sibling CLI, prediction, and validation systems.
 Its [frontend workflow driver](../src/frontend/iced/src/integration_control/workflows.rs)
 uses normal primary actions and viewers. It separately requires typed terminal
-stages and canvas pixel observations for Train curves, all six thumbnails,
-detail, each prediction source, retained Stop output, and theme/narrow layouts.
-It checks the absence of Train's native image workspace and Train/Validate
-aspect selectors. Sparse chart markers preserve missing intervals; axes and
-legends alone cannot satisfy the curve-pixel assertion. These functional
-checks do not establish numerical overhead or throughput.
+stages and canvas pixel observations for Train curves, the isolated live
+progress bar, all six thumbnails, detail, each prediction source, retained Stop
+output, and theme/narrow layouts. Progress evidence pairs the bar capture with
+observed native image counts during the Train phase; hidden-tab evidence then
+requires metric sequence advancement.
+
+The same case pans the chart and changes its legend through browser input,
+then requires settled camera/legend retention through expansion, return to the
+grid, hide/reveal, and navigation. Wheel checks cover plot, axes, and legend
+with ordinary and modified input while preserving the camera. It exercises
+Train's aspect selector and checks the absence of Train's native image workspace
+and Validate's aspect selector. Sparse chart markers preserve missing intervals;
+axes and legends alone cannot satisfy the curve-pixel assertion. These
+functional checks do not establish numerical overhead or throughput.
 
 Explore acceptance follows actual measured N/N+1/N visible-row changes,
 forward/reverse demand, exact cached cells, and an independently held visible
@@ -385,6 +393,12 @@ requires the reconciled viewport, paired completed atlas draw, visible ready
 cells, and coverage of newly visible lower rows. The driver changes only
 temporary inline canvas dimensions so the normal resize observer runs; it
 restores the original dimensions before subsequent scenarios.
+
+The retained semantics scenario joins labels and overlays to the exact
+original and derived detail draws. Its integration fixture holds the initial
+automatic Basic upscale during the original-detail/overlay stages, then
+releases that hold and exercises derived methods through normal UI actions.
+Square, wide, and tall scenarios retain automatic Basic coverage.
 
 The initial general UI scenario audits Explore's five dataset integer inputs:
 minimum/maximum instances, shuffle seed, and first/last compiled index. It
@@ -459,25 +473,29 @@ sessions retain ordinary clipboard permissions.
 | Existing target | Evidence it owns |
 | --- | --- |
 | `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, rejection, and cancellation |
-| `mmltk_controller_data_compute_systems_tests` | Start/input admission, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
-| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
+| `mmltk_controller_services_tests` | Independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
+| `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
+| `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
 | `mmltk_controller_explore_tests` | Explore domain admission, settings/filter persistence, thumbnail identity, viewport priority, augmentation refresh, staged replacement, cancellation, and failure |
 | `mmltk_controller_upscale_tests` | Exact receiver copies, retained derived results, method selection/warmup, activation, cancellation, and resource retirement |
 | `mmltk_controller_live_tests` | Live receiver completion/failure, queued cancellation, and settled snapshots |
 | `mmltk_controller_visual_systems_tests` | Shared visual runtime, presentation protocol/custody, native gallery cache/priority/atlas integration, acceptance gates, and cross-system workspace behavior |
 | `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, receiver/device transfers, acquisition/release/settlement, pressure, failure, and retirement |
-| `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, and independent prepared/released artifacts |
+| `mmltk_acceptance` | Compiled-dataset Explore integration, retained residency, projection, control-reader settlement, independent prepared/released artifacts, and bounded fatal reporting with disabled/uninitialized/failed sinks and broken pipes |
+| `mmltk_entrypoints_cli_tests` and `mmltk_entrypoints_tools_tests` | CLI/ONNX fatal stderr, logging overrides and named file identities, and preserved command exit behavior |
+| `mmltk_entrypoints_desktop_tests` and `mmltk_controller_firefox_process_tests` | Desktop startup/child failure status, exact launch OS errors, unexpected signal reporting, and quiet requested shutdown |
 | `mmltk_backend_imaging_explore_tests` | Rendered-card geometry, semantic planes, filtered padding fringes, and exact two-sided copy evidence |
 | `mmltk_backend_imaging_upscale_tests` | ONNX capture/replay, explicit allocation-counter ownership, and separate independent raster-oracle cases |
 | `mmltk_backend_imaging_resample_tests` | Independent CPU/CUDA perceptual-resampling values, checked views, completion, and resource custody |
 | `mmltk_backend_imaging_raster_tests` | Pitched BGR row orientation and planar float pixel conversion |
-| `browser-app` | Primary-action preparation, retained chart summaries/gaps and plot picking cancellation, validation viewer and video-control admission, shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
-| `workspace-wayland` | Real training/validation/prediction workflows and actual chart/sample/preview pixels, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
+| `browser-app` | Primary-action preparation, independent optional-test/output editing, generated scalar selection, bounded live/saved chart histories and gaps, camera/legend retention and plot picking cancellation, live progress availability, validation viewer and video-control admission, shared immediate mouse input and transport retention, typed state reduction, component/crop identity, retained gallery measurements and reconciliation, exact integer/filter reduction, shared layout/navigation, image metadata independent of logical snapshots, encoded/submitted draw custody, completed fallback through navigation, local labels, FPS submission counting, exact displayed gallery interaction, quiet failure receipts, and JavaScript probe/input/callback settlement |
+| `workspace-wayland` | Real training/validation/prediction workflows and actual chart/progress/sample/preview pixels, dashboard aspect/retention/wheel behavior, packaged integer typing/paste and spinner/wheel policy, Detail-open resize returns, shared Annotate layout and long-list reachability, retained sessions, native-source/browser-arena identity, negotiated direct/copy draws, recovery, and shutdown |
 
 RF-DETR backend evidence is separately owned by the core evaluator/matcher/class
-layout cases, training checkpoint/continuation/EMA/telemetry cases, inference
-session/JSON cases, and ML CUDA readback/context cases selected by `--test rfdetr`.
+layout cases, training checkpoint/continuation/EMA/telemetry and native image-count
+cases, inference session/JSON cases, and ML CUDA readback/context cases selected
+by `--test rfdetr`.
 `mmltk_backend_data_tests` owns compilation, loading, acquisition, and exact
 compiled-catalog cases; `--test core` also selects the separate resampling
 target above. These checks cover functional values, boundaries, failure, and
