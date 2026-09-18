@@ -19,6 +19,7 @@ pub(crate) use probe::{record_probe_draw, report_surface_draw, report_workspace_
 mod annotation_checks;
 mod annotation_product;
 mod reporting;
+pub(crate) use reporting::primary_action_draw;
 pub(crate) use reporting::metric_projection as report_metric_projection;
 mod workflows;
 
@@ -159,6 +160,7 @@ const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    PrimaryActionPixels { control: String, active: bool },
     WorkflowPixels {
         picture: workflows::Picture,
         index: u8,
@@ -1633,6 +1635,10 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
+            Message::PrimaryActionPixels { control, active } => {
+                self.workflows.primary_action_pixels(&self.driver, &control, active);
+                return None;
+            }
             Message::WorkflowPixels {
                 picture,
                 index,

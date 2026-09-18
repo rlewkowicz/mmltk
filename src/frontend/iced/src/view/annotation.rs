@@ -273,9 +273,10 @@ impl Component {
                 .style(crate::fluent_theme::button_secondary),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Annotate,
-                "Save annotations",
+                model.primary_action_active(crate::generated::FeatureId::Annotate),
                 (settings_settled && model.annotation_save_available())
                     .then_some(Message::SaveRequested),
+                None,
                 column![].into(),
             ),
         ]

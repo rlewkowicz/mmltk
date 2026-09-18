@@ -3,11 +3,12 @@ pub mod loading;
 pub mod model_card;
 pub mod overlay_controls;
 pub mod progress;
+mod primary_action;
 pub mod status;
 
 use crate::fluent_theme::Element;
-use iced::widget::{button, column, container, text};
-use iced::{Fill, Font, Length, Padding};
+use iced::widget::container;
+use iced::{Fill, Length, Padding};
 
 pub const SIDEBAR_PORTION: f32 = 0.19;
 pub const WORKSPACE_PORTION: f32 = 0.62;
@@ -25,11 +26,12 @@ pub enum Region {
     PrimaryProgress,
     PrimaryAction,
     Status,
+    PrimaryCard,
 }
 
 const SHELL_REGIONS: [Region; 3] = [Region::Setup, Region::Center, Region::Diagnostics];
 const CENTER_REGIONS: [Region; 2] = [Region::Workspace, Region::Advanced];
-const AUDIT_REGIONS: [Region; 8] = [
+const AUDIT_REGIONS: [Region; 9] = [
     Region::Setup,
     Region::Center,
     Region::Workspace,
@@ -38,6 +40,7 @@ const AUDIT_REGIONS: [Region; 8] = [
     Region::PrimaryProgress,
     Region::PrimaryAction,
     Region::Status,
+    Region::PrimaryCard,
 ];
 pub fn ordinary_pages() -> impl Iterator<Item = crate::generated::FeatureId> {
     crate::view::navigation::ORDER
@@ -86,8 +89,12 @@ impl Composition {
         &CENTER_REGIONS
     }
 
-    pub const fn audit_regions(self) -> &'static [Region] {
-        &AUDIT_REGIONS
+    pub fn audit_regions(self) -> &'static [Region] {
+        if matches!(self.page, crate::generated::FeatureId::Train | crate::generated::FeatureId::Validate | crate::generated::FeatureId::Predict | crate::generated::FeatureId::Export) {
+            &AUDIT_REGIONS
+        } else {
+            &AUDIT_REGIONS[..8]
+        }
     }
 
     pub const fn stable_id(self, region: Region) -> &'static str {
@@ -97,6 +104,13 @@ impl Composition {
             Region::Workspace => "workflow.workspace",
             Region::Advanced => "workflow.advanced",
             Region::Diagnostics => "workflow.diagnostics",
+            Region::PrimaryCard => match self.page {
+                crate::generated::FeatureId::Train => "train.card.dataset",
+                crate::generated::FeatureId::Validate => "validate.card.inputs",
+                crate::generated::FeatureId::Predict => "predict.card.inputs",
+                crate::generated::FeatureId::Export => "export.card.output",
+                _ => unreachable!("this workflow does not audit a preceding primary card"),
+            },
             Region::PrimaryProgress => match self.page {
                 crate::generated::FeatureId::Train => "train.primary.progress",
                 crate::generated::FeatureId::Validate => "validate.primary.progress",
@@ -286,45 +300,7 @@ pub fn view<'a, Message: 'a>(
         .into()
 }
 
-pub fn primary_action<'a, Message: Clone + 'a>(
-    page: crate::generated::FeatureId,
-    label: &'static str,
-    on_press: Option<Message>,
-    progress: Element<'a, Message>,
-) -> Element<'a, Message> {
-    let composition = Composition::new(page, 0.0);
-    let label = text(label)
-        .font(Font::new("Bitstream Vera Sans").weight(iced::font::Weight::Bold))
-        .size(16)
-        .width(Fill)
-        .height(Fill)
-        .align_x(iced::Center)
-        .align_y(iced::Center);
-    let action = button(label)
-        .on_press_maybe(on_press)
-        .style(crate::fluent_theme::button_workflow_primary)
-        .padding(0)
-        .width(Fill)
-        .height(Fill);
-    let framed = container(action)
-        .id(composition.stable_id(Region::PrimaryAction))
-        .padding(1)
-        .width(Fill)
-        .height(Length::Fixed(PRIMARY_ACTION_HEIGHT))
-        .style(crate::fluent_theme::container_primary_frame);
-    column![
-        container(progress)
-            .id(composition.stable_id(Region::PrimaryProgress))
-            .padding(Padding {
-                bottom: 1.0,
-                ..Padding::ZERO
-            })
-            .width(Fill),
-        framed
-    ]
-    .spacing(FIELD_SPACING)
-    .into()
-}
+pub use primary_action::view as primary_action;
 
 #[cfg(test)]
 mod tests {
@@ -364,6 +340,7 @@ mod tests {
                 Region::PrimaryProgress,
                 Region::PrimaryAction,
                 Region::Status,
+                Region::PrimaryCard,
             ]
         );
     }
@@ -385,7 +362,7 @@ mod tests {
         for page in ordinary_pages() {
             assert_ne!(page, crate::generated::FeatureId::Explore);
             let composition = Composition::new(page, 1200.0);
-            assert_eq!(composition.audit_regions().len(), 8);
+            assert_eq!(composition.audit_regions().len(), if matches!(page, crate::generated::FeatureId::Live | crate::generated::FeatureId::Annotate) { 8 } else { 9 });
             assert!(!composition.stable_id(Region::PrimaryAction).is_empty());
             assert!(!composition.stable_id(Region::PrimaryProgress).is_empty());
             assert!(!composition.stable_id(Region::Status).is_empty());

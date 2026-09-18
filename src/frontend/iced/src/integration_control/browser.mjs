@@ -39,6 +39,7 @@ export function mmltkIntegrationInitialize(enabled) {
     compositionPending: false,
     canvasScratch: undefined,
     canvasContext: undefined,
+    primaryActions: new Map(),
     fpsDraw: undefined,
     fpsPending: undefined,
     integrationRenderKey: 0,
@@ -383,6 +384,103 @@ function canvasPixelBounds(canvas, cssBounds, control) {
   report({event: 'integration.canvas_probe_geometry', control, detail: 'css-to-backing-pixels',
     canvas: [canvas.width, canvas.height], css: [css.width, css.height], css_bounds: cssBounds, pixel_bounds: pixels});
   return pixels;
+}
+
+// Bounded acceptance-only sampling of the actual composited canvas. The six
+// entries retain only the latest draw and two active captures; this never
+// schedules application redraws or influences operation admission.
+export function mmltkIntegrationPrimaryAction(control, label, active, dark, facts) {
+  const owner = integrationState;
+  if (!owner || !integrationDriver) return;
+  const width = Math.round(facts[2]);
+  let state = owner.primaryActions.get(control);
+  if (!state || state.label !== label || state.active !== active || state.dark !== dark || state.width !== width || state.scale !== facts[8]) {
+    state = {label, active, dark, width, scale: facts[8], captures: 0, attempts: 0, pending: false, phase: undefined,
+      latest: {label, active, dark, facts: new Float64Array(13), time: 0}};
+    owner.primaryActions.set(control, state);
+  }
+  if (state.captures >= (active ? 2 : 1)) {
+    if (!state.notified) { state.notified = true; return true; }
+    return false;
+  }
+  if (state.attempts >= 32) return false;
+  state.latest.facts.set(facts);
+  state.latest.time = performance.now();
+  if (state.pending) return;
+  if (active && state.phase !== undefined && ((facts[9] - state.phase + 1) % 1) < 0.025) return;
+  state.pending = true;
+  integrationFrame(() => integrationFrame(() => {
+    state.pending = false;
+    if (integrationState !== owner || owner.primaryActions.get(control) !== state || performance.now() - state.latest.time > 250) return;
+    const draw = state.latest;
+    const [x,y,w,h,cx,cy,cw,ch,scale,phase,red,green,blue] = draw.facts;
+    // A clipped action cannot supply a complete perimeter observation.
+    if (cx > x + 0.1 || cy > y + 0.1 || cx+cw < x+w-0.1 || cy+ch < y+h-0.1) return;
+    try {
+      const canvas = document.querySelector('canvas');
+      if (!canvas || (x+w)*scale > canvas.width || (y+h)*scale > canvas.height) return;
+      const snapshot = canvasSnapshot(canvas);
+      const pixels = snapshot.getImageData(Math.floor(x*scale), Math.floor(y*scale), Math.ceil(w*scale)+1, Math.ceil(h*scale)+1);
+      const at = (px,py) => {
+        const ix = Math.floor((x+px)*scale)-Math.floor(x*scale), iy = Math.floor((y+py)*scale)-Math.floor(y*scale);
+        return pixels.data.subarray((iy*pixels.width+ix)*4,(iy*pixels.width+ix)*4+3);
+      };
+      const core = at(6, h/2);
+      const stop = draw.active && control !== 'annotation.save';
+      const coreCorrect = stop ? core[0] > core[1]+20 && core[0] > core[2]+15 : core[1] > core[0]+60 && core[1] > core[2]+40;
+      const straight = [w-20, h-20], radius = 8.5, arc = Math.PI*radius/2;
+      const perimeter = 2*(straight[0]+straight[1])+4*arc;
+      const point = distance => {
+        for (let side=0; side<4; ++side) {
+          const length = straight[side%2];
+          if (distance <= length) return [[10+distance,1.5,0,-1],[w-1.5,10+distance,1,0],[w-10-distance,h-1.5,0,1],[1.5,h-10-distance,-1,0]][side];
+          distance -= length;
+          if (distance <= arc) {
+            const center = [[w-10,10],[w-10,h-10],[10,h-10],[10,10]][side];
+            const angle = -Math.PI/2+side*Math.PI/2+distance/radius;
+            return [center[0]+radius*Math.cos(angle),center[1]+radius*Math.sin(angle),Math.cos(angle),Math.sin(angle)];
+          }
+          distance -= arc;
+        }
+        return [10,1.5,0,-1];
+      };
+      const samples = 400, ring = [], expected = [red*255,green*255,blue*255];
+      let mismatch = 0, compared = 0, bandLeaks = 0;
+      for (let index=0;index<samples;++index) {
+        const fraction = (index+0.5)/samples, [px,py,nx,ny] = point(fraction*perimeter);
+        const pixel = at(px,py), inner = at(px-nx*3,py-ny*3);
+        bandLeaks += Number(Math.hypot(...expected.map((channel,i)=>channel-inner[i])) < 95);
+        const isBlue = Math.hypot(...expected.map((channel,i)=>channel-pixel[i])) < 95;
+        ring.push(isBlue);
+        const within = ((fraction-phase)%0.1+0.1)%0.1;
+        // Ignore AA and a single compositor-frame ambiguity at a moving end.
+        if (Math.min(within, Math.abs(within-0.05), 0.1-within)*perimeter > 3) {
+          ++compared;
+          mismatch += Number(isBlue !== (draw.active && within < 0.05));
+        }
+      }
+      let segments = 0;
+      const lengths = [];
+      for (let i=0;i<samples;++i) if (ring[i] && !ring[(i+samples-1)%samples]) {
+        ++segments;
+        let length=1;
+        while (length<samples && ring[(i+length)%samples]) ++length;
+        lengths.push(length);
+      }
+      const valid = coreCorrect && bandLeaks===0 && (draw.active ? segments===10 && lengths.every(length=>length>=15 && length<=25) && mismatch<=compared*0.12 : segments===0);
+      if (!valid) {
+        ++state.attempts;
+        report({event:'integration.primary_action.rejected',control,detail:'primary action canvas mismatch',label:draw.label,segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,phase});
+        return;
+      }
+      report({event:'integration.primary_action.pixels',control,label:draw.label,active:draw.active,dark:draw.dark,phase,
+        segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,width:w,height:h,scale,blue:expected});
+      state.phase = phase;
+      ++state.captures;
+    } catch (error) {
+      report({event:'integration.failed',control,detail:`primary action canvas read: ${error}`});
+    }
+  }));
 }
 
 export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation, completed) {

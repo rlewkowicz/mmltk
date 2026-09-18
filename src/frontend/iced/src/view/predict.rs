@@ -176,14 +176,9 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING),
                 )
             ),
-            text(
-                model
-                    .workflow
-                    .start_detail(crate::generated::FeatureId::Predict)
-            ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Predict,
-                "Run prediction",
+                model.primary_action_active(crate::generated::FeatureId::Predict),
                 settings
                     .draft
                     .as_ref()
@@ -191,6 +186,7 @@ impl Component {
                         model.compute_start_available(draft, crate::generated::FeatureId::Predict)
                     })
                     .then_some(Message::StartRequested),
+                model.compute_stop_available(crate::generated::FeatureId::Predict).then_some(Message::StopRequested),
                 crate::view::workflow::progress::compute(operation),
             ),
         ]

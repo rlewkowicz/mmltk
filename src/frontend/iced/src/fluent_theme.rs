@@ -51,6 +51,14 @@ pub fn button_workflow_primary(
     }
 }
 
+pub fn button_workflow_stop(theme: &Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
+    let mut style = button_workflow_primary(theme, status);
+    style.background = button_danger(theme, if status == iced::widget::button::Status::Disabled {
+        iced::widget::button::Status::Active
+    } else { status }).background;
+    style
+}
+
 pub fn button_secondary(
     theme: &Theme,
     status: iced::widget::button::Status,
@@ -304,6 +312,25 @@ fn fill(background: Color, foreground: Color) -> iced::widget::container::Style 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_stop_preserves_geometry_and_danger_interaction_in_both_themes() {
+        use iced::widget::button::Status;
+        for dark in [false, true] {
+            let theme = app_theme(dark);
+            for status in [Status::Active, Status::Hovered, Status::Pressed, Status::Disabled] {
+                let idle = button_workflow_primary(&theme, status);
+                let stop = button_workflow_stop(&theme, status);
+                assert_eq!(stop.border, idle.border);
+                assert_eq!(stop.shadow, idle.shadow);
+                assert_eq!(stop.text_color, Color::WHITE);
+                assert_eq!(stop.background, button_danger(&theme, if status == Status::Disabled { Status::Active } else { status }).background);
+            }
+            let frame = container_primary_frame(&theme);
+            assert_eq!(frame.border.width, 1.0);
+            assert_eq!(frame.border.radius.top_left, 11.0);
+        }
+    }
 
     #[test]
     fn fluent_light_and_dark_themes_preserve_the_requested_mode() {

@@ -90,6 +90,13 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
     validate.request.batch_size = 2;
     validate.request.h2d_dataloader = true;
     validate.request.report_json_path = output / "validation.json";
+    auto& export_state = settings.workflows.export_state;
+    export_state.model_source = contracts::ModelSelectionSource::Custom;
+    export_state.model_input = contracts::ModelArtifactInputKind::Weights;
+    export_state.weights_path = weights_;
+    export_state.model_resolution = 64;
+    export_state.build_tensorrt = false;
+    export_state.onnx_output_path = output / "cancelled-export.onnx";
     auto& predict = settings.workflows.predict;
     predict.model_source = contracts::ModelSelectionSource::Custom;
     predict.model_input = contracts::ModelArtifactInputKind::Weights;

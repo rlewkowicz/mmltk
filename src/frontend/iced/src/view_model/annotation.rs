@@ -3,10 +3,16 @@ use super::UiError;
 #[derive(Debug, Clone, Default)]
 pub struct AnnotationModel {
     pub snapshot: Option<crate::generated::AnnotationSnapshot>,
+    save_admission: Option<u64>,
+    settled_revision: u64,
     pending_frame: Option<crate::generated::AnnotationFrameState>,
 }
 
 impl AnnotationModel {
+    pub fn save_active(&self) -> bool {
+        self.save_admission.is_some()
+    }
+
     pub(super) fn install_snapshot(
         &mut self,
         mut incoming: crate::generated::AnnotationSnapshot,
@@ -39,6 +45,14 @@ impl AnnotationModel {
                 } else {
                     keep_pending = frame.uirevision >= incoming.uirevision;
                 }
+            }
+        }
+        // Retain ordered idle settlement even when a later unrelated command
+        // has overtaken it, or when the Save admission reply arrives last.
+        if !incoming.busy {
+            self.settled_revision = self.settled_revision.max(incoming.uirevision);
+            if self.save_admission.is_some_and(|revision| revision <= self.settled_revision) {
+                self.save_admission = None;
             }
         }
         let observation = match self.snapshot.as_ref() {
@@ -161,6 +175,10 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
     }
 
     fn project_annotation_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
+        if let ApplicationReply::AnnotationSave(snapshot) = &reply {
+            self.annotation.save_admission = (snapshot.busy && snapshot.uirevision > self.annotation.settled_revision)
+                .then_some(snapshot.uirevision);
+        }
         let snapshot = match reply {
             ApplicationReply::AnnotationOpen(snapshot)
             | ApplicationReply::AnnotationEdit(snapshot)
@@ -177,6 +195,53 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepted_save_survives_reply_until_native_settlement_in_either_order() {
+        use crate::generated::{AnnotationApplicationProjection, ApplicationReply};
+        for terminal_first in [false, true] {
+            let mut model = super::super::test_support::bootstrapped();
+            let mut admitted = model.annotation.snapshot.clone().unwrap();
+            admitted.revision += 1;
+            admitted.uirevision = admitted.revision;
+            admitted.busy = true;
+            let mut terminal = admitted.clone();
+            terminal.revision += 1;
+            terminal.uirevision = terminal.revision;
+            terminal.busy = false;
+            if terminal_first { model.annotation.install_snapshot(terminal.clone()).unwrap(); }
+            model.project_annotation_reply(1, ApplicationReply::AnnotationSave(admitted));
+            assert_eq!(model.annotation.save_active(), !terminal_first);
+            model.annotation.install_snapshot(terminal.clone()).unwrap();
+            assert!(!model.annotation.save_active());
+            terminal.revision += 1;
+            terminal.uirevision = terminal.revision;
+            terminal.busy = true;
+            model.annotation.install_snapshot(terminal).unwrap();
+            assert!(!model.annotation.save_active(), "unrelated work cannot restart save animation");
+        }
+    }
+
+    #[test]
+    fn an_unrelated_command_cannot_revive_a_save_whose_terminal_event_preceded_its_reply() {
+        use crate::generated::{AnnotationApplicationProjection, ApplicationReply};
+        let mut model = super::super::test_support::bootstrapped();
+        let mut admitted = model.annotation.snapshot.clone().unwrap();
+        admitted.revision += 1;
+        admitted.uirevision = admitted.revision;
+        admitted.busy = true;
+        let mut later = admitted.clone();
+        later.revision += 1;
+        later.uirevision = later.revision;
+        later.busy = false;
+        model.annotation.install_snapshot(later.clone()).unwrap();
+        later.revision += 1;
+        later.uirevision = later.revision;
+        later.busy = true;
+        model.annotation.install_snapshot(later).unwrap();
+        model.project_annotation_reply(1, ApplicationReply::AnnotationSave(admitted));
+        assert!(!model.annotation.save_active());
+    }
+
     #[test]
     fn logical_ui_and_frame_observations_keep_revision_order() {
         let mut model = super::super::test_support::bootstrapped().annotation;

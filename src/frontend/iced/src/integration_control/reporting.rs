@@ -16,6 +16,23 @@ use crate::view_model::ApplicationModel;
 use iced::Rectangle;
 use std::cell::RefCell;
 
+/// Only the opt-in acceptance observer sees presentation facts. It cannot
+/// change execution, widget identity, redraw scheduling, or GPU resource custody.
+pub(crate) fn primary_action_draw(control: &str, label: &str, active: bool, dark: bool, phase: f32, bounds: Rectangle, clip: Rectangle, scale: f32, blue: iced::Color) {
+    if !reporting_enabled() { return; }
+    #[cfg(target_arch = "wasm32")]
+    if primary_action_js(control, label, active, dark, &[
+        f64::from(bounds.x), f64::from(bounds.y), f64::from(bounds.width), f64::from(bounds.height),
+        f64::from(clip.x), f64::from(clip.y), f64::from(clip.width), f64::from(clip.height),
+        f64::from(scale), f64::from(phase), f64::from(blue.r), f64::from(blue.g), f64::from(blue.b),
+    ]) && let Some(mut output) = probe::scenario_output() {
+        output.receipt = None;
+        output.send(super::Message::PrimaryActionPixels { control: control.to_owned(), active });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (control, label, active, dark, phase, bounds, clip, scale, blue);
+}
+
 pub(super) fn chart_view(stage: &str, view: &crate::view::metrics::ChartView) {
     emit(|sink| {
         sink.record(
@@ -231,6 +248,9 @@ thread_local! {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/integration_control/browser.mjs")]
 extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPrimaryAction)]
+    fn primary_action_js(control: &str, label: &str, active: bool, dark: bool, facts: &[f64]) -> bool;
+
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReport)]
     fn report_js(event: &str, control: &str, detail: &str, a: f64, b: f64, c: f64, d: f64);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationRenderedStyle)]

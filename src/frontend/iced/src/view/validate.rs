@@ -128,14 +128,9 @@ impl Component {
                     .spacing(crate::view::workflow::FIELD_SPACING)
                 )
             ),
-            text(
-                model
-                    .workflow
-                    .start_detail(crate::generated::FeatureId::Validate)
-            ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Validate,
-                "Run validation",
+                model.primary_action_active(crate::generated::FeatureId::Validate),
                 settings
                     .draft
                     .as_ref()
@@ -143,6 +138,7 @@ impl Component {
                         model.compute_start_available(draft, crate::generated::FeatureId::Validate)
                     })
                     .then_some(Message::StartRequested),
+                model.compute_stop_available(crate::generated::FeatureId::Validate).then_some(Message::StopRequested),
                 progress,
             ),
         ]

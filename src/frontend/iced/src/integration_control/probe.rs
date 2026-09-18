@@ -489,6 +489,7 @@ impl Requests {
                                 | Message::NumberPasteRead { .. }
                                 | Message::GalleryMouseDelivered
                                 | Message::WorkflowPixels { .. }
+                                | Message::PrimaryActionPixels { .. }
                                 | Message::ChartInputDelivered(_)
                         ),
                     }

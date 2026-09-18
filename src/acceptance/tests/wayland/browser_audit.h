@@ -164,6 +164,10 @@ struct BrowserAudit final {
     std::array<Bounds, 5> settings_numeric_values;
     bool bounds_valid = true;
     bool fluent = false;
+    std::set<std::string, std::less<>> primary_idle_labels;
+    std::map<std::string, double, std::less<>> primary_phases;
+    std::set<std::string, std::less<>> primary_phase_progress;
+    std::set<bool> primary_active_themes;
     std::set<std::string, std::less<>> shared_primary;
     std::map<std::string, std::array<double, 4>, std::less<>> shared_primary_colors;
     std::map<std::string, std::uint64_t, std::less<>> rendered_style_keys;

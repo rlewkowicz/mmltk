@@ -145,6 +145,13 @@ pub(super) enum Step {
     Restarted,
     Stop,
     Stopped,
+    Export,
+    PrepareExport,
+    StartExport,
+    Exporting,
+    StopExport,
+    ExportStopped,
+    ExportReturn,
     Theme,
     Dark,
     DarkReady,
@@ -168,6 +175,9 @@ pub(super) struct State {
     pixel_presentation: u64,
     pixel_attempts: u8,
     validation_layer: u8,
+    export_pixels: bool,
+    primary_pixels: [bool; 3],
+    export_narrow: bool,
 }
 
 fn atlas_cell(bounds: Rectangle, index: u8) -> Rectangle {
@@ -198,6 +208,24 @@ mod tests {
     use super::{Picture, Step};
     use crate::integration_control::pixel_checks::ProbeOutcome;
     use crate::integration_control::{Message, Phase};
+
+    #[test]
+    fn export_stop_requires_current_active_primary_canvas_completion() {
+        let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+        let controller = &mut fixture.controller;
+        controller.driver.phase = Phase::Workflows(Step::Exporting);
+        let generation = controller.driver.generation;
+        let completion = |generation, active| Message::Scoped {
+            generation, receipt: None,
+            message: Box::new(Message::PrimaryActionPixels { control: "export.primary".into(), active }),
+        };
+        let _ = controller.update(completion(generation.wrapping_sub(1), true));
+        assert!(!controller.workflows.export_pixels);
+        let _ = controller.update(completion(generation, false));
+        assert!(!controller.workflows.export_pixels);
+        let _ = controller.update(completion(generation, true));
+        assert!(controller.workflows.export_pixels);
+    }
 
     #[test]
     fn chart_input_completion_requires_current_scenario_and_successful_settlement() {
@@ -297,6 +325,16 @@ impl State {
         true
     }
 
+    pub(super) fn primary_action_pixels(&mut self, driver: &Driver, control: &str, active: bool) {
+        if !active { return; }
+        for (index, feature) in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict].into_iter().enumerate() {
+            if control == primary(feature) { self.primary_pixels[index] = true; }
+        }
+        if driver.phase == Phase::Workflows(Step::Exporting) && control == primary(FeatureId::Export) {
+            self.export_pixels = true;
+        }
+    }
+
     pub(super) fn workflow_step(&mut self, driver: &mut Driver, step: Step) -> Task<RootMessage> {
         driver.advance_to(Phase::Workflows(step))
     }
@@ -320,6 +358,8 @@ impl State {
                     | Step::ChartReturn
                     | Step::Validate
                     | Step::Predict
+                    | Step::Export
+                    | Step::ExportReturn
                     | Step::Theme
                     | Step::NoImageWorkspace
                     | Step::TrainAspect
@@ -374,7 +414,7 @@ impl State {
                     Picture::Compiled => Step::Source(1),
                     Picture::Image => Step::Source(2),
                     Picture::Video => Step::Restart,
-                    Picture::Stop => Step::Theme,
+                    Picture::Stop => Step::Export,
                     Picture::Theme => Step::Narrow,
                     Picture::Narrow => {
                         completed(
@@ -434,6 +474,10 @@ impl State {
             return;
         }
         match step {
+            Step::Training | Step::Validating | Step::Predicting(_) | Step::Exporting => {
+                driver.reporting.observe(|reporting| reporting.located(&driver.phase, control, bounds));
+                return;
+            }
             Step::ChartLegend | Step::ChartPan => {
                 driver.phase = Phase::Workflows(if step == Step::ChartLegend {
                     Step::ChartLegendPending
@@ -618,6 +662,13 @@ impl State {
             Step::Resume => Step::VideoEnd,
             Step::Restart => Step::Restarted,
             Step::Stop => Step::Stopped,
+            Step::Export => Step::PrepareExport,
+            Step::StartExport => {
+                self.export_pixels = false;
+                Step::Exporting
+            }
+            Step::StopExport => Step::ExportStopped,
+            Step::ExportReturn => Step::Pixels(Picture::Narrow, 0),
             Step::Theme => Step::Dark,
             _ => {
                 driver.fail("Unexpected workflow click continuation");
@@ -647,8 +698,20 @@ impl State {
         let success = |value: &crate::generated::ComputeUiState| {
             !value.active && value.terminal.outcome == ComputeOperationOutcome::Succeeded
         };
+        // Observe the primary through normal scrolling before progressing to
+        // another card. Native progress may increase the setup column height.
+        let primary_observation = match step {
+            Step::Training => Some((0, FeatureId::Train)),
+            Step::Validating => Some((1, FeatureId::Validate)),
+            Step::Predicting(_) => Some((2, FeatureId::Predict)),
+            _ => None,
+        };
+        if let Some((index, feature)) = primary_observation
+            && !self.primary_pixels[index] && model.primary_action_active(feature) {
+            return self.workflow_control(widgets, driver, primary(feature));
+        }
         match step {
-            Step::Train | Step::ReturnTrain | Step::Theme => self.workflow_control(
+            Step::Train | Step::ReturnTrain | Step::Theme | Step::ExportReturn => self.workflow_control(
                 widgets,
                 driver,
                 crate::view::navigation::stable_id(FeatureId::Train),
@@ -1080,7 +1143,7 @@ impl State {
                 self.workflow_step(driver, Step::Stop)
             }
             Step::Stop if model.compute_stop_available(FeatureId::Predict) => {
-                self.workflow_control(widgets, driver, "predict.stop")
+                self.workflow_control(widgets, driver, primary(FeatureId::Predict))
             }
             Step::Stopped
                 if prediction.is_some_and(|value| {
@@ -1098,6 +1161,31 @@ impl State {
                     ],
                 );
                 self.workflow_step(driver, Step::Pixels(Picture::Stop, 0))
+            }
+            Step::Export => self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Export)),
+            Step::PrepareExport if active == FeatureId::Export && settled
+                && settings.draft.as_ref().is_some_and(|draft| model.model_selection_available(draft, FeatureId::Export)) => {
+                self.generation = model.workflow.export.as_ref().map_or(0, |operation| operation.generationfrontier);
+                driver.phase = Phase::Workflows(Step::StartExport);
+                Task::done(RootMessage::Workspace(crate::view::router::Message::Export(
+                    crate::view::export::Message::Model(crate::view::workflow::model_card::Message::PrepareRequested))))
+            }
+            Step::StartExport if settings.draft.as_ref().is_some_and(|draft| model.compute_start_available(draft, FeatureId::Export)) => {
+                self.workflow_control(widgets, driver, primary(FeatureId::Export))
+            }
+            Step::Exporting if model.workflow.export.as_ref().is_some_and(|operation| operation.generationfrontier > self.generation && operation.active) => {
+                if self.export_pixels {
+                    self.workflow_step(driver, Step::StopExport)
+                } else {
+                    self.workflow_control(widgets, driver, primary(FeatureId::Export))
+                }
+            }
+            Step::StopExport if model.compute_stop_available(FeatureId::Export) => {
+                self.workflow_control(widgets, driver, primary(FeatureId::Export))
+            }
+            Step::ExportStopped if model.workflow.export.as_ref().is_some_and(|operation| !operation.active && operation.terminal.outcome == ComputeOperationOutcome::Cancelled) => {
+                completed(if self.export_narrow { "export_stop_narrow_dark" } else { "export_stop" }, [model.workflow.export.as_ref().unwrap().generationfrontier as f64, 0.0, 0.0, 0.0]);
+                self.workflow_step(driver, if self.export_narrow { Step::ExportReturn } else { Step::Theme })
             }
             Step::Dark if active == FeatureId::Train && settled => {
                 driver.phase = Phase::Workflows(Step::DarkReady);
@@ -1136,7 +1224,8 @@ impl State {
             Step::NarrowReady
                 if settled && (driver.input_scale - self.narrow_scale).abs() < 0.001 =>
             {
-                self.workflow_step(driver, Step::Pixels(Picture::Narrow, 0))
+                self.export_narrow = true;
+                self.workflow_step(driver, Step::Export)
             }
             Step::Pixels(picture, index) => {
                 if picture.chart() || picture == Picture::Progress {

@@ -937,6 +937,74 @@ mod tests {
     }
 
     #[test]
+    fn compute_primary_stop_routes_to_each_native_owner_once() {
+        for (page, endpoint) in [
+            (FeatureId::Train, ApplicationIntentEndpoint::TrainingStop),
+            (FeatureId::Validate, ApplicationIntentEndpoint::ValidationStop),
+            (FeatureId::Predict, ApplicationIntentEndpoint::PredictStop),
+            (FeatureId::Export, ApplicationIntentEndpoint::ExportSystemStop),
+        ] {
+            let (mut app, mut capture) = start_app();
+            let training = app.model.workflow.training.as_mut().unwrap();
+            training.activity = crate::generated::TrainingActivity::Local;
+            training.local.active = true;
+            training.local.terminal.outcome = crate::generated::ComputeOperationOutcome::Running;
+            for operation in [
+                &mut app.model.workflow.validation.as_mut().unwrap().operation,
+                &mut app.model.predict_snapshot.as_mut().unwrap().operation,
+                app.model.workflow.export.as_mut().unwrap(),
+            ] {
+                operation.active = true;
+                operation.terminal.outcome = crate::generated::ComputeOperationOutcome::Running;
+            }
+            let stop = |app: &mut App| match page {
+                FeatureId::Train => app.on_train(crate::view::train::Outcome::TrainingStopRequested),
+                FeatureId::Validate => app.on_validate(crate::view::validate::Outcome::StopRequested),
+                FeatureId::Predict => app.on_predict(crate::view::predict::Outcome::StopRequested),
+                FeatureId::Export => app.on_export(crate::view::export::Outcome::StopRequested),
+                _ => unreachable!(),
+            };
+            drop(stop(&mut app));
+            next_intent(&mut capture, endpoint);
+            assert!(app.model.primary_action_active(page));
+            drop(stop(&mut app));
+            assert!(capture.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn live_primary_routes_typed_start_and_stop_with_pending_reply_protection() {
+        let (mut app, mut capture) = start_app();
+        app.model.window_width = 64;
+        app.model.window_height = 64;
+        drop(app.on_live(crate::view::live::Outcome::StartRequested));
+        let start = next_intent(&mut capture, ApplicationIntentEndpoint::LiveStart);
+        assert!(app.model.primary_action_active(FeatureId::Live));
+        assert!(!app.model.live_stop_available());
+        let mut running = app.model.live_snapshot.clone().unwrap();
+        running.revision += 1;
+        running.running = true;
+        app.model.reduce_reply(start.correlation, Ok(crate::generated::ApplicationReply::LiveStart(running.clone())));
+        assert!(app.model.live_stop_available());
+        drop(app.on_live(crate::view::live::Outcome::StopRequested));
+        let stop = next_intent(&mut capture, ApplicationIntentEndpoint::LiveStop);
+        assert!(app.model.primary_action_active(FeatureId::Live));
+        assert!(!app.model.live_stop_available());
+        drop(app.on_live(crate::view::live::Outcome::StopRequested));
+        assert!(capture.try_recv().is_err());
+        running.revision += 1;
+        running.cancellationrequested = true;
+        app.model.reduce_reply(stop.correlation, Ok(crate::generated::ApplicationReply::LiveStop(running.clone())));
+        assert!(app.model.primary_action_active(FeatureId::Live));
+        assert!(!app.model.live_stop_available());
+        running.revision += 1;
+        running.running = false;
+        running.cancellationrequested = false;
+        app.model.reduce_event(crate::generated::ApplicationEvent::LiveLiveChanged(crate::generated::LiveChanged { snapshot: running }));
+        assert!(!app.model.primary_action_active(FeatureId::Live));
+    }
+
+    #[test]
     fn validation_navigation_refusal_preserves_the_viewer_without_busy_or_replay() {
         for message in validation_navigation() {
             for disconnected in [false, true] {

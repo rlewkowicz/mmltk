@@ -642,6 +642,8 @@ void WaylandSession::RunWorkflows() {
                                                     "image",
                                                     "video",
                                                     "stop",
+                                                    "export_stop",
+                                                    "export_stop_narrow_dark",
                                                     "theme",
                                                     "narrow",
                                                     "chart_legend",
@@ -677,6 +679,13 @@ void WaylandSession::RunWorkflows() {
                                                     "chart_wheel_expanded_4",
                                                     "chart_wheel_expanded_5"}));
     CHECK((workflow_pixels_ == std::set<std::string>{"progress", "train", "validation", "detail", "compiled", "image", "video", "stop", "theme", "narrow"}));
+    CHECK(browser.primary_phase_progress.contains("train.primary:light"));
+    CHECK(browser.primary_phase_progress.contains("validate.primary:light"));
+    CHECK(browser.primary_phase_progress.contains("predict.primary:light"));
+    CHECK(browser.primary_phase_progress.contains("export.primary:light"));
+    CHECK(browser.primary_phase_progress.contains("export.primary:dark"));
+    CHECK(browser.primary_active_themes.contains(false));
+    CHECK(browser.primary_active_themes.contains(true));
     CHECK_FALSE(surface_audit.surfaces.empty());
     process.interrupt();
     arm_timerfd(deadline.get(), kWaylandShutdownDeadline, "workflow shutdown");

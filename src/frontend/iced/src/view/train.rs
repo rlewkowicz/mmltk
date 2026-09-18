@@ -224,14 +224,9 @@ impl Component {
                 settings_settled,
             )
             .map(Message::Dataset),
-            text(
-                model
-                    .workflow
-                    .start_detail(crate::generated::FeatureId::Train)
-            ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Train,
-                "Start training",
+                model.primary_action_active(crate::generated::FeatureId::Train),
                 settings
                     .draft
                     .as_ref()
@@ -239,6 +234,7 @@ impl Component {
                         model.compute_start_available(draft, crate::generated::FeatureId::Train)
                     })
                     .then_some(Message::StartRequested),
+                model.training_stop_available().then_some(Message::TrainingStopRequested),
                 crate::view::workflow::progress::compute(training),
             ),
         ]

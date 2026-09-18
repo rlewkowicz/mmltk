@@ -678,6 +678,36 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     } else if (event == "integration.fluent_shell") {
         fluent = record.value("control", "") == "navigation" && (record.value("detail", "") == "light" || record.value("detail", "") == "dark") &&
                  numeric(record, "a") > 0.0 && numeric(record, "b") > 0.0 && numeric(record, "c") > 0.0 && numeric(record, "d") == 1.0;
+    } else if (event == "integration.primary_action.pixels") {
+        const std::string control = record.value("control", "");
+        const std::string label = record.value("label", "");
+        const bool active = record.value("active", false);
+        const auto labels = [&]() -> std::pair<std::string_view, std::string_view> {
+            if (control == "train.primary") return {"Start Training", "Stop Training"};
+            if (control == "validate.primary") return {"Start Validation", "Stop Validation"};
+            if (control == "predict.primary") return {"Run Predict", "Stop Predict"};
+            if (control == "export.primary") return {"Run Export", "Stop Export"};
+            if (control == "live.primary") return {"Start Live", "Stop Live"};
+            if (control == "annotation.save") return {"Save Annotations", "Save Annotations"};
+            return {};
+        }();
+        if (labels.first.empty() || label != (active ? labels.second : labels.first) ||
+            std::abs(record.value("height", 0.0) - 46.0) > 0.01 || record.value("segments", -1) != (active ? 10 : 0) || record.value("band_leaks", -1) != 0) {
+            failed = true;
+        } else {
+            if (!active) primary_idle_labels.insert(label);
+            else {
+                const bool dark = record.value("dark", false);
+                primary_active_themes.insert(dark);
+                const std::string identity = control + (dark ? ":dark" : ":light");
+                const double phase = record.value("phase", -1.0);
+                if (const auto found = primary_phases.find(identity); found != primary_phases.end()) {
+                    const double advance = std::fmod(phase - found->second + 1.0, 1.0);
+                    if (advance >= 0.02 && advance < 0.25) primary_phase_progress.insert(identity);
+                }
+                primary_phases.insert_or_assign(identity, phase);
+            }
+        }
     } else if (event == "integration.rendered_style") {
         if (record.value("detail", "") == "shared-primary" && numeric(record, "d") == 1.0 &&
             (numeric(record, "a") > 0.0 || numeric(record, "b") > 0.0 || numeric(record, "c") > 0.0)) {
@@ -1269,6 +1299,22 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
         return action_bounds != nullptr && setup_bounds != nullptr && std::abs(action_bounds->height - 48.0) < 0.01 &&
                std::abs(action_bounds->width - (setup_bounds->width - 20.0)) < 1.0;
     });
+    const bool primary_card_gaps = [&] {
+        const auto gap = [&page_bound, &primary_action](const std::string_view page, const std::string_view card) -> std::optional<double> {
+            const Bounds* const above = page_bound(page, card);
+            const Bounds* const action = page_bound(page, primary_action(page));
+            if (!above || !action) return std::nullopt;
+            return action->y - above->y - above->height;
+        };
+        const auto reference = gap("Export", "export.card.output");
+        if (!reference || *reference <= 0.0) return false;
+        for (const auto& [page, card] : std::array{
+                 std::pair{"Train", "train.card.dataset"}, std::pair{"Validate", "validate.card.inputs"}, std::pair{"Predict", "predict.card.inputs"}}) {
+            const auto measured = gap(page, card);
+            if (!measured || std::abs(*measured - *reference) > 1.0) return false;
+        }
+        return true;
+    }();
     const bool compile_progress_placement = immediately_above(compile_progress, compile_action);
     const bool model_progress_placement = model_card.valid() && model_progress.valid() && model_card.contains(model_progress);
     const bool model_composition = [&] {
@@ -1407,11 +1453,13 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
     const bool uniform_primary = !shared_primary_colors.empty() && std::ranges::all_of(shared_primary_colors, [this](const auto& style) {
         return style.second == shared_primary_colors.begin()->second;
     });
+    static const std::array expected_primary_labels{"Start Training", "Start Validation", "Run Predict", "Run Export", "Start Live", "Save Annotations"};
     return first_failed_check(
+        std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }), "primary action rendered labels",
         bootstrap && fluent && uniform_primary && benchmark_purple && rendered_controls.contains(BENCHMARK_OVERRIDE) &&
             std::ranges::all_of(expected_primary, [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
         "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement", primary_action_geometry,
-        "primary action geometry", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition", advanced_composition,
+        "primary action geometry", primary_card_gaps, "primary card gaps match Export", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition", advanced_composition,
         "Advanced composition", advanced_compact, "Advanced compact controls", explore_integer_controls.size() == 5U && explore_integer_precision,
         "Explore integer editing and spinner suppression", explore_paste_restored, "Explore clipboard paste persistence and restoration", spinnerless_integer,
         "integer spinner suppression", spinnerless_floating, "floating spinner suppression", advanced_integer_persisted, "Advanced integer persistence",

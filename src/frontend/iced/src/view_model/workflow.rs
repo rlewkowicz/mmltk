@@ -381,13 +381,6 @@ impl WorkflowModel {
         }
     }
 
-    pub fn start_detail(&self, feature: FeatureId) -> &str {
-        self.start_status
-            .as_ref()
-            .filter(|(owner, _)| *owner == feature)
-            .map_or("", |(_, detail)| detail.as_str())
-    }
-
     pub fn install_settings(&mut self, snapshot: &SettingsUiState) {
         self.settings_revision = Some(snapshot.revision);
     }

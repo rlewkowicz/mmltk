@@ -71,9 +71,10 @@ impl Component {
             ),
             crate::view::workflow::primary_action(
                 crate::generated::FeatureId::Live,
-                "Start Live",
+                model.primary_action_active(crate::generated::FeatureId::Live),
                 (!settings.has_local_edits() && model.live_start_available())
                     .then_some(Message::StartRequested),
+                model.live_stop_available().then_some(Message::StopRequested),
                 column![].into(),
             ),
         ]
