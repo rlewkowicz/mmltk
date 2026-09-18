@@ -128,24 +128,6 @@ pub fn view<'a>(
                 crate::generated::constraint_workflowstraincompileddatasetdir().stable_field_id,
             )))
             .style(crate::fluent_theme::button_primary),
-        model
-            .workflow
-            .dialogs(crate::generated::FeatureId::Train)
-            .filter(|fact| [
-                crate::generated::constraint_workflowstrainrequesttraincompiledpath()
-                    .stable_field_id,
-                crate::generated::constraint_workflowstrainrequestvalcompiledpath().stable_field_id,
-                crate::generated::constraint_workflowstrainrequesttestcompiledpath()
-                    .stable_field_id
-            ]
-            .contains(&fact.stable_field_id))
-            .fold(column![], |column, fact| column.push(
-                button(fact.title).on_press_maybe(
-                    model
-                        .file_dialog_open_available(fact, crate::generated::FeatureId::Train)
-                        .then_some(Message::Browse(fact.stable_field_id))
-                )
-            )),
         crate::view::workflow::fields::toggle(
             "Infer train/validation splits",
             train.usecompileddirectorydefaults,
@@ -173,21 +155,15 @@ pub fn view<'a>(
                 enabled,
                 Message::ValidationSplitChanged,
             ))
+            .push(crate::view::workflow::fields::text_field(
+                "Test dataset (optional)",
+                crate::generated::constraint_workflowstrainrequesttestcompiledpath().stable_field_id,
+                &train.request.testcompiledpath,
+                enabled,
+                Message::TestSplitChanged,
+            ))
     };
     let fields = fields
-        .push(crate::view::workflow::fields::text_field(
-            "Test dataset (optional)",
-            crate::generated::constraint_workflowstrainrequesttestcompiledpath().stable_field_id,
-            &train.request.testcompiledpath,
-            enabled,
-            Message::TestSplitChanged,
-        ))
-        .push(
-            button("Clear test dataset").on_press_maybe(
-                (enabled && !train.request.testcompiledpath.is_empty())
-                    .then(|| Message::TestSplitChanged(String::new())),
-            ),
-        )
         .push(crate::view::workflow::fields::toggle(
             "Overwrite",
             train.overwritecompileddataset,
@@ -271,6 +247,18 @@ pub fn view<'a>(
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+
+    #[test]
+    fn inference_toggles_retain_optional_test_path() {
+        let mut model = installed_settings_model();
+        update(&mut model, Message::TestSplitChanged("/retained/test.bin".into())).unwrap();
+        for inferred in [false, true, false] {
+            update(&mut model, Message::InferSplitsChanged(inferred)).unwrap();
+            let train = &model.draft.as_ref().unwrap().workflows.train;
+            assert_eq!(train.usecompileddirectorydefaults, inferred);
+            assert_eq!(train.request.testcompiledpath, "/retained/test.bin");
+        }
+    }
 
     #[test]
     fn test_selection_and_clear_preserve_inference_and_other_inputs() {

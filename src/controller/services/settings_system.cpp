@@ -269,6 +269,7 @@ contracts::SettingsUiState SettingsSystem::snapshot() const {
     std::scoped_lock lock(mutex_);
     auto result = state_;
     if (h2d_dataloader_override_) select_data_loading(result.settings_state, *h2d_dataloader_override_);
+    result.validation_source = contracts::resolve_validation_source(result.settings_state).native();
     result.explore_source = contracts::resolve_explore_source(result.settings_state);
     return result;
 }

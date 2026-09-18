@@ -141,7 +141,7 @@ ComputeIntentMaterializer::ValidationMaterialization ComputeIntentMaterializer::
     auto request = settings.workflows.validate.request;
     const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Validate, model);
     if (!selected) return std::unexpected(selected.error());
-    const auto compiled = current_artifact_split(artifact, request.compiled_path, "selected validation artifact is unavailable");
+    const auto compiled = current_artifact_split(artifact, mmltk::controller::contracts::resolve_validation_source(settings), "selected validation artifact is unavailable");
     if (!compiled) return std::unexpected(compiled.error());
     request.compiled_path = (*compiled)->path;
     assign_model_artifact(request, model);

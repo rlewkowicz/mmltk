@@ -898,6 +898,24 @@ TEST_CASE("explicit compiled selections override inferred directories and keep t
     REQUIRE(apply_gui_settings_values(inferred, unrelated));
     CHECK(inferred.workflows.train.request.test_compiled_path.empty());
 }
+TEST_CASE("validation source follows effective training split without persisting an override", "[gui][settings]") {
+    auto state = default_gui_settings_state();
+    state.workflows.train.compiled_dataset_dir = "/inferred";
+    CHECK(resolve_validation_source(state) == "/inferred/val.bin");
+    CHECK(state.workflows.validate.request.compiled_path.empty());
+    state.workflows.train.use_compiled_directory_defaults = false;
+    state.workflows.train.request.val_compiled_path = "/explicit/train-validation.bin";
+    CHECK(resolve_validation_source(state) == "/explicit/train-validation.bin");
+    state.workflows.validate.request.compiled_path = "/independent.bin";
+    state.workflows.train.compiled_dataset_dir = "/changed";
+    state.workflows.train.use_compiled_directory_defaults = true;
+    CHECK(resolve_validation_source(state) == "/independent.bin");
+    state.workflows.validate.request.compiled_path.clear();
+    auto loaded = default_gui_settings_state();
+    apply_gui_settings(snapshot_gui_settings(state), loaded);
+    CHECK(loaded.workflows.validate.request.compiled_path.empty());
+    CHECK(resolve_validation_source(loaded) == "/changed/val.bin");
+}
 TEST_CASE("optional test selection and persistence are independent of inferred training splits", "[gui][settings]") {
     auto state = default_gui_settings_state();
     const auto edit = [&](const char* path, const char* value) {

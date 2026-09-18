@@ -234,11 +234,14 @@ template <class T>
            state.workflows.explore.min_compiled_index <= state.workflows.explore.max_compiled_index &&
            valid_annotation_model_selection(model_artifacts(state.workflows.annotate)) && valid_model_selection_relations(state);
 }
+[[nodiscard]] std::filesystem::path effective_train_validation_path(const TrainViewState& train) {
+    return train.use_compiled_directory_defaults ? std::filesystem::path{train.compiled_dataset_dir} / "val.bin" : train.request.val_compiled_path;
+}
 void apply_compiled_directory_defaults(TrainViewState& train) {
     if (!train.use_compiled_directory_defaults) return;
     const std::filesystem::path directory{train.compiled_dataset_dir};
     train.request.train_compiled_path = directory / "train.bin";
-    train.request.val_compiled_path = directory / "val.bin";
+    train.request.val_compiled_path = effective_train_validation_path(train);
 }
 template <class Selection>
 void normalize_canonical_source_transition(const Selection& installed, Selection& candidate) noexcept {
@@ -279,6 +282,11 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
     return {};
 }
 bool gui_settings_valid(const GuiSettingsState& state) noexcept { return valid_settings(state); }
+std::filesystem::path resolve_validation_source(const GuiSettingsState& state) {
+    const auto& override_path = state.workflows.validate.request.compiled_path;
+    if (!override_path.empty()) return override_path;
+    return effective_train_validation_path(state.workflows.train);
+}
 ExploreSourceFact resolve_explore_source(const GuiSettingsState& state) {
     const auto& train = state.workflows.train;
     const auto& explore = state.workflows.explore;

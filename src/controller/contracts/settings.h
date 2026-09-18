@@ -19,6 +19,7 @@ struct SettingsUiState final {
     std::uint64_t revision = 0U;
     GuiSettingsState settings_state{};
     ExploreSourceFact explore_source{};
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string validation_source;
     bool operator==(const SettingsUiState&) const = default;
 };
 // This immutable fact separates installed settings from a default-constructed

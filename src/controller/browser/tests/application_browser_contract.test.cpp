@@ -1100,9 +1100,16 @@ TEST_CASE("custom model dialogs derive from the canonical compatibility catalog"
         CHECK(found != entries.end());
         CHECK(found->stable_id == application_settings_field_stable_id(typed_path.view()));
         CHECK(found->field_path.view() == typed_path.view());
-        CHECK(found->title.view() == compatibility.dialog_title);
-        CHECK(found->filter.name.view() == compatibility.dialog_filter);
-        CHECK(found->filter.pattern.view() == compatibility.dialog_pattern);
+        if (compatibility.workflow == contracts::FeatureId::Train || compatibility.workflow == contracts::FeatureId::Validate) {
+            CHECK(found->filter.pattern.view().contains(compatibility.dialog_pattern));
+            CHECK(found->filter.pattern.view().contains("*.pth"));
+            CHECK(found->filter.pattern.view().contains("*.onnx") == (compatibility.workflow == contracts::FeatureId::Validate));
+            CHECK(found->filter.pattern.view().contains("*.engine") == (compatibility.workflow == contracts::FeatureId::Validate));
+        } else {
+            CHECK(found->title.view() == compatibility.dialog_title);
+            CHECK(found->filter.name.view() == compatibility.dialog_filter);
+            CHECK(found->filter.pattern.view() == compatibility.dialog_pattern);
+        }
     });
     CHECK(row_index == 9U);
 }

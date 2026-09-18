@@ -2,6 +2,7 @@
 #include <inplace_vector>
 #include <ranges>
 #include <span>
+#include <string>
 #include "src/controller/browser/application_schema.h"
 #include "src/controller/contracts/model_selection.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
@@ -28,6 +29,18 @@ void append_model_artifact_dialogs(FileDialogDescriptorStorage& dialogs) {
             descriptor.title = decltype(descriptor.title)::From(compatibility.dialog_title);
             descriptor.filter.name = decltype(descriptor.filter.name)::From(compatibility.dialog_filter);
             descriptor.filter.pattern = decltype(descriptor.filter.pattern)::From(compatibility.dialog_pattern);
+            if (compatibility.workflow == mmltk::controller::contracts::FeatureId::Train ||
+                compatibility.workflow == mmltk::controller::contracts::FeatureId::Validate) {
+                std::string patterns;
+                for (const auto& candidate : mmltk::controller::contracts::kModelSelectionCompatibility) {
+                    if (candidate.workflow != compatibility.workflow || !candidate.custom_allowed) continue;
+                    if (!patterns.empty()) patterns += ' ';
+                    patterns += candidate.dialog_pattern;
+                }
+                descriptor.title = decltype(descriptor.title)::From("Select custom model");
+                descriptor.filter.name = decltype(descriptor.filter.name)::From("Compatible model artifacts");
+                descriptor.filter.pattern = decltype(descriptor.filter.pattern)::From(patterns);
+            }
             dialogs.push_back(std::move(descriptor));
         });
 }

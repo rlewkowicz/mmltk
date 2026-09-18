@@ -109,6 +109,10 @@ impl Component {
                             projection.fields.key_fields.preset,
                             crate::generated::SettingsFieldValue::String(name),
                         ),
+                        (
+                            projection.fields.key_fields.classlayoutpath,
+                            crate::generated::SettingsFieldValue::String(if shared_weights_selector(self.workflow) { String::new() } else { projection.selection.key.classlayoutpath.clone() }),
+                        ),
                     ],
                 )?;
                 Outcome::SettingsEdited(schedule)
@@ -219,7 +223,11 @@ impl Component {
                     .as_ref()
                     .ok_or_else(|| "Model settings are unavailable.".to_owned())?;
                 let projection = projection(draft, workflow)?;
-                let row = custom_compatible_row(&projection)?;
+                let row = if shared_weights_selector(workflow) {
+                    artifact_row(workflow, projection.selection.exportbuildtensorrt, &path)?
+                } else {
+                    custom_compatible_row(&projection)?
+                };
                 let dialog = dialog_for_row(row)?;
                 let schedule = settings.edit_fields(
                     EditCadence::Debounced,
@@ -237,6 +245,10 @@ impl Component {
                         (
                             dialog.stable_field_id,
                             crate::generated::SettingsFieldValue::String(path),
+                        ),
+                        (
+                            dialog.key_fields.classlayoutpath,
+                            crate::generated::SettingsFieldValue::String(String::new()),
                         ),
                     ],
                 )?;
@@ -343,9 +355,9 @@ impl<'a> State<'a> {
     ) -> Self {
         let projection = settings
             .and_then(|settings| crate::view_model::model_settings_projection(settings, workflow));
-        let train_custom_row = projection
+        let shared_custom_row = projection
             .as_ref()
-            .filter(|_| workflow == FeatureId::Train)
+            .filter(|_| shared_weights_selector(workflow))
             .and_then(|value| custom_compatible_row(value).ok());
         let source = projection
             .as_ref()
@@ -363,7 +375,7 @@ impl<'a> State<'a> {
                 }
             },
             |value| {
-                train_custom_row
+                shared_custom_row
                     .filter(|_| value.selection.key.input == ModelArtifactInputKind::None)
                     .map_or(value.selection.key.input, |row| row.input)
             },
@@ -377,7 +389,7 @@ impl<'a> State<'a> {
         let artifact_field_id = projection
             .as_ref()
             .and_then(|value| value.artifact_field)
-            .or_else(|| train_custom_row.and_then(|row| dialog_for_row(row).ok()))
+            .or_else(|| shared_custom_row.and_then(|row| dialog_for_row(row).ok()))
             .map_or(0, |dialog| dialog.stable_field_id);
         let class_layout_path = projection.as_ref().map_or_else(String::new, |value| {
             value.selection.key.classlayoutpath.clone()
@@ -454,7 +466,7 @@ fn custom_compatible_row(
     compatibility(workflow, projection.selection.exportbuildtensorrt)
         .find(|row| row.input == projection.selection.key.input && row.customallowed)
         .or_else(|| {
-            (workflow == FeatureId::Train)
+            shared_weights_selector(workflow)
                 .then(|| {
                     compatibility(workflow, projection.selection.exportbuildtensorrt)
                         .find(|row| row.customallowed)
@@ -464,6 +476,25 @@ fn custom_compatible_row(
         .ok_or_else(|| {
             "Generated catalog has no custom row for the current model input.".to_owned()
         })
+}
+
+const fn shared_weights_selector(workflow: FeatureId) -> bool {
+    matches!(workflow, FeatureId::Train | FeatureId::Validate)
+}
+
+fn artifact_row(
+    workflow: FeatureId,
+    build_tensorrt: bool,
+    path: &str,
+) -> Result<&'static crate::generated::ModelSelectionCompatibility, String> {
+    compatibility(workflow, build_tensorrt)
+        .find(|row| row.customallowed && row.dialogpattern.split_whitespace().any(|pattern| {
+            pattern.strip_prefix('*').is_some_and(|suffix| {
+                path.get(path.len().saturating_sub(suffix.len())..)
+                    .is_some_and(|ending| ending.eq_ignore_ascii_case(suffix))
+            })
+        }))
+        .ok_or_else(|| "The selected file extension is not supported by this workflow.".to_owned())
 }
 
 fn dialog_for_row(
@@ -499,6 +530,10 @@ pub const fn progress_id(workflow: FeatureId) -> &'static str {
             "workflow.card.model.progress"
         }
     }
+}
+
+fn selector_id(workflow: FeatureId, train: &'static str, validate: &'static str) -> &'static str {
+    if workflow == FeatureId::Train { train } else { validate }
 }
 
 pub const TRAIN_SELECTOR_ID: &str = "train.model.selector";
@@ -573,15 +608,18 @@ pub(crate) fn status_presentation(state: Option<&ModelUiState>) -> StatusPresent
 }
 
 pub(crate) const fn card_title(workflow: FeatureId) -> &'static str {
-    if matches!(workflow, FeatureId::Train) {
+    if shared_weights_selector(workflow) {
         "RF-DETR Weights"
     } else {
         "RF-DETR Model"
     }
 }
 
-fn status<'a>(state: Option<&ModelUiState>) -> Element<'a, Message> {
-    let status = status_presentation(state);
+fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, Message> {
+    let mut status = status_presentation(state);
+    if shared_weights_selector(workflow) && status.tone == StatusTone::Ready {
+        status.detail.clear();
+    }
     let label = match status.tone {
         StatusTone::Neutral => text(status.label).style(crate::fluent_theme::text_secondary),
         StatusTone::Ready => text(status.label).style(crate::fluent_theme::text_success),
@@ -597,7 +635,7 @@ fn status<'a>(state: Option<&ModelUiState>) -> Element<'a, Message> {
         ]
         .spacing(4)
     };
-    let content = container(content).id(TRAIN_STATUS_ID).width(Fill);
+    let content = container(content).id(selector_id(workflow, TRAIN_STATUS_ID, "validate.model.status")).width(Fill);
     if status.tone == StatusTone::Error {
         content
             .padding([6, 8])
@@ -699,7 +737,17 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
                 ),
             )
         });
-    let artifact: Element<'_, Message> = if state.source == ModelSelectionSource::Custom
+    let artifact: Element<'_, Message> = if shared_weights_selector(state.workflow) {
+        if state.source == ModelSelectionSource::Custom {
+            text(if state.artifact.is_empty() {
+                "No custom model selected".to_owned()
+            } else {
+                state.artifact.clone()
+            }).size(12).into()
+        } else {
+            space::vertical().height(0).into()
+        }
+    } else if state.source == ModelSelectionSource::Custom
         && state.input != ModelArtifactInputKind::None
     {
         column![
@@ -723,9 +771,14 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
     let progress: Element<'_, Message> = state.model.map_or_else(
         || text("Model state unavailable").size(12).into(),
         |model| {
-            crate::view::workflow::progress::presentation(
-                crate::view::workflow::progress::model_presentation(Some(model)),
-            )
+            let progress = if shared_weights_selector(state.workflow)
+                && !model.active
+                && model.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted {
+                crate::view::workflow::progress::Presentation::Hidden
+            } else {
+                crate::view::workflow::progress::model_presentation(Some(model))
+            };
+            crate::view::workflow::progress::presentation(progress)
         },
     );
     let action = if state.model.is_some_and(|model| model.active) {
@@ -736,12 +789,12 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
             .style(crate::fluent_theme::button_primary)
     };
     let mut presets = Some(presets);
-    let train_selector: Option<Element<'_, Message>> =
-        (state.workflow == FeatureId::Train).then(|| {
+    let weights_selector: Option<Element<'_, Message>> =
+        shared_weights_selector(state.workflow).then(|| {
             container(
                 column![
                     container(presets.take().expect("one preset selector"))
-                        .id(TRAIN_PRESETS_ID)
+                        .id(selector_id(state.workflow, TRAIN_PRESETS_ID, "validate.model.presets"))
                         .width(Fill),
                     container(
                         row![
@@ -751,7 +804,7 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
                         ]
                         .width(Fill)
                     )
-                    .id(TRAIN_DIVIDER_ID)
+                    .id(selector_id(state.workflow, TRAIN_DIVIDER_ID, "validate.model.divider"))
                     .width(Fill),
                     container(
                         button("Custom Weights")
@@ -761,12 +814,12 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
                             .style(crate::fluent_theme::button_primary)
                             .width(Fill)
                     )
-                    .id(TRAIN_CUSTOM_ID)
+                    .id(selector_id(state.workflow, TRAIN_CUSTOM_ID, "validate.model.custom_weights"))
                     .width(Fill),
                 ]
                 .spacing(super::FIELD_SPACING),
             )
-            .id(TRAIN_SELECTOR_ID)
+            .id(selector_id(state.workflow, TRAIN_SELECTOR_ID, "validate.model.selector"))
             .padding(2)
             .width(Fill)
             .style(crate::fluent_theme::container_bordered_box)
@@ -780,7 +833,14 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
                 column![
                     text("Use custom model?").size(24),
                     text(format!("Workflow: {:?}", state.workflow)),
-                    text(format!("Input: {}", input_label(state.input))),
+                    text(format!("Input: {}", input_label(
+                        if shared_weights_selector(state.workflow) {
+                            artifact_row(state.workflow, state.build_tensorrt, &path)
+                                .map_or(state.input, |row| row.input)
+                        } else {
+                            state.input
+                        }
+                    ))),
                     text(format!(
                         "Preset: {}",
                         state.preset.as_deref().unwrap_or("Unspecified")
@@ -807,12 +867,11 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
     ]
     .spacing(super::FIELD_SPACING);
     let title = card_title(state.workflow);
-    let body = if state.workflow == FeatureId::Train {
+    let body = if shared_weights_selector(state.workflow) {
         column![
-            train_selector.expect("Train has one weights selector"),
-            status(state.model),
+            weights_selector.expect("shared weights selector"),
+            status(state.model, state.workflow),
             artifact,
-            class_layout,
             iced::widget::container(progress)
                 .id(progress_id(state.workflow))
                 .padding(iced::Padding {
@@ -820,12 +879,12 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
                     ..iced::Padding::ZERO
                 })
                 .width(Fill),
-            container(action).id(TRAIN_ACTION_ID)
+            container(action).id(selector_id(state.workflow, TRAIN_ACTION_ID, "validate.model.action"))
         ]
         .spacing(super::FIELD_SPACING)
     } else {
         column![
-            presets.expect("non-Train workflow has one preset selector"),
+            presets.expect("other workflow has one preset selector"),
             source,
             inputs,
             artifact,
@@ -859,6 +918,61 @@ pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, M
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+
+    #[test]
+    fn train_and_validate_have_the_same_common_selector_widget_shape() {
+        fn shape(tree: &iced::advanced::widget::Tree, result: &mut Vec<usize>) {
+            result.push(tree.children.len());
+            for child in &tree.children {
+                shape(child, result);
+            }
+        }
+        let settings = installed_settings_model();
+        let widget_shape = |workflow| {
+            let card = view(State::from_settings(
+                workflow, settings.draft.as_ref(), None, None, true, true, false,
+            ), 0);
+            let tree = iced::advanced::widget::Tree::new(&card);
+            let mut result = Vec::new();
+            shape(&tree, &mut result);
+            result
+        };
+        assert_eq!(widget_shape(FeatureId::Train), widget_shape(FeatureId::Validate));
+        assert_ne!(widget_shape(FeatureId::Validate), widget_shape(FeatureId::Predict));
+    }
+
+    #[test]
+    fn common_selector_infers_each_native_extension_without_companion_leakage() {
+        for workflow in [FeatureId::Train, FeatureId::Validate] {
+            assert!(shared_weights_selector(workflow));
+            assert_eq!(card_title(workflow), "RF-DETR Weights");
+            let mut component = Component::new(workflow);
+            let mut settings = installed_settings_model();
+            for row in compatibility(workflow, false).filter(|row| row.customallowed) {
+                for pattern in row.dialogpattern.split_whitespace() {
+                    let path = format!("/tmp/model{}", pattern.trim_start_matches('*'));
+                    let fields = projection(settings.draft.as_ref().unwrap(), workflow).unwrap().fields;
+                    crate::generated::apply_settings_field(
+                        settings.draft.as_mut().unwrap(),
+                        fields.key_fields.classlayoutpath,
+                        crate::generated::SettingsFieldValue::String("/old/classes.json".into()),
+                    ).unwrap();
+                    component.update(Message::ConfirmArtifact { path: path.clone(), generation: 1 }, &mut settings).unwrap();
+                    let selected = projection(settings.draft.as_ref().unwrap(), workflow).unwrap();
+                    assert_eq!(selected.selection.key.input, row.input);
+                    assert_eq!(selected.selection.artifact, path);
+                    assert!(selected.selection.key.classlayoutpath.is_empty());
+                }
+            }
+            let before = settings.draft.clone();
+            assert!(component.update(Message::ConfirmArtifact { path: "/tmp/model.txt".into(), generation: 2 }, &mut settings).is_err());
+            assert_eq!(settings.draft, before);
+        }
+        assert!(artifact_row(FeatureId::Train, false, "/model.onnx").is_err());
+        assert_eq!(artifact_row(FeatureId::Validate, false, "/MODEL.ONNX").unwrap().input, ModelArtifactInputKind::Onnx);
+        assert!(!shared_weights_selector(FeatureId::Predict));
+        assert!(!shared_weights_selector(FeatureId::Export));
+    }
 
     #[test]
     fn workflow_choices_and_open_ended_progress_are_truthful() {
@@ -1102,7 +1216,7 @@ mod tests {
             Component::new(canonical.workflow)
                 .update(
                     Message::ConfirmArtifact {
-                        path: "/tmp/model".into(),
+                        path: "/tmp/model.pth".into(),
                         generation: 1,
                     },
                     &mut settings,
@@ -1112,7 +1226,7 @@ mod tests {
                 projection(settings.draft.as_ref().unwrap(), canonical.workflow).unwrap();
             assert_eq!(selected.selection.key.source, ModelSelectionSource::Custom);
             assert_eq!(selected.selection.key.input, canonical.input);
-            assert_eq!(selected.selection.artifact, "/tmp/model");
+            assert_eq!(selected.selection.artifact, "/tmp/model.pth");
         } else {
             let before = settings.draft.clone();
             let queued = settings.queued_len();

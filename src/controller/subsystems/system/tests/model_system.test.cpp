@@ -152,6 +152,30 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     inconsistent.splits[1].class_names[0].value = "different";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inconsistent, train));
 }
+TEST_CASE("validation materializes inherited and independent dataset sources", "[controller][systems][compute]") {
+    auto settings = contracts::default_gui_settings_state();
+    settings.workflows.train.compiled_dataset_dir = "/inferred";
+    settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;
+    settings.workflows.validate.request.weights_path = "/selected/model.pt";
+    const auto model = selected_model(settings, contracts::FeatureId::Validate);
+    const contracts::ArtifactInspection inspected{
+        .compatible = true, .splits = {split("/inferred/val.bin"), split("/manual.bin"), split("/independent.bin")}, .detail = {}};
+    const auto check_path = [&](const char* expected) {
+        const auto request = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspected, model);
+        REQUIRE(request);
+        CHECK(request->compiled_path == expected);
+    };
+    check_path("/inferred/val.bin");
+    CHECK(settings.workflows.validate.request.compiled_path.empty());
+    settings.workflows.train.use_compiled_directory_defaults = false;
+    settings.workflows.train.request.val_compiled_path = "/manual.bin";
+    check_path("/manual.bin");
+    settings.workflows.validate.request.compiled_path = "/independent.bin";
+    settings.workflows.train.request.val_compiled_path = "/missing.bin";
+    check_path("/independent.bin");
+    settings.workflows.validate.request.compiled_path.clear();
+    CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::Validation(settings, inspected, model));
+}
 TEST_CASE("compute inputs retain normalized full-path identity and image independence", "[controller][systems][compute]") {
     auto settings = contracts::default_gui_settings_state();
     settings.workflows.validate.model_source = contracts::ModelSelectionSource::Custom;

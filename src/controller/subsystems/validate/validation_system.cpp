@@ -14,6 +14,7 @@
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 #include "src/controller/runtime/local_run.h"
 #include "src/controller/contracts/application_boundary.h"
+#include "src/controller/contracts/gui_settings_mutation.h"
 #include "src/common/system/execution_policy.h"
 namespace mmltk::controller {
 class CudaValidationRuntime::Impl final : public detail::CudaSessionRuntimeState<mmltk::backend::models::rfdetr::ValidationSession> {
@@ -89,7 +90,7 @@ class ValidationSystem::Impl final {
                     [&](const ComputeProgressSink& progress) {
                         if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
                         const auto inspection =
-                            dataset_.Inspect({settings.workflows.validate.request.compiled_path, {}, {}}, selection.key.preset, selection.key.resolution, stop);
+                            dataset_.Inspect({contracts::resolve_validation_source(settings), {}, {}}, selection.key.preset, selection.key.resolution, stop);
                         if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
                         auto prepared = subsystems::system::ComputeIntentMaterializer::Validation(settings, inspection, selection);
                         if (!prepared) throw contracts::InvalidIntentError(prepared.error().detail);

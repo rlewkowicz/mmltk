@@ -21,7 +21,10 @@ pub struct WorkflowModel {
 #[derive(Debug, Clone)]
 pub enum StartInputs {
     Train(crate::generated::TrainViewState),
-    Validate(crate::generated::ValidateViewState),
+    Validate {
+        settings: crate::generated::ValidateViewState,
+        inherited_source: Option<(bool, String)>,
+    },
     Predict(crate::generated::PredictViewState),
 }
 
@@ -32,7 +35,11 @@ impl StartInputs {
     ) -> Option<Self> {
         match feature {
             FeatureId::Train => Some(Self::Train(settings.workflows.train.clone())),
-            FeatureId::Validate => Some(Self::Validate(settings.workflows.validate.clone())),
+            FeatureId::Validate => Some(Self::Validate {
+                settings: settings.workflows.validate.clone(),
+                inherited_source: validation_inherited_source(settings)
+                    .map(|(inferred, path)| (inferred, path.to_owned())),
+            }),
             FeatureId::Predict => Some(Self::Predict(settings.workflows.predict.clone())),
             _ => None,
         }
@@ -41,10 +48,28 @@ impl StartInputs {
     pub fn matches(&self, settings: &crate::generated::GuiSettingsState) -> bool {
         match self {
             Self::Train(value) => value == &settings.workflows.train,
-            Self::Validate(value) => value == &settings.workflows.validate,
+            Self::Validate { settings: value, inherited_source } => {
+                value == &settings.workflows.validate
+                    && inherited_source.as_ref().map(|(inferred, path)| (*inferred, path.as_str()))
+                        == validation_inherited_source(settings)
+            },
             Self::Predict(value) => value == &settings.workflows.predict,
         }
     }
+}
+
+// Track the configured source rather than the normalized request path: native
+// settlement may materialize inferred paths without changing the user's intent.
+fn validation_inherited_source(settings: &crate::generated::GuiSettingsState) -> Option<(bool, &str)> {
+    if !settings.workflows.validate.request.compiledpath.is_empty() {
+        return None;
+    }
+    let train = &settings.workflows.train;
+    Some((train.usecompileddirectorydefaults, if train.usecompileddirectorydefaults {
+        train.compileddatasetdir.as_str()
+    } else {
+        train.request.valcompiledpath.as_str()
+    }))
 }
 
 #[derive(Debug, Clone)]
@@ -552,6 +577,28 @@ impl crate::generated::LiveApplicationProjection<UiError> for ApplicationModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_start_tracks_only_its_effective_dataset_source() {
+        let mut settings = crate::view::settings::installed_settings_model().draft.unwrap();
+        settings.workflows.validate.request.compiledpath.clear();
+        let inherited = StartInputs::capture(&settings, FeatureId::Validate).unwrap();
+        settings.workflows.train.request.valcompiledpath = "/normalized/val.bin".into();
+        assert!(inherited.matches(&settings));
+        settings.workflows.train.compileddatasetdir = "/new-source".into();
+        assert!(!inherited.matches(&settings));
+        settings.workflows.train.usecompileddirectorydefaults = false;
+        let manual = StartInputs::capture(&settings, FeatureId::Validate).unwrap();
+        settings.workflows.train.request.valcompiledpath = "/another.bin".into();
+        assert!(!manual.matches(&settings));
+        settings.workflows.validate.request.compiledpath = "/independent.bin".into();
+        let explicit = StartInputs::capture(&settings, FeatureId::Validate).unwrap();
+        settings.workflows.train.usecompileddirectorydefaults = true;
+        settings.workflows.train.compileddatasetdir = "/unrelated".into();
+        assert!(explicit.matches(&settings));
+        settings.workflows.validate.request.compiledpath.clear();
+        assert!(!explicit.matches(&settings));
+    }
 
     #[test]
     fn generated_catalog_and_dialog_facts_drive_workflow_availability() {

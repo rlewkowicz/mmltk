@@ -13,7 +13,6 @@ pub enum Message {
     StopRequested,
     DialogRequested(u64),
     Model(crate::view::workflow::model_card::Message),
-    CompiledPathChanged(String),
     // CLEANUP-IGNORE: Validate retains its generated batch-size message before its workspace child message.
     BatchSizeChanged(u64),
     Results(results::Message),
@@ -76,7 +75,7 @@ impl Component {
             .fold(column![].spacing(6), |column, fact| {
                 column.push(
                     container(
-                        button(fact.title).on_press_maybe(
+                        button("Open Dataset").style(crate::fluent_theme::button_primary).on_press_maybe(
                             model
                                 .file_dialog_open_available(
                                     fact,
@@ -117,16 +116,14 @@ impl Component {
                 "validate.card.inputs",
                 crate::view::shared::card(
                     "Validation",
-                    "Compiled dataset and validation inputs.",
+                    "",
                     column![
-                        crate::view::workflow::fields::text_field(
-                            "Compiled dataset",
-                            crate::generated::constraint_workflowsvalidaterequestcompiledpath()
-                                .stable_field_id,
-                            draft.map_or("", |value| value.request.compiledpath.as_str()),
-                            settings_edit_available,
-                            Message::CompiledPathChanged,
-                        ),
+                        text(draft.filter(|value| !value.request.compiledpath.is_empty())
+                            .map(|value| value.request.compiledpath.as_str())
+                            .or_else(|| model.settings_snapshot.as_ref().map(|value| value.validationsource.as_str()))
+                            .filter(|path| !path.is_empty())
+                            .unwrap_or("No dataset selected"))
+                            .size(12),
                         dialogs,
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING)
@@ -239,11 +236,6 @@ impl Component {
                 };
                 Outcome::Model(outcome)
             }
-            Message::CompiledPathChanged(value) => Outcome::SettingsEdited(
-                settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
-                    crate::generated::edit_workflowsvalidaterequestcompiledpath(draft, value)
-                })?,
-            ),
             Message::BatchSizeChanged(value) => Outcome::SettingsEdited(
                 settings.edit(crate::view::settings::EditCadence::Debounced, |draft| {
                     // CLEANUP-IGNORE: Validate applies its generated batch-size edit before workspace routing.
