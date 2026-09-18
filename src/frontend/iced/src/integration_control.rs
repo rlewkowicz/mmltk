@@ -160,7 +160,9 @@ const ANNOTATION_SURFACE: &str = annotation::WORKSPACE_ID;
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    PrimaryActionPixels { control: String, active: bool },
+    PrimaryActionPixels { control: String, active: bool, token: u32 },
+    PrimaryActionMeasure { control: String, token: u32 },
+    PrimaryActionMeasured { control: String, token: u32, bounds: [Rectangle; 3] },
     WorkflowPixels {
         picture: workflows::Picture,
         index: u8,
@@ -1635,8 +1637,18 @@ impl Controller {
             message => message,
         };
         let (control, bounds) = match message {
-            Message::PrimaryActionPixels { control, active } => {
-                self.workflows.primary_action_pixels(&self.driver, &control, active);
+            Message::PrimaryActionMeasure { control, token } => {
+                self.driver.reporting.measure_primary(control, token);
+                return None;
+            }
+            Message::PrimaryActionMeasured { control, token, bounds } => {
+                reporting::primary_action_measured(control, token, bounds);
+                return None;
+            }
+            Message::PrimaryActionPixels { control, active, token } => {
+                if reporting::primary_action_current(&control, token) {
+                    self.workflows.primary_action_pixels(&self.driver, &control, active);
+                }
                 return None;
             }
             Message::WorkflowPixels {
@@ -2232,12 +2244,14 @@ impl Controller {
         surface: Option<crate::presentation_surface::Surface>,
     ) -> Task<RootMessage> {
         let running = self.driver.running();
+        if running { reporting::primary_page(active, applied_scale); }
+        let measurements = if running { self.driver.reporting.primary_measurements(self.driver.generation) } else { None };
         let result =
             self.advance_transition(model, settings, applied_scale, router, active, surface);
         if running {
             self.finish_transition();
         }
-        result
+        match measurements { Some(measurements) => Task::batch([measurements, result]), None => result }
     }
     fn finish_transition(&mut self) {
         if matches!(self.driver.phase, Phase::Failed) {

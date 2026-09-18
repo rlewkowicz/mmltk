@@ -98,3 +98,55 @@ fn annotation_reveal_proves_subregions_without_rescaling_full_geometry() {
     assert!(absent.visible().is_none());
     assert!(absent.requested(request).is_none());
 }
+
+#[test]
+fn primary_action_measurement_uses_nested_scroll_coordinates_and_outer_frame() {
+    use super::FindControl;
+    use iced::Vector;
+    use iced::advanced::widget::{Id, Operation};
+    use iced::advanced::widget::operation::{Outcome, Scrollable};
+    use iced::widget::operation::{AbsoluteOffset, RelativeOffset};
+    struct Scroll;
+    impl Scrollable for Scroll {
+        fn snap_to(&mut self, _: RelativeOffset<Option<f32>>) {}
+        fn scroll_to(&mut self, _: AbsoluteOffset<Option<f32>>) {}
+        fn scroll_by(&mut self, _: AbsoluteOffset, _: Rectangle, _: Rectangle) {}
+    }
+    let outer = Rectangle { x: 450.0, y: 800.0, width: 202.0, height: 48.0 };
+    for (horizontal_offset, vertical_offset, visible) in [
+        (0.0, 0.0, false),
+        (0.0, 600.0, false), // Right edge remains clipped until horizontal reveal.
+        (300.0, 0.0, false),
+        (300.0, 600.0, true),
+        (300.0, 480.0, false), // Only part of the bottom perimeter is visible.
+        (300.0, 600.0, true),
+    ] {
+        let id = Id::from("train.primary");
+        let mut find = FindControl {
+            target: id.clone(), translation: Vector::ZERO, pending_translation: Vector::ZERO,
+            bounds: None, page: Rectangle::default(), horizontal: Rectangle::default(),
+        };
+        let horizontal = Rectangle { x: 0.0, y: 0.0, width: 500.0, height: 400.0 };
+        let page = Rectangle { x: 0.0, y: 52.0, width: 1020.0, height: 300.0 };
+        find.scrollable(Some(&Id::from(crate::view::HORIZONTAL_SCROLL_ID)), horizontal, horizontal,
+            Vector::new(horizontal_offset, 0.0), &mut Scroll);
+        find.traverse(&mut |operation| {
+            operation.scrollable(Some(&Id::from(crate::view::PAGE_SCROLL_ID)), page, page,
+                Vector::new(0.0, vertical_offset), &mut Scroll);
+            operation.traverse(&mut |operation| operation.container(Some(&id), outer));
+        });
+        let Outcome::Some(measured) = find.finish() else { panic!("measurement missing") };
+        assert_eq!(measured.target, Rectangle { x: outer.x-horizontal_offset, y: outer.y-vertical_offset, ..outer });
+        assert_eq!(measured.page.x, -horizontal_offset);
+        assert_eq!(measured.horizontal, horizontal);
+        assert_eq!(find.translation, Vector::ZERO);
+        let inner = Rectangle { x: measured.target.x+1.0, y: measured.target.y+1.0,
+            width: measured.target.width-2.0, height: measured.target.height-2.0 };
+        assert_eq!(inner.height, 46.0);
+        assert_eq!(measured.target.height, 48.0);
+        assert_eq!(measured.page.intersection(&measured.horizontal).is_some_and(|viewport| contains_rectangle(viewport,inner)),visible);
+        // A sibling must not inherit either scroller's translation.
+        find.container(Some(&id), outer);
+        assert_eq!(find.bounds, Some(outer));
+    }
+}

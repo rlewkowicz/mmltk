@@ -33,6 +33,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
       return true;
     },
   };
+  const listeners = new Map();
   const sampling = {pixel: () => [64, 64, 64, 255], error: undefined};
   const NativeMap = Map, NativeSet = Set;
   install('Map', class extends NativeMap { constructor(...args) { super(...args); allocations.maps++; } });
@@ -40,8 +41,8 @@ function canvasFixture(t, diagnostics = false, driver = true) {
   install('document', {querySelector: () => canvas, activeElement: canvas, hasFocus: () => true, visibilityState: 'visible'});
   install('window', {
     devicePixelRatio: 1,
-    addEventListener: () => { allocations.listeners++; },
-    removeEventListener: () => { allocations.listeners--; },
+    addEventListener: (type, callback) => { allocations.listeners++; listeners.set(type, callback); },
+    removeEventListener: (type) => { allocations.listeners--; listeners.delete(type); },
   });
   install('performance', {now: () => { allocations.clock++; return 0; }});
   install('dump', line => { lines.push(line); reports.push(JSON.parse(line)); });
@@ -62,9 +63,16 @@ function canvasFixture(t, diagnostics = false, driver = true) {
           allocations.reads++;
           sampling.lastRead = [x, y, width, height];
           if (sampling.error) throw sampling.error;
-          if (sampling.data) return {data: sampling.data};
+          if (sampling.data) return {data: sampling.data, width, height};
+          if (sampling.raster) {
+            const data = new Uint8ClampedArray(width * height * 4);
+            for (let row = 0; row < height; ++row) for (let column = 0; column < width; ++column) {
+              data.set(sampling.raster(x + column, y + row), (row * width + column) * 4);
+            }
+            return {data, width, height};
+          }
           const pixel = sampling.pixel(sourceX + x, sourceY + y);
-          return {data: Uint8ClampedArray.from({length: width * height * 4}, (_, i) => pixel[i % 4])};
+          return {data: Uint8ClampedArray.from({length: width * height * 4}, (_, i) => pixel[i % 4]), width, height};
         },
       };
     }
@@ -87,6 +95,7 @@ function canvasFixture(t, diagnostics = false, driver = true) {
     }
   };
   return {canvas, css, sampling, allocations, events, keys, reports, lines, frames, microtasks,
+    input: (type, fields = {}) => listeners.get(type)?.({type, ...fields}),
     flushMicrotasks: () => drain(microtasks), flushFrames: () => drain(frames)};
 }
 
@@ -752,4 +761,189 @@ test('superseded numeric delivery settles the old request and dispatch failure s
   assert.deepEqual(current, [false]);
   browser.mmltkIntegrationCancelNumberEdit();
   assert.deepEqual(current, [false]);
+});
+
+// Local draw coordinates deliberately remain below the canvas. Only the
+// measured outer frame is permitted to place this action's pixel probe.
+function primaryFacts(phase = 0, scale = 1) {
+  return [451, 801, 200, 46, 300, 600, 640, 480, scale, phase, 0, 0.4, 1, 1];
+}
+function primaryBounds(x = 10, y = 100) {
+  return [x, y, 202, 48, 0, 52, 640, 428, 0, 0, 640, 480];
+}
+function primaryCapture(f, control, label, active, facts, bounds = primaryBounds()) {
+  const token = browser.mmltkIntegrationPrimaryAction(control, label, active, false, facts);
+  assert.ok(token > 0);
+  const outcomes = [];
+  const complete = (outcome, executing) => outcomes.push([outcome, executing]);
+  browser.mmltkIntegrationPrimaryActionMeasured(control, token, bounds, complete);
+  f.flushFrames();
+  assert.equal(outcomes[0]?.[0], 'measure');
+  browser.mmltkIntegrationPrimaryActionMeasured(control, token, bounds, complete);
+  return {token, outcomes};
+}
+
+// Paint a synthetic stroked rounded path at screen coordinates. This fixture
+// supplies pixels, independently of the adapter's 400 perimeter sample sites.
+function primaryRaster(f, phase, active = true, scale = 1, save = false) {
+  const points = [], pixels = new Map(), radius = 8.5;
+  for (const [cx, cy, start] of [[190,10,-Math.PI/2], [190,36,0], [10,36,Math.PI/2], [10,10,Math.PI]]) {
+    for (let index = 0; index <= 64; ++index) {
+      const angle = start + index * Math.PI / 128;
+      points.push([cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)]);
+    }
+  }
+  const lengths = points.map((point, index) => Math.hypot(point[0]-points[(index+1)%points.length][0], point[1]-points[(index+1)%points.length][1]));
+  const perimeter = lengths.reduce((total, length) => total+length, 0);
+  // The closed path starts at the top-right corner, 180px after the action's
+  // top-left tangent; this offset aligns the supplied component phase.
+  let travelled = 180;
+  for (let index = 0; index < points.length; ++index) {
+    const [x,y] = points[index], [nextX,nextY] = points[(index+1)%points.length];
+    const length = lengths[index], steps = Math.ceil(length * scale * 4);
+    for (let step = 0; step < steps; ++step) {
+      const fraction = step / steps, distance = travelled + fraction * length;
+      const blue = active && ((distance/perimeter-phase)%0.1+0.1)%0.1 < 0.05;
+      if (!blue) continue;
+      const px = (11+x+(nextX-x)*fraction)*scale, py = (101+y+(nextY-y)*fraction)*scale;
+      for (let row=Math.floor(py-1.4*scale); row<=Math.ceil(py+1.4*scale); ++row) {
+        for (let column=Math.floor(px-1.4*scale); column<=Math.ceil(px+1.4*scale); ++column) {
+          if (Math.hypot(column+0.5-px,row+0.5-py)<=1.4*scale) pixels.set(`${column},${row}`, [0,102,255,255]);
+        }
+      }
+    }
+    travelled += length;
+  }
+  const core = active && !save ? [210,30,30,255] : [20,180,40,255];
+  f.sampling.raster = (x,y) => pixels.get(`${x},${y}`) ?? core;
+}
+
+test('primary action evidence measures the revealed inner frame and bounds all six idle receipts', t => {
+  const f = canvasFixture(t, true);
+  f.sampling.pixel = () => [20,180,40,255];
+  for (const [control,label] of [
+    ['train.primary','Start Training'], ['validate.primary','Start Validation'],
+    ['predict.primary','Run Predict'], ['export.primary','Run Export'],
+    ['live.primary','Start Live'], ['annotation.save','Save Annotations'],
+  ]) {
+    const {token,outcomes} = primaryCapture(f,control,label,false,primaryFacts());
+    assert.equal(outcomes.at(-1)[0], 'observed');
+    assert.equal(browser.mmltkIntegrationPrimaryActionCurrent(control,token), true);
+    assert.deepEqual(f.sampling.lastRead, [11,101,200,46]);
+    for (let index=0;index<64;++index) assert.equal(browser.mmltkIntegrationPrimaryAction(control,label,false,false,primaryFacts()),0);
+  }
+  assert.equal(browser.mmltkIntegrationPrimaryAction('seventh','unused',false,false,primaryFacts()),0);
+  assert.equal(f.allocations.reads,6);
+  assert.equal(f.allocations.scratch,1);
+  assert.equal(f.allocations.clock,0);
+  assert.deepEqual(f.reports.filter(report => report.event === 'integration.primary_action.pixels').map(report => report.height),[46,46,46,46,46,46]);
+});
+
+test('primary active evidence retains actual theme, ten segments, moving phases and two-capture limit', t => {
+  const f = canvasFixture(t, true);
+  for (const phase of [0,0.05]) {
+    primaryRaster(f,phase);
+    const {token,outcomes} = primaryCapture(f,'export.primary','Stop Export',true,primaryFacts(phase));
+    assert.equal(outcomes.at(-1)[0], phase === 0 ? 'retry' : 'observed');
+    if (phase !== 0) assert.equal(browser.mmltkIntegrationPrimaryActionCurrent('export.primary',token),true);
+  }
+  assert.equal(browser.mmltkIntegrationPrimaryAction('export.primary','Stop Export',true,false,primaryFacts(0.1)),0);
+  assert.equal(f.allocations.reads,2);
+  const reports = f.reports.filter(report => report.event === 'integration.primary_action.pixels');
+  assert.equal(reports.length,2);
+  assert.ok(reports.every(report => report.segments === 10 && report.band_leaks === 0));
+  assert.deepEqual(reports.map(report => report.phase),[0,0.05]);
+});
+
+test('primary measurements reject clipping and changed final geometry then retry after reveal', t => {
+  const f = canvasFixture(t,true);
+  f.sampling.pixel = () => [20,180,40,255];
+  let facts = primaryFacts();
+  for (const bounds of [primaryBounds(10,470),primaryBounds(10,700),primaryBounds(-100,100)]) {
+    const token = browser.mmltkIntegrationPrimaryAction('train.primary','Start Training',false,false,facts);
+    let outcome;
+    browser.mmltkIntegrationPrimaryActionMeasured('train.primary',token,bounds,value => { outcome=value; });
+    assert.equal(outcome,'invalidated');
+  }
+  const token = browser.mmltkIntegrationPrimaryAction('train.primary','Start Training',false,false,facts);
+  browser.mmltkIntegrationPrimaryActionMeasured('train.primary',token,primaryBounds(),()=>{});
+  f.flushFrames();
+  browser.mmltkIntegrationPrimaryActionMeasured('train.primary',token,primaryBounds(20,110),outcome => assert.equal(outcome,'invalidated'));
+  assert.equal(f.allocations.reads,0);
+  facts = primaryFacts(); facts[4] += 20; facts[5] += 30;
+  const result = primaryCapture(f,'train.primary','Start Training',false,facts,primaryBounds(20,110));
+  assert.equal(result.outcomes.at(-1)[0],'observed');
+  assert.deepEqual(f.sampling.lastRead,[21,111,200,46]);
+});
+
+test('primary capture rejects stale callbacks after scroll, navigation, layout, resize and scale changes', t => {
+  const f = canvasFixture(t,true);
+  f.sampling.pixel = () => [20,180,40,255];
+  for (const invalidate of [
+    () => f.input('wheel'),
+    () => browser.mmltkIntegrationPrimaryPage('navigation.explore',1),
+    () => { const facts=primaryFacts(); facts[1]+=10; browser.mmltkIntegrationPrimaryAction('train.primary','Start Training',false,false,facts); },
+    () => { f.canvas.width+=10; },
+    () => { f.css.width+=10; },
+    () => browser.mmltkIntegrationPrimaryPage('navigation.train',1.5),
+    () => { const facts=primaryFacts(0,2); browser.mmltkIntegrationPrimaryAction('train.primary','Start Training',false,false,facts); },
+    () => browser.mmltkIntegrationResetScenario(),
+    () => browser.mmltkIntegrationInitialize(false),
+  ]) {
+    browser.mmltkIntegrationResetScenario();
+    browser.mmltkIntegrationInitialize(true);
+    const token=browser.mmltkIntegrationPrimaryAction('train.primary','Start Training',false,false,primaryFacts());
+    const outcomes=[];
+    browser.mmltkIntegrationPrimaryActionMeasured('train.primary',token,primaryBounds(),outcome=>outcomes.push(outcome));
+    invalidate();
+    f.flushFrames();
+    assert.deepEqual(outcomes,['invalidated']);
+    assert.equal(browser.mmltkIntegrationPrimaryActionCurrent('train.primary',token),false);
+  }
+  assert.equal(f.allocations.reads,0);
+});
+
+test('primary observations scale measured logical coordinates exactly once and reject stale receipts', t => {
+  const f=canvasFixture(t,true);
+  f.canvas.width=1280; f.canvas.height=960;
+  f.sampling.pixel=()=>[20,180,40,255];
+  const {token,outcomes}=primaryCapture(f,'train.primary','Start Training',false,primaryFacts(0,2));
+  assert.equal(outcomes.at(-1)[0],'observed');
+  assert.deepEqual(f.sampling.lastRead,[22,202,400,92]);
+  f.input('wheel');
+  assert.equal(browser.mmltkIntegrationPrimaryActionCurrent('train.primary',token),false);
+  const result=primaryCapture(f,'train.primary','Start Training',false,primaryFacts(0,2));
+  assert.equal(result.outcomes.at(-1)[0],'observed');
+  assert.equal(browser.mmltkIntegrationPrimaryActionCurrent('train.primary',result.token),true);
+});
+
+test('primary mismatches have bounded retries and quiet reporting has no observation work', t => {
+  const f=canvasFixture(t,true);
+  for (let attempt=0;attempt<32;++attempt) {
+    const {outcomes}=primaryCapture(f,'train.primary','Start Training',false,primaryFacts());
+    assert.equal(outcomes.at(-1)[0],'retry');
+  }
+  assert.equal(browser.mmltkIntegrationPrimaryAction('train.primary','Start Training',false,false,primaryFacts()),0);
+  assert.equal(f.allocations.reads,32);
+  browser.mmltkIntegrationInitialize(false);
+  const before={...f.allocations};
+  for (let index=0;index<64;++index) {
+    assert.equal(browser.mmltkIntegrationPrimaryAction('train.primary','Start Training',false,false,primaryFacts()),0);
+    browser.mmltkIntegrationPrimaryPage('navigation.train',1);
+    assert.equal(browser.mmltkIntegrationPrimaryActionCurrent('train.primary',1),false);
+  }
+  assert.deepEqual(f.allocations,before);
+  assert.deepEqual(f.frames,[]);
+});
+
+test('Save Annotations active perimeter evidence keeps its green save-only core', t => {
+  const f=canvasFixture(t,true);
+  for (const phase of [0,0.05]) {
+    primaryRaster(f,phase,true,1,true);
+    const result=primaryCapture(f,'annotation.save','Save Annotations',true,primaryFacts(phase));
+    assert.equal(result.outcomes.at(-1)[0],phase === 0 ? 'retry' : 'observed');
+  }
+  const reports=f.reports.filter(report=>report.event === 'integration.primary_action.pixels');
+  assert.equal(reports.length,2);
+  assert.ok(reports.every(report=>report.label === 'Save Annotations' && report.core[1]>report.core[0]+60));
 });

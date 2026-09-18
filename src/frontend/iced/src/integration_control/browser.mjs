@@ -40,16 +40,20 @@ export function mmltkIntegrationInitialize(enabled) {
     canvasScratch: undefined,
     canvasContext: undefined,
     primaryActions: new Map(),
+    primarySequence: 0,
+    primaryInput: 0,
+    primaryPage: undefined,
     fpsDraw: undefined,
     fpsPending: undefined,
     integrationRenderKey: 0,
-    inputTypes: ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown'],
+    inputTypes: ['pointermove', 'pointerdown', 'pointerup', 'wheel', 'focus', 'keydown', 'resize'],
     onInput: undefined,
   };
   const owner = integrationState;
   integrationState.onInput = (event) => {
     if (integrationState !== owner) return;
-    if (!integrationState.initialAtlasWithoutInput) return;
+    if (event.type !== 'pointermove' || event.buttons) ++owner.primaryInput;
+    if (!integrationState.initialAtlasWithoutInput || event.type === 'resize') return;
     integrationState.initialAtlasInputCount++;
     report({event: 'integration.failure', control: 'explore.gallery.workspace',
       detail: `input during initial atlas completion: ${event.type}`,
@@ -391,36 +395,100 @@ function canvasPixelBounds(canvas, cssBounds, control) {
 // schedules application redraws or influences operation admission.
 export function mmltkIntegrationPrimaryAction(control, label, active, dark, facts) {
   const owner = integrationState;
-  if (!owner || !integrationDriver) return;
-  const width = Math.round(facts[2]);
+  if (!owner || !integrationDriver) return 0;
+  if (facts.length !== 14 || !facts.every(Number.isFinite) || facts[2] <= 20 || facts[3] <= 20 || facts[8] <= 0 || facts[13] < 0) return 0;
   let state = owner.primaryActions.get(control);
-  if (!state || state.label !== label || state.active !== active || state.dark !== dark || state.width !== width || state.scale !== facts[8]) {
-    state = {label, active, dark, width, scale: facts[8], captures: 0, attempts: 0, pending: false, phase: undefined,
-      latest: {label, active, dark, facts: new Float64Array(13), time: 0}};
+  if (!state || state.label !== label || state.active !== active || state.dark !== dark ||
+      state.latest[2] !== facts[2] || state.latest[3] !== facts[3] || state.latest[8] !== facts[8] ||
+      state.latest[10] !== facts[10] || state.latest[11] !== facts[11] || state.latest[12] !== facts[12]) {
+    if (!state && owner.primaryActions.size === 6) return 0;
+    state = {label, active, dark, captures: 0, attempts: 0, phase: undefined,
+      latest: new Float64Array(14), input: owner.primaryInput, request: undefined};
     owner.primaryActions.set(control, state);
   }
-  if (state.captures >= (active ? 2 : 1)) {
-    if (!state.notified) { state.notified = true; return true; }
-    return false;
+  // Layout/viewport facts are only an invalidation key, never canvas positions.
+  // The full viewport (not its intersection) detects even fully visible scrolls.
+  let changed = state.input !== owner.primaryInput;
+  for (let index = 0; index < 9; ++index) changed ||= state.latest[index] !== facts[index];
+  if (state.completed && !state.notified) changed ||= !sameGeometry(state.completed.geometry, canvasGeometry());
+  if (changed) {
+    if (state.completed && !state.notified) { state.captures = 0; state.phase = undefined; }
+    state.request = undefined; state.completed = undefined; state.attempts = 0; state.input = owner.primaryInput;
   }
-  if (state.attempts >= 32) return false;
-  state.latest.facts.set(facts);
-  state.latest.time = performance.now();
-  if (state.pending) return;
-  if (active && state.phase !== undefined && ((facts[9] - state.phase + 1) % 1) < 0.025) return;
-  state.pending = true;
-  integrationFrame(() => integrationFrame(() => {
-    state.pending = false;
-    if (integrationState !== owner || owner.primaryActions.get(control) !== state || performance.now() - state.latest.time > 250) return;
-    const draw = state.latest;
-    const [x,y,w,h,cx,cy,cw,ch,scale,phase,red,green,blue] = draw.facts;
-    // A clipped action cannot supply a complete perimeter observation.
-    if (cx > x + 0.1 || cy > y + 0.1 || cx+cw < x+w-0.1 || cy+ch < y+h-0.1) return;
-    try {
-      const canvas = document.querySelector('canvas');
-      if (!canvas || (x+w)*scale > canvas.width || (y+h)*scale > canvas.height) return;
+  state.latest.set(facts);
+  if (state.captures >= (active ? 2 : 1) || state.attempts >= 32 || state.request) return 0;
+  if (active && state.phase !== undefined && ((facts[9] - state.phase + 1) % 1) < 0.025) return 0;
+  const token = ++owner.primarySequence;
+  state.request = {token, input: owner.primaryInput, geometry: canvasGeometry(), bounds: undefined};
+  ++state.attempts;
+  return token;
+}
+
+export function mmltkIntegrationPrimaryPage(control, scale) {
+  const owner = integrationState;
+  if (!owner || !integrationDriver) return;
+  if (owner.primaryPage !== control || owner.primaryScale !== scale) {
+    owner.primaryPage = control;
+    owner.primaryScale = scale;
+    ++owner.primaryInput;
+  }
+}
+
+export function mmltkIntegrationPrimaryActionCurrent(control, token) {
+  const owner = integrationState, state = owner?.primaryActions.get(control);
+  const completed = state?.completed;
+  const current = !!owner && !!integrationDriver && !!completed && completed.token === token &&
+    !state.notified && state.captures >= (state.active ? 2 : 1) &&
+    completed.input === owner.primaryInput && sameGeometry(completed.geometry, canvasGeometry());
+  if (current) state.notified = true;
+  return current;
+}
+
+export function mmltkIntegrationPrimaryActionMeasured(control, token, measured, callback) {
+  if (!integrationState || !integrationDriver) { callback('invalidated', false); return; }
+  const completed = integrationCompletion(callback), owner = integrationState;
+  const state = owner?.primaryActions.get(control), request = state?.request;
+  const current = () => integrationState === owner && !!integrationDriver &&
+    owner.primaryActions.get(control) === state && state.request === request &&
+    request.input === owner.primaryInput && sameGeometry(request.geometry, canvasGeometry());
+  if (!request || request.token !== token) { completed('invalidated'); return; }
+  const retire = (outcome) => {
+    if (state.request === request) state.request = undefined;
+    completed(outcome, state.active);
+  };
+  if (!current()) { retire('invalidated'); return; }
+  const facts = state.latest, inset = facts[13];
+  const [outerX, outerY, outerW, outerH, px, py, pw, ph, hx, hy, hw, hh] = measured;
+  const x = outerX + inset, y = outerY + inset, w = facts[2], h = facts[3];
+  const scale = facts[8];
+  const canvas = request.geometry.canvas;
+  const contained = measured.length === 12 && Array.from(measured).every(Number.isFinite) &&
+    Math.abs(outerW-w-2*inset) < 0.01 && Math.abs(outerH-h-2*inset) < 0.01 &&
+    pw > 0 && ph > 0 && hw > 0 && hh > 0 && w > 0 && h > 0 && scale > 0 &&
+    x >= Math.max(px,hx,0) && y >= Math.max(py,hy,0) &&
+    x+w <= Math.min(px+pw,hx+hw,canvas.width/scale) &&
+    y+h <= Math.min(py+ph,hy+hh,canvas.height/scale);
+  if (!contained) { retire('invalidated'); return; }
+  if (!request.bounds) {
+    request.bounds = Float64Array.from(measured);
+    // Re-measure after presentation. A pending capture is the only reason for
+    // this second traversal; no tree walk occurs after evidence is complete.
+    integrationFrame(() => integrationFrame(() => {
+      if (!current()) { retire('invalidated'); return; }
+      request.verifyReady = true;
+      completed('measure');
+    }));
+    return;
+  }
+  if (!request.verifyReady || !request.bounds.every((value,index) => value === measured[index])) { retire('invalidated'); return; }
+  // The final widget operation and this read run in the same browser turn.
+  // Navigation, clipping, growth and programmatic scrolling cannot pair an
+  // old position with a newly composited region.
+  const phase = facts[9], [red,green,blue] = facts.subarray(10,13);
+  const draw = state;
+  try {
       const snapshot = canvasSnapshot(canvas);
-      const pixels = snapshot.getImageData(Math.floor(x*scale), Math.floor(y*scale), Math.ceil(w*scale)+1, Math.ceil(h*scale)+1);
+      const pixels = snapshot.getImageData(Math.floor(x*scale), Math.floor(y*scale), Math.ceil((x+w)*scale)-Math.floor(x*scale), Math.ceil((y+h)*scale)-Math.floor(y*scale));
       const at = (px,py) => {
         const ix = Math.floor((x+px)*scale)-Math.floor(x*scale), iy = Math.floor((y+py)*scale)-Math.floor(y*scale);
         return pixels.data.subarray((iy*pixels.width+ix)*4,(iy*pixels.width+ix)*4+3);
@@ -469,18 +537,20 @@ export function mmltkIntegrationPrimaryAction(control, label, active, dark, fact
       }
       const valid = coreCorrect && bandLeaks===0 && (draw.active ? segments===10 && lengths.every(length=>length>=15 && length<=25) && mismatch<=compared*0.12 : segments===0);
       if (!valid) {
-        ++state.attempts;
         report({event:'integration.primary_action.rejected',control,detail:'primary action canvas mismatch',label:draw.label,segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,phase});
+        retire('retry');
         return;
       }
       report({event:'integration.primary_action.pixels',control,label:draw.label,active:draw.active,dark:draw.dark,phase,
-        segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,width:w,height:h,scale,blue:expected});
+        segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,width:w,height:h,scale,blue:expected,screen_bounds:[x,y,w,h]});
       state.phase = phase;
       ++state.captures;
+      state.completed = request;
+      retire(state.captures >= (state.active ? 2 : 1) ? 'observed' : 'retry');
     } catch (error) {
       report({event:'integration.failed',control,detail:`primary action canvas read: ${error}`});
+      retire('failed');
     }
-  }));
 }
 
 export function mmltkIntegrationWorkflowPixels(control, cssBounds, chart, progress, source, presentation, completed) {

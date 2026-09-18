@@ -8,6 +8,8 @@ use iced::widget::{button, column, container, text};
 use iced::{Event, Fill, Font, Length, Padding, Rectangle, Size};
 use super::{Composition, Region, FIELD_SPACING, PRIMARY_ACTION_HEIGHT};
 
+const FRAME_INSET: f32 = 1.0;
+
 fn label(page: FeatureId, active: bool) -> &'static str {
     match (page, active) {
         (FeatureId::Train, false) => "Start Training",
@@ -62,7 +64,7 @@ pub fn view<'a, Message: Clone + 'a>(
     let decorated = Element::new(Decorated { child: action.into(), active, page });
     let framed = container(decorated)
         .id(composition.stable_id(Region::PrimaryAction))
-        .padding(1).width(Fill).height(Length::Fixed(PRIMARY_ACTION_HEIGHT))
+        .padding(FRAME_INSET).width(Fill).height(Length::Fixed(PRIMARY_ACTION_HEIGHT))
         .style(crate::fluent_theme::container_primary_frame);
     column![
         container(progress).id(composition.stable_id(Region::PrimaryProgress))
@@ -123,10 +125,10 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Decorated<'_, Message> 
         if !self.active && !reporting { return; }
         let state = tree.state.downcast_ref::<Animation>();
         let Some(iced::Background::Color(blue)) = crate::fluent_theme::button_primary(theme, iced::widget::button::Status::Active).background else { return; };
-        let Some(clip) = layout.bounds().intersection(viewport).filter(|clip| clip.width > 0.0 && clip.height > 0.0) else { return; };
+        let Some(_clip) = layout.bounds().intersection(viewport).filter(|clip| clip.width > 0.0 && clip.height > 0.0) else { return; };
         if reporting {
             use iced::advanced::Renderer as _;
-            crate::integration_control::primary_action_draw(Composition::new(self.page, 0.0).stable_id(Region::PrimaryAction), label(self.page, self.active), self.active, theme.is_dark(), state.phase, layout.bounds(), clip, renderer.scale_factor().unwrap_or(1.0), blue);
+            crate::integration_control::primary_action_draw(Composition::new(self.page, 0.0).stable_id(Region::PrimaryAction), label(self.page, self.active), self.active, theme.is_dark(), state.phase, layout.bounds(), *viewport, FRAME_INSET, renderer.scale_factor().unwrap_or(1.0), blue);
         }
         if !self.active { return; }
         // Stack-only Shader construction submits through Iced's public primitive API.

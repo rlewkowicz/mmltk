@@ -490,6 +490,8 @@ impl Requests {
                                 | Message::GalleryMouseDelivered
                                 | Message::WorkflowPixels { .. }
                                 | Message::PrimaryActionPixels { .. }
+                                | Message::PrimaryActionMeasure { .. }
+                                | Message::PrimaryActionMeasured { .. }
                                 | Message::ChartInputDelivered(_)
                         ),
                     }

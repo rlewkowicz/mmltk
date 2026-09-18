@@ -217,7 +217,7 @@ mod tests {
         let generation = controller.driver.generation;
         let completion = |generation, active| Message::Scoped {
             generation, receipt: None,
-            message: Box::new(Message::PrimaryActionPixels { control: "export.primary".into(), active }),
+            message: Box::new(Message::PrimaryActionPixels { control: "export.primary".into(), active, token: 1 }),
         };
         let _ = controller.update(completion(generation.wrapping_sub(1), true));
         assert!(!controller.workflows.export_pixels);
@@ -225,6 +225,27 @@ mod tests {
         assert!(!controller.workflows.export_pixels);
         let _ = controller.update(completion(generation, true));
         assert!(controller.workflows.export_pixels);
+    }
+
+    #[test]
+    fn primary_measurement_tasks_belong_to_the_current_enabled_scenario() {
+        let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+        let controller = &mut fixture.controller;
+        controller.driver.phase = Phase::Workflows(Step::Exporting);
+        let generation = controller.driver.generation;
+        let request = |generation| Message::Scoped {
+            generation, receipt: None,
+            message: Box::new(Message::PrimaryActionMeasure { control: "export.primary".into(), token: 1 }),
+        };
+        let _ = controller.update(request(generation.wrapping_sub(1)));
+        assert!(controller.driver.reporting.primary_measurements(generation).is_none());
+        let _ = controller.update(request(generation));
+        assert!(controller.driver.reporting.primary_measurements(generation).is_some());
+        assert!(controller.driver.reporting.primary_measurements(generation).is_none());
+        crate::integration_control::initialize_reporting(false, false);
+        let _ = controller.update(request(generation));
+        assert!(controller.driver.reporting.primary_measurements(generation).is_none());
+        assert!(!crate::integration_control::reporting::primary_action_current("export.primary", 1));
     }
 
     #[test]

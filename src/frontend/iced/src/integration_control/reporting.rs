@@ -18,19 +18,58 @@ use std::cell::RefCell;
 
 /// Only the opt-in acceptance observer sees presentation facts. It cannot
 /// change execution, widget identity, redraw scheduling, or GPU resource custody.
-pub(crate) fn primary_action_draw(control: &str, label: &str, active: bool, dark: bool, phase: f32, bounds: Rectangle, clip: Rectangle, scale: f32, blue: iced::Color) {
+pub(crate) fn primary_action_draw(control: &str, label: &str, active: bool, dark: bool, phase: f32, bounds: Rectangle, viewport: Rectangle, inset: f32, scale: f32, blue: iced::Color) {
     if !reporting_enabled() { return; }
     #[cfg(target_arch = "wasm32")]
-    if primary_action_js(control, label, active, dark, &[
-        f64::from(bounds.x), f64::from(bounds.y), f64::from(bounds.width), f64::from(bounds.height),
-        f64::from(clip.x), f64::from(clip.y), f64::from(clip.width), f64::from(clip.height),
-        f64::from(scale), f64::from(phase), f64::from(blue.r), f64::from(blue.g), f64::from(blue.b),
-    ]) && let Some(mut output) = probe::scenario_output() {
-        output.receipt = None;
-        output.send(super::Message::PrimaryActionPixels { control: control.to_owned(), active });
+    {
+        let token = primary_action_js(control, label, active, dark, &[
+            f64::from(bounds.x), f64::from(bounds.y), f64::from(bounds.width), f64::from(bounds.height),
+            f64::from(viewport.x), f64::from(viewport.y), f64::from(viewport.width), f64::from(viewport.height),
+            f64::from(scale), f64::from(phase), f64::from(blue.r), f64::from(blue.g), f64::from(blue.b), f64::from(inset),
+        ]);
+        if token != 0 && let Some(mut output) = probe::scenario_output() {
+            output.receipt = None;
+            output.send(super::Message::PrimaryActionMeasure { control: control.to_owned(), token });
+        }
     }
     #[cfg(not(target_arch = "wasm32"))]
-    let _ = (control, label, active, dark, phase, bounds, clip, scale, blue);
+    let _ = (control, label, active, dark, phase, bounds, viewport, inset, scale, blue);
+}
+
+pub(super) fn primary_action_measured(control: String, token: u32, bounds: [Rectangle; 3]) {
+    if !reporting_enabled() { return; }
+    #[cfg(target_arch = "wasm32")]
+    if let Some(mut output) = probe::scenario_output() {
+        output.receipt = None;
+        let completed_control = control.clone();
+        let completed = wasm_bindgen::closure::Closure::once_into_js(move |outcome: String, active: bool| {
+            match outcome.as_str() {
+                "measure" => output.send(super::Message::PrimaryActionMeasure { control: completed_control, token }),
+                "observed" => output.send(super::Message::PrimaryActionPixels { control: completed_control, active, token }),
+                _ => {},
+            }
+        });
+        let facts = bounds.map(|r| [f64::from(r.x), f64::from(r.y), f64::from(r.width), f64::from(r.height)]);
+        primary_action_measured_js(&control, token, facts.as_flattened(), &completed);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (control, token, bounds);
+}
+
+pub(super) fn primary_page(page: FeatureId, scale: f32) {
+    if !reporting_enabled() { return; }
+    #[cfg(target_arch = "wasm32")]
+    primary_page_js(crate::view::navigation::stable_id(page), f64::from(scale));
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (page, scale);
+}
+
+pub(super) fn primary_action_current(control: &str, token: u32) -> bool {
+    if !reporting_enabled() { return false; }
+    #[cfg(target_arch = "wasm32")]
+    { primary_action_current_js(control, token) }
+    #[cfg(not(target_arch = "wasm32"))]
+    { let _ = (control, token); true }
 }
 
 pub(super) fn chart_view(stage: &str, view: &crate::view::metrics::ChartView) {
@@ -129,6 +168,33 @@ impl Owner {
         });
     }
 
+    pub(super) fn measure_primary(&self, control: String, token: u32) {
+        self.observe(|state| {
+            if let Some(slot) = state.primary_measurements.iter_mut().find(|slot| slot.as_ref().is_some_and(|(id, _)| id == &control)) {
+                *slot = Some((control, token));
+            } else if let Some(slot) = state.primary_measurements.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some((control, token));
+            }
+        });
+    }
+
+    pub(super) fn primary_measurements(&self, generation: u64) -> Option<iced::Task<crate::message::Message>> {
+        if !reporting_enabled() { return None; }
+        let mut state = self.state.borrow_mut();
+        let state = state.as_mut()?;
+        if state.primary_measurements.iter().all(Option::is_none) { return None; }
+        Some(iced::Task::batch(state.primary_measurements.iter_mut().filter_map(Option::take).map(|(control, token)| {
+            super::widget_ops::measure_control(control.clone()).map(move |bounds| {
+                crate::message::Message::Integration(super::Message::Scoped {
+                    generation, receipt: None,
+                    message: Box::new(super::Message::PrimaryActionMeasured {
+                        control: control.clone(), token, bounds: [bounds.target, bounds.page, bounds.horizontal],
+                    }),
+                })
+            })
+        })))
+    }
+
     #[cfg(test)]
     pub(super) fn state_is_absent(&self) -> bool {
         self.state.borrow().is_none()
@@ -138,6 +204,7 @@ impl Owner {
 #[derive(Default)]
 pub(crate) struct State {
     reported_phase: Option<Phase>,
+    primary_measurements: [Option<(String, u32)>; 6],
     explore_snapshot_revision: u64,
     reopen_wait_revision: u64,
     scroll_placeholder_reported: bool,
@@ -249,8 +316,14 @@ thread_local! {
 #[wasm_bindgen::prelude::wasm_bindgen(module = "/src/integration_control/browser.mjs")]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPrimaryAction)]
-    fn primary_action_js(control: &str, label: &str, active: bool, dark: bool, facts: &[f64]) -> bool;
+    fn primary_action_js(control: &str, label: &str, active: bool, dark: bool, facts: &[f64]) -> u32;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPrimaryActionMeasured)]
+    fn primary_action_measured_js(control: &str, token: u32, bounds: &[f64], completed: &wasm_bindgen::JsValue);
 
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPrimaryPage)]
+    fn primary_page_js(control: &str, scale: f64);
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationPrimaryActionCurrent)]
+    fn primary_action_current_js(control: &str, token: u32) -> bool;
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationReport)]
     fn report_js(event: &str, control: &str, detail: &str, a: f64, b: f64, c: f64, d: f64);
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = mmltkIntegrationRenderedStyle)]
