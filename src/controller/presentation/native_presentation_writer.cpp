@@ -133,6 +133,7 @@ struct SampleArena final {
     VisualExtent extent{};
     PresentationSubmittedSource submitted{};
     abi::Record layout{};
+    std::optional<gpu::DeviceContext> context;
     bool ready = false;
     bool binding_retired = false;
 };
@@ -306,14 +307,13 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics,
                              gpu::DeviceExecution execution)
         : NativePresentationWriter(
-              settings, std::move(configuration), diagnostics, execution,
+              settings, std::move(configuration), diagnostics,
               gpu::DeviceContext(settings.device, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, settings.numa_node, execution)) {}
     NativePresentationWriter(VisualDeviceSettings settings, PresentationNativeConfiguration configuration, VisualDiagnosticSink diagnostics,
-                             gpu::DeviceExecution execution, gpu::DeviceContext context)
+                             gpu::DeviceContext context)
         : settings_(settings),
           configuration_(std::move(configuration)),
           diagnostics_(diagnostics),
-          execution_(std::move(execution)),
           channel_(configuration_.import_socket, diagnostics_),
           context_(std::move(context)),
           wake_(std::make_shared<ScopedFd>(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK))) {
@@ -599,9 +599,10 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         return candidate_.get();
     }
     gpu::ImageWorkspaceLayout Layout(const SampleArena& arena) const {
+        if (!arena.context) throw std::runtime_error("Firefox workspace device is unresolved");
         const auto& packet = arena.layout;
         gpu::ImageWorkspaceLayout layout{.device_incarnation = packet.device_incarnation,
-                                         .device = settings_.device,
+                                         .device = arena.context->device(),
                                          .width = packet.width,
                                          .height = packet.height,
                                          .pitch_bytes = packet.stride,
@@ -643,6 +644,11 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 outcome.layout.height != candidate_->extent.height)
                 throw std::runtime_error("Firefox arena layout identity mismatch");
             candidate_->layout = outcome.layout;
+            // Browser display selection and each producer's compute selection
+            // are independent. Resolve the exported allocation once at arena
+            // admission; retain that context through old arena retirement.
+            context_ = context_.OnDevice(gpu::resolve_device_uuid(std::to_array(outcome.layout.device_uuid)));
+            candidate_->context = context_;
             static_cast<void>(Layout(*candidate_));
             candidate_->ready = true;
             return;
@@ -740,6 +746,12 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                     progress.source_acquired = source->acquired;
                     progress.source_release_submitted = source->release_submitted;
                     progress.source_withdrawing = source->withdrawing;
+                    const auto access = source->workspace->ObserveAccess();
+                    progress.admitted_access = access.access;
+                    progress.admitted_generation = access.generation;
+                    progress.admitted_display_held = access.display_held;
+                    progress.admitted_write_reserved = access.write_reserved;
+                    progress.admitted_completion_pending = access.completion_pending;
                 }
                 if (observed) {
                     progress.requested_product_owner = observed->product_owner;
@@ -787,7 +799,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 const auto count = std::ranges::count_if(sources_, [&](const auto& source) { return !source->withdrawing && source->arena() == arena->id; });
                 if (count == 2 || sources_.size() == kSourceCapacity) return wait("shared_back_slot_unavailable", arena, &observed);
                 const auto id = native::WorkspaceSurfaceImportId::generate();
-                auto workspace = gpu::ImageWorkspace::Create(context_, Layout(*arena), execution_);
+                auto workspace = gpu::ImageWorkspace::Create(*arena->context, Layout(*arena));
                 auto packet = arena->layout;
                 packet.opcode = abi::Opcode::Allocate;
                 packet.descriptors = abi::kAllocateDescriptorCount;
@@ -797,7 +809,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
                 packet.arena_low = arena->id.low;
                 packet.allocation_identity = workspace->identity();
                 packet.size = workspace->allocation_bytes();
-                auto source = std::make_unique<AdmittedSource>(packet, context_, wake_->get(), diagnostics_);
+                auto source = std::make_unique<AdmittedSource>(packet, *arena->context, wake_->get(), diagnostics_);
                 source->AdoptWorkspace(std::move(workspace), wake_);
                 source->generation = mmltk::common::types::take_monotonic_identity(next_generation_);
                 source->edge.reset(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
@@ -1031,7 +1043,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     VisualDiagnosticFact Fact(VisualDiagnosticOperation operation, const Transfer& transfer, std::uint64_t outcome) const noexcept {
         auto fact = presentation_diagnostic_fact(operation,
                                                  {.submitted = transfer.pending.submitted, .publication = transfer.publication, .link = transfer.pending.link},
-                                                 settings_.device, outcome);
+                                                 transfer.source->context.device(), outcome);
         fact.context.workspace = native::workspace_source_diagnostic(transfer.source->description);
         fact.context.workspace.native_process_id = static_cast<std::uint64_t>(::getpid());
         fact.context.workspace.workspace_plane = transfer.plane.data;
@@ -1041,7 +1053,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
         diagnostics_.Emit([&] {
             return VisualDiagnosticFact{.system = contracts::DiagnosticOwner::Presentation,
                                         .operation = operation,
-                                        .device = settings_.device,
+                                        .device = source.context.device(),
                                         .generation = source.generation,
                                         .context = {.capacity_width = source.description.width,
                                                     .capacity_height = source.description.height,
@@ -1054,7 +1066,7 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     void DiagnoseArena(VisualDiagnosticOperation operation, const SampleArena& arena, std::uint64_t outcome) const noexcept {
         diagnostics_.Emit([&] {
             auto fact = presentation_diagnostic_fact(operation, {.submitted = arena.submitted, .publication = {.capability = CapabilityOf(arena)}},
-                                                     settings_.device, outcome);
+                                                     arena.context ? arena.context->device() : settings_.device, outcome);
             if (operation == VisualDiagnosticOperation::PresentationImportOutcome) fact.value = outcome;
             return fact;
         });
@@ -1084,7 +1096,6 @@ class NativePresentationWriter final : public PresentationNativeWriter {
     bool pending_supersession_acceptance_ = configuration_.pending_supersession_acceptance;
     VisualDiagnosticSink diagnostics_;
     std::optional<services::RuntimeDiagnosticSpan<VisualDiagnosticSink, VisualDiagnosticFact>> ready_span_;
-    gpu::DeviceExecution execution_;
     native::WorkspaceSurfaceImportChannel channel_;
     gpu::DeviceContext context_;
     std::shared_ptr<ScopedFd> wake_;
@@ -1105,7 +1116,7 @@ std::unique_ptr<PresentationNativeWriter> test_support::NativePresentationWriter
                                                                                                    std::shared_ptr<gpu::ImageWorkspace> workspace,
                                                                                                    VisualDiagnosticSink diagnostics) {
     const VisualDeviceSettings settings{context.device(), workspace->layout().width, workspace->layout().height};
-    auto result = std::make_unique<NativePresentationWriter>(settings, std::move(configuration), diagnostics, gpu::DeviceExecution{}, std::move(context));
+    auto result = std::make_unique<NativePresentationWriter>(settings, std::move(configuration), diagnostics, std::move(context));
     abi::Record description{};
     description.id_low = workspace->identity();
     auto source = std::make_unique<AdmittedSource>(description, result->context_, result->wake_->get(), diagnostics);

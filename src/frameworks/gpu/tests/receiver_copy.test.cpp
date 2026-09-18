@@ -10,6 +10,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <cerrno>
@@ -33,6 +34,67 @@ namespace {
 using test_support::FakeImageBackend;
 using test_support::make_clean_semantic_runtime;
 using test_support::RuntimeFactory;
+TEST_CASE("Native image handoffs preserve both planes between every visible GPU pair", "[gpu][hardware][multi_gpu]") {
+    const int count = mmltk::testsupport::checked_cuda_device_count();
+    if (count == 0) SKIP("No CUDA-visible device; native image handoffs remain unverified");
+    const auto backend = cuda_image_copy_backend();
+    for (int source_device = 0; source_device < count; ++source_device) {
+        for (int receiver_device = 0; receiver_device < count; ++receiver_device) {
+            CAPTURE(source_device, receiver_device);
+            auto source =
+                std::make_unique<SystemImageRuntime>(SystemImageRuntimeConfig{.device = source_device, .output_layout = ImageProductLayout::CleanAndSemantic});
+            SystemImageRuntime receiver{{.device = receiver_device, .output_layout = ImageProductLayout::CleanAndSemantic}};
+            const auto expected_path = source_device == receiver_device                         ? ImageCopyPath::SameDevice
+                                       : backend->CanAccessPeer(receiver_device, source_device) ? ImageCopyPath::Peer
+                                                                                                : ImageCopyPath::PinnedStaging;
+            ImageStorageFootprint high_water{};
+            for (const std::uint32_t width : {7U, 13U, 7U}) {
+                source->BeginWork();
+                source->Publish(width, 5U, [width](const auto clean, const auto semantic, const auto stream) {
+                    for (const auto plane : {clean, semantic}) {
+                        const auto fill = static_cast<unsigned char>(width + (plane.descriptor.kind == ImagePlaneKind::Clean ? 17U : 83U));
+                        REQUIRE(cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, fill, plane.descriptor.row_bytes(), plane.descriptor.height,
+                                                  reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
+                    }
+                });
+                const auto paths = receiver.CopyFrom(source->Borrow());
+                CHECK(paths[0U] == expected_path);
+                CHECK(paths[1U] == expected_path);
+                const auto storage = receiver.OutputStorageFootprint();
+                if (high_water.device_bytes != 0U && width == 7U) {
+                    CHECK(storage.device_bytes == high_water.device_bytes);
+                    CHECK(storage.pinned_bytes == high_water.pinned_bytes);
+                    // The receiver's completed copy must survive source teardown.
+                    CHECK(source->Retire().safe_to_destroy);
+                    source.reset();
+                }
+                high_water = storage;
+                auto copied = receiver.Borrow();
+                REQUIRE(copied.valid());
+                REQUIRE(copied.plane_count() == 2U);
+                for (std::size_t index = 0U; index < copied.plane_count(); ++index) {
+                    const auto plane = copied.plane(index).plane();
+                    CHECK(copied.plane(index).device() == receiver_device);
+                    copied.plane(index).context().Bind();
+                    std::array<unsigned char, 13U * 5U * 4U> bytes{};
+                    CUDA_MEMCPY2D read{};
+                    read.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+                    read.srcDevice = plane.data;
+                    read.srcPitch = plane.descriptor.pitch_bytes;
+                    read.dstMemoryType = CU_MEMORYTYPE_HOST;
+                    read.dstHost = bytes.data();
+                    read.dstPitch = plane.descriptor.row_bytes();
+                    read.WidthInBytes = read.dstPitch;
+                    read.Height = plane.descriptor.height;
+                    REQUIRE(cuMemcpy2D(&read) == CUDA_SUCCESS);
+                    const auto fill = static_cast<unsigned char>(width + (index == 0U ? 17U : 83U));
+                    CHECK(std::all_of(bytes.begin(), bytes.begin() + width * 5U * 4U, [fill](auto value) { return value == fill; }));
+                }
+            }
+            CHECK(receiver.Retire().safe_to_destroy);
+        }
+    }
+}
 TEST_CASE("receiver selects same peer and reusable staged copy paths") {
     auto backend = std::make_shared<FakeImageBackend>();
     SystemImageRuntime source{{.device = 0, .backend = backend}};

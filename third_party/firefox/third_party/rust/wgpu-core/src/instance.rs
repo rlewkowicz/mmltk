@@ -441,6 +441,7 @@ this.try_add_hal(hal::api::Vulkan, &instance_desc, telemetry);
         &self,
         desc: &wgt::RequestAdapterOptions<&Surface>,
         backends: Backends,
+        display_pci_bus_id: Option<&str>,
     ) -> Result<Adapter, wgt::RequestAdapterError> {
         api_log!("Instance::request_adapter");
 
@@ -460,6 +461,11 @@ this.try_add_hal(hal::api::Vulkan, &instance_desc, telemetry);
 
             let mut backend_adapters =
                 unsafe { instance.enumerate_adapters(compatible_hal_surface) };
+            // Firefox's EGL display owns adapter selection. Power preference
+            // cannot move a canvas to a different physical graphics device.
+            if let Some(display_device) = display_pci_bus_id {
+                backend_adapters.retain(|exposed| exposed.info.device_pci_bus_id == display_device);
+            }
             if backend_adapters.is_empty() {
                 log::debug!("enabled backend `{backend:?}` has no adapters");
                 no_adapter_backends |= Backends::from(backend);
@@ -1095,6 +1101,7 @@ impl Global {
         desc: &RequestAdapterOptions,
         backends: Backends,
         id_in: Option<AdapterId>,
+        display_pci_bus_id: Option<&str>,
     ) -> Result<AdapterId, wgt::RequestAdapterError> {
         let compatible_surface = desc.compatible_surface.map(|id| self.surfaces.get(id));
         let desc = wgt::RequestAdapterOptions {
@@ -1103,7 +1110,7 @@ impl Global {
             compatible_surface: compatible_surface.as_deref(),
             apply_limit_buckets: desc.apply_limit_buckets,
         };
-        let adapter = self.instance.request_adapter(&desc, backends)?;
+        let adapter = self.instance.request_adapter(&desc, backends, display_pci_bus_id)?;
         let id = self.hub.adapters.prepare(id_in).assign(Arc::new(adapter));
         Ok(id)
     }

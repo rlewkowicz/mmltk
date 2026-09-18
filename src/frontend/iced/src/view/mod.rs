@@ -139,6 +139,8 @@ pub fn view<'a>(
         scrollable(shell)
             .id(HORIZONTAL_SCROLL_ID)
             .direction(Direction::Horizontal(compact_scrollbar()))
+            // Reserve the rail's height so it cannot cover bottom-row controls.
+            .spacing(0)
             .style(crate::fluent_theme::scrollable_default)
             .width(Fill)
             .height(Fill)

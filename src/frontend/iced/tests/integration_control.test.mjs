@@ -835,7 +835,8 @@ test('primary action evidence measures the revealed inner frame and bounds all s
   assert.equal(browser.mmltkIntegrationPrimaryAction('seventh','unused',false,false,primaryFacts()),0);
   assert.equal(f.allocations.reads,6);
   assert.equal(f.allocations.scratch,1);
-  assert.equal(f.allocations.clock,0);
+  // Each of the six accepted opt-in pixel records gets one report timestamp.
+  assert.equal(f.allocations.clock,6);
   assert.deepEqual(f.reports.filter(report => report.event === 'integration.primary_action.pixels').map(report => report.height),[46,46,46,46,46,46]);
 });
 
@@ -916,6 +917,19 @@ test('primary observations scale measured logical coordinates exactly once and r
   assert.equal(result.outcomes.at(-1)[0],'observed');
   assert.equal(browser.mmltkIntegrationPrimaryActionCurrent('train.primary',result.token),true);
 });
+
+for (const [dpi, uiScale] of [[1,1.5], [1.25,1.5], [2,1.5]]) {
+  test(`primary capture uses applied UI scale ${uiScale} and backing scale ${dpi} despite a stale renderer hint`, t => {
+    const f=canvasFixture(t,true);
+    f.canvas.width=640*dpi; f.canvas.height=480*dpi;
+    f.sampling.pixel=()=>[20,180,40,255];
+    browser.mmltkIntegrationPrimaryPage('navigation.train',uiScale);
+    const {outcomes}=primaryCapture(f,'train.primary','Start Training',false,primaryFacts(0,1));
+    assert.equal(outcomes.at(-1)[0],'observed');
+    const scale=dpi*uiScale, left=Math.floor(11*scale), top=Math.floor(101*scale);
+    assert.deepEqual(f.sampling.lastRead,[left,top,Math.ceil(211*scale)-left,Math.ceil(147*scale)-top]);
+  });
+}
 
 test('primary mismatches have bounded retries and quiet reporting has no observation work', t => {
   const f=canvasFixture(t,true);

@@ -173,6 +173,7 @@ if(BUILD_RFDETR_NATIVE)
         mmltk::common::io
         mmltk::controller::contracts
         mmltk::controller::direct_services
+        mmltk::controller::upscale_system
         mmltk::controller::visual_contract
         mmltk::backend::models::rfdetr::training
         mmltk::backend::ml::torch_dependencies

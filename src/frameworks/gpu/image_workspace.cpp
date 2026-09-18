@@ -446,6 +446,20 @@ bool ImageWorkspace::WriteAvailable() const noexcept {
     const auto access = std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire);
     return (access & kWorkspaceAccessMask) == kWorkspaceAccessEmpty || (access & kWorkspaceAccessMask) == kWorkspaceAccessAvailable;
 }
+bool ImageWorkspace::FinalizationPending() const noexcept {
+    std::scoped_lock lock(state_->access);
+    return bool(state_->pending_source);
+}
+ImageWorkspace::AccessObservation ImageWorkspace::ObserveAccess() const noexcept {
+    std::scoped_lock lock(state_->access);
+    return {
+        .access = std::atomic_ref{state_->access_signal->access}.load(std::memory_order_acquire),
+        .generation = std::atomic_ref{state_->access_signal->generation}.load(std::memory_order_relaxed),
+        .display_held = state_->display_held.load(std::memory_order_acquire),
+        .write_reserved = state_->write_reserved,
+        .completion_pending = bool(state_->pending_source),
+    };
+}
 bool ImageWorkspace::ReserveWrite() {
     if (!admitted()) return false;
     std::unique_lock lock(state_->access, std::try_to_lock);

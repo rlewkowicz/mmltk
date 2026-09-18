@@ -28,7 +28,7 @@ mod workspace_input;
 #[cfg(any(target_arch = "wasm32", test))]
 pub fn run() -> iced::Result {
     use iced::Backend;
-    use iced::backend::{Api, PowerPreference};
+    use iced::backend::Api;
 
     let mut fonts = iced_fluent_theme::font::load();
     fonts.extend([
@@ -55,6 +55,5 @@ pub fn run() -> iced::Result {
         .theme(app::theme)
         .scale_factor(app::scale_factor)
         .backend(Backend::Hardware(Api::WebGPU))
-        .power_preference(PowerPreference::HighPerformance)
         .run()
 }

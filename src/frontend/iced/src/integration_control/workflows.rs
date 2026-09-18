@@ -174,9 +174,12 @@ pub(super) struct State {
     pixel_source: u64,
     pixel_presentation: u64,
     pixel_attempts: u8,
+    progress_epoch: Option<u64>,
     validation_layer: u8,
     export_pixels: bool,
-    primary_pixels: [bool; 3],
+    primary_pixels: [bool; 4],
+    primary_reveal: [Option<(u64, u64)>; 4],
+    work_progress: Option<(FeatureId, u64, u64)>,
     export_narrow: bool,
 }
 
@@ -214,8 +217,142 @@ fn completed(stage: &str, facts: [f64; 4]) {
 #[cfg(test)]
 mod tests {
     use super::{Picture, Step};
+    use crate::generated::FeatureId;
     use crate::integration_control::pixel_checks::ProbeOutcome;
-    use crate::integration_control::{Message, Phase};
+    use crate::integration_control::{Controller, Message, Phase};
+
+    fn advance_workflow(
+        controller: &mut Controller,
+        model: &crate::view_model::ApplicationModel,
+        step: Step,
+        feature: FeatureId,
+    ) -> usize {
+        controller
+            .workflows
+            .advance_workflows(
+                &mut controller.widgets,
+                &mut controller.driver,
+                step,
+                model,
+                &crate::view::settings::SettingsModel::default(),
+                feature,
+                None,
+                &crate::view::router::Router::default(),
+            )
+            .units()
+    }
+
+    #[test]
+    fn validation_controls_wait_for_the_sample_selection_reply() {
+        for step in [
+            Step::OpenSample,
+            Step::HideBoxes,
+            Step::ValidationLayer(true, 1),
+            Step::CloseSample,
+        ] {
+            let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+            let controller = &mut fixture.controller;
+            controller.driver.phase = Phase::Workflows(step);
+            let mut model = crate::view_model::test_support::bootstrapped();
+            model.workflow.validation.as_mut().unwrap().detail = true;
+            let pending = model
+                .begin_intent(crate::generated::ApplicationIntentEndpoint::ValidationSelectSample)
+                .unwrap();
+            assert_eq!(
+                advance_workflow(controller, &model, step, FeatureId::Validate),
+                0
+            );
+            assert!(!controller.widgets.location_pending());
+            model.abandon_intent(pending);
+            assert!(advance_workflow(controller, &model, step, FeatureId::Validate) > 0);
+        }
+    }
+
+    #[test]
+    fn active_primary_reveal_yields_to_rendering_until_native_progress_changes() {
+        for (feature, step) in [
+            (FeatureId::Train, Step::Training),
+            (FeatureId::Export, Step::Exporting),
+        ] {
+            let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+            let controller = &mut fixture.controller;
+            controller.driver.phase = Phase::Workflows(step);
+            let mut model = crate::view_model::test_support::bootstrapped();
+            let operation = match feature {
+                FeatureId::Train => &mut model.workflow.training.as_mut().unwrap().local,
+                _ => model.workflow.export.as_mut().unwrap(),
+            };
+            operation.active = true;
+            assert!(advance_workflow(controller, &model, step, feature) > 0);
+            controller.widgets.location_completed();
+            assert_eq!(advance_workflow(controller, &model, step, feature), 0);
+            assert_eq!(advance_workflow(controller, &model, step, feature), 0);
+            let operation = match feature {
+                FeatureId::Train => &mut model.workflow.training.as_mut().unwrap().local,
+                _ => model.workflow.export.as_mut().unwrap(),
+            };
+            operation.progress.sequence += 1;
+            assert!(advance_workflow(controller, &model, step, feature) > 0);
+        }
+    }
+
+    #[test]
+    fn page_navigation_waits_for_verified_idle_primary_pixels() {
+        let mut fixture = crate::integration_control::ProbeFixture::new("");
+        let controller = &mut fixture.controller;
+        controller.driver.phase = Phase::PagePrimary(FeatureId::Validate);
+        let model = crate::view_model::test_support::bootstrapped();
+        let settings = crate::view::settings::SettingsModel::default();
+        let advance = |controller: &mut Controller| {
+            controller
+                .lifecycle
+                .advance_lifecycle(
+                    &mut controller.driver,
+                    &mut controller.widgets,
+                    &model,
+                    &settings,
+                    1.0,
+                    FeatureId::Validate,
+                )
+                .units()
+        };
+        assert!(advance(controller) > 0);
+        let _ = controller.update_location(
+            "validate.primary".into(),
+            iced::Rectangle {
+                x: 10.0,
+                y: 10.0,
+                width: 200.0,
+                height: 48.0,
+            },
+        );
+        assert_eq!(
+            controller.driver.phase,
+            Phase::AwaitPagePrimary(FeatureId::Validate)
+        );
+        assert_eq!(advance(controller), 0);
+        let completion = |control: &str, active| Message::Scoped {
+            generation: controller.driver.generation,
+            receipt: None,
+            message: Box::new(Message::PrimaryActionPixels {
+                control: control.into(),
+                active,
+                token: 1,
+            }),
+        };
+        let active = completion("validate.primary", true);
+        let other = completion("train.primary", false);
+        let idle = completion("validate.primary", false);
+        let _ = controller.update(active);
+        let _ = controller.update(other);
+        assert_eq!(advance(controller), 0);
+        let _ = controller.update(idle);
+        let _ = advance(controller);
+        assert_eq!(
+            controller.driver.phase,
+            Phase::PageNavigation(FeatureId::Predict)
+        );
+    }
 
     #[test]
     fn export_stop_requires_current_active_primary_canvas_completion() {
@@ -348,6 +485,48 @@ mod tests {
         ));
         assert_eq!(controller.driver.phase, Phase::Failed);
     }
+
+    #[test]
+    fn progress_capture_rejects_a_training_phase_change_without_accepting_blank_pixels() {
+        for changed in [false, true] {
+            let mut fixture = crate::integration_control::ProbeFixture::new("workflows");
+            let controller = &mut fixture.controller;
+            controller.driver.phase = Phase::Workflows(Step::AwaitPixels(Picture::Progress, 0));
+            let mut model = crate::view_model::test_support::bootstrapped();
+            let train = model.workflow.training.as_mut().unwrap();
+            train.local.active = true;
+            train.metrics = Some(crate::view::metrics::tests::record());
+            let progress = &mut train.metrics.as_mut().unwrap().progress;
+            controller.workflows.progress_epoch = Some(progress.epoch as u64);
+            if changed {
+                progress.phase = crate::generated::TrainingPhase::Validate;
+            }
+            let _ = controller.workflows.advance_workflows(
+                &mut controller.widgets,
+                &mut controller.driver,
+                Step::AwaitPixels(Picture::Progress, 0),
+                &model,
+                &crate::view::settings::SettingsModel::default(),
+                FeatureId::Train,
+                None,
+                &crate::view::router::Router::default(),
+            );
+            controller.workflows.workflow_pixels(
+                &mut controller.driver,
+                Picture::Progress,
+                0,
+                ProbeOutcome::Observed(256, 0),
+            );
+            assert_eq!(
+                controller.driver.phase,
+                if changed {
+                    Phase::Workflows(Step::Training)
+                } else {
+                    Phase::Failed
+                }
+            );
+        }
+    }
 }
 
 impl State {
@@ -393,9 +572,14 @@ impl State {
         if !active {
             return;
         }
-        for (index, feature) in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
-            .into_iter()
-            .enumerate()
+        for (index, feature) in [
+            FeatureId::Train,
+            FeatureId::Validate,
+            FeatureId::Predict,
+            FeatureId::Export,
+        ]
+        .into_iter()
+        .enumerate()
         {
             if control == primary(feature) {
                 self.primary_pixels[index] = true;
@@ -456,6 +640,10 @@ impl State {
         if driver.phase != Phase::Workflows(Step::AwaitPixels(picture, index)) {
             return;
         }
+        if picture == Picture::Progress && self.progress_epoch.is_none() {
+            self.retry_progress_capture(driver);
+            return;
+        }
         match outcome {
             ProbeOutcome::Invalidated if self.pixel_attempts < 32 => {
                 self.pixel_attempts += 1;
@@ -504,6 +692,14 @@ impl State {
             )),
         }
     }
+    fn retry_progress_capture(&mut self, driver: &mut Driver) {
+        if self.pixel_attempts < 32 {
+            self.pixel_attempts += 1;
+            driver.phase = Phase::Workflows(Step::Training);
+        } else {
+            driver.fail("Training progress capture remained invalidated");
+        }
+    }
     pub(super) fn workflow_located(
         &mut self,
         driver: &mut Driver,
@@ -513,6 +709,10 @@ impl State {
         let Phase::Workflows(step) = driver.phase else {
             return;
         };
+        if matches!(step, Step::Pixels(Picture::Progress, _)) && self.progress_epoch.is_none() {
+            self.retry_progress_capture(driver);
+            return;
+        }
         if matches!(step, Step::NoImageWorkspace | Step::NoValidationAspect) {
             if bounds.width > 0.0 || bounds.height > 0.0 {
                 driver.fail("Workflow still exposes a removed image workspace or aspect selector");
@@ -743,6 +943,8 @@ impl State {
             Step::Export => Step::PrepareExport,
             Step::StartExport => {
                 self.export_pixels = false;
+                self.primary_pixels[3] = false;
+                self.primary_reveal[3] = None;
                 Step::Exporting
             }
             Step::StopExport => Step::ExportStopped,
@@ -773,22 +975,101 @@ impl State {
         let validation = model.workflow.validation.as_ref();
         let prediction = model.predict_snapshot.as_ref();
         let record = train.and_then(|value| value.metrics.as_ref());
+        if crate::integration_control::reporting_enabled() {
+            let work = match step {
+                Step::Training | Step::HiddenTrain | Step::Trained => {
+                    train.map(|value| (FeatureId::Train, &value.local))
+                }
+                Step::Validating => validation.map(|value| (FeatureId::Validate, &value.operation)),
+                Step::Predicting(_) | Step::VideoEnd | Step::Restarted | Step::Stopped => {
+                    prediction.map(|value| (FeatureId::Predict, &value.operation))
+                }
+                Step::Exporting | Step::ExportStopped => model
+                    .workflow
+                    .export
+                    .as_ref()
+                    .map(|value| (FeatureId::Export, value)),
+                _ => None,
+            };
+            if let Some((feature, operation)) =
+                work.filter(|(_, operation)| operation.active && operation.progress.sequence > 0)
+            {
+                let current = (
+                    feature,
+                    operation.generationfrontier,
+                    operation.progress.sequence,
+                );
+                if self.work_progress != Some(current) {
+                    self.work_progress = Some(current);
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.workflow.operation_progress",
+                            primary(feature),
+                            &format!("{step:?}"),
+                            [current.1 as f64, current.2 as f64, 0.0, 0.0],
+                        )
+                    });
+                }
+            }
+        }
+        if matches!(
+            step,
+            Step::Pixels(Picture::Progress, _) | Step::AwaitPixels(Picture::Progress, _)
+        ) && self.progress_epoch.is_some()
+            && !(train.is_some_and(|value| value.local.active)
+                && record.is_some_and(|value| {
+                    value.progress.phase == crate::generated::TrainingPhase::Train
+                        && Some(value.progress.epoch as u64) == self.progress_epoch
+                }))
+        {
+            // A native phase transition can remove the bar between widget
+            // measurement and the asynchronous canvas read. Retire that request;
+            // never interpret pixels from its old rectangle as current evidence.
+            reporting::emit(|sink| {
+                sink.record(
+                    "integration.workflow.progress_invalidated",
+                    "train.progress.bar",
+                    "native phase changed before canvas completion",
+                    [
+                        self.progress_epoch.unwrap() as f64,
+                        record.map_or(-1.0, |value| value.progress.epoch as f64),
+                        0.0,
+                        0.0,
+                    ],
+                )
+            });
+            self.progress_epoch = None;
+        }
         let success = |value: &crate::generated::ComputeUiState| {
             !value.active && value.terminal.outcome == ComputeOperationOutcome::Succeeded
         };
         // Observe the primary through normal scrolling before progressing to
         // another card. Native progress may increase the setup column height.
         let primary_observation = match step {
-            Step::Training => Some((0, FeatureId::Train)),
-            Step::Validating => Some((1, FeatureId::Validate)),
-            Step::Predicting(_) => Some((2, FeatureId::Predict)),
+            Step::Training => train.map(|value| (0, FeatureId::Train, &value.local)),
+            Step::Validating => validation.map(|value| (1, FeatureId::Validate, &value.operation)),
+            Step::Predicting(_) => {
+                prediction.map(|value| (2, FeatureId::Predict, &value.operation))
+            }
+            Step::Exporting => model
+                .workflow
+                .export
+                .as_ref()
+                .map(|value| (3, FeatureId::Export, value)),
             _ => None,
         };
-        if let Some((index, feature)) = primary_observation
+        if let Some((index, feature, operation)) = primary_observation
             && !self.primary_pixels[index]
             && model.primary_action_active(feature)
         {
-            return self.workflow_control(widgets, driver, primary(feature));
+            // A location completion immediately re-enters advance. Reveal once
+            // per native progress change, then let rendering and transport run.
+            let revision = (operation.generationfrontier, operation.progress.sequence);
+            if !widgets.location_pending() && self.primary_reveal[index] != Some(revision) {
+                self.primary_reveal[index] = Some(revision);
+                return self.workflow_control(widgets, driver, primary(feature));
+            }
+            return Task::none();
         }
         match step {
             Step::Train | Step::ReturnTrain | Step::Theme | Step::ExportReturn => self
@@ -797,7 +1078,13 @@ impl State {
                     driver,
                     crate::view::navigation::stable_id(FeatureId::Train),
                 ),
-            Step::StartTrain if active == FeatureId::Train && settled => {
+            Step::StartTrain
+                if active == FeatureId::Train
+                    && settled
+                    && settings.draft.as_ref().is_some_and(|draft| {
+                        model.compute_start_available(draft, FeatureId::Train)
+                    }) =>
+            {
                 self.workflow_control(widgets, driver, primary(FeatureId::Train))
             }
             Step::Training
@@ -805,10 +1092,12 @@ impl State {
                     && record.is_some_and(|value| {
                         value.progress.globaloptimizerstep > 0
                             && value.progress.phase == crate::generated::TrainingPhase::Train
-                            && value.progress.totalimages > 0
+                            && value.progress.completedimages > 0
+                            && value.progress.completedimages < value.progress.totalimages
                     }) =>
             {
                 let progress = &record.unwrap().progress;
+                self.progress_epoch = Some(progress.epoch as u64);
                 reporting::emit(|sink| {
                     sink.record(
                         "integration.workflow.progress",
@@ -1079,7 +1368,13 @@ impl State {
             Step::TrainAspect | Step::NoValidationAspect => {
                 widgets.arm(driver, "workflow.workspace.aspect")
             }
-            Step::StartValidate if active == FeatureId::Validate && settled => {
+            Step::StartValidate
+                if active == FeatureId::Validate
+                    && settled
+                    && settings.draft.as_ref().is_some_and(|draft| {
+                        model.compute_start_available(draft, FeatureId::Validate)
+                    }) =>
+            {
                 self.workflow_control(widgets, driver, primary(FeatureId::Validate))
             }
             Step::Validating if validation.is_some_and(|value| success(&value.operation)) => {
@@ -1108,28 +1403,31 @@ impl State {
                 );
                 self.workflow_step(driver, Step::NoValidationAspect)
             }
-            Step::OpenSample => {
+            Step::OpenSample if model.validation_navigation_available() => {
                 self.workflow_control(widgets, driver, crate::view::validate::samples::ATLAS_ID)
             }
             Step::Sample if validation.is_some_and(|value| value.detail) => {
                 self.workflow_step(driver, Step::HideBoxes)
             }
-            Step::HideBoxes => self.workflow_control(widgets, driver, "validate.pred.boxes"),
+            Step::HideBoxes if model.validation_navigation_available() => {
+                self.workflow_control(widgets, driver, "validate.pred.boxes")
+            }
             Step::HiddenBoxes
                 if validation
                     .is_some_and(|value| value.detail && !value.overlays.predictionboxes) =>
             {
                 self.workflow_step(driver, Step::Pixels(Picture::Detail, 0))
             }
-            Step::ValidationLayer(_, index) => self.workflow_control(
-                widgets,
-                driver,
-                if index == 1 || index == 3 {
-                    "validate.gt.layer"
-                } else {
-                    "validate.pred.layer"
-                },
-            ),
+            Step::ValidationLayer(_, index) if model.validation_navigation_available() => self
+                .workflow_control(
+                    widgets,
+                    driver,
+                    if index == 1 || index == 3 {
+                        "validate.gt.layer"
+                    } else {
+                        "validate.pred.layer"
+                    },
+                ),
             Step::ValidationLayerReady(detail, index)
                 if validation.is_some_and(|snapshot| {
                     snapshot.detail == detail
@@ -1153,7 +1451,9 @@ impl State {
                     ),
                 )
             }
-            Step::CloseSample => self.workflow_control(widgets, driver, "validate.detail.close"),
+            Step::CloseSample if model.validation_navigation_available() => {
+                self.workflow_control(widgets, driver, "validate.detail.close")
+            }
             Step::ClosedSample if validation.is_some_and(|value| !value.detail) => {
                 self.workflow_step(driver, Step::Predict)
             }

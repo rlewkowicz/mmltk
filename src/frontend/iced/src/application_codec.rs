@@ -402,7 +402,11 @@ fn decode_sequence<T>(
     let Value::Array(values) = value else {
         return Err("array expected".into());
     };
-    values.into_iter().map(decode).collect()
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| decode(value).map_err(|error| format!("[{index}]: {error}")))
+        .collect()
 }
 
 impl<T: IntoApplicationValue> IntoApplicationValue for Vec<T> {

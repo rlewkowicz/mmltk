@@ -119,11 +119,9 @@ impl Component {
             return text("Waiting for validation").into();
         };
         let overlays = snapshot.overlayselection.value.clone();
-        let available = model.settings_edit_available()
+        let available = model.validation_navigation_available()
             && (snapshot.frame.revision == 0
-                || snapshot.overlayselection.value == snapshot.overlays)
-            && !model
-                .has_pending(crate::generated::ApplicationIntentEndpoint::ValidationSetOverlays);
+                || snapshot.overlayselection.value == snapshot.overlays);
         let group = |ground_truth: bool| {
             let (boxes, masks, labels, layer, ids, name) = if ground_truth {
                 (

@@ -128,7 +128,8 @@ ohttp = { git = "https://github.com/martinthomson/ohttp", rev = "600931b5a1e9477
 [patch."https://github.com/libjxl/jxl-rs"]
 jxl_simd = { path = "third_party/rust/jxl_simd" }
 
-# The owned HAL changes must participate in Cargo's ordinary source freshness
+# The owned graphics changes must participate in Cargo's ordinary source freshness
 # tracking; unchanged dependencies retain their pinned vendored identities.
 [patch."https://github.com/gfx-rs/wgpu"]
+wgpu-core = { path = "third_party/rust/wgpu-core" }
 wgpu-hal = { path = "third_party/rust/wgpu-hal" }

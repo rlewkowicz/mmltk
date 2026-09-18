@@ -352,6 +352,7 @@ void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
     }
     if (!destination->layout().valid()) throw std::invalid_argument("visual workspace destination is invalid");
     std::optional<VisualWorkspaceRequest> displaced;
+    std::stop_source background_stop{std::nostopstate};
     {
         std::scoped_lock lock(mutex_);
         if (stopping_ || runtime_retirement_blocked_) {
@@ -366,7 +367,12 @@ void VisualRuntimeOwner::RequestWorkspace(VisualWorkspaceRequest request) {
         displaced = std::exchange(workspace_request_, std::move(request));
         workspace_retry_.store(false, std::memory_order_release);
         workspace_pending_.store(true, std::memory_order_release);
+        if (active_yields_to_workspace_ && active_outcome_ == ActiveOutcome::Running) {
+            active_outcome_ = ActiveOutcome::Cancelled;
+            background_stop = active_stop_;
+        }
     }
+    static_cast<void>(background_stop.request_stop());
     if (displaced) displaced->ready();
     worker_.Wake();
 }
@@ -502,6 +508,11 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         } else if (latest_) {
             latest_work = std::move(latest_);
             latest_.reset();
+        } else if (continuation_cancellation_ == ContinuationCancellation::YieldToWorkspace &&
+                   (workspace_pending_.load(std::memory_order_acquire) || workspace_retry_.load(std::memory_order_acquire))) {
+            // A physical completion or new request wakes us. Keep background
+            // work queued without delaying that completion or polling for it.
+            return;
         } else if (const auto pending =
                        continuation_state_.fetch_and(static_cast<std::uint8_t>(~(kContinuationPending | kOutputRetryPending)), std::memory_order_acq_rel);
                    (pending & kContinuationEnabled) != 0U && (pending & (kContinuationPending | kOutputRetryPending)) != 0U) {
@@ -514,6 +525,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         active_discrete_ = discrete;
         active_preserves_input_ = (ordered_work && (ordered_work->ordered_drain || ordered_work->terminal_barrier)) ||
                                   (continuation_work && continuation_cancellation_ == ContinuationCancellation::PreserveOrderedInput);
+        active_yields_to_workspace_ = continuation_work && continuation_cancellation_ == ContinuationCancellation::YieldToWorkspace;
         operation_stop = active_stop_.get_token();
     }
     Observe(ActivityStage::WorkSelected, ordered_work ? 1U : (latest_work ? 2U : (continuation_work ? 3U : 0U)));
@@ -573,6 +585,7 @@ void VisualRuntimeOwner::Run(const std::stop_token worker_stop) {
         active_stop_ = std::stop_source{std::nostopstate};
         active_discrete_ = false;
         active_preserves_input_ = false;
+        active_yields_to_workspace_ = false;
         wake_again = !ordered_.empty() || latest_.has_value() ||
                      (continuation_state_.load(std::memory_order_acquire) & (kContinuationPending | kOutputRetryPending)) != 0U;
     }

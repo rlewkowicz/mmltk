@@ -142,6 +142,7 @@ enum class VisualDiagnosticOperation : std::uint8_t {
     UpscaleWarmAdmissionStarted[[= detail::VisualDiagnosticName{"upscale.warm.admission.started"}]],
     UpscaleWarmRuntimeStarted[[= detail::VisualDiagnosticName{"upscale.warm.runtime.started"}]],
     UpscaleWarmRuntimeCompleted[[= detail::VisualDiagnosticName{"upscale.warm.runtime.completed"}]],
+    UpscaleExecutionCheckpoint[[= detail::VisualDiagnosticName{"upscale.execution.checkpoint"}]],
     ExplorePrefetchReady[[= detail::VisualDiagnosticName{"explore.prefetch.ready"}]],
     ExploreCacheStorage[[= detail::VisualDiagnosticName{"explore.cache.storage"}]],
     ExploreStorageGrown[[= detail::VisualDiagnosticName{"explore.storage.grown"}]],

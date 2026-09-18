@@ -497,7 +497,7 @@ class BindingEmitter final {
                         output_ << "take_optional_field(&mut fields, \"" << fact.member_name << "\")";
                     else
                         output_ << "take_field(&mut fields, \"" << fact.member_name << "\")?";
-                    output_ << ")?;\n";
+                    output_ << ").map_err(|error| format!(\"" << name << "." << fact.member_name << ": {error}\"))?;\n";
                     EmitConstraint<Field>(member, fact.constraint);
                 });
                 if (!transport) output_ << "if !fields.is_empty() { return Err(\"unknown object field\".into()) }\n";
@@ -505,8 +505,9 @@ class BindingEmitter final {
                     constexpr auto policy = mmltk::frameworks::reflection::fixed_text_policy_of<Type>();
                     output_ << "let fixed_size: usize = size.try_into().map_err(|_| \"fixed text size overflow\")?;\n"
                                "if fixed_size == 0 || fixed_size > "
-                            << policy.capacity
-                            << " { return Err(\"invalid fixed text size\".into()) }\n"
+                            << policy.capacity << " { return Err(format!(\"invalid fixed text size: " << name
+                            << ".size={fixed_size}, expected 1..=" << policy.capacity
+                            << "\")) }\n"
                                "if bytes.0[fixed_size..].iter().any(|byte| *byte != 0) "
                                "{ return Err(\"fixed text tail is not canonical\".into()) }\n";
                     if constexpr (policy.characters == mmltk::frameworks::reflection::FixedTextCharacterPolicy::PrintableAscii)

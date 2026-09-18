@@ -267,6 +267,7 @@ fn integration_phases_assign_bounded_progress_deadline_classes() {
         "work"
     );
     assert_eq!(Phase::AwaitPointer(1).deadline_class(), "work");
+    assert_eq!(Phase::ViewerSquareBasic.deadline_class(), "work");
     for stage in 0..=3 {
         let first = Phase::CopyListSetup {
             stage,

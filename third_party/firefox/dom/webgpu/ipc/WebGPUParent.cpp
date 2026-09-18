@@ -484,7 +484,7 @@ class PresentationData {
 WebGPUParent::WebGPUParent(const dom::ContentParentId& aContentId)
     : mContentId(aContentId),
       mOwningEventTarget(GetCurrentSerialEventTarget()),
-      mContext(ffi::wgpu_server_new(this)) {}
+      mContext(ffi::wgpu_server_new(this, &gfx::gfxVars::DrmRenderDevice())) {}
 
 WebGPUParent::~WebGPUParent() = default;
 

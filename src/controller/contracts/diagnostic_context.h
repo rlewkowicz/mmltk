@@ -78,6 +78,8 @@ struct DiagnosticWorkspaceProgress final {
     std::uint64_t suppressed_request_owner = 0U;
     // CLEANUP-IGNORE: Admission state differs from the acceptance viewer's rendered-grid evidence.
     std::uint64_t admitted_allocation = 0U;
+    std::uint64_t admitted_access = 0U;
+    std::uint64_t admitted_generation = 0U;
     std::uint64_t candidate_allocation = 0U;
     std::uint64_t candidate_product_owner = 0U;
     std::uint64_t expected_workspace_pitch = 0U;
@@ -93,6 +95,9 @@ struct DiagnosticWorkspaceProgress final {
     bool source_acquired = false;
     bool source_release_submitted = false;
     bool source_withdrawing = false;
+    bool admitted_display_held = false;
+    bool admitted_write_reserved = false;
+    bool admitted_completion_pending = false;
 };
 struct DiagnosticExploreAdmission final {
     std::uint64_t admission_position = 0U;

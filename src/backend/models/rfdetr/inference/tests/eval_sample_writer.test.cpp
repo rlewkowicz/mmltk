@@ -18,26 +18,26 @@ import mmltk.backend.ml.cuda.gpu_quiescence;
 namespace cuda_api = mmltk::backend::ml::cuda;
 namespace fs = std::filesystem;
 namespace {
-void require_cuda_device() {
+int require_cuda_devices() {
     int device_count = 0;
     const cudaError_t status = ::cudaGetDeviceCount(&device_count);
     if (status != cudaSuccess || device_count <= 0) { throw std::runtime_error("test_rfdetr_eval_sample_writer requires at least one CUDA device"); }
+    return device_count;
 }
-void test_eval_sample_writer_flushes_output() {
-    require_cuda_device();
-    cuda_api::TorchCudaDeviceGuard guard(static_cast<cuda_api::TorchDeviceIndex>(0));
+void require_eval_sample_output(mmltk::backend::models::rfdetr::EvaluationSampleWriter& writer, const int device) {
+    cuda_api::TorchCudaDeviceGuard guard(cuda_api::checked_device_index(device));
     const mmltk::testsupport::ScopedTempDir temp_dir("mmltk_eval_sample_writer");
     const fs::path output_path = temp_dir.path() / "sample.png";
-    auto image = torch::full({3, 16, 16}, 0.35f, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, 0));
-    auto boxes = torch::tensor({{2.0f, 2.0f, 13.0f, 13.0f}}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, 0));
-    auto labels = torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, 0));
-    auto masks = torch::zeros({1, 16, 16}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA, 0));
+    auto image = torch::full({3, 16, 16}, 0.35f, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device));
+    auto boxes = torch::tensor({{2.0f, 2.0f, 13.0f, 13.0f}}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device));
+    auto labels = torch::tensor({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, device));
+    auto masks = torch::zeros({1, 16, 16}, torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA, device));
     masks[0].slice(0, 4, 12).slice(1, 4, 12).fill_(true);
     mmltk::backend::models::rfdetr::RenderSampleOptions options;
     options.output_path = output_path;
     options.num_classes = 4;
-    mmltk::backend::models::rfdetr::draw_eval_sample_async_gpu(image, boxes, labels, masks, options);
-    mmltk::backend::models::rfdetr::flush_eval_sample_writes();
+    writer.Draw(image, boxes, labels, masks, options);
+    writer.Flush();
     const bool output_exists = fs::exists(output_path);
     REQUIRE((output_exists));
     const auto output_size = fs::file_size(output_path);
@@ -56,4 +56,12 @@ void test_eval_sample_writer_flushes_output() {
     REQUIRE((center_sum > 100));
 }
 }  // namespace
-TEST_CASE("test_eval_sample_writer_flushes_output", "[model][rfdetr][eval_sample_writer]") { test_eval_sample_writer_flushes_output(); }
+TEST_CASE("test_eval_sample_writer_flushes_output", "[model][rfdetr][eval_sample_writer]") {
+    const int device_count = require_cuda_devices();
+    for (int device = 0; device < device_count; ++device) {
+        CAPTURE(device);
+        mmltk::backend::models::rfdetr::EvaluationSampleWriter writer;
+        require_eval_sample_output(writer, device);
+        require_eval_sample_output(writer, device);
+    }
+}

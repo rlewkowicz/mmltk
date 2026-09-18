@@ -274,7 +274,8 @@ class UpscaleSystem::Impl final {
               Publish(event_type{UpscaleFailed{snapshot(), std::move(detail), request, UpscaleFailureKind::Physical}});
           }) {
         if (!settings_.valid() || !borrow_source_) throw contracts::InvalidIntentError("Upscale device settings are invalid");
-        worker_.RegisterContinuation([this](auto& runtime, auto stop) { return WarmNext(runtime, stop); });
+        worker_.RegisterContinuation([this](auto& runtime, auto stop) { return WarmNext(runtime, stop); }, {}, false,
+                                     detail::VisualRuntimeOwner::ContinuationCancellation::YieldToWorkspace);
     }
     ~Impl() { Shutdown(); }
     void Warm(const VisualExtent extent) noexcept {
@@ -315,13 +316,16 @@ class UpscaleSystem::Impl final {
                 if (candidate.valid() && current()) {
                     auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
                     if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable during warm-up");
-                    services::RuntimeDiagnosticSpan warm_span{diagnostics_, [&] {
-                                                                  return visual_diagnostic_boundary(
-                                                                      {.system = contracts::DiagnosticOwner::Upscale,
-                                                                       .operation = VisualDiagnosticOperation::UpscaleWarmRuntimeStarted,
-                                                                       .device = settings_.device},
-                                                                      VisualDiagnosticOperation::UpscaleWarmRuntimeCompleted);
-                                                              }};
+                    services::RuntimeDiagnosticSpan warm_span{
+                        diagnostics_, [&] {
+                            return visual_diagnostic_boundary({.system = contracts::DiagnosticOwner::Upscale,
+                                                               .operation = VisualDiagnosticOperation::UpscaleWarmRuntimeStarted,
+                                                               .device = settings_.device,
+                                                               .value = index,
+                                                               .context = {.capacity_width = extent.width, .capacity_height = extent.height},
+                                                               .failure_detail = mmltk::frameworks::reflection::enum_name(static_cast<UpscaleKernel>(index))},
+                                                              VisualDiagnosticOperation::UpscaleWarmRuntimeCompleted);
+                        }};
                     if (!warm_initialized_) {
                         warm_initialized_ = true;
                         model->Warm();
@@ -367,8 +371,8 @@ class UpscaleSystem::Impl final {
                     state_.methods[index].warm = false;
                     AdvanceRevision();
                 }
-                if (!stop.stop_requested() && warm_admitted_) {
-                    if (extent == warm_extent_ && state_.busy) warm_next_ = index;
+                if (warm_admitted_) {
+                    if (extent == warm_extent_) warm_next_ = index;
                     static_cast<void>(worker_.NotifyContinuation());
                 }
                 if (!failure.empty()) return [this] { PublishChanged(); };

@@ -3,11 +3,25 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include "src/common/system/cpu_affinity.h"
 #include "src/frameworks/gpu/cuda_error.h"
 namespace mmltk::frameworks::gpu {
+int resolve_device_uuid(const std::array<std::uint8_t, 16U>& expected) {
+    ensure_cuda_driver_ok(cuInit(0), "initialize graphics device discovery");
+    int count = 0;
+    ensure_cuda_driver_ok(cuDeviceGetCount(&count), "enumerate CUDA-visible graphics devices");
+    for (int ordinal = 0; ordinal < count; ++ordinal) {
+        CUdevice device;
+        CUuuid uuid{};
+        ensure_cuda_driver_ok(cuDeviceGet(&device, ordinal), "resolve CUDA-visible graphics device");
+        ensure_cuda_driver_ok(cuDeviceGetUuid(&uuid, device), "read graphics device UUID");
+        if (std::memcmp(uuid.bytes, expected.data(), expected.size()) == 0) return ordinal;
+    }
+    throw std::runtime_error("workspace graphics device UUID is not visible to CUDA");
+}
 DeviceExecution resolve_device_execution(int ordinal, const mmltk::common::system::NumaTopology& topology, int numa_node, const std::string& eligible_cpus) {
     const auto eligible = eligible_cpus.empty() ? std::vector<int>{} : mmltk::common::system::resolve_cpu_affinity(eligible_cpus);
     ensure_cuda_driver_ok(cuInit(0), "initialize GPU placement discovery");

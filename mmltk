@@ -2090,18 +2090,9 @@ firefox_source_state_fingerprint_for() {
                 "${repo_root}/src/entrypoints/desktop/build_firefox_runtime.sh")"
         printf 'firefox-runtime-manifest\0%s\0' \
             "$(fingerprint_path "${repo_root}/src/entrypoints/desktop/firefox_runtime_files.txt")"
-        local graphics_input
-        for graphics_input in \
-            src/controller/presentation/abi/workspace_surface_import_abi.h \
-            src/controller/presentation/abi/workspace_frame_signal.h \
-            src/controller/presentation/workspace_presentation_types.h \
-            src/frameworks/gpu/image_workspace.h \
-            src/controller/browser/application_workspace_abi_emitter.h \
-            src/controller/browser/application_binding_generator.cpp \
-            src/controller/browser/CMakeLists.txt; do
-            printf 'graphics-input\0%s\0%s\0' "${graphics_input}" \
-                "$(fingerprint_path "${repo_root}/${graphics_input}")"
-        done
+        # CMake regenerates the native graphics ABI before the Firefox edge.
+        # build_firefox_runtime.sh fingerprints those emitted bytes separately:
+        # generator-only or unrelated native edits must not invalidate Firefox.
         git -C "${repo_root}" rev-parse HEAD:third_party/firefox
         git -C "${repo_root}" diff --no-ext-diff --binary \
             HEAD -- third_party/firefox
@@ -2116,7 +2107,7 @@ firefox_source_state_fingerprint_for() {
 
 firefox_source_state_fingerprint() {
     firefox_source_state_fingerprint_for \
-        mmltk-firefox-build-input-v2 \
+        mmltk-firefox-build-input-v3 \
         "${repo_root}/src/entrypoints/desktop/firefox_runtime_build.cmake" \
         "$1"
 }

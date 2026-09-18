@@ -108,11 +108,13 @@ optional = true
 
 [dependencies.naga]
 version = "30.0.0"
-path = "../naga"
+git = "https://github.com/gfx-rs/wgpu"
+rev = "93e00976015c937fc86f02bd9efcf343c6ce5e5d"
 
 [dependencies.naga-types]
 version = "30.0.0"
-path = "../naga-types"
+git = "https://github.com/gfx-rs/wgpu"
+rev = "93e00976015c937fc86f02bd9efcf343c6ce5e5d"
 
 [dependencies.once_cell]
 version = "1.21"
@@ -152,11 +154,13 @@ path = "../wgpu-hal"
 
 [dependencies.wgpu-naga-bridge]
 version = "30.0.0"
-path = "../wgpu-naga-bridge"
+git = "https://github.com/gfx-rs/wgpu"
+rev = "93e00976015c937fc86f02bd9efcf343c6ce5e5d"
 
 [dependencies.wgpu-types]
 version = "30.0.0"
-path = "../wgpu-types"
+git = "https://github.com/gfx-rs/wgpu"
+rev = "93e00976015c937fc86f02bd9efcf343c6ce5e5d"
 default-features = false
 
 [build-dependencies.cfg_aliases]
@@ -164,7 +168,8 @@ version = "0.2.1"
 
 [target.'cfg(target_os = "linux")'.dependencies.wgpu-core-deps-linux]
 version = "30.0.0"
-path = "../wgpu-core-deps-linux"
+git = "https://github.com/gfx-rs/wgpu"
+rev = "93e00976015c937fc86f02bd9efcf343c6ce5e5d"
 optional = true
 
 [target.'cfg(not(target_has_atomic = "64"))'.dependencies.portable-atomic]
@@ -177,4 +182,12 @@ missing_debug_implementations = "warn"
 [lints.rust.unexpected_cfgs]
 level = "warn"
 priority = 0
-check-cfg = ["cfg(wgpu_validate_locks)"]
+check-cfg = [
+    "cfg(wgpu_validate_locks)",
+    # Upstream source retains these disabled branches in the Vulkan-only vendor.
+    "cfg(dx12)",
+    "cfg(gles)",
+    "cfg(metal)",
+    "cfg(webgl)",
+    'cfg(feature, values("dx12", "gles", "metal", "observe_locks", "replay", "trace"))',
+]

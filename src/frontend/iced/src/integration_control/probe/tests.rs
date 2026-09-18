@@ -55,6 +55,34 @@ impl Drop for ProbeFixture {
     }
 }
 
+#[test]
+fn validation_draw_changes_wake_the_scenario_once_with_current_receipt_custody() {
+    let mut fixture = ProbeFixture::new("workflows");
+    fixture.controller.driver.phase =
+        Phase::Workflows(crate::integration_control::workflows::Step::Pixels(
+            crate::integration_control::workflows::Picture::Detail,
+            0,
+        ));
+    for control in [
+        crate::view::validate::samples::ATLAS_ID,
+        "validate.detail.image",
+    ] {
+        let bounds = fixture.bounds;
+        record_probe_draw(control, fixture.surface, bounds, bounds, bounds);
+        let first = fixture.receiver.try_recv().unwrap();
+        assert!(fixture.controller.accepts_message(&first));
+        record_probe_draw(control, fixture.surface, bounds, bounds, bounds);
+        assert!(fixture.receiver.try_recv().is_err());
+        let moved = Rectangle { x: 1.0, ..bounds };
+        record_probe_draw(control, fixture.surface, bounds, moved, bounds);
+        assert!(!fixture.controller.accepts_message(&first));
+        let replacement = fixture.receiver.try_recv().unwrap();
+        assert!(fixture.controller.accepts_message(&replacement));
+        record_probe_draw(control, fixture.surface, bounds, moved, bounds);
+        assert!(fixture.receiver.try_recv().is_err());
+    }
+}
+
 impl ProbeFixture {
     pub(in crate::integration_control) fn fps_draw_output(
         &self,

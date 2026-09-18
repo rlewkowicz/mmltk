@@ -408,7 +408,7 @@ mod tests {
             )
         };
         let component = crate::view::workflow::model_card::Component::default();
-        let train = component.view_with(
+        let mut train = component.view_with(
             state(crate::generated::FeatureId::Train),
             continuation_controls(
                 &model,
@@ -417,23 +417,18 @@ mod tests {
             ),
             Message::Model,
         );
-        let validate = crate::view::workflow::model_card::view(
+        let mut validate = crate::view::workflow::model_card::view(
             state(crate::generated::FeatureId::Validate),
             0,
         );
-        let train_tree = iced::advanced::widget::Tree::new(&train);
-        let validate_tree = iced::advanced::widget::Tree::new(&validate);
-        let body = |tree: &iced::advanced::widget::Tree| {
-            tree.children[0].children[0].children[2].children.len()
-        };
+        let mut train_tree = iced::advanced::widget::Tree::new(&train);
+        let mut validate_tree = iced::advanced::widget::Tree::new(&validate);
+        train_tree.diff(&mut train);
+        validate_tree.diff(&mut validate);
+        let body = |tree: &iced::advanced::widget::Tree| tree.children[2].children.len();
         assert_eq!(body(&train_tree), 2);
         assert_eq!(body(&validate_tree), 1);
-        assert_eq!(
-            train_tree.children[0].children[0].children[2].children[1]
-                .children
-                .len(),
-            2
-        );
+        assert_eq!(train_tree.children[2].children[1].children.len(), 2);
     }
 
     #[test]
@@ -495,7 +490,7 @@ mod tests {
             preset.presetname
         );
 
-        let draft = crate::generated::default_workflowstrainrequestweightspath().unwrap();
+        let draft = "/tmp/selected-model.safetensors".to_owned();
         component
             .update(
                 &mut model,

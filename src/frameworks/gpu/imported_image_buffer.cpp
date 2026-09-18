@@ -106,11 +106,11 @@ void observe(const char* operation, std::uint64_t identity, int retained_fd, CUe
         std::snprintf(output, sizeof(output),
                       "{\"event\":\"cuda.workspace.%s\",\"native_process_id\":%ld,\"workspace_allocation\":%llu,"
                       "\"retained_memory_descriptor\":%d,\"import_descriptor\":%d,\"cuda_external_memory\":%llu,\"cuda_mapped_base\":%llu,"
-                      "\"device_uuid\":\"%s\",\"device_incarnation\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,"
+                      "\"device_uuid\":\"%s\",\"device\":%d,\"device_incarnation\":%llu,\"capacity_width\":%u,\"capacity_height\":%u,"
                       "\"fd_consumed\":%s,\"memory_size\":%zu,\"image_offset\":%zu,\"row_pitch\":%zu,\"dedicated\":%s,\"cuda_status\":%d}\n",
                       operation, static_cast<long>(::getpid()), static_cast<unsigned long long>(identity), retained_fd, importing_fd,
                       static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(memory)), static_cast<unsigned long long>(base), device_uuid,
-                      static_cast<unsigned long long>(layout.device_incarnation), layout.width, layout.height,
+                      layout.device, static_cast<unsigned long long>(layout.device_incarnation), layout.width, layout.height,
                       std::strcmp(operation, "memory_import") == 0 && status == CUDA_SUCCESS ? "true" : "false", layout.required_allocation_bytes,
                       layout.offset_bytes, layout.pitch_bytes, layout.dedicated ? "true" : "false", static_cast<int>(status));
     if (length > 0 && static_cast<std::size_t>(length) < sizeof(output))
@@ -143,8 +143,9 @@ bool ImportedImageBuffer::Import(DeviceContext context, mmltk::common::io::Scope
     context.Bind();
     CUuuid uuid{};
     auto status = cuDeviceGetUuid(&uuid, layout.device);
-    if (status != CUDA_SUCCESS || std::memcmp(uuid.bytes, layout.device_uuid.data(), layout.device_uuid.size()) != 0)
-        return fail("workspace physical device UUID", CUDA_ERROR_INVALID_DEVICE);
+    if (status != CUDA_SUCCESS) return fail("workspace physical device UUID lookup", status);
+    if (std::memcmp(uuid.bytes, layout.device_uuid.data(), layout.device_uuid.size()) != 0)
+        return fail(("workspace physical device UUID mismatch for CUDA device " + std::to_string(layout.device)).c_str(), CUDA_ERROR_INVALID_DEVICE);
     mmltk::common::io::ScopedFd consumed;
     int duplicate;
     do { duplicate = ::fcntl(backing.get(), F_DUPFD_CLOEXEC, 0); } while (duplicate < 0 && errno == EINTR);

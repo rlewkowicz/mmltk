@@ -1003,8 +1003,10 @@ mod tests {
             }
         }
         let widget_shape = |workflow| {
-            let card = shared_selector(workflow, text("preset fixture").into(), true);
-            let tree = iced::advanced::widget::Tree::new(&card);
+            let mut card = shared_selector(workflow, text("preset fixture").into(), true);
+            let mut tree = iced::advanced::widget::Tree::new(&card);
+            tree.diff(&mut card);
+            assert!(!tree.children.is_empty());
             let mut result = Vec::new();
             shape(&tree, &mut result);
             result

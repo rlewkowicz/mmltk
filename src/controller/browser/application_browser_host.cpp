@@ -4,6 +4,7 @@
 #include <limits>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -14,6 +15,16 @@
 namespace mmltk::controller::browser {
 namespace {
 namespace transport = mmltk::frameworks::transport;
+[[nodiscard]] std::string_view endpoint_diagnostic_name(const std::uint64_t id) {
+    std::string_view name;
+    ApplicationSchema<ApplicationSystems>::VisitEndpoints([&]<class Endpoint>() {
+        if (id == Endpoint::stable_id) {
+            static constexpr auto qualified = std::define_static_string(std::string(Endpoint::system_cell::name) + "." + std::string(Endpoint::name));
+            name = qualified;
+        }
+    });
+    return name;
+}
 [[nodiscard]] constexpr transport::BrowserRecordPriority priority(const contracts::reflection::EventDelivery delivery) noexcept {
     return delivery != contracts::reflection::EventDelivery::Transient ? transport::BrowserRecordPriority::Critical
                                                                        : transport::BrowserRecordPriority::Transient;
@@ -183,6 +194,7 @@ struct ApplicationBrowserHost::Impl final {
                                 return services::RuntimeDiagnosticFact{
                                     .owner = contracts::DiagnosticOwner::BrowserRuntime,
                                     .event = "browser.intent.rejected",
+                                    .participant = endpoint_diagnostic_name(endpoint_id),
                                     .sequence = endpoint_id,
                                     .value = correlation,
                                     .detail = static_cast<std::uint64_t>(reply.error->category),
@@ -194,6 +206,7 @@ struct ApplicationBrowserHost::Impl final {
                                 return services::RuntimeDiagnosticFact{
                                     .owner = contracts::DiagnosticOwner::BrowserRuntime,
                                     .event = "browser.intent.accepted",
+                                    .participant = endpoint_diagnostic_name(endpoint_id),
                                     .sequence = endpoint_id,
                                     .value = correlation,
                                 };
@@ -205,6 +218,7 @@ struct ApplicationBrowserHost::Impl final {
                                 return services::RuntimeDiagnosticFact{
                                     .owner = contracts::DiagnosticOwner::BrowserRuntime,
                                     .event = "browser.intent.reply_rejected",
+                                    .participant = endpoint_diagnostic_name(endpoint_id),
                                     .sequence = endpoint_id,
                                     .value = correlation,
                                 };

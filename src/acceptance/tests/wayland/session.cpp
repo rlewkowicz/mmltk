@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -22,6 +23,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <exception>
 #include <iostream>
 #include <iterator>
 #include <map>
@@ -36,6 +39,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 #include <cuda.h>
 #include <catch2/catch_test_macros.hpp>
@@ -51,6 +55,7 @@
 #include "src/frameworks/serialization/serialization.h"
 #include "src/frameworks/reflection/reflection_metadata.h"
 #include "src/controller/subsystems/explore/explore_system.h"
+#include "src/controller/subsystems/upscale/upscale_system.h"
 #include "src/backend/data/tests/test_fixture.h"
 #include "artifact_cursor.h"
 #include "surface_audit.h"
@@ -433,6 +438,33 @@ void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpe
                                                {fixture.split});
     DatasetCompiler::compile(plan, 0U);
 }
+void prepare_wayland_upscale_assets() {
+    using namespace mmltk::controller;
+    constexpr VisualDeviceSettings settings{.device = 0, .maximum_width = 32U, .maximum_height = 32U};
+    std::promise<void> prepared;
+    auto ready = prepared.get_future();
+    std::atomic_bool completed{false};
+    UpscaleSystem upscale{settings, make_native_upscale_runtime_factory(settings), [](const VisualFrame&) { return VisualDocumentRead{}; },
+                          [&](UpscaleSystem::event_type event) {
+                              const auto* failure = std::get_if<UpscaleFailed>(&event);
+                              const auto* changed = std::get_if<UpscaleChanged>(&event);
+                              if (!failure && (!changed || !std::ranges::all_of(changed->snapshot.methods, [](const auto& method) { return method.warm; })))
+                                  return;
+                              if (completed.exchange(true)) return;
+                              if (failure)
+                                  prepared.set_exception(std::make_exception_ptr(std::runtime_error(failure->detail)));
+                              else
+                                  prepared.set_value();
+                          }};
+    std::cout << "workspace-wayland: preparing GPU-specific upscale model assets before browser interaction deadlines\n" << std::flush;
+    upscale.Warm({8U, 8U});
+    if (ready.wait_for(std::chrono::seconds{120}) != std::future_status::ready) {
+        upscale.Stop();
+        throw std::runtime_error("Wayland upscale model preparation exceeded its 120-second deadline");
+    }
+    ready.get();
+    upscale.Shutdown();
+}
 PreparedWaylandInputs::PreparedWaylandInputs()
     : root_("mmltk-wayland-inputs"),
       square_{.root_dir = (root_.path() / "square").string(),
@@ -475,6 +507,7 @@ PreparedWaylandInputs::PreparedWaylandInputs()
     // This small prerequisite is compiled once. The primary browser owns
     // the one real 512-pixel compile/control/error workflow.
     compile_wayland_fixture(square_, 384U);
+    prepare_wayland_upscale_assets();
 }
 const mmltk::testsupport::WorkflowWaylandInputs& PreparedWaylandInputs::workflows() {
     if (!workflows_) workflows_ = std::make_unique<mmltk::testsupport::WorkflowWaylandInputs>(root_.path() / "workflows");
@@ -562,6 +595,7 @@ void WaylandSession::ConsumeRecords(const bool final) {
             browser.atlas_draws.failure.report(acceptance_log, "acceptance.atlas_draw.failed", firefox_log, browser_cursor_->line());
             browser.owned_atlas_failure.report(acceptance_log, "acceptance.owned_atlas.failed", firefox_log, browser_cursor_->line());
             const auto event = record.value("event", "");
+            if (event == "firefox.adapter.selected") display_adapter_seen_ = true;
             if (event == "integration.workflow.completed") workflow_steps_.insert(record.value("detail", ""));
             if (event == "integration.workflow.pixels") workflow_pixels_.insert(record.value("detail", ""));
             report_consumed_record(record, "firefox");
@@ -593,6 +627,7 @@ void WaylandSession::RunWorkflows() {
     auto& process = *process_;
     arm_timerfd(deadline.get(), kWaylandStartupDeadline, "workflow browser startup");
     std::size_t progress = 0U;
+    std::size_t work_progress = 0U;
     const auto diagnostics_on_exit = [&] {
         std::cerr << "\nworkflow native log:\n" << read_tail(runtime_log) << "\nworkflow browser log:\n" << read_tail(firefox_log) << std::flush;
     };
@@ -603,8 +638,9 @@ void WaylandSession::RunWorkflows() {
             FAIL("workflow browser reported a product or physical ownership failure");
         }
         if (frontend_settled_ && surface_audit.evidence_settled()) break;
-        if (browser.phase_progress_revision != progress) {
+        if (browser.phase_progress_revision != progress || (browser.phase_progress_class == "work" && browser.work_progress_revision != work_progress)) {
             progress = browser.phase_progress_revision;
+            work_progress = browser.work_progress_revision;
             arm_timerfd(deadline.get(), browser.phase_progress_class == "work" ? kWaylandWorkDeadline : kWaylandInteractionDeadline, "workflow phase progress");
         }
         std::array<pollfd, 4U> waits;
@@ -636,6 +672,7 @@ void WaylandSession::RunWorkflows() {
             FAIL("rendered workflow exited or exceeded its phase deadline");
         }
     }
+    CHECK(display_adapter_seen_);
     CHECK((workflow_steps_ == std::set<std::string>{"train",
                                                     "validation",
                                                     "compiled",
@@ -1242,6 +1279,7 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     INFO("atlas draw first failure: " << browser.atlas_draws.failure.record().dump());
     INFO("owned atlas first failure: " << browser.owned_atlas_failure.record().dump());
     CHECK_FALSE(browser_failed_);
+    CHECK(display_adapter_seen_);
     CHECK_FALSE(browser.failed_before_termination());
     REQUIRE(terminal >= 0);
     CHECK(native.peer_open_count > 0U);

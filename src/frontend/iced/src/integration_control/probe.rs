@@ -370,6 +370,16 @@ pub(crate) fn record_probe_draw(
                 _ => {}
             }
             observer.receipts.insert(control, receipt);
+            // Validation can finish its final native update before the paired
+            // image is drawable. Wake the waiting scenario from that actual
+            // draw, once per receipt; unchanged redraws remain quiet.
+            if matches!(
+                control,
+                crate::view::validate::samples::ATLAS_ID | "validate.detail.image"
+            ) && let Some(output) = observer.output_for(control)
+            {
+                output.send(Message::Advance);
+            }
         }
     });
 }
@@ -644,6 +654,24 @@ pub(super) struct Draws {
     pub(super) annotation: Option<(u64, u64)>,
     pub(super) viewer: Option<(u64, u64, ViewerDraw)>,
     pub(super) gallery: Option<(u64, u64)>,
+}
+impl Draws {
+    pub(super) fn upscale(
+        self,
+        frame: Option<crate::presentation_surface::FrameReady>,
+        revision: u64,
+    ) -> Option<SampleablePresentation> {
+        let sampleable = sampleable_presentation(
+            frame,
+            crate::generated::PresentationSourceKind::Upscale,
+            revision,
+        )?;
+        self.viewer
+            .filter(|(drawn, source, _)| {
+                *drawn == sampleable.presentation_revision && *source == revision
+            })
+            .map(|_| sampleable)
+    }
 }
 pub(super) struct AnnotationObservation<'a> {
     pub(super) sample_baseline: u64,

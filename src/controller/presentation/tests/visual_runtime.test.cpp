@@ -151,6 +151,13 @@ void submit_visual_revision(detail::VisualRuntimeOwner& owner, std::promise<std:
     else
         REQUIRE(owner.SubmitOrdered(std::move(work)));
 }
+void publish_visual_pixels(detail::VisualRuntimeOwner& owner, std::promise<void>& published) {
+    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        runtime.Publish(4U, 3U, [](auto clean, auto, auto) { Fill(clean, 93); });
+        return detail::VisualRuntimeOwner::Notification{[&] { published.set_value(); }};
+    }));
+    mmltk::testsupport::await_test_promise(published, "initial display product");
+}
 mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate enqueue_test_output(mmltk::frameworks::gpu::SystemImageRuntime& runtime, std::uintptr_t& stream) {
     auto candidate = runtime.AcquireOutput();
     runtime.PublishRetained(candidate, 4U, 3U, [&](auto, auto, auto execution) { stream = execution; }, mmltk::frameworks::gpu::ImageSubmission::Enqueue);
@@ -1357,21 +1364,11 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     auto backend = std::make_shared<FakeImageBackend>();
     const auto expected = std::make_exception_ptr(std::runtime_error("display terminal failure"));
     std::promise<std::exception_ptr> failed;
-    std::atomic_uint failures{0U};
-    detail::VisualRuntimeOwner owner(
-        [backend](auto revisions) {
-            return std::make_unique<gpu::SystemImageRuntime>(gpu::SystemImageRuntimeConfig{
-                .device = 0, .backend = backend, .workspace_finalize = fixture::FakeWorkspaceFinalizer(backend), .product_revisions = std::move(revisions)});
-        },
-        first_visual_failure(failures, failed));
     std::promise<void> published;
-    REQUIRE(owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
-        runtime.Publish(4U, 3U, [](auto clean, auto, auto) {
-            std::memset(reinterpret_cast<void*>(clean.data), 93, clean.descriptor.pitch_bytes * clean.descriptor.height);
-        });
-        return detail::VisualRuntimeOwner::Notification{[&] { published.set_value(); }};
-    }));
-    mmltk::testsupport::await_test_promise(published, "initial display product");
+    std::atomic_uint failures{0U};
+    detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, {}, 1U, fixture::FakeWorkspaceFinalizer(backend)),
+                                     first_visual_failure(failures, failed));
+    publish_visual_pixels(owner, published);
     auto make_workspace = [&] {
         auto workspace = mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::CreateAdmitted(
             backend, mmltk::frameworks::gpu::test_support::ImageWorkspaceTestAccess::Layout(0));
@@ -1401,6 +1398,54 @@ TEST_CASE("Display terminal failure wakes request readiness and preserves the la
     candidate.workspace.reset();
     owner.StopAndWait();
     CHECK(failures == 1U);
+    CHECK(backend->planes_allocated == backend->planes_freed);
+    CHECK(backend->contexts_created == backend->contexts_destroyed);
+}
+TEST_CASE("Background visual work yields until requested display pixels physically complete", "[presentation][workspace][background]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    namespace fixture = gpu::test_support;
+    fixture::ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    ProducerWorkspaceRequest display{.workspace = fixture::ImageWorkspaceTestAccess::CreateAdmitted(backend, fixture::ImageWorkspaceTestAccess::Layout(0))};
+    std::promise<void> published, entered, preempted, release, resumed;
+    auto released = release.get_future().share();
+    std::atomic_uint runs{0U};
+    std::atomic_bool resumed_with_pixels{false};
+    detail::VisualRuntimeOwner owner(RuntimeFactory(0, backend, gpu::ImageProductLayout::Clean, {}, 1U, fixture::FakeWorkspaceFinalizer(backend)),
+                                     [](auto) { FAIL("background display fixture unexpectedly failed"); });
+    auto settle = settle_visual_on_exit(owner, release);
+    owner.RegisterContinuation(
+        [&](auto&, std::stop_token stop) {
+            if (runs.fetch_add(1U) == 0U) {
+                std::stop_callback observe_stop{stop, [&] { preempted.set_value(); }};
+                entered.set_value();
+                released.wait();
+                static_cast<void>(owner.NotifyContinuation());
+            } else {
+                resumed_with_pixels = display.workspace->Contains(display.content);
+                resumed.set_value();
+            }
+            return detail::VisualRuntimeOwner::Notification{};
+        },
+        {}, false, detail::VisualRuntimeOwner::ContinuationCancellation::YieldToWorkspace);
+    publish_visual_pixels(owner, published);
+    REQUIRE(owner.NotifyContinuation());
+    mmltk::testsupport::await_test_promise(entered, "background preparation entered");
+    backend->defer_notifications = true;
+    auto admitted = backend->ObserveNextNotificationStream();
+    display.Request(owner);
+    mmltk::testsupport::await_test_promise(preempted, "background preparation preempted by display");
+    release.set_value();
+    const auto stream = mmltk::testsupport::await_test_future(admitted, "display physical completion registered");
+    CHECK(runs == 1U);
+    CHECK_FALSE(display.workspace->Contains(display.content));
+    backend->CompleteNotifications(stream);
+    display.CheckCompleted(owner);
+    mmltk::testsupport::await_test_promise(resumed, "background preparation resumed");
+    CHECK(runs == 2U);
+    CHECK(resumed_with_pixels);
+    display.workspace.reset();
+    owner.StopAndWait();
     CHECK(backend->planes_allocated == backend->planes_freed);
     CHECK(backend->contexts_created == backend->contexts_destroyed);
 }

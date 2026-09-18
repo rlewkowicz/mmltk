@@ -1180,6 +1180,7 @@ bool ImageProductBuffer::DetachWorkspace(ImageStream& stream, const std::shared_
     if (!transaction.owns_lock()) return false;
     if (state_->workspace_ != workspace && state_->raw_workspace_ != workspace) return true;
     if (state_->receiver_reads_.load(std::memory_order_acquire) != 0U || state_->workspace_reserved_) return false;
+    if (workspace->FinalizationPending()) return false;
     state_->DetachDisplay(stream, workspace);
     return true;
 }
@@ -1187,6 +1188,7 @@ bool ImageProductBuffer::ConfigureWorkspace(std::shared_ptr<ImageWorkspace> work
     if (!workspace || !workspace->admitted() || !finalize) throw std::invalid_argument("workspace configuration is incomplete");
     std::unique_lock transaction(state_->transaction_, std::try_to_lock);
     if (!transaction.owns_lock() || state_->receiver_reads_.load(std::memory_order_acquire) != 0U) return false;
+    if (state_->workspace_ && state_->workspace_->FinalizationPending()) return false;
     const bool reserved_replacement = workspace != state_->workspace_ && state_->workspace_reserved_;
     if (reserved_replacement) {
         if (!workspace->ReserveWrite()) return false;
@@ -1287,6 +1289,9 @@ bool ImageProductBuffer::writable() const {
     std::unique_lock transaction(state_->transaction_, std::try_to_lock);
     if (!transaction.owns_lock()) return false;
     if (state_->receiver_reads_.load(std::memory_order_acquire) != 0U) return false;
+    // A cross-device copy may release the raw read before final display work
+    // settles. Keep its workspace attached to this completion-draining owner.
+    if (state_->workspace_ && state_->workspace_->FinalizationPending()) return false;
     if (state_->unsettled_source_) throw std::runtime_error("image product retains an unsettled source");
     std::array<std::unique_lock<std::shared_mutex>, 2U> locks;
     for (std::size_t index = 0U; index != state_->plane_count_; ++index) {

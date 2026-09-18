@@ -624,6 +624,8 @@ enum Phase {
         page: FeatureId,
         index: usize,
     },
+    PagePrimary(FeatureId),
+    AwaitPagePrimary(FeatureId),
     TrainModelCard,
     TrainModelPart(usize),
     TrainModelProgress,
@@ -1032,6 +1034,7 @@ impl Phase {
             | Self::ViewerAwaitDisconnect
             | Self::ViewerReconnect
             | Self::StartUpscale { .. }
+            | Self::ViewerSquareBasic
             | Self::AwaitUpscale { .. }
             | Self::Complete => "work",
             _ => "interaction",
@@ -1527,6 +1530,7 @@ impl Controller {
             | Phase::TrainNavigation
             | Phase::PageNavigation(..)
             | Phase::PageRegion { .. }
+            | Phase::PagePrimary(..)
             | Phase::TrainModelCard
             | Phase::TrainModelPart(..)
             | Phase::TrainModelProgress
@@ -1666,6 +1670,7 @@ impl Controller {
                 token,
             } => {
                 if reporting::primary_action_current(&control, token) {
+                    self.lifecycle.primary_action_pixels(&control, active);
                     self.workflows
                         .primary_action_pixels(&self.driver, &control, active);
                 }
@@ -2011,6 +2016,8 @@ impl Controller {
             | Phase::PageNavigation(..)
             | Phase::AwaitPage(..)
             | Phase::PageRegion { .. }
+            | Phase::PagePrimary(..)
+            | Phase::AwaitPagePrimary(..)
             | Phase::TrainModelCard
             | Phase::TrainModelPart(..)
             | Phase::TrainModelProgress

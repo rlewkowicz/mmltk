@@ -1386,6 +1386,31 @@ TEST_CASE("Asynchronous workspace finalization retains raw custody until the own
     CHECK(runtime.TryAcquireOutput(baseline).valid());
     CHECK(runtime.PrepareDisplay(raw.product_revision, workspace));
 }
+TEST_CASE("Cross-device display detachment preserves pending finalization settlement", "[gpu][workspace][display]") {
+    using test_support::ImageWorkspaceTestAccess;
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    SystemImageRuntime runtime(test_support::WorkspaceRuntimeConfig(backend));
+    runtime.Publish(
+        4U, 3U, [](auto clean, auto, auto) { std::memset(reinterpret_cast<void*>(clean.data), 37, clean.descriptor.pitch_bytes * clean.descriptor.height); });
+    auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout(1));
+    backend->defer_notifications = true;
+    CHECK_FALSE(runtime.PrepareDisplay(runtime.Completed().revision(), workspace));
+    REQUIRE(workspace->ObserveAccess().completion_pending);
+    auto baseline = runtime.Completed();
+    CHECK_FALSE(runtime.TryAcquireOutput(baseline).valid());
+    CHECK_FALSE(runtime.DetachDisplay(workspace));
+    auto replacement = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout(1));
+    CHECK_FALSE(runtime.PrepareDisplay(baseline.revision(), replacement));
+    backend->CompleteNotifications();
+    runtime.CompleteWorkspaces();
+    CHECK_FALSE(workspace->ObserveAccess().completion_pending);
+    CHECK(workspace->WriteAvailable());
+    REQUIRE(runtime.DetachDisplay(workspace));
+    CHECK(runtime.TryAcquireOutput(baseline).valid());
+    REQUIRE(workspace->ReserveDisplayWrite());
+    workspace->CancelDisplayWrite();
+}
 TEST_CASE("Workspace cancellation publishes availability before ordered product and display wakes", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;
     ImageWorkspaceTestAccess::Reset();

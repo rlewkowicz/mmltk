@@ -2,6 +2,7 @@
 #include <array>
 #include <algorithm>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include "src/common/system/execution_policy.h"
 #include "src/controller/browser/application_materializer.h"
@@ -94,9 +95,25 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
     predict_ = std::make_unique<PredictSystem>(
         *settings_, *dataset_, *model_, configuration.base_visual, [compute] { return std::make_unique<CudaPredictRuntime>(compute); },
         browser::ApplicationEventPublisher<&ApplicationSystems::predict>(events_, continuity_, source_changed));
-    upscale_ =
-        std::make_unique<UpscaleSystem>(configuration.output_visual, make_native_upscale_runtime_factory(configuration.output_visual), borrow_exact,
-                                        browser::ApplicationEventPublisher<&ApplicationSystems::upscale>(events_, continuity_, source_changed), diagnostics);
+    mmltk::backend::imaging::upscale::ImageUpscalerExecutionCheckpoint upscale_checkpoint;
+    if (diagnostics.valid()) {
+        upscale_checkpoint = [diagnostics, device = configuration.output_visual.device](const auto stage) {
+            diagnostics.Emit([&] {
+                constexpr auto& entries = mmltk::frameworks::reflection::kReflectedEnumEntries<std::remove_cv_t<decltype(stage)>>;
+                const auto entry = std::ranges::find_if(entries, [stage](const auto& item) { return item.value == stage; });
+                return VisualDiagnosticFact{
+                    .system = contracts::DiagnosticOwner::Upscale,
+                    .operation = VisualDiagnosticOperation::UpscaleExecutionCheckpoint,
+                    .device = device,
+                    .value = static_cast<std::uint64_t>(stage),
+                    .failure_detail = entry == entries.end() ? std::string_view{} : entry->name,
+                };
+            });
+        };
+    }
+    upscale_ = std::make_unique<UpscaleSystem>(
+        configuration.output_visual, make_native_upscale_runtime_factory(configuration.output_visual, std::move(upscale_checkpoint)), borrow_exact,
+        browser::ApplicationEventPublisher<&ApplicationSystems::upscale>(events_, continuity_, source_changed), diagnostics);
     explore_ = make_shell_explore_system(*settings_, configuration, *compute.execution,
                                          make_explore_upscale_event_sink(events_, *upscale_, continuity_, source_changed), diagnostics);
     annotation_ = std::make_unique<AnnotationSystem>(

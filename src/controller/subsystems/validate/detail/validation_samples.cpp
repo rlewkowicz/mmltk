@@ -222,6 +222,7 @@ class ValidationSamples::Impl final {
             for (const auto& name : raw->classes()) document->scene.categories.push_back({.value = name});
             for (const auto& gt : raw->ground_truth()) {
                 contracts::AnnotationObject object;
+                object.name = contracts::AnnotationText::From("object " + std::to_string(document->scene.objects.size() + 1U));
                 object.category = static_cast<std::uint16_t>(gt.class_reference);
                 object.box = {{gt.bbox_xyxy[0], gt.bbox_xyxy[1]}, {gt.bbox_xyxy[2], gt.bbox_xyxy[3]}};
                 object.mask.present = gt.has_mask;

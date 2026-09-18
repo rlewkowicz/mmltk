@@ -2928,20 +2928,10 @@ impl State {
                 {
                     return Task::none();
                 }
-                let Some(sampleable) = sampleable_presentation(
-                    frame,
-                    crate::generated::PresentationSourceKind::Upscale,
-                    upscale.frame.revision,
-                ) else {
+                let Some(sampleable) = probes.draws().upscale(frame, upscale.frame.revision) else {
                     return Task::none();
                 };
-                if sampleable.content_width != 1536
-                    || sampleable.content_height != 1536
-                    || probes.draws().viewer.is_none_or(|(drawn, source, _)| {
-                        drawn != sampleable.presentation_revision
-                            || source != upscale.frame.revision
-                    })
-                {
+                if sampleable.content_width != 1536 || sampleable.content_height != 1536 {
                     return Task::none();
                 }
                 driver.phase = Phase::ViewerNoAspect;
@@ -3523,7 +3513,9 @@ impl State {
                 }
             }
             Phase::DetailNext(_) => widgets.arm(driver, EXPLORE_NEXT),
-            Phase::AwaitNext(previous) => {
+            Phase::DetailPrevious(_) => widgets.arm(driver, EXPLORE_PREVIOUS),
+            Phase::AwaitNext(prior) | Phase::AwaitPrevious(prior) => {
+                let forward = matches!(driver.phase, Phase::AwaitNext(_));
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
@@ -3531,18 +3523,24 @@ impl State {
                     return Task::none();
                 };
                 if snapshot.busy
-                    || selected == previous
+                    || selected == prior
                     || settings.has_local_edits()
                     || !model.explore_mutation_available()
+                    || !model.annotation_open_available()
                     || displayed_detail(surface, snapshot).is_none()
                 {
                     return Task::none();
                 }
-                let Some(sampleable) = sampleable_presentation(
-                    frame,
-                    crate::generated::PresentationSourceKind::Explore,
-                    snapshot.frame.revision,
-                ) else {
+                let Some(upscale) = model.current_upscale() else {
+                    return Task::none();
+                };
+                if upscale.input != snapshot.frame
+                    || model.displayed_upscale_kernel()
+                        != Some(crate::generated::UpscaleKernel::Default)
+                {
+                    return Task::none();
+                }
+                let Some(sampleable) = probes.draws().upscale(frame, upscale.frame.revision) else {
                     return Task::none();
                 };
                 if sampleable.presentation_revision
@@ -3552,38 +3550,40 @@ impl State {
                 }
                 reporting::emit(|sink| {
                     sink.record(
-                        "integration.upscale_later_frame",
-                        EXPLORE_GALLERY,
-                        "distinct-imported-frame",
+                        "integration.viewer_navigation",
+                        if forward {
+                            EXPLORE_NEXT
+                        } else {
+                            EXPLORE_PREVIOUS
+                        },
+                        "automatic-basic-completed-draw",
                         [
-                            probes.annotation_observation().sample_baseline as f64,
+                            prior as f64,
+                            selected as f64,
+                            upscale.frame.revision as f64,
                             sampleable.presentation_revision as f64,
-                            sampleable.content_width as f64,
-                            sampleable.content_height as f64,
                         ],
                     )
                 });
-                driver.phase = Phase::DetailPrevious(selected);
-                widgets.arm(driver, EXPLORE_PREVIOUS)
-            }
-            Phase::DetailPrevious(_) => widgets.arm(driver, EXPLORE_PREVIOUS),
-            Phase::AwaitPrevious(next) => {
-                let Some(snapshot) = model.explore.snapshot.as_ref() else {
-                    return Task::none();
-                };
-                if snapshot.busy
-                    || snapshot.selectedimage == Some(next)
-                    || settings.has_local_edits()
-                    || !model.annotation_open_available()
-                    || displayed_detail(surface, snapshot).is_none()
-                {
-                    return Task::none();
+                if forward {
+                    reporting::emit(|sink| {
+                        sink.record(
+                            "integration.upscale_later_frame",
+                            EXPLORE_GALLERY,
+                            "distinct-imported-frame",
+                            [
+                                probes.annotation_observation().sample_baseline as f64,
+                                sampleable.presentation_revision as f64,
+                                sampleable.content_width as f64,
+                                sampleable.content_height as f64,
+                            ],
+                        )
+                    });
+                    probes.await_annotation_sample(sampleable.presentation_revision);
+                    driver.phase = Phase::DetailPrevious(selected);
+                    return widgets.arm(driver, EXPLORE_PREVIOUS);
                 }
-                probes.restart_annotation_sampling(
-                    crate::presentation_surface::retained_surface()
-                        .and_then(|surface| surface.frame)
-                        .map_or(0, |frame| frame.presentation_revision),
-                );
+                probes.restart_annotation_sampling(sampleable.presentation_revision);
                 driver.phase = Phase::DetailCloseEvidence;
                 widgets.arm(driver, EXPLORE_DETAIL_CLOSE)
             }

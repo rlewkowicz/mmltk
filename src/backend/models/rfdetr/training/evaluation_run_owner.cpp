@@ -472,6 +472,7 @@ struct TrainingValidationRuntime::Impl {
     }
     mmltk::common::concurrency::WorkerPool& lane_pool() { return lane_pool_; }
     TrainingEvaluationRunOwner& evaluation_run() noexcept { return *evaluation_run_; }
+    EvaluationSampleWriter& sample_writer() noexcept { return sample_writer_; }
     std::string_view split_name() const noexcept { return split_name_; }
     const ResolvedDatasetLimit& detection_limit() const noexcept { return detection_limit_; }
     bool query_count_automatic() const noexcept { return query_count_automatic_; }
@@ -481,6 +482,7 @@ struct TrainingValidationRuntime::Impl {
     std::unique_ptr<mmltk::backend::data::DatasetLoader> loader_;
     size_t batch_size_ = 1;
     std::unique_ptr<TrainingEvaluationRunOwner> evaluation_run_;
+    EvaluationSampleWriter sample_writer_;
     std::vector<int> image_ids_;
     BatchStaticTensors batch_tensors_;
     std::unique_ptr<GpuBatchPreprocessor> preprocessor_;
@@ -512,6 +514,7 @@ torch::Tensor TrainingValidationRuntime::nested_mask() const { return impl_->nes
 TargetScratch& TrainingValidationRuntime::target_scratch() { return impl_->target_scratch(); }
 mmltk::common::concurrency::WorkerPool& TrainingValidationRuntime::lane_pool() { return impl_->lane_pool(); }
 TrainingEvaluationRunOwner& TrainingValidationRuntime::evaluation_run() noexcept { return impl_->evaluation_run(); }
+EvaluationSampleWriter& TrainingValidationRuntime::sample_writer() noexcept { return impl_->sample_writer(); }
 std::string_view TrainingValidationRuntime::split_name() const noexcept { return impl_->split_name(); }
 std::size_t TrainingValidationRuntime::detection_limit() const noexcept { return impl_->detection_limit().as_size; }
 bool TrainingValidationRuntime::automatic_detection_limit() const noexcept { return impl_->detection_limit().automatic; }
@@ -752,7 +755,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
         RenderSampleOptions render_options;
         render_options.num_classes = static_cast<int>(model.class_layout()->catalog()->size());
         render_options.output_path = options.output_dir / "eval_samples" / std::format("epoch_{}.png", *current_epoch + 1);
-        draw_eval_sample_async_gpu(captured_sample->image, captured_sample->boxes, captured_sample->labels, captured_sample->masks, render_options);
+        validation.sample_writer().Draw(captured_sample->image, captured_sample->boxes, captured_sample->labels, captured_sample->masks, render_options);
     }
     if (progress) { progress->close(); }
     if (calculate_loss) { result.loss = metrics->validation_average(batch_count); }
@@ -763,7 +766,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
     }
     evaluation_run.settle(result.summary);
     static_cast<void>(cancel_unsettled_run.release());
-    flush_eval_sample_writes();
+    validation.sample_writer().Flush();
     result.timing = elapsed_timing(started_at, image_count);
     return result;
 }

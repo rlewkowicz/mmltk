@@ -109,6 +109,14 @@ class ImageWorkspace final {
     class Owner;
 
    public:
+    struct AccessObservation final {
+        std::uint64_t access = 0U;
+        std::uint64_t generation = 0U;
+        bool display_held = false;
+        bool write_reserved = false;
+        bool completion_pending = false;
+    };
+    [[nodiscard]] AccessObservation ObserveAccess() const noexcept;
     class Retirement final {
        public:
         struct Result final {
@@ -142,6 +150,7 @@ class ImageWorkspace final {
     [[nodiscard]] ImageStorageFootprint StorageFootprint() const noexcept;
     [[nodiscard]] mmltk::common::io::ScopedFd ExportAccessDescriptor() const;
     [[nodiscard]] bool WriteAvailable() const noexcept;
+    [[nodiscard]] bool FinalizationPending() const noexcept;
     [[nodiscard]] bool ReserveWrite();
     [[nodiscard]] bool ReserveDisplayWrite();
     void CancelDisplayWrite() noexcept;

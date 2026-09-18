@@ -113,8 +113,10 @@ mod tests {
             1 + tree.children.iter().map(count).sum::<usize>()
         }
         let settings = crate::view::settings::installed_settings_model();
-        let output = view(model, &settings, 0);
-        count(&iced::advanced::widget::Tree::new(&output))
+        let mut output = view(model, &settings, 0);
+        let mut tree = iced::advanced::widget::Tree::new(&output);
+        tree.diff(&mut output);
+        count(&tree)
     }
 
     #[test]

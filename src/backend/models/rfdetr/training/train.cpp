@@ -182,6 +182,7 @@ DistributedContext make_distributed_context(const TrainRequest& options) {
     auto pg_options = c10::make_intrusive<c10d::ProcessGroupNCCL::Options>();
     pg_options->timeout = c10d::kProcessGroupNCCLDefaultTimeout;
     distributed.process_group = c10::make_intrusive<c10d::ProcessGroupNCCL>(distributed.store, distributed.rank, distributed.world_size, std::move(pg_options));
+    distributed.process_group->setBoundDeviceId(mmltk::backend::ml::cuda::cuda_device(options.device_id));
     return distributed;
 #endif
 }
@@ -1070,6 +1071,7 @@ TrainRunResult TrainingRuntimeOwner::Impl::run() {
     distributed_barrier(distributed);
     if (distributed.enabled) {
 #if defined(USE_C10D_NCCL)
+        distributed.process_group->shutdown();
         distributed.process_group.reset();
         distributed.store.reset();
 #endif

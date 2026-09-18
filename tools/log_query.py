@@ -84,7 +84,9 @@ VULKAN_RESOURCE_FIELDS = {
 }
 FAILURE_WORD = re.compile(
     r"(?<![a-z])(?:error|fatal|panic|failed|failure|exception|crash|timeout|timed out"
-    r"|segmentation fault|sigsegv|sigabrt|sigbus|aborted)(?![a-z])",
+    r"|segmentation fault|sigsegv|sigabrt|sigbus|aborted"
+    r"|invalid server CBOR record|invalid fixed text size|corrupted size vs\. prev_size"
+    r"|corrupted double-linked list|double free|malloc\(\):|free\(\):)(?![a-z])",
     re.IGNORECASE,
 )
 LEVEL_NAMES = {
@@ -2847,14 +2849,71 @@ class Triage:
 
     def choose_anchors(self, files, query):
         explicit = bool(self.options.query.strip() or self.options.errors or self.lookup)
+        peer_scope = peer_opened = last_peer_close = None
+        short_peers = 0
+        stage_scope = None
+        workspace_waits = {}
+
+        def retain_pending():
+            for state in self.pending.values():
+                row = state.first
+                span = row.get("span_id")
+                exact_span = type(span) is int and span > 0 and row.get("span_outcome") == 0
+                why = ("unclosed instrumented span at capture end (candidate, not proof)" if exact_span else
+                       "unclosed start at capture end (candidate, not proof)")
+                self.seed_pool.add(row, (-80 if exact_span else -30, False, -row.metadata["mtime_ns"], *physical_position(row)),
+                                   why, (row.metadata["run"], str(row.get("@event")), "unclosed"))
+            for row in workspace_waits.values():
+                why = "workspace wait without a captured frame edge: " + str(row.get("message"))
+                self.seed_pool.add(row, (-85, False, -row.metadata["mtime_ns"], *physical_position(row)),
+                                   why, (row.metadata["run"], row.source, "workspace-wait"))
+            self.pending.clear()
+            workspace_waits.clear()
+
         for row in self.records(files, apply_where=False):
             self.scanned += 1
+            scope = row.source, row.metadata["run"]
+            if scope != stage_scope:
+                retain_pending()
+                stage_scope = scope
             if row.parse_error:
                 self.malformed += 1
                 if len(self.parse_examples) < 5:
                     self.parse_examples.append(f"{row.source}:{row.line}: {row.parse_error}")
             if not self.where.matches(row) or not query.matches(row):
                 continue
+            # Records arrive in physical file order. Keep one source-local
+            # lifetime, not a growing peer registry or a cross-clock join.
+            scope = row.source, row.metadata["run"], row.clock
+            if scope != peer_scope:
+                peer_scope, peer_opened, last_peer_close, short_peers = scope, None, None, 0
+            event = row.get("@event")
+            if not row.metadata.get("context_copy"):
+                product = correlation_key(row, ("source_session", "source_instance", "source_revision"))
+                if product is not None:
+                    if event == "presentation.frame.edge":
+                        workspace_waits.pop(product, None)
+                    elif event == "presentation.workspace.wait" and row.get("message") == "producer_finalization_pending":
+                        if product in workspace_waits or len(workspace_waits) < MAX_TRIAGE_STATES:
+                            workspace_waits[product] = triage_snapshot(row)
+            if not row.metadata.get("context_copy") and event in (
+                "browser.server.peer_opened", "browser.server.peer_closed", "browser.server.peer_replaced"
+            ):
+                peer = row.get("value")
+                if event == "browser.server.peer_opened" and type(peer) is int and peer > 0 and row.time_ns is not None:
+                    peer_opened = peer, row.time_ns
+                elif event == "browser.server.peer_closed" and peer_opened is not None and row.time_ns is not None:
+                    same_peer = type(peer) is int and peer == peer_opened[0]
+                    short = same_peer and 0 <= row.time_ns - peer_opened[1] <= 100_000_000
+                    consecutive = last_peer_close is not None and 0 <= row.time_ns - last_peer_close <= 1_000_000_000
+                    short_peers = min(short_peers + 1, 4) if short and consecutive else int(short)
+                    last_peer_close, peer_opened = row.time_ns, None
+                    if short_peers == 3:
+                        why = "rapid reconnects: three peers closed within 100ms each, at intervals under 1s; cause not recorded by these events"
+                        self.seed_pool.add(row, (-95, False, -row.metadata["mtime_ns"], *physical_position(row)), why,
+                                           (row.metadata["run"], row.source, "rapid-reconnects"))
+                else:
+                    peer_opened, last_peer_close, short_peers = None, None, 0
             self.observe_pixel_chain(row, emit=False)
             identities = strong_identities(row, self.explicit)
             score, why = anchor_rank(row, identities)
@@ -2882,12 +2941,7 @@ class Triage:
         # Their missing joins are judged by the full analysis pass instead.
         if not explicit:
             self.finalize_pixel_chain(emit=False)
-        for state in self.pending.values():
-            row = state.first
-            self.seed_pool.add(row, (-30, False, -row.metadata["mtime_ns"], *physical_position(row)),
-                               "unclosed start at capture end (candidate, not proof)",
-                               (row.metadata["run"], str(row.get("@event")), "unclosed"))
-        self.pending.clear()
+        retain_pending()
         candidates = self.seed_pool.rows()
         self.pixel_samples.clear()
         self.pixel_sources.clear()
@@ -2949,6 +3003,10 @@ class Triage:
 
     def gather_context(self, files):
         for _, row, why in self.selected:
+            if why.startswith("rapid reconnects:"):
+                self.finding("rapid-reconnects", 108, why, row)
+            if why.startswith("workspace wait without"):
+                self.finding("workspace-wait", 108, why, row)
             if anchor_rank(row)[0] >= 85 and (row.get("@error") or why == "failed outcome/span"):
                 self.finding("anchor-failure", 115, why, row)
             for identity in strong_identities(row, self.explicit):
@@ -3279,9 +3337,10 @@ def render_record(item, options):
             }
         return encoded(output)
     reason = "auto: " + record.metadata["auto_reason"] if item.reason == "auto" else item.reason
+    detail_width = 2048 if record.get("@error") is True else 180
     if options.fields:
         cells = projected(record, options.fields)
-        return " ".join(f"{name}={compact(value, None if record.get('@event') == 'vulkan.validation' else 180)}"
+        return " ".join(f"{name}={compact(value, None if record.get('@event') == 'vulkan.validation' else detail_width)}"
                         for name, value in cells.items()) + f" [{reason}]"
     clock = "elapsed" if record.clock.startswith("elapsed:") else record.clock
     timestamp = (
@@ -3307,7 +3366,7 @@ def render_record(item, options):
                  "workspace_allocation", "workspace_plane"):
         if correlation_key(record, (name,)) is not None:
             facts.append(f"{name}={compact(record.get(name), 70)}")
-    for name in ("reason", "observed_event", "observed_file", "observed_line", "audit_context.field"):
+    for name in ("participant", "reason", "observed_event", "observed_file", "observed_line", "audit_context.field"):
         value = record.get(name)
         if value is not MISSING:
             facts.append(f"{name}={compact(value, 150)}")
@@ -3346,6 +3405,13 @@ def render_record(item, options):
             value = record.get(name)
             if value is not MISSING:
                 facts.append(f"{name}={compact(value, 70)}")
+    if event in ("presentation.workspace.wait", "presentation.workspace.service"):
+        for name in ("requested_product_owner", "requested_product_revision", "observed_product_owner", "observed_product_revision",
+                     "admitted_allocation", "admitted_access", "admitted_generation", "admitted_display_held",
+                     "admitted_write_reserved", "admitted_completion_pending", "source_timeline_imported",
+                     "workspace_admitted", "workspace_write_available"):
+            if (value := record.get(name)) is not MISSING:
+                facts.append(f"{name}={compact(value, 70)}")
     if options.triage:
         for name in ("generation", "slot", "boundary", "status", "code", "outcome", "span_outcome"):
             value = record.get(name)
@@ -3373,7 +3439,7 @@ def render_record(item, options):
         facts.append("context-copy")
     if "proximity_ns" in record.metadata:
         facts.append(f"delta_ms={record.metadata['proximity_ns'] / 1000000:+.3f} ({record.metadata['time_link']})")
-    suffix = (" " + compact(detail)) if detail is not MISSING and detail != "" and event != "vulkan.validation" else ""
+    suffix = (" " + compact(detail, detail_width)) if detail is not MISSING and detail != "" and event != "vulkan.validation" else ""
     if facts:
         suffix += " " + " ".join(facts)
     location = str(record.line)

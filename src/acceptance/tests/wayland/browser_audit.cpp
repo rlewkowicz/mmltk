@@ -491,7 +491,10 @@ auto BrowserAudit::consume_gallery_generation(const nlohmann::json& record) -> v
 auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     atlas_draws.consume(record);
     const auto surface_event = record.value("event", "");
-    if (surface_event == "iced.surface.renderer_reconstructed")
+    if (surface_event == "firefox.adapter.selected") {
+        const auto display = record.value("display_pci_bus_id", "");
+        if (display.empty() || record.value("adapter_pci_bus_id", "") != display) workspace_protocol_failure = true;
+    } else if (surface_event == "iced.surface.renderer_reconstructed")
         ++renderer_reconstructions[record.value("requested_surface", "")];
     else if (surface_event == "iced.surface.draw_encoded") {
         owned_atlas_seen = atlas_draws.seen;
@@ -529,6 +532,18 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
                 phase_progress_class = deadline_class;
                 phase_progress_name = phase;
                 ++phase_progress_revision;
+            }
+        }
+    } else if (event == "integration.workflow.operation_progress") {
+        constexpr std::array<std::string_view, 4U> primary_controls{"train.primary", "validate.primary", "predict.primary", "export.primary"};
+        const auto control = std::ranges::find(primary_controls, record.value("control", ""));
+        const auto native_progress = std::pair{scalar(record, "a"), scalar(record, "b")};
+        if (control != primary_controls.end() && native_progress.first != 0U && native_progress.second != 0U && phase_progress_class == "work" &&
+            phase_progress_name == "Workflows(" + record.value("detail", "") + ")") {
+            auto& prior = workflow_progress[static_cast<std::size_t>(control - primary_controls.begin())];
+            if (native_progress > prior) {
+                prior = native_progress;
+                ++work_progress_revision;
             }
         }
     } else if (event == "integration.explore_reopen_wait") {
@@ -1109,6 +1124,11 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
     } else if (event == "integration.upscale_later_frame") {
         upscale_later_frame = record.value("detail", "") == "distinct-imported-frame" && scalar(record, "b") > scalar(record, "a") &&
                               scalar(record, "c") != 0U && scalar(record, "d") != 0U;
+    } else if (event == "integration.viewer_navigation") {
+        const auto control = record.value("control", "");
+        if (record.value("detail", "") == "automatic-basic-completed-draw" && scalar(record, "a") != scalar(record, "b") && scalar(record, "c") != 0U &&
+            scalar(record, "d") != 0U && (control == EXPLORE_NEXT || control == EXPLORE_PREVIOUS))
+            viewer_navigation_draws[control == EXPLORE_NEXT ? 0U : 1U] = scalar(record, "d");
     } else if (event == "integration.annotation_ready") {
         annotation_ready = record.value("detail", "") == "receiver-owned" && scalar(record, "a") != 0U;
     } else if (event == "integration.annotation_tool_observed") {
@@ -1481,7 +1501,10 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
         padded_and_original_detail, "padded and original detail", upscale_growth, "upscale growth", upscale_presentation, "upscale presentation",
         upscale_modes == expected_upscale_modes, "upscale modes", upscale_presentations == expected_upscale_presentations, "upscale presentations",
         upscale_completed_pixels == expected_upscale_presentations, "upscale completed blue pixels", upscale_same_method == expected_upscale_presentations,
-        "upscale exact re-click", upscale_later_frame, "upscale later frame", reopened, "dataset reopen", repeated_same_revision, "same-revision redraw",
+        "upscale exact re-click", upscale_later_frame, "upscale later frame",
+        std::ranges::all_of(
+            viewer_navigation_draws, [this](const auto draw) { return draw != 0U && surface_draws.contains(draw); }),
+        "Previous/Next automatic upscale draws", reopened, "dataset reopen", repeated_same_revision, "same-revision redraw",
         annotation_ready && annotation_tool && annotation_pointer, "annotation lifecycle",
         complete && surface_draws.contains(presentation_receipt) && surface_redraws.contains(presentation_receipt), "presentation completion",
         bounds_valid && !failed_before_termination(), "browser validity", firefox_import && firefox_claim && firefox_ready, "Firefox integration",

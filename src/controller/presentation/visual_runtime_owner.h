@@ -57,7 +57,7 @@ class VisualRuntimeOwner final {
     [[nodiscard]] bool NotifyOrderedDrain();
     [[nodiscard]] bool SubmitTerminalBarrier(Work);
     bool SubmitLatest(Work);
-    enum class ContinuationCancellation : std::uint8_t { Cancel, PreserveOrderedInput };
+    enum class ContinuationCancellation : std::uint8_t { Cancel, PreserveOrderedInput, YieldToWorkspace };
     void RegisterContinuation(Work, DispatchObservation = {}, bool wake_on_output_available = false,
                               ContinuationCancellation = ContinuationCancellation::Cancel);
     [[nodiscard]] bool NotifyContinuation() noexcept;
@@ -166,6 +166,7 @@ class VisualRuntimeOwner final {
     bool discrete_active_ = false;
     bool active_discrete_ = false;
     bool active_preserves_input_ = false;
+    bool active_yields_to_workspace_ = false;
     bool terminal_barrier_active_ = false;
     bool runtime_retirement_blocked_ = false;
     bool stopping_ = false;

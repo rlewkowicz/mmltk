@@ -191,7 +191,12 @@ fn worker(
                     Some(SocketEvent::Bytes(bytes)) => {
                         let record = match protocol::decode_server(&bytes) {
                             Ok(record) => record,
-                            Err(error) => break format!("invalid server CBOR record: {error}"),
+                            Err(error) => {
+                                break format!(
+                                    "invalid server CBOR record: {error} (record_bytes={})",
+                                    bytes.len()
+                                );
+                            }
                         };
                         if let Err(error) = connection.observe(&record) {
                             break error;
@@ -229,6 +234,17 @@ fn worker(
                     }
                 }
             };
+            if config.surface_trace {
+                let message: String = reason.chars().take(2048).collect();
+                if let Ok(message) =
+                    js_sys::JSON::stringify(&wasm_bindgen::JsValue::from_str(&message))
+                    && let Some(message) = message.as_string()
+                {
+                    crate::presentation_surface::emit_surface_trace(&format!(
+                        "{{\"event\":\"iced.transport.disconnected\",\"message\":{message}}}"
+                    ));
+                }
+            }
             connection.close();
             drop(socket);
             // Accepted events retain their delivery order before the terminal edge.

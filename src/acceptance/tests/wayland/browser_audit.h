@@ -299,6 +299,7 @@ struct BrowserAudit final {
     bool upscale_growth = false;
     bool upscale_presentation = false;
     bool upscale_later_frame = false;
+    std::array<std::uint64_t, 2U> viewer_navigation_draws{};
     std::set<std::string, std::less<>> upscale_modes;
     std::set<std::string, std::less<>> upscale_presentations;
     std::set<std::string, std::less<>> upscale_completed_pixels;
@@ -324,6 +325,7 @@ struct BrowserAudit final {
     std::size_t ordinal = 0U;
     std::size_t phase_progress_revision = 0U;
     std::size_t work_progress_revision = 0U;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 4U> workflow_progress{};
     std::uint64_t reopen_snapshot_progress = 0U;
     std::uint64_t reopen_draw_progress = 0U;
     std::string phase_progress_class;

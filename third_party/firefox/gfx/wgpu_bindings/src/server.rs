@@ -129,6 +129,7 @@ unsafe impl Sync for WebGPUParentPtr {}
 
 pub struct Global {
     owner: WebGPUParentPtr,
+    display_pci_bus_id: Result<String, String>,
     global: Arc<wgc::global::Global>,
     device_poll_workers: DevicePollWorkers,
     swap_chain_configs: Mutex<HashMap<SwapChainId, SwapChainConfig>>,
@@ -430,8 +431,27 @@ impl Drop for Global {
     }
 }
 
+fn display_pci_bus_id(render_device: &nsACString) -> Result<String, String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let path = render_device.to_utf8();
+    let metadata = std::fs::metadata(path.as_ref())
+        .map_err(|error| format!("display render device {path}: {error}"))?;
+    if !metadata.file_type().is_char_device() {
+        return Err("display render device is not a character device".into());
+    }
+    let device = metadata.rdev();
+    let path = std::fs::canonicalize(format!(
+        "/sys/dev/char/{}:{}/device",
+        libc::major(device),
+        libc::minor(device)
+    ))
+    .map_err(|error| format!("display PCI identity: {error}"))?;
+    path.file_name().and_then(|name| name.to_str()).map(str::to_owned)
+        .ok_or_else(|| "display PCI identity is unavailable".into())
+}
+
 #[no_mangle]
-pub extern "C" fn wgpu_server_new(owner: WebGPUParentPtr) -> *mut Global {
+pub extern "C" fn wgpu_server_new(owner: WebGPUParentPtr, render_device: &nsACString) -> *mut Global {
     mmltk_workspace_channel::initialize_diagnostics();
     MMLTK_WORKSPACE_ACCEPTANCE_TRACE.get_or_init(|| {
         mmltk_workspace_channel::workspace_diagnostics_enabled()
@@ -465,6 +485,7 @@ pub extern "C" fn wgpu_server_new(owner: WebGPUParentPtr) -> *mut Global {
     let device_poll_workers = DevicePollWorkers::new(global.clone());
     let global = Global {
         owner,
+        display_pci_bus_id: display_pci_bus_id(render_device),
         global,
         device_poll_workers,
         swap_chain_configs: Mutex::new(HashMap::new()),
@@ -5702,14 +5723,19 @@ unsafe fn process_message(
                 compatible_surface: None,
                 apply_limit_buckets: false,
             };
-            let created =
-                match global.request_adapter(&desc, wgt::Backends::VULKAN, Some(adapter_id)) {
+            let created = match &global.display_pci_bus_id {
+                Ok(display_device) => match global.request_adapter(&desc, wgt::Backends::VULKAN, Some(adapter_id), Some(display_device)) {
                     Ok(_) => true,
                     Err(e) => {
                         log::warn!("{e}");
                         false
                     }
-                };
+                },
+                Err(error) => {
+                    log::error!("WebGPU display adapter selection failed: {error}");
+                    false
+                }
+            };
 
             let response = if created {
                 let wgt::AdapterInfo {
@@ -5721,11 +5747,14 @@ unsafe fn process_message(
                     driver_info,
                     backend,
                     transient_saves_memory: _,
-                    device_pci_bus_id: _,
+                    device_pci_bus_id,
                     subgroup_min_size,
                     subgroup_max_size,
                     limit_bucket: _,
                 } = global.adapter_get_info(adapter_id);
+                mmltk_workspace_channel::write_diagnostic(|line| write!(line,
+                    "{{\"event\":\"firefox.adapter.selected\",\"browser_process_id\":{},\"display_pci_bus_id\":\"{}\",\"adapter_pci_bus_id\":\"{}\",\"vendor\":{},\"device\":{}}}",
+                    std::process::id(), global.display_pci_bus_id.as_deref().unwrap_or(""), device_pci_bus_id, vendor, device));
 
                 let is_hardware = match device_type {
                     wgt::DeviceType::IntegratedGpu | wgt::DeviceType::DiscreteGpu => true,

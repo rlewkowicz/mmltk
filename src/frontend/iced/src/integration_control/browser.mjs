@@ -43,6 +43,7 @@ export function mmltkIntegrationInitialize(enabled) {
     primarySequence: 0,
     primaryInput: 0,
     primaryPage: undefined,
+    primaryScale: 1,
     fpsDraw: undefined,
     fpsPending: undefined,
     integrationRenderKey: 0,
@@ -460,14 +461,19 @@ export function mmltkIntegrationPrimaryActionMeasured(control, token, measured, 
   const facts = state.latest, inset = facts[13];
   const [outerX, outerY, outerW, outerH, px, py, pw, ph, hx, hy, hw, hh] = measured;
   const x = outerX + inset, y = outerY + inset, w = facts[2], h = facts[3];
-  const scale = facts[8];
   const canvas = request.geometry.canvas;
+  // The renderer's hint can remain at device scale while the application
+  // changes UI scale. Measured widget positions are logical; convert them
+  // through the applied UI scale and the actual canvas backing dimensions.
+  const scale = owner.primaryScale * canvas.width / request.geometry.css[2];
+  const scaleY = owner.primaryScale * canvas.height / request.geometry.css[3];
   const contained = measured.length === 12 && Array.from(measured).every(Number.isFinite) &&
     Math.abs(outerW-w-2*inset) < 0.01 && Math.abs(outerH-h-2*inset) < 0.01 &&
-    pw > 0 && ph > 0 && hw > 0 && hh > 0 && w > 0 && h > 0 && scale > 0 &&
+    pw > 0 && ph > 0 && hw > 0 && hh > 0 && w > 0 && h > 0 &&
+    Number.isFinite(scale) && Number.isFinite(scaleY) && scale > 0 && scaleY > 0 &&
     x >= Math.max(px,hx,0) && y >= Math.max(py,hy,0) &&
     x+w <= Math.min(px+pw,hx+hw,canvas.width/scale) &&
-    y+h <= Math.min(py+ph,hy+hh,canvas.height/scale);
+    y+h <= Math.min(py+ph,hy+hh,canvas.height/scaleY);
   if (!contained) { retire('invalidated'); return; }
   if (!request.bounds) {
     request.bounds = Float64Array.from(measured);
@@ -488,9 +494,9 @@ export function mmltkIntegrationPrimaryActionMeasured(control, token, measured, 
   const draw = state;
   try {
       const snapshot = canvasSnapshot(canvas);
-      const pixels = snapshot.getImageData(Math.floor(x*scale), Math.floor(y*scale), Math.ceil((x+w)*scale)-Math.floor(x*scale), Math.ceil((y+h)*scale)-Math.floor(y*scale));
+      const pixels = snapshot.getImageData(Math.floor(x*scale), Math.floor(y*scaleY), Math.ceil((x+w)*scale)-Math.floor(x*scale), Math.ceil((y+h)*scaleY)-Math.floor(y*scaleY));
       const at = (px,py) => {
-        const ix = Math.floor((x+px)*scale)-Math.floor(x*scale), iy = Math.floor((y+py)*scale)-Math.floor(y*scale);
+        const ix = Math.floor((x+px)*scale)-Math.floor(x*scale), iy = Math.floor((y+py)*scaleY)-Math.floor(y*scaleY);
         return pixels.data.subarray((iy*pixels.width+ix)*4,(iy*pixels.width+ix)*4+3);
       };
       const core = at(6, h/2);
@@ -537,12 +543,17 @@ export function mmltkIntegrationPrimaryActionMeasured(control, token, measured, 
       }
       const valid = coreCorrect && bandLeaks===0 && (draw.active ? segments===10 && lengths.every(length=>length>=15 && length<=25) && mismatch<=compared*0.12 : segments===0);
       if (!valid) {
-        report({event:'integration.primary_action.rejected',control,detail:'primary action canvas mismatch',label:draw.label,segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,phase});
+        report({event:'integration.primary_action.rejected',control,detail:'primary action canvas mismatch',label:draw.label,
+          active:draw.active,dark:draw.dark,segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,phase,
+          scale,scale_y:scaleY,ui_scale:owner.primaryScale,draw_scale:facts[8],
+          screen_bounds:[x,y,w,h],draw_bounds:Array.from(facts.subarray(0,8)),measured_bounds:Array.from(measured),
+          edge_pixels:[[w/2,1.5],[w-1.5,h/2],[w/2,h-1.5],[1.5,h/2]].map(([px,py])=>Array.from(at(px,py))),
+          canvas:[canvas.width,canvas.height],css:request.geometry.css});
         retire('retry');
         return;
       }
       report({event:'integration.primary_action.pixels',control,label:draw.label,active:draw.active,dark:draw.dark,phase,
-        segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,width:w,height:h,scale,blue:expected,screen_bounds:[x,y,w,h]});
+        segments,lengths,core:Array.from(core),mismatch,compared,band_leaks:bandLeaks,width:w,height:h,scale,scale_y:scaleY,blue:expected,screen_bounds:[x,y,w,h]});
       state.phase = phase;
       ++state.captures;
       state.completed = request;

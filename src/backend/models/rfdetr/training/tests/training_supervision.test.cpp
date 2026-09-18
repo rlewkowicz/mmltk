@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -1639,14 +1641,25 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
                     request.distributed_rank = rank;
                     request.distributed_world_size = 2;
                     request.distributed_store_path = store_path;
-                    request.device_id = rank;
-                    return rfdetr::run_training(request);
+                    // Rank order must not stand in for the selected CUDA device.
+                    request.device_id = 1 - rank;
+                    try {
+                        return rfdetr::run_training(request);
+                    } catch (const std::exception& error) {
+                        std::fprintf(stderr, "distributed training fixture: rank %d, CUDA device %d failed: %s\n", rank, request.device_id, error.what());
+                        throw;
+                    }
                 });
             }
-            for (auto& worker : workers) {
-                const auto result = worker.get();
-                REQUIRE(result.history.size() == 1);
-                REQUIRE(std::isfinite(result.history.front().train_loss));
+            for (std::size_t rank = 0; rank < workers.size(); ++rank) {
+                const auto result = workers[rank].get();
+                REQUIRE(result.last_epoch == 0);
+                if (rank == 0) {
+                    REQUIRE(result.history.size() == 1);
+                    REQUIRE(std::isfinite(result.history.front().train_loss));
+                } else {
+                    REQUIRE(result.history.empty());
+                }
             }
         }
     }

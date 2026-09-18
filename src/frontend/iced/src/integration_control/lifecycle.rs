@@ -25,6 +25,7 @@ pub(super) struct State {
     denoising_target: bool,
     ui_scale_baseline: f32,
     ui_scale_first: Option<f32>,
+    primary_pixels: std::collections::BTreeSet<String>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -39,11 +40,28 @@ impl Default for State {
             denoising_target: false,
             ui_scale_baseline: 1.0,
             ui_scale_first: None,
+            primary_pixels: std::collections::BTreeSet::new(),
         }
     }
 }
 
 impl State {
+    pub(super) fn primary_action_pixels(&mut self, control: &str, active: bool) {
+        if !active && self.primary_pixels.len() < 6 {
+            self.primary_pixels.insert(control.to_owned());
+        }
+    }
+
+    fn after_page(page: FeatureId) -> Phase {
+        if page == FeatureId::Train {
+            Phase::TrainModelCard
+        } else {
+            crate::view::workflow::Composition::new(page, 0.0)
+                .next_ordinary_page()
+                .map_or(Phase::ReturnTrain, Phase::PageNavigation)
+        }
+    }
+
     pub(super) fn begin_advanced_numeric_edit(
         &mut self,
         driver: &mut Driver,
@@ -319,6 +337,22 @@ impl State {
                 widgets.arm(driver, region_id(page, 0))
             }
             Phase::PageRegion { page, index } => widgets.arm(driver, region_id(page, index)),
+            Phase::PagePrimary(page) | Phase::AwaitPagePrimary(page)
+                if !crate::integration_control::reporting_enabled()
+                    || self.primary_pixels.contains(
+                        crate::view::workflow::Composition::new(page, 0.0)
+                            .stable_id(crate::view::workflow::Region::PrimaryAction),
+                    ) =>
+            {
+                driver.advance_to(Self::after_page(page))
+            }
+            Phase::PagePrimary(page) if widgets.begin_location() => reveal_control(
+                crate::view::workflow::Composition::new(page, 0.0)
+                    .stable_id(crate::view::workflow::Region::PrimaryAction)
+                    .to_owned(),
+                driver.generation,
+                AnnotationReveal::Control,
+            ),
             Phase::TrainModelCard => widgets.arm(driver, TRAIN_MODEL_CARD),
             Phase::TrainModelPart(index) => widgets.arm(driver, TRAIN_MODEL_PARTS[index]),
             Phase::TrainModelProgress => widgets.arm(driver, TRAIN_MODEL_PROGRESS),
@@ -817,6 +851,9 @@ impl State {
             }
             Phase::PageNavigation(page) => crate::view::navigation::stable_id(page).to_owned(),
             Phase::PageRegion { page, index } => region_id(page, index).to_owned(),
+            Phase::PagePrimary(page) => crate::view::workflow::Composition::new(page, 0.0)
+                .stable_id(crate::view::workflow::Region::PrimaryAction)
+                .to_owned(),
             Phase::TrainModelCard => TRAIN_MODEL_CARD.to_owned(),
             Phase::TrainModelPart(index) => TRAIN_MODEL_PARTS[index].to_owned(),
             Phase::TrainModelProgress => TRAIN_MODEL_PROGRESS.to_owned(),
@@ -966,13 +1003,13 @@ impl State {
                         page,
                         index: index + 1,
                     };
-                } else if page == FeatureId::Train {
-                    driver.phase = Phase::TrainModelCard;
-                } else if let Some(next) = composition.next_ordinary_page() {
-                    driver.phase = Phase::PageNavigation(next);
                 } else {
-                    driver.phase = Phase::ReturnTrain;
+                    driver.phase = Phase::PagePrimary(page);
                 }
+                None
+            }
+            Phase::PagePrimary(page) => {
+                driver.phase = Phase::AwaitPagePrimary(page);
                 None
             }
             Phase::TrainModelCard => {

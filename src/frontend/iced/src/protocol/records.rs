@@ -189,7 +189,7 @@ fn decode_snapshot(
     validate_server_dynamic_value(&value)?;
     crate::generated::decode_application_snapshot(system_id, value)
         .map(|snapshot| (system_id, snapshot))
-        .map_err(ProtocolError)
+        .map_err(|error| ProtocolError(format!("Bootstrap system_id={system_id}: {error}")))
 }
 
 fn decode_error(value: Value) -> Result<ApplicationError, ProtocolError> {
@@ -354,7 +354,11 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
             let value = take_required(&mut fields, "value");
             validate_server_dynamic_value(&value)?;
             let event = crate::generated::decode_application_event(system_id, event_id, value)
-                .map_err(ProtocolError)?;
+                .map_err(|error| {
+                    ProtocolError(format!(
+                        "SystemEvent system_id={system_id} event_id={event_id} state_revision={state_revision}: {error}"
+                    ))
+                })?;
             Ok(ServerRecord::SystemEvent(SystemEvent {
                 delivery,
                 state_revision,
@@ -368,6 +372,64 @@ pub fn decode_server(bytes: &[u8]) -> Result<ServerRecord, ProtocolError> {
 mod tests {
     use super::*;
     use crate::protocol::object;
+
+    #[test]
+    fn server_decode_errors_identify_the_record_object_and_fixed_text_boundary() {
+        for size in [0, 97] {
+            let mut snapshot = crate::view_model::test_support::bootstrapped()
+                .upscale_snapshot
+                .unwrap();
+            let annotation = crate::view_model::test_support::annotation_object(0);
+            snapshot.scene.objects = vec![annotation.clone(), annotation];
+            snapshot.scene.objects[1].name.bytes.0.fill(0);
+            snapshot.scene.objects[1].name.size = size;
+            let bootstrap = bootstrap_payload(
+                1,
+                crate::generated::SCHEMA_FINGERPRINT,
+                vec![object([
+                    (
+                        "system_id",
+                        Value::Unsigned(crate::generated::SYSTEM_Upscale),
+                    ),
+                    ("value", snapshot.clone().into_application_transport_value()),
+                ])],
+            );
+            let event = protocol_payload([
+                (
+                    "system_id",
+                    Value::Unsigned(crate::generated::SYSTEM_Upscale),
+                ),
+                (
+                    "event_id",
+                    Value::Unsigned(crate::generated::EVENT_Upscale_UpscaleChanged),
+                ),
+                ("delivery", Value::Text("LatestState".into())),
+                ("state_revision", Value::Unsigned(7)),
+                (
+                    "value",
+                    crate::generated::UpscaleChanged { snapshot }
+                        .into_application_transport_value(),
+                ),
+            ]);
+            for (kind, payload) in [("Bootstrap", bootstrap), ("SystemEvent", event)] {
+                let error = decode_server(&encode_envelope(kind, &payload).unwrap())
+                    .unwrap_err()
+                    .to_string();
+                for expected in [
+                    kind,
+                    "system_id=",
+                    "UpscaleSnapshot.scene",
+                    "AnnotationSceneContent.objects",
+                    "[1]",
+                    "AnnotationObject.name",
+                    &format!("AnnotationText.size={size}"),
+                    "expected 1..=96",
+                ] {
+                    assert!(error.contains(expected), "{error}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn full_scene_output_reaches_typed_server_decode_without_relaxing_input() {

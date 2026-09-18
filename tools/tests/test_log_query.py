@@ -271,6 +271,19 @@ class LogFormatTests(unittest.TestCase):
         self.assertIs(exited.get("@signal"), logs.MISSING)
         self.assertFalse(record({"event": "child.exited", "value": 0}).get("@error"))
 
+    def test_transport_decode_and_allocator_failures_are_searchable_without_a_level(self):
+        for message in (
+            "invalid server CBOR record: UpscaleSnapshot.scene: invalid fixed text size: AnnotationText.size=0, expected 1..=96",
+            "corrupted size vs. prev_size while consolidating",
+            "free(): double free detected in tcache 2",
+            "malloc(): corrupted top size",
+        ):
+            with self.subTest(message=message):
+                row = logs.parse_record("stderr.log", 1, message)
+                self.assertTrue(row.get("@error"))
+                self.assertGreaterEqual(logs.anchor_rank(row)[0], 90)
+        self.assertFalse(record({"event": "iced.transport.disconnected", "message": "WebSocket closed: 1000"}).get("@error"))
+
     def test_catch_failure_preserves_parent_and_extracts_quoted_json(self):
         context = logs.TranscriptContext()
         list(context.parse_line("test.log", 1, "[ RUN ] viewer_copy", {}, {}))
@@ -2379,6 +2392,45 @@ class FileQueryTests(unittest.TestCase):
         self.assertIn("failure-related event (not an explicit failure)", output)
         self.assertNotIn("anchor-failure", output)
 
+    def test_triage_finds_short_reconnect_lifetimes_without_claiming_their_cause(self):
+        rows = []
+        for peer in range(1, 7):
+            opened = peer * 250_000_000
+            rows.extend([
+                {"event": "browser.server.peer_opened", "value": peer, "steady_ns": opened},
+                {"event": "browser.server.peer_closed", "value": peer, "steady_ns": opened + 1_000_000},
+            ])
+        self.write("input.jsonl", rows)
+        status, output, diagnostics = self.run_query("input.jsonl", "--triage")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("rapid reconnects:", output)
+        self.assertIn("cause not recorded", output)
+        for changed in (
+            rows[:4],
+            [dict(row, value=999) if row["event"].endswith("closed") else row for row in rows],
+            [dict(row, steady_ns=row["steady_ns"] * 20) for row in rows],
+            [dict(row, steady_ns=None) for row in rows],
+        ):
+            self.write("input.jsonl", changed)
+            _, output, _ = self.run_query("input.jsonl", "--triage")
+            self.assertNotIn("rapid reconnects:", output)
+
+    def test_pasted_transport_error_retains_field_cause_and_reconnect_context(self):
+        message = ("invalid server CBOR record: SystemEvent system_id=7 event_id=8 state_revision=9: "
+                   "UpscaleChanged.snapshot: UpscaleSnapshot.scene: AnnotationSceneContent.objects: "
+                   "[0]: AnnotationObject.name: invalid fixed text size: AnnotationText.size=0, expected 1..=96")
+        self.write("input.jsonl", [
+            {"event": "browser.server.peer_opened", "value": 1, "steady_ns": 100},
+            {"event": "iced.transport.disconnected", "message": message, "steady_ns": 200},
+            {"event": "browser.server.peer_closed", "value": 1, "steady_ns": 300},
+        ])
+        status, output, diagnostics = self.run_query(
+            "input.jsonl", "--error", "invalid server CBOR record: invalid fixed text size", "--triage"
+        )
+        self.assertEqual(status, 0, diagnostics)
+        for expected in ("all-words fallback", "AnnotationObject.name", "AnnotationText.size=0", "browser.server.peer_closed"):
+            self.assertIn(expected, output)
+
     def test_triage_pasted_error_retains_earliest_physical_and_timestamp_neighbors(self):
         pasted = self.pasted_error_fixture()
         status, output, diagnostics = self.run_query("--error", pasted, "--triage")
@@ -2528,6 +2580,44 @@ class FileQueryTests(unittest.TestCase):
         self.assertEqual(status, 0)
         candidate = output.split("Earliest divergence candidates", 1)[1].splitlines()[1]
         self.assertIn("input.jsonl:2: incomplete-state", candidate)
+
+    def test_triage_retains_native_spans_and_accepted_requests_after_busy_browser_capture(self):
+        self.write("capture-firefox.log", [
+            {"event": "sample.started", "request_id": index + 1}
+            for index in range(logs.MAX_TRIAGE_STATES + 1)
+        ])
+        product = {"source_session": 5, "source_instance": 1, "source_revision": 4}
+        rows = [
+            {"event": "upscale.warm.runtime.started", "span_id": 580, "span_outcome": 0, "steady_ns": 1_000_000_000},
+            {"event": "browser.intent.accepted", "participant": "Presentation.Select", "sequence": 1258, "value": 17,
+             "steady_ns": 1_008_000_000},
+            {"event": "presentation.workspace.wait", "message": "producer_finalization_pending", **product,
+             "requested_product_owner": 19, "requested_product_revision": 4, "admitted_allocation": 37,
+             "admitted_access": 21, "admitted_generation": 3, "admitted_display_held": False,
+             "admitted_write_reserved": True, "admitted_completion_pending": True,
+             "source_timeline_imported": True, "steady_ns": 1_038_000_000},
+        ]
+        self.write("capture.jsonl", rows)
+        status, output, diagnostics = self.run_query("capture-firefox.log", "capture.jsonl", "--triage", "--limit", "80")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertIn("unclosed instrumented span", output)
+        self.assertIn("upscale.warm.runtime.started", output)
+        self.assertIn("workspace wait without a captured frame edge: producer_finalization_pending", output)
+        self.assertIn("participant=Presentation.Select", output)
+        self.assertIn("sequence=1258 value=17", output)
+        self.assertIn("admitted_allocation=37", output)
+        self.assertIn("admitted_access=21 admitted_generation=3 admitted_display_held=false", output)
+        self.assertIn("admitted_write_reserved=true admitted_completion_pending=true", output)
+        self.assertIn("source_timeline_imported=true", output)
+        rows.extend([
+            {"event": "upscale.warm.runtime.completed", "span_id": 580, "span_outcome": 2, "steady_ns": 1_050_000_000},
+            {"event": "presentation.frame.edge", **product, "steady_ns": 1_060_000_000},
+        ])
+        self.write("capture.jsonl", rows)
+        status, output, diagnostics = self.run_query("capture-firefox.log", "capture.jsonl", "--triage", "--limit", "80")
+        self.assertEqual(status, 0, diagnostics)
+        self.assertNotIn("unclosed instrumented span", output)
+        self.assertNotIn("workspace wait without a captured frame edge:", output)
 
     @staticmethod
     def pixel_bridge_records():

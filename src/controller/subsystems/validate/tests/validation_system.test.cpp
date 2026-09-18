@@ -207,6 +207,11 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     CHECK(document.document->facts() == detail.document);
     CHECK(document.document->scene.frame_index == 3U);
     CHECK(document.document->scene.categories[0].value == "original");
+    CHECK(document.document->scene.valid());
+    for (const auto& object : document.document->scene.objects) {
+        CHECK(object.name.valid());
+        CHECK(object.name.view() == "object 1");
+    }
     REQUIRE(document.image_metadata);
     document.pixels = {};
     auto retained = samples.BorrowFrame();

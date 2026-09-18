@@ -30,6 +30,7 @@ namespace mmltk::backend::data {
 struct Batch;
 }
 namespace mmltk::backend::models::rfdetr {
+class EvaluationSampleWriter;
 struct PredictionBatchMetadata {
     std::int64_t dataset_index = 0;
     std::int64_t image_id = 0;
@@ -308,6 +309,7 @@ class TrainingValidationRuntime final {
     TargetScratch& target_scratch();
     mmltk::common::concurrency::WorkerPool& lane_pool();
     TrainingEvaluationRunOwner& evaluation_run() noexcept;
+    EvaluationSampleWriter& sample_writer() noexcept;
     std::string_view split_name() const noexcept;
     std::size_t detection_limit() const noexcept;
     bool automatic_detection_limit() const noexcept;

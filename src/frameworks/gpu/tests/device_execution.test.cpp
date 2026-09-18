@@ -3,9 +3,11 @@
 #include "src/test_support/cuda_test_utils.hpp"
 #include <cuda.h>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <stdexcept>
 #include <string_view>
 #include "src/common/system/cpu_affinity.h"
@@ -65,5 +67,21 @@ TEST_CASE("CUDA-visible placement resolves the device PCI identity", "[framework
                                                                                   mmltk::common::system::format_cpu_list(topology.permitted_cpus));
         CHECK(constrained.placement.cpus == selected.placement.cpus);
     }
+}
+TEST_CASE("Graphics UUID resolution preserves CUDA-visible identity across device order", "[frameworks][gpu][hardware][device_uuid]") {
+    if (cuInit(0) != CUDA_SUCCESS) SKIP("CUDA driver unavailable; graphics device mapping remains unverified");
+    int count = 0;
+    REQUIRE(cuDeviceGetCount(&count) == CUDA_SUCCESS);
+    if (!count) SKIP("No CUDA-visible device; graphics device mapping remains unverified");
+    for (int ordinal = count - 1; ordinal >= 0; --ordinal) {
+        CUdevice device;
+        CUuuid uuid{};
+        REQUIRE(cuDeviceGet(&device, ordinal) == CUDA_SUCCESS);
+        REQUIRE(cuDeviceGetUuid(&uuid, device) == CUDA_SUCCESS);
+        std::array<std::uint8_t, 16U> bytes{};
+        std::memcpy(bytes.data(), uuid.bytes, bytes.size());
+        CHECK(mmltk::frameworks::gpu::resolve_device_uuid(bytes) == ordinal);
+    }
+    CHECK_THROWS_WITH(mmltk::frameworks::gpu::resolve_device_uuid({}), "workspace graphics device UUID is not visible to CUDA");
 }
 }  // namespace

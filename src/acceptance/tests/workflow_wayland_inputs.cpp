@@ -16,7 +16,9 @@ namespace data = mmltk::backend::data;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace contracts = mmltk::controller::contracts;
 WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
-    : fixture_{.root_dir = root.string(), .split = "train", .width = 64, .height = 64, .num_images = 24, .background_images = 0, .pixel_evidence = true},
+    // Keep real work outstanding across the trainer's one-second live-progress
+    // publication interval, rather than observing only epoch-boundary records.
+    : fixture_{.root_dir = root.string(), .split = "train", .width = 64, .height = 64, .num_images = 256, .background_images = 0, .pixel_evidence = true},
       weights_(root / "workflow.pt"),
       video_(root / "workflow.y4m") {
     data::testsupport::create_synthetic_dataset(fixture_);
@@ -69,6 +71,7 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
     train.request.val_compiled_path = compiled;
     train.auto_output = false;
     train.request.output_dir = output / "training";
+    std::filesystem::create_directories(train.request.output_dir);
     train.request.resolution = 64;
     train.request.num_queries = 6;
     train.request.eval_max_dets = 6;

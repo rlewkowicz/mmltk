@@ -24,6 +24,14 @@
 #include "native_audit.h"
 #include "browser_audit.h"
 namespace mmltk::acceptance::wayland {
+TEST_CASE("browser adapter evidence requires the compositor display device", "[workspace][audit][device]") {
+    BrowserAudit audit;
+    audit.consume({{"event", "firefox.adapter.selected"}, {"display_pci_bus_id", "0000:09:00.0"}, {"adapter_pci_bus_id", "0000:09:00.0"}});
+    CHECK_FALSE(audit.failed_before_termination());
+    const auto selected = GENERATE("", "0000:02:00.0");
+    audit.consume({{"event", "firefox.adapter.selected"}, {"display_pci_bus_id", "0000:09:00.0"}, {"adapter_pci_bus_id", selected}});
+    CHECK(audit.failed_before_termination());
+}
 TEST_CASE("pixel evidence joins exact physical samples and includes alpha", "[workspace][audit][pixel]") {
     const nlohmann::json native{{"event", "presentation.pixel"}, {"surface_high", 1U},         {"surface_low", 2U},
                                 {"presentation_revision", 7U},   {"source_session", 1U},       {"source_instance", 3U},
@@ -542,6 +550,28 @@ TEST_CASE("browser audit exposes distinct integration phases for progress deadli
     CHECK(audit.work_progress_revision == 3U);
     audit.consume({{"event", "integration.phase_progress"}, {"control", "unbounded"}, {"detail", "Unknown"}});
     CHECK_FALSE(audit.bounds_valid);
+}
+TEST_CASE("workflow deadlines advance only for new native progress in the waiting step", "[workspace][audit]") {
+    BrowserAudit audit;
+    audit.consume({{"event", "integration.phase_progress"}, {"control", "work"}, {"detail", "Workflows(Trained)"}});
+    nlohmann::json progress{{"event", "integration.workflow.operation_progress"}, {"control", "train.primary"}, {"detail", "Training"}, {"a", 1U}, {"b", 2U}};
+    audit.consume(progress);
+    CHECK(audit.work_progress_revision == 0U);
+    progress["detail"] = "Trained";
+    audit.consume(progress);
+    CHECK(audit.work_progress_revision == 1U);
+    audit.consume(progress);
+    CHECK(audit.work_progress_revision == 1U);
+    progress["b"] = 1U;
+    audit.consume(progress);
+    CHECK(audit.work_progress_revision == 1U);
+    progress["b"] = 3U;
+    audit.consume(progress);
+    CHECK(audit.work_progress_revision == 2U);
+    progress["control"] = "unrelated";
+    progress["b"] = 4U;
+    audit.consume(progress);
+    CHECK(audit.work_progress_revision == 2U);
 }
 // Configured inventory: primary + DPI + two destructive terminals + four
 // startup-latched faults + two quiet paths + model workflows = 11 H2D lifetimes. Optional GDR
