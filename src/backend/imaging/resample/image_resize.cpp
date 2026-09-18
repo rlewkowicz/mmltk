@@ -27,12 +27,14 @@ struct RgbImageResizer::Impl {
     bool perceptual_enabled = false;
     std::unique_ptr<perceptual::CpuDownscaler> perceptual;
 };
-RgbLetterbox compute_rgb_letterbox(const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width,
-                                   const std::uint32_t target_height) {
+ImageResizeGeometry compute_image_resize_geometry(const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width,
+                                   const std::uint32_t target_height, const ImageResizeMode mode) {
     if (source_width == 0U || source_height == 0U || target_width == 0U || target_height == 0U) {
         throw std::runtime_error("letterbox source and target dimensions must be positive");
     }
-    RgbLetterbox result;
+    if (mode == ImageResizeMode::Stretch) return {target_width, target_height, 0U, 0U};
+    if (mode != ImageResizeMode::Letterbox) throw std::invalid_argument("invalid image resize mode");
+    ImageResizeGeometry result;
     const std::uint64_t width_limited = static_cast<std::uint64_t>(source_width) * target_height;
     const std::uint64_t height_limited = static_cast<std::uint64_t>(source_height) * target_width;
     if (width_limited >= height_limited) {

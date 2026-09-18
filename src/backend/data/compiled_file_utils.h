@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <cmath>
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -40,6 +41,8 @@ struct CompiledDatasetInfo {
 inline void validate_compiled_header(const FileHeader& header) {
     if (header.magic != MAGIC) { throw std::runtime_error("Bad magic in compiled file"); }
     if (header.version != FORMAT_VERSION) { throw std::runtime_error("Version mismatch"); }
+    if (!std::ranges::all_of(header._reserved, [](std::uint8_t value) { return value == 0U; }))
+        throw std::runtime_error("compiled header reserved fields are invalid");
     if (header.num_images == 0U || header.image_width == 0U || header.image_height == 0U || header.channels == 0U) {
         throw std::runtime_error("compiled file has invalid image dimensions");
     }
@@ -47,6 +50,10 @@ inline void validate_compiled_header(const FileHeader& header) {
     if (header.max_instances_per_image > std::numeric_limits<std::uint16_t>::max()) {
         throw std::runtime_error("compiled file maximum instance count exceeds the index representation");
     }
+    if (header.image_width > MAX_IMAGE_EXTENT || header.image_height > MAX_IMAGE_EXTENT || header.channels != 3U ||
+        (header.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch &&
+         header.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox))
+        throw std::runtime_error("compiled image extent, channels or resize mode is invalid");
     const uint64_t expected_image_stride = static_cast<uint64_t>(header.image_width) * header.image_height * header.channels * sizeof(float);
     if (header.image_stride != expected_image_stride) { throw std::runtime_error("compiled file has an invalid image stride"); }
 }
@@ -85,7 +92,7 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
     if (label_bytes % sizeof(PackedInstance) != 0) { throw std::runtime_error("label block is not aligned to PackedInstance"); }
     const size_t pixel_blob_size = label_offset - pixel_offset;
     const auto expected_pixel_blob_size =
-        mmltk::common::math::checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * header.image_stride, "pixel blob size overflow");
+        mmltk::common::math::checked_cast<size_t>(mmltk::common::math::checked_multiply(static_cast<uint64_t>(header.num_images), header.image_stride, "pixel blob size overflow"), "pixel blob size overflow");
     if (pixel_blob_size != expected_pixel_blob_size) { throw std::runtime_error("compiled pixel blob size mismatch"); }
     const size_t rle_region_bytes = total_file_size - rle_offset;
     if (rle_region_bytes % sizeof(RLEPair) != 0U) { throw std::runtime_error("compiled RLE block is not aligned to RLEPair"); }
@@ -105,7 +112,7 @@ inline void validate_compiled_index_entries(const std::span<const ImageEntry> in
         if (entry.pixel_offset != expected_pixel_offset) {
             throw std::runtime_error("compiled pixel index is inconsistent at image " + std::to_string(image_index));
         }
-        if (entry.label_offset != expected_label_offset || entry.label_offset % sizeof(PackedInstance) != 0U ||
+        if (entry._pad != 0U || entry.num_instances > header.max_instances_per_image || entry.label_offset != expected_label_offset || entry.label_offset % sizeof(PackedInstance) != 0U ||
             entry.label_bytes != static_cast<uint32_t>(entry.num_instances) * sizeof(PackedInstance)) {
             throw std::runtime_error("compiled label index is inconsistent at image " + std::to_string(image_index));
         }
@@ -124,7 +131,8 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
     for (size_t image_index = 0U; image_index < index.size(); ++image_index) {
         throw_if_compiled_validation_cancelled(image_index, cancel_requested);
         const ImageEntry& entry = index[image_index];
-        if (entry.original_width == 0U || entry.original_height == 0U) {
+        if (entry.original_width == 0U || entry.original_height == 0U || entry.has_source_image_id > 1U ||
+            entry.source > AnnotationSource::OpenImages || (!entry.has_source_image_id && entry.source_image_id != 0U) || entry._reserved != 0U) {
             throw std::runtime_error("compiled original image dimensions are invalid at image " + std::to_string(image_index));
         }
     }
@@ -139,9 +147,13 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
         if (instance.class_id >= header.num_classes) {
             throw std::runtime_error("compiled instance class id is out of bounds at label " + std::to_string(label_index));
         }
-        if (instance.bbox_x1 < 0 || instance.bbox_y1 < 0 || instance.bbox_x2 <= instance.bbox_x1 || instance.bbox_y2 <= instance.bbox_y1 ||
-            static_cast<std::uint32_t>(instance.bbox_x2) > header.image_width || static_cast<std::uint32_t>(instance.bbox_y2) > header.image_height) {
-            throw std::runtime_error("compiled instance bounding box is invalid at label " + std::to_string(label_index));
+        if (!std::isfinite(instance.bbox_x1) || !std::isfinite(instance.bbox_y1) || !std::isfinite(instance.bbox_x2) ||
+            !std::isfinite(instance.bbox_y2) || instance.bbox_x2 <= instance.bbox_x1 || instance.bbox_y2 <= instance.bbox_y1 ||
+            !std::isfinite(instance.original_area) || instance.original_area < 0.0 || (instance.flags & ~kAnnotationFlags) != 0U ||
+            (!instance.has_mask() && instance.mask_rle_pairs != 0U) ||
+            ((instance.flags & kAnnotationId) == 0U && instance.annotation_id != 0U) ||
+            ((instance.flags & kAnnotationCategory) == 0U && instance.source_category_id != 0U)) {
+            throw std::runtime_error("compiled instance annotation metadata is invalid at label " + std::to_string(label_index));
         }
         if (instance.mask_rle_offset != used_rle_bytes || instance.mask_rle_offset % sizeof(RLEPair) != 0U) {
             throw std::runtime_error("compiled instance RLE metadata is invalid at label " + std::to_string(label_index));
@@ -174,6 +186,21 @@ inline void validate_compiled_rle_pairs(const std::span<const PackedInstance> la
                 throw std::runtime_error("compiled RLE run is invalid at label " + std::to_string(label_index) + ", pair " + std::to_string(local_pair_index));
             }
             previous_end = start + length;
+        }
+    }
+}
+inline void validate_compiled_annotation_provenance(const std::span<const ImageEntry> images, const std::span<const PackedInstance> labels,
+                                                   mmltk::common::concurrency::CancellationObservation cancel_requested = {}) {
+    std::size_t visited = 0U;
+    for (const auto& image : images) {
+        throw_if_compiled_validation_cancelled(visited++, cancel_requested);
+        if (image.source == AnnotationSource::Generic) continue;
+        if (image.has_source_image_id != 1U) throw std::runtime_error("compiled benchmark image lacks source identity");
+        for (const auto& label : labels.subspan(image.label_offset / sizeof(PackedInstance), image.num_instances)) {
+            throw_if_compiled_validation_cancelled(visited++, cancel_requested);
+            if (!label.has_source_category()) throw std::runtime_error("compiled benchmark annotation lacks source category");
+            if (image.source == AnnotationSource::OpenImages && !valid_open_images_category(label.source_category_id))
+                throw std::runtime_error("invalid compiled Open Images source category");
         }
     }
 }

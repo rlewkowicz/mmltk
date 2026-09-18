@@ -263,9 +263,9 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
     const std::array runs{RLEPair{9, 3}, RLEPair{17, 3}, RLEPair{25, 3}, RLEPair{10, 2}, RLEPair{18, 2}, RLEPair{26, 2}};
-    PackedInstance source{.class_id = 2, ._pad = 0, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 0, .mask_rle_pairs = 3};
+    PackedInstance source{.class_id = 2, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 0, .mask_rle_pairs = 3};
     PackedInstance donor{
-        .class_id = 4, ._pad = 0, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 3 * sizeof(RLEPair), .mask_rle_pairs = 3};
+        .class_id = 4, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 3 * sizeof(RLEPair), .mask_rle_pairs = 3};
     AugmentationImagePlan plan;
     plan.paste_donor_slot = 0;
     plan.paste_source_box = {0, 0, 0.625F, 0.625F};
@@ -320,6 +320,7 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
     }
     SECTION("box-only source uses actual irregular donor footprint") {
         source.mask_rle_pairs = 0;
+        source.flags &= ~mmltk::backend::data::kAnnotationMask;
         build_augmentation_preview_annotations(std::span{&source, 1U}, &donor, &plan, 8, 8, output, runs);
         REQUIRE(output.size() == 2);
         CHECK(output[0].visible_area_pixels == 19.0F);
@@ -343,6 +344,7 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
             } else {
                 source.bbox_x2 = source.bbox_x1;
                 source.mask_rle_pairs = 0;
+        source.flags &= ~mmltk::backend::data::kAnnotationMask;
             }
             plan = {};
             for (const auto* identity : {static_cast<const AugmentationImagePlan*>(nullptr), static_cast<const AugmentationImagePlan*>(&plan)}) {
@@ -520,7 +522,7 @@ TEST_CASE("raw augmentation is deterministic, seed-sensitive, bounded, and reuse
     CHECK(transformed_pixels != identity_output);
     const mmltk::backend::data::PackedInstance source_box{
         .class_id = 0U,
-        ._pad = 0U,
+        .flags = 0U,
         .bbox_x1 = 1,
         .bbox_y1 = 1,
         .bbox_x2 = 3,

@@ -76,7 +76,7 @@ std::vector<ExploreImageSummary> build_explore_summaries(const mmltk::backend::d
             for (std::size_t instance_index = 0U; instance_index < entry.num_instances; ++instance_index) {
                 const mmltk::backend::data::PackedInstance& instance = image_labels[instance_index];
                 summary.classes[instance.class_id >> 6U] |= std::uint64_t{1} << (instance.class_id & 63U);
-                summary.has_masks |= instance.mask_rle_pairs != 0U;
+                summary.has_masks |= instance.has_mask();
             }
         }
     };

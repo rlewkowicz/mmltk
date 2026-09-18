@@ -12,6 +12,7 @@
 namespace mmltk::backend::data::compiler_internal {
 struct DatasetScan {
     std::unordered_map<std::string, uint8_t> class_map;
+    std::unordered_map<std::string, std::uint64_t> source_categories;
     std::vector<DatasetCompileSplitPlan> splits;
 };
 struct LabelBlocks {
@@ -55,6 +56,7 @@ struct FileHeaderInputs {
     uint32_t channels = 0;
     uint32_t max_instances_per_image = 0;
     size_t image_stride = 0;
+    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
 };
 struct FileLayout {
     size_t index_size = 0;
@@ -84,6 +86,7 @@ struct PixelBlobWriteRequest {
     size_t pixel_offset = 0;
     mmltk::common::concurrency::CancellationObservation cancel_requested = {};
     std::atomic<bool>* failure_requested = nullptr;
+    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
 };
 int resolve_num_workers(int configured_workers, std::span<const int> worker_cpus);
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
@@ -91,7 +94,7 @@ std::filesystem::path annotation_path(const std::filesystem::path& split_dir, ui
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits,
                          mmltk::common::concurrency::CancellationObservation cancellation = {});
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config,
-                               const std::unordered_map<std::string, uint8_t>& class_map, int num_workers, std::span<const int> worker_cpus,
+                               const std::unordered_map<std::string, uint8_t>& class_map, const std::unordered_map<std::string, std::uint64_t>& source_categories, int num_workers, std::span<const int> worker_cpus,
                                ProgressCounter* completed_images = nullptr, std::atomic<bool>* failure_requested = nullptr,
                                mmltk::common::concurrency::CancellationObservation cancellation = {});
 FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride);

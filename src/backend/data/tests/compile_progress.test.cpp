@@ -19,11 +19,14 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_file_utils.h"
+#include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/data/dataset_loader.h"
@@ -72,8 +75,9 @@ void overwrite_annotation(const fs::path& annotation_path, const std::string& re
     REQUIRE(file.is_open());
     file << record << "\n";
 }
-void compile_resized_fixture(const FixtureSpec& fixture) {
+void compile_resized_fixture(const FixtureSpec& fixture, mmltk::backend::imaging::resample::ImageResizeMode mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch) {
     auto config = compiler_config(fixture);
+    config.resize_mode = mode;
     config.target_width = 8;
     config.target_height = 8;
     config.num_workers = 2;
@@ -95,7 +99,7 @@ void compile_resized_fixture(const FixtureSpec& fixture) {
     config.target_height = 32U;
     return DatasetCompiler::prepare(config, {config.split});
 }
-void test_vanished_masks_are_omitted() {
+void test_vanished_masks_retain_detection_annotations() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_drop_vanished_mask");
     const FixtureSpec fixture{
         root.path().string(), "train", 16, 16, 20,
@@ -105,8 +109,14 @@ void test_vanished_masks_are_omitted() {
                          R"({"class":"person","bbox_xyxy":[0,0,1,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"0:1","image_size_wh":[16,16]})");
     compile_resized_fixture(fixture);
     DatasetLoader loader(resized_fixture_loader_config(fixture));
-    REQUIRE(loader.num_label_instances() == 9);
-    REQUIRE(loader.label_index()[10].num_instances == 0);
+    REQUIRE(loader.num_label_instances() == 10);
+    const auto entry = loader.label_index()[10];
+    REQUIRE(entry.num_instances == 1);
+    const auto& annotation = loader.label_data()[entry.label_begin];
+    CHECK(annotation.has_mask());
+    CHECK(annotation.mask_rle_pairs == 0U);
+    CHECK(annotation.bbox_x2 == 0.5F);
+    CHECK(annotation.original_area == 1.0);
 }
 void test_partial_mask_vanish_keeps_instance() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_keep_partial_mask");
@@ -138,7 +148,7 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     overwrite_annotation(
         fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl",
         R"({"class":"person","bbox_xyxy":[4,2,12,6],"mask_rle_encoding":"row_major_start_length","mask_rle":"36:8 52:8 68:8 84:8","image_size_wh":[16,8]})");
-    compile_resized_fixture(fixture);
+    compile_resized_fixture(fixture, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     DatasetLoader loader(resized_fixture_loader_config(fixture));
     REQUIRE(loader.image_width() == 8U);
     REQUIRE(loader.image_height() == 8U);
@@ -184,11 +194,11 @@ void test_compiled_tiny_masks_keep_outer_pixel_edges() {
     const std::array source_runs{RLEPair{0, 1}, RLEPair{7, 1}, RLEPair{24, 1}, RLEPair{31, 1}, RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}};
     std::ostringstream annotations;
     for (const auto run : source_runs) {
-        annotations << R"({"class":"person","bbox_xyxy":[0,0,8,4],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << run.start << ':' << run.length
+        annotations << R"({"class":"person","mask_rle_encoding":"row_major_start_length","mask_rle":")" << run.start << ':' << run.length
                     << R"(","image_size_wh":[8,4]})" << '\n';
     }
     overwrite_annotation(fs::path(dataset_dir(fixture)) / fixture.split / "000011.jsonl", annotations.str());
-    compile_resized_fixture(fixture);
+    compile_resized_fixture(fixture, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     DatasetLoader loader(resized_fixture_loader_config(fixture));
     const auto& entry = loader.label_index()[10];
     REQUIRE(entry.num_instances == source_runs.size());
@@ -332,7 +342,7 @@ void test_compile_progress_reports_monotonic_updates() {
     CHECK(completed.remaining_seconds == 0U);
     CHECK(observed.front().progress.elapsed_seconds == 0U);
     CHECK(main_thread_observed);
-    test_vanished_masks_are_omitted();
+    test_vanished_masks_retain_detection_annotations();
     test_partial_mask_vanish_keeps_instance();
     test_native_compile_letterboxes_pixels_boxes_and_masks();
     test_compiled_tiny_masks_keep_outer_pixel_edges();
@@ -455,5 +465,218 @@ TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense 
             CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
         }
         CHECK_FALSE(fs::exists(fs::path(compiled_dir(fixture)) / "train.bin"));
+    }
+}
+
+TEST_CASE("compiled annotations preserve continuous source meaning in both resize modes", "[backend][data][compiler]") {
+    namespace resize = mmltk::backend::imaging::resample;
+    const mmltk::testsupport::ScopedTempDir root("faithful-annotations");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 8, .num_images = 1, .pixel_evidence = true};
+    create_synthetic_dataset(fixture);
+    overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
+        R"({"class":"person","bbox_xyxy":[-0.5,1.25,12.5,6.75],"id":0,"image_id":0,"category_id":0,"area":7.25,"iscrowd":1,"ignore":1,"mask_rle_encoding":"row_major_start_length","mask_rle":""})" "\n"
+        R"({"class":"person","bbox_xyxy":[-0.5,1.25,12.5,6.75],"id":8,"image_id":0,"category_id":42})" "\n"
+        R"({"class":"person","mask_rle_encoding":"row_major_start_length","mask_rle":"36:8 52:8 68:8 84:8"})");
+    for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
+        auto config = compiler_config(fixture);
+        config.resize_mode = mode;
+        config.target_width = 8; config.target_height = 8;
+        config.num_workers = 1;
+        DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0U);
+        const auto store = CompiledDataset::open(compiled_bin_path(fixture));
+        CHECK(store.header().version == 8U);
+        CHECK(store.header().resize_mode == mode);
+        const auto geometry = store.geometry(0);
+        CHECK(geometry.resized_width == 8U);
+        const float* pixels = store.image_pixels(0);
+        CHECK(pixels[0] == (mode == resize::ImageResizeMode::Stretch ? 48.0F / 255.0F : 0.0F));
+        CHECK(pixels[64] == (mode == resize::ImageResizeMode::Stretch ? 80.0F / 255.0F : 0.0F));
+        CHECK(pixels[128] == (mode == resize::ImageResizeMode::Stretch ? 112.0F / 255.0F : 0.0F));
+        CHECK(geometry.resized_height == (mode == resize::ImageResizeMode::Stretch ? 8U : 4U));
+        const auto labels = store.image_labels(0);
+        REQUIRE(labels.size() == 3U);
+        CHECK(labels[0].bbox_x1 == -0.25F);
+        CHECK(labels[0].bbox_y1 == (mode == resize::ImageResizeMode::Stretch ? 1.25F : 2.625F));
+        CHECK(labels[0].bbox_x2 == labels[1].bbox_x2);
+        CHECK(labels[0].original_area == 7.25);
+        CHECK(labels[0].is_crowd()); CHECK(labels[0].raw_ignore()); CHECK(labels[0].has_mask());
+        CHECK(labels[0].has_annotation_id()); CHECK(labels[0].annotation_id == 0U);
+        CHECK(labels[0].has_source_category()); CHECK(labels[0].source_category_id == 0U);
+        CHECK(labels[1].source_category_id == 42U);
+        CHECK_FALSE(labels[1].has_mask());
+        CHECK(store.instance_rle(labels[0]).empty()); CHECK(store.masks_available());
+        CHECK(labels[0].source_ordinal < labels[1].source_ordinal);
+        CHECK(labels[1].source_ordinal < labels[2].source_ordinal);
+        CHECK(labels[2].bbox_x1 == 2.0F); CHECK(labels[2].bbox_x2 == 6.0F);
+        CHECK(labels[2].original_area == 32.0);
+        CHECK(store.image_entry(0).has_source_image_id == 1U); CHECK(store.image_entry(0).source_image_id == 0U);
+    }
+}
+TEST_CASE("format 8 admission rejects invalid metadata and old versions", "[backend][data][compiler]") {
+    const mmltk::testsupport::ScopedTempDir root("format8-admission");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1, .background_images = 0};
+    create_synthetic_dataset(fixture);
+    compile_existing_fixture(fixture);
+    const auto original = CompiledDataset::open(compiled_bin_path(fixture));
+    const auto mutate = [&](auto change) {
+        const auto path = root.path() / "invalid.bin";
+        fs::copy_file(compiled_bin_path(fixture), path, fs::copy_options::overwrite_existing);
+        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+        auto header = original.header();
+        auto label = original.labels().front();
+        change(header, label);
+        file.seekp(0); file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        file.seekp(static_cast<std::streamoff>(original.header().label_offset));
+        file.write(reinterpret_cast<const char*>(&label), sizeof(label));
+        file.close();
+        CHECK_THROWS(CompiledDataset::open(path));
+    };
+    mutate([](auto& header, auto&) { header.version = 7U; });
+    mutate([](auto& header, auto&) { header.resize_mode = static_cast<mmltk::backend::imaging::resample::ImageResizeMode>(255U); });
+    mutate([](auto& header, auto&) { header.mask_rle_offset = header.total_file_size + 1U; });
+    mutate([](auto&, auto& label) { label.original_area = std::numeric_limits<double>::infinity(); });
+    mutate([](auto&, auto& label) { label.bbox_x1 = std::numeric_limits<float>::quiet_NaN(); });
+    mutate([](auto&, auto& label) { label.flags = 128U; });
+    mutate([](auto&, auto& label) { label.flags &= ~kAnnotationMask; });
+    mutate([](auto&, auto& label) { label.mask_rle_offset = std::numeric_limits<std::uint32_t>::max(); });
+}
+TEST_CASE("known empty masks declare availability without RLE storage", "[backend][data][compiler]") {
+    const mmltk::testsupport::ScopedTempDir root("empty-mask-presence");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1};
+    create_synthetic_dataset(fixture);
+    overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
+        R"({"class":"person","bbox_xyxy":[1.25,2.5,7.75,9.5],"mask_rle_encoding":"row_major_start_length","mask_rle":""})");
+    compile_existing_fixture(fixture);
+    const auto store = CompiledDataset::open(compiled_bin_path(fixture));
+    REQUIRE(store.labels().size() == 1U);
+    CHECK(store.rle_pairs().empty());
+    CHECK(store.masks_available());
+    CHECK(store.labels()[0].has_mask());
+    CHECK(store.labels()[0].original_area == 0.0);
+    CHECK(store.labels()[0].bbox_x1 == 1.25F);
+}
+TEST_CASE("generic bbox narrowing rejects overflow and collapsed corners", "[backend][data][compiler]") {
+    const mmltk::testsupport::ScopedTempDir root("bbox-narrowing");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1};
+    create_synthetic_dataset(fixture);
+    for (const auto& [bbox, expected] : std::array{
+             std::pair{"[1e100,0,2e100,1]", "transformed bbox overflow"},
+             std::pair{"[1,0,1.000000000001,1]", "transformed bbox loses strict corner ordering"}}) {
+        overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
+                             std::string(R"({"class":"person","bbox_xyxy":)") + bbox + "}");
+        try {
+            compile_existing_fixture(fixture);
+            FAIL("invalid transformed bbox was accepted");
+        } catch (const std::runtime_error& error) {
+            CHECK(std::string(error.what()).find(expected) != std::string::npos);
+            CHECK(std::string(error.what()).find("at line 1") != std::string::npos);
+        }
+    }
+}
+TEST_CASE("generic annotation flags admit only exact boolean or integer zero and one", "[backend][data][compiler]") {
+    using mmltk::backend::imaging::resample::ImageResizeMode;
+    const mmltk::testsupport::ScopedTempDir root("exact-annotation-flags");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 8, .num_images = 1};
+    create_synthetic_dataset(fixture);
+    const auto annotation_path = fs::path(dataset_dir(fixture)) / "train/000001.jsonl";
+    const auto record = [](const char* field, const char* value) {
+        return std::string(R"({"class":"person","bbox_xyxy":[1,1,7,5],"id":0,"image_id":0,"category_id":0,"area":7.25,")") +
+               field + "\":" + value + "}";
+    };
+    const auto read_artifact = [&] {
+        std::ifstream file(compiled_bin_path(fixture), std::ios::binary);
+        REQUIRE(file.is_open());
+        std::ostringstream bytes;
+        bytes << file.rdbuf();
+        return bytes.str();
+    };
+    for (const auto mode : {ImageResizeMode::Stretch, ImageResizeMode::Letterbox}) {
+        auto config = compiler_config(fixture);
+        config.resize_mode = mode; config.target_width = 8; config.target_height = 8; config.num_workers = 1;
+        const auto compile = [&] { DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0U); };
+        for (const char* field : {"iscrowd", "ignore"}) {
+            for (const auto& [value, enabled] : std::array{
+                     std::pair{"false", false}, std::pair{"true", true}, std::pair{"0", false}, std::pair{"1", true}}) {
+                overwrite_annotation(annotation_path, record(field, value));
+                compile();
+                const auto store = CompiledDataset::open(compiled_bin_path(fixture));
+                REQUIRE(store.labels().size() == 1U);
+                const auto& label = store.labels().front();
+                CHECK(label.is_crowd() == (std::string_view(field) == "iscrowd" && enabled));
+                CHECK(label.raw_ignore() == (std::string_view(field) == "ignore" && enabled));
+                CHECK_FALSE(label.has_mask());
+                CHECK(label.has_annotation_id()); CHECK(label.annotation_id == 0U);
+                CHECK(label.has_source_category()); CHECK(label.source_category_id == 0U);
+                CHECK(label.source_ordinal == 1U); CHECK(label.original_area == 7.25);
+                CHECK(store.image_entry(0).has_source_image_id == 1U); CHECK(store.image_entry(0).source_image_id == 0U);
+            }
+            const auto accepted_artifact = read_artifact();
+            for (const char* value : {"-1", "2", "4294967296", "4294967297", "-4294967296", "18446744073709551615", "1.0", "\"1\""}) {
+                overwrite_annotation(annotation_path, record(field, value));
+                try {
+                    compile();
+                    FAIL("invalid annotation flag was accepted");
+                } catch (const std::runtime_error& error) {
+                    CHECK(std::string(error.what()).find("annotation flag must be") != std::string::npos);
+                    CHECK(std::string(error.what()).find("at line 1") != std::string::npos);
+                }
+                CHECK(read_artifact() == accepted_artifact);
+            }
+        }
+    }
+}
+TEST_CASE("compiler resize modes use canonical reflected admission", "[backend][data][compiler]") {
+    using mmltk::backend::imaging::resample::ImageResizeMode;
+    constexpr auto entries = mmltk::frameworks::reflection::enum_entries<ImageResizeMode>();
+    STATIC_REQUIRE(entries.size() == 2U);
+    STATIC_REQUIRE(entries[0].value == ImageResizeMode::Stretch);
+    STATIC_REQUIRE(entries[1].value == ImageResizeMode::Letterbox);
+    STATIC_REQUIRE(entries[0].name == "Stretch");
+    STATIC_REQUIRE(entries[1].name == "Letterbox");
+    CompilerConfig config;
+    config.source_dir = "source"; config.output_dir = "output";
+    for (const auto entry : entries) {
+        config.resize_mode = entry.value;
+        CHECK(validate_compiler_config(config).has_value());
+    }
+    config.resize_mode = static_cast<ImageResizeMode>(255U);
+    const auto invalid = validate_compiler_config(config);
+    REQUIRE_FALSE(invalid.has_value());
+    CHECK(invalid.error() == CompilerConfigViolation::InvalidStorage);
+}
+TEST_CASE("compiled benchmark provenance cannot be erased while Generic identities remain optional", "[backend][data][compiler]") {
+    const mmltk::testsupport::ScopedTempDir root("compiled-provenance");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1, .background_images = 0};
+    create_synthetic_dataset(fixture);
+    compile_existing_fixture(fixture);
+    const auto original = CompiledDataset::open(compiled_bin_path(fixture));
+    const auto path = root.path() / "provenance.bin";
+    const auto write = [&](const ImageEntry& image, const PackedInstance& label) {
+        fs::copy_file(compiled_bin_path(fixture), path, fs::copy_options::overwrite_existing);
+        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+        REQUIRE(file.is_open());
+        file.seekp(static_cast<std::streamoff>(original.header().index_offset));
+        file.write(reinterpret_cast<const char*>(&image), sizeof(image));
+        file.seekp(static_cast<std::streamoff>(original.header().label_offset));
+        file.write(reinterpret_cast<const char*>(&label), sizeof(label));
+    };
+    for (const auto source : {AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages}) {
+        auto image = original.image_entry(0);
+        auto label = original.labels()[0];
+        image.source = source; image.has_source_image_id = 1U; image.source_image_id = 0U;
+        label.flags |= kAnnotationCategory;
+        label.source_category_id = source == AnnotationSource::OpenImages ? encode_open_images_category("/m/person") : 0U;
+        write(image, label);
+        REQUIRE_NOTHROW(CompiledDataset::open(path));
+        image.has_source_image_id = 0U;
+        write(image, label);
+        CHECK_THROWS(CompiledDataset::open(path));
+        image.has_source_image_id = 1U;
+        label.flags &= ~kAnnotationCategory; label.source_category_id = 0U;
+        write(image, label);
+        CHECK_THROWS(CompiledDataset::open(path));
+        image.source = AnnotationSource::Generic; image.has_source_image_id = 0U;
+        write(image, label);
+        CHECK_NOTHROW(CompiledDataset::open(path));
     }
 }

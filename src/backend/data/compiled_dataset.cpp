@@ -19,7 +19,7 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
     CompiledDataset store;
     store.path_ = path;
     store.mapping_ = std::move(mapping);
-    if (store.mapping_.size() < sizeof(mmltk::backend::data::FileHeader)) { throw std::runtime_error("compiled dataset is smaller than its v7 header"); }
+    if (store.mapping_.size() < sizeof(mmltk::backend::data::FileHeader)) { throw std::runtime_error("compiled dataset is smaller than its v8 header"); }
     std::memcpy(&store.header_, store.mapping_.data(), sizeof(store.header_));
     mmltk::backend::data::validate_compiled_header(store.header_);
     if (store.header_.num_images > image_limit) { throw std::runtime_error("compiled dataset exceeds the caller image limit"); }
@@ -39,6 +39,8 @@ CompiledDataset CompiledDataset::open_mapped(const std::filesystem::path& path, 
     }
     const std::size_t mask_pixels = static_cast<std::size_t>(store.header_.image_width) * store.header_.image_height;
     mmltk::backend::data::validate_compiled_rle_pairs(store.labels_, store.rle_pairs_, mask_pixels);
+    validate_compiled_annotation_provenance(store.image_entries_, store.labels_);
+    store.masks_available_ = std::ranges::any_of(store.labels_, [](const PackedInstance& label) { return label.has_mask(); });
     store.label_index_.reserve(store.image_entries_.size());
     for (const auto& entry : store.image_entries_)
         store.label_index_.push_back({static_cast<std::uint32_t>(entry.label_offset / sizeof(PackedInstance)), entry.num_instances, 0});
@@ -56,7 +58,7 @@ std::span<const std::string> CompiledDataset::class_names() const noexcept { ret
 std::span<const mmltk::backend::data::ImageEntry> CompiledDataset::image_entries() const noexcept { return image_entries_; }
 std::span<const mmltk::backend::data::PackedInstance> CompiledDataset::labels() const noexcept { return labels_; }
 std::span<const mmltk::backend::data::RLEPair> CompiledDataset::rle_pairs() const noexcept { return rle_pairs_; }
-bool CompiledDataset::masks_available() const noexcept { return !rle_pairs_.empty(); }
+bool CompiledDataset::masks_available() const noexcept { return masks_available_; }
 const mmltk::backend::data::ImageEntry& CompiledDataset::image_entry(const std::uint32_t compiled_index) const noexcept {
     assert(compiled_index < image_entries_.size());
     return image_entries_[compiled_index];
@@ -76,9 +78,9 @@ const float* CompiledDataset::image_pixels(const std::uint32_t compiled_index) c
     // cppcheck-suppress invalidPointerCast
     return reinterpret_cast<const float*>(mapping_.data() + entry.pixel_offset);
 }
-mmltk::backend::imaging::resample::RgbLetterbox CompiledDataset::letterbox(const std::uint32_t compiled_index) const {
+mmltk::backend::imaging::resample::ImageResizeGeometry CompiledDataset::geometry(const std::uint32_t compiled_index) const {
     const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
-    return mmltk::backend::imaging::resample::compute_rgb_letterbox(entry.original_width, entry.original_height, header_.image_width, header_.image_height);
+    return mmltk::backend::imaging::resample::compute_image_resize_geometry(entry.original_width, entry.original_height, header_.image_width, header_.image_height, header_.resize_mode);
 }
 std::span<const LabelIndexEntry> CompiledDataset::label_index() const noexcept { return label_index_; }
 const float* CompiledDataset::pixel_blob() const noexcept { return reinterpret_cast<const float*>(mapping_.data() + header_.pixel_offset); }

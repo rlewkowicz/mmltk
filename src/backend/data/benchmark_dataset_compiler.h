@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/imaging/resample/image_resize.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,7 @@ struct BenchmarkCompilerConfig {
     int num_workers = -1;
     bool overwrite = false;
     bool perceptual_downscale = false;
+    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     mmltk::common::concurrency::CancellationObservation cancel_requested;
     BenchmarkProgressCallback progress;
     BenchmarkTraceCallback trace;

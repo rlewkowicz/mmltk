@@ -41,17 +41,18 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
 }
 FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride) {
     FileLayout layout;
-    layout.index_size = static_cast<size_t>(num_images) * sizeof(ImageEntry);
-    layout.pixel_offset = align_up(layout.index_offset + layout.index_size, HUGE_PAGE_SIZE);
-    layout.pixel_blob_size = static_cast<size_t>(num_images) * image_stride;
+    layout.index_size = mmltk::common::math::checked_multiply(static_cast<size_t>(num_images), sizeof(ImageEntry), "compiled index size overflow");
+    layout.pixel_offset = mmltk::common::math::checked_add(mmltk::common::math::checked_add(layout.index_offset, layout.index_size, "compiled index end overflow"), HUGE_PAGE_SIZE - 1U, "compiled alignment overflow") & ~(HUGE_PAGE_SIZE - 1U);
+    layout.pixel_blob_size = mmltk::common::math::checked_multiply(static_cast<size_t>(num_images), image_stride, "compiled pixels overflow");
+    (void)mmltk::common::math::checked_add(layout.pixel_offset, layout.pixel_blob_size, "compiled pixel end overflow");
     return layout;
 }
 void finalize_layout(FileLayout& layout, const LayoutFinalizeInputs& inputs) {
-    layout.label_block_size = inputs.label_count * sizeof(PackedInstance);
-    layout.rle_block_size = inputs.rle_count * sizeof(RLEPair);
-    layout.label_offset = layout.pixel_offset + layout.pixel_blob_size;
-    layout.rle_offset = layout.label_offset + layout.label_block_size;
-    layout.total_size = layout.rle_offset + layout.rle_block_size;
+    layout.label_block_size = mmltk::common::math::checked_multiply(inputs.label_count, sizeof(PackedInstance), "compiled layout overflow");
+    layout.rle_block_size = mmltk::common::math::checked_multiply(inputs.rle_count, sizeof(RLEPair), "compiled layout overflow");
+    layout.label_offset = mmltk::common::math::checked_add(layout.pixel_offset, layout.pixel_blob_size, "compiled layout overflow");
+    layout.rle_offset = mmltk::common::math::checked_add(layout.label_offset, layout.label_block_size, "compiled layout overflow");
+    layout.total_size = mmltk::common::math::checked_add(layout.rle_offset, layout.rle_block_size, "compiled layout overflow");
 }
 void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride) {
     for (size_t i = 0; i < index.size(); ++i) { index[i].pixel_offset = pixel_offset + i * image_stride; }
@@ -60,6 +61,7 @@ FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered
     FileHeader header{};
     header.magic = MAGIC;
     header.version = FORMAT_VERSION;
+    header.resize_mode = inputs.resize_mode;
     header.num_images = inputs.num_images;
     header.image_width = inputs.width;
     header.image_height = inputs.height;

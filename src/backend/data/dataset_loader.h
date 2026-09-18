@@ -73,12 +73,13 @@ class DatasetLoader {
     [[nodiscard]] size_t image_stride() const;
     [[nodiscard]] size_t num_label_instances() const;
     [[nodiscard]] size_t num_rle_pairs() const;
+    [[nodiscard]] bool masks_available() const noexcept;
     [[nodiscard]] const float* pixel_blob() const;
     [[nodiscard]] const LabelIndexEntry* label_index() const;
     [[nodiscard]] const PackedInstance* label_data() const;
     [[nodiscard]] const RLEPair* rle_data() const;
     [[nodiscard]] const ImageEntry& image_entry(std::uint32_t index) const;
-    [[nodiscard]] mmltk::backend::imaging::resample::RgbLetterbox letterbox(std::uint32_t index) const;
+    [[nodiscard]] mmltk::backend::imaging::resample::ImageResizeGeometry geometry(std::uint32_t index) const;
 
    private:
     struct Impl;

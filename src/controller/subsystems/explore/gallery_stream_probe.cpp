@@ -92,7 +92,7 @@ void GalleryStreamProbe::DiagnoseRendered(const GalleryProductState& product, co
         throw std::runtime_error("Explore semantic diagnostic count failed");
     if (explore::checksum_explore_pixels(checksum_target, device_facts + 1U, stream) != explore::kExploreStorageSuccess)
         throw std::runtime_error("Explore image diagnostic checksum failed");
-    const auto letterbox = product.store->letterbox(compiled_index);
+    const auto letterbox = product.store->geometry(compiled_index);
     const auto scale_coordinate = [](const std::uint32_t coordinate, const std::uint32_t destination, const std::uint32_t source) {
         return static_cast<std::uint32_t>((static_cast<std::uint64_t>(coordinate) * destination) / source);
     };

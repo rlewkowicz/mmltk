@@ -88,6 +88,8 @@ __pycache__/
 !/src/**
 
 /actionplan.md
+/reviewplan.md
+/mapreview.md
 /gui.json
 /log.txt
 CLAUDE.md

@@ -363,9 +363,9 @@ const ImageEntry& DatasetLoader::image_entry(std::uint32_t index) const {
     if (index >= num_images()) throw std::out_of_range("dataset image geometry index");
     return impl_->source.image_entry(index);
 }
-mmltk::backend::imaging::resample::RgbLetterbox DatasetLoader::letterbox(std::uint32_t index) const {
-    if (index >= num_images()) throw std::out_of_range("dataset letterbox index");
-    return impl_->source.letterbox(index);
+mmltk::backend::imaging::resample::ImageResizeGeometry DatasetLoader::geometry(std::uint32_t index) const {
+    if (index >= num_images()) throw std::out_of_range("dataset resize geometry index");
+    return impl_->source.geometry(index);
 }
 uint32_t DatasetLoader::image_height() const { return impl_->source.header().image_height; }
 uint32_t DatasetLoader::num_classes() const { return impl_->source.header().num_classes; }
@@ -378,6 +378,7 @@ const char* DatasetLoader::class_name(uint32_t id) const {
 size_t DatasetLoader::image_stride() const { return impl_->source.header().image_stride; }
 size_t DatasetLoader::num_label_instances() const { return impl_->source.labels().size(); }
 size_t DatasetLoader::num_rle_pairs() const { return impl_->source.rle_pairs().size(); }
+bool DatasetLoader::masks_available() const noexcept { return impl_->source.masks_available(); }
 const float* DatasetLoader::pixel_blob() const { return impl_->source.pixel_blob(); }
 const LabelIndexEntry* DatasetLoader::label_index() const { return impl_->source.label_index().data(); }
 const PackedInstance* DatasetLoader::label_data() const { return impl_->source.labels().data(); }

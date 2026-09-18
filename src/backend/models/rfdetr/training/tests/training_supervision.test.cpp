@@ -524,9 +524,9 @@ void test_build_targets_recovers_after_staging_growth_and_failure() {
         LabelIndexEntry{1, 2, 0},
     };
     std::array labels{
-        PackedInstance{0, 0, 1, 1, 5, 5, 0, 1},
-        PackedInstance{1, 0, 2, 2, 6, 6, static_cast<std::uint32_t>(sizeof(RLEPair)), 1},
-        PackedInstance{0, 0, 3, 3, 7, 7, static_cast<std::uint32_t>(2 * sizeof(RLEPair)), 1},
+        PackedInstance{0, mmltk::backend::data::kAnnotationMask, 1, 1, 5, 5, 0, 1},
+        PackedInstance{1, mmltk::backend::data::kAnnotationMask, 2, 2, 6, 6, static_cast<std::uint32_t>(sizeof(RLEPair)), 1},
+        PackedInstance{0, mmltk::backend::data::kAnnotationMask, 3, 3, 7, 7, static_cast<std::uint32_t>(2 * sizeof(RLEPair)), 1},
     };
     const std::array rle_pairs{
         RLEPair{0, 16},
@@ -573,7 +573,7 @@ void test_copy_paste_cache_publication_recovers_without_targets() {
     const auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     const auto donor_pixels = torch::full({1, 3, 8, 8}, .9F, options);
     const auto source_pixels = torch::full({1, 3, 8, 8}, .1F, options);
-    constexpr PackedInstance instance{0, 0, 0, 0, 8, 8, 0, 1};
+    constexpr PackedInstance instance{0, mmltk::backend::data::kAnnotationMask, 0, 0, 8, 8, 0, 1};
     constexpr RLEPair run{0, 64};
     const std::array<mmltk::backend::data::LabelIndexEntry, 2> entries{{{0, 1, 0}, {0, 0, 0}}};
     const std::array<std::uint32_t, 1> donor_index{0}, source_index{1};
@@ -658,7 +658,7 @@ void test_training_adapter_matches_raw_augmentation_executor() {
     std::array<mmltk::backend::data::LabelIndexEntry, donor_index + 1U> label_index{};
     label_index[donor_index] = {0U, 1U, 0U};
     constexpr std::array donor_labels{
-        mmltk::backend::data::PackedInstance{2U, 0U, 1, 1, 7, 7, 0U, 1U},
+        mmltk::backend::data::PackedInstance{2U, mmltk::backend::data::kAnnotationMask, 1, 1, 7, 7, 0U, 1U},
     };
     constexpr std::array donor_rle{mmltk::backend::data::RLEPair{0U, height * width}};
     const mmltk::backend::data::Batch donor_batch{
@@ -867,15 +867,15 @@ void test_copy_paste_ring_support_and_cache_cycles() {
         const auto x = static_cast<int>(dot_runs[i].start % 8);
         const auto y = static_cast<int>(dot_runs[i].start / 8);
         labels[i] = {static_cast<std::uint8_t>(i),
-                     0,
-                     static_cast<std::int16_t>(x),
-                     static_cast<std::int16_t>(y),
-                     static_cast<std::int16_t>(x + dot_runs[i].length),
-                     static_cast<std::int16_t>(y + 1),
+                     mmltk::backend::data::kAnnotationMask,
+                     static_cast<float>(x),
+                     static_cast<float>(y),
+                     static_cast<float>(x + dot_runs[i].length),
+                     static_cast<float>(y + 1),
                      static_cast<std::uint32_t>(i * sizeof(RLEPair)),
                      1};
     }
-    labels.back() = {7, 0, 1, 1, 7, 7, dot_runs.size() * sizeof(RLEPair), static_cast<std::uint16_t>(ring_runs.size())};
+    labels.back() = {7, mmltk::backend::data::kAnnotationMask, 1, 1, 7, 7, dot_runs.size() * sizeof(RLEPair), static_cast<std::uint16_t>(ring_runs.size())};
     const std::array<mmltk::backend::data::LabelIndexEntry, 3> entries{{{0, 7, 0}, {7, 1, 0}, {0, 0, 0}}};
     const std::array<std::uint32_t, 1> source_index{0}, donor_index{1}, empty_index{2};
     auto batch = mmltk::backend::data::Batch{.num_images = 1,
@@ -980,6 +980,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
             // Replacing a masked donor with a genuinely box-only record clears
             // mask availability and keeps the original rectangular paste mode.
             labels.back().mask_rle_pairs = 0;
+            labels.back().flags &= ~mmltk::backend::data::kAnnotationMask;
             batch.image_indices = donor_index.data();
             batch.device_images = donor_pixels.data_ptr<float>();
             (void)augmenter.run(batch, 127, 0, 0, 6);
@@ -1018,6 +1019,7 @@ void test_copy_paste_ring_support_and_cache_cycles() {
             CHECK_FALSE(targets.packed_masks.has_value());
             check_copy_paste_targets(targets, expected, preview, points);
             labels.back().mask_rle_pairs = static_cast<std::uint16_t>(ring_runs.size());
+            labels.back().flags |= mmltk::backend::data::kAnnotationMask;
         }
         // Exact identity placement isolates all prescribed partial-visibility boundaries.
         rfdetr::AugmentationBatchPlan plan;
@@ -1063,8 +1065,8 @@ void test_native_augmentation_preview_target_support_parity() {
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
     const std::array runs{RLEPair{9, 3}, RLEPair{17, 3}, RLEPair{25, 3}, RLEPair{10, 2}, RLEPair{18, 2}, RLEPair{26, 2}};
-    const PackedInstance source{2, 0, 0, 0, 5, 5, 0, 3};
-    const PackedInstance donor{4, 0, 0, 0, 5, 5, 3 * sizeof(RLEPair), 3};
+    const PackedInstance source{2, mmltk::backend::data::kAnnotationMask, 0, 0, 5, 5, 0, 3};
+    const PackedInstance donor{4, mmltk::backend::data::kAnnotationMask, 0, 0, 5, 5, 3 * sizeof(RLEPair), 3};
     const std::array<mmltk::backend::data::LabelIndexEntry, 1> entries{{{0, 1, 0}}};
     const std::array<std::uint32_t, 1> indices{0};
     const mmltk::backend::data::Batch batch{.num_images = 1,
@@ -1128,7 +1130,7 @@ void test_tiny_mask_training_outer_edges() {
     const std::array<mmltk::backend::data::LabelIndexEntry, 1> entries{{{0, 1, 0}}};
     const std::array<std::uint32_t, 1> indices{0};
     for (const auto run : {RLEPair{0, 1}, RLEPair{7, 1}, RLEPair{24, 1}, RLEPair{31, 1}, RLEPair{11, 1}, RLEPair{11, 2}, RLEPair{10, 4}}) {
-        const PackedInstance source{0, 0, 0, 0, 8, 4, 0, 1};
+        const PackedInstance source{0, mmltk::backend::data::kAnnotationMask, 0, 0, 8, 4, 0, 1};
         const mmltk::backend::data::Batch batch{.num_images = 1,
                                                 .device_images = nullptr,
                                                 .label_index = entries.data(),
@@ -1181,7 +1183,7 @@ void test_training_mask_targets_follow_spatial_image_erasure() {
         indices[image] = static_cast<std::uint32_t>(image);
         label_index[image] = {0U, 1U, 0U};
     }
-    constexpr std::array labels{mmltk::backend::data::PackedInstance{0U, 0U, 0, 0, extent, extent, 0U, 1U}};
+    constexpr std::array labels{mmltk::backend::data::PackedInstance{0U, mmltk::backend::data::kAnnotationMask, 0, 0, extent, extent, 0U, 1U}};
     constexpr std::array rle{mmltk::backend::data::RLEPair{0U, extent * extent}};
     const mmltk::backend::data::Batch batch{.num_images = count,
                                             .device_images = pixels.data_ptr<float>(),

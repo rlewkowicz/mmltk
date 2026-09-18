@@ -8,7 +8,7 @@
 #include "src/backend/data/benchmark_dataset_compiler.h"
 namespace mmltk::backend::data::benchmark_internal {
 inline constexpr std::string_view kBenchmarkCatalogRevision = "benchmark-sources-v1";
-inline constexpr std::string_view kBenchmarkMappingRevision = "coco80-detection-masks-v2";
+inline constexpr std::string_view kBenchmarkMappingRevision = "coco80-faithful-annotations-v3";
 struct CatalogArtifact {
     std::string artifact_id;
     std::string url;

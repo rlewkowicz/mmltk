@@ -17,6 +17,7 @@
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/compiled_format.h"
 namespace mmltk::backend::data::benchmark_internal {
+inline constexpr std::uint32_t kNormalizedAnnotationIndexVersion = 3U;
 struct __attribute__((packed)) NormalizedBox {
     float x1 = 0.0F;
     float y1 = 0.0F;
@@ -25,9 +26,14 @@ struct __attribute__((packed)) NormalizedBox {
     std::uint64_t mask_rle_offset = 0U;
     std::uint32_t mask_rle_pairs = 0U;
     std::uint8_t class_id = 0U;
-    std::uint8_t reserved[3]{};
+    std::uint8_t flags = 0U;
+    std::uint8_t reserved[2]{};
+    double original_area = 0.0;
+    std::uint64_t annotation_id = 0U;
+    std::uint64_t source_category_id = 0U;
+    std::uint64_t source_ordinal = 0U;
 };
-static_assert(sizeof(NormalizedBox) == 32U);
+static_assert(sizeof(NormalizedBox) == 64U);
 struct __attribute__((packed)) NormalizedImage {
     std::uint64_t source_image_id = 0U;
     std::uint64_t first_box = 0U;
@@ -47,7 +53,7 @@ struct AnnotationRejectCounts {
     std::uint64_t duplicate_boxes = 0U;
 };
 MMLTK_REFLECT_FIELDS(AnnotationRejectCounts)
-// The version-2 normalized index persists declaration order as six uint64 slots.
+// The version-3 normalized index persists declaration order as six uint64 slots.
 static_assert([] consteval {
     constexpr const auto& fields = mmltk::frameworks::reflection::field_declarations<AnnotationRejectCounts>();
     constexpr std::array<std::string_view, 6> names{"raw_records",       "unmapped_categories", "unknown_images",

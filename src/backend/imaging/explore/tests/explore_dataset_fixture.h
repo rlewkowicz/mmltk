@@ -1,5 +1,6 @@
 #pragma once
 #include <filesystem>
+#include "src/backend/imaging/resample/image_resize.h"
 #include <cstdint>
 #include <cstddef>
 #include <string_view>
@@ -9,6 +10,7 @@ struct ExploreFixtureDimensions final {
     int source_height = 32;
     std::uint32_t compiled_width = 32U;
     std::uint32_t compiled_height = 32U;
+    backend::imaging::resample::ImageResizeMode resize_mode = backend::imaging::resample::ImageResizeMode::Stretch;
 };
 struct ExploreFixtureAnnotations final {
     std::size_t objects = 0U;

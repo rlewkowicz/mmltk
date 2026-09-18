@@ -502,14 +502,9 @@ struct PlannedBenchmarkInstance {
     PackedInstance label{};
     std::vector<RLEPair> mask_rle;
 };
-// Per-image duplicate rejection orders and compares planned labels by the same identity, so the
-// projection is handed to the range algorithms directly instead of through comparator wrappers.
-[[nodiscard]] constexpr auto planned_label_identity(const PlannedBenchmarkInstance& instance) noexcept {
-    return std::tuple{instance.label.class_id, instance.label.bbox_x1, instance.label.bbox_y1, instance.label.bbox_x2, instance.label.bbox_y2};
-}
 SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, const std::vector<CachedImageDirectory>& directories,
-                                      const std::vector<std::uint64_t>* unavailable_image_ids, const std::uint32_t resolution, const bool require_every_image,
-                                      PreparedBenchmarkSplit* split, std::uint64_t* dropped_boxes,
+                                      const std::vector<std::uint64_t>* unavailable_image_ids, const std::uint32_t resolution, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const bool require_every_image,
+                                      PreparedBenchmarkSplit* split,
                                       mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if (directories.empty()) { throw std::runtime_error("benchmark source has no cached image directories"); }
     if (unavailable_image_ids != nullptr &&
@@ -564,14 +559,19 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
         }
         image_labels.clear();
         image_labels.reserve(image.box_count);
-        const mmltk::backend::imaging::resample::RgbLetterbox letterbox =
-            mmltk::backend::imaging::resample::compute_rgb_letterbox(image.width, image.height, resolution, resolution);
+        const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
+            mmltk::backend::imaging::resample::compute_image_resize_geometry(image.width, image.height, resolution, resolution, resize_mode);
         for (std::uint64_t box_index = image.first_box; box_index < image.first_box + image.box_count; ++box_index) {
             const NormalizedBox& box = index.boxes[common_math::checked_cast<std::size_t>(box_index, "box index overflow")];
-            PackedInstance label = benchmark_letterbox_box(box.class_id, box.x1, box.y1, box.x2, box.y2, letterbox);
+            PackedInstance label = benchmark_canvas_box(box.class_id, box.x1, box.y1, box.x2, box.y2, letterbox);
+            label.flags = box.flags;
+            label.annotation_id = box.annotation_id;
+            label.source_category_id = box.source_category_id;
+            label.source_ordinal = box.source_ordinal;
+            label.original_area = box.original_area;
+            if (index.source == BenchmarkDatasetSource::kOpenImagesV7) label.original_area *= static_cast<double>(image.width) * image.height;
             if (label.bbox_x2 <= label.bbox_x1 || label.bbox_y2 <= label.bbox_y1) {
-                ++*dropped_boxes;
-                continue;
+                throw std::runtime_error("benchmark continuous box is not representable on the compiled canvas");
             }
             std::vector<RLEPair> mask_rle;
             if (box.mask_rle_pairs != 0U) {
@@ -585,10 +585,6 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
             }
             image_labels.push_back(PlannedBenchmarkInstance{label, std::move(mask_rle)});
         }
-        std::ranges::sort(image_labels, std::ranges::less{}, planned_label_identity);
-        const auto unique_end = std::ranges::unique(image_labels, std::ranges::equal_to{}, planned_label_identity).begin();
-        *dropped_boxes += static_cast<std::uint64_t>(image_labels.end() - unique_end);
-        image_labels.erase(unique_end, image_labels.end());
         if (image_labels.empty() && !require_every_image) { continue; }
         const std::uint32_t first_label = common_math::checked_cast<std::uint32_t>(split->labels.size(), "benchmark label index overflow");
         split->images.push_back(EncodedImageRecord{
@@ -598,6 +594,8 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
             first_label,
             common_math::checked_cast<std::uint16_t>(image_labels.size(), "per-image label count overflow"),
             common_math::checked_cast<std::uint16_t>(source_base + local_source, "benchmark cached source index overflow"),
+            index.source == BenchmarkDatasetSource::kCoco2017 ? AnnotationSource::Coco :
+                index.source == BenchmarkDatasetSource::kObjects365V2 ? AnnotationSource::Objects365 : AnnotationSource::OpenImages,
         });
         for (PlannedBenchmarkInstance& instance : image_labels) {
             instance.label.mask_rle_offset = common_math::checked_cast<std::uint32_t>(
@@ -669,7 +667,7 @@ void publish_dataset_directory(const std::filesystem::path& staging, const std::
 void write_split_with_progress(const BenchmarkWriteRequest& request, ProgressReporter* progress, const std::uint64_t completed_before,
                                const std::uint64_t total_images, const BenchmarkTraceSink& trace) {
     progress->pixel_attempt(completed_before, total_images, request.split.name, request.split.images.size());
-    progress->activity("Decoding, letterboxing, and resizing " + request.split.name + " JPEG pixels");
+    progress->activity("Decoding and resizing " + request.split.name + " JPEG pixels");
     const Clock::time_point started = trace ? Clock::now() : Clock::time_point{};
     BenchmarkWriteRequest observed = request;
     if (progress->pixel_observer_enabled()) {
@@ -735,6 +733,8 @@ void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std
                                 nlohmann::json facts, const common_concurrency::CancellationObservation cancelled) {
     facts["schema_version"] = 3U;
     facts["compiled_format_version"] = FORMAT_VERSION;
+    facts["normalized_annotation_version"] = kNormalizedAnnotationIndexVersion;
+    facts["resize_mode"] = config.resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Stretch ? "stretch" : "letterbox";
     facts["resampling"] = {{"perceptual_downscale", config.perceptual_downscale}, {"version", 1U}};
     facts["catalog_revision"] = kBenchmarkCatalogRevision;
     facts["mapping_revision"] = kBenchmarkMappingRevision;
@@ -747,6 +747,8 @@ void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std
 }  // namespace benchmark_internal
 void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     using namespace benchmark_internal;
+    if (config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch &&
+        config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox) throw std::invalid_argument("invalid benchmark resize mode");
     if (config.resolution == 0U || config.resolution > MAX_IMAGE_EXTENT) {
         throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format");
     }
@@ -1281,20 +1283,20 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
         std::uint64_t prepared_dropped_boxes = 0U;
         if (report_progress) { progress.activity("Preparing COCO training labels"); }
         prepared_counts.push_back(append_source_plan(*coco_train, coco_train_images, coco_train_unavailable_ids.empty() ? nullptr : &coco_train_unavailable_ids,
-                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, cancel_requested));
+                                                     config.resolution, config.resize_mode, false, &prepared, cancel_requested));
         if (report_progress) {
             progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount);
             progress.activity("Preparing Objects365 training labels");
         }
         prepared_counts.push_back(append_source_plan(*objects, object_images, objects_unavailable_ids.empty() ? nullptr : &objects_unavailable_ids,
-                                                     config.resolution, false, &prepared, &prepared_dropped_boxes, cancel_requested));
+                                                     config.resolution, config.resize_mode, false, &prepared, cancel_requested));
         if (report_progress) {
             progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount);
             progress.activity("Preparing Open Images training labels");
         }
         prepared_counts.push_back(append_source_plan(*open_images, open_image_directories,
-                                                     open_images_unavailable_ids.empty() ? nullptr : &open_images_unavailable_ids, config.resolution, false,
-                                                     &prepared, &prepared_dropped_boxes, cancel_requested));
+                                                     open_images_unavailable_ids.empty() ? nullptr : &open_images_unavailable_ids, config.resolution, config.resize_mode, false,
+                                                     &prepared, cancel_requested));
         if (report_progress) { progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount); }
         train = std::move(prepared);
         source_counts = std::move(prepared_counts);
@@ -1303,7 +1305,7 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     prepare_training_plan(true);
     progress.activity("Preparing COCO validation labels");
     const SourceCompileCount validation_count =
-        append_source_plan(*coco_val, coco_val_images, nullptr, config.resolution, true, &validation, &validation_target_dropped_boxes, cancel_requested);
+        append_source_plan(*coco_val, coco_val_images, nullptr, config.resolution, config.resize_mode, true, &validation, cancel_requested);
     progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount);
     if (validation.images.size() != 5000U) { throw std::runtime_error("compiled COCO validation plan must contain exactly 5,000 images"); }
     const auto calculate_output_estimate = [&] {
@@ -1429,11 +1431,11 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     };
     compile_split(
         BenchmarkWriteRequest{
-            train, staging_dir / "train.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale},
+            train, staging_dir / "train.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode},
         0U);
     compile_split(
         BenchmarkWriteRequest{
-            validation, staging_dir / "val.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale},
+            validation, staging_dir / "val.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode},
         train.images.size());
     progress.activity("Finalizing rejected and quarantined records");
     std::ranges::sort(quarantined);

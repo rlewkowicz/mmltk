@@ -151,6 +151,7 @@ DatasetCompilePlan DatasetCompiler::prepare(CompilerConfig config, const std::ve
     DatasetCompilePlan plan;
     plan.config = std::move(config);
     plan.class_map = std::move(scan.class_map);
+    plan.source_categories = std::move(scan.source_categories);
     plan.splits = std::move(scan.splits);
     return plan;
 }
@@ -240,6 +241,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
                                                         layout.pixel_offset,
                                                         cancellation,
                                                         &failure_requested,
+                                                        effective_config.resize_mode,
                                                     });
         } catch (...) {
             failure_requested.store(true, std::memory_order_relaxed);
@@ -247,7 +249,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
         }
     });
     try {
-        label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_map, label_workers, label_cpus,
+        label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_map, plan.source_categories, label_workers, label_cpus,
                                                              telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
         if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
     } catch (...) {
@@ -281,6 +283,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
             channels,
             label_blocks.max_instances_per_image,
             image_stride,
+            effective_config.resize_mode,
         },
         class_map, layout);
     validate_compiled_index_entries(label_blocks.index, header, label_blocks.labels.size(), cancellation);

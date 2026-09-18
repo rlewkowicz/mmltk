@@ -47,7 +47,7 @@ class CompiledDataset {
     [[nodiscard]] std::span<const mmltk::backend::data::PackedInstance> image_labels(std::uint32_t compiled_index) const noexcept;
     [[nodiscard]] std::span<const mmltk::backend::data::RLEPair> instance_rle(const mmltk::backend::data::PackedInstance& instance) const noexcept;
     [[nodiscard]] const float* image_pixels(std::uint32_t compiled_index) const noexcept;
-    [[nodiscard]] mmltk::backend::imaging::resample::RgbLetterbox letterbox(std::uint32_t compiled_index) const;
+    [[nodiscard]] mmltk::backend::imaging::resample::ImageResizeGeometry geometry(std::uint32_t compiled_index) const;
     [[nodiscard]] std::span<const LabelIndexEntry> label_index() const noexcept;
     [[nodiscard]] const float* pixel_blob() const noexcept;
     // Called only by image-stream I/O workers. Each advised/populated range is
@@ -71,5 +71,6 @@ class CompiledDataset {
     std::span<const mmltk::backend::data::RLEPair> rle_pairs_;
     std::shared_ptr<const catalog::ClassCatalog> catalog_;
     std::vector<LabelIndexEntry> label_index_;
+    bool masks_available_ = false;
 };
 }  // namespace mmltk::backend::data

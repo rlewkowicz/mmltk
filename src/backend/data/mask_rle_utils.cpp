@@ -1,5 +1,8 @@
 #include "detail/mask_rle_utils.h"
 #include <immintrin.h>
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <span>
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
@@ -59,7 +62,7 @@ void prepare_lookup(const MaskDimensions source, const std::uint32_t width, cons
     fill_center_scale_lookup(scratch->source_x, width, source.width, "scaled mask x overflow");
     fill_center_scale_lookup(scratch->source_y, height, source.height, "scaled mask y overflow");
 }
-void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions, const mmltk::backend::imaging::resample::RgbLetterbox& letterbox) {
+void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
     const std::size_t top = static_cast<std::size_t>(letterbox.offset_y) * dimensions.width;
     std::fill_n(target->data(), top, std::uint8_t{0U});
     const std::uint32_t right = dimensions.width - letterbox.offset_x - letterbox.resized_width;
@@ -73,23 +76,6 @@ void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimen
     std::fill_n(target->data() + static_cast<std::size_t>(content_end) * dimensions.width, bottom, std::uint8_t{0U});
 }
 }  // namespace
-std::array<std::int16_t, 4> RowMajorMaskBounds::packed_bbox() const {
-    if (!has_foreground) { return {}; }
-    return {
-        checked_cast<std::int16_t>(min_x, "mask bbox x1 overflow"),
-        checked_cast<std::int16_t>(min_y, "mask bbox y1 overflow"),
-        checked_cast<std::int16_t>(max_x, "mask bbox x2 overflow"),
-        checked_cast<std::int16_t>(max_y, "mask bbox y2 overflow"),
-    };
-}
-std::array<std::int64_t, 4> RowMajorMaskBounds::diagnostic_bbox() const noexcept {
-    return {
-        static_cast<std::int64_t>(min_x),
-        static_cast<std::int64_t>(min_y),
-        static_cast<std::int64_t>(max_x),
-        static_cast<std::int64_t>(max_y),
-    };
-}
 EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8_t> dense, const MaskDimensions dimensions) {
     const std::size_t pixels = checked_pixel_count(dimensions);
     if (dense.size() != pixels) { throw std::runtime_error("dense mask size does not match its dimensions"); }
@@ -127,6 +113,18 @@ EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8
     }
     return encoded;
 }
+RowMajorMaskBounds row_major_mask_bounds(const std::span<const RLEPair> pairs, const MaskDimensions dimensions) {
+    const auto pixels = checked_pixel_count(dimensions);
+    RowMajorMaskBounds bounds;
+    std::size_t previous_end = 0U;
+    for (const auto pair : pairs) {
+        if (pair.length == 0U || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start)
+            throw std::runtime_error("row-major mask contains an invalid run");
+        previous_end = static_cast<std::size_t>(pair.start) + pair.length;
+        include_run(&bounds, pair.start, previous_end, dimensions.width);
+    }
+    return bounds;
+}
 void materialize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, std::vector<std::uint8_t>* dense,
                                 RowMajorMaskBounds* bounds) {
     if (dense == nullptr) { throw std::invalid_argument("dense mask output is required"); }
@@ -147,7 +145,7 @@ void materialize_row_major_mask(const std::span<const RLEPair> pairs, const Mask
     }
 }
 EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions source_dimensions, const MaskDimensions target_dimensions,
-                                          const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, MaskResizeScratch* scratch,
+                                          const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch,
                                           RowMajorMaskBounds* source_bounds) {
     if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U ||
         letterbox.offset_x + letterbox.resized_width > target_dimensions.width || letterbox.offset_y + letterbox.resized_height > target_dimensions.height) {

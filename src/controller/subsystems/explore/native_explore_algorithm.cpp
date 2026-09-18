@@ -712,7 +712,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
     }
     [[nodiscard]] VisualRegion DetailContent(const ExploreRenderPlan& plan) const override {
         if (!plan.selected_image) return {};
-        const auto crop = committed_->store.letterbox(*plan.selected_image);
+        const auto crop = committed_->store.geometry(*plan.selected_image);
         return {crop.offset_x, crop.offset_y, crop.resized_width, crop.resized_height};
     }
     [[nodiscard]] std::shared_ptr<const VisualDocument> Document() const override { return gallery_.Document(); }

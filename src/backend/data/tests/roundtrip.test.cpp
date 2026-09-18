@@ -551,7 +551,7 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
     CHECK(std::memcmp(ordinary.labels().data(), selected.labels().data(), ordinary.labels().size_bytes()) == 0);
     REQUIRE(ordinary.rle_pairs().size() == selected.rle_pairs().size());
     CHECK(std::memcmp(ordinary.rle_pairs().data(), selected.rle_pairs().data(), ordinary.rle_pairs().size_bytes()) == 0);
-    const auto geometry = mmltk::backend::imaging::resample::compute_rgb_letterbox(65, 49, 31, 31);
+    const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(65, 49, 31, 31, config.resize_mode);
     for (std::uint32_t image = 0; image != 2; ++image) {
         const auto name = image == 0 ? "000001.png" : "000002.png";
         const auto source = expected_nchw_stub((fs::path(config.source_dir) / "train" / name).string(), 65, 49);

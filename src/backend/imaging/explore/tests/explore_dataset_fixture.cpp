@@ -46,7 +46,7 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
             const auto name = image == 1 ? "000001.jsonl" : "000002.jsonl";
             std::ofstream output{std::filesystem::path{backend::data::testsupport::dataset_dir(fixture)} / fixture.split / name};
             const auto write = [&](std::span<const backend::data::RLEPair> runs, std::string_view category) {
-                output << "{\"class\":\"" << category << "\",\"bbox_xyxy\":[0,0,8,8],"
+                output << "{\"class\":\"" << category << "\","
                        << "\"mask_rle_encoding\":\"row_major_start_length\",\"mask_rle\":\"";
                 for (std::size_t i = 0; i < runs.size(); ++i) {
                     if (i != 0) output << ' ';
@@ -65,6 +65,7 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
     config.source_dir = backend::data::testsupport::dataset_dir(fixture);
     config.output_dir = backend::data::testsupport::compiled_dir(fixture);
     config.split = fixture.split;
+    config.resize_mode = dimensions.resize_mode;
     config.target_width = dimensions.compiled_width;
     config.target_height = dimensions.compiled_height;
     config.num_workers = 1U;

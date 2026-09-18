@@ -96,6 +96,9 @@ class ReadOnlyMappedRange {
         destination.num_instances = source.label_count;
         destination.label_bytes =
             common_math::checked_cast<std::uint32_t>(static_cast<std::size_t>(source.label_count) * sizeof(PackedInstance), "benchmark label size overflow");
+        destination.has_source_image_id = 1U;
+        destination.source_image_id = source.source_image_id;
+        destination.source = source.annotation_source;
         destination.original_width = source.source_width;
         destination.original_height = source.source_height;
         expected_first_label += source.label_count;
@@ -188,8 +191,8 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                     } catch (const std::bad_alloc&) { throw; } catch (const BenchmarkImageReadError&) {
                         throw;
                     } catch (const std::exception& error) { throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what()); }
-                    const mmltk::backend::imaging::resample::RgbLetterbox letterbox = mmltk::backend::imaging::resample::compute_rgb_letterbox(
-                        image.source_width, image.source_height, request.resolution, request.resolution);
+                    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox = mmltk::backend::imaging::resample::compute_image_resize_geometry(
+                        image.source_width, image.source_height, request.resolution, request.resolution, request.resize_mode);
                     const std::uint8_t* source_pixels = decoded.data();
                     if (image.source_width != letterbox.resized_width || image.source_height != letterbox.resized_height) {
                         resized.resize(checked_rgb_bytes(letterbox.resized_width, letterbox.resized_height));
@@ -228,33 +231,18 @@ BenchmarkImageReadError::BenchmarkImageReadError(const std::uint16_t source_inde
       source_image_id_(source_image_id) {}
 std::uint16_t BenchmarkImageReadError::source_index() const noexcept { return source_index_; }
 std::uint64_t BenchmarkImageReadError::source_image_id() const noexcept { return source_image_id_; }
-PackedInstance benchmark_letterbox_box(const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2,
-                                       const mmltk::backend::imaging::resample::RgbLetterbox& letterbox) {
+PackedInstance benchmark_canvas_box(const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2,
+                                       const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
     if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }
-    const auto scaled_coordinate = [](const float value, const std::uint32_t extent, const std::uint32_t offset, const bool round_up,
-                                      const char* overflow_message) {
-        const double scaled = std::clamp(static_cast<double>(value), 0.0, 1.0) * extent;
-        const double rounded = round_up ? std::ceil(scaled) : std::floor(scaled);
-        return common_math::checked_cast<std::int16_t>(
-            static_cast<std::int32_t>(rounded) + common_math::checked_cast<std::int32_t>(offset, "benchmark box offset overflow"), overflow_message);
-    };
-    const auto minimum = [&](const float value, const std::uint32_t extent, const std::uint32_t offset) {
-        return scaled_coordinate(value, extent, offset, false, "benchmark minimum box coordinate overflow");
-    };
-    const auto maximum = [&](const float value, const std::uint32_t extent, const std::uint32_t offset) {
-        return scaled_coordinate(value, extent, offset, true, "benchmark maximum box coordinate overflow");
-    };
-    return PackedInstance{
-        class_id,
-        0U,
-        minimum(x1, letterbox.resized_width, letterbox.offset_x),
-        minimum(y1, letterbox.resized_height, letterbox.offset_y),
-        maximum(x2, letterbox.resized_width, letterbox.offset_x),
-        maximum(y2, letterbox.resized_height, letterbox.offset_y),
-        0U,
-        0U,
-    };
+    PackedInstance result{};
+    result.class_id = class_id;
+    result.bbox_x1 = x1 * letterbox.resized_width + letterbox.offset_x;
+    result.bbox_y1 = y1 * letterbox.resized_height + letterbox.offset_y;
+    result.bbox_x2 = x2 * letterbox.resized_width + letterbox.offset_x;
+    result.bbox_y2 = y2 * letterbox.resized_height + letterbox.offset_y;
+    return result;
 }
+
 void write_benchmark_split(const BenchmarkWriteRequest& request) {
     mmltk::common::logging::ScopedProfile profile{"benchmark.writer.total"};
     if (request.resolution == 0U || request.resolution > MAX_IMAGE_EXTENT) {
@@ -277,9 +265,12 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
     const std::size_t rle_bytes = checked_size_multiply(request.split.rle_pairs.size(), sizeof(RLEPair), "benchmark RLE block overflow");
     const std::size_t total_size = checked_size_add(rle_offset, rle_bytes, "benchmark file size overflow");
     std::vector<ImageEntry> index = build_index(request.split, pixel_offset, image_stride);
-    const FileHeader header = make_header(request.split, request.resolution, image_stride, index_offset, pixel_offset, label_offset, rle_offset, total_size);
+    FileHeader header = make_header(request.split, request.resolution, image_stride, index_offset, pixel_offset, label_offset, rle_offset, total_size);
+    header.resize_mode = request.resize_mode;
+    validate_compiled_header(header);
     validate_compiled_index_entries(index, header, request.split.labels.size(), request.cancel_requested);
     validate_compiled_original_image_dimensions(index, request.cancel_requested);
+    validate_compiled_annotation_provenance(index, request.split.labels, request.cancel_requested);
     const std::size_t used_rle = validate_compiled_label_entries(request.split.labels, header, rle_bytes, request.cancel_requested);
     if (used_rle != rle_bytes) { throw std::runtime_error("benchmark labels do not reference the complete mask block"); }
     validate_compiled_rle_pairs(request.split.labels, request.split.rle_pairs, static_cast<std::size_t>(request.resolution) * request.resolution,
@@ -311,6 +302,7 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
     const auto persisted_label_span = std::span(reinterpret_cast<const PackedInstance*>(persisted_labels.data()), sections.label_count);
     const std::size_t persisted_rle_bytes =
         validate_compiled_label_entries(persisted_label_span, staged_header, sections.rle_region_bytes, request.cancel_requested);
+    validate_compiled_annotation_provenance(persisted_index_span, persisted_label_span, request.cancel_requested);
     if (persisted_rle_bytes != rle_bytes) { throw std::runtime_error("persisted benchmark labels do not reference the complete mask block"); }
     const ReadOnlyMappedRange persisted_rle(staged, sections.rle_offset, sections.rle_region_bytes);
     const auto persisted_rle_span = std::span(reinterpret_cast<const RLEPair*>(persisted_rle.data()), request.split.rle_pairs.size());

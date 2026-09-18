@@ -12,6 +12,8 @@ mmltk_register_ordinary_sources(mmltk_backend_imaging_resample
 target_link_libraries(mmltk_backend_imaging_resample
     PUBLIC CUDA::cudart
     PRIVATE mmltk::common::math avir mmltk::frameworks::gpu CUDA::cuda_driver)
+mmltk_link_declarations(mmltk_backend_imaging_resample PUBLIC
+    mmltk::frameworks::reflection)
 if(BUILD_RFDETR_NATIVE)
     mmltk_register_ordinary_sources(mmltk_backend_imaging_resample image_resize_cuda.cu)
     set_target_properties(mmltk_backend_imaging_resample PROPERTIES

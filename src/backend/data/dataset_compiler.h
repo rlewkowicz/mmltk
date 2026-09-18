@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/imaging/resample/image_resize.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -105,11 +106,12 @@ struct CompileDiagnostic {
     uint32_t target_height = 0;
     size_t source_foreground = 0;
     // CLEANUP-IGNORE: Diagnostic bounding boxes are fixed ABI facts, unrelated to reflected settings paths.
-    std::array<int64_t, 4> declared_bbox{};
+    std::array<double, 4> declared_bbox{};
     // CLEANUP-IGNORE: The measured mask box is a separate compiler diagnostic fact with the same fixed extent.
-    std::array<int64_t, 4> mask_bbox{};
+    std::array<double, 4> mask_bbox{};
 };
 struct CompilerConfig {
+    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     bool perceptual_downscale = false;
     // CLEANUP-IGNORE: Compiler input/output paths remain backend execution facts with canonical reflected limits.
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string source_dir;
@@ -156,6 +158,7 @@ struct DatasetCompileSplitPlan {
 struct DatasetCompilePlan {
     CompilerConfig config;
     std::unordered_map<std::string, std::uint8_t> class_map;
+    std::unordered_map<std::string, std::uint64_t> source_categories;
     std::vector<DatasetCompileSplitPlan> splits;
     [[nodiscard]] size_t total_steps() const noexcept {
         size_t total = 0;

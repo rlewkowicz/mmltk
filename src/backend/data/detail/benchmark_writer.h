@@ -20,6 +20,7 @@ struct EncodedImageRecord {
     std::uint32_t first_label = 0;
     std::uint16_t label_count = 0;
     std::uint16_t source_index = 0;
+    AnnotationSource annotation_source = AnnotationSource::Generic;
 };
 struct PreparedBenchmarkSplit {
     std::string name;
@@ -39,8 +40,8 @@ class BenchmarkImageReadError final : public std::runtime_error {
     std::uint16_t source_index_ = 0U;
     std::uint64_t source_image_id_ = 0U;
 };
-[[nodiscard]] PackedInstance benchmark_letterbox_box(std::uint8_t class_id, float x1, float y1, float x2, float y2,
-                                                     const mmltk::backend::imaging::resample::RgbLetterbox& letterbox);
+[[nodiscard]] PackedInstance benchmark_canvas_box(std::uint8_t class_id, float x1, float y1, float x2, float y2,
+                                                     const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox);
 struct BenchmarkWriteProgressEvent final {
     void* context = nullptr;
     void (*image_completed)(void*) = nullptr;
@@ -59,6 +60,7 @@ struct BenchmarkWriteRequest {
     mmltk::common::concurrency::CancellationObservation cancel_requested = {};
     BenchmarkWriteProgressEvent progress;
     bool perceptual_downscale = false;
+    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
 };
 void write_benchmark_split(const BenchmarkWriteRequest& request);
 }  // namespace mmltk::backend::data::benchmark_internal

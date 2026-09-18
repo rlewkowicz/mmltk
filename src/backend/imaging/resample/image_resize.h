@@ -2,6 +2,9 @@
 #include <cstdint>
 #include <cstddef>
 #include <memory>
+#if !defined(__CUDACC__)
+#include "src/frameworks/reflection/reflection_metadata.h"
+#endif
 namespace mmltk::backend::imaging::resample {
 enum class RgbPixelFormat : std::uint8_t { RGB8, RGBA8, PlanarUnitSrgbF32 };
 // All strides and capacity are bytes. Float planes are R, G, B, contain unit
@@ -20,14 +23,18 @@ struct RgbMutableImageView {
     void* data = nullptr;
     RgbImageLayout layout{};
 };
-struct RgbLetterbox {
+enum class ImageResizeMode : std::uint8_t { Stretch, Letterbox };
+#if !defined(__CUDACC__)
+MMLTK_REFLECT_ENUM(ImageResizeMode)
+#endif
+struct ImageResizeGeometry {
     std::uint32_t resized_width = 0;
     std::uint32_t resized_height = 0;
     std::uint32_t offset_x = 0;
     std::uint32_t offset_y = 0;
 };
-[[nodiscard]] RgbLetterbox compute_rgb_letterbox(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t target_width,
-                                                 std::uint32_t target_height);
+[[nodiscard]] ImageResizeGeometry compute_image_resize_geometry(std::uint32_t source_width, std::uint32_t source_height, std::uint32_t target_width,
+                                                 std::uint32_t target_height, ImageResizeMode mode);
 void rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, std::uint32_t width, std::uint32_t height);
 void letterboxed_rgb_hwc_u8_to_nchw_f32(const std::uint8_t* source, float* destination, std::uint32_t source_width, std::uint32_t source_height,
                                         std::uint32_t destination_width, std::uint32_t destination_height, std::uint32_t offset_x, std::uint32_t offset_y);

@@ -104,13 +104,14 @@ void write_gallery_artifact(const std::filesystem::path& path, const float red, 
                                      .original_height = 8U,
                                      ._reserved = 0U};
         const data::PackedInstance label{.class_id = 0U,
-                                         ._pad = 0U,
+                                         .flags = data::kAnnotationMask,
                                          .bbox_x1 = 1,
                                          .bbox_y1 = 1,
                                          .bbox_x2 = 7,
                                          .bbox_y2 = 7,
                                          .mask_rle_offset = static_cast<std::uint32_t>(index * sizeof(data::RLEPair)),
-                                         .mask_rle_pairs = 1U};
+                                         .mask_rle_pairs = 1U,
+                                         .original_area = 4.0};
         const data::RLEPair run{mask_start, 4U};
         std::array<float, 8U * 8U * 3U> pixels{};
         for (std::size_t pixel = 0U; pixel < 64U; ++pixel) {

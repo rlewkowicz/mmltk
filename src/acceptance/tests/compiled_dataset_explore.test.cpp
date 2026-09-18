@@ -362,7 +362,8 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     mmltk::testsupport::ScopedTempDir root{"mmltk-compiled-dataset-explore"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 12);
     const auto non_square_compiled = mmltk::testsupport::compile_explore_fixture(
-        root.path(), "non-square-fixture", 12, {.source_width = 48, .source_height = 24, .compiled_width = 32U, .compiled_height = 32U});
+        root.path(), "non-square-fixture", 12, {.source_width = 48, .source_height = 24, .compiled_width = 32U, .compiled_height = 32U,
+                                             .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox});
     const data::CompiledDatasetInfo info = data::inspect_compiled_dataset(compiled);
     REQUIRE(info.image_count == 12U);
     REQUIRE(info.width == 32U);
@@ -381,7 +382,7 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     REQUIRE(non_square_store.class_names().size() >= 2U);
     CHECK(non_square_store.class_names()[0] == "person");
     CHECK(non_square_store.class_names()[1] == "ret");
-    const auto letterbox = non_square_store.letterbox(10U);
+    const auto letterbox = non_square_store.geometry(10U);
     CHECK(letterbox.resized_width == 32U);
     CHECK(letterbox.resized_height == 16U);
     CHECK(letterbox.offset_x == 0U);
@@ -390,10 +391,10 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
         const auto labels = non_square_store.image_labels(image);
         REQUIRE(labels.size() == 1U);
         CHECK(labels.front().class_id == image - 10U);
-        CHECK(labels.front().bbox_x1 == 7);
-        CHECK(labels.front().bbox_y1 == 15);
+        CHECK(std::abs(labels.front().bbox_x1 - 20.0F / 3.0F) < 1e-5F);
+        CHECK(std::abs(labels.front().bbox_y1 - 44.0F / 3.0F) < 1e-5F);
         CHECK(labels.front().bbox_x2 == 20);
-        CHECK(labels.front().bbox_y2 == 23);
+        CHECK(std::abs(labels.front().bbox_y2 - 70.0F / 3.0F) < 1e-5F);
         const auto runs = non_square_store.instance_rle(labels.front());
         REQUIRE_FALSE(runs.empty());
         CHECK(runs.front().start >= letterbox.offset_y * 32U);

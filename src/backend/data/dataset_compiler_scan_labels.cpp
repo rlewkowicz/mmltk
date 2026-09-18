@@ -3,12 +3,13 @@
 #include "src/backend/data/dataset_compiler.h"
 #include "src/backend/imaging/resample/image_resize.h"
 // CLEANUP-IGNORE: This module implementation has an independent global-fragment and import preamble.
-#include <immintrin.h>
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <charconv>
+#include <cctype>
+#include <cmath>
 #include <format>
 #include <fstream>
 #include <limits>
@@ -41,7 +42,8 @@ using mmltk::common::math::checked_cast;
 namespace {
 struct ParsedInstance {
     uint8_t class_id;
-    std::array<int16_t, 4> bbox{};
+    std::array<float, 4> bbox{};
+    PackedInstance metadata{};
     std::vector<RLEPair> rle_pairs;
 };
 struct ParsedRle {
@@ -51,85 +53,22 @@ struct ParsedRle {
 struct ParsedLabels {
     std::vector<ParsedInstance> instances;
     std::uint64_t dropped_instances = 0;
+    bool has_image_id = false;
+    std::uint64_t image_id = 0;
 };
 struct WorkerResult {
     std::vector<PackedInstance> labels;
     std::vector<RLEPair> rle_pairs;
+    bool has_image_id = false;
+    std::uint64_t image_id = 0;
     uint32_t original_width = 0;
     uint32_t original_height = 0;
 };
-struct ImageDimensions {
-    uint32_t width = 0;
-    uint32_t height = 0;
-};
-struct MaskResizeLookup {
-    ImageDimensions source_dims{};
-    uint32_t target_width = 0;
-    uint32_t target_height = 0;
-    std::vector<uint32_t> source_x;
-    std::vector<uint32_t> source_y;
-    void prepare(const ImageDimensions& source, const uint32_t target_w, const uint32_t target_h) {
-        if (target_w == 0 || target_h == 0) { throw std::runtime_error("mask resize target dimensions must be positive"); }
-        if (source_dims.width == source.width && source_dims.height == source.height && target_width == target_w && target_height == target_h) { return; }
-        source_dims = source;
-        target_width = target_w;
-        target_height = target_h;
-        source_x.resize(target_w);
-        source_y.resize(target_h);
-        mmltk::backend::data::dataset::fill_center_scale_lookup(source_x, target_w, source.width, "scaled mask x overflow");
-        mmltk::backend::data::dataset::fill_center_scale_lookup(source_y, target_h, source.height, "scaled mask y overflow");
-    }
-};
-struct MaskBounds {
-    uint32_t min_x;
-    uint32_t min_y;
-    uint32_t max_x = 0;
-    uint32_t max_y = 0;
-    bool has_foreground = false;
-    explicit MaskBounds(const ImageDimensions& dimensions) : min_x(dimensions.width), min_y(dimensions.height) {}
-    void include_row_major_run(size_t start, size_t end, uint32_t width) {
-        has_foreground = true;
-        const auto start_y = checked_cast<uint32_t>(start / width, "mask run y overflow");
-        const auto start_x = checked_cast<uint32_t>(start % width, "mask run x overflow");
-        const auto end_position = end - 1;
-        const auto end_y = checked_cast<uint32_t>(end_position / width, "mask run y overflow");
-        const auto end_x = checked_cast<uint32_t>(end_position % width, "mask run x overflow");
-        min_y = std::min(min_y, start_y);
-        max_y = std::max(max_y, end_y + 1);
-        if (start_y == end_y) {
-            min_x = std::min(min_x, start_x);
-            max_x = std::max(max_x, end_x + 1);
-        } else {
-            min_x = 0;
-            max_x = width;
-        }
-    }
-    [[nodiscard]] std::array<int16_t, 4> bbox() const {
-        return {
-            checked_cast<int16_t>(min_x, "mask bbox x1 overflow"),
-            checked_cast<int16_t>(min_y, "mask bbox y1 overflow"),
-            checked_cast<int16_t>(max_x, "mask bbox x2 overflow"),
-            checked_cast<int16_t>(max_y, "mask bbox y2 overflow"),
-        };
-    }
-    [[nodiscard]] std::array<int64_t, 4> diagnostic_bbox() const noexcept {
-        return {
-            static_cast<int64_t>(min_x),
-            static_cast<int64_t>(min_y),
-            static_cast<int64_t>(max_x),
-            static_cast<int64_t>(max_y),
-        };
-    }
-};
+using ImageDimensions = dataset::MaskDimensions;
 struct ResizeObservation {
     bool needs_resize = false;
     bool needs_downscale = false;
     ImageDimensions source_dimensions{};
-};
-struct ResizedMask {
-    std::vector<RLEPair> rle_pairs;
-    bool has_foreground = false;
-    std::array<int16_t, 4> bbox{};
 };
 struct LabelWorkerStats {
 #if MMLTK_ENABLE_PROFILING
@@ -208,9 +147,11 @@ ParsedRle parse_rle(const std::string_view rle) {
             throw std::runtime_error("mask_rle runs must be sorted and non-overlapping");
         }
         if (length > std::numeric_limits<size_t>::max() - parsed.foreground) { throw std::runtime_error("mask_rle foreground count overflow"); }
+        const bool adjacent = !parsed.pairs.empty() && static_cast<size_t>(start) == previous_end;
         previous_end = static_cast<size_t>(start) + length;
         parsed.foreground += length;
-        parsed.pairs.push_back({start, length});
+        if (adjacent) parsed.pairs.back().length = checked_cast<uint32_t>(static_cast<std::uint64_t>(parsed.pairs.back().length) + length, "mask run length overflow");
+        else parsed.pairs.push_back({start, length});
     }
     return parsed;
 }
@@ -238,151 +179,14 @@ void validate_record_image_dimensions(const json& record, const std::filesystem:
         throw std::runtime_error("annotation image_size_wh does not match PNG dimensions in " + annotation_file.string());
     }
 }
-bool read_declared_bbox(const json& record, std::array<int64_t, 4>* bbox) {
-    if (bbox == nullptr) { return false; }
-    const auto it = record.find("bbox_xyxy");
-    if (it == record.end() || !it->is_array() || it->size() != bbox->size()) { return false; }
-    for (size_t index = 0; index < bbox->size(); ++index) {
-        const json& value = (*it)[index];
-        if (!value.is_number_integer()) { return false; }
-        (*bbox)[index] = value.get<std::int64_t>();
-    }
-    return true;
-}
 void append_diagnostic(std::vector<CompileDiagnostic>* diagnostics, CompileDiagnostic diagnostic) noexcept {
-    if (diagnostics == nullptr) { return; }
-    try {
-        diagnostics->push_back(std::move(diagnostic));
-    } catch (...) { return; }
-}
-// Builds the diagnostic fields shared by every label-resize diagnostic record.
-[[nodiscard]] CompileDiagnostic make_resize_diagnostic(const CompileDiagnosticKind kind, const std::filesystem::path& annotation_file,
-                                                       const std::string& class_name, const size_t line_number, const ImageDimensions& source_dims,
-                                                       const uint32_t target_width, const uint32_t target_height, const size_t source_foreground) {
-    CompileDiagnostic diagnostic;
-    diagnostic.kind = kind;
-    diagnostic.annotation_path = annotation_file.string();
-    diagnostic.class_name = class_name;
-    diagnostic.line = line_number;
-    diagnostic.source_width = source_dims.width;
-    diagnostic.source_height = source_dims.height;
-    diagnostic.target_width = target_width;
-    diagnostic.target_height = target_height;
-    diagnostic.source_foreground = source_foreground;
-    return diagnostic;
-}
-void append_source_bbox_mismatch(std::vector<CompileDiagnostic>* diagnostics, const json& record, const std::filesystem::path& annotation_file,
-                                 const std::string& class_name, const size_t line_number, const ImageDimensions& source_dims, const uint32_t target_width,
-                                 const uint32_t target_height, const MaskBounds& source_bounds, const size_t source_foreground) {
-    if (diagnostics == nullptr) { return; }
-    std::array<int64_t, 4> declared_bbox{};
-    if (!read_declared_bbox(record, &declared_bbox)) { return; }
-    const std::array<int64_t, 4> mask_bbox = source_bounds.diagnostic_bbox();
-    if (declared_bbox == mask_bbox) { return; }
-    CompileDiagnostic diagnostic = make_resize_diagnostic(CompileDiagnosticKind::kSourceBoundingBoxMismatch, annotation_file, class_name, line_number,
-                                                          source_dims, target_width, target_height, source_foreground);
-    diagnostic.declared_bbox = declared_bbox;
-    diagnostic.mask_bbox = mask_bbox;
-    append_diagnostic(diagnostics, std::move(diagnostic));
-}
-size_t checked_run_end(const RLEPair& pair, size_t mask_pixels) {
-    const size_t start = pair.start;
-    const size_t length = pair.length;
-    if (start > mask_pixels || length > mask_pixels - start) { throw std::runtime_error("mask_rle run exceeds image bounds"); }
-    return start + length;
-}
-void materialize_mask_row_major(const std::vector<RLEPair>& input_pairs, const ImageDimensions& source_dims, std::vector<uint8_t>& source_mask_scratch,
-                                MaskBounds* source_bounds = nullptr) {
-    const size_t source_pixels = static_cast<size_t>(source_dims.width) * source_dims.height;
-    if (source_mask_scratch.size() != source_pixels) { source_mask_scratch.resize(source_pixels); }
-    std::ranges::fill(source_mask_scratch, uint8_t{0});
-    for (const RLEPair& pair : input_pairs) {
-        const size_t start = pair.start;
-        const size_t end = checked_run_end(pair, source_pixels);
-        std::fill(source_mask_scratch.data() + start, source_mask_scratch.data() + end, uint8_t{1});
-        if (source_bounds != nullptr) { source_bounds->include_row_major_run(start, end, source_dims.width); }
-    }
-}
-ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask, uint32_t target_width, uint32_t target_height) {
-    ResizedMask resized;
-    const size_t target_pixels = static_cast<size_t>(target_width) * target_height;
-    if (target_pixels == 0 || dense_mask == nullptr) { return resized; }
-    const __m256i zero = _mm256_setzero_si256();
-    MaskBounds bounds({target_width, target_height});
-    size_t cursor = 0;
-    while (cursor < target_pixels) {
-        while (cursor + 32 <= target_pixels) {
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
-            const auto nonzero_mask = static_cast<uint32_t>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
-            if (nonzero_mask != 0) {
-                cursor += static_cast<uint32_t>(__builtin_ctz(nonzero_mask));
-                goto found_start;
-            }
-            cursor += 32;
-        }
-        while (cursor < target_pixels && dense_mask[cursor] == 0) { ++cursor; }
-        if (cursor >= target_pixels) { break; }
-    found_start:;
-        const size_t run_start = cursor;
-        while (cursor + 32 <= target_pixels) {
-            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
-            const auto zero_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
-            if (zero_mask != 0) {
-                cursor += static_cast<uint32_t>(__builtin_ctz(zero_mask));
-                goto found_end;
-            }
-            cursor += 32;
-        }
-        while (cursor < target_pixels && dense_mask[cursor] != 0) { ++cursor; }
-    found_end:;
-        resized.rle_pairs.push_back({
-            checked_cast<uint32_t>(run_start, "resized mask run start overflow"),
-            checked_cast<uint32_t>(cursor - run_start, "resized mask run length overflow"),
-        });
-        bounds.include_row_major_run(run_start, cursor, target_width);
-    }
-    resized.has_foreground = bounds.has_foreground;
-    if (bounds.has_foreground) { resized.bbox = bounds.bbox(); }
-    return resized;
-}
-void clear_mask_letterbox_padding(std::vector<uint8_t>& target_mask, const uint32_t target_width, const uint32_t target_height,
-                                  const mmltk::backend::imaging::resample::RgbLetterbox& letterbox) {
-    const size_t top_pixels = static_cast<size_t>(letterbox.offset_y) * target_width;
-    if (top_pixels != 0U) { std::fill_n(target_mask.data(), top_pixels, uint8_t{0}); }
-    const uint32_t right = target_width - letterbox.offset_x - letterbox.resized_width;
-    if (letterbox.offset_x != 0U || right != 0U) {
-        for (uint32_t row = 0U; row < letterbox.resized_height; ++row) {
-            uint8_t* target_row = target_mask.data() + static_cast<size_t>(letterbox.offset_y + row) * target_width;
-            std::fill_n(target_row, letterbox.offset_x, uint8_t{0});
-            std::fill_n(target_row + letterbox.offset_x + letterbox.resized_width, right, uint8_t{0});
-        }
-    }
-    const uint32_t content_end_y = letterbox.offset_y + letterbox.resized_height;
-    const size_t bottom_pixels = static_cast<size_t>(target_height - content_end_y) * target_width;
-    if (bottom_pixels != 0U) { std::fill_n(target_mask.data() + static_cast<size_t>(content_end_y) * target_width, bottom_pixels, uint8_t{0}); }
-}
-ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs, const ImageDimensions& source_dims, uint32_t target_width, uint32_t target_height,
-                                  const mmltk::backend::imaging::resample::RgbLetterbox& letterbox, std::vector<uint8_t>& source_mask_scratch,
-                                  std::vector<uint8_t>& target_mask_scratch, MaskResizeLookup& resize_lookup, MaskBounds* source_bounds) {
-    ResizedMask resized;
-    if (input_pairs.empty()) { return resized; }
-    const size_t target_pixels = static_cast<size_t>(target_width) * target_height;
-    materialize_mask_row_major(input_pairs, source_dims, source_mask_scratch, source_bounds);
-    if (target_mask_scratch.size() != target_pixels) { target_mask_scratch.resize(target_pixels); }
-    clear_mask_letterbox_padding(target_mask_scratch, target_width, target_height, letterbox);
-    resize_lookup.prepare(source_dims, letterbox.resized_width, letterbox.resized_height);
-    for (uint32_t y = 0; y < letterbox.resized_height; ++y) {
-        const uint32_t src_y = resize_lookup.source_y[y];
-        const uint8_t* src_row = source_mask_scratch.data() + static_cast<size_t>(src_y) * source_dims.width;
-        uint8_t* dst_row = target_mask_scratch.data() + static_cast<size_t>(letterbox.offset_y + y) * target_width + letterbox.offset_x;
-        for (uint32_t x = 0; x < letterbox.resized_width; ++x) { dst_row[x] = src_row[resize_lookup.source_x[x]] != 0 ? 1u : 0u; }
-    }
-    return encode_dense_mask_row_major(target_mask_scratch.data(), target_width, target_height);
+    if (diagnostics == nullptr) return;
+    try { diagnostics->push_back(std::move(diagnostic)); } catch (...) {}
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std::filesystem::path& image_file,
                          const std::unordered_map<std::string, uint8_t>& class_map, const CompilerConfig& config, ResizeObservation* resize_observation,
-                         std::vector<uint8_t>& source_mask_scratch, std::vector<uint8_t>& target_mask_scratch, MaskResizeLookup& resize_lookup,
+                         dataset::MaskResizeScratch& mask_scratch,
                          std::vector<CompileDiagnostic>* diagnostics) {
     mmltk::common::logging::ScopedProfile profile{"compiler.labels.parse_jsonl"};
     ParsedLabels parsed_labels;
@@ -392,9 +196,9 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
     const uint32_t target_width = config.target_width;
     const uint32_t target_height = config.target_height;
     const bool exact_target = source_dims.width == target_width && source_dims.height == target_height;
-    const mmltk::backend::imaging::resample::RgbLetterbox letterbox =
-        exact_target ? mmltk::backend::imaging::resample::RgbLetterbox{target_width, target_height, 0U, 0U}
-                     : mmltk::backend::imaging::resample::compute_rgb_letterbox(source_dims.width, source_dims.height, target_width, target_height);
+    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
+        exact_target ? mmltk::backend::imaging::resample::ImageResizeGeometry{target_width, target_height, 0U, 0U}
+                     : mmltk::backend::imaging::resample::compute_image_resize_geometry(source_dims.width, source_dims.height, target_width, target_height, config.resize_mode);
     const bool needs_resize = !exact_target;
     const bool needs_downscale = source_dims.width > letterbox.resized_width || source_dims.height > letterbox.resized_height;
     if (resize_observation != nullptr) {
@@ -412,6 +216,15 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
             throw std::runtime_error("invalid JSON annotation record in " + annotation_file.string() + " at line " + std::to_string(line_number));
         }
         validate_record_image_dimensions(record, annotation_file, source_dims);
+        if (record.contains("image_id")) {
+            const auto& value = record["image_id"];
+            if (!value.is_number_integer() || (!value.is_number_unsigned() && value.get<std::int64_t>() < 0))
+                throw std::runtime_error("image_id must be a nonnegative integer");
+            const auto id = value.get<std::uint64_t>();
+            if (parsed_labels.has_image_id && parsed_labels.image_id != id) throw std::runtime_error("inconsistent source image identities");
+            parsed_labels.image_id = id;
+            parsed_labels.has_image_id = true;
+        }
         const std::string class_name = record["class"].get<std::string>();
         auto class_it = class_map.find(class_name);
         if (class_it == class_map.end()) {
@@ -421,46 +234,89 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
         ParsedInstance instance{};
         instance.class_id = class_it->second;
         try {
-            if (!record.contains("mask_rle_encoding") || !record["mask_rle_encoding"].is_string() ||
-                record["mask_rle_encoding"].get_ref<const std::string&>() != "row_major_start_length") {
-                throw std::runtime_error("mask_rle_encoding must be 'row_major_start_length'");
+            auto& metadata = instance.metadata;
+            metadata.source_ordinal = line_number;
+            const auto read_flag = [&](const char* name, const std::uint8_t bit) {
+                const auto field = record.find(name);
+                if (field == record.end()) return;
+                if (!field->is_boolean() && !field->is_number_integer()) throw std::runtime_error("annotation flag must be boolean or 0/1");
+                bool enabled = false;
+                if (field->is_boolean()) enabled = field->get<bool>();
+                else if (field->is_number_unsigned()) {
+                    const auto value = field->get<std::uint64_t>();
+                    if (value > 1U) throw std::runtime_error("annotation flag must be 0/1");
+                    enabled = value == 1U;
+                } else {
+                    const auto value = field->get<std::int64_t>();
+                    if (value != 0 && value != 1) throw std::runtime_error("annotation flag must be 0/1");
+                    enabled = value == 1;
+                }
+                if (enabled) metadata.flags |= bit;
+            };
+            read_flag("iscrowd", kAnnotationCrowd);
+            read_flag("ignore", kAnnotationIgnore);
+            const auto read_identity = [&](const char* name, const std::uint8_t bit) -> std::uint64_t {
+                const auto field = record.find(name);
+                if (field == record.end()) return 0U;
+                if (!field->is_number_integer() || (field->is_number_integer() && !field->is_number_unsigned() && field->get<std::int64_t>() < 0))
+                    throw std::runtime_error("annotation identity must be a nonnegative integer");
+                metadata.flags |= bit;
+                return field->get<std::uint64_t>();
+            };
+            metadata.annotation_id = read_identity("id", kAnnotationId);
+            metadata.source_category_id = read_identity("category_id", kAnnotationCategory);
+            const bool has_mask = record.contains("mask_rle");
+            ParsedRle parsed_rle;
+            if (has_mask) {
+                if (record.value("mask_rle_encoding", std::string{}) != "row_major_start_length" || !record["mask_rle"].is_string())
+                    throw std::runtime_error("mask_rle requires row_major_start_length string encoding");
+                metadata.flags |= kAnnotationMask;
+                parsed_rle = parse_rle(record["mask_rle"].get_ref<const std::string&>());
             }
-            if (!record.contains("mask_rle") || !record["mask_rle"].is_string()) { throw std::runtime_error("mask_rle must be a string"); }
-            ParsedRle parsed_rle = parse_rle(record["mask_rle"].get_ref<const std::string&>());
-            if (parsed_rle.pairs.empty()) { throw std::runtime_error("mask_rle has no foreground"); }
-            const size_t source_foreground = parsed_rle.foreground;
-            instance.rle_pairs = std::move(parsed_rle.pairs);
-            MaskBounds source_bounds(source_dims);
-            MaskBounds* const source_bounds_out = diagnostics != nullptr ? &source_bounds : nullptr;
-            if (needs_resize) {
-                ResizedMask resized = resize_mask_row_major(instance.rle_pairs, source_dims, target_width, target_height, letterbox, source_mask_scratch,
-                                                            target_mask_scratch, resize_lookup, source_bounds_out);
-                if (source_bounds_out != nullptr) {
-                    append_source_bbox_mismatch(diagnostics, record, annotation_file, class_name, line_number, source_dims, target_width, target_height,
-                                                source_bounds, source_foreground);
+            const auto source_bounds = dataset::row_major_mask_bounds(parsed_rle.pairs, source_dims);
+            std::array<double, 4> source_box{};
+            if (record.contains("bbox_xyxy")) {
+                const auto& box = record["bbox_xyxy"];
+                if (!box.is_array() || box.size() != 4U) throw std::runtime_error("bbox_xyxy must have four numeric coordinates");
+                for (size_t coordinate = 0; coordinate < 4U; ++coordinate) {
+                    if (!box[coordinate].is_number()) throw std::runtime_error("bbox_xyxy coordinates must be numeric");
+                    source_box[coordinate] = box[coordinate].get<double>();
                 }
-                if (!resized.has_foreground) {
-                    if (diagnostics != nullptr) {
-                        append_diagnostic(diagnostics, make_resize_diagnostic(CompileDiagnosticKind::kDroppedInstanceAfterResize, annotation_file, class_name,
-                                                                              line_number, source_dims, target_width, target_height, source_foreground));
-                    }
-                    ++parsed_labels.dropped_instances;
-                    mmltk::common::logging::profile_add_value("compiler.labels.dropped_instances", 1);
-                    continue;
-                }
-                instance.rle_pairs = std::move(resized.rle_pairs);
-                instance.bbox = resized.bbox;
             } else {
-                materialize_mask_row_major(instance.rle_pairs, source_dims, source_mask_scratch, source_bounds_out);
-                ResizedMask decoded = encode_dense_mask_row_major(source_mask_scratch.data(), source_dims.width, source_dims.height);
-                if (!decoded.has_foreground) { throw std::runtime_error("mask_rle has no foreground"); }
-                if (source_bounds_out != nullptr) {
-                    append_source_bbox_mismatch(diagnostics, record, annotation_file, class_name, line_number, source_dims, target_width, target_height,
-                                                source_bounds, source_foreground);
-                }
-                instance.rle_pairs = std::move(decoded.rle_pairs);
-                instance.bbox = decoded.bbox;
+                if (!source_bounds.has_foreground) throw std::runtime_error("annotation requires a bbox or a nonempty source mask");
+                source_box = {static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y),
+                              static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
             }
+            if (!std::ranges::all_of(source_box, [](double value) { return std::isfinite(value); }) ||
+                source_box[2] <= source_box[0] || source_box[3] <= source_box[1]) throw std::runtime_error("invalid source bbox");
+            if (diagnostics != nullptr && has_mask && source_bounds.has_foreground && record.contains("bbox_xyxy")) {
+                const std::array<double, 4> mask_box{static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y),
+                                                     static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
+                if (source_box != mask_box) {
+                    CompileDiagnostic diagnostic;
+                    diagnostic.kind = CompileDiagnosticKind::kSourceBoundingBoxMismatch;
+                    diagnostic.annotation_path = annotation_file.string(); diagnostic.class_name = class_name; diagnostic.line = line_number;
+                    diagnostic.source_width = source_dims.width; diagnostic.source_height = source_dims.height;
+                    diagnostic.target_width = target_width; diagnostic.target_height = target_height;
+                    diagnostic.source_foreground = parsed_rle.foreground;
+                    diagnostic.declared_bbox = source_box; diagnostic.mask_bbox = mask_box;
+                    append_diagnostic(diagnostics, std::move(diagnostic));
+                }
+            }
+            metadata.original_area = record.contains("area") ? record["area"].get<double>() :
+                has_mask ? static_cast<double>(parsed_rle.foreground) : (source_box[2] - source_box[0]) * (source_box[3] - source_box[1]);
+            if (!std::isfinite(metadata.original_area) || metadata.original_area < 0.0) throw std::runtime_error("invalid annotation area");
+            for (size_t coordinate = 0; coordinate < 4U; ++coordinate) {
+                const bool x = (coordinate & 1U) == 0U;
+                const double scaled = source_box[coordinate] * (x ? letterbox.resized_width : letterbox.resized_height) /
+                                      (x ? source_dims.width : source_dims.height) + (x ? letterbox.offset_x : letterbox.offset_y);
+                constexpr double limit = std::numeric_limits<float>::max();
+                if (!std::isfinite(scaled) || scaled < -limit || scaled > limit) throw std::runtime_error("transformed bbox overflow");
+                instance.bbox[coordinate] = static_cast<float>(scaled);
+            }
+            if (instance.bbox[2] <= instance.bbox[0] || instance.bbox[3] <= instance.bbox[1])
+                throw std::runtime_error("transformed bbox loses strict corner ordering");
+            instance.rle_pairs = needs_resize ? dataset::resize_row_major_mask(parsed_rle.pairs, source_dims, {target_width, target_height}, letterbox, &mask_scratch).pairs : std::move(parsed_rle.pairs);
         } catch (const std::exception& error) {
             throw std::runtime_error(std::string(error.what()) + " in " + annotation_file.string() + " at line " + std::to_string(line_number) + " (source " +
                                      std::to_string(source_dims.width) + "x" + std::to_string(source_dims.height) + ", target " + std::to_string(target_width) +
@@ -479,7 +335,7 @@ size_t parsed_rle_pair_count(const std::vector<ParsedInstance>& instances) {
     return total_rle_pairs;
 }
 PackedInstance pack_instance(const ParsedInstance& instance) {
-    PackedInstance packed{};
+    PackedInstance packed = instance.metadata;
     packed.class_id = instance.class_id;
     packed.bbox_x1 = instance.bbox[0];
     packed.bbox_y1 = instance.bbox[1];
@@ -542,6 +398,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
         const auto class_id = static_cast<uint8_t>(normalized_id);
         if (seen_ids[class_id]) { throw std::runtime_error("duplicate class id in categories.json"); }
         seen_ids[class_id] = true;
+        scan.source_categories.emplace(category.name, static_cast<std::uint64_t>(category.raw_id));
         auto inserted = scan.class_map.emplace(category.name, class_id);
         if (!inserted.second) { throw std::runtime_error("duplicate class name in categories.json"); }
     }
@@ -570,7 +427,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
     return scan;
 }
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config,
-                               const std::unordered_map<std::string, uint8_t>& class_map, int num_workers, const std::span<const int> worker_cpus,
+                               const std::unordered_map<std::string, uint8_t>& class_map, const std::unordered_map<std::string, std::uint64_t>& source_categories, int num_workers, const std::span<const int> worker_cpus,
                                ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
                                const mmltk::common::concurrency::CancellationObservation cancellation) {
     mmltk::common::logging::ScopedProfile profile{"compiler.labels.build_blocks"};
@@ -608,6 +465,8 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
 #endif
         return total_dropped_instances;
     };
+    std::array<std::uint64_t, MAX_CLASSES> source_category_ids{};
+    for (const auto& [name, dense] : class_map) source_category_ids[dense] = source_categories.at(name);
     std::atomic<bool> any_image_resize{false};
     std::atomic<bool> any_image_downscale{false};
     std::atomic<bool> worker_cancelled{false};
@@ -622,9 +481,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
 #if MMLTK_ENABLE_PROFILING
             const auto worker_start = std::chrono::steady_clock::now();
 #endif
-            std::vector<uint8_t> source_mask_scratch;
-            std::vector<uint8_t> target_mask_scratch;
-            MaskResizeLookup resize_lookup;
+            dataset::MaskResizeScratch mask_scratch;
             ProgressBatch progress(completed_images);
             std::vector<CompileDiagnostic>* diagnostics = worker_diagnostics.empty() ? nullptr : &worker_diagnostics[static_cast<size_t>(worker_id)];
             for (uint32_t image_index = start; image_index < end; ++image_index) {
@@ -638,10 +495,12 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
                 try {
                     ResizeObservation resize_observation;
                     ParsedLabels parsed_labels = parse_jsonl(annotation_path(split_dir, image_index), image_path(split_dir, image_index), class_map, config,
-                                                             &resize_observation, source_mask_scratch, target_mask_scratch, resize_lookup, diagnostics);
+                                                             &resize_observation, mask_scratch, diagnostics);
                     if (resize_observation.needs_resize) { any_image_resize.store(true, std::memory_order_relaxed); }
                     if (resize_observation.needs_downscale) { any_image_downscale.store(true, std::memory_order_relaxed); }
                     WorkerResult& result = worker_results[image_index];
+                    result.has_image_id = parsed_labels.has_image_id;
+                    result.image_id = parsed_labels.image_id;
                     result.original_width = resize_observation.source_dimensions.width;
                     result.original_height = resize_observation.source_dimensions.height;
                     std::vector<ParsedInstance>& instances = parsed_labels.instances;
@@ -649,7 +508,12 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
                     const size_t instance_rle_pairs = parsed_rle_pair_count(instances);
                     result.rle_pairs.reserve(instance_rle_pairs);
                     for (const ParsedInstance& instance : instances) {
-                        result.labels.push_back(pack_instance(instance));
+                        auto packed = pack_instance(instance);
+                        if ((packed.flags & kAnnotationCategory) == 0U) {
+                            packed.source_category_id = source_category_ids[packed.class_id];
+                            packed.flags |= kAnnotationCategory;
+                        }
+                        result.labels.push_back(packed);
                         result.rle_pairs.insert(result.rle_pairs.end(), instance.rle_pairs.begin(), instance.rle_pairs.end());
                     }
 #if MMLTK_ENABLE_PROFILING
@@ -694,6 +558,8 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
         for (uint32_t image_index = 0; image_index < num_images; ++image_index) {
             WorkerResult& result = worker_results[image_index];
             ImageEntry& entry = blocks.index[image_index];
+            entry.has_source_image_id = result.has_image_id;
+            entry.source_image_id = result.image_id;
             entry.original_width = result.original_width;
             entry.original_height = result.original_height;
             entry.num_instances = checked_cast<uint16_t>(result.labels.size(), "too many instances for one image");

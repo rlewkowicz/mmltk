@@ -37,7 +37,7 @@ void hwc_uint8_to_nchw_float(const uint8_t* src, float* dst, int height, int wid
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePixelRange& pixel_blob, uint32_t image_index, uint32_t target_width,
                         uint32_t target_height, mmltk::backend::imaging::resample::RgbImageResizer& image_resizer, size_t image_stride,
-                        std::vector<uint8_t>& resize_scratch) {
+                        std::vector<uint8_t>& resize_scratch, mmltk::backend::imaging::resample::ImageResizeMode resize_mode) {
     const int width = checked_cast<int>(target_width, "image width too large");
     const int height = checked_cast<int>(target_height, "image height too large");
     const std::filesystem::path img_path = image_path(split_dir, image_index);
@@ -58,8 +58,8 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
         hwc_uint8_to_nchw_float(raw_pixels.get(), dst, height, width);
         return;
     }
-    const mmltk::backend::imaging::resample::RgbLetterbox letterbox =
-        mmltk::backend::imaging::resample::compute_rgb_letterbox(source_width, source_height, target_width, target_height);
+    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
+        mmltk::backend::imaging::resample::compute_image_resize_geometry(source_width, source_height, target_width, target_height, resize_mode);
     const uint8_t* src_pixels = raw_pixels.get();
     if (static_cast<uint32_t>(raw_width) != letterbox.resized_width || static_cast<uint32_t>(raw_height) != letterbox.resized_height) {
         const size_t resized_bytes = static_cast<size_t>(letterbox.resized_width) * letterbox.resized_height * 3U;
@@ -96,7 +96,7 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
 void decode_pixel_worker(const std::filesystem::path& split_dir, const WritablePixelRange& pixel_blob, std::atomic<uint32_t>& next_image, uint32_t num_images,
                          uint32_t target_width, uint32_t target_height, size_t image_stride, int resize_threads_per_image, bool perceptual_downscale,
                          ProgressCounter* completed_images, mmltk::common::concurrency::CancellationObservation cancel_requested,
-                         std::atomic<bool>* failure_requested) {
+                         std::atomic<bool>* failure_requested, mmltk::backend::imaging::resample::ImageResizeMode resize_mode) {
     mmltk::common::logging::ScopedProfile profile{"compiler.pixels.decode_worker"};
     mmltk::backend::imaging::resample::RgbImageResizer image_resizer(resize_threads_per_image, perceptual_downscale);
     std::vector<uint8_t> resize_scratch;
@@ -106,7 +106,7 @@ void decode_pixel_worker(const std::filesystem::path& split_dir, const WritableP
         const uint32_t image_index = next_image.fetch_add(1, std::memory_order_relaxed);
         if (image_index >= num_images) { break; }
         try {
-            decode_pixel_image(split_dir, pixel_blob, image_index, target_width, target_height, image_resizer, image_stride, resize_scratch);
+            decode_pixel_image(split_dir, pixel_blob, image_index, target_width, target_height, image_resizer, image_stride, resize_scratch, resize_mode);
             progress.increment();
         } catch (...) {
             if (failure_requested != nullptr) { failure_requested->store(true, std::memory_order_relaxed); }
@@ -134,7 +134,7 @@ void write_pixel_blob(const FileHandle& fd, const PixelBlobWriteRequest& request
         }
         decode_pixel_worker(request.split_dir, pixel_blob, next_image, request.num_images, request.width, request.height, request.image_stride,
                             resize_plan.resize_threads_per_image, request.perceptual_downscale, request.completed_images, request.cancel_requested,
-                            request.failure_requested);
+                            request.failure_requested, request.resize_mode);
     });
 }
 }  // namespace mmltk::backend::data::compiler_internal

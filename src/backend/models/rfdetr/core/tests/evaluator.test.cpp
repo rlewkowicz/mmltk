@@ -196,7 +196,7 @@ TEST_CASE("evaluation areas use original geometry and preserve the inclusive 96 
     CHECK(*summary.bbox.area_ap[1] == Approx(1.0));
     REQUIRE(summary.bbox.area_ap[2]);
     CHECK(*summary.bbox.area_ap[2] == Approx(1.0));
-    CHECK_THROWS_AS(fixture.loader->letterbox(1U), std::out_of_range);
+    CHECK_THROWS_AS(fixture.loader->geometry(1U), std::out_of_range);
     CHECK_THROWS_AS(match(owner, 1, {}, 10), std::out_of_range);
     CHECK_THROWS_AS(owner.evaluate(0U, r::EvaluationDetailRetention::Detailed), std::invalid_argument);
 }

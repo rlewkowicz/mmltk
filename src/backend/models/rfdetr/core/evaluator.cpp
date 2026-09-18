@@ -452,7 +452,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     out.image_area_scale_.resize(image_count);
     for (size_t image = 0; image < image_count; ++image) {
         const auto& entry = loader.image_entry(static_cast<std::uint32_t>(image));
-        const auto geometry = loader.letterbox(static_cast<std::uint32_t>(image));
+        const auto geometry = loader.geometry(static_cast<std::uint32_t>(image));
         out.image_area_scale_[image] =
             (static_cast<double>(entry.original_width) / geometry.resized_width) * (static_cast<double>(entry.original_height) / geometry.resized_height);
     }

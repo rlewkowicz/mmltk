@@ -360,8 +360,8 @@ void test_benchmark_annotation_indexes() {
     const std::string digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(coco));
     NormalizedAnnotationIndex parsed = parse_coco_style_annotations(coco, digest, mappings, options);
     REQUIRE(parsed.images.size() == 2U);
-    REQUIRE(parsed.boxes.size() == 1U);
-    REQUIRE(parsed.rejected.duplicate_boxes == 1U);
+    REQUIRE(parsed.boxes.size() == 2U);
+    REQUIRE(parsed.rejected.duplicate_boxes == 0U);
     REQUIRE(parsed.rejected.degenerate_boxes == 1U);
     REQUIRE(parsed.rejected.unmapped_categories == 1U);
     parsed.rejected = {
@@ -371,20 +371,20 @@ void test_benchmark_annotation_indexes() {
     auto loaded = load_normalized_annotation_index(index_path, options.source, options.split, digest, {});
     if (!loaded.has_value()) { throw std::runtime_error("stored normalized annotation index did not reload"); }
     REQUIRE(loaded.value().images.size() == 2U);
-    REQUIRE(loaded.value().boxes.size() == 1U);
+    REQUIRE(loaded.value().boxes.size() == 2U);
     CHECK(loaded->rejected.raw_records == 101U);
     CHECK(loaded->rejected.unmapped_categories == 23U);
     CHECK(loaded->rejected.unknown_images == 37U);
     CHECK(loaded->rejected.malformed_records == 41U);
     CHECK(loaded->rejected.degenerate_boxes == 53U);
     CHECK(loaded->rejected.duplicate_boxes == 67U);
-    // Independent version-2 byte offsets and values protect the persisted format.
+    // Independent version-3 byte offsets and values protect the persisted format.
     std::ifstream persisted(index_path, std::ios::binary);
     std::uint32_t version = 0U;
     persisted.seekg(8);
     persisted.read(reinterpret_cast<char*>(&version), sizeof(version));
     REQUIRE(persisted.good());
-    CHECK(version == 2U);
+    CHECK(version == 3U);
     std::uint64_t image_offset = 0U;
     persisted.seekg(36);
     persisted.read(reinterpret_cast<char*>(&image_offset), sizeof(image_offset));
@@ -408,9 +408,9 @@ void test_benchmark_annotation_indexes() {
     const fs::path boxes = root.path() / "boxes.csv";
     write_text(classes, "/m/person,Person\n");
     write_text(boxes,
-               "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax\n"
-               "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9\n"
-               "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9\n"
+               "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax,IsOccluded,IsTruncated,IsGroupOf\n"
+               "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9,0,0,0\n"
+               "0000000000000001,xclick,/m/person,1,0.1,0.8,0.2,0.9,0,0,1\n"
                "0000000000000001,xclick,/m/person,1,0.5,0.5,0.2,0.9\n");
     const std::array<StringCategoryMapping, 1> open_mappings{{
         {"/m/person", 0U, "Person"},
@@ -422,8 +422,12 @@ void test_benchmark_annotation_indexes() {
     NormalizedAnnotationIndex open =
         parse_open_images_annotations(boxes, classes, mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(boxes)), open_mappings, open_options);
     REQUIRE(open.images.size() == 1U);
-    REQUIRE(open.boxes.size() == 1U);
-    REQUIRE(open.rejected.duplicate_boxes == 1U);
+    REQUIRE(open.boxes.size() == 2U);
+    REQUIRE(open.rejected.duplicate_boxes == 0U);
+    CHECK(open.boxes[0].source_ordinal < open.boxes[1].source_ordinal);
+    CHECK(decode_open_images_category(open.boxes[0].source_category_id) == "/m/person");
+    CHECK((open.boxes[0].flags & kAnnotationCrowd) == 0U);
+    CHECK((open.boxes[1].flags & kAnnotationCrowd) != 0U);
     REQUIRE(open.rejected.degenerate_boxes == 1U);
 }
 void test_benchmark_supplemental_sampling() {
@@ -631,15 +635,15 @@ void test_benchmark_cached_image_writer_and_loader() {
     split.name = "validation";
     split.class_names = {"person"};
     split.sources.push_back(CachedImageSource{image_root});
-    const mmltk::backend::imaging::resample::RgbLetterbox letterbox =
-        mmltk::backend::imaging::resample::compute_rgb_letterbox(16U, 8U, kNanoResolution, kNanoResolution);
+    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
+        mmltk::backend::imaging::resample::compute_image_resize_geometry(16U, 8U, kNanoResolution, kNanoResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     REQUIRE(letterbox.resized_width == kNanoResolution);
     REQUIRE(letterbox.resized_height == 192U);
     REQUIRE(letterbox.offset_x == 0U);
     REQUIRE(letterbox.offset_y == 96U);
     split.labels = {
-        benchmark_letterbox_box(0U, 0.0F, 0.0F, 1.0F, 1.0F, letterbox),
-        benchmark_letterbox_box(0U, 0.125F, 0.25F, 0.875F, 0.75F, letterbox),
+        benchmark_canvas_box(0U, 0.0F, 0.0F, 1.0F, 1.0F, letterbox),
+        benchmark_canvas_box(0U, 0.125F, 0.25F, 0.875F, 0.75F, letterbox),
     };
     for (std::size_t index = 0U; index < ids.size(); ++index) {
         split.images.push_back(EncodedImageRecord{
@@ -663,6 +667,8 @@ void test_benchmark_cached_image_writer_and_loader() {
         {},
         {.context = &producer_events,
          .image_completed = [](void* context) { static_cast<std::atomic<std::uint64_t>*>(context)->fetch_add(1U, std::memory_order_relaxed); }},
+        false,
+        mmltk::backend::imaging::resample::ImageResizeMode::Letterbox,
     });
     REQUIRE(producer_events.load(std::memory_order_relaxed) == split.images.size());
     REQUIRE_FALSE(static_cast<bool>(benchmark_write_request(split, output, kNanoResolution).progress));
@@ -720,6 +726,7 @@ void test_benchmark_cached_image_writer_and_loader() {
     const auto cache_manifest_digest = mmltk::common::io::sha256_file(completion);
     auto perceptual_request = benchmark_write_request(split, root.path() / "perceptual.bin", kNanoResolution);
     perceptual_request.perceptual_downscale = true;
+    perceptual_request.resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
     write_benchmark_split(perceptual_request);
     // These sources enlarge; selecting perceptual shrinking changes no pixels or format facts.
     CHECK(mmltk::common::io::sha256_file(perceptual_request.output_path) == mmltk::common::io::sha256_file(output));
@@ -742,7 +749,9 @@ void test_benchmark_cached_image_writer_and_loader() {
         const auto manifest = read_json_file(staged / "benchmark_manifest.json");
         CHECK(manifest.at("resampling").at("perceptual_downscale").get<bool>() == perceptual);
         CHECK(manifest.at("resampling").at("version").get<unsigned>() == 1U);
-        CHECK(manifest.at("compiled_format_version").get<unsigned>() == 7U);
+        CHECK(manifest.at("compiled_format_version").get<unsigned>() == 8U);
+        CHECK(manifest.at("normalized_annotation_version").get<unsigned>() == 3U);
+        CHECK(manifest.at("resize_mode") == "stretch");
         CHECK(manifest.at("schema_version").get<unsigned>() == 3U);
         CHECK(manifest.at("image_cache").at(0) == raw_cache_identity);
         CHECK(manifest.at("resolution").get<unsigned>() == kNanoResolution);
@@ -904,3 +913,260 @@ TEST_CASE("benchmark event cancellation without progress", "[backend][data][benc
 }
 TEST_CASE("benchmark source status", "[backend][data][benchmark][progress]") { test_benchmark_cli_source_status_preserves_active_transfer_state(); }
 TEST_CASE("benchmark trace gate is lazy", "[backend][data][benchmark][trace]") { test_benchmark_trace_gate_is_lazy(); }
+TEST_CASE("benchmark annotations retain provenance crowd area masks and deterministic source order", "[backend][data][benchmark][annotations]") {
+    mmltk::testsupport::ScopedTempDir root("faithful-benchmark");
+    const auto path = root.path() / "annotations.json";
+    nlohmann::json document{{"images", {{{"id", 0}, {"width", 16}, {"height", 8}}}},
+                            {"categories", {{{"id", 1}, {"name", "person"}}, {{"id", 2}, {"name", "human"}}}},
+                            {"annotations", nlohmann::json::array()}};
+    for (unsigned ordinal = 0; ordinal != 128U; ++ordinal) {
+        document["annotations"].push_back({{"id", 127U - ordinal}, {"image_id", 0}, {"category_id", ordinal % 2U + 1U},
+                                           {"bbox", {-0.5, 1.25, 13.0, 5.5}}, {"area", 7.25}, {"iscrowd", ordinal % 2U},
+                                           {"ignore", true}, {"segmentation", nlohmann::json::array()}});
+    }
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1},
+                                       {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
+    write_text(path, document.dump());
+    const std::array<NumericCategoryMapping, 2> mappings{{{1U, 0U, "person"}, {2U, 0U, "human"}}};
+    AnnotationParseOptions options;
+    options.split = "train";
+    options.num_workers = 4;
+    const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+    const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
+    options.num_workers = 1;
+    const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
+    REQUIRE(parallel.boxes.size() == 129U);
+    REQUIRE(parallel.boxes.size() == sequential.boxes.size());
+    CHECK(std::memcmp(parallel.boxes.data(), sequential.boxes.data(), parallel.boxes.size() * sizeof(NormalizedBox)) == 0);
+    CHECK(parallel.rejected.duplicate_boxes == 0U);
+    for (unsigned ordinal = 0; ordinal != 128U; ++ordinal) {
+        const auto& box = parallel.boxes[ordinal];
+        CHECK(box.annotation_id == 127U - ordinal);
+        CHECK(box.source_category_id == ordinal % 2U + 1U);
+        CHECK(box.original_area == 7.25);
+        CHECK(box.x1 == -0.5F / 16.0F);
+        CHECK((box.flags & kAnnotationMask) != 0U);
+        CHECK((box.flags & kAnnotationIgnore) != 0U);
+        CHECK(((box.flags & kAnnotationCrowd) != 0U) == (ordinal % 2U != 0U));
+        CHECK(box.mask_rle_pairs == 0U);
+        if (ordinal) CHECK(parallel.boxes[ordinal - 1U].source_ordinal < box.source_ordinal);
+    }
+    CHECK(parallel.boxes.back().original_area == 1.0);
+    CHECK(parallel.boxes.back().x2 == 1.0F / 16.0F);
+    CHECK(parallel.boxes.back().y2 == 1.0F / 8.0F);
+    const auto cache = root.path() / "normalized.index";
+    store_normalized_annotation_index(cache, parallel, {});
+    const auto loaded = load_normalized_annotation_index(cache, options.source, options.split, digest, {});
+    REQUIRE(loaded);
+    REQUIRE(loaded->boxes.size() == parallel.boxes.size());
+    CHECK(std::memcmp(loaded->boxes.data(), parallel.boxes.data(), parallel.boxes.size() * sizeof(NormalizedBox)) == 0);
+    CHECK(decode_open_images_category(encode_open_images_category("/m/0h8my_4")) == "/m/0h8my_4");
+    CHECK_THROWS(encode_open_images_category("/m/toolongidentifier"));
+    CHECK_FALSE(valid_open_images_category(0U));
+    CHECK_FALSE(valid_open_images_category(0x610062U));
+}
+TEST_CASE("benchmark semantic admission isolates malformed masks and numeric overflow", "[backend][data][benchmark][annotations]") {
+    mmltk::testsupport::ScopedTempDir root("benchmark-admission");
+    const auto path = root.path() / "annotations.json";
+    nlohmann::json document{{"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}}},
+                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+    const nlohmann::json base{{"image_id", 0}, {"category_id", 1}, {"bbox", {-0.5, 1.25, 13.0, 5.5}}};
+    const auto append = [&](nlohmann::json record) { document["annotations"].push_back(std::move(record)); };
+    auto record = base;
+    record["segmentation"] = nlohmann::json::array(); append(record);
+    record.erase("bbox"); record["segmentation"] = {{"size", {8, 16}}, {"counts", {0, 1, 127}}}; append(record);
+    record = base; record["segmentation"] = {{0, 0, 2, 0, 2, 2, 0, 2}}; append(record);
+    record = base; record["segmentation"] = {{"size", {4, 4}}, {"counts", {16}}}; append(record);
+    record["segmentation"] = {{"size", {8, 16}}, {"counts", "!"}}; append(record);
+    record["segmentation"] = {{"size", {8, 16}}, {"counts", {127}}}; append(record);
+    record["segmentation"] = {{0, 0, 1, 1}}; append(record);
+    record = base; record["bbox"] = {1e100, 0.0, 1e100, 1.0}; append(record);
+    record["bbox"] = {0.0, 0.0, 1e200, 1e200}; append(record);
+    constexpr unsigned rejected_capacity = 4096U;
+    record = base; record["segmentation"] = {{"size", {8, 16}}, {"counts", {127}}};
+    for (unsigned rejected = 0; rejected < rejected_capacity; ++rejected) append(record);
+    write_text(path, document.dump());
+    const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
+    const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+    for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2}) {
+        AnnotationParseOptions options;
+        options.source = source; options.split = "train"; options.num_workers = 1;
+        const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
+        options.num_workers = 4;
+        const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
+        REQUIRE(sequential.boxes.size() == 3U);
+        REQUIRE(parallel.boxes.size() == sequential.boxes.size());
+        CHECK(parallel.rejected.raw_records == 9U + rejected_capacity);
+        CHECK(parallel.rejected.malformed_records == 6U + rejected_capacity);
+        CHECK(sequential.boxes.capacity() == sequential.boxes.size());
+        CHECK(parallel.boxes.capacity() == parallel.boxes.size());
+        CHECK(sequential.mask_rle_pairs.capacity() == sequential.mask_rle_pairs.size());
+        CHECK(parallel.mask_rle_pairs.capacity() == parallel.mask_rle_pairs.size());
+        CHECK(reject_json(parallel.rejected) == reject_json(sequential.rejected));
+        CHECK(std::memcmp(parallel.boxes.data(), sequential.boxes.data(), parallel.boxes.size() * sizeof(NormalizedBox)) == 0);
+        REQUIRE(parallel.mask_rle_pairs.size() == sequential.mask_rle_pairs.size());
+        CHECK(std::memcmp(parallel.mask_rle_pairs.data(), sequential.mask_rle_pairs.data(), parallel.mask_rle_pairs.size() * sizeof(RLEPair)) == 0);
+        CHECK((parallel.boxes[0].flags & kAnnotationMask) != 0U);
+        CHECK(parallel.boxes[0].mask_rle_pairs == 0U);
+        CHECK(parallel.boxes[1].original_area == 1.0);
+        CHECK(parallel.boxes[2].original_area == 4.0);
+    }
+    const auto classes = root.path() / "classes.csv";
+    const auto boxes = root.path() / "boxes.csv";
+    write_text(classes, "/m/person,Person\n");
+    write_text(boxes, "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax\n"
+                      "0000000000000000,xclick,/m/person,1,-0.1,0.8,0.2,0.9\n"
+                      "0000000000000000,xclick,/m/person,1,1e100,2e100,0.2,0.9\n"
+                      "0000000000000000,xclick,/m/person,1,0,1e200,0,1e200\n");
+    const std::array<StringCategoryMapping, 1> open_mappings{{{"/m/person", 0U, "Person"}}};
+    AnnotationParseOptions options;
+    options.source = BenchmarkDatasetSource::kOpenImagesV7; options.split = "train"; options.num_workers = 1;
+    const auto sequential = parse_open_images_annotations(boxes, classes, digest, open_mappings, options);
+    options.num_workers = 4;
+    const auto parallel = parse_open_images_annotations(boxes, classes, digest, open_mappings, options);
+    REQUIRE(parallel.boxes.size() == 1U);
+    CHECK(parallel.boxes[0].x1 == -0.1F);
+    CHECK(parallel.rejected.raw_records == 3U);
+    CHECK(parallel.rejected.malformed_records == 2U);
+    CHECK(reject_json(parallel.rejected) == reject_json(sequential.rejected));
+}
+TEST_CASE("normalized benchmark caches require source category presence", "[backend][data][benchmark][annotations]") {
+    mmltk::testsupport::ScopedTempDir root("normalized-provenance");
+    const std::string digest(64U, '0');
+    for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kOpenImagesV7}) {
+        NormalizedAnnotationIndex index;
+        index.source = source; index.split = "train"; index.annotation_sha256 = digest;
+        index.images.push_back(NormalizedImage{0U, 0U, 1U, 1U, 1U, 0U, 0U});
+        NormalizedBox box;
+        box.x2 = 1.0F; box.y2 = 1.0F; box.original_area = 1.0;
+        box.flags = kAnnotationCategory;
+        box.source_category_id = source == BenchmarkDatasetSource::kOpenImagesV7 ? encode_open_images_category("/m/person") : 0U;
+        index.boxes.push_back(box);
+        const auto path = root.path() / "normalized.index";
+        store_normalized_annotation_index(path, index, {});
+        REQUIRE(load_normalized_annotation_index(path, source, "train", digest, {}));
+        box.flags &= ~kAnnotationCategory;
+        box.source_category_id = 0U;
+        index.boxes[0] = box;
+        CHECK_THROWS(store_normalized_annotation_index(root.path() / "missing.index", index, {}));
+        // Version 3 has a 256-byte header followed by this one image record.
+        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+        REQUIRE(file.is_open());
+        file.seekp(256U + sizeof(NormalizedImage));
+        file.write(reinterpret_cast<const char*>(&box), sizeof(box));
+        file.close();
+        CHECK_FALSE(load_normalized_annotation_index(path, source, "train", digest, {}));
+    }
+}
+TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[backend][data][benchmark][annotations]") {
+    mmltk::testsupport::ScopedTempDir root("bbox-first-admission");
+    const auto path = root.path() / "annotations.json";
+    nlohmann::ordered_json document{{"images", {
+                                {{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}},
+                                {{"id", 1}, {"width", 4096}, {"height", 4096}, {"file_name", "patch0/1.jpg"}}}},
+                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::ordered_json::array()}};
+    // Invalid compressed RLE must not override a supplied degenerate bbox.
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 0, 1}},
+                                       {"segmentation", {{"size", {8, 16}}, {"counts", "!"}}}});
+    // This valid all-background mask would otherwise allocate 16 MiB.
+    document["annotations"].push_back({{"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, -1, 1}},
+                                       {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
+    // Normalized-float admission also runs before that mask can be allocated.
+    document["annotations"].push_back({{"image_id", 1}, {"category_id", 1}, {"bbox", {1e100, 0.0, 1e100, 1.0}},
+                                       {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {-1, -1, 3, 3}},
+                                       {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1},
+                                       {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
+    // Decode-time failures must remain irrelevant to a degenerate supplied box,
+    // even when segmentation is encountered before the box and identities.
+    const std::array<nlohmann::ordered_json, 3> invalid_segmentations{
+        nlohmann::ordered_json(false),
+        nlohmann::ordered_json{{"size", {8, 16}}},
+        nlohmann::ordered_json::array({nlohmann::ordered_json::array({0, 0, 1})})};
+    for (const auto& segmentation : invalid_segmentations) {
+        for (const bool segmentation_first : {false, true}) {
+            for (const int bbox_width : {0, 1}) {
+                nlohmann::ordered_json record = nlohmann::ordered_json::object();
+                if (segmentation_first) record["segmentation"] = segmentation;
+                record["image_id"] = 0; record["category_id"] = 1;
+                record["bbox"] = {0, 0, bbox_width, 1};
+                if (!segmentation_first) record["segmentation"] = segmentation;
+                document["annotations"].push_back(std::move(record));
+            }
+        }
+    }
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 1, 1}}, {"segmentation", nullptr}});
+    document["annotations"].push_back({{"segmentation", nlohmann::ordered_json::array()}, {"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 1, 1}}});
+    write_text(path, document.dump());
+    const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+    const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
+    for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2}) {
+        AnnotationParseOptions options;
+        options.source = source; options.split = "train"; options.num_workers = 1;
+        const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
+        options.num_workers = 4;
+        const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
+        CHECK(parallel.rejected.raw_records == 19U);
+        CHECK(parallel.rejected.degenerate_boxes == 8U);
+        CHECK(parallel.rejected.malformed_records == 7U);
+        CHECK(reject_json(parallel.rejected) == reject_json(sequential.rejected));
+        REQUIRE(parallel.boxes.size() == 4U);
+        REQUIRE(sequential.boxes.size() == parallel.boxes.size());
+        CHECK(std::memcmp(parallel.boxes.data(), sequential.boxes.data(), parallel.boxes.size() * sizeof(NormalizedBox)) == 0);
+        CHECK(parallel.boxes[0].x1 == -1.0F / 16.0F);
+        CHECK(parallel.boxes[0].x2 == 2.0F / 16.0F);
+        CHECK(parallel.boxes[1].x1 == 0.0F);
+        CHECK(parallel.boxes[1].x2 == 1.0F / 16.0F);
+        REQUIRE(parallel.mask_rle_pairs.size() == sequential.mask_rle_pairs.size());
+        CHECK(std::memcmp(parallel.mask_rle_pairs.data(), sequential.mask_rle_pairs.data(), parallel.mask_rle_pairs.size() * sizeof(RLEPair)) == 0);
+        CHECK((parallel.boxes[2].flags & kAnnotationMask) == 0U);
+        CHECK(parallel.boxes[2].original_area == 1.0);
+        CHECK((parallel.boxes[3].flags & kAnnotationMask) != 0U);
+        CHECK(parallel.boxes[3].original_area == 0.0);
+        CHECK(parallel.boxes[2].mask_rle_pairs == 0U);
+        CHECK(parallel.boxes[3].mask_rle_pairs == 0U);
+        for (const auto& box : std::span(parallel.boxes).first(2U)) {
+            CHECK(box.original_area == 1.0);
+            CHECK((box.flags & kAnnotationMask) != 0U);
+            REQUIRE(box.mask_rle_pairs == 1U);
+            CHECK(parallel.mask_rle_pairs[box.mask_rle_offset].start == 0U);
+            CHECK(parallel.mask_rle_pairs[box.mask_rle_offset].length == 1U);
+        }
+    }
+}
+TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordinates", "[backend][data][benchmark][annotations]") {
+    mmltk::testsupport::ScopedTempDir root("polygon-bounds");
+    const auto path = root.path() / "annotations.json";
+    nlohmann::json document{{"images", {{{"id", 0}, {"width", 4}, {"height", 4}}}},
+                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+    const std::array<std::vector<double>, 4> polygons{{
+        {-1e308, -1e308, 1e308, -1e308, 1e308, 1e308, -1e308, 1e308},
+        {1e308, 1e308, 1e308, 9e307, 9e307, 9e307},
+        {-0.5, -0.5, 3.5, -0.5, 3.5, 3.5, -0.5, 3.5},
+        {0.5, 0.5, 4.5, 0.5, 4.5, 4.5, 0.5, 4.5},
+    }};
+    for (const auto& polygon : polygons)
+        document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 4, 4}}, {"segmentation", {polygon}}});
+    write_text(path, document.dump());
+    const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
+    const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+    for (const unsigned workers : {1U, 4U}) {
+        AnnotationParseOptions options;
+        options.source = BenchmarkDatasetSource::kCoco2017; options.split = "train"; options.num_workers = workers;
+        const auto index = parse_coco_style_annotations(path, digest, mappings, options);
+        REQUIRE(index.boxes.size() == polygons.size());
+        CHECK(index.rejected.malformed_records == 0U);
+        for (std::size_t ordinal = 0; ordinal < polygons.size(); ++ordinal) {
+            std::array<bool, 16> actual{};
+            const auto& box = index.boxes[ordinal];
+            for (std::size_t run = 0; run < box.mask_rle_pairs; ++run) {
+                const auto pair = index.mask_rle_pairs[box.mask_rle_offset + run];
+                REQUIRE(pair.start + pair.length <= actual.size());
+                std::fill(actual.begin() + pair.start, actual.begin() + pair.start + pair.length, true);
+            }
+            for (unsigned pixel = 0; pixel < actual.size(); ++pixel)
+                CHECK(actual[pixel] == (ordinal == 0U || ordinal == 3U || (ordinal == 2U && pixel % 4U < 3U && pixel / 4U < 3U)));
+        }
+    }
+}
