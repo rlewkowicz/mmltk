@@ -5,7 +5,10 @@ use iced::{Event, Point, Rectangle, mouse};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Placement {
     Contain,
-    FixedGrid { columns: u32, rows: u32 },
+    FixedGrid {
+        columns: u32,
+        rows: u32,
+    },
     GalleryGrid {
         columns: u32,
         rows: u32,
@@ -336,9 +339,13 @@ pub(super) fn placement_geometry(
                 (bounds.width, bounds.width / aspect)
             }
         }
-        Placement::FixedGrid { columns, rows } if columns != 0 && rows != 0
-            && content.0 % columns == 0 && content.1 % rows == 0 => {
-            (bounds.width, bounds.width * content.1 as f32 / content.0 as f32)
+        Placement::FixedGrid { columns, rows }
+            if columns != 0 && rows != 0 && content.0 % columns == 0 && content.1 % rows == 0 =>
+        {
+            (
+                bounds.width,
+                bounds.width * content.1 as f32 / content.0 as f32,
+            )
         }
         Placement::FixedGrid { .. } => return None,
         Placement::GalleryGrid {
@@ -445,7 +452,9 @@ pub(super) fn geometry_key(
         .map_or([0.0, 0.0], |geometry| [geometry.width, geometry.height]);
     let (grid, gallery) = match placement {
         Placement::Contain => ([0, 0], 0),
-        Placement::GalleryGrid { columns, rows, .. } | Placement::FixedGrid { columns, rows } => ([columns, rows], 1),
+        Placement::GalleryGrid { columns, rows, .. } | Placement::FixedGrid { columns, rows } => {
+            ([columns, rows], 1)
+        }
     };
     GeometryKey {
         uv_scale: content_uv_scale(surface),
@@ -476,12 +485,30 @@ mod tests {
     use crate::view_model::test_support::physical_frame as frame_ready;
     #[test]
     fn rectangular_fixed_grid_shares_border_geometry_without_scroll_or_zoom() {
-        let bounds = Rectangle { x: 11.0, y: 17.0, width: 400.0, height: 450.0 };
-        let placement = Placement::FixedGrid { columns: 2, rows: 3 };
-        let transform = ViewTransform { zoom: 3.0, pan_x: 20.0, pan_y: 40.0 };
+        let bounds = Rectangle {
+            x: 11.0,
+            y: 17.0,
+            width: 400.0,
+            height: 450.0,
+        };
+        let placement = Placement::FixedGrid {
+            columns: 2,
+            rows: 3,
+        };
+        let transform = ViewTransform {
+            zoom: 3.0,
+            pan_x: 20.0,
+            pan_y: 40.0,
+        };
         let geometry = placement_geometry(bounds, (512, 576), placement, transform).unwrap();
-        assert_eq!((geometry.x, geometry.y, geometry.width, geometry.height), (11.0, 17.0, 400.0, 450.0));
-        assert_eq!(inverse_content_point(geometry, Point::new(211.0, 167.0), (512, 576)), Some((256.0, 192.0)));
+        assert_eq!(
+            (geometry.x, geometry.y, geometry.width, geometry.height),
+            (11.0, 17.0, 400.0, 450.0)
+        );
+        assert_eq!(
+            inverse_content_point(geometry, Point::new(211.0, 167.0), (512, 576)),
+            Some((256.0, 192.0))
+        );
         assert_eq!(placement.logical_extent((512, 576)), (512, 576));
     }
 

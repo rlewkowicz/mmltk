@@ -60,7 +60,7 @@ class FixtureSettingsSystem final {
     }
     [[= mmltk::controller::contracts::reflection::Snapshot{
         mmltk::controller::contracts::kSettingsUiStateByteBudget}]] [[nodiscard]] mmltk::controller::contracts::SettingsUiState snapshot() const {
-        return {.revision = 1U, .settings_state = state};
+        return {.revision = 1U, .settings_state = state, .validation_source = mmltk::controller::contracts::resolve_validation_source(state)};
     }
     mmltk::controller::contracts::GuiSettingsState state{};
     mmltk::controller::contracts::SettingsUpdateRequest latest{};

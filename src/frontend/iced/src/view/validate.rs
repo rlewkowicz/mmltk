@@ -73,14 +73,16 @@ impl Component {
             .fold(column![].spacing(6), |column, fact| {
                 column.push(
                     container(
-                        button("Open Dataset").style(crate::fluent_theme::button_primary).on_press_maybe(
-                            model
-                                .file_dialog_open_available(
-                                    fact,
-                                    crate::generated::FeatureId::Validate,
-                                )
-                                .then_some(Message::DialogRequested(fact.stable_field_id)),
-                        ),
+                        button("Open Dataset")
+                            .style(crate::fluent_theme::button_primary)
+                            .on_press_maybe(
+                                model
+                                    .file_dialog_open_available(
+                                        fact,
+                                        crate::generated::FeatureId::Validate,
+                                    )
+                                    .then_some(Message::DialogRequested(fact.stable_field_id)),
+                            ),
                     )
                     .id(format!("dialog.{}", fact.stable_field_id)),
                 )
@@ -91,7 +93,11 @@ impl Component {
                 .validation
                 .as_ref()
                 .map(|snapshot| &snapshot.operation)
-                .filter(|operation| operation.active || operation.terminal.outcome != crate::generated::ComputeOperationOutcome::Succeeded),
+                .filter(|operation| {
+                    operation.active
+                        || operation.terminal.outcome
+                            != crate::generated::ComputeOperationOutcome::Succeeded
+                }),
         );
         let setup = column![
             self.model_card
@@ -117,12 +123,18 @@ impl Component {
                     "Validation",
                     "",
                     column![
-                        text(draft.filter(|value| !value.request.compiledpath.is_empty())
-                            .map(|value| value.request.compiledpath.as_str())
-                            .or_else(|| model.settings_snapshot.as_ref().map(|value| value.validationsource.as_str()))
-                            .filter(|path| !path.is_empty())
-                            .unwrap_or("No dataset selected"))
-                            .size(12),
+                        text(
+                            draft
+                                .filter(|value| !value.request.compiledpath.is_empty())
+                                .map(|value| value.request.compiledpath.as_str())
+                                .or_else(|| model
+                                    .settings_snapshot
+                                    .as_ref()
+                                    .map(|value| value.validationsource.as_str()))
+                                .filter(|path| !path.is_empty())
+                                .unwrap_or("No dataset selected")
+                        )
+                        .size(12),
                         dialogs,
                     ]
                     .spacing(crate::view::workflow::FIELD_SPACING)
@@ -138,7 +150,9 @@ impl Component {
                         model.compute_start_available(draft, crate::generated::FeatureId::Validate)
                     })
                     .then_some(Message::StartRequested),
-                model.compute_stop_available(crate::generated::FeatureId::Validate).then_some(Message::StopRequested),
+                model
+                    .compute_stop_available(crate::generated::FeatureId::Validate)
+                    .then_some(Message::StopRequested),
                 progress,
             ),
         ]
@@ -152,22 +166,49 @@ impl Component {
         let paired = surface.and_then(crate::presentation_surface::drawable_validation);
         let headings = iced::widget::row![
             container(text("Metrics")).center_x(iced::Fill).width(half),
-            container(text("Validation Preview")).center_x(iced::Fill).width(half),
-        ].height(crate::view::aspect_ratio::HEADER_HEIGHT).align_y(iced::Center);
-        let atlas = self.samples.atlas(paired.clone(), settings, self.input.clone()).map(Message::Samples);
-        let controls = if paired.as_ref().is_some_and(|(_, content)| content.metadata.detail) {
+            container(text("Validation Preview"))
+                .center_x(iced::Fill)
+                .width(half),
+        ]
+        .height(crate::view::aspect_ratio::HEADER_HEIGHT)
+        .align_y(iced::Center);
+        let atlas = self
+            .samples
+            .atlas(paired.clone(), settings, self.input.clone())
+            .map(Message::Samples);
+        let controls = if paired
+            .as_ref()
+            .is_some_and(|(_, content)| content.metadata.detail)
+        {
             iced::widget::space::horizontal().height(47).into()
-        } else { self.samples.controls(model).map(Message::Samples) };
+        } else {
+            self.samples.controls(model).map(Message::Samples)
+        };
         let base = column![
             headings,
-            iced::widget::row![container(results::view(model)).width(half), container(atlas).width(half)]
-                .height(center * 9.0 / 16.0),
+            iced::widget::row![
+                container(results::view(model)).width(half),
+                container(atlas).width(half)
+            ]
+            .height(center * 9.0 / 16.0),
             controls,
-        ].spacing(crate::view::workflow::SECTION_SPACING).width(center);
-        let workspace = if let Some((surface, content)) = paired.filter(|(_, content)| content.metadata.detail) {
-            container(iced::widget::stack![base, self.samples.detail(surface, content, model, settings, self.input.clone()).map(Message::Samples)])
-                .clip(true).into()
-        } else { base.into() };
+        ]
+        .spacing(crate::view::workflow::SECTION_SPACING)
+        .width(center);
+        let workspace = if let Some((surface, content)) =
+            paired.filter(|(_, content)| content.metadata.detail)
+        {
+            container(iced::widget::stack![
+                base,
+                self.samples
+                    .detail(surface, content, model, settings, self.input.clone())
+                    .map(Message::Samples)
+            ])
+            .clip(true)
+            .into()
+        } else {
+            base.into()
+        };
         let advanced = crate::view::shared::card(
             "Advanced",
             "Validation execution and generated constraints.",
@@ -247,7 +288,9 @@ impl Component {
                 // CLEANUP-IGNORE: Validate closes its local settings outcome before workspace routing.
             ),
             Message::Samples(message) => {
-                let Some(message) = self.samples.update(message) else { return Ok(None); };
+                let Some(message) = self.samples.update(message) else {
+                    return Ok(None);
+                };
                 Outcome::Sample(message)
             }
         };

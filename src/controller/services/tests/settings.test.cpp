@@ -1686,7 +1686,6 @@ TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", 
 }
 TEST_CASE("test_copy_paste_default_and_persisted_overrides", "[gui][settings][copy_paste]") { test_copy_paste_default_and_persisted_overrides(); }
 TEST_CASE("test_apply_current_copy_paste_preference", "[.][acceptance][settings]") { test_apply_current_copy_paste_preference(); }
-
 TEST_CASE("checkpoint restore preserves output policy and installs explicit inherited splits", "[gui][settings][train]") {
     namespace c = mmltk::controller::contracts;
     using Value = mmltk::frameworks::serialization::wire::FlatValue;
@@ -1699,8 +1698,10 @@ TEST_CASE("checkpoint restore preserves output policy and installs explicit inhe
             c::SettingsUpdateRequest selected;
             selected.updates = {
                 {.path = "workflows.train.auto_output", .value = Value{automatic}},
-                {.path = "workflows.train.request.output_dir", .value = Value{std::string{automatic ? "" : "/selected/output"}}},
-                {.path = "workflows.validate.request.compiled_path", .value = Value{std::string{independent ? "/independent/val.bin" : ""}}},
+                {.path = "workflows.train.request.output_dir",
+                 .value = Value::text(automatic ? "" : "/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes).value()},
+                {.path = "workflows.validate.request.compiled_path",
+                 .value = Value::text(independent ? "/independent/val.bin" : "", mmltk::frameworks::reflection::kMaximumPathBytes).value()},
             };
             (void)settings.Update(std::move(selected));
             auto request = settings.snapshot().settings_state.workflows.train.request;
@@ -1727,23 +1728,22 @@ TEST_CASE("checkpoint restore preserves output policy and installs explicit inhe
         }
     }
 }
-
 TEST_CASE("manual output selection disables automatic output and enabling it clears the path", "[gui][settings][train]") {
     auto settings = mmltk::controller::contracts::default_gui_settings_state();
     REQUIRE(settings.workflows.train.auto_output);
     REQUIRE(settings.workflows.train.request.output_dir.empty());
     const mmltk::controller::contracts::SettingsValueUpdate selected{
-        .path = "workflows.train.request.output_dir", .value = mmltk::frameworks::serialization::wire::FlatValue{std::string{"/selected/output"}}};
+        .path = "workflows.train.request.output_dir",
+        .value = mmltk::frameworks::serialization::wire::FlatValue::text("/selected/output", mmltk::frameworks::reflection::kMaximumPathBytes).value()};
     REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&selected, 1}));
     REQUIRE_FALSE(settings.workflows.train.auto_output);
     REQUIRE(settings.workflows.train.request.output_dir == "/selected/output");
-    const mmltk::controller::contracts::SettingsValueUpdate automatic{
-        .path = "workflows.train.auto_output", .value = mmltk::frameworks::serialization::wire::FlatValue{true}};
+    const mmltk::controller::contracts::SettingsValueUpdate automatic{.path = "workflows.train.auto_output",
+                                                                      .value = mmltk::frameworks::serialization::wire::FlatValue{true}};
     REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&automatic, 1}));
     REQUIRE(settings.workflows.train.auto_output);
     REQUIRE(settings.workflows.train.request.output_dir.empty());
 }
-
 TEST_CASE("schema 8 output preferences preserve legacy destinations and persist canonically", "[gui][settings][train]") {
     struct Case {
         std::string_view name;
@@ -1769,8 +1769,10 @@ TEST_CASE("schema 8 output preferences preserve legacy destinations and persist 
         auto document = snapshot_gui_settings(expected);
         auto& training = document["workflows"]["train"]["training"];
         training["output_dir"] = test.path;
-        if (test.automatic.has_value()) training["auto_output"] = *test.automatic;
-        else training.erase("auto_output");
+        if (test.automatic.has_value())
+            training["auto_output"] = *test.automatic;
+        else
+            training.erase("auto_output");
         expected.workflows.train.auto_output = test.expected_automatic;
         expected.workflows.train.request.output_dir = test.expected_path;
         const auto path = write_recipe_case(root, "gui.json", document);
@@ -1779,7 +1781,6 @@ TEST_CASE("schema 8 output preferences preserve legacy destinations and persist 
         REQUIRE(load_settings(path, loaded, nullptr, &repaired));
         CHECK(loaded == expected);
         CHECK(repaired == test.repaired);
-
         mmltk::controller::SettingsSystem settings;
         REQUIRE(settings.Load(mmltk::controller::services::SettingsLocation{path.string()}).applied());
         CHECK(settings.snapshot().settings_state == expected);
@@ -1795,7 +1796,6 @@ TEST_CASE("schema 8 output preferences preserve legacy destinations and persist 
         CHECK_FALSE(repaired);
     }
 }
-
 TEST_CASE("partial training settings retain an unspecified output policy", "[gui][settings][train]") {
     for (const bool automatic : {false, true}) {
         auto settings = default_gui_settings_state();

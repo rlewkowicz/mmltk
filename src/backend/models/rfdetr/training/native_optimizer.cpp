@@ -166,7 +166,8 @@ torch::Tensor require_parameter_state_tensor(torch::serialize::InputArchive& arc
     }
     return materialize ? align_tensor_like_param(state_tensor, param) : state_tensor;
 }
-torch::Tensor require_adam_step_tensor(torch::serialize::InputArchive& archive, const torch::Tensor& param, const NativeOptimizerBackend backend, bool materialize) {
+torch::Tensor require_adam_step_tensor(torch::serialize::InputArchive& archive, const torch::Tensor& param, const NativeOptimizerBackend backend,
+                                       bool materialize) {
     auto step = mmltk::backend::ml::serialization::require_tensor(archive, "step");
     if (!step.defined() || !step.device().is_cpu() || step.dim() != 0 || step.scalar_type() != torch::kFloat32 || !torch::isfinite(step).item<bool>() ||
         step.item<float>() < 0.0F) {
@@ -412,7 +413,8 @@ void read_inspection_layout(torch::serialize::InputArchive& archive, const std::
 template <typename GroupConfig, typename ParamStateT>
 template <class Optimizer>
 std::vector<std::string> NativeOptimizerStorage<GroupConfig, ParamStateT>::inspect_checkpoint(torch::serialize::InputArchive& archive,
-                                                                                              const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
+                                                                                              const std::unordered_map<std::string, torch::Tensor>& tensors,
+                                                                                              std::stop_token stop) {
     Optimizer candidate;
     read_inspection_layout(archive, tensors, candidate.groups_, candidate.params_, stop);
     populate_named_parameter_views(candidate.params_, candidate.all_params_, candidate.all_param_names_, "invalid CPU checkpoint tensor");
@@ -550,9 +552,7 @@ void NativeAdamW::save(torch::serialize::OutputArchive& archive, mmltk::backend:
         mmltk::backend::ml::serialization::write_int(param_archive, "has_max_exp_avg_sq", state_[index].max_exp_avg_sq.defined() ? 1 : 0);
     });
 }
-void NativeAdamW::load(torch::serialize::InputArchive& archive, std::stop_token stop) {
-    read_checkpoint(archive, stop, true);
-}
+void NativeAdamW::load(torch::serialize::InputArchive& archive, std::stop_token stop) { read_checkpoint(archive, stop, true); }
 void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::stop_token stop, bool materialize) {
     validate_optimizer_archive_format(archive, kNativeAdamWFormat, kNativeAdamWFormatVersion, "AdamW");
     const auto stored_backend = parse_backend_name(mmltk::backend::ml::serialization::require_string(archive, "backend"));
@@ -567,15 +567,15 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
     }
     validate_archive_layout_counts(archive, groups_.size(), params_.size(), "native AdamW archive layout does not match the current optimizer");
     auto candidate_groups = groups_;
-    read_optimizer_group_archives(
-        archive, candidate_groups,
-        "native AdamW archive parameter group size does not match the "
-        "current optimizer",
-        "native AdamW archive parameter group order does not match the "
-        "current optimizer",
-        [stop](auto& group_archive, auto& config) {
-            if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
-            config.amsgrad = mmltk::backend::ml::serialization::require_int(group_archive, "amsgrad") != 0; });
+    read_optimizer_group_archives(archive, candidate_groups,
+                                  "native AdamW archive parameter group size does not match the "
+                                  "current optimizer",
+                                  "native AdamW archive parameter group order does not match the "
+                                  "current optimizer",
+                                  [stop](auto& group_archive, auto& config) {
+                                      if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+                                      config.amsgrad = mmltk::backend::ml::serialization::require_int(group_archive, "amsgrad") != 0;
+                                  });
     for (const auto& group : candidate_groups) {
         if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
         if (!std::isfinite(group.config.lr) || group.config.lr < 0.0 || !std::isfinite(group.config.weight_decay) || group.config.weight_decay < 0.0) {
@@ -593,10 +593,12 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
         auto loaded_step = require_adam_step_tensor(param_archive, param, backend_, materialize);
         auto loaded_exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
                                                              "native AdamW archive tensor shape "
-                                                             "does not match the current model", materialize);
+                                                             "does not match the current model",
+                                                             materialize);
         auto loaded_exp_avg_sq = require_parameter_state_tensor(param_archive, "exp_avg_sq", param,
                                                                 "native AdamW archive tensor shape "
-                                                                "does not match the current model", materialize);
+                                                                "does not match the current model",
+                                                                materialize);
         const bool has_max_exp_avg_sq = mmltk::backend::ml::serialization::require_int(param_archive, "has_max_exp_avg_sq") != 0;
         if (has_max_exp_avg_sq != uses_amsgrad[index]) { throw std::runtime_error("native AdamW archive AMSGrad state does not match the current optimizer"); }
         auto& state = candidate_state[index];
@@ -606,7 +608,8 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
         if (has_max_exp_avg_sq) {
             state.max_exp_avg_sq = require_parameter_state_tensor(param_archive, "max_exp_avg_sq", param,
                                                                   "native AdamW archive AMSGrad tensor shape does not match the "
-                                                                  "current model", materialize);
+                                                                  "current model",
+                                                                  materialize);
         } else {
             state.max_exp_avg_sq = torch::Tensor();
         }
@@ -614,8 +617,8 @@ void NativeAdamW::read_checkpoint(torch::serialize::InputArchive& archive, std::
     groups_.swap(candidate_groups);
     state_.swap(candidate_state);
 }
-std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputArchive& archive,
-                                                        const std::unordered_map<std::string, torch::Tensor>& tensors, std::stop_token stop) {
+std::vector<std::string> NativeAdamW::InspectCheckpoint(torch::serialize::InputArchive& archive, const std::unordered_map<std::string, torch::Tensor>& tensors,
+                                                        std::stop_token stop) {
     return inspect_checkpoint<NativeAdamW>(archive, tensors, stop);
 }
 NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params)
@@ -701,9 +704,7 @@ void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive, mmltk
         write_optimizer_state(param_archive, state_[index], readback, first_slot);
     });
 }
-void NativeMuonWithAuxAdam::load(torch::serialize::InputArchive& archive, std::stop_token stop) {
-    read_checkpoint(archive, stop, true);
-}
+void NativeMuonWithAuxAdam::load(torch::serialize::InputArchive& archive, std::stop_token stop) { read_checkpoint(archive, stop, true); }
 void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& archive, std::stop_token stop, bool materialize) {
     validate_optimizer_archive_format(archive, kNativeMuonFormat, kNativeMuonFormatVersion, "Muon");
     if (mmltk::backend::ml::serialization::require_int(archive, "ns_steps") != kMuonNsSteps ||
@@ -726,7 +727,7 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
                                   "native Muon archive parameter group order does not match the "
                                   "current optimizer",
                                   [stop](auto& group_archive, auto& config) {
-            if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+                                      if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
                                       config.momentum = mmltk::backend::ml::serialization::require_double(group_archive, "momentum");
                                       config.use_muon = mmltk::backend::ml::serialization::require_int(group_archive, "use_muon") != 0;
                                       config.nesterov = mmltk::backend::ml::serialization::require_int(group_archive, "nesterov") != 0;
@@ -756,7 +757,8 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
         if (stored_use_muon) {
             auto momentum_buffer = require_parameter_state_tensor(param_archive, "momentum_buffer", param,
                                                                   "native Muon archive momentum tensor shape does not match the "
-                                                                  "current model", materialize);
+                                                                  "current model",
+                                                                  materialize);
             state.step = 0;
             state.exp_avg = torch::Tensor();
             state.exp_avg_sq = torch::Tensor();
@@ -767,10 +769,12 @@ void NativeMuonWithAuxAdam::read_checkpoint(torch::serialize::InputArchive& arch
         if (step < 0) { throw std::runtime_error("native Muon archive step does not match the current optimizer"); }
         auto exp_avg = require_parameter_state_tensor(param_archive, "exp_avg", param,
                                                       "native Muon archive AuxAdam tensor shape does not match the "
-                                                      "current model", materialize);
+                                                      "current model",
+                                                      materialize);
         auto exp_avg_sq = require_parameter_state_tensor(param_archive, "exp_avg_sq", param,
                                                          "native Muon archive AuxAdam tensor shape does not match the "
-                                                         "current model", materialize);
+                                                         "current model",
+                                                         materialize);
         state.step = step;
         state.momentum_buffer = torch::Tensor();
         state.exp_avg = std::move(exp_avg);

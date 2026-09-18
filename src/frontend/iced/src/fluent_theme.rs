@@ -51,11 +51,20 @@ pub fn button_workflow_primary(
     }
 }
 
-pub fn button_workflow_stop(theme: &Theme, status: iced::widget::button::Status) -> iced::widget::button::Style {
+pub fn button_workflow_stop(
+    theme: &Theme,
+    status: iced::widget::button::Status,
+) -> iced::widget::button::Style {
     let mut style = button_workflow_primary(theme, status);
-    style.background = button_danger(theme, if status == iced::widget::button::Status::Disabled {
-        iced::widget::button::Status::Active
-    } else { status }).background;
+    style.background = button_danger(
+        theme,
+        if status == iced::widget::button::Status::Disabled {
+            iced::widget::button::Status::Active
+        } else {
+            status
+        },
+    )
+    .background;
     style
 }
 
@@ -318,13 +327,29 @@ mod tests {
         use iced::widget::button::Status;
         for dark in [false, true] {
             let theme = app_theme(dark);
-            for status in [Status::Active, Status::Hovered, Status::Pressed, Status::Disabled] {
+            for status in [
+                Status::Active,
+                Status::Hovered,
+                Status::Pressed,
+                Status::Disabled,
+            ] {
                 let idle = button_workflow_primary(&theme, status);
                 let stop = button_workflow_stop(&theme, status);
                 assert_eq!(stop.border, idle.border);
                 assert_eq!(stop.shadow, idle.shadow);
                 assert_eq!(stop.text_color, Color::WHITE);
-                assert_eq!(stop.background, button_danger(&theme, if status == Status::Disabled { Status::Active } else { status }).background);
+                assert_eq!(
+                    stop.background,
+                    button_danger(
+                        &theme,
+                        if status == Status::Disabled {
+                            Status::Active
+                        } else {
+                            status
+                        }
+                    )
+                    .background
+                );
             }
             let frame = container_primary_frame(&theme);
             assert_eq!(frame.border.width, 1.0);

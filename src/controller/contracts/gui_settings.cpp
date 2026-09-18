@@ -824,9 +824,7 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
             train_training_fields(s, read);
             train_execution_target_fields(s, read);
             // Schema 8 predates the preference; its stored destinations were manual.
-            if (!training->contains("auto_output") && training->contains("output_dir")) {
-                s.auto_output = s.request.output_dir.empty();
-            }
+            if (!training->contains("auto_output") && training->contains("output_dir")) { s.auto_output = s.request.output_dir.empty(); }
         }
         if (const nlohmann::json* augmentation = find_object(train, kAugmentationKey)) {
             apply_gpu_augmentation_json(*augmentation, s.request.gpu_augmentation);

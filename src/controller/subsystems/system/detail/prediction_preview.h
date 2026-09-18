@@ -37,8 +37,8 @@ class PredictionPreviewFrame final : public std::enable_shared_from_this<Predict
     friend class PredictionPreviewPool;
     friend class PredictionPreviewComposition;
     void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
-                    std::uintptr_t stream, bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers,
-                    bool write_clean, bool write_semantic) const;
+                    std::uintptr_t stream, bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks,
+                    bool complementary_layers, bool write_clean, bool write_semantic) const;
     struct State;
     PredictionPreviewFrame(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>,
                            std::shared_ptr<void>, mmltk::frameworks::gpu::CudaContextApi);

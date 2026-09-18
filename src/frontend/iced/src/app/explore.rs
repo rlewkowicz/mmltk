@@ -550,9 +550,19 @@ impl App {
                 .integration
                 .as_ref()
                 .is_none_or(|integration| !integration.hold_initial_upscale())
-            && self.model.requested_upscale.as_ref().is_some_and(|request|
-                request.source.source.kind != crate::generated::PresentationSourceKind::Explore
-                    || self.model.explore.snapshot.as_ref().is_some_and(|snapshot| !snapshot.renderpending))
+            && self
+                .model
+                .requested_upscale
+                .as_ref()
+                .is_some_and(|request| {
+                    request.source.source.kind != crate::generated::PresentationSourceKind::Explore
+                        || self
+                            .model
+                            .explore
+                            .snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| !snapshot.renderpending)
+                })
             && let Some(request) = self.model.requested_upscale.clone()
             && self.model.sent_upscale.as_ref() != Some(&request)
         {

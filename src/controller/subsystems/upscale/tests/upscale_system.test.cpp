@@ -308,9 +308,12 @@ TEST_CASE("Validation clean identity reuses native Upscale while replacing paire
     REQUIRE(initial.frame.clean_revision != 0U);
     REQUIRE(initial.frame.content == VisualRegion{0U, 0U, 8U, 8U});
     std::atomic_uint32_t runs = 0U;
-    UpscaleSystem upscale{kDevice, make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
-                              if (stage == Stage::BasicLaunchAdmitted) ++runs;
-                          }), [&samples](const VisualFrame& frame) { return samples.BorrowDocument(frame); },
+    UpscaleSystem upscale{kDevice,
+                          make_native_upscale_runtime_factory(kDevice,
+                                                              [&](Stage stage) {
+                                                                  if (stage == Stage::BasicLaunchAdmitted) ++runs;
+                                                              }),
+                          [&samples](const VisualFrame& frame) { return samples.BorrowDocument(frame); },
                           [&](UpscaleSystem::event_type) { output_events.Advance(); }};
     static_cast<void>(upscale.Start({.source = initial.frame, .document = initial.document}));
     REQUIRE(output_events.Wait([&] { return upscale.snapshot().ready; }, 120s));
@@ -350,7 +353,10 @@ TEST_CASE("Validation clean identity reuses native Upscale while replacing paire
 }
 TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input provenance") {
     const auto source_kind = GENERATE(PresentationSourceKind::Explore, PresentationSourceKind::Validation);
-    const auto displayed = [source_kind](VisualFrame frame) { frame.source.kind = source_kind; return frame; };
+    const auto displayed = [source_kind](VisualFrame frame) {
+        frame.source.kind = source_kind;
+        return frame;
+    };
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {16U, 8U}, 3U};
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);

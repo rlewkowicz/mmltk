@@ -112,7 +112,13 @@ impl Component {
                         ),
                         (
                             projection.fields.key_fields.classlayoutpath,
-                            crate::generated::SettingsFieldValue::String(if shared_weights_selector(self.workflow) { String::new() } else { projection.selection.key.classlayoutpath.clone() }),
+                            crate::generated::SettingsFieldValue::String(
+                                if shared_weights_selector(self.workflow) {
+                                    String::new()
+                                } else {
+                                    projection.selection.key.classlayoutpath.clone()
+                                },
+                            ),
                         ),
                     ],
                 )?;
@@ -318,7 +324,12 @@ impl Component {
         debug_assert_eq!(self.workflow, state.workflow);
         view(state, self.dismissed_dialog_generation)
     }
-    pub fn view_with<'a, M: Clone + 'a>(&'a self, state: State<'a>, content: Element<'a, M>, map: fn(Message) -> M) -> Element<'a, M> {
+    pub fn view_with<'a, M: Clone + 'a>(
+        &'a self,
+        state: State<'a>,
+        content: Element<'a, M>,
+        map: fn(Message) -> M,
+    ) -> Element<'a, M> {
         view_with(state, self.dismissed_dialog_generation, Some(content), map)
     }
 }
@@ -492,12 +503,15 @@ fn artifact_row(
     path: &str,
 ) -> Result<&'static crate::generated::ModelSelectionCompatibility, String> {
     compatibility(workflow, build_tensorrt)
-        .find(|row| row.customallowed && row.dialogpattern.split_whitespace().any(|pattern| {
-            pattern.strip_prefix('*').is_some_and(|suffix| {
-                path.get(path.len().saturating_sub(suffix.len())..)
-                    .is_some_and(|ending| ending.eq_ignore_ascii_case(suffix))
-            })
-        }))
+        .find(|row| {
+            row.customallowed
+                && row.dialogpattern.split_whitespace().any(|pattern| {
+                    pattern.strip_prefix('*').is_some_and(|suffix| {
+                        path.get(path.len().saturating_sub(suffix.len())..)
+                            .is_some_and(|ending| ending.eq_ignore_ascii_case(suffix))
+                    })
+                })
+        })
         .ok_or_else(|| "The selected file extension is not supported by this workflow.".to_owned())
 }
 
@@ -537,7 +551,11 @@ pub const fn progress_id(workflow: FeatureId) -> &'static str {
 }
 
 fn selector_id(workflow: FeatureId, train: &'static str, validate: &'static str) -> &'static str {
-    if workflow == FeatureId::Train { train } else { validate }
+    if workflow == FeatureId::Train {
+        train
+    } else {
+        validate
+    }
 }
 
 pub const TRAIN_SELECTOR_ID: &str = "train.model.selector";
@@ -639,7 +657,13 @@ fn status<'a>(state: Option<&ModelUiState>, workflow: FeatureId) -> Element<'a, 
         ]
         .spacing(4)
     };
-    let content = container(content).id(selector_id(workflow, TRAIN_STATUS_ID, "validate.model.status")).width(Fill);
+    let content = container(content)
+        .id(selector_id(
+            workflow,
+            TRAIN_STATUS_ID,
+            "validate.model.status",
+        ))
+        .width(Fill);
     if status.tone == StatusTone::Error {
         content
             .padding([6, 8])
@@ -678,46 +702,69 @@ fn pending_artifact_confirmation(
     Some((selected.path.clone(), dialog.generation))
 }
 
-fn shared_selector<'a>(workflow: FeatureId, presets: Element<'a, Message>, enabled: bool) -> Element<'a, Message> {
+fn shared_selector<'a>(
+    workflow: FeatureId,
+    presets: Element<'a, Message>,
+    enabled: bool,
+) -> Element<'a, Message> {
+    container(
+        column![
+            container(presets)
+                .id(selector_id(
+                    workflow,
+                    TRAIN_PRESETS_ID,
+                    "validate.model.presets"
+                ))
+                .width(Fill),
             container(
-                column![
-                    container(presets)
-                        .id(selector_id(workflow, TRAIN_PRESETS_ID, "validate.model.presets"))
-                        .width(Fill),
-                    container(
-                        row![
-                            space::horizontal().width(Length::FillPortion(1)),
-                            container(rule::horizontal(1)).width(Length::FillPortion(6)),
-                            space::horizontal().width(Length::FillPortion(1)),
-                        ]
-                        .width(Fill)
-                    )
-                    .id(selector_id(workflow, TRAIN_DIVIDER_ID, "validate.model.divider"))
-                    .width(Fill),
-                    container(
-                        button("Custom Weights")
-                            .on_press_maybe(
-                                enabled.then_some(Message::BrowseRequested)
-                            )
-                            .style(crate::fluent_theme::button_primary)
-                            .width(Fill)
-                    )
-                    .id(selector_id(workflow, TRAIN_CUSTOM_ID, "validate.model.custom_weights"))
-                    .width(Fill),
+                row![
+                    space::horizontal().width(Length::FillPortion(1)),
+                    container(rule::horizontal(1)).width(Length::FillPortion(6)),
+                    space::horizontal().width(Length::FillPortion(1)),
                 ]
-                .spacing(super::FIELD_SPACING),
+                .width(Fill)
             )
-            .id(selector_id(workflow, TRAIN_SELECTOR_ID, "validate.model.selector"))
-            .padding(2)
-            .width(Fill)
-            .style(crate::fluent_theme::container_bordered_box)
-            .into()
+            .id(selector_id(
+                workflow,
+                TRAIN_DIVIDER_ID,
+                "validate.model.divider"
+            ))
+            .width(Fill),
+            container(
+                button("Custom Weights")
+                    .on_press_maybe(enabled.then_some(Message::BrowseRequested))
+                    .style(crate::fluent_theme::button_primary)
+                    .width(Fill)
+            )
+            .id(selector_id(
+                workflow,
+                TRAIN_CUSTOM_ID,
+                "validate.model.custom_weights"
+            ))
+            .width(Fill),
+        ]
+        .spacing(super::FIELD_SPACING),
+    )
+    .id(selector_id(
+        workflow,
+        TRAIN_SELECTOR_ID,
+        "validate.model.selector",
+    ))
+    .padding(2)
+    .width(Fill)
+    .style(crate::fluent_theme::container_bordered_box)
+    .into()
 }
 
 pub fn view(state: State<'_>, dismissed_dialog_generation: u64) -> Element<'_, Message> {
     view_with(state, dismissed_dialog_generation, None, |message| message)
 }
-fn view_with<'a, M: Clone + 'a>(state: State<'a>, dismissed_dialog_generation: u64, content: Option<Element<'a, M>>, map: fn(Message) -> M) -> Element<'a, M> {
+fn view_with<'a, M: Clone + 'a>(
+    state: State<'a>,
+    dismissed_dialog_generation: u64,
+    content: Option<Element<'a, M>>,
+    map: fn(Message) -> M,
+) -> Element<'a, M> {
     const ROW_PADDING: f32 = 5.0;
     const TEXT_SIZE: f32 = 12.0;
     let card_id = stable_id(state.workflow);
@@ -786,7 +833,9 @@ fn view_with<'a, M: Clone + 'a>(state: State<'a>, dismissed_dialog_generation: u
                 "No custom model selected".to_owned()
             } else {
                 state.artifact.clone()
-            }).size(12).into()
+            })
+            .size(12)
+            .into()
         } else {
             space::vertical().height(0).into()
         }
@@ -816,7 +865,8 @@ fn view_with<'a, M: Clone + 'a>(state: State<'a>, dismissed_dialog_generation: u
         |model| {
             let progress = if shared_weights_selector(state.workflow)
                 && !model.active
-                && model.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted {
+                && model.terminal.outcome == crate::generated::ModelSelectionOutcome::Accepted
+            {
                 crate::view::workflow::progress::Presentation::Hidden
             } else {
                 crate::view::workflow::progress::model_presentation(Some(model))
@@ -832,9 +882,13 @@ fn view_with<'a, M: Clone + 'a>(state: State<'a>, dismissed_dialog_generation: u
             .style(crate::fluent_theme::button_primary)
     };
     let mut presets = Some(presets);
-    let weights_selector: Option<Element<'_, Message>> =
-        shared_weights_selector(state.workflow).then(|| {
-            shared_selector(state.workflow, presets.take().expect("one preset selector"), state.settings_enabled)
+    let weights_selector: Option<Element<'_, Message>> = shared_weights_selector(state.workflow)
+        .then(|| {
+            shared_selector(
+                state.workflow,
+                presets.take().expect("one preset selector"),
+                state.settings_enabled,
+            )
         });
     let confirmation = pending_artifact_confirmation(&state, dismissed_dialog_generation).map(
         |(path, generation)| {
@@ -844,14 +898,15 @@ fn view_with<'a, M: Clone + 'a>(state: State<'a>, dismissed_dialog_generation: u
                 column![
                     text("Use custom model?").size(24),
                     text(format!("Workflow: {:?}", state.workflow)),
-                    text(format!("Input: {}", input_label(
-                        if shared_weights_selector(state.workflow) {
+                    text(format!(
+                        "Input: {}",
+                        input_label(if shared_weights_selector(state.workflow) {
                             artifact_row(state.workflow, state.build_tensorrt, &path)
                                 .map_or(state.input, |row| row.input)
                         } else {
                             state.input
-                        }
-                    ))),
+                        })
+                    )),
                     text(format!(
                         "Preset: {}",
                         state.preset.as_deref().unwrap_or("Unspecified")
@@ -890,7 +945,11 @@ fn view_with<'a, M: Clone + 'a>(state: State<'a>, dismissed_dialog_generation: u
                     ..iced::Padding::ZERO
                 })
                 .width(Fill),
-            container(action).id(selector_id(state.workflow, TRAIN_ACTION_ID, "validate.model.action"))
+            container(action).id(selector_id(
+                state.workflow,
+                TRAIN_ACTION_ID,
+                "validate.model.action"
+            ))
         ]
         .spacing(super::FIELD_SPACING)
     } else {
@@ -913,7 +972,9 @@ fn view_with<'a, M: Clone + 'a>(state: State<'a>, dismissed_dialog_generation: u
     };
     let body: Element<'a, Message> = body.into();
     let mut body = column![body.map(map)].spacing(super::FIELD_SPACING);
-    if let Some(content) = content { body = body.push(content); }
+    if let Some(content) = content {
+        body = body.push(content);
+    }
     let card = crate::view::shared::identified(
         card_id,
         crate::view::shared::card(
@@ -948,8 +1009,10 @@ mod tests {
             shape(&tree, &mut result);
             result
         };
-        assert_eq!(widget_shape(FeatureId::Train), widget_shape(FeatureId::Validate));
-
+        assert_eq!(
+            widget_shape(FeatureId::Train),
+            widget_shape(FeatureId::Validate)
+        );
     }
 
     #[test]
@@ -958,16 +1021,38 @@ mod tests {
             let mut component = Component::new(workflow);
             let mut settings = installed_settings_model();
             for generation in [1, 2] {
-                assert!(matches!(component.update(Message::ConfirmArtifact {
-                    path: "/tmp/same.pt".into(), generation,
-                }, &mut settings).unwrap(), Some(Outcome::ArtifactConfirmed(_))));
+                assert!(matches!(
+                    component
+                        .update(
+                            Message::ConfirmArtifact {
+                                path: "/tmp/same.pt".into(),
+                                generation,
+                            },
+                            &mut settings
+                        )
+                        .unwrap(),
+                    Some(Outcome::ArtifactConfirmed(_))
+                ));
             }
             let before = settings.draft.clone();
             let queued = settings.queued_len();
-            assert!(component.update(Message::CancelArtifact(3), &mut settings).unwrap().is_none());
-            assert!(component.update(Message::ConfirmArtifact {
-                path: "/tmp/invalid.txt".into(), generation: 4,
-            }, &mut settings).is_err());
+            assert!(
+                component
+                    .update(Message::CancelArtifact(3), &mut settings)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                component
+                    .update(
+                        Message::ConfirmArtifact {
+                            path: "/tmp/invalid.txt".into(),
+                            generation: 4,
+                        },
+                        &mut settings
+                    )
+                    .is_err()
+            );
             assert_eq!(settings.draft, before);
             assert_eq!(settings.queued_len(), queued);
         }
@@ -983,13 +1068,24 @@ mod tests {
             for row in compatibility(workflow, false).filter(|row| row.customallowed) {
                 for pattern in row.dialogpattern.split_whitespace() {
                     let path = format!("/tmp/model{}", pattern.trim_start_matches('*'));
-                    let fields = projection(settings.draft.as_ref().unwrap(), workflow).unwrap().fields;
+                    let fields = projection(settings.draft.as_ref().unwrap(), workflow)
+                        .unwrap()
+                        .fields;
                     crate::generated::apply_settings_field(
                         settings.draft.as_mut().unwrap(),
                         fields.key_fields.classlayoutpath,
                         crate::generated::SettingsFieldValue::String("/old/classes.json".into()),
-                    ).unwrap();
-                    component.update(Message::ConfirmArtifact { path: path.clone(), generation: 1 }, &mut settings).unwrap();
+                    )
+                    .unwrap();
+                    component
+                        .update(
+                            Message::ConfirmArtifact {
+                                path: path.clone(),
+                                generation: 1,
+                            },
+                            &mut settings,
+                        )
+                        .unwrap();
                     let selected = projection(settings.draft.as_ref().unwrap(), workflow).unwrap();
                     assert_eq!(selected.selection.key.input, row.input);
                     assert_eq!(selected.selection.artifact, path);
@@ -997,11 +1093,26 @@ mod tests {
                 }
             }
             let before = settings.draft.clone();
-            assert!(component.update(Message::ConfirmArtifact { path: "/tmp/model.txt".into(), generation: 2 }, &mut settings).is_err());
+            assert!(
+                component
+                    .update(
+                        Message::ConfirmArtifact {
+                            path: "/tmp/model.txt".into(),
+                            generation: 2
+                        },
+                        &mut settings
+                    )
+                    .is_err()
+            );
             assert_eq!(settings.draft, before);
         }
         assert!(artifact_row(FeatureId::Train, false, "/model.onnx").is_err());
-        assert_eq!(artifact_row(FeatureId::Validate, false, "/MODEL.ONNX").unwrap().input, ModelArtifactInputKind::Onnx);
+        assert_eq!(
+            artifact_row(FeatureId::Validate, false, "/MODEL.ONNX")
+                .unwrap()
+                .input,
+            ModelArtifactInputKind::Onnx
+        );
         assert!(!shared_weights_selector(FeatureId::Predict));
         assert!(!shared_weights_selector(FeatureId::Export));
     }

@@ -51,7 +51,10 @@ impl AnnotationModel {
         // has overtaken it, or when the Save admission reply arrives last.
         if !incoming.busy {
             self.settled_revision = self.settled_revision.max(incoming.uirevision);
-            if self.save_admission.is_some_and(|revision| revision <= self.settled_revision) {
+            if self
+                .save_admission
+                .is_some_and(|revision| revision <= self.settled_revision)
+            {
                 self.save_admission = None;
             }
         }
@@ -176,7 +179,8 @@ impl crate::generated::AnnotationApplicationProjection<UiError> for ApplicationM
 
     fn project_annotation_reply(&mut self, _correlation: u64, reply: ApplicationReply) {
         if let ApplicationReply::AnnotationSave(snapshot) = &reply {
-            self.annotation.save_admission = (snapshot.busy && snapshot.uirevision > self.annotation.settled_revision)
+            self.annotation.save_admission = (snapshot.busy
+                && snapshot.uirevision > self.annotation.settled_revision)
                 .then_some(snapshot.uirevision);
         }
         let snapshot = match reply {
@@ -208,7 +212,9 @@ mod tests {
             terminal.revision += 1;
             terminal.uirevision = terminal.revision;
             terminal.busy = false;
-            if terminal_first { model.annotation.install_snapshot(terminal.clone()).unwrap(); }
+            if terminal_first {
+                model.annotation.install_snapshot(terminal.clone()).unwrap();
+            }
             model.project_annotation_reply(1, ApplicationReply::AnnotationSave(admitted));
             assert_eq!(model.annotation.save_active(), !terminal_first);
             model.annotation.install_snapshot(terminal.clone()).unwrap();
@@ -217,7 +223,10 @@ mod tests {
             terminal.uirevision = terminal.revision;
             terminal.busy = true;
             model.annotation.install_snapshot(terminal).unwrap();
-            assert!(!model.annotation.save_active(), "unrelated work cannot restart save animation");
+            assert!(
+                !model.annotation.save_active(),
+                "unrelated work cannot restart save animation"
+            );
         }
     }
 

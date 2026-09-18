@@ -112,7 +112,9 @@ impl Component {
                 self.saved.clear(&self.metrics);
                 if let Some(run) = &opened.run {
                     self.saved.set_run(&run.runid, opened.generation);
-                } else { self.saved.generation = opened.generation; }
+                } else {
+                    self.saved.generation = opened.generation;
+                }
                 saved_changed = u16::MAX;
             }
             if let Some(page) = model.workflow.output.page() {
@@ -125,7 +127,10 @@ impl Component {
                 }
             }
         }
-        if selected && model.workflow.output.run().is_none() && (self.saved.generation != 0 || !self.saved_selected) {
+        if selected
+            && model.workflow.output.run().is_none()
+            && (self.saved.generation != 0 || !self.saved_selected)
+        {
             self.saved.clear(&self.metrics);
             saved_changed = u16::MAX;
         }
@@ -849,7 +854,9 @@ pub(crate) mod tests {
             .request
             .clone();
         model.workflow.output.select_saved("saved-output".into());
-        model.workflow.output.saved_mut().unwrap().run = Some(crate::view_model::test_support::saved_training_run(configuration));
+        model.workflow.output.saved_mut().unwrap().run = Some(
+            crate::view_model::test_support::saved_training_run(configuration),
+        );
     }
     #[test]
     fn hidden_navigation_saved_selection_and_preparation_preserve_independent_live_history() {

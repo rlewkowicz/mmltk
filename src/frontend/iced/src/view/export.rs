@@ -162,7 +162,9 @@ impl Component {
                                 .compute_start_available(draft, crate::generated::FeatureId::Export)
                     })
                     .then_some(Message::StartRequested),
-                model.compute_stop_available(crate::generated::FeatureId::Export).then_some(Message::StopRequested),
+                model
+                    .compute_stop_available(crate::generated::FeatureId::Export)
+                    .then_some(Message::StopRequested),
                 crate::view::workflow::progress::compute(operation),
             ),
         ]

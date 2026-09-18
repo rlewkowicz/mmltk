@@ -575,20 +575,47 @@ pub(crate) fn record_drawn_detail(surface: Surface, crop: [u32; 4]) {
     });
 }
 
-pub(crate) fn viewer_upscale_request(kernel: crate::generated::UpscaleKernel) -> Option<crate::generated::UpscaleRequest> {
+pub(crate) fn viewer_upscale_request(
+    kernel: crate::generated::UpscaleKernel,
+) -> Option<crate::generated::UpscaleRequest> {
     let (surface, _) = drawn_detail()?;
     let frame = surface.frame?;
     let paired = metadata::pending(frame)?;
-    if !paired.view_ready || paired.surface.frame != Some(frame)
-        || !same_allocation(surface, paired.surface) || !frame.belongs_to(surface)
-        || surface.viewer_identity != paired.surface.viewer_identity { return None; }
-    if let Some(validation) = paired.content.validation().filter(|value| value.metadata.detail) {
-        if !frame.matches_content(validation.frame()) || metadata::product(frame).as_ref() != Some(validation.frame()) { return None; }
-        return Some(crate::generated::UpscaleRequest { source: validation.metadata.frame.clone(), document: validation.metadata.document.clone(), kernel });
+    if !paired.view_ready
+        || paired.surface.frame != Some(frame)
+        || !same_allocation(surface, paired.surface)
+        || !frame.belongs_to(surface)
+        || surface.viewer_identity != paired.surface.viewer_identity
+    {
+        return None;
+    }
+    if let Some(validation) = paired
+        .content
+        .validation()
+        .filter(|value| value.metadata.detail)
+    {
+        if !frame.matches_content(validation.frame())
+            || metadata::product(frame).as_ref() != Some(validation.frame())
+        {
+            return None;
+        }
+        return Some(crate::generated::UpscaleRequest {
+            source: validation.metadata.frame.clone(),
+            document: validation.metadata.document.clone(),
+            kernel,
+        });
     }
     let detail = paired.content.detail()?;
-    if !frame.matches_content(detail.frame()) || metadata::product(frame).as_ref() != Some(detail.frame()) { return None; }
-    Some(crate::generated::UpscaleRequest { source: detail.explore.frame.clone(), document: detail.explore.document.clone(), kernel })
+    if !frame.matches_content(detail.frame())
+        || metadata::product(frame).as_ref() != Some(detail.frame())
+    {
+        return None;
+    }
+    Some(crate::generated::UpscaleRequest {
+        source: detail.explore.frame.clone(),
+        document: detail.explore.document.clone(),
+        kernel,
+    })
 }
 
 pub(crate) fn viewer_annotation_request() -> Option<crate::generated::AnnotationOpen> {
@@ -597,11 +624,20 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
     let paired = metadata::pending(frame)?;
     if let Some(validation) = paired.content.validation() {
         let source = validation.frame();
-        if validation.metadata.detail && paired.view_ready && paired.surface.frame == Some(frame)
-            && same_allocation(surface, paired.surface) && frame.belongs_to(surface)
-            && metadata::product(frame).as_ref() == Some(source) && frame.matches_content(source) && crop == [0, 0, source.extent.width, source.extent.height]
-            && surface.viewer_identity == paired.surface.viewer_identity {
-            return Some(crate::generated::AnnotationOpen { source: source.clone(), originalcontent: true });
+        if validation.metadata.detail
+            && paired.view_ready
+            && paired.surface.frame == Some(frame)
+            && same_allocation(surface, paired.surface)
+            && frame.belongs_to(surface)
+            && metadata::product(frame).as_ref() == Some(source)
+            && frame.matches_content(source)
+            && crop == [0, 0, source.extent.width, source.extent.height]
+            && surface.viewer_identity == paired.surface.viewer_identity
+        {
+            return Some(crate::generated::AnnotationOpen {
+                source: source.clone(),
+                originalcontent: true,
+            });
         }
         return None;
     }
@@ -1327,7 +1363,16 @@ pub(crate) fn drawable_validation(
 ) -> Option<(Surface, std::sync::Arc<labels::ValidationContent>)> {
     drawable_content(
         requested,
-        if requested.frame.is_some_and(|frame| frame.content_session == crate::generated::presentation_source_session(crate::generated::PresentationSourceKind::Upscale)) { crate::generated::PresentationSourceKind::Upscale } else { crate::generated::PresentationSourceKind::Validation },
+        if requested.frame.is_some_and(|frame| {
+            frame.content_session
+                == crate::generated::presentation_source_session(
+                    crate::generated::PresentationSourceKind::Upscale,
+                )
+        }) {
+            crate::generated::PresentationSourceKind::Upscale
+        } else {
+            crate::generated::PresentationSourceKind::Validation
+        },
         |pending| pending.content.validation(),
         |image| image.content.validation(),
     )
@@ -1641,8 +1686,10 @@ fn parse_arena_identity(identity: &str) -> Option<(u64, u64)> {
 }
 
 fn retained_draw_admitted(retained: Surface, requested: Surface, placement: Placement) -> bool {
-    matches!(placement, Placement::GalleryGrid { .. } | Placement::FixedGrid { .. })
-        || (retained.frame.is_some() && retained.frame == requested.frame)
+    matches!(
+        placement,
+        Placement::GalleryGrid { .. } | Placement::FixedGrid { .. }
+    ) || (retained.frame.is_some() && retained.frame == requested.frame)
         || retained.viewer_identity == requested.viewer_identity
 }
 
@@ -2086,7 +2133,9 @@ impl SurfaceRenderer {
             frame.content_sequence,
             frame.presentation_revision,
         );
-        if control_id == crate::view::explore::DETAIL_WORKSPACE_ID || control_id == "validate.detail.image" {
+        if control_id == crate::view::explore::DETAIL_WORKSPACE_ID
+            || control_id == "validate.detail.image"
+        {
             record_drawn_detail(draw.surface, draw.surface.content_region());
         }
         if crate::integration_control::reporting_enabled() {

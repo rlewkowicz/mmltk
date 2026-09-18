@@ -135,16 +135,32 @@ fn valid_detail(source: &generated::ExploreImageMetadata) -> bool {
 }
 
 fn valid_validation(snapshot: &generated::ValidationImageMetadata) -> bool {
-    snapshot.contentidentity != 0 && valid_content(&snapshot.frame)
+    snapshot.contentidentity != 0
+        && valid_content(&snapshot.frame)
         && snapshot.detail == snapshot.selected.is_some()
-        && (!snapshot.detail || snapshot.samples.iter().any(|sample|
-            sample.available && Some(&sample.identity) == snapshot.selected.as_ref()))
-        && snapshot.samples.iter().all(|sample| !sample.available
-            || (sample.identity.generation != 0 && sample.originalextent.width != 0 && sample.originalextent.height != 0
-                && ((snapshot.detail && Some(&sample.identity) != snapshot.selected.as_ref())
-                    || (sample.crop.width != 0 && sample.crop.height != 0
-                        && sample.crop.x.checked_add(sample.crop.width).is_some_and(|end| end <= snapshot.frame.extent.width)
-                        && sample.crop.y.checked_add(sample.crop.height).is_some_and(|end| end <= snapshot.frame.extent.height)))))
+        && (!snapshot.detail
+            || snapshot.samples.iter().any(|sample| {
+                sample.available && Some(&sample.identity) == snapshot.selected.as_ref()
+            }))
+        && snapshot.samples.iter().all(|sample| {
+            !sample.available
+                || (sample.identity.generation != 0
+                    && sample.originalextent.width != 0
+                    && sample.originalextent.height != 0
+                    && ((snapshot.detail && Some(&sample.identity) != snapshot.selected.as_ref())
+                        || (sample.crop.width != 0
+                            && sample.crop.height != 0
+                            && sample
+                                .crop
+                                .x
+                                .checked_add(sample.crop.width)
+                                .is_some_and(|end| end <= snapshot.frame.extent.width)
+                            && sample
+                                .crop
+                                .y
+                                .checked_add(sample.crop.height)
+                                .is_some_and(|end| end <= snapshot.frame.extent.height))))
+        })
 }
 
 pub(crate) fn install(
@@ -194,11 +210,24 @@ pub(crate) fn install(
             Prepared::None
         }
         WorkspaceImageProduct::Upscale(snapshot) if snapshot.frame == metadata.frame => {
-            if !valid_content(&snapshot.frame) { return Err("invalid derived image geometry".into()); }
+            if !valid_content(&snapshot.frame) {
+                return Err("invalid derived image geometry".into());
+            }
             match &source {
-                Some(WorkspaceImageProduct::Explore(source)) if source.frame == snapshot.input && valid_detail(source) => Prepared::None,
-                Some(WorkspaceImageProduct::Validation(source)) if source.frame == snapshot.input && source.detail && valid_validation(source) => {
-                    Prepared::Validation(Arc::new(super::labels::ValidationContent::new(source.clone()).with_upscale(snapshot.clone())))
+                Some(WorkspaceImageProduct::Explore(source))
+                    if source.frame == snapshot.input && valid_detail(source) =>
+                {
+                    Prepared::None
+                }
+                Some(WorkspaceImageProduct::Validation(source))
+                    if source.frame == snapshot.input
+                        && source.detail
+                        && valid_validation(source) =>
+                {
+                    Prepared::Validation(Arc::new(
+                        super::labels::ValidationContent::new(source.clone())
+                            .with_upscale(snapshot.clone()),
+                    ))
                 }
                 _ => return Err("graphics detail source identity mismatch".into()),
             }
@@ -240,10 +269,14 @@ pub(crate) fn install(
             .as_ref()
             .map(|content| (frame.content_session, content.metadata.contentidentity))
             .or_else(|| {
-                content
-                    .validation()
-                    .as_ref()
-                    .map(|content| (generated::presentation_source_session(generated::PresentationSourceKind::Validation), content.metadata.contentidentity))
+                content.validation().as_ref().map(|content| {
+                    (
+                        generated::presentation_source_session(
+                            generated::PresentationSourceKind::Validation,
+                        ),
+                        content.metadata.contentidentity,
+                    )
+                })
             }),
         fit_revision: 0,
     };
@@ -398,7 +431,12 @@ mod tests {
         image.detail = true;
         assert!(!valid_validation(&image));
         image.selected = Some(image.samples[0].identity.clone());
-        image.samples[1].crop = generated::VisualRegion { x: 0, y: 0, width: 0, height: 0 };
+        image.samples[1].crop = generated::VisualRegion {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
         assert!(valid_validation(&image));
         image.samples[0].available = false;
         assert!(!valid_validation(&image));
@@ -411,9 +449,24 @@ mod tests {
     fn validation_rejects_empty_and_outside_content_and_pairs_derived_identity() {
         let original = crate::view_model::test_support::validation_image_metadata();
         for content in [
-            generated::VisualRegion { x: 0, y: 0, width: 0, height: 576 },
-            generated::VisualRegion { x: 1, y: 0, width: 512, height: 576 },
-            generated::VisualRegion { x: u32::MAX, y: 0, width: 2, height: 576 },
+            generated::VisualRegion {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 576,
+            },
+            generated::VisualRegion {
+                x: 1,
+                y: 0,
+                width: 512,
+                height: 576,
+            },
+            generated::VisualRegion {
+                x: u32::MAX,
+                y: 0,
+                width: 2,
+                height: 576,
+            },
         ] {
             let mut invalid = original.clone();
             invalid.frame.content = content;
@@ -423,29 +476,58 @@ mod tests {
         source.detail = true;
         source.selected = Some(source.samples[0].identity.clone());
         source.frame.extent = source.samples[0].originalextent.clone();
-        source.frame.content = generated::VisualRegion { x: 0, y: 0, width: 200, height: 200 };
+        source.frame.content = generated::VisualRegion {
+            x: 0,
+            y: 0,
+            width: 200,
+            height: 200,
+        };
         source.samples[0].crop = source.frame.content.clone();
         assert!(valid_validation(&source));
         let mut derived_frame = source.frame.clone();
         derived_frame.source.kind = generated::PresentationSourceKind::Upscale;
-        derived_frame.extent = generated::VisualExtent { width: 800, height: 800 };
-        derived_frame.content = generated::VisualRegion { x: 0, y: 0, width: 800, height: 800 };
+        derived_frame.extent = generated::VisualExtent {
+            width: 800,
+            height: 800,
+        };
+        derived_frame.content = generated::VisualRegion {
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 800,
+        };
         let physical = crate::view_model::test_support::physical_frame(
             generated::presentation_source_session(generated::PresentationSourceKind::Upscale),
-            derived_frame.revision, 1, 800, 800,
+            derived_frame.revision,
+            1,
+            800,
+            800,
         );
         let derived = generated::UpscaleImageMetadata {
-            frame: derived_frame.clone(), input: source.frame.clone(),
+            frame: derived_frame.clone(),
+            input: source.frame.clone(),
             scene: crate::view_model::test_support::explore_snapshot().scene,
         };
-        let bytes = encode(derived_frame.clone(), encode_product(generated::ApplicationSystem::Upscale, derived.clone()),
-            Some(encode_product(generated::ApplicationSystem::Validation, source.clone())));
+        let bytes = encode(
+            derived_frame.clone(),
+            encode_product(generated::ApplicationSystem::Upscale, derived.clone()),
+            Some(encode_product(
+                generated::ApplicationSystem::Validation,
+                source.clone(),
+            )),
+        );
         super::super::reset_test_releases();
         install(physical, 800, 800, 1, &bytes).unwrap();
         retire(physical);
         source.frame.revision += 1;
-        let invalid = encode(derived_frame, encode_product(generated::ApplicationSystem::Upscale, derived),
-            Some(encode_product(generated::ApplicationSystem::Validation, source)));
+        let invalid = encode(
+            derived_frame,
+            encode_product(generated::ApplicationSystem::Upscale, derived),
+            Some(encode_product(
+                generated::ApplicationSystem::Validation,
+                source,
+            )),
+        );
         assert!(install(physical, 800, 800, 2, &invalid).is_err());
         super::super::reset_test_releases();
     }

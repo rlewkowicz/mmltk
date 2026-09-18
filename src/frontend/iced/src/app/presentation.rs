@@ -79,14 +79,28 @@ impl Controller {
             return None;
         }
         if route == FeatureId::Validate {
-            let source = model.workflow.validation.as_ref().filter(|value| value.detail && value.selected.is_some()
-                && !model.has_pending(ApplicationIntentEndpoint::ValidationSelectSample)
-                && !model.has_pending(ApplicationIntentEndpoint::ValidationCloseDetail));
-            let identity = source.map(|value| (value.contentidentity, value.selected.as_ref().unwrap().datasetindex));
+            let source = model.workflow.validation.as_ref().filter(|value| {
+                value.detail
+                    && value.selected.is_some()
+                    && !model.has_pending(ApplicationIntentEndpoint::ValidationSelectSample)
+                    && !model.has_pending(ApplicationIntentEndpoint::ValidationCloseDetail)
+            });
+            let identity = source.map(|value| {
+                (
+                    value.contentidentity,
+                    value.selected.as_ref().unwrap().datasetindex,
+                )
+            });
             if let Some(suspended) = self.suspended.take() {
-                if suspended.route == route && identity == self.viewer
-                    && suspended.request.as_ref().is_some_and(|request| source.is_some_and(|snapshot|
-                        snapshot.frame == request.source && snapshot.document == request.document)) {
+                if suspended.route == route
+                    && identity == self.viewer
+                    && suspended.request.as_ref().is_some_and(|request| {
+                        source.is_some_and(|snapshot| {
+                            snapshot.frame == request.source
+                                && snapshot.document == request.document
+                        })
+                    })
+                {
                     return suspended.request.map(ViewerOutcome::Opened);
                 }
                 // A changed retained sample must reopen through its current native facts.
@@ -94,9 +108,12 @@ impl Controller {
             }
             if identity == self.viewer {
                 if let (Some(source), Some(request)) = (source, model.requested_upscale.as_ref())
-                    && request.source != source.frame {
+                    && request.source != source.frame
+                {
                     return Some(ViewerOutcome::Opened(crate::generated::UpscaleRequest {
-                        source: source.frame.clone(), document: source.document.clone(), kernel: request.kernel,
+                        source: source.frame.clone(),
+                        document: source.document.clone(),
+                        kernel: request.kernel,
                     }));
                 }
                 return None;
@@ -105,8 +122,16 @@ impl Controller {
                 let replaced = self.viewer.is_some();
                 self.suspended = None;
                 self.viewer = identity;
-                let request = crate::generated::UpscaleRequest { source: source.frame.clone(), document: source.document.clone(), kernel: crate::generated::UpscaleKernel::Default };
-                return Some(if replaced { ViewerOutcome::Replaced(request) } else { ViewerOutcome::Opened(request) });
+                let request = crate::generated::UpscaleRequest {
+                    source: source.frame.clone(),
+                    document: source.document.clone(),
+                    kernel: crate::generated::UpscaleKernel::Default,
+                };
+                return Some(if replaced {
+                    ViewerOutcome::Replaced(request)
+                } else {
+                    ViewerOutcome::Opened(request)
+                });
             }
             return self.abandon_viewer();
         }
@@ -319,7 +344,11 @@ impl App {
     }
 
     fn finish_viewer_departure(&mut self, stop: bool) {
-        let source = if self.workspace.active() == FeatureId::Validate { PresentationSourceKind::Validation } else { self.model.viewer_native_kind() };
+        let source = if self.workspace.active() == FeatureId::Validate {
+            PresentationSourceKind::Validation
+        } else {
+            self.model.viewer_native_kind()
+        };
         self.model.abandon_viewer();
         self.model.set_foreground_visual(Some(source));
         self.presentation.stop_requested |= stop;
@@ -1551,10 +1580,7 @@ mod tests {
 
             navigate(&mut app, FeatureId::Explore);
             assert_eq!(app.presentation.viewer, viewer);
-            assert_eq!(
-                app.model.requested_upscale.as_ref(),
-                Some(&requested)
-            );
+            assert_eq!(app.model.requested_upscale.as_ref(), Some(&requested));
             assert!(app.model.sent_upscale.is_none());
             assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
             assert_eq!(crate::presentation_surface::drawn_detail(), retained);

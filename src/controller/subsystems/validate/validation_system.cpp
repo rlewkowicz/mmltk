@@ -70,7 +70,8 @@ class ValidationSystem::Impl final {
                     samples_.Capture(generation, std::move(sample));
                 } catch (const mmltk::backend::ml::runtime::CudaOperationError&) {
                     throw;
-                } catch (...) { /* Sample settlement retains the incumbent; metrics remain valid. */ }
+                } catch (...) { /* Sample settlement retains the incumbent; metrics remain valid. */
+                }
             };
         }
         return delivery;

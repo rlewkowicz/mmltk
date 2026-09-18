@@ -126,6 +126,10 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         OUTPUT "${MMLTK_BROWSER_PROTOCOL_V17_CLIENT_FIXTURE}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory
             "${CMAKE_BINARY_DIR}/generated/frontend/iced"
+        COMMAND "${MMLTK_CARGO_EXECUTABLE}" fetch
+            --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+            --locked
+            --target x86_64-unknown-linux-gnu
         COMMAND "${CMAKE_COMMAND}" -E env
             ${_mmltk_protocol_v17_environment}
             "${MMLTK_CARGO_EXECUTABLE}" run
@@ -221,6 +225,10 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
         BYPRODUCTS "${MMLTK_FRONTEND_ICED_DIST_DIR}/index.html"
         COMMAND "${CMAKE_COMMAND}" -E rm -rf
             "${_mmltk_frontend_dist_next_dir}"
+        COMMAND "${MMLTK_CARGO_EXECUTABLE}" fetch
+            --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
+            --locked
+            --target wasm32-unknown-unknown
         COMMAND "${CMAKE_COMMAND}" -E env
             "PATH=/usr/local/bin:$ENV{PATH}"
             ${_mmltk_frontend_environment}

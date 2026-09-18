@@ -149,7 +149,9 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     auto source = PredictionSource::Device(execution, {2U, 2U}, pixels, detections, classes);
     for (const auto index : selected_indices) {
         const rfdetr::PredictionRecord record{.dataset_index = index, .detections = source.detections()};
-        samples.Capture(7U, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), source.detections()});
+        samples.Capture(
+            7U,
+            {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), source.detections()});
     }
     const auto await = [&](auto predicate) {
         std::unique_lock lock(mutex);
@@ -229,21 +231,24 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     samples.Begin(9U, selected_indices);
     const auto capture = [&](std::uint32_t index) {
         const rfdetr::PredictionRecord record{.dataset_index = index, .detections = source.detections()};
-        samples.Capture(9U, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), source.detections()});
+        samples.Capture(
+            9U,
+            {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), source.detections()});
     };
     capture(1U);  // A partial newer set stays pending while old detail is selected.
     samples.CloseDetail();
     await([&] { return !samples.snapshot().detail; });
     CHECK(samples.snapshot().content_identity == atlas.content_identity);
     CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
-    for (const auto overlays : {ValidationOverlays{true, true, true, true, false, true}, ValidationOverlays{true, true, true, true, true, false},
-                                ValidationOverlays{true, true, true, true, false, false}, ValidationOverlays{true, false, false, false}, ValidationOverlays{false, true, false, false},
-                                ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
+    for (const auto overlays :
+         {ValidationOverlays{true, true, true, true, false, true}, ValidationOverlays{true, true, true, true, true, false},
+          ValidationOverlays{true, true, true, true, false, false}, ValidationOverlays{true, false, false, false},
+          ValidationOverlays{false, true, false, false}, ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
         const auto revision = samples.snapshot().frame.revision;
         samples.SetOverlays(overlays);
         await([&] { return samples.snapshot().frame.revision > revision; });
         CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
+        CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
         CHECK(samples.snapshot().overlays == overlays);
     }
     const auto preserved = samples.snapshot();
@@ -282,8 +287,8 @@ TEST_CASE("validation preview generations settle to retained source custody with
     const bool detail_open = GENERATE(false, true);
     // Failure and cancellation share unsuccessful terminal settlement. Refusal
     // rejects capture independently of an otherwise successful metric result.
-    const auto outcome = GENERATE(contracts::ComputeOperationOutcome::Succeeded, contracts::ComputeOperationOutcome::Failed,
-                                  contracts::ComputeOperationOutcome::Cancelled);
+    const auto outcome =
+        GENERATE(contracts::ComputeOperationOutcome::Succeeded, contracts::ComputeOperationOutcome::Failed, contracts::ComputeOperationOutcome::Cancelled);
     const bool refuse = GENERATE(false, true);
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     std::mutex mutex;
@@ -313,8 +318,8 @@ TEST_CASE("validation preview generations settle to retained source custody with
             read.context().Bind();
             const auto plane = read.plane();
             std::vector<std::array<std::uint8_t, 4U>> pixels(512U * 576U);
-            REQUIRE(cudaMemcpy2D(pixels.data(), 512U * 4U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes,
-                                 512U * 4U, 576U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            REQUIRE(cudaMemcpy2D(pixels.data(), 512U * 4U, reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes, 512U * 4U, 576U,
+                                 cudaMemcpyDeviceToHost) == cudaSuccess);
             const auto expected = index == 0U ? std::array<std::uint8_t, 4U>{24U, 18U, 35U, 255U} : std::array<std::uint8_t, 4U>{};
             CHECK(std::ranges::all_of(pixels, [&](const auto& value) { return value == expected; }));
         }
@@ -324,7 +329,8 @@ TEST_CASE("validation preview generations settle to retained source custody with
     auto source = PredictionSource::Device(execution, {2U, 2U}, red, {}, classes);
     const auto capture = [&](std::uint64_t generation, std::uint32_t index) {
         const rfdetr::PredictionRecord record{.dataset_index = index};
-        samples.Capture(generation, {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
+        samples.Capture(generation,
+                        {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), {}});
     };
     capture(1U, 3U);
     samples.Settle(1U, true);
@@ -339,9 +345,9 @@ TEST_CASE("validation preview generations settle to retained source custody with
     samples.Begin(2U, indices);
     const std::array<float, 12U> green{0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0};
     source = PredictionSource::Device(execution, {2U, 2U}, green, {},
-        std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"replacement"}));
+                                      std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"replacement"}));
     samples.Begin(1U, indices);  // A stale selection callback cannot restart an older generation.
-    capture(1U, 7U);  // A stale producer cannot fill the new set's matching slot.
+    capture(1U, 7U);             // A stale producer cannot fill the new set's matching slot.
     capture(2U, 7U);
     if (!detail_open) await([&] { return samples.snapshot().sample_identities[1].generation == 2U; });
     const auto preview = samples.snapshot();
@@ -356,8 +362,10 @@ TEST_CASE("validation preview generations settle to retained source custody with
     const bool restored = refuse || outcome != contracts::ComputeOperationOutcome::Succeeded || detail_open;
     if (restored) {
         const bool republished = !detail_open || refuse || outcome != contracts::ComputeOperationOutcome::Succeeded;
-        await([&] { return samples.snapshot().content_identity == incumbent.content_identity
-            && (!republished || samples.snapshot().frame.revision > preview.frame.revision); });
+        await([&] {
+            return samples.snapshot().content_identity == incumbent.content_identity &&
+                   (!republished || samples.snapshot().frame.revision > preview.frame.revision);
+        });
         const auto after = samples.snapshot();
         CHECK(after.frame.clean_revision == incumbent.frame.clean_revision);
         CHECK(after.selected == incumbent.selected);
@@ -389,8 +397,8 @@ TEST_CASE("validation preview generations settle to retained source custody with
     read.context().Bind();
     std::array<std::uint8_t, 4U> pixel{};
     const auto plane = read.plane();
-    REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(plane.data + sample.crop.y * plane.descriptor.pitch_bytes + sample.crop.x * 4U),
-                       4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(plane.data + sample.crop.y * plane.descriptor.pitch_bytes + sample.crop.x * 4U), 4U,
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
     CHECK(pixel == (restored ? std::array<std::uint8_t, 4U>{255U, 0U, 0U, 255U} : std::array<std::uint8_t, 4U>{0U, 255U, 0U, 255U}));
     image = {};
     samples.Shutdown();
@@ -456,7 +464,7 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
         CHECK(pixel(1U, 3U) == (options.prediction_boxes ? std::array<std::uint8_t, 4U>{255, 0, 0, 255} : empty));
         const bool cyan = same_class == complementary;
         const std::array<std::uint8_t, 4U> truth_mask{static_cast<std::uint8_t>(cyan ? 0 : 255), static_cast<std::uint8_t>(cyan ? 255 : 0),
-                                                   static_cast<std::uint8_t>(cyan ? 255 : 0), 96};
+                                                      static_cast<std::uint8_t>(cyan ? 255 : 0), 96};
         auto truth_box = truth_mask;
         truth_box[3] = 255;
         auto overlap = options.prediction_masks ? std::array<std::uint8_t, 4U>{255, 0, 0, 96} : empty;
@@ -485,14 +493,14 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
     PredictionReceiverFault fault;
     ScopedPredictionReceiverFault receiver(fault);
     detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 6U);
-    gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
-                                     .output_buffer_count = 2U, .adopted_context = context});
+    gpu::SystemImageRuntime runtime(
+        {.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
     Composition retained;
     const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"sample"});
     const std::array<float, 12U> red{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
     auto source = PredictionSource::Device(execution, {2U, 2U}, red, {}, classes);
-    const std::array truth{rfdetr::Prediction{.class_reference = 0, .bbox_xyxy = {-0.5F, -0.5F, 0.5F, 0.5F},
-                                            .mask = {.height = 2U, .width = 2U, .area = 1U, .runs = {{0U, 1U}}}, .has_mask = true}};
+    const std::array truth{rfdetr::Prediction{
+        .class_reference = 0, .bbox_xyxy = {-0.5F, -0.5F, 0.5F, 0.5F}, .mask = {.height = 2U, .width = 2U, .area = 1U, .runs = {{0U, 1U}}}, .has_mask = true}};
     std::array<Composition::Region, 6U> regions;
     std::array<std::uint64_t, 2U> allocations{};
     std::size_t publications = 0U;
@@ -511,29 +519,30 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
         for (std::size_t index = 0U; index < count; ++index) {
             std::array<std::uint8_t, 4U> pixel{};
             const auto crop = regions[index].crop;
-            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(clean.data + crop.y * clean.descriptor.pitch_bytes + crop.x * 4U),
-                               4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(clean.data + crop.y * clean.descriptor.pitch_bytes + crop.x * 4U), 4U,
+                               cudaMemcpyDeviceToHost) == cudaSuccess);
             CHECK(pixel == std::array<std::uint8_t, 4U>{255, 0, 0, 255});
             const auto semantic = image.plane(1U).plane();
-            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(semantic.data + crop.y * semantic.descriptor.pitch_bytes + crop.x * 4U),
-                               4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(semantic.data + crop.y * semantic.descriptor.pitch_bytes + crop.x * 4U), 4U,
+                               cudaMemcpyDeviceToHost) == cudaSuccess);
             CHECK(pixel == (options.ground_truth_masks ? std::array<std::uint8_t, 4U>{0, 255, 255, 96} : std::array<std::uint8_t, 4U>{}));
-            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(semantic.data + crop.y * semantic.descriptor.pitch_bytes + (crop.x + 2U) * 4U),
-                               4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(semantic.data + crop.y * semantic.descriptor.pitch_bytes + (crop.x + 2U) * 4U), 4U,
+                               cudaMemcpyDeviceToHost) == cudaSuccess);
             CHECK(pixel == (options.ground_truth_boxes ? std::array<std::uint8_t, 4U>{0, 255, 255, 255} : std::array<std::uint8_t, 4U>{}));
         }
     };
     Composition::Options options{false, false, false, false, true, true};
     draw(0U, options);
     for (std::size_t index = 0U; index < regions.size(); ++index) {
-        auto frame = pool.Capture(source.pixels(), {2U, 2U}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, truth, true);
+        auto frame =
+            pool.Capture(source.pixels(), {2U, 2U}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, truth, true);
         REQUIRE(frame);
         regions[index] = {std::move(frame), {static_cast<std::uint32_t>(index % 3U) * 4U, static_cast<std::uint32_t>(index / 3U) * 4U, 4U, 4U}};
         draw(index + 1U, options);
-        CHECK(fault.draws == index + 1U); // One source conversion, including both destination allocations.
-        CHECK(fault.uploads == 0U); // GT boxes/disabled masks do not upload RLE.
+        CHECK(fault.draws == index + 1U);  // One source conversion, including both destination allocations.
+        CHECK(fault.uploads == 0U);        // GT boxes/disabled masks do not upload RLE.
     }
-    draw(6U, options); // Both allocations now hold all six unchanged tiles.
+    draw(6U, options);  // Both allocations now hold all six unchanged tiles.
     REQUIRE(allocations[0] != allocations[1]);
     const auto unchanged_semantics = fault.semantic_writes.load();
     draw(6U, options);
@@ -554,7 +563,7 @@ TEST_CASE("retained validation preparation follows physical storage and changed 
     fault.partial_semantic = false;
     // Allocation rotation after a refused candidate is unspecified; validate pixels directly.
     draw(6U, options, {16U, 12U});
-    CHECK(fault.draws == 6U); // Failure and output growth preserve untouched source clean preparation.
+    CHECK(fault.draws == 6U);  // Failure and output growth preserve untouched source clean preparation.
     options.ground_truth_masks = true;
     draw(6U, options, {16U, 12U});
     CHECK(fault.uploads == 6U);
@@ -604,9 +613,12 @@ TEST_CASE("validation semantic metrics survive optional preview refusal without 
     ValidationSystem validation(
         settings, dataset, model, [&] { return std::make_unique<RefusedValidationPreview>(runs); },
         [&](auto event) {
-            if (auto* changed = std::get_if<ValidationChanged>(&event); changed && !changed->snapshot.operation.active
-                && changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded) {
-                try { finished.set_value(changed->snapshot); } catch (const std::future_error&) {}
+            if (auto* changed = std::get_if<ValidationChanged>(&event);
+                changed && !changed->snapshot.operation.active &&
+                changed->snapshot.operation.terminal.outcome == contracts::ComputeOperationOutcome::Succeeded) {
+                try {
+                    finished.set_value(changed->snapshot);
+                } catch (const std::future_error&) {}
             }
         },
         {}, {.device = 0, .maximum_width = 768U, .maximum_height = 512U});

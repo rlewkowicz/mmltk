@@ -96,7 +96,8 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
     page.more = page.next_cursor < size && ((!page.records.empty() && consumed >= page_bytes) || page.records.size() == query.count);
     return page;
 }
-std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& selected, const std::optional<r::TrainingCheckpoint>& resume, const bool automatic) {
+std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& selected, const std::optional<r::TrainingCheckpoint>& resume,
+                                                   const bool automatic) {
     if (selected.empty()) throw std::invalid_argument("training output directory is empty");
     const auto root = std::filesystem::absolute(selected).lexically_normal();
     if (!automatic && resume && std::filesystem::exists(root / "run.json") && std::filesystem::exists(root / "metrics.jsonl")) {

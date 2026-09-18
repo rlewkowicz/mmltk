@@ -58,21 +58,38 @@ impl ApplicationModel {
         })
     }
 
-    pub(crate) fn viewer_base_source(&self) -> Option<(&VisualFrame, &crate::generated::VisualDocumentFacts)> {
+    pub(crate) fn viewer_base_source(
+        &self,
+    ) -> Option<(&VisualFrame, &crate::generated::VisualDocumentFacts)> {
         let validation = self.foreground_visual() == Some(PresentationSourceKind::Validation)
             || (self.foreground_visual() == Some(PresentationSourceKind::Upscale)
-                && self.requested_upscale.as_ref().is_some_and(|request| request.source.source.kind == PresentationSourceKind::Validation));
+                && self.requested_upscale.as_ref().is_some_and(|request| {
+                    request.source.source.kind == PresentationSourceKind::Validation
+                }));
         if validation {
-            let snapshot = self.workflow.validation.as_ref().filter(|value| value.detail)?;
-            return Self::valid_visual_source(&snapshot.frame).map(|_| (&snapshot.frame, &snapshot.document));
+            let snapshot = self
+                .workflow
+                .validation
+                .as_ref()
+                .filter(|value| value.detail)?;
+            return Self::valid_visual_source(&snapshot.frame)
+                .map(|_| (&snapshot.frame, &snapshot.document));
         }
         let snapshot = self.explore.snapshot.as_ref()?;
-        (snapshot.mode == crate::generated::ExploreMode::Detail && snapshot.selectedimage.is_some()
-            && self.explore.requested_selection.is_none_or(|image| snapshot.selectedimage == Some(image)))
-            .then_some((&snapshot.frame, &snapshot.document))
+        (snapshot.mode == crate::generated::ExploreMode::Detail
+            && snapshot.selectedimage.is_some()
+            && self
+                .explore
+                .requested_selection
+                .is_none_or(|image| snapshot.selectedimage == Some(image)))
+        .then_some((&snapshot.frame, &snapshot.document))
     }
     pub(crate) fn viewer_native_kind(&self) -> PresentationSourceKind {
-        self.requested_upscale.as_ref().map_or(PresentationSourceKind::Explore, |request| request.source.source.kind)
+        self.requested_upscale
+            .as_ref()
+            .map_or(PresentationSourceKind::Explore, |request| {
+                request.source.source.kind
+            })
     }
     pub fn request_upscale(&mut self, request: crate::generated::UpscaleRequest) {
         let source_kind = request.source.source.kind;
@@ -194,11 +211,17 @@ impl ApplicationModel {
     }
 
     pub fn set_foreground_feature(&mut self, feature: FeatureId) {
-        if ((feature == FeatureId::Explore && self.viewer_native_kind() == PresentationSourceKind::Explore)
-            || (feature == FeatureId::Validate && self.viewer_native_kind() == PresentationSourceKind::Validation))
+        if ((feature == FeatureId::Explore
+            && self.viewer_native_kind() == PresentationSourceKind::Explore)
+            || (feature == FeatureId::Validate
+                && self.viewer_native_kind() == PresentationSourceKind::Validation))
             && matches!(
                 self.presentation_model.foreground(),
-                Some(PresentationSourceKind::Explore | PresentationSourceKind::Validation | PresentationSourceKind::Upscale)
+                Some(
+                    PresentationSourceKind::Explore
+                        | PresentationSourceKind::Validation
+                        | PresentationSourceKind::Upscale
+                )
             )
         {
             return;
@@ -302,14 +325,24 @@ mod tests {
         let document = model.explore.snapshot.as_ref().unwrap().document.clone();
         let validation = model.workflow.validation.as_mut().unwrap();
         validation.detail = true;
-        validation.selected = Some(crate::generated::ValidationSampleIdentity { generation: 7, datasetindex: 42 });
+        validation.selected = Some(crate::generated::ValidationSampleIdentity {
+            generation: 7,
+            datasetindex: 42,
+        });
         validation.frame = visual_frame(PresentationSourceKind::Validation, 11);
         validation.document = document.clone();
         let source = validation.frame.clone();
         model.set_foreground_feature(FeatureId::Validate);
-        let request = crate::generated::UpscaleRequest { source: source.clone(), document, kernel: crate::generated::UpscaleKernel::Default };
+        let request = crate::generated::UpscaleRequest {
+            source: source.clone(),
+            document,
+            kernel: crate::generated::UpscaleKernel::Default,
+        };
         model.request_upscale(request.clone());
-        assert_eq!(model.foreground_visual(), Some(PresentationSourceKind::Validation));
+        assert_eq!(
+            model.foreground_visual(),
+            Some(PresentationSourceKind::Validation)
+        );
         let upscale = model.upscale_snapshot.as_mut().unwrap();
         upscale.ready = true;
         upscale.input = source;
@@ -318,7 +351,10 @@ mod tests {
         upscale.methods[0].completed = Some(request.clone());
         upscale.methods[0].frame = upscale.frame.clone();
         model.request_upscale(request);
-        assert_eq!(model.foreground_visual(), Some(PresentationSourceKind::Upscale));
+        assert_eq!(
+            model.foreground_visual(),
+            Some(PresentationSourceKind::Upscale)
+        );
         assert!(model.current_upscale().is_some());
         model.explore.snapshot.as_mut().unwrap().frame.revision += 1;
         assert!(model.current_upscale().is_some());

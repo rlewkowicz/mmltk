@@ -129,7 +129,8 @@ int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, s
     }
     return mmltk::backend::imaging::raster::chw_float_to_rgba(source, width, height, destination, pitch, stream);
 }
-cudaError_t PredictionReceiverFault::ClearSemantic(void* destination, std::size_t pitch, int value, std::size_t width, std::size_t height, cudaStream_t stream) {
+cudaError_t PredictionReceiverFault::ClearSemantic(void* destination, std::size_t pitch, int value, std::size_t width, std::size_t height,
+                                                   cudaStream_t stream) {
     auto* fault = receiver_fault.load();
     if (fault) ++fault->semantic_writes;
     if (fault && fault->partial_semantic) {

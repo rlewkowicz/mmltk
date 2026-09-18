@@ -1,0 +1,61 @@
+{
+  "source": "https://hg.mozilla.org/mozilla-central/file/d4ae522db3b933e502d1febec899e7955c1fb633/taskcluster/kinds/toolchain",
+  "tasks": {
+    "toolchain-linux64-clang": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.linux64-clang-21.hash.1f707603f8593eac8450091ff084fb317e4443e24cdae956aa72bab99c0feb69"
+      ],
+      "artifact": "public/build/clang.tar.zst",
+      "extract": true
+    },
+    "toolchain-linux64-sccache": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.linux64-sccache.hash.4e2ce1b7b582420e2643e79161fc9a85615740093fb1d66782dcf5d1a11b3c7c"
+      ],
+      "artifact": "public/build/sccache.tar.zst",
+      "extract": true
+    },
+    "toolchain-sysroot-x86_64-linux-gnu": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.sysroot-x86_64-linux-gnu.hash.f18eb4f18093faedb235bfa14d052234cb65568766407d95867142131994042a"
+      ],
+      "artifact": "public/build/sysroot-x86_64-linux-gnu.tar.zst",
+      "extract": true
+    },
+    "toolchain-linux64-pkgconf": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.linux64-pkgconf.hash.62f9c0ea07b0ef08c8382d0d7cc1f745352d2801e9c470b00b514909517e65f6"
+      ],
+      "artifact": "public/build/pkgconf.tar.zst",
+      "extract": true
+    },
+    "toolchain-linux64-cbindgen": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.linux64-cbindgen.hash.1d6fe6a0add4a10a8b355dccd2eed7a0b7f09d06407d0070d6e13e185cc71971"
+      ],
+      "artifact": "public/build/cbindgen.tar.zst",
+      "extract": true
+    },
+    "toolchain-linux64-nasm": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.linux64-nasm.hash.b7ab3f19cef0d13b28bbd65b911ee3ec55bd36a2563da645e5d1ca5a645b3aee"
+      ],
+      "artifact": "public/build/nasm.tar.zst",
+      "extract": true
+    },
+    "toolchain-linux64-node": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.linux64-node-22.hash.077cf8b026a346228449aa98886b5ef96e2e5991eedd951d0c422ba4ea5072fd"
+      ],
+      "artifact": "public/build/node.tar.zst",
+      "extract": true
+    },
+    "toolchain-linux64-dump_syms": {
+      "index": [
+        "gecko.cache.level-3.toolchains.v3.linux64-dump_syms.hash.ca486ca20f44f7d85f04ce60c91b8d13a125d07d8d84f6f5c2681ef96426a44a"
+      ],
+      "artifact": "public/build/dump_syms.tar.zst",
+      "extract": true
+    }
+  }
+}

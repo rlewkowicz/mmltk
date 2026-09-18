@@ -398,74 +398,78 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
     Allocation staged;
     const auto prior_allocations = candidate.allocations();
     try {
-        runtime.PublishRetained(candidate, extent.width, extent.height, [submission, &runtime, retained, &allocation, &staged, prior_allocations](auto clean, auto semantic, auto stream) {
-            const auto clear = [&](auto plane) {
-                checked(cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes(),
-                                          plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream)));
-            };
-            bool initialize = true;
-            if (retained) {
-                auto found = std::ranges::find_if(retained->allocations_, [&](const auto& value) {
-                    return (value.clean == clean.allocation && value.semantic == semantic.allocation)
-                        || (prior_allocations[0].identity != 0U && value.clean == prior_allocations[0] && value.semantic == prior_allocations[1]);
-                });
-                allocation = found == retained->allocations_.end()
-                    ? &retained->allocations_[retained->replacement_++ % retained->allocations_.size()] : &*found;
-                initialize = !allocation->initialized || allocation->clean != clean.allocation || allocation->semantic != semantic.allocation
-                    || allocation->extent != submission->extent || allocation->padding != submission->options.atlas_padding;
-                // A removed or moved region exposes padding and changes the layout.
-                for (std::size_t index = 0U; !initialize && index < allocation->count; ++index)
-                    initialize = std::ranges::none_of(submission->regions, [&](const auto& region) { return region.crop == allocation->cells[index].crop; });
-                if (initialize) *allocation = {};
-                staged = *allocation;
-                staged.clean = clean.allocation;
-                staged.semantic = semantic.allocation;
-                staged.extent = submission->extent;
-                staged.padding = submission->options.atlas_padding;
-                staged.initialized = true;
-                staged.count = submission->regions.size();
-            }
-            if (initialize && (submission->regions.size() != 1U ||
-                submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height})) {
-                if (submission->options.atlas_padding) {
-                    constexpr auto color = raster::kAtlasPadding;
-                    constexpr unsigned packed = unsigned(color.r) | (unsigned(color.g) << 8U) | (unsigned(color.b) << 16U) | (unsigned(color.a) << 24U);
-                    const auto status = cuMemsetD2D32Async(clean.data, clean.descriptor.pitch_bytes, packed, clean.descriptor.width, clean.descriptor.height,
-                                                        reinterpret_cast<CUstream>(stream));
-                    if (status != CUDA_SUCCESS) throw std::runtime_error("validation atlas padding failed: " + std::to_string(status));
-                } else clear(clean);
-                clear(semantic);
-            }
-            const auto plane_region = [](gpu::ImagePlaneView plane, VisualRegion crop) {
-                plane.data += static_cast<std::size_t>(crop.y) * plane.descriptor.pitch_bytes + static_cast<std::size_t>(crop.x) * 4U;
-                plane.descriptor.width = crop.width;
-                plane.descriptor.height = crop.height;
-                return plane;
-            };
-            const auto& overlays = submission->options;
-            for (std::size_t index = 0U; index < submission->regions.size(); ++index) {
-                const auto& region = submission->regions[index];
-                bool write_clean = true, write_semantic = true;
-                if (allocation && !initialize) {
-                    for (std::size_t previous = 0U; previous < allocation->count; ++previous) {
-                        auto& cell = allocation->cells[previous];
-                        if (cell.crop != region.crop) continue;
-                        const bool same = cell.frame.lock() == region.frame && cell.capture == region.frame->state_->capture;
-                        write_clean = !same || !cell.clean;
-                        write_semantic = !same || !cell.semantic || cell.options != overlays;
-                        // Invalidate the real destination before its first possible write.
-                        if (write_clean) cell.clean = false;
-                        if (write_semantic) cell.semantic = false;
-                        break;
-                    }
+        runtime.PublishRetained(
+            candidate, extent.width, extent.height,
+            [submission, &runtime, retained, &allocation, &staged, prior_allocations](auto clean, auto semantic, auto stream) {
+                const auto clear = [&](auto plane) {
+                    checked(cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes(),
+                                              plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream)));
+                };
+                bool initialize = true;
+                if (retained) {
+                    auto found = std::ranges::find_if(retained->allocations_, [&](const auto& value) {
+                        return (value.clean == clean.allocation && value.semantic == semantic.allocation) ||
+                               (prior_allocations[0].identity != 0U && value.clean == prior_allocations[0] && value.semantic == prior_allocations[1]);
+                    });
+                    allocation =
+                        found == retained->allocations_.end() ? &retained->allocations_[retained->replacement_++ % retained->allocations_.size()] : &*found;
+                    initialize = !allocation->initialized || allocation->clean != clean.allocation || allocation->semantic != semantic.allocation ||
+                                 allocation->extent != submission->extent || allocation->padding != submission->options.atlas_padding;
+                    // A removed or moved region exposes padding and changes the layout.
+                    for (std::size_t index = 0U; !initialize && index < allocation->count; ++index)
+                        initialize =
+                            std::ranges::none_of(submission->regions, [&](const auto& region) { return region.crop == allocation->cells[index].crop; });
+                    if (initialize) *allocation = {};
+                    staged = *allocation;
+                    staged.clean = clean.allocation;
+                    staged.semantic = semantic.allocation;
+                    staged.extent = submission->extent;
+                    staged.padding = submission->options.atlas_padding;
+                    staged.initialized = true;
+                    staged.count = submission->regions.size();
                 }
-                if (write_clean || write_semantic)
-                    region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream, overlays.prediction_boxes,
-                                             overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks, overlays.complementary_layers,
-                                             write_clean, write_semantic);
-                if (allocation) staged.cells[index] = {region.frame, region.frame->state_->capture, region.crop, overlays, true, true};
-            }
-        });
+                if (initialize && (submission->regions.size() != 1U ||
+                                   submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height})) {
+                    if (submission->options.atlas_padding) {
+                        constexpr auto color = raster::kAtlasPadding;
+                        constexpr unsigned packed = unsigned(color.r) | (unsigned(color.g) << 8U) | (unsigned(color.b) << 16U) | (unsigned(color.a) << 24U);
+                        const auto status = cuMemsetD2D32Async(clean.data, clean.descriptor.pitch_bytes, packed, clean.descriptor.width,
+                                                               clean.descriptor.height, reinterpret_cast<CUstream>(stream));
+                        if (status != CUDA_SUCCESS) throw std::runtime_error("validation atlas padding failed: " + std::to_string(status));
+                    } else
+                        clear(clean);
+                    clear(semantic);
+                }
+                const auto plane_region = [](gpu::ImagePlaneView plane, VisualRegion crop) {
+                    plane.data += static_cast<std::size_t>(crop.y) * plane.descriptor.pitch_bytes + static_cast<std::size_t>(crop.x) * 4U;
+                    plane.descriptor.width = crop.width;
+                    plane.descriptor.height = crop.height;
+                    return plane;
+                };
+                const auto& overlays = submission->options;
+                for (std::size_t index = 0U; index < submission->regions.size(); ++index) {
+                    const auto& region = submission->regions[index];
+                    bool write_clean = true, write_semantic = true;
+                    if (allocation && !initialize) {
+                        for (std::size_t previous = 0U; previous < allocation->count; ++previous) {
+                            auto& cell = allocation->cells[previous];
+                            if (cell.crop != region.crop) continue;
+                            const bool same = cell.frame.lock() == region.frame && cell.capture == region.frame->state_->capture;
+                            write_clean = !same || !cell.clean;
+                            write_semantic = !same || !cell.semantic || cell.options != overlays;
+                            // Invalidate the real destination before its first possible write.
+                            if (write_clean) cell.clean = false;
+                            if (write_semantic) cell.semantic = false;
+                            break;
+                        }
+                    }
+                    if (write_clean || write_semantic)
+                        region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream,
+                                                 overlays.prediction_boxes, overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks,
+                                                 overlays.complementary_layers, write_clean, write_semantic);
+                    if (allocation) staged.cells[index] = {region.frame, region.frame->state_->capture, region.crop, overlays, true, true};
+                }
+            });
         if (allocation) *allocation = std::move(staged);
         // PublishRetained's completion, including its outer stream settlement,
         // proves every source read and staging upload complete before release.
@@ -486,9 +490,7 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
         const auto failure = std::current_exception();
         // Failed submission may have partially overwritten scratch or upload storage.
         // Only previously settled, untouched preparation survives an ordinary failure.
-        for (const auto& region : submission->regions) {
-            region.frame->state_->pending = region.frame->state_->prepared;
-        }
+        for (const auto& region : submission->regions) { region.frame->state_->pending = region.frame->state_->prepared; }
         const bool unsafe_frame =
             std::ranges::any_of(submission->regions, [](const auto& region) { return region.frame->state_->unsafe.load() != cudaSuccess; });
         if (gpu::is_image_execution_failure(failure) || unsafe_frame || (retirement && !retirement->admission_open())) {
@@ -506,8 +508,8 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
     }
 }
 void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic, std::uintptr_t stream,
-                                        bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers,
-                                        bool write_clean, bool write_semantic) const {
+                                        bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks,
+                                        bool complementary_layers, bool write_clean, bool write_semantic) const {
     if (!CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
     auto& state = *state_;
     std::lock_guard state_lock(state.mutex);
@@ -546,7 +548,8 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
                     state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)));
                 if (scale) state.pending.clean = true;
             }
-            const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers};
+            const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks,
+                                                                         complementary_layers};
             if (write_semantic && (!scale || !state.prepared.semantic || state.prepared.options != semantic_options)) {
                 if (scale) state.prepared.semantic = false;
                 checked(state.clear_semantic(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
@@ -583,7 +586,7 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
                 std::size_t word = 0U, gt_index = 0U;
                 for (const auto& gt : state.ground_truth) {
                     raster::RgbColor color{state.ground_truth_colors[gt_index * 3U], state.ground_truth_colors[gt_index * 3U + 1U],
-                                                 state.ground_truth_colors[gt_index * 3U + 2U]};
+                                           state.ground_truth_colors[gt_index * 3U + 2U]};
                     if (complementary_layers) {
                         color.r = 255U - color.r;
                         color.g = 255U - color.g;
@@ -621,16 +624,17 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             }
             if (scale) {
                 if (write_clean)
-                    checked(
-                    static_cast<cudaError_t>(raster::scale_rgba_nearest({clean_pixels, clean_pitch, overlay.width, overlay.height},
-                                                                        {reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes,
-                                                                         static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)},
-                                                                        stream)));
-                if (write_semantic) checked(static_cast<cudaError_t>(
-                    raster::scale_rgba_nearest({semantic_pixels, semantic_pitch, overlay.width, overlay.height},
-                                               {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes,
-                                                static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)},
-                                               stream)));
+                    checked(static_cast<cudaError_t>(
+                        raster::scale_rgba_nearest({clean_pixels, clean_pitch, overlay.width, overlay.height},
+                                                   {reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes,
+                                                    static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)},
+                                                   stream)));
+                if (write_semantic)
+                    checked(static_cast<cudaError_t>(
+                        raster::scale_rgba_nearest({semantic_pixels, semantic_pitch, overlay.width, overlay.height},
+                                                   {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes,
+                                                    static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)},
+                                                   stream)));
             }
         });
         // The enclosing PublishRetained owns completion and partial-write settlement.

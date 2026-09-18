@@ -108,7 +108,6 @@ TEST_CASE("saved training format one is explicitly incompatible", "[gui][train][
     TrainRunStore store;
     REQUIRE_THROWS_WITH(store.Open(temp.path()), Catch::Matchers::ContainsSubstring("unsupported or inconsistent training run format"));
 }
-
 TEST_CASE("automatic output reserves increasing directories across owners", "[gui][train][history]") {
     mmltk::testsupport::ScopedTempDir temp{"training-output-reservation"};
     const auto root = temp.path() / "output";

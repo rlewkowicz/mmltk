@@ -62,11 +62,12 @@ pub fn panel<'a, Message: Clone + 'a>(
                     } else {
                         crate::fluent_theme::button_secondary
                     })
-                    .on_press_maybe(
-                        upscale_available.then(|| upscale_requested(kernel)),
-                    ),
+                    .on_press_maybe(upscale_available.then(|| upscale_requested(kernel))),
                 )
-                .id(ids.upscale[crate::generated::UPSCALE_KERNEL_VALUES.iter().position(|value| *value == kernel).expect("canonical kernel")]),
+                .id(ids.upscale[crate::generated::UPSCALE_KERNEL_VALUES
+                    .iter()
+                    .position(|value| *value == kernel)
+                    .expect("canonical kernel")]),
             )
         });
     let panel = container(
@@ -74,21 +75,9 @@ pub fn panel<'a, Message: Clone + 'a>(
             row![
                 text(format!("Sample #{}", selected)).size(20),
                 space::horizontal(),
-                container(
-                    button("Previous")
-                        .on_press_maybe(previous)
-                )
-                .id(ids.previous),
-                container(
-                    button("Next").on_press_maybe(next)
-                )
-                .id(ids.next),
-                container(
-                    button("×")
-                        .on_press_maybe(close)
-                        .padding([2, 9])
-                )
-                .id(ids.close),
+                container(button("Previous").on_press_maybe(previous)).id(ids.previous),
+                container(button("Next").on_press_maybe(next)).id(ids.next),
+                container(button("×").on_press_maybe(close).padding([2, 9])).id(ids.close),
             ]
             .spacing(7)
             .align_y(Center),
@@ -110,9 +99,7 @@ pub fn panel<'a, Message: Clone + 'a>(
             .align_y(Center),
             container(
                 button("Open in Annotation")
-                    .on_press_maybe(
-                        annotate,
-                    )
+                    .on_press_maybe(annotate,)
                     .style(crate::fluent_theme::button_primary)
             )
             .id(ids.annotate),

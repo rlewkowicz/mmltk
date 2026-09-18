@@ -455,8 +455,8 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
     PredictionReceiverFault fault;
     ScopedPredictionReceiverFault receiver(fault);
     detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 1U);
-    gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
-                                     .output_buffer_count = 2U, .adopted_context = context});
+    gpu::SystemImageRuntime runtime(
+        {.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic, .output_buffer_count = 2U, .adopted_context = context});
     Composition retained;
     const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"sample"});
     const detail::PredictionPreviewFrame* slot = nullptr;
@@ -466,9 +466,10 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
         std::vector<float> pixels(count * 3U, 0.0F);
         std::fill_n(pixels.begin() + generation * count, count, 1.0F);
         auto source = PredictionSource::Device(execution, {side, side}, pixels, {}, classes);
-        auto frame = pool.Capture(source.pixels(), {side, side}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, {}, true);
+        auto frame =
+            pool.Capture(source.pixels(), {side, side}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, {}, true);
         REQUIRE(frame);
-        if (slot) CHECK(frame.get() == slot); // Weak preparation records cannot occupy a raw slot.
+        if (slot) CHECK(frame.get() == slot);  // Weak preparation records cannot occupy a raw slot.
         slot = frame.get();
         const std::array regions{Composition::Region{frame, {0U, 0U, 4U, 4U}}};
         for (unsigned publication = 0U; publication < 2U; ++publication) {
@@ -479,8 +480,8 @@ TEST_CASE("preview recapture invalidates retained scratch and destination region
             context.Bind();
             const auto clean = image.plane(0U).plane();
             std::array<std::array<std::uint8_t, 4U>, 16U> actual{};
-            REQUIRE(cudaMemcpy2D(actual.data(), 16U, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes,
-                                 16U, 4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            REQUIRE(cudaMemcpy2D(actual.data(), 16U, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes, 16U, 4U,
+                                 cudaMemcpyDeviceToHost) == cudaSuccess);
             std::array<std::uint8_t, 4U> expected{0, 0, 0, 255};
             expected[generation] = 255U;
             CHECK(std::ranges::all_of(actual, [&](auto pixel) { return pixel == expected; }));

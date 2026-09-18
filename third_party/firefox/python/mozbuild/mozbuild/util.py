@@ -1295,50 +1295,6 @@ def get_root_url(block_proxy=False):
     return TASKCLUSTER_ROOT_URL
 
 
-def get_taskcluster_client(service: str, block_proxy=False):
-    import taskcluster
-
-    if "TASKCLUSTER_PROXY_URL" in os.environ and not block_proxy:
-        options = {"rootUrl": os.environ["TASKCLUSTER_PROXY_URL"].rstrip("/")}
-    else:
-        options = taskcluster.optionsFromEnvironment({
-            "rootUrl": get_root_url(block_proxy)
-        })
-    return getattr(taskcluster, service[0].upper() + service[1:])(options)
-
-
-def find_task_from_index(index_paths):
-    """Search the Taskcluster index for an existing task.
-
-    Args:
-        index_paths: List of index paths to search
-
-    Returns:
-        str: Task ID if found and valid
-        None: If no valid task found
-    """
-    from taskcluster.exceptions import TaskclusterRestFailure
-
-    for index_path in index_paths:
-        try:
-            index = get_taskcluster_client("index")
-            task = index.findTask(index_path)
-            task_id = task["taskId"]
-
-            queue = get_taskcluster_client("queue")
-            response = queue.status(task_id)
-            status = response.get("status", {}) if response else {}
-
-            if not status or status.get("state") in ("exception", "failed"):
-                continue
-
-            return task_id
-        except (KeyError, TaskclusterRestFailure):
-            pass
-
-    return None
-
-
 def set_taskcluster_root_url():
     if "TASKCLUSTER_ROOT_URL" not in os.environ:
         os.environ["TASKCLUSTER_ROOT_URL"] = TASKCLUSTER_ROOT_URL

@@ -86,9 +86,17 @@ impl ApplicationModel {
         match result {
             Err(error) => {
                 let current_failure = match context {
-                    ApplicationIntentEndpoint::TrainingOpenRun | ApplicationIntentEndpoint::TrainingHistory => self.workflow.output.fail(correlation),
-                    ApplicationIntentEndpoint::TrainingInspectCheckpoint => self.workflow.train_continuation.fail(correlation, error.detail.clone()),
-                    ApplicationIntentEndpoint::UpscaleStart => self.requested_upscale == self.sent_upscale,
+                    ApplicationIntentEndpoint::TrainingOpenRun
+                    | ApplicationIntentEndpoint::TrainingHistory => {
+                        self.workflow.output.fail(correlation)
+                    }
+                    ApplicationIntentEndpoint::TrainingInspectCheckpoint => self
+                        .workflow
+                        .train_continuation
+                        .fail(correlation, error.detail.clone()),
+                    ApplicationIntentEndpoint::UpscaleStart => {
+                        self.requested_upscale == self.sent_upscale
+                    }
                     _ => true,
                 };
                 if context == ApplicationIntentEndpoint::UpscaleStart {
@@ -266,10 +274,15 @@ impl ApplicationModel {
         mut snapshot: crate::generated::TrainingSnapshot,
     ) -> Result<(Observation, Option<String>), UiError> {
         if let Some(current) = self.workflow.training.as_mut() {
-            super::workflow::merge_checkpoint_inspection(&mut current.inspection, snapshot.inspection.clone())?;
+            super::workflow::merge_checkpoint_inspection(
+                &mut current.inspection,
+                snapshot.inspection.clone(),
+            )?;
             snapshot.inspection = current.inspection.clone();
         }
-        self.workflow.train_continuation.observe(snapshot.inspection.clone());
+        self.workflow
+            .train_continuation
+            .observe(snapshot.inspection.clone());
         let prior = self.workflow.training.as_ref().map(|value| {
             (
                 value.local.terminal.outcome,
@@ -431,7 +444,11 @@ impl ApplicationModel {
         let observation = merge_explore_snapshot(&mut self.explore.snapshot, snapshot)?;
         if observation == Observation::Installed {
             let snapshot = self.explore.snapshot.as_ref().expect("installed snapshot");
-            if let Some(request) = self.requested_upscale.as_mut().filter(|request| request.source.source.kind == PresentationSourceKind::Explore) {
+            if let Some(request) = self
+                .requested_upscale
+                .as_mut()
+                .filter(|request| request.source.source.kind == PresentationSourceKind::Explore)
+            {
                 if !dataset_changed
                     && same_image
                     && snapshot.mode == crate::generated::ExploreMode::Detail
@@ -449,7 +466,9 @@ impl ApplicationModel {
             }
         }
         if observation == Observation::Installed
-            && self.requested_upscale.as_ref().is_some_and(|request| request.source.source.kind == PresentationSourceKind::Explore)
+            && self.requested_upscale.as_ref().is_some_and(|request| {
+                request.source.source.kind == PresentationSourceKind::Explore
+            })
             && self.current_upscale().is_none()
         {
             self.set_foreground_visual(Some(PresentationSourceKind::Explore));

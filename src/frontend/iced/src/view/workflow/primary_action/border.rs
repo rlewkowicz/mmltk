@@ -22,7 +22,9 @@ pub(super) struct Border {
 impl<Message> shader::Program<Message> for Border {
     type State = super::Animation;
     type Primitive = Self;
-    fn draw(&self, _state: &Self::State, _cursor: iced::mouse::Cursor, _bounds: Rectangle) -> Self { self.clone() }
+    fn draw(&self, _state: &Self::State, _cursor: iced::mouse::Cursor, _bounds: Rectangle) -> Self {
+        self.clone()
+    }
 }
 
 pub(super) struct Pipeline {
@@ -36,55 +38,131 @@ impl shader::Pipeline for Pipeline {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("primary border uniforms"),
             entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0, visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None,
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
             }],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("primary border"), source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            label: Some("primary border"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("primary border"), bind_group_layouts: &[Some(&layout)], immediate_size: 0,
+            label: Some("primary border"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
         let render = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("primary border"), layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &module, entry_point: Some("vertex"), buffers: &[], compilation_options: Default::default() },
+            label: Some("primary border"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
             fragment: Some(wgpu::FragmentState {
-                module: &module, entry_point: Some("fragment"),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
+                module: &module,
+                entry_point: Some("fragment"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
                 compilation_options: Default::default(),
             }),
-            primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
         });
-        Self { identity: NEXT_DEVICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed), render, layout }
+        Self {
+            identity: NEXT_DEVICE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            render,
+            layout,
+        }
     }
 }
 impl shader::Primitive for Border {
     type Pipeline = Pipeline;
-    fn prepare(&self, pipeline: &mut Pipeline, device: &wgpu::Device, queue: &wgpu::Queue, bounds: &Rectangle, viewport: &shader::Viewport) {
+    fn prepare(
+        &self,
+        pipeline: &mut Pipeline,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bounds: &Rectangle,
+        viewport: &shader::Viewport,
+    ) {
         let mut retained = self.resources.0.lock().expect("primary border binding");
-        if retained.as_ref().is_none_or(|binding| binding.device != pipeline.identity) {
+        if retained
+            .as_ref()
+            .is_none_or(|binding| binding.device != pipeline.identity)
+        {
             let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("primary border"), size: 48, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+                label: Some("primary border"),
+                size: 48,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
             });
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("primary border"), layout: &pipeline.layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
+                label: Some("primary border"),
+                layout: &pipeline.layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                }],
             });
-            *retained = Some(Binding { device: pipeline.identity, uniform, group });
+            *retained = Some(Binding {
+                device: pipeline.identity,
+                uniform,
+                group,
+            });
         }
         let blue = self.blue.into_linear();
         // Retain the aligned 48-byte binding; unused vector lanes are padding.
-        let values = [bounds.width, bounds.height, 0.0, 0.0,
-            viewport.scale_factor(), self.phase, 0.0, 0.0,
-            blue[0], blue[1], blue[2], blue[3]];
+        let values = [
+            bounds.width,
+            bounds.height,
+            0.0,
+            0.0,
+            viewport.scale_factor(),
+            self.phase,
+            0.0,
+            0.0,
+            blue[0],
+            blue[1],
+            blue[2],
+            blue[3],
+        ];
         let mut bytes = [0u8; 48];
-        for (value, target) in values.into_iter().zip(bytes.chunks_exact_mut(4)) { target.copy_from_slice(&value.to_ne_bytes()); }
-        queue.write_buffer(&retained.as_ref().expect("prepared binding").uniform, 0, &bytes);
+        for (value, target) in values.into_iter().zip(bytes.chunks_exact_mut(4)) {
+            target.copy_from_slice(&value.to_ne_bytes());
+        }
+        queue.write_buffer(
+            &retained.as_ref().expect("prepared binding").uniform,
+            0,
+            &bytes,
+        );
     }
-    fn draw(&self, pipeline: &Pipeline, pass: &mut wgpu::RenderPass<'_>, _resources: &mut shader::Resources) -> bool {
+    fn draw(
+        &self,
+        pipeline: &Pipeline,
+        pass: &mut wgpu::RenderPass<'_>,
+        _resources: &mut shader::Resources,
+    ) -> bool {
         let retained = self.resources.0.lock().expect("primary border binding");
-        let Some(binding) = retained.as_ref().filter(|binding| binding.device == pipeline.identity) else { return true; };
+        let Some(binding) = retained
+            .as_ref()
+            .filter(|binding| binding.device == pipeline.identity)
+        else {
+            return true;
+        };
         pass.set_pipeline(&pipeline.render);
         pass.set_bind_group(0, &binding.group, &[]);
         pass.draw(0..6, 0..8);

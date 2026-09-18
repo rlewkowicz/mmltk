@@ -3,7 +3,7 @@ use crate::generated::{ValidationOverlays, ValidationSampleIdentity};
 use crate::presentation_surface::{self, Surface};
 use crate::view::workflow::overlay_controls;
 use iced::widget::{button, checkbox, column, container, row, text};
-use iced::{Fill, Center};
+use iced::{Center, Fill};
 
 pub const ATLAS_ID: &str = "validate.samples.atlas";
 #[derive(Debug, Clone)]
@@ -39,19 +39,30 @@ impl AtlasInteraction {
     fn synchronize(&mut self, source: Option<AtlasSource>) {
         // Publication revisions carry exact hit metadata, but do not end a hold
         // on the same retained atlas.
-        let same_source = self.source.as_ref().zip(source.as_ref()).is_some_and(|(old, new)| {
-            old.binding == new.binding && old.frame.source == new.frame.source
-                && old.content == new.content
-        });
-        if !same_source { self.pressed = None; }
+        let same_source = self
+            .source
+            .as_ref()
+            .zip(source.as_ref())
+            .is_some_and(|(old, new)| {
+                old.binding == new.binding
+                    && old.frame.source == new.frame.source
+                    && old.content == new.content
+            });
+        if !same_source {
+            self.pressed = None;
+        }
         self.source = source;
     }
     fn input(&mut self, input: AtlasInput) -> Option<ValidationSampleIdentity> {
-        if self.source.as_ref() != Some(&input.source) { return None; }
+        if self.source.as_ref() != Some(&input.source) {
+            return None;
+        }
         match input.kind {
             presentation_surface::SurfaceGestureKind::Pointer if input.pressed => {
                 let selected = input.selected?;
-                if self.pressed.as_ref() == Some(&selected) { return None; }
+                if self.pressed.as_ref() == Some(&selected) {
+                    return None;
+                }
                 self.pressed = Some(selected.clone());
                 Some(selected)
             }
@@ -73,7 +84,12 @@ pub struct Component {
 }
 impl Default for Component {
     fn default() -> Self {
-        Self { ground_truth: true, prediction: true, fit_revision: 0, atlas: Default::default() }
+        Self {
+            ground_truth: true,
+            prediction: true,
+            fit_revision: 0,
+            atlas: Default::default(),
+        }
     }
 }
 impl Component {
@@ -81,53 +97,126 @@ impl Component {
         match message {
             Message::Atlas(input) => self.atlas.get_mut().input(input).map(Message::Select),
             Message::Labels(ground_truth, value) => {
-                if ground_truth { self.ground_truth = value; } else { self.prediction = value; }
+                if ground_truth {
+                    self.ground_truth = value;
+                } else {
+                    self.prediction = value;
+                }
                 None
             }
-            Message::Fit => { self.fit_revision = self.fit_revision.wrapping_add(1); None }
+            Message::Fit => {
+                self.fit_revision = self.fit_revision.wrapping_add(1);
+                None
+            }
             message => Some(message),
         }
     }
-    pub fn controls<'a>(&self, model: &crate::view_model::ApplicationModel) -> Element<'a, Message> {
-        let Some(snapshot) = model.workflow.validation.as_ref()
-            else { return text("Waiting for validation").into(); };
+    pub fn controls<'a>(
+        &self,
+        model: &crate::view_model::ApplicationModel,
+    ) -> Element<'a, Message> {
+        let Some(snapshot) = model.workflow.validation.as_ref() else {
+            return text("Waiting for validation").into();
+        };
         let overlays = snapshot.overlayselection.value.clone();
-        let available = model.settings_edit_available() && (snapshot.frame.revision == 0 || snapshot.overlayselection.value == snapshot.overlays)
-            && !model.has_pending(crate::generated::ApplicationIntentEndpoint::ValidationSetOverlays);
+        let available = model.settings_edit_available()
+            && (snapshot.frame.revision == 0
+                || snapshot.overlayselection.value == snapshot.overlays)
+            && !model
+                .has_pending(crate::generated::ApplicationIntentEndpoint::ValidationSetOverlays);
         let group = |ground_truth: bool| {
             let (boxes, masks, labels, layer, ids, name) = if ground_truth {
-                (overlays.groundtruthboxes, overlays.groundtruthmasks, self.ground_truth, overlays.groundtruthlayer,
-                 ["validate.gt.labels", "validate.gt.masks", "validate.gt.boxes"], "GT labels")
+                (
+                    overlays.groundtruthboxes,
+                    overlays.groundtruthmasks,
+                    self.ground_truth,
+                    overlays.groundtruthlayer,
+                    [
+                        "validate.gt.labels",
+                        "validate.gt.masks",
+                        "validate.gt.boxes",
+                    ],
+                    "GT labels",
+                )
             } else {
-                (overlays.predictionboxes, overlays.predictionmasks, self.prediction, overlays.predictionlayer,
-                 ["validate.pred.labels", "validate.pred.masks", "validate.pred.boxes"], "Det labels")
+                (
+                    overlays.predictionboxes,
+                    overlays.predictionmasks,
+                    self.prediction,
+                    overlays.predictionlayer,
+                    [
+                        "validate.pred.labels",
+                        "validate.pred.masks",
+                        "validate.pred.boxes",
+                    ],
+                    "Det labels",
+                )
             };
             let full = overlays.clone();
             let fine = overlays.clone();
             column![
-                container(checkbox(layer).label(name).on_toggle_maybe(available.then_some(move |value| {
-                    let mut next = full.clone();
-                    if ground_truth { next.groundtruthlayer = value; } else { next.predictionlayer = value; }
-                    Message::Overlays(next)
-                }))).id(if ground_truth { "validate.gt.layer" } else { "validate.pred.layer" }),
-                overlay_controls::view(labels, masks, boxes, true, available, ids).map(move |message| {
-                    let mut next = fine.clone();
-                    match message {
-                        overlay_controls::Message::Labels(value) => return Message::Labels(ground_truth, value),
-                        overlay_controls::Message::Masks(value) => if ground_truth { next.groundtruthmasks = value; } else { next.predictionmasks = value; },
-                        overlay_controls::Message::Boxes(value) => if ground_truth { next.groundtruthboxes = value; } else { next.predictionboxes = value; },
-                    }
-                    Message::Overlays(next)
+                container(
+                    checkbox(layer)
+                        .label(name)
+                        .on_toggle_maybe(available.then_some(move |value| {
+                            let mut next = full.clone();
+                            if ground_truth {
+                                next.groundtruthlayer = value;
+                            } else {
+                                next.predictionlayer = value;
+                            }
+                            Message::Overlays(next)
+                        }))
+                )
+                .id(if ground_truth {
+                    "validate.gt.layer"
+                } else {
+                    "validate.pred.layer"
                 }),
-            ].spacing(3).into()
+                overlay_controls::view(labels, masks, boxes, true, available, ids).map(
+                    move |message| {
+                        let mut next = fine.clone();
+                        match message {
+                            overlay_controls::Message::Labels(value) => {
+                                return Message::Labels(ground_truth, value);
+                            }
+                            overlay_controls::Message::Masks(value) => {
+                                if ground_truth {
+                                    next.groundtruthmasks = value;
+                                } else {
+                                    next.predictionmasks = value;
+                                }
+                            }
+                            overlay_controls::Message::Boxes(value) => {
+                                if ground_truth {
+                                    next.groundtruthboxes = value;
+                                } else {
+                                    next.predictionboxes = value;
+                                }
+                            }
+                        }
+                        Message::Overlays(next)
+                    }
+                ),
+            ]
+            .spacing(3)
+            .into()
         };
         let gt: Element<'a, Message> = group(true);
         let pred: Element<'a, Message> = group(false);
         row![gt, pred].spacing(12).align_y(Center).into()
     }
-    pub fn atlas<'a>(&self, paired: Option<(Surface, std::sync::Arc<presentation_surface::labels::ValidationContent>)>,
-        settings: &crate::view::settings::SettingsModel, input: crate::workspace_input::Binding) -> Element<'a, Message> {
-        let (surface, labels, local) = match paired.filter(|(_, content)| !content.metadata.detail) {
+    pub fn atlas<'a>(
+        &self,
+        paired: Option<(
+            Surface,
+            std::sync::Arc<presentation_surface::labels::ValidationContent>,
+        )>,
+        settings: &crate::view::settings::SettingsModel,
+        input: crate::workspace_input::Binding,
+    ) -> Element<'a, Message> {
+        let (surface, labels, local) = match paired.filter(|(_, content)| !content.metadata.detail)
+        {
             Some((surface, content)) => {
                 let source = AtlasSource {
                     binding: (surface.high, surface.low),
@@ -136,60 +225,181 @@ impl Component {
                 };
                 self.atlas.borrow_mut().synchronize(Some(source.clone()));
                 let hit_metadata = content.metadata.clone();
-                let local: std::sync::Arc<dyn Fn(presentation_surface::SurfaceGesture) -> Option<Message> + Send + Sync> = std::sync::Arc::new(move |gesture| {
-                    if gesture.kind == presentation_surface::SurfaceGestureKind::Viewport { return None; }
+                let local: std::sync::Arc<
+                    dyn Fn(presentation_surface::SurfaceGesture) -> Option<Message> + Send + Sync,
+                > = std::sync::Arc::new(move |gesture| {
+                    if gesture.kind == presentation_surface::SurfaceGestureKind::Viewport {
+                        return None;
+                    }
                     Some(Message::Atlas(AtlasInput {
-                        source: source.clone(), kind: gesture.kind,
-                        selected: hit(&hit_metadata, gesture.sample.content_x, gesture.sample.content_y),
+                        source: source.clone(),
+                        kind: gesture.kind,
+                        selected: hit(
+                            &hit_metadata,
+                            gesture.sample.content_x,
+                            gesture.sample.content_y,
+                        ),
                         pressed: gesture.sample.pressed,
                     }))
                 });
-                (surface, presentation_surface::labels::Source::Validation(content, self.ground_truth, self.prediction), Some(local))
+                (
+                    surface,
+                    presentation_surface::labels::Source::Validation(
+                        content,
+                        self.ground_truth,
+                        self.prediction,
+                    ),
+                    Some(local),
+                )
             }
             None => {
                 self.atlas.borrow_mut().synchronize(None);
-                (Surface::empty(), presentation_surface::labels::Source::Hidden, None)
+                (
+                    Surface::empty(),
+                    presentation_surface::labels::Source::Hidden,
+                    None,
+                )
             }
         };
-        container(presentation_surface::labels::view(presentation_surface::Program {
-            surface, show_fps: crate::workspace_fps::enabled(settings),
-            input: Some(input.for_source(crate::generated::PresentationSourceKind::Validation, 0, None)),
-            local, publish: None, placement: presentation_surface::Placement::FixedGrid { columns: 2, rows: 3 }, control_id: ATLAS_ID,
-        }, labels)).id(ATLAS_ID).width(Fill).height(Fill).style(crate::fluent_theme::container_workspace).into()
+        container(presentation_surface::labels::view(
+            presentation_surface::Program {
+                surface,
+                show_fps: crate::workspace_fps::enabled(settings),
+                input: Some(input.for_source(
+                    crate::generated::PresentationSourceKind::Validation,
+                    0,
+                    None,
+                )),
+                local,
+                publish: None,
+                placement: presentation_surface::Placement::FixedGrid {
+                    columns: 2,
+                    rows: 3,
+                },
+                control_id: ATLAS_ID,
+            },
+            labels,
+        ))
+        .id(ATLAS_ID)
+        .width(Fill)
+        .height(Fill)
+        .style(crate::fluent_theme::container_workspace)
+        .into()
     }
-    pub fn detail<'a>(&self, surface: Surface, content: std::sync::Arc<presentation_surface::labels::ValidationContent>,
-        model: &crate::view_model::ApplicationModel, settings: &crate::view::settings::SettingsModel,
-        input: crate::workspace_input::Binding) -> Element<'a, Message> {
-        let selected = content.metadata.selected.as_ref().expect("paired validation detail identity");
+    pub fn detail<'a>(
+        &self,
+        surface: Surface,
+        content: std::sync::Arc<presentation_surface::labels::ValidationContent>,
+        model: &crate::view_model::ApplicationModel,
+        settings: &crate::view::settings::SettingsModel,
+        input: crate::workspace_input::Binding,
+    ) -> Element<'a, Message> {
+        let selected = content
+            .metadata
+            .selected
+            .as_ref()
+            .expect("paired validation detail identity");
         let (previous, next) = neighbors(&content.metadata);
         let available = model.validation_navigation_available();
         let mut shown = surface;
         shown.fit_revision = self.fit_revision;
-        let image = crate::view::image_viewer::image(shown,
-            presentation_surface::labels::Source::Validation(content.clone(), self.ground_truth, self.prediction),
-            Some(input.for_source(content.frame().source.kind, 0, None)), crate::workspace_fps::enabled(settings), "validate.detail.image");
-        let source = row![container(button("Fit").on_press(Message::Fit)).id("validate.detail.fit"), self.controls(model)].spacing(7).align_y(Center);
-        crate::view::image_viewer::panel(selected.datasetindex, image, source.into(), crate::view::image_viewer::PanelIds {
-            image: "validate.detail.image", previous: "validate.detail.previous", next: "validate.detail.next", close: "validate.detail.close",
-            annotate: "validate.detail.annotate", upscale: ["validate.detail.upscale.basic", "validate.detail.upscale.fast", "validate.detail.upscale.neural"],
-        }, previous.filter(|_| available).map(Message::Select), next.filter(|_| available).map(Message::Select),
-        available.then_some(Message::Close), (model.annotation_import_available() && !settings.has_local_edits()).then_some(Message::OpenAnnotation),
-        model.displayed_upscale_kernel(), model.requested_upscale.as_ref().filter(|value| Some(value.kernel) != model.displayed_upscale_kernel()).map(|value| value.kernel),
-        model.upscale_start_available(), Message::Upscale)
+        let image = crate::view::image_viewer::image(
+            shown,
+            presentation_surface::labels::Source::Validation(
+                content.clone(),
+                self.ground_truth,
+                self.prediction,
+            ),
+            Some(input.for_source(content.frame().source.kind, 0, None)),
+            crate::workspace_fps::enabled(settings),
+            "validate.detail.image",
+        );
+        let source = row![
+            container(button("Fit").on_press(Message::Fit)).id("validate.detail.fit"),
+            self.controls(model)
+        ]
+        .spacing(7)
+        .align_y(Center);
+        crate::view::image_viewer::panel(
+            selected.datasetindex,
+            image,
+            source.into(),
+            crate::view::image_viewer::PanelIds {
+                image: "validate.detail.image",
+                previous: "validate.detail.previous",
+                next: "validate.detail.next",
+                close: "validate.detail.close",
+                annotate: "validate.detail.annotate",
+                upscale: [
+                    "validate.detail.upscale.basic",
+                    "validate.detail.upscale.fast",
+                    "validate.detail.upscale.neural",
+                ],
+            },
+            previous.filter(|_| available).map(Message::Select),
+            next.filter(|_| available).map(Message::Select),
+            available.then_some(Message::Close),
+            (model.annotation_import_available() && !settings.has_local_edits())
+                .then_some(Message::OpenAnnotation),
+            model.displayed_upscale_kernel(),
+            model
+                .requested_upscale
+                .as_ref()
+                .filter(|value| Some(value.kernel) != model.displayed_upscale_kernel())
+                .map(|value| value.kernel),
+            model.upscale_start_available(),
+            Message::Upscale,
+        )
     }
 }
-pub fn hit(metadata: &crate::generated::ValidationImageMetadata, x: f32, y: f32) -> Option<ValidationSampleIdentity> {
+pub fn hit(
+    metadata: &crate::generated::ValidationImageMetadata,
+    x: f32,
+    y: f32,
+) -> Option<ValidationSampleIdentity> {
     let extent = &metadata.frame.extent;
-    if metadata.detail || !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= extent.width as f32 || y >= extent.height as f32 { return None; }
+    if metadata.detail
+        || !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= extent.width as f32
+        || y >= extent.height as f32
+    {
+        return None;
+    }
     let column = (x * 2.0 / extent.width as f32) as usize;
     let row = (y * 3.0 / extent.height as f32) as usize;
-    metadata.samples.get(row * 2 + column).filter(|sample| sample.available).map(|sample| sample.identity.clone())
+    metadata
+        .samples
+        .get(row * 2 + column)
+        .filter(|sample| sample.available)
+        .map(|sample| sample.identity.clone())
 }
-fn neighbors(metadata: &crate::generated::ValidationImageMetadata) -> (Option<ValidationSampleIdentity>, Option<ValidationSampleIdentity>) {
-    let Some(index) = metadata.samples.iter().position(|sample| Some(&sample.identity) == metadata.selected.as_ref()) else { return (None, None) };
-    let previous = metadata.samples[..index].iter().rev().find(|sample| sample.available);
-    let next = metadata.samples[index + 1..].iter().find(|sample| sample.available);
-    (previous.map(|sample| sample.identity.clone()), next.map(|sample| sample.identity.clone()))
+fn neighbors(
+    metadata: &crate::generated::ValidationImageMetadata,
+) -> (
+    Option<ValidationSampleIdentity>,
+    Option<ValidationSampleIdentity>,
+) {
+    let Some(index) = metadata
+        .samples
+        .iter()
+        .position(|sample| Some(&sample.identity) == metadata.selected.as_ref())
+    else {
+        return (None, None);
+    };
+    let previous = metadata.samples[..index]
+        .iter()
+        .rev()
+        .find(|sample| sample.available);
+    let next = metadata.samples[index + 1..]
+        .iter()
+        .find(|sample| sample.available);
+    (
+        previous.map(|sample| sample.identity.clone()),
+        next.map(|sample| sample.identity.clone()),
+    )
 }
 #[cfg(test)]
 mod tests {
@@ -197,40 +407,91 @@ mod tests {
     use presentation_surface::SurfaceGestureKind;
 
     fn source(metadata: &crate::generated::ValidationImageMetadata) -> AtlasSource {
-        AtlasSource { binding: (1, 2), frame: metadata.frame.clone(), content: metadata.contentidentity }
+        AtlasSource {
+            binding: (1, 2),
+            frame: metadata.frame.clone(),
+            content: metadata.contentidentity,
+        }
     }
     fn pointer(metadata: &crate::generated::ValidationImageMetadata, x: f32, y: f32) -> AtlasInput {
-        AtlasInput { source: source(metadata), kind: SurfaceGestureKind::Pointer, selected: hit(metadata, x, y), pressed: true }
+        AtlasInput {
+            source: source(metadata),
+            kind: SurfaceGestureKind::Pointer,
+            selected: hit(metadata, x, y),
+            pressed: true,
+        }
     }
 
     #[test]
     fn held_target_selects_once_and_keeps_exact_paired_identity() {
         let metadata = crate::view_model::test_support::validation_image_metadata();
         let mut component = Component::default();
-        component.atlas.get_mut().synchronize(Some(source(&metadata)));
-        assert!(matches!(component.update(Message::Atlas(pointer(&metadata, 10.0, 10.0))),
-            Some(Message::Select(identity)) if identity == metadata.samples[0].identity));
+        component
+            .atlas
+            .get_mut()
+            .synchronize(Some(source(&metadata)));
+        assert!(
+            matches!(component.update(Message::Atlas(pointer(&metadata, 10.0, 10.0))),
+            Some(Message::Select(identity)) if identity == metadata.samples[0].identity)
+        );
         for x in 11..200 {
-            assert!(component.update(Message::Atlas(pointer(&metadata, x as f32, 10.0))).is_none());
+            assert!(
+                component
+                    .update(Message::Atlas(pointer(&metadata, x as f32, 10.0)))
+                    .is_none()
+            );
         }
-        assert!(matches!(component.update(Message::Atlas(pointer(&metadata, 300.0, 10.0))),
-            Some(Message::Select(identity)) if identity == metadata.samples[1].identity));
-        assert!(component.update(Message::Atlas(pointer(&metadata, 310.0, 10.0))).is_none());
-        for (x, y) in [(0.0, 200.0), (-1.0, 0.0), (512.0, 0.0), (0.0, 576.0), (f32::NAN, 0.0), (0.0, f32::INFINITY)] {
-            assert!(component.update(Message::Atlas(pointer(&metadata, x, y))).is_none());
+        assert!(
+            matches!(component.update(Message::Atlas(pointer(&metadata, 300.0, 10.0))),
+            Some(Message::Select(identity)) if identity == metadata.samples[1].identity)
+        );
+        assert!(
+            component
+                .update(Message::Atlas(pointer(&metadata, 310.0, 10.0)))
+                .is_none()
+        );
+        for (x, y) in [
+            (0.0, 200.0),
+            (-1.0, 0.0),
+            (512.0, 0.0),
+            (0.0, 576.0),
+            (f32::NAN, 0.0),
+            (0.0, f32::INFINITY),
+        ] {
+            assert!(
+                component
+                    .update(Message::Atlas(pointer(&metadata, x, y)))
+                    .is_none()
+            );
         }
-        assert!(component.update(Message::Atlas(pointer(&metadata, 310.0, 10.0))).is_none());
+        assert!(
+            component
+                .update(Message::Atlas(pointer(&metadata, 310.0, 10.0)))
+                .is_none()
+        );
     }
 
     #[test]
     fn release_end_and_cancel_allow_a_later_press() {
         let metadata = crate::view_model::test_support::validation_image_metadata();
-        for kind in [SurfaceGestureKind::Pointer, SurfaceGestureKind::End, SurfaceGestureKind::Cancel] {
+        for kind in [
+            SurfaceGestureKind::Pointer,
+            SurfaceGestureKind::End,
+            SurfaceGestureKind::Cancel,
+        ] {
             let mut state = AtlasInteraction::default();
             state.synchronize(Some(source(&metadata)));
             let input = pointer(&metadata, 10.0, 10.0);
             assert!(state.input(input.clone()).is_some());
-            assert!(state.input(AtlasInput { kind, pressed: false, ..input.clone() }).is_none());
+            assert!(
+                state
+                    .input(AtlasInput {
+                        kind,
+                        pressed: false,
+                        ..input.clone()
+                    })
+                    .is_none()
+            );
             assert!(state.input(input).is_some());
         }
     }
@@ -244,10 +505,26 @@ mod tests {
         assert!(state.input(old.clone()).is_some());
         metadata.frame.revision += 1;
         state.synchronize(Some(source(&metadata)));
-        assert!(state.input(AtlasInput { kind: SurfaceGestureKind::Cancel, ..old.clone() }).is_none());
+        assert!(
+            state
+                .input(AtlasInput {
+                    kind: SurfaceGestureKind::Cancel,
+                    ..old.clone()
+                })
+                .is_none()
+        );
         assert!(state.input(pointer(&metadata, 10.0, 10.0)).is_none());
-        assert!(state.input(AtlasInput { selected: Some(metadata.samples[1].identity.clone()), ..old.clone() }).is_none());
-        for sample in &mut metadata.samples { sample.identity.generation += 1; }
+        assert!(
+            state
+                .input(AtlasInput {
+                    selected: Some(metadata.samples[1].identity.clone()),
+                    ..old.clone()
+                })
+                .is_none()
+        );
+        for sample in &mut metadata.samples {
+            sample.identity.generation += 1;
+        }
         metadata.contentidentity += 1;
         state.synchronize(Some(source(&metadata)));
         assert!(state.input(old).is_none());
@@ -261,20 +538,40 @@ mod tests {
         replacement.binding.0 += 1;
         state.synchronize(Some(replacement.clone()));
         assert!(state.input(current.clone()).is_none());
-        assert!(state.input(AtlasInput { source: replacement, ..current }).is_some());
+        assert!(
+            state
+                .input(AtlasInput {
+                    source: replacement,
+                    ..current
+                })
+                .is_some()
+        );
     }
 
     #[test]
     fn grid_hits_and_navigation_use_only_paired_retained_identities() {
         let mut metadata = crate::view_model::test_support::validation_image_metadata();
-        metadata.frame.extent.width = 512; metadata.frame.extent.height = 576;
-        assert_eq!(hit(&metadata, 255.0, 191.0), Some(metadata.samples[0].identity.clone()));
-        assert_eq!(hit(&metadata, 256.0, 0.0), Some(metadata.samples[1].identity.clone()));
+        metadata.frame.extent.width = 512;
+        metadata.frame.extent.height = 576;
+        assert_eq!(
+            hit(&metadata, 255.0, 191.0),
+            Some(metadata.samples[0].identity.clone())
+        );
+        assert_eq!(
+            hit(&metadata, 256.0, 0.0),
+            Some(metadata.samples[1].identity.clone())
+        );
         assert!(hit(&metadata, 0.0, 192.0).is_none());
         assert!(hit(&metadata, 512.0, 0.0).is_none());
         metadata.selected = Some(metadata.samples[0].identity.clone());
-        assert_eq!(neighbors(&metadata), (None, Some(metadata.samples[1].identity.clone())));
+        assert_eq!(
+            neighbors(&metadata),
+            (None, Some(metadata.samples[1].identity.clone()))
+        );
         metadata.selected = Some(metadata.samples[1].identity.clone());
-        assert_eq!(neighbors(&metadata), (Some(metadata.samples[0].identity.clone()), None));
+        assert_eq!(
+            neighbors(&metadata),
+            (Some(metadata.samples[0].identity.clone()), None)
+        );
     }
 }

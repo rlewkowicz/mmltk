@@ -154,7 +154,7 @@ class TrainingSystem::Impl final {
             if (!generation) throw contracts::FailedError("checkpoint inspection generation exhausted");
             previous = inspection_stop_;
             inspection_stop_ = path.empty() ? std::stop_source{std::nostopstate} : std::stop_source{};
-            state_.inspection = {.generation = *generation, .path = std::move(path), .status = Status::Running};
+            state_.inspection = {.generation = *generation, .path = std::move(path), .status = Status::Running, .checkpoint = {}, .error = {}};
             inspection_admission_.reset();
             prepared_admission_.reset();
             if (state_.inspection.path.empty()) {
@@ -188,9 +188,11 @@ class TrainingSystem::Impl final {
             try {
                 if (!inspector) inspector = factory_();
                 if (!inspector) throw std::runtime_error("checkpoint inspection runtime unavailable");
-                admission = std::make_shared<const mmltk::backend::models::rfdetr::TrainingCheckpointAdmission>(inspector->InspectCheckpoint(current.path, stop));
+                admission =
+                    std::make_shared<const mmltk::backend::models::rfdetr::TrainingCheckpointAdmission>(inspector->InspectCheckpoint(current.path, stop));
                 admission->RequireUnchanged(stop);
-                current.checkpoint = mmltk::frameworks::reflection::project_record<mmltk::backend::models::rfdetr::TrainingCheckpointCapability>(admission->checkpoint());
+                current.checkpoint =
+                    mmltk::frameworks::reflection::project_record<mmltk::backend::models::rfdetr::TrainingCheckpointCapability>(admission->checkpoint());
                 current.status = Status::Ready;
             } catch (const std::exception& error) {
                 current.status = Status::Failed;
@@ -200,7 +202,10 @@ class TrainingSystem::Impl final {
                 current.error = "checkpoint inspection failed";
             }
             if (stop.stop_requested()) current.status = Status::Cancelled;
-            if (current.status != Status::Ready) { current.checkpoint.reset(); admission.reset(); }
+            if (current.status != Status::Ready) {
+                current.checkpoint.reset();
+                admission.reset();
+            }
             {
                 std::scoped_lock lock(mutex_);
                 if (inspection_shutdown_ || state_.inspection.generation != current.generation) continue;
@@ -577,8 +582,7 @@ class TrainingSystem::Impl final {
     direct::LocalRun run_;
 };
 TrainingSystem::TrainingSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model,
-                               std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory,
-                               SystemEventSink<event_type> events)
+                               std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory, SystemEventSink<event_type> events)
     : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(policy), std::move(factory), std::move(events))) {}
 TrainingSystem::~TrainingSystem() = default;
 mmltk::backend::models::rfdetr::TrainingOpenedRun TrainingSystem::OpenRun(mmltk::backend::models::rfdetr::TrainingDirectoryQuery query) {

@@ -117,7 +117,9 @@ __global__ void atlas_tile_base_kernel(const ExploreRenderTargetView target_view
     const std::uint32_t x = tile.destination_x + local_x;
     const std::uint32_t y = tile.destination_y + local_y;
     if (x >= target.width || y >= target.height) return;
-    uchar4 output = view.draw_base != 0U ? make_uchar4(mmltk::backend::imaging::raster::kAtlasPadding.r, mmltk::backend::imaging::raster::kAtlasPadding.g, mmltk::backend::imaging::raster::kAtlasPadding.b, mmltk::backend::imaging::raster::kAtlasPadding.a) : make_uchar4(0U, 0U, 0U, 0U);
+    uchar4 output = view.draw_base != 0U ? make_uchar4(mmltk::backend::imaging::raster::kAtlasPadding.r, mmltk::backend::imaging::raster::kAtlasPadding.g,
+                                                       mmltk::backend::imaging::raster::kAtlasPadding.b, mmltk::backend::imaging::raster::kAtlasPadding.a)
+                                         : make_uchar4(0U, 0U, 0U, 0U);
     if (tile.placeholder != 0U || tile.card_index >= view.card_count || cards[tile.card_index].placeholder != 0U) {
         store(target, static_cast<int>(x), static_cast<int>(y), output);
         return;

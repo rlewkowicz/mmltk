@@ -16,13 +16,19 @@ pub struct WorkflowModel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContinuationMode { Transfer, Resume }
+pub enum ContinuationMode {
+    Transfer,
+    Resume,
+}
 
 #[derive(Debug, Clone, Default)]
 pub enum CheckpointCapability {
     #[default]
     Idle,
-    Pending { request: Option<u64>, generation: Option<u64> },
+    Pending {
+        request: Option<u64>,
+        generation: Option<u64>,
+    },
     Ready(crate::generated::TrainingCheckpointCapability),
     Failed(String),
 }
@@ -39,72 +45,138 @@ pub struct Continuation {
 }
 impl Default for Continuation {
     fn default() -> Self {
-        Self { mode: ContinuationMode::Transfer, selection: None, capability: Default::default(),
-            mode_chosen: false, cancel_needed: false, refresh_requested: false, observed: None }
+        Self {
+            mode: ContinuationMode::Transfer,
+            selection: None,
+            capability: Default::default(),
+            mode_chosen: false,
+            cancel_needed: false,
+            refresh_requested: false,
+            observed: None,
+        }
     }
 }
 impl Continuation {
     pub fn matches(&self, train: &crate::generated::TrainViewState) -> bool {
-        !self.refresh_requested && self.selection.as_ref().is_some_and(|(source, path, preset)|
-            *source == train.modelsource && *path == train.request.weightspath && *preset == train.request.presetname)
+        !self.refresh_requested
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|(source, path, preset)| {
+                    *source == train.modelsource
+                        && *path == train.request.weightspath
+                        && *preset == train.request.presetname
+                })
     }
     pub fn select(&mut self, train: &crate::generated::TrainViewState) {
         self.refresh_requested = false;
         self.cancel_needed |= matches!(self.capability, CheckpointCapability::Pending { .. });
-        self.selection = Some((train.modelsource, train.request.weightspath.clone(), train.request.presetname.clone()));
+        self.selection = Some((
+            train.modelsource,
+            train.request.weightspath.clone(),
+            train.request.presetname.clone(),
+        ));
         self.capability = CheckpointCapability::Idle;
         self.mode = ContinuationMode::Transfer;
         self.mode_chosen = false;
         self.observed = None;
     }
     pub fn checkpoint(&self) -> Option<&crate::generated::TrainingCheckpointCapability> {
-        if let CheckpointCapability::Ready(value) = &self.capability { Some(value) } else { None }
+        if let CheckpointCapability::Ready(value) = &self.capability {
+            Some(value)
+        } else {
+            None
+        }
     }
     pub fn request(&self) -> Option<u64> {
-        if let CheckpointCapability::Pending { request, .. } = self.capability { request } else { None }
+        if let CheckpointCapability::Pending { request, .. } = self.capability {
+            request
+        } else {
+            None
+        }
     }
     pub fn begin(&mut self, request: u64) {
         self.cancel_needed = false;
-        self.capability = CheckpointCapability::Pending { request: Some(request), generation: None };
+        self.capability = CheckpointCapability::Pending {
+            request: Some(request),
+            generation: None,
+        };
     }
     pub fn fail(&mut self, correlation: u64, detail: String) -> bool {
-        if self.request() != Some(correlation) { return false; }
+        if self.request() != Some(correlation) {
+            return false;
+        }
         self.capability = CheckpointCapability::Failed(detail);
         true
     }
-    pub fn reply(&mut self, correlation: u64, value: crate::generated::TrainingCheckpointInspection) {
-        if self.request() != Some(correlation) { return; }
-        self.capability = CheckpointCapability::Pending { request: None, generation: Some(value.generation) };
-        let value = self.observed.take().filter(|observed| observed.generation == value.generation)
+    pub fn reply(
+        &mut self,
+        correlation: u64,
+        value: crate::generated::TrainingCheckpointInspection,
+    ) {
+        if self.request() != Some(correlation) {
+            return;
+        }
+        self.capability = CheckpointCapability::Pending {
+            request: None,
+            generation: Some(value.generation),
+        };
+        let value = self
+            .observed
+            .take()
+            .filter(|observed| observed.generation == value.generation)
             .unwrap_or(value);
         self.observe(value);
     }
     pub fn observe(&mut self, value: crate::generated::TrainingCheckpointInspection) {
-        if self.selection.as_ref().is_none_or(|(_, path, _)| *path != value.path) { return; }
-        let CheckpointCapability::Pending { generation, .. } = self.capability else { return; };
+        if self
+            .selection
+            .as_ref()
+            .is_none_or(|(_, path, _)| *path != value.path)
+        {
+            return;
+        }
+        let CheckpointCapability::Pending { generation, .. } = self.capability else {
+            return;
+        };
         if generation.is_none() {
             if let Some(observed) = self.observed.as_mut() {
                 if let Err(error) = merge_checkpoint_inspection(observed, value) {
                     self.capability = CheckpointCapability::Failed(error.detail);
                 }
-            } else { self.observed = Some(value); }
+            } else {
+                self.observed = Some(value);
+            }
             return;
         }
-        if generation != Some(value.generation) { return; }
+        if generation != Some(value.generation) {
+            return;
+        }
         use crate::generated::TrainingInspectionStatus;
         match value.status {
             TrainingInspectionStatus::Ready => {
                 if let Some(checkpoint) = value.checkpoint {
                     if !self.mode_chosen {
-                        self.mode = if checkpoint.resumable { ContinuationMode::Resume } else { ContinuationMode::Transfer };
+                        self.mode = if checkpoint.resumable {
+                            ContinuationMode::Resume
+                        } else {
+                            ContinuationMode::Transfer
+                        };
                     }
                     self.capability = CheckpointCapability::Ready(checkpoint);
                 } else {
-                    self.capability = CheckpointCapability::Failed("Checkpoint inspection returned no capability.".into());
+                    self.capability = CheckpointCapability::Failed(
+                        "Checkpoint inspection returned no capability.".into(),
+                    );
                 }
             }
-            TrainingInspectionStatus::Failed => self.capability = CheckpointCapability::Failed(value.error),
-            TrainingInspectionStatus::Cancelled => self.capability = CheckpointCapability::Failed("Checkpoint inspection cancelled.".into()),
+            TrainingInspectionStatus::Failed => {
+                self.capability = CheckpointCapability::Failed(value.error)
+            }
+            TrainingInspectionStatus::Cancelled => {
+                self.capability =
+                    CheckpointCapability::Failed("Checkpoint inspection cancelled.".into())
+            }
             TrainingInspectionStatus::Idle | TrainingInspectionStatus::Running => {}
         }
     }
@@ -117,13 +189,23 @@ pub(super) fn merge_checkpoint_inspection(
     value: crate::generated::TrainingCheckpointInspection,
 ) -> Result<(), UiError> {
     use crate::generated::TrainingInspectionStatus;
-    if value.generation < current.generation { return Ok(()); }
+    if value.generation < current.generation {
+        return Ok(());
+    }
     if value.generation == current.generation {
-        if value == *current { return Ok(()); }
-        if value.path != current.path { return Err(UiError::protocol("inconsistent checkpoint inspection path")); }
-        if value.status == TrainingInspectionStatus::Running { return Ok(()); }
+        if value == *current {
+            return Ok(());
+        }
+        if value.path != current.path {
+            return Err(UiError::protocol("inconsistent checkpoint inspection path"));
+        }
+        if value.status == TrainingInspectionStatus::Running {
+            return Ok(());
+        }
         if current.status != TrainingInspectionStatus::Running {
-            return Err(UiError::protocol("inconsistent checkpoint inspection terminal"));
+            return Err(UiError::protocol(
+                "inconsistent checkpoint inspection terminal",
+            ));
         }
     }
     *current = value;
@@ -159,40 +241,90 @@ pub struct TrainingOutput {
 }
 impl TrainingOutput {
     pub fn saved(&self) -> Option<&SavedTrainingOutput> {
-        if let TrainingOutputSource::Saved(value) = &self.source { Some(value) } else { None }
+        if let TrainingOutputSource::Saved(value) = &self.source {
+            Some(value)
+        } else {
+            None
+        }
     }
     pub fn saved_mut(&mut self) -> Option<&mut SavedTrainingOutput> {
-        if let TrainingOutputSource::Saved(value) = &mut self.source { Some(value) } else { None }
+        if let TrainingOutputSource::Saved(value) = &mut self.source {
+            Some(value)
+        } else {
+            None
+        }
     }
-    pub fn run(&self) -> Option<&crate::generated::TrainingOpenedRun> { self.saved().and_then(|saved| saved.run.as_ref()) }
-    pub fn page(&self) -> Option<&crate::generated::TrainingHistoryPage> { self.saved().and_then(|saved| saved.page.as_ref()) }
+    pub fn run(&self) -> Option<&crate::generated::TrainingOpenedRun> {
+        self.saved().and_then(|saved| saved.run.as_ref())
+    }
+    pub fn page(&self) -> Option<&crate::generated::TrainingHistoryPage> {
+        self.saved().and_then(|saved| saved.page.as_ref())
+    }
     pub fn select_saved(&mut self, directory: String) {
-        self.source = TrainingOutputSource::Saved(SavedTrainingOutput { directory, run: None, page: None, load: HistoryLoad::Idle });
+        self.source = TrainingOutputSource::Saved(SavedTrainingOutput {
+            directory,
+            run: None,
+            page: None,
+            load: HistoryLoad::Idle,
+        });
     }
-    pub fn live(&mut self) { self.source = TrainingOutputSource::Live; }
-    pub fn start(&mut self, train: &crate::generated::TrainViewState, dialog_generation: Option<u64>) {
+    pub fn live(&mut self) {
+        self.source = TrainingOutputSource::Live;
+    }
+    pub fn start(
+        &mut self,
+        train: &crate::generated::TrainViewState,
+        dialog_generation: Option<u64>,
+    ) {
         self.settings = Some((train.autooutput, train.request.outputdir.clone()));
-        if let Some(generation) = dialog_generation { self.dialog_generation = generation; }
+        if let Some(generation) = dialog_generation {
+            self.dialog_generation = generation;
+        }
         self.live();
     }
     pub fn fail(&mut self, correlation: u64) -> bool {
-        let Some(saved) = self.saved_mut() else { return false; };
-        if matches!(saved.load, HistoryLoad::Opening(value) | HistoryLoad::Paging(value) if value == correlation) {
+        let Some(saved) = self.saved_mut() else {
+            return false;
+        };
+        if matches!(saved.load, HistoryLoad::Opening(value) | HistoryLoad::Paging(value) if value == correlation)
+        {
             saved.load = HistoryLoad::Failed;
             true
-        } else { false }
+        } else {
+            false
+        }
     }
-    pub fn synchronize(&mut self, train: &crate::generated::TrainViewState, native: Option<&TrainingSnapshot>, browse: Option<u64>) -> bool {
-        let changed = self.settings.as_ref().is_none_or(|(automatic, path)| *automatic != train.autooutput || *path != train.request.outputdir);
-        let explicit = self.settings.is_some() && browse.is_some_and(|generation| generation != self.dialog_generation);
-        if !changed && !explicit { return false; }
+    pub fn synchronize(
+        &mut self,
+        train: &crate::generated::TrainViewState,
+        native: Option<&TrainingSnapshot>,
+        browse: Option<u64>,
+    ) -> bool {
+        let changed = self.settings.as_ref().is_none_or(|(automatic, path)| {
+            *automatic != train.autooutput || *path != train.request.outputdir
+        });
+        let explicit = self.settings.is_some()
+            && browse.is_some_and(|generation| generation != self.dialog_generation);
+        if !changed && !explicit {
+            return false;
+        }
         let bootstrap = self.settings.is_none();
         self.settings = Some((train.autooutput, train.request.outputdir.clone()));
-        if let Some(generation) = browse { self.dialog_generation = generation; }
-        let native_live = native.is_some_and(|snapshot| snapshot.activity != crate::generated::TrainingActivity::Idle || !snapshot.outputdirectory.is_empty());
-        if !train.autooutput && !train.request.outputdir.is_empty() && (explicit || !bootstrap || !native_live) {
+        if let Some(generation) = browse {
+            self.dialog_generation = generation;
+        }
+        let native_live = native.is_some_and(|snapshot| {
+            snapshot.activity != crate::generated::TrainingActivity::Idle
+                || !snapshot.outputdirectory.is_empty()
+        });
+        if !train.autooutput
+            && !train.request.outputdir.is_empty()
+            && (explicit || !bootstrap || !native_live)
+        {
             self.select_saved(train.request.outputdir.clone());
-        } else { self.live(); }
+        } else {
+            self.live();
+        }
         true
     }
 }
@@ -227,11 +359,16 @@ impl StartInputs {
     pub fn matches(&self, settings: &crate::generated::GuiSettingsState) -> bool {
         match self {
             Self::Train(value) => value == &settings.workflows.train,
-            Self::Validate { settings: value, inherited_source } => {
+            Self::Validate {
+                settings: value,
+                inherited_source,
+            } => {
                 value == &settings.workflows.validate
-                    && inherited_source.as_ref().map(|(inferred, path)| (*inferred, path.as_str()))
+                    && inherited_source
+                        .as_ref()
+                        .map(|(inferred, path)| (*inferred, path.as_str()))
                         == validation_inherited_source(settings)
-            },
+            }
             Self::Predict(value) => value == &settings.workflows.predict,
         }
     }
@@ -239,16 +376,21 @@ impl StartInputs {
 
 // Track the configured source rather than the normalized request path: native
 // settlement may materialize inferred paths without changing the user's intent.
-fn validation_inherited_source(settings: &crate::generated::GuiSettingsState) -> Option<(bool, &str)> {
+fn validation_inherited_source(
+    settings: &crate::generated::GuiSettingsState,
+) -> Option<(bool, &str)> {
     if !settings.workflows.validate.request.compiledpath.is_empty() {
         return None;
     }
     let train = &settings.workflows.train;
-    Some((train.usecompileddirectorydefaults, if train.usecompileddirectorydefaults {
-        train.compileddatasetdir.as_str()
-    } else {
-        train.request.valcompiledpath.as_str()
-    }))
+    Some((
+        train.usecompileddirectorydefaults,
+        if train.usecompileddirectorydefaults {
+            train.compileddatasetdir.as_str()
+        } else {
+            train.request.valcompiledpath.as_str()
+        },
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -274,7 +416,10 @@ impl StartPreparation {
     pub fn cancelled(self) -> bool {
         matches!(
             self,
-            Self::Restoring { cancelled: true, .. } | Self::Selecting {
+            Self::Restoring {
+                cancelled: true,
+                ..
+            } | Self::Selecting {
                 cancelled: true,
                 ..
             } | Self::Active {
@@ -313,7 +458,9 @@ impl WorkflowModel {
             return;
         };
         match &mut pending.preparation {
-            StartPreparation::Waiting | StartPreparation::ResumeQueued | StartPreparation::Restored => self.pending_start = None,
+            StartPreparation::Waiting
+            | StartPreparation::ResumeQueued
+            | StartPreparation::Restored => self.pending_start = None,
             StartPreparation::Restoring { cancelled, .. } => *cancelled = true,
             StartPreparation::Selecting { cancelled, .. }
             | StartPreparation::Active { cancelled, .. } => *cancelled = true,
@@ -330,17 +477,20 @@ impl WorkflowModel {
             return;
         };
         match pending.preparation {
-            StartPreparation::Restoring { correlation: owned, cancelled } if correlation == owned => {
-                match reply {
-                    Ok(crate::generated::ApplicationReply::TrainingPrepareResume(checkpoint)) if !cancelled => {
-                        pending.resume_checkpoint = Some(checkpoint.path.clone());
-                        pending.preparation = StartPreparation::Restored;
-                    }
-                    _ => {
-                        self.pending_start = None;
-                    }
+            StartPreparation::Restoring {
+                correlation: owned,
+                cancelled,
+            } if correlation == owned => match reply {
+                Ok(crate::generated::ApplicationReply::TrainingPrepareResume(checkpoint))
+                    if !cancelled =>
+                {
+                    pending.resume_checkpoint = Some(checkpoint.path.clone());
+                    pending.preparation = StartPreparation::Restored;
                 }
-            }
+                _ => {
+                    self.pending_start = None;
+                }
+            },
             StartPreparation::Selecting {
                 correlation: owned,
                 cancelled,
@@ -458,7 +608,9 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
                 self.install_training_reply_snapshot(value.snapshot);
             }
             ApplicationEvent::TrainingTrainingInspectionChanged(value) => {
-                if let Err(error) = self.install_checkpoint_inspection(value.inspection) { self.error = Some(error); }
+                if let Err(error) = self.install_checkpoint_inspection(value.inspection) {
+                    self.error = Some(error);
+                }
             }
             _ => unreachable!("generated Training dispatch supplied another system event"),
         }
@@ -468,7 +620,8 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
         let snapshot = match reply {
             ApplicationReply::TrainingOpenRun(value) => {
                 if let Some(saved) = self.workflow.output.saved_mut()
-                    && matches!(saved.load, HistoryLoad::Opening(owned) if owned == correlation) {
+                    && matches!(saved.load, HistoryLoad::Opening(owned) if owned == correlation)
+                {
                     saved.load = HistoryLoad::Idle;
                     saved.run = Some(value);
                     saved.page = None;
@@ -478,19 +631,27 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
             ApplicationReply::TrainingHistory(value) => {
                 if let Some(saved) = self.workflow.output.saved_mut()
                     && matches!(saved.load, HistoryLoad::Paging(owned) if owned == correlation)
-                    && saved.run.as_ref().is_some_and(|run| run.generation == value.generation) {
+                    && saved
+                        .run
+                        .as_ref()
+                        .is_some_and(|run| run.generation == value.generation)
+                {
                     saved.load = HistoryLoad::Idle;
                     saved.page = Some(value);
                 }
                 return;
             }
             ApplicationReply::TrainingInspectCheckpoint(value) => {
-                if let Err(error) = self.install_checkpoint_inspection(value.clone()) { self.error = Some(error); }
+                if let Err(error) = self.install_checkpoint_inspection(value.clone()) {
+                    self.error = Some(error);
+                }
                 self.workflow.train_continuation.reply(correlation, value);
                 return;
             }
             ApplicationReply::TrainingCancelCheckpointInspection(value) => {
-                if let Err(error) = self.install_checkpoint_inspection(value) { self.error = Some(error); }
+                if let Err(error) = self.install_checkpoint_inspection(value) {
+                    self.error = Some(error);
+                }
                 return;
             }
             ApplicationReply::TrainingPrepareResume(_) => return,
@@ -510,7 +671,10 @@ impl crate::generated::TrainingApplicationProjection<UiError> for ApplicationMod
 }
 
 impl ApplicationModel {
-    fn install_checkpoint_inspection(&mut self, value: crate::generated::TrainingCheckpointInspection) -> Result<(), UiError> {
+    fn install_checkpoint_inspection(
+        &mut self,
+        value: crate::generated::TrainingCheckpointInspection,
+    ) -> Result<(), UiError> {
         if let Some(snapshot) = self.workflow.training.as_mut() {
             merge_checkpoint_inspection(&mut snapshot.inspection, value.clone())?;
         }
@@ -551,12 +715,17 @@ impl ApplicationModel {
                 }
             }
             if value.overlayselection.revision == current.overlayselection.revision
-                && value.overlayselection != current.overlayselection {
-                return Err(UiError::protocol("inconsistent Validation overlay selection revision"));
+                && value.overlayselection != current.overlayselection
+            {
+                return Err(UiError::protocol(
+                    "inconsistent Validation overlay selection revision",
+                ));
             }
             let selection = if value.overlayselection.revision < current.overlayselection.revision {
                 current.overlayselection.clone()
-            } else { value.overlayselection.clone() };
+            } else {
+                value.overlayselection.clone()
+            };
             let mut operation = current.operation.clone();
             let outcome =
                 super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
@@ -771,7 +940,9 @@ mod tests {
 
     #[test]
     fn validation_start_tracks_only_its_effective_dataset_source() {
-        let mut settings = crate::view::settings::installed_settings_model().draft.unwrap();
+        let mut settings = crate::view::settings::installed_settings_model()
+            .draft
+            .unwrap();
         settings.workflows.validate.request.compiledpath.clear();
         let inherited = StartInputs::capture(&settings, FeatureId::Validate).unwrap();
         settings.workflows.train.request.valcompiledpath = "/normalized/val.bin".into();
@@ -839,7 +1010,8 @@ mod tests {
 mod validation_tests {
     use super::*;
     use crate::generated::{
-        ValidationApplicationProjection, ValidationChanged, ValidationProgress,
+        ApplicationIntentEndpoint, ValidationApplicationProjection, ValidationChanged,
+        ValidationProgress,
     };
     #[test]
     fn validation_keeps_physical_generation_independent_and_rejects_old_detail_pages() {
@@ -920,22 +1092,39 @@ mod validation_tests {
     fn validation_overlay_selection_settles_independently_from_physical_publication() {
         let mut model = crate::view_model::test_support::bootstrapped();
         let mut snapshot = model.workflow.validation.clone().unwrap();
-        snapshot.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 4);
+        snapshot.frame =
+            crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 4);
         model.install_validation_snapshot(snapshot.clone()).unwrap();
         let applied = snapshot.overlays.clone();
-        let correlation = model.begin_intent(ApplicationIntentEndpoint::ValidationSetOverlays).unwrap();
-        model.reduce_reply(correlation, Err(crate::protocol::ApplicationError {
-            category: crate::generated::ApplicationErrorCategory::Failed,
-            detail: "overlay admission refused".into(),
-        }));
+        let correlation = model
+            .begin_intent(ApplicationIntentEndpoint::ValidationSetOverlays)
+            .unwrap();
+        model.reduce_reply(
+            correlation,
+            Err(crate::protocol::ApplicationError {
+                category: crate::generated::ApplicationErrorCategory::Failed,
+                detail: "overlay admission refused".into(),
+            }),
+        );
         assert!(!model.has_pending(ApplicationIntentEndpoint::ValidationSetOverlays));
-        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, snapshot.overlayselection);
-        let correlation = model.begin_intent(ApplicationIntentEndpoint::ValidationSetOverlays).unwrap();
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().overlayselection,
+            snapshot.overlayselection
+        );
+        let correlation = model
+            .begin_intent(ApplicationIntentEndpoint::ValidationSetOverlays)
+            .unwrap();
         model.abandon_intent(correlation);
-        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, snapshot.overlayselection);
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().overlayselection,
+            snapshot.overlayselection
+        );
         snapshot.overlayselection.revision += 1;
         snapshot.overlayselection.value.groundtruthlayer = false;
-        model.project_validation_reply(11, ApplicationReply::ValidationSetOverlays(snapshot.clone()));
+        model.project_validation_reply(
+            11,
+            ApplicationReply::ValidationSetOverlays(snapshot.clone()),
+        );
         let selected = model.workflow.validation.as_ref().unwrap();
         assert_eq!(selected.overlays, applied);
         assert!(!selected.overlayselection.value.groundtruthlayer);
@@ -945,26 +1134,52 @@ mod validation_tests {
         snapshot.overlayselection.value.predictionlayer = false;
         model.install_validation_snapshot(snapshot.clone()).unwrap();
         model.project_validation_reply(11, ApplicationReply::ValidationSetOverlays(older));
-        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, snapshot.overlayselection);
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().overlayselection,
+            snapshot.overlayselection
+        );
         // Refused rendering restores the applied target without inventing a frame.
         snapshot.overlayselection.revision += 1;
         snapshot.overlayselection.value = applied.clone();
         model.install_validation_snapshot(snapshot.clone()).unwrap();
-        assert_eq!(model.workflow.validation.as_ref().unwrap().frame.revision, 4);
-        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection.value, applied);
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().frame.revision,
+            4
+        );
+        assert_eq!(
+            model
+                .workflow
+                .validation
+                .as_ref()
+                .unwrap()
+                .overlayselection
+                .value,
+            applied
+        );
         snapshot.overlayselection.revision += 1;
         snapshot.overlayselection.value.predictionlayer = false;
         model.install_validation_snapshot(snapshot.clone()).unwrap();
         snapshot.overlays = snapshot.overlayselection.value.clone();
         snapshot.frame.revision += 1;
         model.install_validation_snapshot(snapshot.clone()).unwrap();
-        assert_eq!(model.workflow.validation.as_ref().unwrap().overlays, snapshot.overlayselection.value);
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().overlays,
+            snapshot.overlayselection.value
+        );
         // The component has no preference to resurrect after transport reset.
         model.clear_peer_state();
         assert!(model.workflow.validation.is_none());
-        let bootstrap = crate::view_model::test_support::bootstrapped().workflow.validation.unwrap();
-        model.install_validation_snapshot(bootstrap.clone()).unwrap();
-        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, bootstrap.overlayselection);
+        let bootstrap = crate::view_model::test_support::bootstrapped()
+            .workflow
+            .validation
+            .unwrap();
+        model
+            .install_validation_snapshot(bootstrap.clone())
+            .unwrap();
+        assert_eq!(
+            model.workflow.validation.as_ref().unwrap().overlayselection,
+            bootstrap.overlayselection
+        );
     }
 
     #[test]
@@ -1039,13 +1254,19 @@ mod validation_tests {
 #[cfg(test)]
 mod training_history_tests {
     use super::*;
-    use crate::generated::{TrainingApplicationProjection, TrainingCheckpointInspection, TrainingInspectionStatus};
+    use crate::generated::{
+        TrainingApplicationProjection, TrainingCheckpointInspection, TrainingInspectionStatus,
+    };
 
     fn inspect(path: &str, generation: u64, resumable: bool) -> TrainingCheckpointInspection {
         TrainingCheckpointInspection {
-            generation, path: path.into(), status: TrainingInspectionStatus::Ready, error: String::new(),
+            generation,
+            path: path.into(),
+            status: TrainingInspectionStatus::Ready,
+            error: String::new(),
             checkpoint: Some(crate::generated::TrainingCheckpointCapability {
-                path: path.into(), resumable,
+                path: path.into(),
+                resumable,
             }),
         }
     }
@@ -1056,7 +1277,14 @@ mod training_history_tests {
             for event_first in [false, true] {
                 let mut model = crate::view_model::test_support::bootstrapped();
                 let mut before = model.workflow.training.clone();
-                let mut train = model.settings_snapshot.as_ref().unwrap().settingsstate.workflows.train.clone();
+                let mut train = model
+                    .settings_snapshot
+                    .as_ref()
+                    .unwrap()
+                    .settingsstate
+                    .workflows
+                    .train
+                    .clone();
                 train.modelsource = crate::generated::ModelSelectionSource::Custom;
                 train.request.weightspath = "/run/checkpoint.pt".into();
                 model.workflow.train_continuation.select(&train);
@@ -1066,19 +1294,45 @@ mod training_history_tests {
                 running.status = TrainingInspectionStatus::Running;
                 running.checkpoint = None;
                 if event_first {
-                    model.project_training_event(ApplicationEvent::TrainingTrainingInspectionChanged(
-                        crate::generated::TrainingInspectionChanged { inspection: ready.clone() }));
+                    model.project_training_event(
+                        ApplicationEvent::TrainingTrainingInspectionChanged(
+                            crate::generated::TrainingInspectionChanged {
+                                inspection: ready.clone(),
+                            },
+                        ),
+                    );
                 }
                 assert!(model.workflow.train_continuation.checkpoint().is_none());
-                model.project_training_reply(1, ApplicationReply::TrainingInspectCheckpoint(running));
+                model.project_training_reply(
+                    1,
+                    ApplicationReply::TrainingInspectCheckpoint(running),
+                );
                 if !event_first {
                     assert!(model.workflow.train_continuation.checkpoint().is_none());
-                    model.project_training_event(ApplicationEvent::TrainingTrainingInspectionChanged(
-                        crate::generated::TrainingInspectionChanged { inspection: ready.clone() }));
+                    model.project_training_event(
+                        ApplicationEvent::TrainingTrainingInspectionChanged(
+                            crate::generated::TrainingInspectionChanged {
+                                inspection: ready.clone(),
+                            },
+                        ),
+                    );
                 }
-                assert_eq!(model.workflow.train_continuation.checkpoint(), ready.checkpoint.as_ref());
-                assert_eq!(model.workflow.train_continuation.mode, if resumable { ContinuationMode::Resume } else { ContinuationMode::Transfer });
-                model.project_training_reply(2, ApplicationReply::TrainingPrepareResume(ready.checkpoint.clone().unwrap()));
+                assert_eq!(
+                    model.workflow.train_continuation.checkpoint(),
+                    ready.checkpoint.as_ref()
+                );
+                assert_eq!(
+                    model.workflow.train_continuation.mode,
+                    if resumable {
+                        ContinuationMode::Resume
+                    } else {
+                        ContinuationMode::Transfer
+                    }
+                );
+                model.project_training_reply(
+                    2,
+                    ApplicationReply::TrainingPrepareResume(ready.checkpoint.clone().unwrap()),
+                );
                 assert!(model.workflow.pending_start.is_none());
                 before.as_mut().unwrap().inspection = ready;
                 assert_eq!(model.workflow.training, before);
@@ -1095,7 +1349,10 @@ mod training_history_tests {
         model.project_training_snapshot(training.clone()).unwrap();
         let ready = inspect("/run/checkpoint.pt", 3, true);
         model.project_training_event(ApplicationEvent::TrainingTrainingInspectionChanged(
-            crate::generated::TrainingInspectionChanged { inspection: ready.clone() }));
+            crate::generated::TrainingInspectionChanged {
+                inspection: ready.clone(),
+            },
+        ));
         // The runtime snapshot may have been captured before the inspection event.
         model.project_training_snapshot(training.clone()).unwrap();
         training.inspection = ready.clone();
@@ -1107,7 +1364,12 @@ mod training_history_tests {
     #[test]
     fn replaced_inspection_failure_and_user_mode_are_settled_explicitly() {
         let mut selection = Continuation::default();
-        let mut train = crate::view_model::test_support::bootstrapped().settings_snapshot.unwrap().settingsstate.workflows.train;
+        let mut train = crate::view_model::test_support::bootstrapped()
+            .settings_snapshot
+            .unwrap()
+            .settingsstate
+            .workflows
+            .train;
         train.modelsource = crate::generated::ModelSelectionSource::Custom;
         train.request.weightspath = "/one.pt".into();
         selection.select(&train);
@@ -1120,7 +1382,10 @@ mod training_history_tests {
         assert!(selection.checkpoint().is_none());
         assert!(!selection.fail(1, "stale".into()));
         assert!(selection.fail(2, "unavailable weights".into()));
-        assert!(matches!(selection.capability, CheckpointCapability::Failed(_)));
+        assert!(matches!(
+            selection.capability,
+            CheckpointCapability::Failed(_)
+        ));
         assert!(selection.request().is_none());
         assert!(selection.checkpoint().is_none());
         selection.begin(3);
@@ -1133,13 +1398,20 @@ mod training_history_tests {
     #[test]
     fn bootstrap_prefers_active_or_retained_live_output_and_explicit_browse_selects_saved() {
         let model = crate::view_model::test_support::bootstrapped();
-        let mut train = model.settings_snapshot.unwrap().settingsstate.workflows.train;
+        let mut train = model
+            .settings_snapshot
+            .unwrap()
+            .settingsstate
+            .workflows
+            .train;
         train.autooutput = false;
         train.request.outputdir = "/configured".into();
         for active in [false, true] {
             let mut snapshot = model.workflow.training.clone().unwrap();
             snapshot.outputdirectory = "/configured/run-0002".into();
-            if active { snapshot.activity = crate::generated::TrainingActivity::Local; }
+            if active {
+                snapshot.activity = crate::generated::TrainingActivity::Local;
+            }
             let mut output = TrainingOutput::default();
             // An old accepted dialog in bootstrap is not a new user selection.
             assert!(output.synchronize(&train, Some(&snapshot), Some(4)));
@@ -1160,12 +1432,23 @@ mod training_history_tests {
         model.workflow.output.select_saved("/saved".into());
         model.workflow.output.saved_mut().unwrap().load = HistoryLoad::Opening(2);
         model.workflow.output.live();
-        model.project_training_reply(2, ApplicationReply::TrainingOpenRun(crate::generated::TrainingOpenedRun {
-            generation: 7, directory: "/saved".into(), run: None,
-        }));
-        model.project_training_reply(3, ApplicationReply::TrainingHistory(crate::generated::TrainingHistoryPage {
-            generation: 7, nextcursor: 4096, more: true, records: vec![],
-        }));
+        model.project_training_reply(
+            2,
+            ApplicationReply::TrainingOpenRun(crate::generated::TrainingOpenedRun {
+                generation: 7,
+                directory: "/saved".into(),
+                run: None,
+            }),
+        );
+        model.project_training_reply(
+            3,
+            ApplicationReply::TrainingHistory(crate::generated::TrainingHistoryPage {
+                generation: 7,
+                nextcursor: 4096,
+                more: true,
+                records: vec![],
+            }),
+        );
         assert!(model.workflow.output.saved().is_none());
     }
 }

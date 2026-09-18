@@ -123,14 +123,17 @@ impl ApplicationModel {
         match page {
             FeatureId::Train => {
                 let continuation = &self.workflow.train_continuation;
-                let inspected = settings.workflows.train.modelsource != crate::generated::ModelSelectionSource::Custom
+                let inspected = settings.workflows.train.modelsource
+                    != crate::generated::ModelSelectionSource::Custom
                     || (continuation.matches(&settings.workflows.train)
                         && continuation.checkpoint().is_some());
-                inspected && self.workflow.training.as_ref().is_some_and(|snapshot| {
-                    snapshot.activity == crate::generated::TrainingActivity::Idle
-                }) && (!self.training_family_pending()
-                    || self.has_pending(ApplicationIntentEndpoint::TrainingOpenRun)
-                    || self.has_pending(ApplicationIntentEndpoint::TrainingHistory))
+                inspected
+                    && self.workflow.training.as_ref().is_some_and(|snapshot| {
+                        snapshot.activity == crate::generated::TrainingActivity::Idle
+                    })
+                    && (!self.training_family_pending()
+                        || self.has_pending(ApplicationIntentEndpoint::TrainingOpenRun)
+                        || self.has_pending(ApplicationIntentEndpoint::TrainingHistory))
             }
             FeatureId::Validate => self.compute_start_available_for(
                 self.workflow
@@ -164,17 +167,61 @@ impl ApplicationModel {
 
     /// Only explicitly accepted execution owns the primary Stop presentation.
     pub fn primary_action_active(&self, page: FeatureId) -> bool {
-        if self.connection != ConnectionState::Connected { return false; }
-        if self.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == page) {
+        if self.connection != ConnectionState::Connected {
+            return false;
+        }
+        if self
+            .workflow
+            .pending_start
+            .as_ref()
+            .is_some_and(|pending| pending.feature == page)
+        {
             return true;
         }
         let (active, start, stop) = match page {
-            FeatureId::Train => (self.workflow.training.as_ref().is_some_and(|state| state.local.active) || self.has_pending(ApplicationIntentEndpoint::TrainingResume), ApplicationIntentEndpoint::TrainingStart, ApplicationIntentEndpoint::TrainingStop),
-            FeatureId::Validate => (self.workflow.validation.as_ref().is_some_and(|state| state.operation.active), ApplicationIntentEndpoint::ValidationStart, ApplicationIntentEndpoint::ValidationStop),
-            FeatureId::Predict => (self.predict_snapshot.as_ref().is_some_and(|state| state.operation.active), ApplicationIntentEndpoint::PredictStart, ApplicationIntentEndpoint::PredictStop),
-            FeatureId::Export => (self.workflow.export.as_ref().is_some_and(|state| state.active), ApplicationIntentEndpoint::ExportSystemStart, ApplicationIntentEndpoint::ExportSystemStop),
-            FeatureId::Live => (self.live_snapshot.as_ref().is_some_and(|state| state.running || state.cancellationrequested), ApplicationIntentEndpoint::LiveStart, ApplicationIntentEndpoint::LiveStop),
-            FeatureId::Annotate => return self.has_pending(ApplicationIntentEndpoint::AnnotationSave) || self.annotation.save_active(),
+            FeatureId::Train => (
+                self.workflow
+                    .training
+                    .as_ref()
+                    .is_some_and(|state| state.local.active)
+                    || self.has_pending(ApplicationIntentEndpoint::TrainingResume),
+                ApplicationIntentEndpoint::TrainingStart,
+                ApplicationIntentEndpoint::TrainingStop,
+            ),
+            FeatureId::Validate => (
+                self.workflow
+                    .validation
+                    .as_ref()
+                    .is_some_and(|state| state.operation.active),
+                ApplicationIntentEndpoint::ValidationStart,
+                ApplicationIntentEndpoint::ValidationStop,
+            ),
+            FeatureId::Predict => (
+                self.predict_snapshot
+                    .as_ref()
+                    .is_some_and(|state| state.operation.active),
+                ApplicationIntentEndpoint::PredictStart,
+                ApplicationIntentEndpoint::PredictStop,
+            ),
+            FeatureId::Export => (
+                self.workflow
+                    .export
+                    .as_ref()
+                    .is_some_and(|state| state.active),
+                ApplicationIntentEndpoint::ExportSystemStart,
+                ApplicationIntentEndpoint::ExportSystemStop,
+            ),
+            FeatureId::Live => (
+                self.live_snapshot
+                    .as_ref()
+                    .is_some_and(|state| state.running || state.cancellationrequested),
+                ApplicationIntentEndpoint::LiveStart,
+                ApplicationIntentEndpoint::LiveStop,
+            ),
+            FeatureId::Annotate => {
+                return self.has_pending(ApplicationIntentEndpoint::AnnotationSave)
+                    || self.annotation.save_active();
+            }
             FeatureId::Explore => return false,
         };
         active || self.has_pending(start) || self.has_pending(stop)
@@ -188,7 +235,11 @@ impl ApplicationModel {
             .is_some_and(|pending| pending.feature == page)
         {
             return self.connection == ConnectionState::Connected
-                && self.workflow.pending_start.as_ref().is_some_and(|pending| !pending.preparation.cancelled());
+                && self
+                    .workflow
+                    .pending_start
+                    .as_ref()
+                    .is_some_and(|pending| !pending.preparation.cancelled());
         }
         let (snapshot, stop) = match page {
             FeatureId::Validate => (
@@ -237,7 +288,11 @@ impl ApplicationModel {
             .is_some_and(|pending| pending.feature == FeatureId::Train)
         {
             return self.connection == ConnectionState::Connected
-                && self.workflow.pending_start.as_ref().is_some_and(|pending| !pending.preparation.cancelled());
+                && self
+                    .workflow
+                    .pending_start
+                    .as_ref()
+                    .is_some_and(|pending| !pending.preparation.cancelled());
         }
         self.connection == ConnectionState::Connected
             && self.workflow.training.as_ref().is_some_and(|snapshot| {
@@ -413,7 +468,9 @@ impl ApplicationModel {
 
     pub fn upscale_start_available(&self) -> bool {
         self.connection == ConnectionState::Connected
-            && self.viewer_base_source().is_some_and(|(source, _)| Self::valid_visual_source(source).is_some())
+            && self
+                .viewer_base_source()
+                .is_some_and(|(source, _)| Self::valid_visual_source(source).is_some())
     }
 
     pub fn annotation_save_available(&self) -> bool {
@@ -467,20 +524,46 @@ mod tests {
     fn explicit_preparation_keeps_stop_visible_but_cancelled_preparation_cannot_repeat() {
         use crate::view_model::{PendingStart, StartInputs, StartPreparation};
         let mut model = bootstrapped();
-        for preparation in [StartPreparation::Waiting, StartPreparation::ResumeQueued,
-            StartPreparation::Restoring { correlation: 1, cancelled: false }, StartPreparation::Restored,
-            StartPreparation::Selecting { correlation: 1, cancelled: false },
-            StartPreparation::Active { generation: 1, cancelled: false },
-            StartPreparation::Stopping { generation: 1, correlation: 1 }] {
-            model.workflow.pending_start = Some(PendingStart { feature: FeatureId::Train,
-                inputs: StartInputs::capture(&model.settings_snapshot.as_ref().unwrap().settingsstate, FeatureId::Train).unwrap(),
-                preparation, resume_checkpoint: None });
+        for preparation in [
+            StartPreparation::Waiting,
+            StartPreparation::ResumeQueued,
+            StartPreparation::Restoring {
+                correlation: 1,
+                cancelled: false,
+            },
+            StartPreparation::Restored,
+            StartPreparation::Selecting {
+                correlation: 1,
+                cancelled: false,
+            },
+            StartPreparation::Active {
+                generation: 1,
+                cancelled: false,
+            },
+            StartPreparation::Stopping {
+                generation: 1,
+                correlation: 1,
+            },
+        ] {
+            model.workflow.pending_start = Some(PendingStart {
+                feature: FeatureId::Train,
+                inputs: StartInputs::capture(
+                    &model.settings_snapshot.as_ref().unwrap().settingsstate,
+                    FeatureId::Train,
+                )
+                .unwrap(),
+                preparation,
+                resume_checkpoint: None,
+            });
             assert!(model.primary_action_active(FeatureId::Train));
             assert_eq!(model.training_stop_available(), !preparation.cancelled());
             assert!(!model.primary_action_active(FeatureId::Validate));
             model.workflow.cancel_start();
             assert!(!model.training_stop_available());
-            assert_eq!(model.primary_action_active(FeatureId::Train), model.workflow.pending_start.is_some());
+            assert_eq!(
+                model.primary_action_active(FeatureId::Train),
+                model.workflow.pending_start.is_some()
+            );
         }
         model.workflow.pending_start = None;
         model.workflow.train_continuation.refresh_requested = true;
@@ -489,14 +572,27 @@ mod tests {
 
     #[test]
     fn native_activity_survives_cancellation_requested_and_ends_on_each_terminal() {
-        for page in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict, FeatureId::Export] {
-            for outcome in [ComputeOperationOutcome::Succeeded, ComputeOperationOutcome::Failed, ComputeOperationOutcome::Cancelled] {
+        for page in [
+            FeatureId::Train,
+            FeatureId::Validate,
+            FeatureId::Predict,
+            FeatureId::Export,
+        ] {
+            for outcome in [
+                ComputeOperationOutcome::Succeeded,
+                ComputeOperationOutcome::Failed,
+                ComputeOperationOutcome::Cancelled,
+            ] {
                 let mut model = bootstrapped();
                 let operation = |model: &mut ApplicationModel, active, outcome| {
                     let operation = match page {
                         FeatureId::Train => &mut model.workflow.training.as_mut().unwrap().local,
-                        FeatureId::Validate => &mut model.workflow.validation.as_mut().unwrap().operation,
-                        FeatureId::Predict => &mut model.predict_snapshot.as_mut().unwrap().operation,
+                        FeatureId::Validate => {
+                            &mut model.workflow.validation.as_mut().unwrap().operation
+                        }
+                        FeatureId::Predict => {
+                            &mut model.predict_snapshot.as_mut().unwrap().operation
+                        }
                         FeatureId::Export => model.workflow.export.as_mut().unwrap(),
                         _ => unreachable!(),
                     };
@@ -505,7 +601,11 @@ mod tests {
                 };
                 operation(&mut model, true, ComputeOperationOutcome::Running);
                 assert!(model.primary_action_active(page));
-                operation(&mut model, true, ComputeOperationOutcome::CancellationRequested);
+                operation(
+                    &mut model,
+                    true,
+                    ComputeOperationOutcome::CancellationRequested,
+                );
                 assert!(model.primary_action_active(page));
                 assert!(!model.compute_stop_available(page));
                 operation(&mut model, false, outcome);
@@ -525,18 +625,42 @@ mod tests {
     #[test]
     fn primary_activity_excludes_navigation_and_capability_work_and_retains_stop_settlement() {
         let mut model = bootstrapped();
-        for endpoint in [ApplicationIntentEndpoint::ValidationSelectSample, ApplicationIntentEndpoint::ValidationSetOverlays, ApplicationIntentEndpoint::TrainingInspectCheckpoint] {
+        for endpoint in [
+            ApplicationIntentEndpoint::ValidationSelectSample,
+            ApplicationIntentEndpoint::ValidationSetOverlays,
+            ApplicationIntentEndpoint::TrainingInspectCheckpoint,
+        ] {
             let pending = model.begin_intent(endpoint).unwrap();
             assert!(!model.primary_action_active(FeatureId::Validate));
             assert!(!model.primary_action_active(FeatureId::Train));
             model.abandon_intent(pending);
         }
         for (page, start, stop) in [
-            (FeatureId::Train, ApplicationIntentEndpoint::TrainingStart, ApplicationIntentEndpoint::TrainingStop),
-            (FeatureId::Validate, ApplicationIntentEndpoint::ValidationStart, ApplicationIntentEndpoint::ValidationStop),
-            (FeatureId::Predict, ApplicationIntentEndpoint::PredictStart, ApplicationIntentEndpoint::PredictStop),
-            (FeatureId::Export, ApplicationIntentEndpoint::ExportSystemStart, ApplicationIntentEndpoint::ExportSystemStop),
-            (FeatureId::Live, ApplicationIntentEndpoint::LiveStart, ApplicationIntentEndpoint::LiveStop),
+            (
+                FeatureId::Train,
+                ApplicationIntentEndpoint::TrainingStart,
+                ApplicationIntentEndpoint::TrainingStop,
+            ),
+            (
+                FeatureId::Validate,
+                ApplicationIntentEndpoint::ValidationStart,
+                ApplicationIntentEndpoint::ValidationStop,
+            ),
+            (
+                FeatureId::Predict,
+                ApplicationIntentEndpoint::PredictStart,
+                ApplicationIntentEndpoint::PredictStop,
+            ),
+            (
+                FeatureId::Export,
+                ApplicationIntentEndpoint::ExportSystemStart,
+                ApplicationIntentEndpoint::ExportSystemStop,
+            ),
+            (
+                FeatureId::Live,
+                ApplicationIntentEndpoint::LiveStart,
+                ApplicationIntentEndpoint::LiveStop,
+            ),
         ] {
             for endpoint in [start, stop] {
                 let pending = model.begin_intent(endpoint).unwrap();

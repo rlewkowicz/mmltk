@@ -24,6 +24,7 @@ class TrainingCheckpointAdmission final {
     TrainingCheckpointAdmission(TrainingCheckpoint, mmltk::common::io::FileSnapshot);
     [[nodiscard]] const TrainingCheckpoint& checkpoint() const noexcept { return checkpoint_; }
     void RequireUnchanged(std::stop_token stop = {}) const;
+
    private:
     TrainingCheckpoint checkpoint_;
     std::variant<std::shared_ptr<const ClassArtifactAdmission>, mmltk::common::io::FileSnapshot> evidence_;

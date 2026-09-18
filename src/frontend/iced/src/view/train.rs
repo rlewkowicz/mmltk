@@ -88,23 +88,51 @@ impl Component {
     }
 }
 
-fn continuation_controls<'a>(model: &'a ApplicationModel, train: Option<&crate::generated::TrainViewState>, enabled: bool) -> Element<'a, Message> {
+fn continuation_controls<'a>(
+    model: &'a ApplicationModel,
+    train: Option<&crate::generated::TrainViewState>,
+    enabled: bool,
+) -> Element<'a, Message> {
     let current = train.is_some_and(|train| model.workflow.train_continuation.matches(train));
-    let selected = if current { model.workflow.train_continuation.mode } else { ContinuationMode::Transfer };
+    let selected = if current {
+        model.workflow.train_continuation.mode
+    } else {
+        ContinuationMode::Transfer
+    };
     let radio = |label, mode, available| {
-        iced::widget::radio(label, mode, Some(selected), Message::Continuation)
-            .style(move |theme, status| if available {
-                iced_fluent_theme::radio::default(theme, status)
-            } else { iced_fluent_theme::radio::disabled(theme, status) })
+        iced::widget::radio(label, mode, Some(selected), Message::Continuation).style(
+            move |theme, status| {
+                if available {
+                    iced_fluent_theme::radio::default(theme, status)
+                } else {
+                    iced_fluent_theme::radio::disabled(theme, status)
+                }
+            },
+        )
     };
     let mut controls = column![
         radio("Transfer", ContinuationMode::Transfer, enabled),
-        radio("Resume", ContinuationMode::Resume, enabled && current && model.workflow.train_continuation.checkpoint().is_some_and(|checkpoint| checkpoint.resumable)),
-    ].spacing(crate::view::workflow::FIELD_SPACING);
+        radio(
+            "Resume",
+            ContinuationMode::Resume,
+            enabled
+                && current
+                && model
+                    .workflow
+                    .train_continuation
+                    .checkpoint()
+                    .is_some_and(|checkpoint| checkpoint.resumable)
+        ),
+    ]
+    .spacing(crate::view::workflow::FIELD_SPACING);
     if current {
         match &model.workflow.train_continuation.capability {
-            crate::view_model::CheckpointCapability::Pending { .. } => controls = controls.push(text("Inspecting checkpoint…").size(12)),
-            crate::view_model::CheckpointCapability::Failed(detail) => controls = controls.push(text(detail).size(12)),
+            crate::view_model::CheckpointCapability::Pending { .. } => {
+                controls = controls.push(text("Inspecting checkpoint…").size(12))
+            }
+            crate::view_model::CheckpointCapability::Failed(detail) => {
+                controls = controls.push(text(detail).size(12))
+            }
             _ => {}
         }
     }
@@ -201,8 +229,8 @@ impl Component {
             .as_ref()
             .map(|training| &training.local);
         let setup: Element<'a, Message> = column![
-            self.model_card
-                .view_with(crate::view::workflow::model_card::State::from_settings(
+            self.model_card.view_with(
+                crate::view::workflow::model_card::State::from_settings(
                     crate::generated::FeatureId::Train,
                     settings.draft.as_ref(),
                     model.model_snapshot.as_ref(),
@@ -216,7 +244,10 @@ impl Component {
                             )
                         }),
                     model.model_stop_available(),
-                ), continuation_controls(model, installed_train, settings_edit_available), Message::Model),
+                ),
+                continuation_controls(model, installed_train, settings_edit_available),
+                Message::Model
+            ),
             dataset::view(
                 installed_train,
                 model,
@@ -234,7 +265,9 @@ impl Component {
                         model.compute_start_available(draft, crate::generated::FeatureId::Train)
                     })
                     .then_some(Message::StartRequested),
-                model.training_stop_available().then_some(Message::TrainingStopRequested),
+                model
+                    .training_stop_available()
+                    .then_some(Message::TrainingStopRequested),
                 crate::view::workflow::progress::compute(training),
             ),
         ]
@@ -363,22 +396,44 @@ mod tests {
     fn only_train_installs_continuation_controls_inside_the_weights_card() {
         let model = crate::view_model::test_support::bootstrapped();
         let settings = crate::view::settings::installed_settings_model();
-        let state = |feature| crate::view::workflow::model_card::State::from_settings(
-            feature, settings.draft.as_ref(), None, None, true, true, false,
-        );
+        let state = |feature| {
+            crate::view::workflow::model_card::State::from_settings(
+                feature,
+                settings.draft.as_ref(),
+                None,
+                None,
+                true,
+                true,
+                false,
+            )
+        };
         let component = crate::view::workflow::model_card::Component::default();
         let train = component.view_with(
             state(crate::generated::FeatureId::Train),
-            continuation_controls(&model, settings.draft.as_ref().map(|draft| &draft.workflows.train), true),
+            continuation_controls(
+                &model,
+                settings.draft.as_ref().map(|draft| &draft.workflows.train),
+                true,
+            ),
             Message::Model,
         );
-        let validate = crate::view::workflow::model_card::view(state(crate::generated::FeatureId::Validate), 0);
+        let validate = crate::view::workflow::model_card::view(
+            state(crate::generated::FeatureId::Validate),
+            0,
+        );
         let train_tree = iced::advanced::widget::Tree::new(&train);
         let validate_tree = iced::advanced::widget::Tree::new(&validate);
-        let body = |tree: &iced::advanced::widget::Tree| tree.children[0].children[0].children[2].children.len();
+        let body = |tree: &iced::advanced::widget::Tree| {
+            tree.children[0].children[0].children[2].children.len()
+        };
         assert_eq!(body(&train_tree), 2);
         assert_eq!(body(&validate_tree), 1);
-        assert_eq!(train_tree.children[0].children[0].children[2].children[1].children.len(), 2);
+        assert_eq!(
+            train_tree.children[0].children[0].children[2].children[1]
+                .children
+                .len(),
+            2
+        );
     }
 
     #[test]

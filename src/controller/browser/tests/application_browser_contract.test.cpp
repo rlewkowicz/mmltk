@@ -328,8 +328,8 @@ class SyntheticDerivedSystem final {
    public:
     using event_type = std::variant<SyntheticChanged>;
     using visual_source = VisualSourceProjection<SyntheticDerivedSnapshot, PresentationSourceKind::Upscale,
-        mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::frame>,
-        mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::revision>, SyntheticDerivedSnapshot>;
+                                                 mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::frame>,
+                                                 mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::revision>, SyntheticDerivedSnapshot>;
     [[= contracts::reflection::Snapshot{64U * 1024U}]] SyntheticDerivedSnapshot snapshot() const {
         return {.frame = visual_frame({PresentationSourceKind::Upscale, 1U}, {48U, 32U}, 9U), .input = input};
     }
@@ -530,10 +530,11 @@ TEST_CASE("derived image envelopes select the exact reflected source system") {
         });
         const auto product = mmltk::frameworks::serialization::reflected_transport_value(derived.snapshot());
         REQUIRE(product);
-        const auto expected = mmltk::frameworks::serialization::reflected_transport_value(WorkspaceImageMetadata{
-            .schema_fingerprint = application_schema_fingerprint<DerivedVisualComposition>().words,
-            .frame = derived.snapshot().frame, .product = {.system_id = product_id, .value = *product},
-            .source = SystemSnapshot{.system_id = source_id, .value = *source}});
+        const auto expected = mmltk::frameworks::serialization::reflected_transport_value(
+            WorkspaceImageMetadata{.schema_fingerprint = application_schema_fingerprint<DerivedVisualComposition>().words,
+                                   .frame = derived.snapshot().frame,
+                                   .product = {.system_id = product_id, .value = *product},
+                                   .source = SystemSnapshot{.system_id = source_id, .value = *source}});
         REQUIRE(expected);
         CHECK(*decoded == *expected);
     }

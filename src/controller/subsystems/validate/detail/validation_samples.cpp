@@ -96,8 +96,10 @@ class ValidationSamples::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (generation == 0U || generation <= generation_frontier_) return;
-            if (current_ && !settled_success_) RestoreIncumbent();
-            else current_.reset();
+            if (current_ && !settled_success_)
+                RestoreIncumbent();
+            else
+                current_.reset();
             if (content_frontier_ > std::numeric_limits<std::uint64_t>::max() - (rfdetr::kValidationSampleCapacity + 2U))
                 throw contracts::FailedError("validation content identities exhausted");
             if (!requested_.atlas) {
@@ -108,11 +110,12 @@ class ValidationSamples::Impl final {
             }
             rollback_ = requested_;
             next->atlas_identity = ++content_frontier_;
-            for (auto& sample : next->samples) if (sample) {
-                auto identified = std::make_shared<Sample>(*sample);
-                identified->content_identity = ++content_frontier_;
-                sample = std::move(identified);
-            }
+            for (auto& sample : next->samples)
+                if (sample) {
+                    auto identified = std::make_shared<Sample>(*sample);
+                    identified->content_identity = ++content_frontier_;
+                    sample = std::move(identified);
+                }
             next->clean_revision = NextCleanRevision();
             generation_frontier_ = generation;
             current_ = std::move(next);
@@ -134,7 +137,8 @@ class ValidationSamples::Impl final {
         {
             std::scoped_lock lock(mutex_);
             if (!current_ || current_->generation != generation || settled_success_) return;
-            if (!succeeded) RestoreIncumbent();
+            if (!succeeded)
+                RestoreIncumbent();
             else {
                 // Keep an incumbent detail open. Atlas previews already point
                 // at the complete mutable set, whose capture phase ends here.
@@ -142,8 +146,12 @@ class ValidationSamples::Impl final {
                     requested_.atlas = current_;
                     RequestRender();
                 }
-                if (requested_.atlas == current_) settled_success_ = true;
-                else { current_.reset(); rollback_ = {}; }
+                if (requested_.atlas == current_)
+                    settled_success_ = true;
+                else {
+                    current_.reset();
+                    rollback_ = {};
+                }
             }
         }
         static_cast<void>(worker_.NotifyContinuation());
@@ -153,8 +161,8 @@ class ValidationSamples::Impl final {
             std::scoped_lock lock(mutex_);
             if (!current_ || current_->generation != generation || settled_success_) return;
         }
-        if (!sample.pixels.preview_failure.empty() || (!sample.pixels.chw && !sample.pixels.rgb8)
-            || sample.pixels.width > visual_.maximum_width || sample.pixels.height > visual_.maximum_height) {
+        if (!sample.pixels.preview_failure.empty() || (!sample.pixels.chw && !sample.pixels.rgb8) || sample.pixels.width > visual_.maximum_width ||
+            sample.pixels.height > visual_.maximum_height) {
             Settle(generation, false);
             return;
         }
@@ -167,7 +175,10 @@ class ValidationSamples::Impl final {
                                  sample.pixels.rgb8, std::move(sample.pixels.custody), sample.pixels.stop_source, sample.pixels.source_control,
                                  sample.ground_truth, true);
         }
-        if (!raw) { Settle(generation, false); return; }
+        if (!raw) {
+            Settle(generation, false);
+            return;
+        }
         ValidationSampleMetadata metadata;
         metadata.available = true;
         metadata.original_extent = {sample.pixels.width, sample.pixels.height};
@@ -177,8 +188,10 @@ class ValidationSamples::Impl final {
                 const auto category = static_cast<std::size_t>(prediction.class_reference);
                 if (category >= raw->classes().size()) throw std::invalid_argument("validation sample category is absent");
                 std::array<std::uint8_t, 3> rgb{};
-                mmltk::backend::imaging::raster::color::class_color(static_cast<int>(category), static_cast<int>(raw->classes().size()), rgb[0], rgb[1], rgb[2]);
-                if (ground_truth) for (auto& channel : rgb) channel = 255U - channel;
+                mmltk::backend::imaging::raster::color::class_color(static_cast<int>(category), static_cast<int>(raw->classes().size()), rgb[0], rgb[1],
+                                                                    rgb[2]);
+                if (ground_truth)
+                    for (auto& channel : rgb) channel = 255U - channel;
                 metadata.labels.push_back({{{prediction.bbox_xyxy[0], prediction.bbox_xyxy[1]}, {prediction.bbox_xyxy[2], prediction.bbox_xyxy[3]}},
                                            palette[category],
                                            rgb,
@@ -204,7 +217,7 @@ class ValidationSamples::Impl final {
             document->scene.frame_width = static_cast<std::uint16_t>(metadata.original_extent.width);
             document->scene.frame_height = static_cast<std::uint16_t>(metadata.original_extent.height);
             document->scene.frame_ready = true;
-            document->scene.frame_index = sample.prediction.dataset_index;
+            document->scene.frame_index = metadata.identity.dataset_index;
             document->scene.palette = palette;
             for (const auto& name : raw->classes()) document->scene.categories.push_back({.value = name});
             for (const auto& gt : raw->ground_truth()) {
@@ -222,7 +235,8 @@ class ValidationSamples::Impl final {
                 if (index >= masks->size()) return false;
                 const auto& mask = (*masks)[index];
                 if (!(x >= 0.0F && x < 1.0F && y >= 0.0F && y < 1.0F)) return false;
-                const auto offset = static_cast<std::uint32_t>(y * mask.height) * mask.width + static_cast<std::uint32_t>(x * mask.width);
+                const auto offset = static_cast<std::uint32_t>(y * static_cast<float>(mask.height)) * mask.width +
+                                    static_cast<std::uint32_t>(x * static_cast<float>(mask.width));
                 const auto after = std::ranges::upper_bound(mask.runs, offset, {}, &std::pair<std::uint32_t, std::uint32_t>::first);
                 if (after == mask.runs.begin()) return false;
                 const auto& run = *std::prev(after);
@@ -294,9 +308,7 @@ class ValidationSamples::Impl final {
             if (displayed_) {
                 requested_.atlas = displayed_;
                 requested_.detail.reset();
-                if (image_.detail) {
-                    requested_.detail = image_.selected;
-                }
+                if (image_.detail) { requested_.detail = image_.selected; }
             }
             if (requested_.atlas) RequestRender();
         }
@@ -338,7 +350,8 @@ class ValidationSamples::Impl final {
             image.overlays = overlays;
             auto clean_revision = drawing->clean_revision;
             if (selected) {
-                const auto found = std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot && slot->raw && slot->metadata.identity == *selected; });
+                const auto found =
+                    std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot && slot->raw && slot->metadata.identity == *selected; });
                 if (found == drawing->samples.end()) return {};
                 extent = (*found)->metadata.original_extent;
                 image.content_identity = (*found)->content_identity;
@@ -353,8 +366,8 @@ class ValidationSamples::Impl final {
                 auto& metadata = image.samples[index];
                 metadata = sample->metadata;
                 if (!sample->raw || (selected && sample->metadata.identity != *selected)) continue;
-                const auto contained = mmltk::backend::imaging::raster::contain_image(metadata.original_extent.width, metadata.original_extent.height,
-                                                                                  cell_width, cell_height);
+                const auto contained =
+                    mmltk::backend::imaging::raster::contain_image(metadata.original_extent.width, metadata.original_extent.height, cell_width, cell_height);
                 metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height}
                                          : VisualRegion{static_cast<std::uint32_t>(index % 2U) * cell_width + contained.x,
                                                         static_cast<std::uint32_t>(index / 2U) * cell_height + contained.y, contained.width, contained.height};
@@ -363,7 +376,8 @@ class ValidationSamples::Impl final {
             PredictionPreviewComposition::Draw(
                 runtime, candidate, extent, std::span(regions).first(region_count),
                 {overlays.prediction_layer && overlays.prediction_boxes, overlays.prediction_layer && overlays.prediction_masks,
-                 overlays.ground_truth_layer && overlays.ground_truth_boxes, overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected}, &preparation_);
+                 overlays.ground_truth_layer && overlays.ground_truth_boxes, overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected},
+                &preparation_);
             image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
             image.frame.content = {0U, 0U, extent.width, extent.height};
             image.frame.clean_revision = clean_revision;
@@ -474,8 +488,12 @@ ValidationSamples::ValidationSamples(VisualDeviceSettings visual, std::function<
 ValidationSamples::~ValidationSamples() = default;
 void ValidationSamples::Begin(std::uint64_t generation, std::span<const std::uint32_t> indices) { impl_->Begin(generation, indices); }
 void ValidationSamples::Capture(std::uint64_t generation, rfdetr::ValidationSampleView sample) {
-    try { impl_->Capture(generation, std::move(sample)); }
-    catch (...) { impl_->Settle(generation, false); throw; }
+    try {
+        impl_->Capture(generation, std::move(sample));
+    } catch (...) {
+        impl_->Settle(generation, false);
+        throw;
+    }
 }
 void ValidationSamples::Settle(std::uint64_t generation, bool succeeded) { impl_->Settle(generation, succeeded); }
 void ValidationSamples::Select(ValidationSampleIdentity identity) { impl_->Select(identity); }

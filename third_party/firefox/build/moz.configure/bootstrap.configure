@@ -89,27 +89,6 @@ def bootstrap_toolchain_tasks(host):
         log.debug(message)
         return None
 
-    def task_data(t):
-        result = {
-            "index": t.get("optimization", {})["index-search"],
-            "artifact": t["attributes"][f"{t['kind']}-artifact"],
-            "extract": t["attributes"].get(f"{t['kind']}-extract", True),
-        }
-        command = t["attributes"].get("toolchain-command")
-        if command:
-            result["command"] = command
-        return result
-
-    # We only want to use toolchains annotated with "local-toolchain". We also limit the
-    # amount of data to what we use, so that trace logs can be more useful.
-    tasks = {
-        k: task_data(t)
-        for k, t in tasks.items()
-        if t["attributes"].get(f"local-{t['kind']}")
-        and t.get("optimization")
-        and "index-search" in t.get("optimization", {})
-    }
-
     return namespace(prefix=prefix, tasks=tasks)
 
 
@@ -209,7 +188,7 @@ def bootstrap_path(path, **kwargs):
             if not command:
                 try:
                     find_task_from_index = import_module(
-                        "mozbuild.util"
+                        "mozbuild.toolchain_artifacts"
                     ).find_task_from_index
                 except Exception:
                     log.debug("Cannot bootstrap %s: missing mozbuild module", label)

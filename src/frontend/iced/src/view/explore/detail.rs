@@ -1,8 +1,8 @@
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, checkbox, container, row, space};
 use iced::Center;
+use iced::widget::{button, checkbox, container, row, space};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -108,20 +108,30 @@ pub(super) fn view<'a>(
     .spacing(7)
     .align_y(Center);
     crate::view::image_viewer::panel(
-        selected, image, source.into(),
+        selected,
+        image,
+        source.into(),
         crate::view::image_viewer::PanelIds {
             image: super::DETAIL_WORKSPACE_ID,
             previous: super::DETAIL_PREVIOUS_ID,
             next: super::DETAIL_NEXT_ID,
             close: super::DETAIL_CLOSE_ID,
             annotate: super::DETAIL_ANNOTATE_ID,
-            upscale: [super::DETAIL_UPSCALE_BASIC_ID, super::DETAIL_UPSCALE_FAST_ID, super::DETAIL_UPSCALE_NEURAL_ID],
+            upscale: [
+                super::DETAIL_UPSCALE_BASIC_ID,
+                super::DETAIL_UPSCALE_FAST_ID,
+                super::DETAIL_UPSCALE_NEURAL_ID,
+            ],
         },
         available.then_some(Message::PreviousRequested),
         available.then_some(Message::NextRequested),
         available.then_some(Message::CloseRequested),
-        (model.annotation_import_available() && !settings.has_local_edits()).then_some(Message::OpenAnnotationRequested),
-        active, pending, model.upscale_start_available(), Message::UpscaleRequested,
+        (model.annotation_import_available() && !settings.has_local_edits())
+            .then_some(Message::OpenAnnotationRequested),
+        active,
+        pending,
+        model.upscale_start_available(),
+        Message::UpscaleRequested,
     )
 }
 

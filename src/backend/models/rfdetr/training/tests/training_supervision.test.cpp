@@ -31,6 +31,7 @@
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/models/rfdetr/core/tests/checkpoint_fixture_support/checkpoint_fixture_support.h"
 #include "src/test_support/cuda_test_utils.hpp"
+#include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/models/rfdetr/augmentation/tests/gpu_augment_test_support.h"
 #include "src/backend/models/rfdetr/augmentation/tests/copy_paste_fixture.h"
 #include "detail/checkpoint_private.h"
@@ -1803,7 +1804,6 @@ TEST_CASE("training cache failed settlement retains tensors stream and source an
         if (failure_path != 0) CHECK_FALSE(retained_source.expired());
     }
 }
-
 TEST_CASE("checkpoint capability rejects unknown and damaged archive containers", "[rfdetr][training_supervision]") {
     mmltk::testsupport::ScopedTempDir root{"checkpoint-container-capability"};
     const auto path = root.path() / "weights.pth";

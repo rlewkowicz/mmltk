@@ -11,11 +11,12 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from mozbuild.util import TASKCLUSTER_ROOT_URL
+from mozbuild.util import TASKCLUSTER_ROOT_URL, get_root_url
 
 
 _BUFFER_SIZE = 4 * 1024 * 1024
@@ -33,6 +34,26 @@ def _artifact_url(root_url, task_id, artifact_name):
 def _download_json(url):
     with urllib.request.urlopen(url, timeout=120) as response:
         return json.load(response)
+
+
+def find_task_from_index(index_paths):
+    """Resolve the first usable public toolchain task without the CI SDK."""
+    root_url = get_root_url()
+    for index_path in index_paths:
+        try:
+            quoted_index = urllib.parse.quote(index_path, safe="")
+            task = _download_json(f"{root_url}/api/index/v1/task/{quoted_index}")
+            task_id = task["taskId"]
+            quoted_task = urllib.parse.quote(task_id, safe="")
+            response = _download_json(
+                f"{root_url}/api/queue/v1/task/{quoted_task}/status"
+            )
+            status = response.get("status", {}) if response else {}
+            if status and status.get("state") not in ("exception", "failed"):
+                return task_id
+        except (KeyError, urllib.error.HTTPError):
+            continue
+    return None
 
 
 def _expected_digest(chain_of_trust, artifact_name):

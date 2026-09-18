@@ -78,12 +78,13 @@ TEST_CASE("Annotation imports Validation ground truth and retains receiver pixel
     frame.source.kind = PresentationSourceKind::Validation;
     EventGate events;
     AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend),
-        [&](const VisualFrame& requested) {
-            if (!source || requested != frame) return VisualDocumentRead{};
-            auto result = source->BorrowExact(source->frame());
-            result.document = document;
-            return result;
-        }, [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
+                                [&](const VisualFrame& requested) {
+                                    if (!source || requested != frame) return VisualDocumentRead{};
+                                    auto result = source->BorrowExact(source->frame());
+                                    result.document = document;
+                                    return result;
+                                },
+                                [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
     mmltk::testsupport::open_annotation(annotation, events, frame);
     const auto scene = annotation.snapshot().ui.scene;
     REQUIRE(scene.objects.size() == 1U);

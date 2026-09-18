@@ -181,12 +181,20 @@ pub(super) struct State {
 }
 
 fn atlas_cell(bounds: Rectangle, index: u8) -> Rectangle {
-    Rectangle { x: bounds.x + f32::from(index % 2) * bounds.width / 2.0,
+    Rectangle {
+        x: bounds.x + f32::from(index % 2) * bounds.width / 2.0,
         y: bounds.y + f32::from(index / 2) * bounds.height / 3.0,
-        width: bounds.width / 2.0, height: bounds.height / 3.0 }
+        width: bounds.width / 2.0,
+        height: bounds.height / 3.0,
+    }
 }
 fn layer_selection(index: u8) -> (bool, bool) {
-    match index { 1 => (false, true), 2 => (false, false), 3 => (true, false), _ => (true, true) }
+    match index {
+        1 => (false, true),
+        2 => (false, false),
+        3 => (true, false),
+        _ => (true, true),
+    }
 }
 
 fn source(index: u8) -> SourceKind {
@@ -216,8 +224,13 @@ mod tests {
         controller.driver.phase = Phase::Workflows(Step::Exporting);
         let generation = controller.driver.generation;
         let completion = |generation, active| Message::Scoped {
-            generation, receipt: None,
-            message: Box::new(Message::PrimaryActionPixels { control: "export.primary".into(), active, token: 1 }),
+            generation,
+            receipt: None,
+            message: Box::new(Message::PrimaryActionPixels {
+                control: "export.primary".into(),
+                active,
+                token: 1,
+            }),
         };
         let _ = controller.update(completion(generation.wrapping_sub(1), true));
         assert!(!controller.workflows.export_pixels);
@@ -234,18 +247,48 @@ mod tests {
         controller.driver.phase = Phase::Workflows(Step::Exporting);
         let generation = controller.driver.generation;
         let request = |generation| Message::Scoped {
-            generation, receipt: None,
-            message: Box::new(Message::PrimaryActionMeasure { control: "export.primary".into(), token: 1 }),
+            generation,
+            receipt: None,
+            message: Box::new(Message::PrimaryActionMeasure {
+                control: "export.primary".into(),
+                token: 1,
+            }),
         };
         let _ = controller.update(request(generation.wrapping_sub(1)));
-        assert!(controller.driver.reporting.primary_measurements(generation).is_none());
+        assert!(
+            controller
+                .driver
+                .reporting
+                .primary_measurements(generation)
+                .is_none()
+        );
         let _ = controller.update(request(generation));
-        assert!(controller.driver.reporting.primary_measurements(generation).is_some());
-        assert!(controller.driver.reporting.primary_measurements(generation).is_none());
+        assert!(
+            controller
+                .driver
+                .reporting
+                .primary_measurements(generation)
+                .is_some()
+        );
+        assert!(
+            controller
+                .driver
+                .reporting
+                .primary_measurements(generation)
+                .is_none()
+        );
         crate::integration_control::initialize_reporting(false, false);
         let _ = controller.update(request(generation));
-        assert!(controller.driver.reporting.primary_measurements(generation).is_none());
-        assert!(!crate::integration_control::reporting::primary_action_current("export.primary", 1));
+        assert!(
+            controller
+                .driver
+                .reporting
+                .primary_measurements(generation)
+                .is_none()
+        );
+        assert!(
+            !crate::integration_control::reporting::primary_action_current("export.primary", 1)
+        );
     }
 
     #[test]
@@ -347,11 +390,20 @@ impl State {
     }
 
     pub(super) fn primary_action_pixels(&mut self, driver: &Driver, control: &str, active: bool) {
-        if !active { return; }
-        for (index, feature) in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict].into_iter().enumerate() {
-            if control == primary(feature) { self.primary_pixels[index] = true; }
+        if !active {
+            return;
         }
-        if driver.phase == Phase::Workflows(Step::Exporting) && control == primary(FeatureId::Export) {
+        for (index, feature) in [FeatureId::Train, FeatureId::Validate, FeatureId::Predict]
+            .into_iter()
+            .enumerate()
+        {
+            if control == primary(feature) {
+                self.primary_pixels[index] = true;
+            }
+        }
+        if driver.phase == Phase::Workflows(Step::Exporting)
+            && control == primary(FeatureId::Export)
+        {
             self.export_pixels = true;
         }
     }
@@ -496,7 +548,9 @@ impl State {
         }
         match step {
             Step::Training | Step::Validating | Step::Predicting(_) | Step::Exporting => {
-                driver.reporting.observe(|reporting| reporting.located(&driver.phase, control, bounds));
+                driver
+                    .reporting
+                    .observe(|reporting| reporting.located(&driver.phase, control, bounds));
                 return;
             }
             Step::ChartLegend | Step::ChartPan => {
@@ -613,7 +667,10 @@ impl State {
         let bounds = match step {
             Step::Pixels(Picture::Validation, index) => atlas_cell(bounds, index),
             Step::OpenSample => atlas_cell(bounds, 0),
-            Step::ValidationLayer(..) => Rectangle { width: bounds.width.min(bounds.height), ..bounds },
+            Step::ValidationLayer(..) => Rectangle {
+                width: bounds.width.min(bounds.height),
+                ..bounds
+            },
             _ => bounds,
         };
         let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
@@ -728,15 +785,18 @@ impl State {
             _ => None,
         };
         if let Some((index, feature)) = primary_observation
-            && !self.primary_pixels[index] && model.primary_action_active(feature) {
+            && !self.primary_pixels[index]
+            && model.primary_action_active(feature)
+        {
             return self.workflow_control(widgets, driver, primary(feature));
         }
         match step {
-            Step::Train | Step::ReturnTrain | Step::Theme | Step::ExportReturn => self.workflow_control(
-                widgets,
-                driver,
-                crate::view::navigation::stable_id(FeatureId::Train),
-            ),
+            Step::Train | Step::ReturnTrain | Step::Theme | Step::ExportReturn => self
+                .workflow_control(
+                    widgets,
+                    driver,
+                    crate::view::navigation::stable_id(FeatureId::Train),
+                ),
             Step::StartTrain if active == FeatureId::Train && settled => {
                 self.workflow_control(widgets, driver, primary(FeatureId::Train))
             }
@@ -1048,7 +1108,9 @@ impl State {
                 );
                 self.workflow_step(driver, Step::NoValidationAspect)
             }
-            Step::OpenSample => self.workflow_control(widgets, driver, crate::view::validate::samples::ATLAS_ID),
+            Step::OpenSample => {
+                self.workflow_control(widgets, driver, crate::view::validate::samples::ATLAS_ID)
+            }
             Step::Sample if validation.is_some_and(|value| value.detail) => {
                 self.workflow_step(driver, Step::HideBoxes)
             }
@@ -1059,11 +1121,37 @@ impl State {
             {
                 self.workflow_step(driver, Step::Pixels(Picture::Detail, 0))
             }
-            Step::ValidationLayer(_, index) => self.workflow_control(widgets, driver, if index == 1 || index == 3 { "validate.gt.layer" } else { "validate.pred.layer" }),
-            Step::ValidationLayerReady(detail, index) if validation.is_some_and(|snapshot| snapshot.detail == detail && snapshot.overlayselection.value == snapshot.overlays
-                && (snapshot.overlays.groundtruthlayer, snapshot.overlays.predictionlayer) == layer_selection(index)) => {
+            Step::ValidationLayer(_, index) => self.workflow_control(
+                widgets,
+                driver,
+                if index == 1 || index == 3 {
+                    "validate.gt.layer"
+                } else {
+                    "validate.pred.layer"
+                },
+            ),
+            Step::ValidationLayerReady(detail, index)
+                if validation.is_some_and(|snapshot| {
+                    snapshot.detail == detail
+                        && snapshot.overlayselection.value == snapshot.overlays
+                        && (
+                            snapshot.overlays.groundtruthlayer,
+                            snapshot.overlays.predictionlayer,
+                        ) == layer_selection(index)
+                }) =>
+            {
                 self.validation_layer = index;
-                self.workflow_step(driver, Step::Pixels(if detail { Picture::Detail } else { Picture::Validation }, 0))
+                self.workflow_step(
+                    driver,
+                    Step::Pixels(
+                        if detail {
+                            Picture::Detail
+                        } else {
+                            Picture::Validation
+                        },
+                        0,
+                    ),
+                )
             }
             Step::CloseSample => self.workflow_control(widgets, driver, "validate.detail.close"),
             Step::ClosedSample if validation.is_some_and(|value| !value.detail) => {
@@ -1183,18 +1271,42 @@ impl State {
                 );
                 self.workflow_step(driver, Step::Pixels(Picture::Stop, 0))
             }
-            Step::Export => self.workflow_control(widgets, driver, crate::view::navigation::stable_id(FeatureId::Export)),
-            Step::PrepareExport if active == FeatureId::Export && settled
-                && settings.draft.as_ref().is_some_and(|draft| model.model_selection_available(draft, FeatureId::Export)) => {
-                self.generation = model.workflow.export.as_ref().map_or(0, |operation| operation.generationfrontier);
+            Step::Export => self.workflow_control(
+                widgets,
+                driver,
+                crate::view::navigation::stable_id(FeatureId::Export),
+            ),
+            Step::PrepareExport
+                if active == FeatureId::Export
+                    && settled
+                    && settings.draft.as_ref().is_some_and(|draft| {
+                        model.model_selection_available(draft, FeatureId::Export)
+                    }) =>
+            {
+                self.generation = model
+                    .workflow
+                    .export
+                    .as_ref()
+                    .map_or(0, |operation| operation.generationfrontier);
                 driver.phase = Phase::Workflows(Step::StartExport);
-                Task::done(RootMessage::Workspace(crate::view::router::Message::Export(
-                    crate::view::export::Message::Model(crate::view::workflow::model_card::Message::PrepareRequested))))
+                Task::done(RootMessage::Workspace(
+                    crate::view::router::Message::Export(crate::view::export::Message::Model(
+                        crate::view::workflow::model_card::Message::PrepareRequested,
+                    )),
+                ))
             }
-            Step::StartExport if settings.draft.as_ref().is_some_and(|draft| model.compute_start_available(draft, FeatureId::Export)) => {
+            Step::StartExport
+                if settings.draft.as_ref().is_some_and(|draft| {
+                    model.compute_start_available(draft, FeatureId::Export)
+                }) =>
+            {
                 self.workflow_control(widgets, driver, primary(FeatureId::Export))
             }
-            Step::Exporting if model.workflow.export.as_ref().is_some_and(|operation| operation.generationfrontier > self.generation && operation.active) => {
+            Step::Exporting
+                if model.workflow.export.as_ref().is_some_and(|operation| {
+                    operation.generationfrontier > self.generation && operation.active
+                }) =>
+            {
                 if self.export_pixels {
                     self.workflow_step(driver, Step::StopExport)
                 } else {
@@ -1204,9 +1316,33 @@ impl State {
             Step::StopExport if model.compute_stop_available(FeatureId::Export) => {
                 self.workflow_control(widgets, driver, primary(FeatureId::Export))
             }
-            Step::ExportStopped if model.workflow.export.as_ref().is_some_and(|operation| !operation.active && operation.terminal.outcome == ComputeOperationOutcome::Cancelled) => {
-                completed(if self.export_narrow { "export_stop_narrow_dark" } else { "export_stop" }, [model.workflow.export.as_ref().unwrap().generationfrontier as f64, 0.0, 0.0, 0.0]);
-                self.workflow_step(driver, if self.export_narrow { Step::ExportReturn } else { Step::Theme })
+            Step::ExportStopped
+                if model.workflow.export.as_ref().is_some_and(|operation| {
+                    !operation.active
+                        && operation.terminal.outcome == ComputeOperationOutcome::Cancelled
+                }) =>
+            {
+                completed(
+                    if self.export_narrow {
+                        "export_stop_narrow_dark"
+                    } else {
+                        "export_stop"
+                    },
+                    [
+                        model.workflow.export.as_ref().unwrap().generationfrontier as f64,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                );
+                self.workflow_step(
+                    driver,
+                    if self.export_narrow {
+                        Step::ExportReturn
+                    } else {
+                        Step::Theme
+                    },
+                )
             }
             Step::Dark if active == FeatureId::Train && settled => {
                 driver.phase = Phase::Workflows(Step::DarkReady);
@@ -1263,7 +1399,10 @@ impl State {
                                 // Measure the view only when its paired image has
                                 // the requested atlas/detail shape and overlay state.
                                 content.metadata.detail == (picture == Picture::Detail)
-                                    && (content.metadata.overlays.groundtruthlayer, content.metadata.overlays.predictionlayer) == layer_selection(self.validation_layer)
+                                    && (
+                                        content.metadata.overlays.groundtruthlayer,
+                                        content.metadata.overlays.predictionlayer,
+                                    ) == layer_selection(self.validation_layer)
                                     && (picture != Picture::Detail
                                         || !content.metadata.overlays.predictionboxes)
                             })

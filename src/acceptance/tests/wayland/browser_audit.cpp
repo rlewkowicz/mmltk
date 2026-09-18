@@ -691,11 +691,12 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
             if (control == "annotation.save") return {"Save Annotations", "Save Annotations"};
             return {};
         }();
-        if (labels.first.empty() || label != (active ? labels.second : labels.first) ||
-            std::abs(record.value("height", 0.0) - 46.0) > 0.01 || record.value("segments", -1) != (active ? 10 : 0) || record.value("band_leaks", -1) != 0) {
+        if (labels.first.empty() || label != (active ? labels.second : labels.first) || std::abs(record.value("height", 0.0) - 46.0) > 0.01 ||
+            record.value("segments", -1) != (active ? 10 : 0) || record.value("band_leaks", -1) != 0) {
             failed = true;
         } else {
-            if (!active) primary_idle_labels.insert(label);
+            if (!active)
+                primary_idle_labels.insert(label);
             else {
                 const bool dark = record.value("dark", false);
                 primary_active_themes.insert(dark);
@@ -1308,8 +1309,8 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
         };
         const auto reference = gap("Export", "export.card.output");
         if (!reference || *reference <= 0.0) return false;
-        for (const auto& [page, card] : std::array{
-                 std::pair{"Train", "train.card.dataset"}, std::pair{"Validate", "validate.card.inputs"}, std::pair{"Predict", "predict.card.inputs"}}) {
+        for (const auto& [page, card] :
+             std::array{std::pair{"Train", "train.card.dataset"}, std::pair{"Validate", "validate.card.inputs"}, std::pair{"Predict", "predict.card.inputs"}}) {
             const auto measured = gap(page, card);
             if (!measured || std::abs(*measured - *reference) > 1.0) return false;
         }
@@ -1455,18 +1456,20 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
     });
     static const std::array expected_primary_labels{"Start Training", "Start Validation", "Run Predict", "Run Export", "Start Live", "Save Annotations"};
     return first_failed_check(
-        std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }), "primary action rendered labels",
+        std::ranges::all_of(expected_primary_labels, [this](const char* label) { return primary_idle_labels.contains(label); }),
+        "primary action rendered labels",
         bootstrap && fluent && uniform_primary && benchmark_purple && rendered_controls.contains(BENCHMARK_OVERRIDE) &&
             std::ranges::all_of(expected_primary, [this](const std::string_view id) { return shared_primary.contains(id) && rendered_controls.contains(id); }),
         "shell and style", every_region, "ordinary workflow regions", primary_progress_placement, "primary progress placement", primary_action_geometry,
-        "primary action geometry", primary_card_gaps, "primary card gaps match Export", reference_columns, "workflow column geometry", vertical_composition, "workflow vertical composition", advanced_composition,
-        "Advanced composition", advanced_compact, "Advanced compact controls", explore_integer_controls.size() == 5U && explore_integer_precision,
-        "Explore integer editing and spinner suppression", explore_paste_restored, "Explore clipboard paste persistence and restoration", spinnerless_integer,
-        "integer spinner suppression", spinnerless_floating, "floating spinner suppression", advanced_integer_persisted, "Advanced integer persistence",
-        advanced_floating_persisted, "Advanced floating persistence", compile_progress_placement, "Dataset progress placement", model_progress_placement,
-        "Model progress containment", model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip,
-        "benchmark override interaction", perceptual_controls_round_trip, "independent perceptual controls round trip", explore_composition,
-        "Explore composition", annotation_composition, "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
+        "primary action geometry", primary_card_gaps, "primary card gaps match Export", reference_columns, "workflow column geometry", vertical_composition,
+        "workflow vertical composition", advanced_composition, "Advanced composition", advanced_compact, "Advanced compact controls",
+        explore_integer_controls.size() == 5U && explore_integer_precision, "Explore integer editing and spinner suppression", explore_paste_restored,
+        "Explore clipboard paste persistence and restoration", spinnerless_integer, "integer spinner suppression", spinnerless_floating,
+        "floating spinner suppression", advanced_integer_persisted, "Advanced integer persistence", advanced_floating_persisted,
+        "Advanced floating persistence", compile_progress_placement, "Dataset progress placement", model_progress_placement, "Model progress containment",
+        model_composition && model_copy, "Model card composition", benchmark_override.valid() && benchmark_round_trip, "benchmark override interaction",
+        perceptual_controls_round_trip, "independent perceptual controls round trip", explore_composition, "Explore composition", annotation_composition,
+        "annotation composition", workspace_fps_text && workspace_fps_pixels, "visible workspace FPS",
         settings_composition && settings_numeric_alignment && show_fps_round_trip && ui_scale_drag && ui_scale_released && ui_scale_restored &&
             complete_pointer_drag && error_composition && error_modal_usable,
         "Settings composition", dataset_configured && progress && compile_metrics && dataset_complete && progress_ordinal < dataset_complete_ordinal,

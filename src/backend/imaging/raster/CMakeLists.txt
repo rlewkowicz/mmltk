@@ -45,7 +45,8 @@ function(mmltk_add_backend_imaging_raster_tests)
     add_executable(mmltk_backend_imaging_raster_tests EXCLUDE_FROM_ALL)
     mmltk_configure_component(mmltk_backend_imaging_raster_tests PRIVATE_DECLARATIONS)
     mmltk_register_ordinary_sources(mmltk_backend_imaging_raster_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_operations.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/image_operations.test.cpp)
+    mmltk_register_retained_module_importers(mmltk_backend_imaging_raster_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/validation_overlay.test.cpp)
     target_link_libraries(mmltk_backend_imaging_raster_tests PRIVATE
         mmltk_test_support mmltk_frameworks_gpu_test_support mmltk::backend::imaging::raster)

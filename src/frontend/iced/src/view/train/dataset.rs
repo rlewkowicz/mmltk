@@ -157,7 +157,8 @@ pub fn view<'a>(
             ))
             .push(crate::view::workflow::fields::text_field(
                 "Test dataset (optional)",
-                crate::generated::constraint_workflowstrainrequesttestcompiledpath().stable_field_id,
+                crate::generated::constraint_workflowstrainrequesttestcompiledpath()
+                    .stable_field_id,
                 &train.request.testcompiledpath,
                 enabled,
                 Message::TestSplitChanged,
@@ -251,7 +252,11 @@ mod tests {
     #[test]
     fn inference_toggles_retain_optional_test_path() {
         let mut model = installed_settings_model();
-        update(&mut model, Message::TestSplitChanged("/retained/test.bin".into())).unwrap();
+        update(
+            &mut model,
+            Message::TestSplitChanged("/retained/test.bin".into()),
+        )
+        .unwrap();
         for inferred in [false, true, false] {
             update(&mut model, Message::InferSplitsChanged(inferred)).unwrap();
             let train = &model.draft.as_ref().unwrap().workflows.train;

@@ -2,8 +2,8 @@ pub mod fields;
 pub mod loading;
 pub mod model_card;
 pub mod overlay_controls;
-pub mod progress;
 mod primary_action;
+pub mod progress;
 pub mod status;
 
 use crate::fluent_theme::Element;
@@ -90,7 +90,13 @@ impl Composition {
     }
 
     pub fn audit_regions(self) -> &'static [Region] {
-        if matches!(self.page, crate::generated::FeatureId::Train | crate::generated::FeatureId::Validate | crate::generated::FeatureId::Predict | crate::generated::FeatureId::Export) {
+        if matches!(
+            self.page,
+            crate::generated::FeatureId::Train
+                | crate::generated::FeatureId::Validate
+                | crate::generated::FeatureId::Predict
+                | crate::generated::FeatureId::Export
+        ) {
             &AUDIT_REGIONS
         } else {
             &AUDIT_REGIONS[..8]
@@ -109,7 +115,7 @@ impl Composition {
                 crate::generated::FeatureId::Validate => "validate.card.inputs",
                 crate::generated::FeatureId::Predict => "predict.card.inputs",
                 crate::generated::FeatureId::Export => "export.card.output",
-                _ => unreachable!("this workflow does not audit a preceding primary card"),
+                _ => panic!("this workflow does not audit a preceding primary card"),
             },
             Region::PrimaryProgress => match self.page {
                 crate::generated::FeatureId::Train => "train.primary.progress",
@@ -362,7 +368,17 @@ mod tests {
         for page in ordinary_pages() {
             assert_ne!(page, crate::generated::FeatureId::Explore);
             let composition = Composition::new(page, 1200.0);
-            assert_eq!(composition.audit_regions().len(), if matches!(page, crate::generated::FeatureId::Live | crate::generated::FeatureId::Annotate) { 8 } else { 9 });
+            assert_eq!(
+                composition.audit_regions().len(),
+                if matches!(
+                    page,
+                    crate::generated::FeatureId::Live | crate::generated::FeatureId::Annotate
+                ) {
+                    8
+                } else {
+                    9
+                }
+            );
             assert!(!composition.stable_id(Region::PrimaryAction).is_empty());
             assert!(!composition.stable_id(Region::PrimaryProgress).is_empty());
             assert!(!composition.stable_id(Region::Status).is_empty());

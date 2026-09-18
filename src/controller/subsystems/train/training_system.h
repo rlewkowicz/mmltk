@@ -96,7 +96,8 @@ class TrainingSystem final {
         mmltk::backend::models::rfdetr::TrainingHistoryQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointInspection InspectCheckpoint(
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointInspection CancelCheckpointInspection();
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointInspection
+        CancelCheckpointInspection();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointCapability PrepareResume(
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Resume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
