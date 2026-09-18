@@ -1,3 +1,5 @@
+#include "src/controller/subsystems/validate/detail/validation_samples.h"
+#include "src/frameworks/serialization/reflected_cbor.h"
 #include <algorithm>
 #include "src/controller/presentation/visual_runtime_owner.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
@@ -283,6 +285,68 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
     static_cast<void>(upscale.Start(test_upscale_request({.source = cropped})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == cropped; }));
     CHECK(runs->load() == 4U);
+}
+TEST_CASE("Validation clean identity reuses native Upscale while replacing paired semantics", "[controller][gpu][validation][upscale_gpu]") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    EventGate source_events, output_events;
+    detail::ValidationSamples samples({.device = 0, .maximum_width = 512U, .maximum_height = 576U}, [&] { source_events.Advance(); });
+    const auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"truth"});
+    auto pixels = std::make_shared<std::array<std::uint8_t, 8U * 8U * 3U>>();
+    const mmltk::backend::ml::runtime::AnalysisAnnotationStorage annotations{.class_catalog = catalog};
+    const std::array truth{rfdetr::Prediction{.class_reference = 0, .bbox_xyxy = {2, 2, 5, 5}}};
+    const std::array<std::uint32_t, 1U> indices{3U};
+    samples.Begin(1U, indices);
+    const rfdetr::PredictionRecord record{.dataset_index = 3U};
+    samples.Capture(1U, {record, {.width = 8U, .height = 8U, .device = 0, .rgb8 = pixels->data(), .custody = pixels}, annotations, truth});
+    samples.Settle(1U, true);
+    REQUIRE(source_events.Wait([&] { return samples.snapshot().sample_available[0]; }, 20s));
+    samples.Select({1U, 3U});
+    REQUIRE(source_events.Wait([&] { return samples.snapshot().detail; }, 20s));
+    const auto initial = samples.snapshot();
+    REQUIRE(initial.frame.clean_revision != 0U);
+    REQUIRE(initial.frame.content == VisualRegion{0U, 0U, 8U, 8U});
+    std::atomic_uint32_t runs = 0U;
+    UpscaleSystem upscale{kDevice, make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
+                              if (stage == Stage::BasicLaunchAdmitted) ++runs;
+                          }), [&samples](const VisualFrame& frame) { return samples.BorrowDocument(frame); },
+                          [&](UpscaleSystem::event_type) { output_events.Advance(); }};
+    static_cast<void>(upscale.Start({.source = initial.frame, .document = initial.document}));
+    REQUIRE(output_events.Wait([&] { return upscale.snapshot().ready; }, 120s));
+    const auto clean_launches = runs.load();
+    REQUIRE(clean_launches > 0U);
+    const auto output = upscale.snapshot().frame;
+    const auto original_metadata = upscale.ImageSourceMetadata(output);
+    REQUIRE(original_metadata);
+    const auto expected_initial = mmltk::frameworks::serialization::reflected_transport_value(*samples.ImageSnapshot(initial.frame));
+    REQUIRE(expected_initial);
+    CHECK(*original_metadata == *expected_initial);
+    samples.SetOverlays({false, false, false, false});
+    REQUIRE(source_events.Wait([&] { return samples.snapshot().frame.revision != initial.frame.revision; }, 20s));
+    const auto changed = samples.snapshot();
+    CHECK(visual_clean_content_identity(changed.frame) == visual_clean_content_identity(initial.frame));
+    static_cast<void>(upscale.Start({.source = changed.frame, .document = changed.document}));
+    REQUIRE(output_events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == changed.frame; }, 120s));
+    CHECK(runs.load() == clean_launches);
+    CHECK(upscale.snapshot().frame.clean_revision == output.clean_revision);
+    const auto current_metadata = upscale.ImageSourceMetadata(upscale.snapshot().frame);
+    REQUIRE(current_metadata);
+    const auto expected_current = mmltk::frameworks::serialization::reflected_transport_value(*samples.ImageSnapshot(changed.frame));
+    REQUIRE(expected_current);
+    CHECK(*current_metadata == *expected_current);
+    CHECK(*original_metadata == *expected_initial);
+    auto result = upscale.BorrowDocument(upscale.snapshot().frame);
+    REQUIRE(result.valid());
+    // The processing receiver owns these planes after Validation releases its sources.
+    samples.Shutdown();
+    const auto& semantic = result.pixels.plane(1U);
+    semantic.context().Bind();
+    const auto plane = semantic.plane();
+    std::vector<std::uint8_t> rgba(plane.descriptor.width * plane.descriptor.height * 4U);
+    REQUIRE(cudaMemcpy2D(rgba.data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data), plane.descriptor.pitch_bytes,
+                         plane.descriptor.row_bytes(), plane.descriptor.height, cudaMemcpyDeviceToHost) == cudaSuccess);
+    CHECK(std::ranges::all_of(rgba, [](auto byte) { return byte == 0U; }));
 }
 TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input provenance") {
     const auto source_kind = GENERATE(PresentationSourceKind::Explore, PresentationSourceKind::Validation);

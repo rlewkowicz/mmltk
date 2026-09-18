@@ -14,6 +14,7 @@
 #include "src/backend/models/rfdetr/core/evaluation.h"
 #include "src/controller/presentation/visual_system_types.h"
 #include "src/frameworks/gpu/system_image_runtime.h"
+#include "src/frameworks/gpu/image_types.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 namespace mmltk::controller::detail {
 [[nodiscard]] mmltk::frameworks::gpu::DeviceContext CreatePredictionPreviewContext(const mmltk::frameworks::gpu::DeviceExecution&,
@@ -36,7 +37,8 @@ class PredictionPreviewFrame final : public std::enable_shared_from_this<Predict
     friend class PredictionPreviewPool;
     friend class PredictionPreviewComposition;
     void DrawRegion(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::ImagePlaneView clean, mmltk::frameworks::gpu::ImagePlaneView semantic,
-                    std::uintptr_t stream, bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers) const;
+                    std::uintptr_t stream, bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers,
+                    bool write_clean, bool write_semantic) const;
     struct State;
     PredictionPreviewFrame(const mmltk::frameworks::gpu::DeviceContext&, std::shared_ptr<mmltk::frameworks::gpu::TerminalCudaRetirementOwner>,
                            std::shared_ptr<void>, mmltk::frameworks::gpu::CudaContextApi);
@@ -62,9 +64,30 @@ class PredictionPreviewComposition final {
         bool ground_truth_boxes = false, ground_truth_masks = false;
         bool complementary_layers = false;
         bool atlas_padding = false;
+        bool operator==(const Options&) const = default;
     };
     static void Draw(mmltk::frameworks::gpu::SystemImageRuntime&, mmltk::frameworks::gpu::SystemImageRuntime::OutputCandidate&, VisualExtent,
-                     std::span<const Region>, Options);
+                     std::span<const Region>, Options, PredictionPreviewComposition* retained = nullptr);
+
+   private:
+    // Allocation-local validity only; weak source references never occupy raw slots.
+    // The capture serial distinguishes reuse of a frame object by its pool.
+    struct Cell final {
+        std::weak_ptr<const PredictionPreviewFrame> frame;
+        std::uint64_t capture = 0U;
+        VisualRegion crop;
+        Options options;
+        bool clean = false, semantic = false;
+    };
+    struct Allocation final {
+        mmltk::frameworks::gpu::ImageAllocation clean{}, semantic{};
+        VisualExtent extent;
+        bool padding = false, initialized = false;
+        std::array<Cell, 6U> cells;
+        std::size_t count = 0U;
+    };
+    std::array<Allocation, 2U> allocations_{};
+    std::size_t replacement_ = 0U;
 };
 class PredictionPreviewPool final {
    public:
@@ -78,6 +101,7 @@ class PredictionPreviewPool final {
         mmltk::frameworks::gpu::CudaContextApi context_api{};
         decltype(&mmltk::backend::imaging::raster::chw_float_to_rgba) convert = &mmltk::backend::imaging::raster::chw_float_to_rgba;
         decltype(&cudaStreamWaitEvent) wait = &cudaStreamWaitEvent;
+        decltype(&cudaMemset2DAsync) clear_semantic = &cudaMemset2DAsync;
     };
     PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext);
     PredictionPreviewPool(mmltk::frameworks::gpu::DeviceExecution, mmltk::frameworks::gpu::DeviceContext, TransferOperations operations,

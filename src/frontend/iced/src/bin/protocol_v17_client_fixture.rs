@@ -772,6 +772,15 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
     require(
         sample_image == transported_image
             && sample_image.samples[0].identity.datasetindex == 3
+            && sample_image.samples[0].identity.generation == 7
+            && sample_image.samples[0].labels[0].rgb == [17, 93, 201]
+            && sample_image.frame.cleanrevision == 70
+            && sample_image.frame.content == generated::VisualRegion { x: 0, y: 0, width: 768, height: 512 }
+            && sample_image.frame.extent == generated::VisualExtent { width: 768, height: 512 }
+            && sample_image.samples[0].crop == generated::VisualRegion { x: 0, y: 0, width: 256, height: 256 }
+            && sample_image.samples[0].originalextent == generated::VisualExtent { width: 640, height: 640 }
+            && sample_image.overlays.predictionlayer
+            && sample_image.overlays.groundtruthlayer
             && sample_image.samples[0].labels[0].groundtruth
             && !sample_image.overlays.predictionboxes
             && sample_image.overlays.predictionmasks

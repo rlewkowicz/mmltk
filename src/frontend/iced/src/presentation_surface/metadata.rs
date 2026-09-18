@@ -408,6 +408,49 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_empty_and_outside_content_and_pairs_derived_identity() {
+        let original = crate::view_model::test_support::validation_image_metadata();
+        for content in [
+            generated::VisualRegion { x: 0, y: 0, width: 0, height: 576 },
+            generated::VisualRegion { x: 1, y: 0, width: 512, height: 576 },
+            generated::VisualRegion { x: u32::MAX, y: 0, width: 2, height: 576 },
+        ] {
+            let mut invalid = original.clone();
+            invalid.frame.content = content;
+            assert!(!valid_validation(&invalid));
+        }
+        let mut source = original;
+        source.detail = true;
+        source.selected = Some(source.samples[0].identity.clone());
+        source.frame.extent = source.samples[0].originalextent.clone();
+        source.frame.content = generated::VisualRegion { x: 0, y: 0, width: 200, height: 200 };
+        source.samples[0].crop = source.frame.content.clone();
+        assert!(valid_validation(&source));
+        let mut derived_frame = source.frame.clone();
+        derived_frame.source.kind = generated::PresentationSourceKind::Upscale;
+        derived_frame.extent = generated::VisualExtent { width: 800, height: 800 };
+        derived_frame.content = generated::VisualRegion { x: 0, y: 0, width: 800, height: 800 };
+        let physical = crate::view_model::test_support::physical_frame(
+            generated::presentation_source_session(generated::PresentationSourceKind::Upscale),
+            derived_frame.revision, 1, 800, 800,
+        );
+        let derived = generated::UpscaleImageMetadata {
+            frame: derived_frame.clone(), input: source.frame.clone(),
+            scene: crate::view_model::test_support::explore_snapshot().scene,
+        };
+        let bytes = encode(derived_frame.clone(), encode_product(generated::ApplicationSystem::Upscale, derived.clone()),
+            Some(encode_product(generated::ApplicationSystem::Validation, source.clone())));
+        super::super::reset_test_releases();
+        install(physical, 800, 800, 1, &bytes).unwrap();
+        retire(physical);
+        source.frame.revision += 1;
+        let invalid = encode(derived_frame, encode_product(generated::ApplicationSystem::Upscale, derived),
+            Some(encode_product(generated::ApplicationSystem::Validation, source)));
+        assert!(install(physical, 800, 800, 2, &invalid).is_err());
+        super::super::reset_test_releases();
+    }
+
+    #[test]
     fn accepted_first_validation_product_shares_metadata_and_cached_content() {
         super::super::reset_test_releases();
         let product = crate::view_model::test_support::validation_image_metadata();

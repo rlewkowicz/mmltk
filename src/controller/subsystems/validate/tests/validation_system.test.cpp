@@ -51,9 +51,10 @@ TEST_CASE("composed preview retains every source after the outer draw callback",
             regions[index] = {std::move(frame), {static_cast<std::uint32_t>(index % 3U) * 2U, static_cast<std::uint32_t>(index / 3U) * 2U, 2U, 2U}};
         }
         auto candidate = runtime.AcquireOutput();
+        Composition retained_preparation;
         fault.enabled = outer;
         receiver_fault.enabled = !outer;
-        auto draw = std::async(std::launch::async, [&] { Composition::Draw(runtime, candidate, {6U, 4U}, regions, {}); });
+        auto draw = std::async(std::launch::async, [&] { Composition::Draw(runtime, candidate, {6U, 4U}, regions, {}, &retained_preparation); });
         auto& failure_gate = outer ? fault.settlement : receiver_fault.upload;
         mmltk::testsupport::ScopedTestCleanup release([&] { failure_gate.Release(); });
         REQUIRE(failure_gate.WaitEntered(std::chrono::seconds(20)));
@@ -206,6 +207,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     samples.CloseDetail();
     await([&] { return !samples.snapshot().detail; });
     CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
     if (labelled) CHECK(samples.ImageSnapshot(samples.snapshot().frame)->samples[0].labels[0].name == "original");
     auto atlas_reader = samples.BorrowFrame();
     REQUIRE(atlas_reader.valid());
@@ -218,6 +220,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     retained = {};
     await([&] { return samples.snapshot().frame.revision > before.frame.revision; });
     CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
     CHECK(samples.snapshot().overlays == ValidationOverlays{false, false, false, false});
     CHECK(samples.ImageSnapshot(samples.snapshot().frame)->overlays == samples.snapshot().overlays);
     atlas_reader = {};
@@ -232,6 +235,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     samples.CloseDetail();
     await([&] { return !samples.snapshot().detail; });
     CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
     for (const auto overlays : {ValidationOverlays{true, true, true, true, false, true}, ValidationOverlays{true, true, true, true, true, false},
                                 ValidationOverlays{true, true, true, true, false, false}, ValidationOverlays{true, false, false, false}, ValidationOverlays{false, true, false, false},
                                 ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
@@ -239,6 +243,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
         samples.SetOverlays(overlays);
         await([&] { return samples.snapshot().frame.revision > revision; });
         CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
         CHECK(samples.snapshot().overlays == overlays);
     }
     const auto preserved = samples.snapshot();
@@ -247,7 +252,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
         std::scoped_lock lock(mutex);
         failure_notifications = notifications + 2U;
     }
-    fault.partial_draw = true;
+    fault.partial_semantic = true;
     samples.SetOverlays({true, true, true, true});
     await([&] { return notifications >= failure_notifications; });
     CHECK(samples.snapshot().frame == preserved.frame);
@@ -255,10 +260,11 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     CHECK(samples.snapshot().overlay_selection.value == preserved.overlays);
     CHECK(samples.snapshot().overlay_selection.revision > preserved.overlay_selection.revision);
     CHECK(samples.ImageSnapshot(preserved.frame)->overlays == preserved.overlays);
-    fault.partial_draw = false;
+    fault.partial_semantic = false;
     samples.SetOverlays({true, true, true, true});  // Repeating a refused request is an explicit retry.
     await([&] { return samples.snapshot().frame.revision > preserved.frame.revision; });
     CHECK(samples.snapshot().content_identity == atlas.content_identity);
+    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
     fault.draw_failures_remaining = 1U;
     capture(3U);  // Last capture's ordinary draw failure retries without another producer callback.
     await([&] { return samples.snapshot().sample_identities[0].generation == 9U; });
@@ -295,6 +301,8 @@ TEST_CASE("validation preview generations settle to retained source custody with
     await([&] { return samples.snapshot().frame.valid(); });
     const auto empty = samples.snapshot();
     CHECK(empty.frame.extent == VisualExtent{512U, 576U});
+    CHECK(empty.frame.content == VisualRegion{0U, 0U, 512U, 576U});
+    CHECK(empty.frame.clean_revision != 0U);
     CHECK_FALSE(empty.detail);
     CHECK(std::ranges::none_of(empty.sample_available, [](bool value) { return value; }));
     {
@@ -337,6 +345,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
     capture(2U, 7U);
     if (!detail_open) await([&] { return samples.snapshot().sample_identities[1].generation == 2U; });
     const auto preview = samples.snapshot();
+    if (!detail_open) CHECK(preview.frame.clean_revision != incumbent.frame.clean_revision);
     samples.Settle(1U, false);  // A stale terminal cannot roll back this generation.
     CHECK(samples.snapshot().frame == preview.frame);
     if (refuse) {
@@ -350,6 +359,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
         await([&] { return samples.snapshot().content_identity == incumbent.content_identity
             && (!republished || samples.snapshot().frame.revision > preview.frame.revision); });
         const auto after = samples.snapshot();
+        CHECK(after.frame.clean_revision == incumbent.frame.clean_revision);
         CHECK(after.selected == incumbent.selected);
         CHECK(after.document == incumbent.document);
         CHECK(after.sample_identities == incumbent.sample_identities);
@@ -365,6 +375,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
         }
     } else {
         await([&] { return samples.snapshot().frame.revision > preview.frame.revision; });
+        CHECK(samples.snapshot().frame.clean_revision == preview.frame.clean_revision);
         CHECK(samples.snapshot().sample_identities[1].generation == 2U);
         CHECK_FALSE(samples.snapshot().sample_available[0]);
         CHECK(samples.snapshot().sample_available[1]);
@@ -464,6 +475,97 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
         CHECK(frame->classes()[0] == "prediction");
         CHECK(frame->classes()[1] == "truth");
     }
+}
+TEST_CASE("retained validation preparation follows physical storage and changed regions", "[controller][gpu][validation]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    using Composition = detail::PredictionPreviewComposition;
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+    PredictionReceiverFault fault;
+    ScopedPredictionReceiverFault receiver(fault);
+    detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 6U);
+    gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+                                     .output_buffer_count = 2U, .adopted_context = context});
+    Composition retained;
+    const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"sample"});
+    const std::array<float, 12U> red{1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0};
+    auto source = PredictionSource::Device(execution, {2U, 2U}, red, {}, classes);
+    const std::array truth{rfdetr::Prediction{.class_reference = 0, .bbox_xyxy = {-0.5F, -0.5F, 0.5F, 0.5F},
+                                            .mask = {.height = 2U, .width = 2U, .area = 1U, .runs = {{0U, 1U}}}, .has_mask = true}};
+    std::array<Composition::Region, 6U> regions;
+    std::array<std::uint64_t, 2U> allocations{};
+    std::size_t publications = 0U;
+    const auto draw = [&](std::size_t count, Composition::Options options, VisualExtent extent = {12U, 8U}) {
+        auto candidate = runtime.AcquireOutput();
+        Composition::Draw(runtime, candidate, extent, std::span(regions).first(count), options, &retained);
+        auto completed = runtime.CommitOutput(std::move(candidate));
+        auto image = completed.Borrow();
+        context.Bind();
+        const auto clean = image.plane(0U).plane();
+        if (extent == VisualExtent{12U, 8U}) {
+            const auto slot = publications++ % 2U;
+            if (allocations[slot]) CHECK(clean.allocation.identity == allocations[slot]);
+            allocations[slot] = clean.allocation.identity;
+        }
+        for (std::size_t index = 0U; index < count; ++index) {
+            std::array<std::uint8_t, 4U> pixel{};
+            const auto crop = regions[index].crop;
+            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(clean.data + crop.y * clean.descriptor.pitch_bytes + crop.x * 4U),
+                               4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            CHECK(pixel == std::array<std::uint8_t, 4U>{255, 0, 0, 255});
+            const auto semantic = image.plane(1U).plane();
+            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(semantic.data + crop.y * semantic.descriptor.pitch_bytes + crop.x * 4U),
+                               4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            CHECK(pixel == (options.ground_truth_masks ? std::array<std::uint8_t, 4U>{0, 255, 255, 96} : std::array<std::uint8_t, 4U>{}));
+            REQUIRE(cudaMemcpy(pixel.data(), reinterpret_cast<const void*>(semantic.data + crop.y * semantic.descriptor.pitch_bytes + (crop.x + 2U) * 4U),
+                               4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            CHECK(pixel == (options.ground_truth_boxes ? std::array<std::uint8_t, 4U>{0, 255, 255, 255} : std::array<std::uint8_t, 4U>{}));
+        }
+    };
+    Composition::Options options{false, false, false, false, true, true};
+    draw(0U, options);
+    for (std::size_t index = 0U; index < regions.size(); ++index) {
+        auto frame = pool.Capture(source.pixels(), {2U, 2U}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, truth, true);
+        REQUIRE(frame);
+        regions[index] = {std::move(frame), {static_cast<std::uint32_t>(index % 3U) * 4U, static_cast<std::uint32_t>(index / 3U) * 4U, 4U, 4U}};
+        draw(index + 1U, options);
+        CHECK(fault.draws == index + 1U); // One source conversion, including both destination allocations.
+        CHECK(fault.uploads == 0U); // GT boxes/disabled masks do not upload RLE.
+    }
+    draw(6U, options); // Both allocations now hold all six unchanged tiles.
+    REQUIRE(allocations[0] != allocations[1]);
+    const auto unchanged_semantics = fault.semantic_writes.load();
+    draw(6U, options);
+    draw(6U, options);
+    CHECK(fault.semantic_writes == unchanged_semantics);
+    for (unsigned iteration = 0U; iteration < 6U; ++iteration) {
+        options.ground_truth_masks = iteration % 2U == 0U;
+        draw(6U, options);
+        CHECK(fault.draws == 6U);
+    }
+    CHECK(fault.uploads == 6U);
+    options.ground_truth_boxes = true;
+    fault.partial_semantic = true;
+    {
+        auto candidate = runtime.AcquireOutput();
+        CHECK_THROWS(Composition::Draw(runtime, candidate, {12U, 8U}, regions, options, &retained));
+    }
+    fault.partial_semantic = false;
+    // Allocation rotation after a refused candidate is unspecified; validate pixels directly.
+    draw(6U, options, {16U, 12U});
+    CHECK(fault.draws == 6U); // Failure and output growth preserve untouched source clean preparation.
+    options.ground_truth_masks = true;
+    draw(6U, options, {16U, 12U});
+    CHECK(fault.uploads == 6U);
+    // Detail uses the original extent; returning to scaled layout retains the scratch clean plane.
+    auto detail = runtime.AcquireOutput();
+    const std::array selected{Composition::Region{regions[0].frame, {0U, 0U, 2U, 2U}}};
+    Composition::Draw(runtime, detail, {2U, 2U}, selected, options, &retained);
+    static_cast<void>(runtime.CommitOutput(std::move(detail)));
+    CHECK(fault.draws == 7U);
+    draw(6U, options, {16U, 12U});
+    CHECK(fault.draws == 7U);
 }
 namespace {
 class RefusedValidationPreview final : public ValidationRuntime {

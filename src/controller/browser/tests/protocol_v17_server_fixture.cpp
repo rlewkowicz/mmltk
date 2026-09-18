@@ -210,6 +210,8 @@ int main(const int argument_count, char* const* const arguments) {
     metric_page.rows[1].kind = rfdetr::EvaluationMetricKind::Mask;
     ValidationImageMetadata sample_image;
     sample_image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, {768U, 512U}, 77U);
+    sample_image.frame.content = {0U, 0U, 768U, 512U};
+    sample_image.frame.clean_revision = 70U;
     sample_image.content_identity = 71U;
     sample_image.overlays = {false, true, false, true};
     auto& sample = sample_image.samples[0];
@@ -217,7 +219,13 @@ int main(const int argument_count, char* const* const arguments) {
     sample.available = true;
     sample.crop = {0U, 0U, 256U, 256U};
     sample.original_extent = {640U, 640U};
-    sample.labels.push_back({{{1.25F, 2.5F}, {15.0F, 19.0F}}, {}, 5U, true, 0.0F, "last"});
+    sample.labels.push_back(ValidationLabel{.box = {{1.25F, 2.5F}, {15.0F, 19.0F}},
+                                            .color = {},
+                                            .rgb = {17U, 93U, 201U},
+                                            .category = 5U,
+                                            .ground_truth = true,
+                                            .confidence = 0.0F,
+                                            .name = "last"});
     std::uint64_t validation_correlation = 600U;
     const auto append_validation = [&](const auto& value) {
         auto named = mmltk::frameworks::serialization::reflected_value(value);

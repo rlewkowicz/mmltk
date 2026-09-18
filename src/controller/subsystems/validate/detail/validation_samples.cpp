@@ -22,11 +22,13 @@ class ValidationSamples::Impl final {
     struct Sample final {
         ValidationSampleMetadata metadata;
         std::uint64_t content_identity = 0U;
+        std::uint64_t clean_revision = 0U;
         std::shared_ptr<const PredictionPreviewFrame> raw;
         std::shared_ptr<const VisualDocument> document;
     };
     struct Set final {
-        std::array<Sample, rfdetr::kValidationSampleCapacity> samples;
+        std::array<std::shared_ptr<const Sample>, rfdetr::kValidationSampleCapacity> samples;
+        std::uint64_t clean_revision = 0;
         std::uint64_t generation = 0;
         std::uint64_t atlas_identity = 0;
     };
@@ -86,7 +88,11 @@ class ValidationSamples::Impl final {
         if (indices.size() > rfdetr::kValidationSampleCapacity) throw contracts::InvalidIntentError("validation sample count exceeds six");
         auto next = std::make_shared<Set>();
         next->generation = generation;
-        for (std::size_t index = 0; index < indices.size(); ++index) next->samples[index].metadata.identity = {generation, indices[index]};
+        for (std::size_t index = 0; index < indices.size(); ++index) {
+            auto sample = std::make_shared<Sample>();
+            sample->metadata.identity = {generation, indices[index]};
+            next->samples[index] = std::move(sample);
+        }
         {
             std::scoped_lock lock(mutex_);
             if (generation == 0U || generation <= generation_frontier_) return;
@@ -97,11 +103,17 @@ class ValidationSamples::Impl final {
             if (!requested_.atlas) {
                 requested_.atlas = std::make_shared<Set>();
                 requested_.atlas->atlas_identity = ++content_frontier_;
+                requested_.atlas->clean_revision = NextCleanRevision();
                 RequestRender();
             }
             rollback_ = requested_;
             next->atlas_identity = ++content_frontier_;
-            for (auto& sample : next->samples) sample.content_identity = ++content_frontier_;
+            for (auto& sample : next->samples) if (sample) {
+                auto identified = std::make_shared<Sample>(*sample);
+                identified->content_identity = ++content_frontier_;
+                sample = std::move(identified);
+            }
+            next->clean_revision = NextCleanRevision();
             generation_frontier_ = generation;
             current_ = std::move(next);
             settled_success_ = false;
@@ -126,7 +138,7 @@ class ValidationSamples::Impl final {
             else {
                 // Keep an incumbent detail open. Atlas previews already point
                 // at the complete mutable set, whose capture phase ends here.
-                if (!requested_.detail && std::ranges::any_of(current_->samples, [](const auto& sample) { return bool(sample.raw); })) {
+                if (!requested_.detail && std::ranges::any_of(current_->samples, [](const auto& sample) { return sample && bool(sample->raw); })) {
                     requested_.atlas = current_;
                     RequestRender();
                 }
@@ -182,13 +194,13 @@ class ValidationSamples::Impl final {
             std::scoped_lock lock(mutex_);
             if (!current_ || current_->generation != generation || settled_success_) return;
             auto found = std::ranges::find_if(current_->samples, [&](const auto& slot) {
-                return slot.metadata.identity.generation != 0U && slot.metadata.identity.dataset_index == sample.prediction.dataset_index;
+                return slot && slot->metadata.identity.generation != 0U && slot->metadata.identity.dataset_index == sample.prediction.dataset_index;
             });
             if (found == current_->samples.end()) throw std::logic_error("validation captured an unselected sample");
-            if (found->raw) return;  // A delivery identity owns one immutable sample.
-            metadata.identity = found->metadata.identity;
+            if ((*found)->raw) return;  // A delivery identity owns one immutable sample.
+            metadata.identity = (*found)->metadata.identity;
             auto document = std::make_shared<VisualDocument>();
-            document->scene.document = contracts::WorkspaceResource::From("validation://sample", found->content_identity);
+            document->scene.document = contracts::WorkspaceResource::From("validation://sample", (*found)->content_identity);
             document->scene.frame_width = static_cast<std::uint16_t>(metadata.original_extent.width);
             document->scene.frame_height = static_cast<std::uint16_t>(metadata.original_extent.height);
             document->scene.frame_ready = true;
@@ -216,15 +228,24 @@ class ValidationSamples::Impl final {
                 const auto& run = *std::prev(after);
                 return offset - run.first < run.second;
             };
-            found->metadata = std::move(metadata);
-            found->document = std::move(document);
-            found->raw = std::move(raw);
+            auto captured = std::make_shared<Sample>();
+            captured->metadata = std::move(metadata);
+            captured->content_identity = (*found)->content_identity;
+            captured->clean_revision = NextCleanRevision();
+            captured->document = std::move(document);
+            captured->raw = std::move(raw);
+            *found = std::move(captured);
+            current_->clean_revision = NextCleanRevision();
             if (!requested_.detail) {
                 requested_.atlas = current_;
                 RequestRender();
             }
         }
         static_cast<void>(worker_.NotifyContinuation());
+    }
+    std::uint64_t NextCleanRevision() {
+        if (clean_frontier_ == std::numeric_limits<std::uint64_t>::max()) throw contracts::FailedError("validation clean revisions exhausted");
+        return ++clean_frontier_;
     }
     void RequestRender() {
         if (request_revision_ == std::numeric_limits<std::uint64_t>::max()) throw contracts::FailedError("validation composition revision exhausted");
@@ -237,7 +258,7 @@ class ValidationSamples::Impl final {
             std::scoped_lock lock(mutex_);
             if (!displayed_) throw contracts::InvalidIntentError("validation sample is not displayed");
             const auto found =
-                std::ranges::find_if(displayed_->samples, [&](const auto& sample) { return sample.raw && sample.metadata.identity == identity; });
+                std::ranges::find_if(displayed_->samples, [&](const auto& sample) { return sample && sample->raw && sample->metadata.identity == identity; });
             if (found == displayed_->samples.end()) throw contracts::InvalidIntentError("validation sample identity is stale");
             requested_.atlas = displayed_;
             requested_.detail = identity;
@@ -315,33 +336,37 @@ class ValidationSamples::Impl final {
             image.detail = selected.has_value();
             image.selected = selected;
             image.overlays = overlays;
+            auto clean_revision = drawing->clean_revision;
             if (selected) {
-                const auto found = std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot.raw && slot.metadata.identity == *selected; });
+                const auto found = std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot && slot->raw && slot->metadata.identity == *selected; });
                 if (found == drawing->samples.end()) return {};
-                extent = found->metadata.original_extent;
-                image.content_identity = found->content_identity;
-                image.document = found->document->facts();
+                extent = (*found)->metadata.original_extent;
+                image.content_identity = (*found)->content_identity;
+                image.document = (*found)->document->facts();
+                clean_revision = (*found)->clean_revision;
             }
             std::array<PredictionPreviewComposition::Region, rfdetr::kValidationSampleCapacity> regions;
             std::size_t region_count = 0U;
             for (std::size_t index = 0; index < drawing->samples.size(); ++index) {
                 const auto& sample = drawing->samples[index];
-                image.samples[index] = sample.metadata;
-                if (!sample.raw || (selected && sample.metadata.identity != *selected)) continue;
-                auto metadata = sample.metadata;
+                if (!sample) continue;
+                auto& metadata = image.samples[index];
+                metadata = sample->metadata;
+                if (!sample->raw || (selected && sample->metadata.identity != *selected)) continue;
                 const auto contained = mmltk::backend::imaging::raster::contain_image(metadata.original_extent.width, metadata.original_extent.height,
                                                                                   cell_width, cell_height);
                 metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height}
                                          : VisualRegion{static_cast<std::uint32_t>(index % 2U) * cell_width + contained.x,
                                                         static_cast<std::uint32_t>(index / 2U) * cell_height + contained.y, contained.width, contained.height};
-                regions[region_count++] = {sample.raw, metadata.crop};
-                image.samples[index] = std::move(metadata);
+                regions[region_count++] = {sample->raw, metadata.crop};
             }
             PredictionPreviewComposition::Draw(
                 runtime, candidate, extent, std::span(regions).first(region_count),
                 {overlays.prediction_layer && overlays.prediction_boxes, overlays.prediction_layer && overlays.prediction_masks,
-                 overlays.ground_truth_layer && overlays.ground_truth_boxes, overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected});
+                 overlays.ground_truth_layer && overlays.ground_truth_boxes, overlays.ground_truth_layer && overlays.ground_truth_masks, true, !selected}, &preparation_);
             image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
+            image.frame.content = {0U, 0U, extent.width, extent.height};
+            image.frame.clean_revision = clean_revision;
             {
                 std::scoped_lock lock(mutex_);
                 if (attempt != request_revision_) return {};
@@ -437,7 +462,8 @@ class ValidationSamples::Impl final {
     ValidationImageMetadata image_;
     std::uint64_t overlay_revision_ = 0U;
     std::uint64_t generation_frontier_ = 0U;
-    std::uint64_t content_frontier_ = 0U;
+    std::uint64_t content_frontier_ = 0U, clean_frontier_ = 0U;
+    PredictionPreviewComposition preparation_;
     std::uint64_t request_revision_ = 0U;
     unsigned retry_remaining_ = 0U;
     bool dirty_ = false, render_requested_ = false, settled_success_ = false;
@@ -466,9 +492,9 @@ ValidationSnapshot ValidationSamples::snapshot() const {
     result.overlays = impl_->image_.overlays;
     result.overlay_selection = {impl_->overlay_revision_, impl_->requested_.overlays};
     for (std::size_t index = 0; index < impl_->image_.samples.size(); ++index) {
-        if (impl_->displayed_) {
-            result.sample_identities[index] = impl_->displayed_->samples[index].metadata.identity;
-            result.sample_available[index] = impl_->displayed_->samples[index].metadata.available;
+        if (impl_->displayed_ && impl_->displayed_->samples[index]) {
+            result.sample_identities[index] = impl_->displayed_->samples[index]->metadata.identity;
+            result.sample_available[index] = impl_->displayed_->samples[index]->metadata.available;
         }
     }
     return result;
@@ -489,7 +515,7 @@ VisualDocumentRead ValidationSamples::BorrowDocument(const VisualFrame& frame) c
         if (!impl_->image_.detail || impl_->image_.frame != frame || !impl_->displayed_) return {};
         metadata = impl_->image_;
         for (const auto& sample : impl_->displayed_->samples)
-            if (sample.document && sample.document->facts() == metadata.document) document = sample.document;
+            if (sample && sample->document && sample->document->facts() == metadata.document) document = sample->document;
     }
     if (!document) return {};
     auto encoded = mmltk::frameworks::serialization::reflected_transport_value(metadata);

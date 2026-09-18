@@ -209,7 +209,7 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
     use crate::generated::*;
     let snapshot = bootstrapped().workflow.validation.unwrap();
     ValidationImageMetadata {
-        frame: { let mut frame = visual_frame(PresentationSourceKind::Validation, 1); frame.extent.width = 512; frame.extent.height = 576; frame },
+        frame: { let mut frame = visual_frame(PresentationSourceKind::Validation, 1); frame.extent.width = 512; frame.extent.height = 576; frame.content = VisualRegion { x: 0, y: 0, width: 512, height: 576 }; frame.cleanrevision = 9; frame },
         contentidentity: 9,
         detail: false,
         selected: None,

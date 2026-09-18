@@ -15,6 +15,7 @@
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_owner.h"
 #include "src/frameworks/gpu/terminal_cuda_retirement_authority.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
@@ -445,6 +446,47 @@ TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault cus
         if (stage != 4) REQUIRE(capture(first.get()));
     }
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
+}
+TEST_CASE("preview recapture invalidates retained scratch and destination regions", "[controller][gpu]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    using Composition = detail::PredictionPreviewComposition;
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);
+    PredictionReceiverFault fault;
+    ScopedPredictionReceiverFault receiver(fault);
+    detail::PredictionPreviewPool pool(execution, context, PredictionReceiverFault::Operations(), {}, 1U);
+    gpu::SystemImageRuntime runtime({.device = 0, .output_layout = gpu::ImageProductLayout::CleanAndSemantic,
+                                     .output_buffer_count = 2U, .adopted_context = context});
+    Composition retained;
+    const auto classes = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"sample"});
+    const detail::PredictionPreviewFrame* slot = nullptr;
+    for (std::uint32_t generation = 0U; generation < 3U; ++generation) {
+        const auto side = generation == 1U ? 3U : 2U;
+        const auto count = side * side;
+        std::vector<float> pixels(count * 3U, 0.0F);
+        std::fill_n(pixels.begin() + generation * count, count, 1.0F);
+        auto source = PredictionSource::Device(execution, {side, side}, pixels, {}, classes);
+        auto frame = pool.Capture(source.pixels(), {side, side}, 0U, {}, source.annotations(), classes, 1, nullptr, source.custody(), nullptr, nullptr, {}, true);
+        REQUIRE(frame);
+        if (slot) CHECK(frame.get() == slot); // Weak preparation records cannot occupy a raw slot.
+        slot = frame.get();
+        const std::array regions{Composition::Region{frame, {0U, 0U, 4U, 4U}}};
+        for (unsigned publication = 0U; publication < 2U; ++publication) {
+            auto candidate = runtime.AcquireOutput();
+            Composition::Draw(runtime, candidate, {4U, 4U}, regions, {}, &retained);
+            auto completed = runtime.CommitOutput(std::move(candidate));
+            auto image = completed.Borrow();
+            context.Bind();
+            const auto clean = image.plane(0U).plane();
+            std::array<std::array<std::uint8_t, 4U>, 16U> actual{};
+            REQUIRE(cudaMemcpy2D(actual.data(), 16U, reinterpret_cast<const void*>(clean.data), clean.descriptor.pitch_bytes,
+                                 16U, 4U, cudaMemcpyDeviceToHost) == cudaSuccess);
+            std::array<std::uint8_t, 4U> expected{0, 0, 0, 255};
+            expected[generation] = 255U;
+            CHECK(std::ranges::all_of(actual, [&](auto pixel) { return pixel == expected; }));
+            CHECK(fault.draws == generation + 1U);
+        }
+    }
 }
 TEST_CASE("ordinary preview allocation refusal leaves its decoded source intact", "[controller][gpu]") {
     namespace gpu = mmltk::frameworks::gpu;

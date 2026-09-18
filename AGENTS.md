@@ -431,6 +431,30 @@ Use this prompt verbatim, replacing `<WORK SCOPE>`, `<REQUIREMENTS SOURCE>`, and
 > remains cohesive, resource-safe, bounded, performant, and consistent with
 > `CONTRACT.md`.
 >
+> In this adversarial pass, treat performant as doing only necessary work at the
+> necessary frequency. Trace complexity and work counts against input size,
+> image dimensions, object count, history growth, progressive delivery and
+> input/redraw cadence. Challenge repeated allocation, unnecessary destruction
+> and recreation of reusable resources, deep copies of owned data, oversized
+> buffers, temporary collections and copying or formatting under locks. Verify
+> bounded storage retains useful capacity and immutable data is shared where
+> ownership permits. Trace conversions, rasterization, blending, resampling,
+> uploads, readbacks and CPU/GPU transfers end to end; reject repeated source
+> preparation, full-image passes for local changes, premature uploads and
+> redraws that repeat completed product work. Keep clean pixels, semantic
+> overlays, metadata and presentation invalidation independent where their
+> inputs differ; reuse must describe actual allocations and content, invalidate
+> before writes and become valid only after successful settlement. Check growth,
+> replacement, partial failure and retry for both stale reuse and needless
+> recomputation. Inspect blocking, synchronization, lock scope, worker wakeups,
+> polling, duplicate submissions and backpressure for avoidable serialization
+> or churn; idle, hidden and unchanged work should remain quiet, and disabled
+> diagnostics should collect nothing. Preserve required initialization, copies,
+> ordering, physical completion and resource custody. Support findings with
+> concrete source paths and operation counts or complexity, distinguish necessary
+> work from avoidable work, and prefer cohesive fixes in the existing owner.
+> This is static code inspection; do not add or enable benchmarks or profiling.
+>
 > Return one consolidated report. For every finding include severity, exact
 > artifact and location, failing execution path, violated requirement, and the
 > minimum required correction. Include a coverage ledger mapping every

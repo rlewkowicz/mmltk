@@ -57,12 +57,15 @@ class PredictionReceiverFault final {
     std::atomic_uint draw_failures_remaining = 0U;
     std::atomic_size_t draws = 0U;
     std::atomic_size_t uploads = 0U;
+    std::atomic_size_t semantic_writes = 0U;
+    std::atomic_bool partial_semantic = false;
     std::size_t fail_upload_at = 0U;
     PredictRuntime::PreviewRetirement retirement;
     std::weak_ptr<void> decoded;
     [[nodiscard]] static detail::PredictionPreviewPool::TransferOperations Operations();
 
    private:
+    static cudaError_t ClearSemantic(void*, std::size_t, int, std::size_t, std::size_t, cudaStream_t);
     static cudaError_t Upload(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t);
     static int Convert(const float*, std::uint32_t, std::uint32_t, std::uint8_t*, std::size_t, cudaStream_t) noexcept;
 };

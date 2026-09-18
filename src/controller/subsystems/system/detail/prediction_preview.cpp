@@ -18,6 +18,7 @@
 #include <utility>
 #include <cstring>
 #include <cmath>
+#include <limits>
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller::detail {
 namespace gpu = mmltk::frameworks::gpu;
@@ -91,8 +92,13 @@ struct PredictionPreviewFrame::State final {
     std::vector<std::uint32_t> ground_truth_runs;
     std::vector<std::uint8_t> ground_truth_colors;
     std::size_t ground_truth_offset = 0, scratch_offset = 0;
-    bool composition = false, ground_truth_uploaded = false;
-    bool colors_prepared = false;
+    bool composition = false;
+    decltype(&cudaMemset2DAsync) clear_semantic = &cudaMemset2DAsync;
+    std::uint64_t capture = 0U;
+    struct Preparation final {
+        bool clean = false, semantic = false, ground_truth = false, colors = false;
+        PredictionPreviewComposition::Options options;
+    } prepared, pending;
 };
 PredictionPreviewFrame::PredictionPreviewFrame(const gpu::DeviceContext& context, std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement,
                                                std::shared_ptr<void> source, gpu::CudaContextApi api)
@@ -162,7 +168,7 @@ PredictionPreviewPool::PredictionPreviewPool(gpu::DeviceExecution execution, gpu
       slots_(preview_slot_count(slots)) {
     if (!retirement_->admission_open()) throw std::runtime_error("prediction preview retirement admission is closed");
     if (!operations_.wait || !operations_.copy || !operations_.record || !operations_.settle || !operations_.register_host || !operations_.upload ||
-        !operations_.convert || !operations_.context_api.get || !operations_.context_api.set)
+        !operations_.clear_semantic || !operations_.convert || !operations_.context_api.get || !operations_.context_api.set)
         throw std::invalid_argument("prediction transfer operations are incomplete");
     // Compatibility follows the retained context, device and execution owner.
     // A backend decorating CUDA operations does not create a different context.
@@ -245,6 +251,10 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
             state.register_host = operations_.register_host;
             state.upload = operations_.upload;
             state.convert = operations_.convert;
+            state.clear_semantic = operations_.clear_semantic;
+            if (state.capture == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("preview capture identity exhausted");
+            ++state.capture;
+            state.prepared = state.pending = {};
             state.placement = execution_.placement;
             state.extent = extent;
             state.boxes_offset = pixel_bytes;
@@ -267,8 +277,6 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
             state.ground_truth_offset = ground_truth_offset;
             state.scratch_offset = scratch_offset;
             state.composition = composition;
-            state.colors_prepared = false;
-            state.ground_truth_uploaded = false;
             state.catalog = std::move(catalog);
             state.category_count = classes;
             state.predictions.clear();
@@ -362,8 +370,9 @@ void PredictionPreviewFrame::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemI
     PredictionPreviewComposition::Draw(runtime, candidate, state_->extent, regions, {});
 }
 void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::SystemImageRuntime::OutputCandidate& candidate, VisualExtent extent,
-                                        std::span<const Region> regions, Options options) {
+                                        std::span<const Region> regions, Options options, PredictionPreviewComposition* retained) {
     if (!extent.valid() || regions.size() > kMaximumFrames) throw std::invalid_argument("preview composition extent or count is invalid");
+    if (retained && regions.size() > 6U) throw std::invalid_argument("retained preview exceeds six regions");
     std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement;
     for (const auto& region : regions) {
         if (!region.frame || !region.crop.width || !region.crop.height || region.crop.x > extent.width || region.crop.width > extent.width - region.crop.x ||
@@ -385,14 +394,39 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
     };
     auto submission =
         std::make_shared<Submission>(extent, options, std::vector<Region>(regions.begin(), regions.end()), gpu::SystemImageRuntime::UnsafeCustody{});
+    Allocation* allocation = nullptr;
+    Allocation staged;
+    const auto prior_allocations = candidate.allocations();
     try {
-        runtime.PublishRetained(candidate, extent.width, extent.height, [submission, &runtime](auto clean, auto semantic, auto stream) {
+        runtime.PublishRetained(candidate, extent.width, extent.height, [submission, &runtime, retained, &allocation, &staged, prior_allocations](auto clean, auto semantic, auto stream) {
             const auto clear = [&](auto plane) {
                 checked(cudaMemset2DAsync(reinterpret_cast<void*>(plane.data), plane.descriptor.pitch_bytes, 0, plane.descriptor.row_bytes(),
                                           plane.descriptor.height, reinterpret_cast<cudaStream_t>(stream)));
             };
-            if (submission->regions.size() != 1U ||
-                submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height}) {
+            bool initialize = true;
+            if (retained) {
+                auto found = std::ranges::find_if(retained->allocations_, [&](const auto& value) {
+                    return (value.clean == clean.allocation && value.semantic == semantic.allocation)
+                        || (prior_allocations[0].identity != 0U && value.clean == prior_allocations[0] && value.semantic == prior_allocations[1]);
+                });
+                allocation = found == retained->allocations_.end()
+                    ? &retained->allocations_[retained->replacement_++ % retained->allocations_.size()] : &*found;
+                initialize = !allocation->initialized || allocation->clean != clean.allocation || allocation->semantic != semantic.allocation
+                    || allocation->extent != submission->extent || allocation->padding != submission->options.atlas_padding;
+                // A removed or moved region exposes padding and changes the layout.
+                for (std::size_t index = 0U; !initialize && index < allocation->count; ++index)
+                    initialize = std::ranges::none_of(submission->regions, [&](const auto& region) { return region.crop == allocation->cells[index].crop; });
+                if (initialize) *allocation = {};
+                staged = *allocation;
+                staged.clean = clean.allocation;
+                staged.semantic = semantic.allocation;
+                staged.extent = submission->extent;
+                staged.padding = submission->options.atlas_padding;
+                staged.initialized = true;
+                staged.count = submission->regions.size();
+            }
+            if (initialize && (submission->regions.size() != 1U ||
+                submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height})) {
                 if (submission->options.atlas_padding) {
                     constexpr auto color = raster::kAtlasPadding;
                     constexpr unsigned packed = unsigned(color.r) | (unsigned(color.g) << 8U) | (unsigned(color.b) << 16U) | (unsigned(color.a) << 24U);
@@ -409,10 +443,30 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
                 return plane;
             };
             const auto& overlays = submission->options;
-            for (const auto& region : submission->regions)
-                region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream, overlays.prediction_boxes,
-                                         overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks, overlays.complementary_layers);
+            for (std::size_t index = 0U; index < submission->regions.size(); ++index) {
+                const auto& region = submission->regions[index];
+                bool write_clean = true, write_semantic = true;
+                if (allocation && !initialize) {
+                    for (std::size_t previous = 0U; previous < allocation->count; ++previous) {
+                        auto& cell = allocation->cells[previous];
+                        if (cell.crop != region.crop) continue;
+                        const bool same = cell.frame.lock() == region.frame && cell.capture == region.frame->state_->capture;
+                        write_clean = !same || !cell.clean;
+                        write_semantic = !same || !cell.semantic || cell.options != overlays;
+                        // Invalidate the real destination before its first possible write.
+                        if (write_clean) cell.clean = false;
+                        if (write_semantic) cell.semantic = false;
+                        break;
+                    }
+                }
+                if (write_clean || write_semantic)
+                    region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream, overlays.prediction_boxes,
+                                             overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks, overlays.complementary_layers,
+                                             write_clean, write_semantic);
+                if (allocation) staged.cells[index] = {region.frame, region.frame->state_->capture, region.crop, overlays, true, true};
+            }
         });
+        if (allocation) *allocation = std::move(staged);
         // PublishRetained's completion, including its outer stream settlement,
         // proves every source read and staging upload complete before release.
         for (const auto& region : submission->regions) {
@@ -420,6 +474,7 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
             std::lock_guard lock(frame.state_->mutex);
             auto scope = frame.CompositionScope();
             scope.Run([&] {
+                frame.state_->prepared = frame.state_->pending;
                 frame.state_->rgb8 = nullptr;
                 if (frame.state_->decoded_source) {
                     frame.state_->source_context->Bind();
@@ -429,6 +484,11 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
         }
     } catch (...) {
         const auto failure = std::current_exception();
+        // Failed submission may have partially overwritten scratch or upload storage.
+        // Only previously settled, untouched preparation survives an ordinary failure.
+        for (const auto& region : submission->regions) {
+            region.frame->state_->pending = region.frame->state_->prepared;
+        }
         const bool unsafe_frame =
             std::ranges::any_of(submission->regions, [](const auto& region) { return region.frame->state_->unsafe.load() != cudaSuccess; });
         if (gpu::is_image_execution_failure(failure) || unsafe_frame || (retirement && !retirement->admission_open())) {
@@ -446,7 +506,8 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
     }
 }
 void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic, std::uintptr_t stream,
-                                        bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers) const {
+                                        bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers,
+                                        bool write_clean, bool write_semantic) const {
     if (!CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
     auto& state = *state_;
     std::lock_guard state_lock(state.mutex);
@@ -458,10 +519,12 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
             checked(cudaStreamWaitEvent(cuda_stream, state.source_ready, 0U));
             auto* data = static_cast<std::uint8_t*>(state.storage.active());
-            if ((state.rgb8 || (!state.ground_truth_uploaded && !state.ground_truth_runs.empty())) && !state.pinned)
+            state.pending = state.prepared;
+            const bool upload_gt = write_semantic && ground_truth_masks && !state.prepared.ground_truth && !state.ground_truth_runs.empty();
+            if ((state.rgb8 || upload_gt) && !state.pinned)
                 state.pinned = std::make_unique<gpu::PinnedHostBuffer>(scope.Current(), state.placement, false, state.register_host);
             const auto rgb_bytes = state.rgb8 ? static_cast<std::size_t>(state.extent.width) * state.extent.height * 3U * sizeof(float) : 0U;
-            const auto gt_bytes = !state.ground_truth_uploaded ? state.ground_truth_runs.size() * sizeof(std::uint32_t) : 0U;
+            const auto gt_bytes = upload_gt ? state.ground_truth_runs.size() * sizeof(std::uint32_t) : 0U;
             if (rgb_bytes + gt_bytes != 0U) state.pinned->ensure_bytes(rgb_bytes + gt_bytes);
             if (state.rgb8) {
                 const auto bytes = rgb_bytes;
@@ -477,74 +540,93 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             const auto clean_pitch = scale ? pitch : clean.descriptor.pitch_bytes;
             const auto semantic_pitch = scale ? pitch : semantic.descriptor.pitch_bytes;
             raster::MutableBytes overlay{semantic_pixels, semantic_pitch, static_cast<int>(state.extent.width), static_cast<int>(state.extent.height)};
-            checked(static_cast<cudaError_t>(
-                state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)));
-            checked(cudaMemset2DAsync(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
-            const auto draw_prediction = [&] {
-            if (!state.predictions.empty() && (prediction_boxes || prediction_masks)) {
-                if (!state.colors_prepared) {
-                checked(static_cast<cudaError_t>(raster::build_category_colors_cuda({reinterpret_cast<const int*>(data + state.labels_offset),
-                                                                                     state.predictions.size(),
-                                                                                     state.category_count,
-                                                                                     data + state.colors_offset,
-                                                                                     {reinterpret_cast<void*>(stream)}})));
-                state.colors_prepared = true;
+            if (write_clean && (!scale || !state.prepared.clean)) {
+                if (scale) state.prepared.clean = false;
+                checked(static_cast<cudaError_t>(
+                    state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)));
+                if (scale) state.pending.clean = true;
+            }
+            const PredictionPreviewComposition::Options semantic_options{prediction_boxes, prediction_masks, ground_truth_boxes, ground_truth_masks, complementary_layers};
+            if (write_semantic && (!scale || !state.prepared.semantic || state.prepared.options != semantic_options)) {
+                if (scale) state.prepared.semantic = false;
+                checked(state.clear_semantic(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
+                const auto draw_prediction = [&] {
+                    if (!state.predictions.empty() && (prediction_boxes || prediction_masks)) {
+                        if (!state.prepared.colors) {
+                            checked(static_cast<cudaError_t>(raster::build_category_colors_cuda({reinterpret_cast<const int*>(data + state.labels_offset),
+                                                                                                 state.predictions.size(),
+                                                                                                 state.category_count,
+                                                                                                 data + state.colors_offset,
+                                                                                                 {reinterpret_cast<void*>(stream)}})));
+                            state.pending.colors = true;
+                        }
+                        checked(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(
+                            {.overlay = overlay,
+                             .instances = {reinterpret_cast<const float*>(data + state.boxes_offset), data + state.colors_offset,
+                                           reinterpret_cast<const int*>(data + state.labels_offset), static_cast<int>(state.predictions.size())},
+                             .masks = prediction_masks && state.masks ? reinterpret_cast<const bool*>(data + state.masks_offset) : nullptr,
+                             .mask_alpha = 96U,
+                             .box_thickness = prediction_boxes ? 2 : 0,
+                             .stream = {reinterpret_cast<void*>(stream)},
+                             .labels = !state.composition,
+                             .add_rgb_to_existing = complementary_layers && !state.ground_truth.empty() && (ground_truth_boxes || ground_truth_masks)})));
+                    }
+                };
+                if (!complementary_layers) draw_prediction();
+                if (upload_gt) {
+                    const auto bytes = state.ground_truth_runs.size() * sizeof(std::uint32_t);
+                    auto* staging = static_cast<std::uint8_t*>(state.pinned->data()) + rgb_bytes;
+                    std::memcpy(staging, state.ground_truth_runs.data(), bytes);
+                    checked(state.upload(data + state.ground_truth_offset, staging, bytes, cudaMemcpyHostToDevice, cuda_stream));
+                    state.pending.ground_truth = true;
                 }
-                checked(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(
-                    {.overlay = overlay,
-                     .instances = {reinterpret_cast<const float*>(data + state.boxes_offset), data + state.colors_offset,
-                                   reinterpret_cast<const int*>(data + state.labels_offset), static_cast<int>(state.predictions.size())},
-                     .masks = prediction_masks && state.masks ? reinterpret_cast<const bool*>(data + state.masks_offset) : nullptr,
-                     .mask_alpha = 96U,
-                     .box_thickness = prediction_boxes ? 2 : 0,
-                     .stream = {reinterpret_cast<void*>(stream)},
-                     .labels = !state.composition,
-                     .add_rgb_to_existing = complementary_layers && !state.ground_truth.empty() && (ground_truth_boxes || ground_truth_masks)})));
-            }
-            };
-            if (!complementary_layers) draw_prediction();
-            if (!state.ground_truth_uploaded && !state.ground_truth_runs.empty()) {
-                const auto bytes = state.ground_truth_runs.size() * sizeof(std::uint32_t);
-                auto* staging = static_cast<std::uint8_t*>(state.pinned->data()) + rgb_bytes;
-                std::memcpy(staging, state.ground_truth_runs.data(), bytes);
-                checked(state.upload(data + state.ground_truth_offset, staging, bytes, cudaMemcpyHostToDevice, cuda_stream));
-                state.ground_truth_uploaded = true;
-            }
-            std::size_t word = 0U, gt_index = 0U;
-            for (const auto& gt : state.ground_truth) {
-                raster::RgbColor color{state.ground_truth_colors[gt_index * 3U], state.ground_truth_colors[gt_index * 3U + 1U],
-                                             state.ground_truth_colors[gt_index * 3U + 2U]};
-                if (complementary_layers) {
-                    color.r = 255U - color.r;
-                    color.g = 255U - color.g;
-                    color.b = 255U - color.b;
+                std::size_t word = 0U, gt_index = 0U;
+                for (const auto& gt : state.ground_truth) {
+                    raster::RgbColor color{state.ground_truth_colors[gt_index * 3U], state.ground_truth_colors[gt_index * 3U + 1U],
+                                                 state.ground_truth_colors[gt_index * 3U + 2U]};
+                    if (complementary_layers) {
+                        color.r = 255U - color.r;
+                        color.g = 255U - color.g;
+                        color.b = 255U - color.b;
+                    }
+                    ++gt_index;
+                    if (ground_truth_masks && !gt.mask.runs.empty())
+                        checked(static_cast<cudaError_t>(
+                            raster::raster_mask_runs_rgba({.overlay = overlay,
+                                                           .run_pairs = reinterpret_cast<const std::uint32_t*>(data + state.ground_truth_offset) + word,
+                                                           .run_count = static_cast<std::uint32_t>(gt.mask.runs.size()),
+                                                           .color = {color.r, color.g, color.b, 96U},
+                                                           .stream = {reinterpret_cast<void*>(stream)}})));
+                    if (ground_truth_boxes) {
+                        const raster::IntRect box{static_cast<int>(std::floor(gt.bbox_xyxy[0])), static_cast<int>(std::floor(gt.bbox_xyxy[1])),
+                                                  static_cast<int>(std::ceil(gt.bbox_xyxy[2])), static_cast<int>(std::ceil(gt.bbox_xyxy[3]))};
+                        checked(static_cast<cudaError_t>(
+                            raster::raster_box_outline_rgba({.overlay = overlay,
+                                                             .box = box,
+                                                             .color = {color.r, color.g, color.b},
+                                                             .thickness = 1,
+                                                             .stream = {reinterpret_cast<void*>(stream)},
+                                                             .clip = {static_cast<int>(std::max<std::int64_t>(0, std::int64_t{box.x1} - 1)),
+                                                                      static_cast<int>(std::max<std::int64_t>(0, std::int64_t{box.y1} - 1)),
+                                                                      static_cast<int>(std::min<std::int64_t>(overlay.width, std::int64_t{box.x2} + 1)),
+                                                                      static_cast<int>(std::min<std::int64_t>(overlay.height, std::int64_t{box.y2} + 1))}})));
+                    }
+                    word += gt.mask.runs.size() * 2U;
                 }
-                ++gt_index;
-                if (ground_truth_masks && !gt.mask.runs.empty())
-                    checked(static_cast<cudaError_t>(
-                        raster::raster_mask_runs_rgba({.overlay = overlay,
-                                                       .run_pairs = reinterpret_cast<const std::uint32_t*>(data + state.ground_truth_offset) + word,
-                                                       .run_count = static_cast<std::uint32_t>(gt.mask.runs.size()),
-                                                       .color = {color.r, color.g, color.b, 96U},
-                                                       .stream = {reinterpret_cast<void*>(stream)}})));
-                if (ground_truth_boxes)
-                    checked(static_cast<cudaError_t>(
-                        raster::raster_box_outline_rgba({.overlay = overlay,
-                                                         .box = {static_cast<int>(std::floor(gt.bbox_xyxy[0])), static_cast<int>(std::floor(gt.bbox_xyxy[1])),
-                                                                 static_cast<int>(std::ceil(gt.bbox_xyxy[2])), static_cast<int>(std::ceil(gt.bbox_xyxy[3]))},
-                                                         .color = {color.r, color.g, color.b},
-                                                         .thickness = 1,
-                                                         .stream = {reinterpret_cast<void*>(stream)}})));
-                word += gt.mask.runs.size() * 2U;
+                if (complementary_layers) draw_prediction();
+                if (scale) {
+                    state.pending.semantic = true;
+                    state.pending.options = semantic_options;
+                }
             }
-            if (complementary_layers) draw_prediction();
             if (scale) {
-                checked(
+                if (write_clean)
+                    checked(
                     static_cast<cudaError_t>(raster::scale_rgba_nearest({clean_pixels, clean_pitch, overlay.width, overlay.height},
                                                                         {reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes,
                                                                          static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)},
                                                                         stream)));
-                checked(static_cast<cudaError_t>(
+                if (write_semantic) checked(static_cast<cudaError_t>(
                     raster::scale_rgba_nearest({semantic_pixels, semantic_pitch, overlay.width, overlay.height},
                                                {reinterpret_cast<std::uint8_t*>(semantic.data), semantic.descriptor.pitch_bytes,
                                                 static_cast<int>(semantic.descriptor.width), static_cast<int>(semantic.descriptor.height)},

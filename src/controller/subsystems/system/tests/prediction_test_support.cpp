@@ -129,8 +129,19 @@ int PredictionReceiverFault::Convert(const float* source, std::uint32_t width, s
     }
     return mmltk::backend::imaging::raster::chw_float_to_rgba(source, width, height, destination, pitch, stream);
 }
+cudaError_t PredictionReceiverFault::ClearSemantic(void* destination, std::size_t pitch, int value, std::size_t width, std::size_t height, cudaStream_t stream) {
+    auto* fault = receiver_fault.load();
+    if (fault) ++fault->semantic_writes;
+    if (fault && fault->partial_semantic) {
+        const auto written = cudaMemset2DAsync(destination, pitch, 123, width, 1U, stream);
+        if (written != cudaSuccess) return written;
+        const auto settled = cudaStreamSynchronize(stream);
+        return settled == cudaSuccess ? cudaErrorMemoryAllocation : settled;
+    }
+    return cudaMemset2DAsync(destination, pitch, value, width, height, stream);
+}
 detail::PredictionPreviewPool::TransferOperations PredictionReceiverFault::Operations() {
-    return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &Upload, {}, &Convert};
+    return {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister, &Upload, {}, &Convert, &cudaStreamWaitEvent, &ClearSemantic};
 }
 namespace {
 class SettlementBackend final : public gpu::ImageCopyBackend {
