@@ -77,7 +77,6 @@ impl App {
             preparation: if resume_checkpoint.is_some() { StartPreparation::ResumeQueued } else { StartPreparation::Waiting },
             resume_checkpoint,
         });
-        self.model.workflow.start_status = Some((feature, "Saving current settings…".to_owned()));
         self.flush_settings_edits();
         self.advance_start();
     }
@@ -181,9 +180,7 @@ impl App {
             return;
         }
         if self.workspace.active() != feature {
-            self.model
-                .workflow
-                .cancel_start("Start cancelled after leaving the workflow.");
+            self.model.workflow.cancel_start();
             self.advance_start_cancellation();
             return;
         }
@@ -207,9 +204,7 @@ impl App {
             return;
         };
         if !pending.inputs.matches(draft) {
-            self.model
-                .workflow
-                .cancel_start("Start cancelled because its inputs changed.");
+            self.model.workflow.cancel_start();
             self.advance_start_cancellation();
             return;
         }
@@ -240,8 +235,6 @@ impl App {
                 return;
             };
             if snapshot.active {
-                self.model.workflow.start_status =
-                    Some((feature, "Waiting for model preparation…".to_owned()));
                 return;
             }
             if matches!(
@@ -253,12 +246,6 @@ impl App {
                     .preparation,
                 StartPreparation::Active { .. }
             ) {
-                let detail = if snapshot.terminal.detail.is_empty() {
-                    "Model preparation did not produce the selected model.".to_owned()
-                } else {
-                    snapshot.terminal.detail.clone()
-                };
-                self.model.workflow.start_status = Some((feature, detail));
                 self.model.workflow.pending_start = None;
                 return;
             }
@@ -284,13 +271,7 @@ impl App {
                     cancelled: false,
                 };
             }
-            self.model.workflow.start_status =
-                Some((feature, "Preparing the selected model…".to_owned()));
             if !self.submit_registered_intent(ApplicationIntentEndpoint::ModelSelect, registered) {
-                self.model.workflow.start_status = Some((
-                    feature,
-                    "Model preparation could not be submitted.".to_owned(),
-                ));
                 self.model.workflow.pending_start = None;
             }
             return;
@@ -301,11 +282,7 @@ impl App {
             .pending_start
             .take()
             .and_then(|pending| pending.resume_checkpoint);
-        self.model.workflow.start_status = Some((
-            feature,
-            "Inspecting selected inputs and starting…".to_owned(),
-        ));
-        let submitted = match feature {
+        match feature {
             FeatureId::Train => {
                 if let Some(path) = resume_checkpoint {
                     self.submit_intent(ApplicationIntentEndpoint::TrainingResume, |correlation| {
@@ -338,10 +315,6 @@ impl App {
             }
             _ => false,
         };
-        if !submitted {
-            self.model.workflow.start_status =
-                Some((feature, "Start could not be submitted.".to_owned()));
-        }
     }
 
     fn advance_start_cancellation(&mut self) {
@@ -392,10 +365,6 @@ impl App {
             };
         }
         if !self.submit_registered_intent(ApplicationIntentEndpoint::ModelStop, registered) {
-            self.model.workflow.start_status = Some((
-                feature,
-                "Model preparation cancellation could not be submitted.".to_owned(),
-            ));
             self.model.workflow.pending_start = None;
         }
     }
@@ -436,7 +405,7 @@ impl App {
             .as_ref()
             .is_some_and(|pending| pending.feature == page)
         {
-            self.model.workflow.cancel_start("Start cancelled.");
+            self.model.workflow.cancel_start();
             self.advance_start_cancellation();
             return false;
         }
@@ -491,7 +460,7 @@ impl App {
                 pending.feature == page && pending.preparation != StartPreparation::Waiting
             })
         {
-            self.model.workflow.cancel_start("Start cancelled.");
+            self.model.workflow.cancel_start();
             self.advance_start_cancellation();
             return;
         }
@@ -509,7 +478,7 @@ impl App {
             crate::view::workflow::model_card::Outcome::ArtifactConfirmed(schedule) => {
                 if workflow == FeatureId::Train {
                     if self.model.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == FeatureId::Train) {
-                        self.model.workflow.cancel_start("Start cancelled after confirming training weights.");
+                        self.model.workflow.cancel_start();
                     }
                     self.model.workflow.train_continuation.refresh_requested = true;
                 }
@@ -560,7 +529,7 @@ impl App {
                     self.model.workflow.train_continuation.mode_chosen = true;
                     return Task::none();
                 }
-                self.model.workflow.cancel_start("Start cancelled because its continuation mode changed.");
+                self.model.workflow.cancel_start();
                 self.model.workflow.train_continuation.mode = mode;
                 self.model.workflow.train_continuation.mode_chosen = true;
             }
@@ -1645,7 +1614,59 @@ mod tests {
         );
         app.advance_start();
         assert!(app.model.workflow.pending_start.is_none());
+        assert_eq!(
+            app.model.error.as_ref().unwrap().detail,
+            "A separate model operation was admitted first."
+        );
         assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_start_submissions_retire_pending_work_and_keep_transport_error() {
+        for endpoint in [
+            ApplicationIntentEndpoint::TrainingPrepareResume,
+            ApplicationIntentEndpoint::ModelSelect,
+            ApplicationIntentEndpoint::TrainingStart,
+            ApplicationIntentEndpoint::ModelStop,
+        ] {
+            let (mut app, mut capture) = start_app();
+            match endpoint {
+                ApplicationIntentEndpoint::TrainingPrepareResume => {
+                    select_resumable(&mut app);
+                }
+                ApplicationIntentEndpoint::TrainingStart => {
+                    app.model.model_snapshot = Some(accepted_model_for(
+                        &app.model,
+                        app.settings.draft().unwrap(),
+                        FeatureId::Train,
+                    ));
+                }
+                ApplicationIntentEndpoint::ModelStop => {
+                    app.request_start(FeatureId::Train);
+                    let select = next_intent(&mut capture, ApplicationIntentEndpoint::ModelSelect);
+                    let active = active_preparation(&app, FeatureId::Train);
+                    app.model.reduce_reply(
+                        select.correlation,
+                        Ok(crate::generated::ApplicationReply::ModelSelect(active)),
+                    );
+                }
+                _ => {}
+            }
+            app.connection = None;
+            if endpoint == ApplicationIntentEndpoint::ModelStop {
+                assert!(!app.guard_compute_stop(FeatureId::Train));
+            } else {
+                app.request_start(FeatureId::Train);
+            }
+            assert!(app.model.workflow.pending_start.is_none());
+            assert!(!app.model.has_pending(endpoint));
+            assert_eq!(
+                app.model.error.as_ref().unwrap().detail,
+                "browser connection is not ready"
+            );
+            app.advance_start();
+            assert!(capture.try_recv().is_err());
+        }
     }
 
     #[test]

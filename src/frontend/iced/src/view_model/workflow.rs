@@ -13,7 +13,6 @@ pub struct WorkflowModel {
     pub export: Option<ComputeUiState>,
     settings_revision: Option<u64>,
     pub pending_start: Option<PendingStart>,
-    pub start_status: Option<(FeatureId, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,17 +303,15 @@ impl Default for WorkflowModel {
             export: None,
             settings_revision: None,
             pending_start: None,
-            start_status: None,
         }
     }
 }
 
 impl WorkflowModel {
-    pub fn cancel_start(&mut self, detail: &str) {
+    pub fn cancel_start(&mut self) {
         let Some(pending) = self.pending_start.as_mut() else {
             return;
         };
-        self.start_status = Some((pending.feature, detail.to_owned()));
         match &mut pending.preparation {
             StartPreparation::Waiting | StartPreparation::ResumeQueued | StartPreparation::Restored => self.pending_start = None,
             StartPreparation::Restoring { cancelled, .. } => *cancelled = true,
@@ -340,9 +337,6 @@ impl WorkflowModel {
                         pending.preparation = StartPreparation::Restored;
                     }
                     _ => {
-                        if let Err(error) = reply {
-                            self.start_status = Some((pending.feature, error.detail.clone()));
-                        }
                         self.pending_start = None;
                     }
                 }
@@ -357,23 +351,14 @@ impl WorkflowModel {
                         cancelled,
                     };
                 }
-                Err(error) => {
-                    self.start_status = Some((pending.feature, error.detail.clone()));
-                    self.pending_start = None;
-                }
                 _ => {
-                    self.start_status = Some((
-                        pending.feature,
-                        "Model selection reply did not match its request.".to_owned(),
-                    ));
                     self.pending_start = None;
                 }
             },
             StartPreparation::Stopping {
                 correlation: owned, ..
             } if correlation == owned => {
-                if let Err(error) = reply {
-                    self.start_status = Some((pending.feature, error.detail.clone()));
+                if reply.is_err() {
                     self.pending_start = None;
                 }
             }

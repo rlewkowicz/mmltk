@@ -478,7 +478,7 @@ mod tests {
             assert!(model.primary_action_active(FeatureId::Train));
             assert_eq!(model.training_stop_available(), !preparation.cancelled());
             assert!(!model.primary_action_active(FeatureId::Validate));
-            model.workflow.cancel_start("Start cancelled.");
+            model.workflow.cancel_start();
             assert!(!model.training_stop_available());
             assert_eq!(model.primary_action_active(FeatureId::Train), model.workflow.pending_start.is_some());
         }

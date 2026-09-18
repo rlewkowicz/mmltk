@@ -218,9 +218,7 @@ impl App {
                     .is_none_or(|draft| !pending.inputs.matches(draft))
             })
         {
-            self.model
-                .workflow
-                .cancel_start("Start cancelled because its inputs changed.");
+            self.model.workflow.cancel_start();
         }
         match schedule {
             EditSchedule::Debounce(generation) => settings_persist_task(generation),
