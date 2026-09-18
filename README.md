@@ -54,11 +54,13 @@ policy, generated bindings, and build timing.
 Train prepares the selected model and starts the run from its primary action.
 Its center shows a selectable chart dashboard with a separate live progress
 card. Train and validation inputs are required; the final-test split is optional.
-The Output card edits the destination, explicitly opens saved runs, and inspects
-full checkpoints for resume. EMA is optional and off by default.
-Validate combines detailed metrics with up to six sample previews. Predict is a
-quick visual check for compiled data, an image, or a local video, with
-Pause/Resume/Stop for video.
+Choose Transfer or Resume in the weights card. Auto Output creates a fresh run
+directory at Start; Browse Output selects a manual destination and loads its
+saved charts. EMA is optional and off by default.
+Validate shows twelve COCO summaries beside six sample tiles and uses Explore's
+viewer, including Upscale and Open in Annotation. Its GT labels and Det labels
+switch the two annotation layers independently. Predict is a quick visual check
+for compiled data, an image, or a local video, with Pause/Resume/Stop for video.
 
 The [RF-DETR workflow guide](docs/rfdetr-workflows.md) covers class identity,
 metrics, output files, and continuation. Current native checkpoints use version

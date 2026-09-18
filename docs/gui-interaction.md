@@ -16,7 +16,8 @@ Explore.
 
 The [page canvas](../src/frontend/iced/src/view/mod.rs) is at least 1020 logical
 pixels wide and centers a page of at most 1500 logical pixels. A narrower
-window exposes horizontal scrolling. Ordinary workflows use one vertical page
+window exposes horizontal scrolling, with space reserved for its scrollbar so
+the rail cannot cover bottom-row controls. Ordinary workflows use one vertical page
 scroll beneath the header; Explore retains its gallery and sidebar scroll
 owners.
 
@@ -40,21 +41,19 @@ editor widget identities survive ordinary layout and native-state updates.
 Train uses the [retained dashboard](#training-dashboard) in the center column,
 with the shared workspace aspect selector and a separate live progress card.
 It has no native GPU image workspace. Its Dataset card keeps the optional test
-split independent of inferred train/validation paths. Its Output card edits
-the destination, explicitly opens current-format saved history, pages through
-records, inspects checkpoints, and prepares resume. Advanced includes
+split independent of inferred train/validation paths; manual split text fields
+appear when inference is disabled. Its weights card owns Transfer/Resume.
+Its Output card selects Auto Output or Browse Output, shows the selected/active
+path, and loads supported saved charts. Advanced includes
 **Exponential moving average**, disabled by default, and separate
 augmentation/perceptual-downscaling settings. The
 [workflow reference](rfdetr-workflows.md) owns the metric conventions, current
 file formats, input admission, live progress, and continuation requirements.
 
-Validate preserves the outer setup/status columns and divides the center
-equally between metrics and sample viewing. Its micro atlas always has three
-columns and two rows, with explicit empty cells when fewer samples exist.
-Opening one sample uses its paired displayed identity and the shared
-fit/pan/zoom viewer. Prediction and ground-truth labels are separate local
-controls; their box/mask controls request native recomposition of retained
-samples. Validate has no workspace aspect selector.
+Train and Validate share the weights-selector presentation and native artifact
+compatibility facts. Validate's Open Dataset shows its explicit path or the
+effective inherited Train validation split. It uses the
+[fixed Validation workspace](#validation-workspace-and-shared-viewer) below.
 
 Predict offers compiled-dataset, single-image, and local-video inputs, a preview
 threshold, optional output JSON, and video Pause/Resume/Stop. It retains the
@@ -70,6 +69,86 @@ duplicate starts. Progress shows the preparation stage and then the owning
 operation's completed work; unknown totals stay indeterminate. Video controls
 use the same pending-system admission as their typed requests, including an
 event arriving before its reply.
+
+## Shared primary actions
+
+The [primary-action widget](../src/frontend/iced/src/view/workflow/primary_action.rs)
+owns the common presentation:
+
+| Workflow | Green idle action | Red active action |
+| --- | --- | --- |
+| Train | Start Training | Stop Training |
+| Validate | Start Validation | Stop Validation |
+| Predict | Run Predict | Stop Predict |
+| Export | Run Export | Stop Export |
+| Live | Start Live | Stop Live |
+| Annotate | Save Annotations | Remains green and save-only |
+
+Native activity and accepted explicit preparation/save state determine the
+active presentation. Stop keeps each owner's cancellation behavior. An accepted
+save disables duplicate saves until settlement without changing its label.
+Train, Validate, Predict, and Export share the card-to-action gap; Train,
+Validate, and Predict have no separate start-status sentence. Native progress
+and failures retain their owning displays, while a successful Validate result
+does not leave “Succeeded” immediately above the action.
+
+During active work, ten equal blue segments move clockwise by perimeter distance
+through the existing white, three-logical-pixel rounded border. They use the
+theme color of Browse dataset source without changing bounds, radius, or the
+button core. The [border renderer](../src/frontend/iced/src/view/workflow/primary_action/border.rs)
+retains one small uniform binding per widget and a shared pipeline per Iced
+device. It draws narrow strips and corner regions; it builds no per-frame mesh.
+Only an active, visible widget requests continuing redraws. Animation is local
+presentation state and adds no native protocol field or polling loop.
+
+## Validation workspace and shared viewer
+
+Validate preserves the outer setup/status columns. Its center image/metrics
+region is always 16:9, independent of the aspect selected on other pages.
+**Metrics** and **Validation Preview** share a centered heading strip of the
+same height as the other pages' aspect selector. Equal 8:9 halves contain the
+[twelve COCO summaries](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
+and a non-scrolling native atlas of two columns by three rows. Each cell is
+4:3. Smaller sample sets retain explicit empty cells.
+
+The atlas reuses Explore's native image containment and padding plus the shared
+surface border, spacing, placeholder, and hit geometry. Source images retain
+their aspect rather than stretching into cells. Shared
+[image containment](../src/backend/imaging/raster/image_containment.h) has no
+Explore scheduler or dataset dependency. Validation keeps its own bounded
+sample products and composition owner.
+
+Explore and Validation call the complete
+[image-viewer panel](../src/frontend/iced/src/view/image_viewer.rs): Sample
+heading, Previous/Next, Fit, wheel zoom, right-drag pan, source/overlay controls,
+Close, Basic/Fast/Neural Upscale, and Open in Annotation. Validation navigation
+stays within its retained available samples. Its opaque modal covers both
+headings and the center workspace, constrains the image there, and leaves the
+sidebars outside the overlay.
+
+Sample selection uses metadata paired with the displayed atlas. A held pointer
+admits a target once until that target changes or the hold ends; a publication
+revision alone does not create another selection. Navigation and overlay
+requests use the common connection/settings/system admission. Upscale and
+Annotation consume the exact displayed sample through their existing native
+owners. Annotation receives the sample's ground truth, including masks;
+detections remain a Validation viewer overlay.
+
+Validation's atlas and detail panel have **GT labels** and **Det labels**
+checkboxes. Each controls its entire ground-truth or detection layer—text,
+boxes, and masks—while retaining that layer's finer Labels/Masks/Boxes choices.
+Fine label toggles stay local to Iced; layer and box/mask changes request native
+composition from retained products.
+
+For one class, GT RGB is `255 - Det RGB` per channel, preserving the established
+alpha. Overlapping native masks and box outlines use Direct Addition / Linear
+Dodge: sum RGB with saturation at 255, then apply the existing alpha. Matching
+complements therefore have white overlap RGB before alpha application. Text and
+caption backgrounds use ordinary painter order, with GT drawn first and Det
+drawn second. Separate Iced layers keep Det backgrounds above GT glyphs as well
+as GT backgrounds. The existing font, glyph layout, contrast, and alpha policy
+remain. These layer controls and color/composition rules belong to Validation;
+Explore keeps its existing palette and single caption layer.
 
 ## Training dashboard
 
@@ -182,7 +261,10 @@ locates their emitters and the handwritten presentation-state reducers.
 Application output objects in snapshots, replies, and events use positional
 CBOR arrays in canonical reflected member order. Each declared field has a
 slot, including null optionals, and generated decoders enforce the exact field
-count and constraints. Schema agreement authorizes those positions; they are
+count and constraints. Generated failures name the enclosing type/member;
+array decoding adds the failing index. Bootstrap and event errors retain their
+system/event context, with fixed-text failures reporting the actual size and
+allowed range. Schema agreement authorizes those positions; they are
 not handwritten field inventories. Scalars, byte strings, named variant
 discriminators, and opaque relation storage retain their canonical policies.
 Ordinary intent field IDs and named request values keep their existing
@@ -345,6 +427,11 @@ storage while display buffers are occupied. Clean/semantic products retain both
 raw planes and use fused finalization. Completed products and front/back display
 roles can be selected without copying pixels. Allocation and logical product
 revision remain independent.
+
+Pending workspace finalization retains its completion-draining product owner.
+Even if a cross-device transfer has released its raw input read, that product
+cannot detach, replace its workspace, or become writable before final display
+work settles. Raw-reader release and completed finalization are separate facts.
 
 The native runtime factories linked above and
 [SystemImageRuntime](../src/frameworks/gpu/system_image_runtime.h) define these

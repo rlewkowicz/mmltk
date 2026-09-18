@@ -226,14 +226,27 @@ The graphics artifact derives records, enum wire values, field offsets, sizes,
 and alignments from the native workspace import and frame-signal declarations
 in [presentation/abi](../src/controller/presentation/abi).
 Firefox includes it through `MMLTK_WORKSPACE_GRAPHICS_ABI`. CMake makes its
-generation a direct Firefox build dependency. The wrapper's
-`.cache/firefox/build-input.sha256` includes the canonical graphics declarations,
-emitter, generator, and generation build rules as well as the Firefox source
-and toolchain identity. The successful build stamp at
-`.cache/firefox/obj-minimal-opt/.mmltk-build-input.sha256` also includes the
-generated artifact's content hash. A native graphics change therefore
-invalidates Firefox reuse even when `third_party/firefox` itself is unchanged.
-This boundary does not change Firefox's cached Clang/bootstrap-sysroot policy.
+generation a direct Firefox build dependency and owns regeneration from the
+native declarations and generator inputs.
+
+The wrapper's `.cache/firefox/build-input.sha256` uses the version-3 outer
+source key. It includes the dependency toolchain image identity,
+`firefox_runtime_build.cmake`, `build_firefox_runtime.sh`, the runtime manifest,
+the committed `third_party/firefox` tree, its tracked working-tree diff, and its
+nonignored untracked files. Native declarations, the application generator, and
+its CMake rules are handled by the generation graph rather than duplicated in
+that outer source key.
+
+`build_firefox_runtime.sh` combines that key with the runtime-manifest hash and
+the emitted graphics ABI's content hash in
+`.cache/firefox/obj-minimal-opt/.mmltk-build-input.sha256`. It skips Mach build
+and staging only when this guard matches and every manifest entry exists.
+Changed emitted ABI bytes therefore invalidate the guard even when Firefox's
+source is unchanged; an unrelated generator edit producing identical ABI bytes
+does not itself require Firefox compilation. Missing outputs or changed Firefox,
+toolchain, build-script, manifest, or ABI inputs can still require work. These
+guards retain the existing Firefox objdir, Clang/bootstrap sysroot, Cargo, and
+sccache state.
 
 Generated Rust stays in build output: change canonical native declarations
 or generators, then regenerate. `--update-gui-lock` performs the containerized

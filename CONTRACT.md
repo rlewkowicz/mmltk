@@ -144,7 +144,11 @@ work. Completion and failure come from typed native results and events.
 
 Training, validation, and prediction start through their primary action,
 including required settings settlement, model preparation, and input inspection.
-Training owns current-format history and validated checkpoint continuation;
+Train and Validate share artifact-selection presentation while keeping their
+workflow controls and admission independent. Training owns automatic or manual
+output reservation, current-format history, fresh transfer initialization, and
+validated checkpoint continuation. Selecting inputs, continuation mode, or an
+output directory never starts a run.
 Rust/Iced owns a bounded retained chart dashboard in the aspect-selected center
 workspace, defaulting to 16:9. Selected charts fit the available workspace without
 internal scrolling and expand within that same region; wheel input belongs to
@@ -156,11 +160,22 @@ observations remain separate from live training samples and final-test products.
 Only the selected evaluation weights are plotted; validation loss is not
 calculated or plotted by the GUI.
 
-Validation owns detailed metrics and up to six retained samples from its
-evaluation pass, with paired prediction/ground-truth geometry and a detail viewer.
+Validation presents fixed COCO summaries and up to six retained samples from its
+evaluation pass in a fixed metrics/preview workspace. It shares atlas containment
+and the complete image viewer with Explore, while retaining its own sample
+selection and overlay policy. Both viewers support navigation, fit, pan, zoom,
+upscaling, and ground-truth import into Annotation. Validation independently
+controls its complete ground-truth and detection layers, uses complementary
+class colors, adds overlapping mask/outline RGB with unchanged alpha, and paints
+detection captions after ground-truth captions. Explore retains its own palette
+and overlay behavior.
 Prediction incrementally processes compiled images, ordinary images, and local
 video, retaining the latest completed preview through completion or cancellation.
 GUI prediction uses one image per batch; video has pause, resume, and stop.
+
+Primary execution actions expose their owning cancellation while active, with
+shared visual feedback driven by visible browser redraws. Annotation's primary
+action remains save-only and prevents duplicate accepted saves.
 
 Training admits target populations above the model's query count while retaining
 the established assignment and loss semantics. Optional EMA remains GPU-resident;
@@ -253,8 +268,11 @@ requirements. Page and device teardown settle terminal resource ownership
 independently from rendering success. The last completed image remains drawable
 through newer work, capacity pressure, source changes, or presentation failure.
 
-Display-device mismatch uses producer-owned finalization through the existing
-peer or reusable pinned transfer route. Same-GPU display keeps pixels on the
+The browser's display device follows its Wayland graphics session independently
+of each product's compute device. Native imports match the display allocation's
+physical device identity. Display-device mismatch uses producer-owned finalization
+through the existing peer or reusable pinned transfer route, retaining pending
+finalization custody through completion. Same-GPU display keeps pixels on the
 GPU; explicit diagnostic probes may read back samples. Firefox owns downstream
 graphics queues, swapchain, compositor cadence, and Wayland presentation
 independently of Live capture rate.

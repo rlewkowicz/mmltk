@@ -28,7 +28,7 @@ execution and state boundaries through typed APIs:
 | [detail/training_snapshot.h](../src/backend/models/rfdetr/training/detail/training_snapshot.h) | Ordinary/EMA serialization snapshots and continuation save/load coordination |
 | [detail/native_optimizer_private.h](../src/backend/models/rfdetr/training/detail/native_optimizer_private.h) | Typed AdamW/Muon state, parameter groups, update, and archive operations |
 | [detail/target_builder_private.h](../src/backend/models/rfdetr/training/detail/target_builder_private.h) | Target staging, scratch storage, and consumer leases |
-| [detail/evaluation_runtime.h](../src/backend/models/rfdetr/training/detail/evaluation_runtime.h) | Evaluation lanes, prediction buffers, and scheduled validation lifetime |
+| [detail/evaluation_runtime.h](../src/backend/models/rfdetr/training/detail/evaluation_runtime.h) | Evaluation lanes, prediction buffers, scheduled validation lifetime, and retained sample-output writer |
 | [checkpoint.h](../src/backend/models/rfdetr/training/checkpoint.h) | Ordinary checkpoint application, normalization, weight loading, and continuation inspection API |
 
 Runtime definitions stay in the corresponding ordinary source files; sources
@@ -86,12 +86,31 @@ match-free class axes. Unmatched destination state keeps its initialized value.
 Resume instead requires the exact native class layout and compatible saved
 state; it does not perform transfer remapping.
 
+## Shared weights selection
+
+Train and Validate use the same **RF-DETR Weights** card: catalog presets and
+**Custom Weights**, with a compact selected path, active preparation progress,
+and actionable errors. Train accepts trainable weights (`.pt`, `.pth`, `.ckpt`,
+`.safetensors`). Validate also accepts ONNX (`.onnx`) and TensorRT
+(`.engine`, `.trt`). The selected extension identifies an input kind through
+the native [compatibility catalog](../src/controller/contracts/model_selection.h);
+normal artifact and class admission still apply.
+
+The shared card has no separate backend-kind or companion class-layout control
+for these two workflows. A new custom selection clears an unrelated descriptor
+path. Native descriptors and CLI `--class-layout` retain their supported
+admission route. Only Train adds Transfer/Resume controls; Validate has no
+continuation preparation or training-output state.
+
 ## Training inputs and output destination
 
 Train requires compiled train and validation splits. **Infer train/validation
 splits** resolves `train.bin` and `val.bin` from the compiled output directory.
-The optional test split remains independently selectable and clearable in that
-mode; it is not inferred from `test.bin`. Clearing it disables the final test.
+Dataset source and compiled output retain their browse buttons. With inference
+disabled, text fields expose the train, validation, and optional test paths;
+there are no per-split browse buttons. The stored optional test path survives
+inference toggles and is not inferred from `test.bin`. Clear that text field
+with inference disabled to disable the final test.
 An absent test split does not block training. A selected test split must be a
 readable compiled artifact with the same ordered class catalog as train and
 validation, or native admission rejects the start. The
@@ -99,19 +118,34 @@ validation, or native admission rejects the start. The
 and [dataset inspection](../src/controller/subsystems/system/dataset_system.cpp)
 own these checks.
 
-The Output card's **Output directory** field is editable. Typing a destination
-or using **Select training output** updates settings; **Open saved run** is the
-separate inspection action. Neither editing nor browsing starts training or
-loads history.
+The Output card owns **Auto Output**, initially enabled, **Browse Output**, and
+a compact selected or active path. Auto keeps the saved destination empty until
+Start reserves `gui-train-output/run-0001`, `run-0002`, and so on. The next suffix
+comes from existing entries and directory creation reserves it atomically, so
+new automatic runs remain distinct after relaunch. A resolved automatic path is
+a runtime fact rather than a restored manual destination.
 
-On a GUI start, an absent or empty output directory can become the run directory.
-Resume reuses a populated current run directory only when its full
-`checkpoint.pt`, attempt identity, selected weights, and class layout agree.
-A fresh start, or a resume that does not match that directory, creates a new
-`run-*` child when the selected directory is nonempty. The resolved destination
-is shown after it exists. This GUI directory policy belongs to
-[TrainRunStore](../src/controller/services/train_run_store.cpp); the CLI uses
-its explicit `--output-dir`.
+Browse Output switches to manual selection and loads supported saved charts.
+An empty or unrelated folder clears the saved charts; a folder claiming history
+through either `run.json` or `metrics.jsonl` must satisfy current-format admission
+or reports an error. Browsing changes neither weights nor Transfer/Resume mode.
+Re-enabling Auto clears the manual selection. Start selects live charts.
+
+Transfer may use an absent or empty manual destination directly. A populated
+destination gets a new numeric `run-*` child. Resume reuses a manual run directory
+only when the selected full `checkpoint.pt` is in that directory and its attempt,
+evaluated-weight choice, and class layout match the current history. Otherwise
+Resume reserves a fresh child, including for an empty manual destination.
+Automatic mode always reserves a fresh child. The resolved path appears when
+the run is admitted. This GUI policy belongs to
+[TrainRunStore](../src/controller/services/train_run_store.cpp); CLI training
+uses its explicit `--output-dir`.
+
+Validate's **Open Dataset** selects an independent override. While that override
+is empty, its compact effective path follows Train's validation split, including
+inferred paths. Native settings own this resolution. Changing an inherited
+source cancels an unstarted Validate request just as changing an explicit
+selection does.
 
 ## Training and query limits
 
@@ -159,11 +193,22 @@ checkpoints. Class layout accompanies native artifacts. Checkpoint/export
 serialization uses [reusable pinned readback storage](gpu-execution.md#checkpoint-and-export-readbacks);
 this does not move per-step EMA updates onto the CPU.
 
-In Train's Output card, select a checkpoint and use **Inspect checkpoint**.
-Inspection validates the current archive, continuation, optimizer inventory,
-and required EMA state before exposing **Resume**. Resume restores saved
-training settings and passes the same continuation admission used by CLI
-training. A path or run-history manifest alone cannot make an artifact resumable.
+Train's weights card owns mutually exclusive **Transfer** and **Resume** radios.
+Catalog and weights-only inputs use Transfer and cannot Resume. A resumable
+custom checkpoint defaults to Resume; Transfer may still use its weights with
+fresh training state. Selecting a file or changing the radio never starts work.
+
+Custom selection starts cancellable native inspection on a worker. Inspection
+validates the archive, continuation, optimizer inventory, and required EMA
+state before publishing a compact capability. It retains immutable admission
+evidence rather than decoded tensors; exact file identity is checked again
+before use. Confirming the same custom path deliberately refreshes inspection.
+An inspection error stays actionable rather than automatically retrying.
+
+Start in Resume mode restores the saved training settings, settles that
+restoration, and passes the native continuation admission used by CLI training.
+Only the still-current explicit Start request may proceed after preparation.
+A path or run-history manifest alone cannot make an artifact resumable.
 See the [checkpoint API](../src/backend/models/rfdetr/training/checkpoint.h),
 [checkpoint I/O](../src/backend/models/rfdetr/training/checkpoint_io.cpp),
 and [continuation validation](../src/backend/models/rfdetr/training/training_continuation.cpp).
@@ -225,18 +270,19 @@ weighted. Auxiliary and denoising groups are separate weighted values;
 correspondence is an overlapping breakdown. Only total represents the complete
 optimized objective, so these displayed components must not simply be summed.
 
-**Open saved run** inspects the selected output directory without starting
-training. **Load history / More history** fetch pages of at most 32 records;
-**Current live run** returns the dashboard to live data. The reader uses
+**Browse Output** selects saved history without starting training. The frontend
+automatically fetches pages of at most 32 records into the bounded dashboard;
+Start returns it to live data. The reader uses
 generation and byte-boundary cursors, rejects replaced/truncated streams, and
 does not advance past an incomplete trailing append. Opening history requires
-both a valid current manifest and its `metrics.jsonl`.
+both a valid current manifest and its `metrics.jsonl`; a directory with neither
+is a valid empty history selection.
 
 Scheduled evaluation contributes one sparse observation per recorded epoch
 for the selected weight set. Live and terminal records carrying the latest
 evaluation do not add duplicate observations. Missing or unavailable
-measurements remain gaps; a final test stays in the Output summary rather than
-joining the validation trajectory. The
+measurements remain gaps. Optional final-test support and persisted results
+remain native; the GUI has no final-test result display or chart trajectory. The
 [training dashboard](gui-interaction.md#training-dashboard) owns chart selection,
 axes, retained interaction, bounded summaries, and rendering behavior. Throughput
 belongs to live progress rather than a dashboard curve.
@@ -270,15 +316,27 @@ it is not a constant-memory statistic.
 Validation chooses up to six distinct random images from the evaluated
 population and captures their pixels, predictions, and ground truth during the
 same evaluation pass. A smaller population leaves empty cells. The fixed
-three-column/two-row atlas and its detail viewer reuse those retained products;
+two-column/three-row atlas and its detail viewer reuse those retained products;
 opening detail and changing overlays do not run inference again. Selection
 uses the identity paired with displayed pixels, including during replacement
 or partial progress.
 
-Metrics details are fetched in pages of at most four rows. The GUI exposes
-IoU and recall selectors over generated axes, plus separate prediction and
-ground-truth box, mask, and label controls. Labels are local Iced presentation;
-box/mask composition belongs to Validation's native renderer.
+The GUI presents twelve fixed COCO summary rows: AP 50:95, AP50, AP75,
+AP small/medium/large, AR at each of the three recorded caps, and AR
+small/medium/large. Boxes and available Masks use separate columns; unavailable
+values show `—`. Native detail queries still support pages of at most four
+rows, while this view has no metric, IoU, recall, or detail-page controls.
+The [Validation workspace](gui-interaction.md#validation-workspace-and-shared-viewer)
+owns layout, shared viewer interaction, and the Validation-only GT/Det layer
+and compositing rules.
+
+Scheduled training evaluation separately writes `eval_samples/epoch_N.png`.
+[TrainingValidationRuntime](../src/backend/models/rfdetr/training/evaluation_run_owner.cpp)
+owns an [EvaluationSampleWriter](../src/backend/models/rfdetr/core/sample_output.h)
+that lazily retains its CUDA device, worker, settlement stream, and event across
+epochs. One pending future bounds output; explicit `Flush` propagates errors,
+and destruction settles queued image custody. Independent validation runtimes
+can write on different devices without sharing a process-global writer.
 
 ## Incremental prediction
 

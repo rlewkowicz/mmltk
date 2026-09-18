@@ -10,7 +10,8 @@
 - [Commands](commands.md): wrapper operations, process snapshots, native CLI,
   desktop options, and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
-  training inputs and live progress, EMA, checkpoint resume, saved history,
+  shared weights selection, Transfer/Resume, automatic/manual output, training
+  inputs and live progress, EMA, saved history,
   evaluation metrics and samples, and incremental image/video prediction.
 
 ## Architecture and frameworks
@@ -20,6 +21,7 @@
   generated bindings, frontend components, and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, the retained training dashboard,
+  fixed Validation metrics/atlas, the shared image viewer and primary actions,
   numeric editing, shared immediate mouse input, native command settlement,
   retained Explore measurements, paired image geometry, direct/copy acquisition,
   retained redraws, FPS, and resource lifetime.
@@ -31,7 +33,8 @@
   Explore thumbnail/atlas retention through viewport and augmentation changes.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
-  CUDA import, provider capture, and capability inspection.
+  CUDA import, independent display/compute selection and transfers, provider
+  capture, and capability inspection.
 
 ## Engineering, validation, and operations
 
