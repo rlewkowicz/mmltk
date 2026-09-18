@@ -338,6 +338,7 @@ mod tests {
         assert_eq!(
             composition.audit_regions(),
             &[
+                // CLEANUP-IGNORE: Independent expected inventory; reusing AUDIT_REGIONS would make this assertion tautological.
                 Region::Setup,
                 Region::Center,
                 Region::Workspace,

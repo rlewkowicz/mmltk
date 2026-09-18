@@ -844,6 +844,7 @@ pub(crate) mod tests {
     }
 
     fn select_saved_run(model: &mut crate::view_model::ApplicationModel) {
+        // CLEANUP-IGNORE: One selected-request field access supplies this chart fixture, independent of the output-view fixture.
         let configuration = model
             .settings_snapshot
             .as_ref()

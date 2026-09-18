@@ -449,6 +449,7 @@ TEST_CASE("preview slot reuse orders cross-stream writes and preserves fault cus
 }
 TEST_CASE("preview recapture invalidates retained scratch and destination regions", "[controller][gpu]") {
     namespace gpu = mmltk::frameworks::gpu;
+    // CLEANUP-IGNORE: An alias and ordinary policy/context construction precede independently owned test resources.
     using Composition = detail::PredictionPreviewComposition;
     const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
     gpu::DeviceContext context(0, gpu::cuda_image_copy_backend(), gpu::DeviceContextMode::Isolated, execution.placement.numa_node, execution);

@@ -15,6 +15,14 @@
 #include <future>
 using namespace mmltk::controller::test_support;
 namespace mmltk::controller {
+namespace {
+template <class Predicate>
+void await_validation(std::mutex& mutex, std::condition_variable& changed, Predicate predicate) {
+    std::unique_lock lock(mutex);
+    REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
+}
+}  // namespace
+// CLEANUP-IGNORE: Independent custody test preamble; aliases and one execution-policy call are not a shared algorithm.
 TEST_CASE("composed preview retains every source after the outer draw callback", "[controller][gpu][validation]") {
     namespace gpu = mmltk::frameworks::gpu;
     using Composition = detail::PredictionPreviewComposition;
@@ -153,15 +161,16 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
             7U,
             {record, {.chw = source.pixels(), .width = 2U, .height = 2U, .device = 0, .custody = source.custody()}, source.annotations(), source.detections()});
     }
-    const auto await = [&](auto predicate) {
-        std::unique_lock lock(mutex);
-        REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
-    };
-    await([&] {
+    await_validation(mutex, changed, [&] {
         const auto snapshot = samples.snapshot();
         return std::cmp_equal(std::count(snapshot.sample_available.begin(), snapshot.sample_available.end(), true), sample_count);
     });
     const auto atlas = samples.snapshot();
+    const auto check_retained_atlas = [&] {
+        const auto current = samples.snapshot();
+        CHECK(current.content_identity == atlas.content_identity);
+        CHECK(current.frame.clean_revision == atlas.frame.clean_revision);
+    };
     CHECK_FALSE(atlas.detail);
     CHECK(atlas.frame.extent.width * 9U == atlas.frame.extent.height * 8U);
     const auto atlas_metadata = samples.ImageSnapshot(atlas.frame);
@@ -189,7 +198,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     CHECK_THROWS_AS(samples.Select({6U, 1U}), contracts::InvalidIntentError);
     CHECK_THROWS_AS(samples.Select({7U, 2U}), contracts::InvalidIntentError);
     samples.Select({7U, 3U});
-    await([&] { return samples.snapshot().detail; });
+    await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
     const auto detail = samples.snapshot();
     CHECK(detail.content_identity != atlas.content_identity);
     CHECK(detail.frame.extent == VisualExtent{2U, 2U});
@@ -207,9 +216,8 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     source = PredictionSource::Device(execution, {2U, 2U}, pixels, detections,
                                       std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"replacement"}));
     samples.CloseDetail();
-    await([&] { return !samples.snapshot().detail; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
+    await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
+    check_retained_atlas();
     if (labelled) CHECK(samples.ImageSnapshot(samples.snapshot().frame)->samples[0].labels[0].name == "original");
     auto atlas_reader = samples.BorrowFrame();
     REQUIRE(atlas_reader.valid());
@@ -220,14 +228,13 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     CHECK(samples.snapshot().overlay_selection.value == ValidationOverlays{false, false, false, false});
     CHECK(samples.snapshot().overlay_selection.revision > before.overlay_selection.revision);
     retained = {};
-    await([&] { return samples.snapshot().frame.revision > before.frame.revision; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
+    await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > before.frame.revision; });
+    check_retained_atlas();
     CHECK(samples.snapshot().overlays == ValidationOverlays{false, false, false, false});
     CHECK(samples.ImageSnapshot(samples.snapshot().frame)->overlays == samples.snapshot().overlays);
     atlas_reader = {};
     samples.Select({7U, 1U});
-    await([&] { return samples.snapshot().detail; });
+    await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
     samples.Begin(9U, selected_indices);
     const auto capture = [&](std::uint32_t index) {
         const rfdetr::PredictionRecord record{.dataset_index = index, .detections = source.detections()};
@@ -237,18 +244,16 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     };
     capture(1U);  // A partial newer set stays pending while old detail is selected.
     samples.CloseDetail();
-    await([&] { return !samples.snapshot().detail; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
+    await_validation(mutex, changed, [&] { return !samples.snapshot().detail; });
+    check_retained_atlas();
     for (const auto overlays :
          {ValidationOverlays{true, true, true, true, false, true}, ValidationOverlays{true, true, true, true, true, false},
           ValidationOverlays{true, true, true, true, false, false}, ValidationOverlays{true, false, false, false},
           ValidationOverlays{false, true, false, false}, ValidationOverlays{false, false, true, false}, ValidationOverlays{false, false, false, true}}) {
         const auto revision = samples.snapshot().frame.revision;
         samples.SetOverlays(overlays);
-        await([&] { return samples.snapshot().frame.revision > revision; });
-        CHECK(samples.snapshot().content_identity == atlas.content_identity);
-        CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
+        await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > revision; });
+        check_retained_atlas();
         CHECK(samples.snapshot().overlays == overlays);
     }
     const auto preserved = samples.snapshot();
@@ -259,7 +264,7 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     }
     fault.partial_semantic = true;
     samples.SetOverlays({true, true, true, true});
-    await([&] { return notifications >= failure_notifications; });
+    await_validation(mutex, changed, [&] { return notifications >= failure_notifications; });
     CHECK(samples.snapshot().frame == preserved.frame);
     CHECK(samples.snapshot().overlays == preserved.overlays);
     CHECK(samples.snapshot().overlay_selection.value == preserved.overlays);
@@ -267,12 +272,11 @@ TEST_CASE("validation retains the limited sample atlas and selects detail withou
     CHECK(samples.ImageSnapshot(preserved.frame)->overlays == preserved.overlays);
     fault.partial_semantic = false;
     samples.SetOverlays({true, true, true, true});  // Repeating a refused request is an explicit retry.
-    await([&] { return samples.snapshot().frame.revision > preserved.frame.revision; });
-    CHECK(samples.snapshot().content_identity == atlas.content_identity);
-    CHECK(samples.snapshot().frame.clean_revision == atlas.frame.clean_revision);
+    await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > preserved.frame.revision; });
+    check_retained_atlas();
     fault.draw_failures_remaining = 1U;
     capture(3U);  // Last capture's ordinary draw failure retries without another producer callback.
-    await([&] { return samples.snapshot().sample_identities[0].generation == 9U; });
+    await_validation(mutex, changed, [&] { return samples.snapshot().sample_identities[0].generation == 9U; });
     CHECK(samples.snapshot().sample_available[0]);
     CHECK(samples.snapshot().sample_available[1]);
     if (labelled) CHECK(samples.ImageSnapshot(samples.snapshot().frame)->samples[0].labels[0].name == "replacement");
@@ -297,13 +301,9 @@ TEST_CASE("validation preview generations settle to retained source custody with
         std::scoped_lock lock(mutex);
         changed.notify_all();
     });
-    const auto await = [&](auto predicate) {
-        std::unique_lock lock(mutex);
-        REQUIRE(changed.wait_for(lock, std::chrono::seconds(20), predicate));
-    };
     const std::array<std::uint32_t, 2U> indices{3U, 7U};
     samples.Begin(1U, indices);
-    await([&] { return samples.snapshot().frame.valid(); });
+    await_validation(mutex, changed, [&] { return samples.snapshot().frame.valid(); });
     const auto empty = samples.snapshot();
     CHECK(empty.frame.extent == VisualExtent{512U, 576U});
     CHECK(empty.frame.content == VisualRegion{0U, 0U, 512U, 576U});
@@ -334,10 +334,10 @@ TEST_CASE("validation preview generations settle to retained source custody with
     };
     capture(1U, 3U);
     samples.Settle(1U, true);
-    await([&] { return samples.snapshot().sample_available[0]; });
+    await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0]; });
     if (detail_open) {
         samples.Select({1U, 3U});
-        await([&] { return samples.snapshot().detail; });
+        await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
     }
     const auto incumbent = samples.snapshot();
     const auto incumbent_metadata = samples.ImageSnapshot(incumbent.frame);
@@ -349,7 +349,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
     samples.Begin(1U, indices);  // A stale selection callback cannot restart an older generation.
     capture(1U, 7U);             // A stale producer cannot fill the new set's matching slot.
     capture(2U, 7U);
-    if (!detail_open) await([&] { return samples.snapshot().sample_identities[1].generation == 2U; });
+    if (!detail_open) await_validation(mutex, changed, [&] { return samples.snapshot().sample_identities[1].generation == 2U; });
     const auto preview = samples.snapshot();
     if (!detail_open) CHECK(preview.frame.clean_revision != incumbent.frame.clean_revision);
     samples.Settle(1U, false);  // A stale terminal cannot roll back this generation.
@@ -362,7 +362,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
     const bool restored = refuse || outcome != contracts::ComputeOperationOutcome::Succeeded || detail_open;
     if (restored) {
         const bool republished = !detail_open || refuse || outcome != contracts::ComputeOperationOutcome::Succeeded;
-        await([&] {
+        await_validation(mutex, changed, [&] {
             return samples.snapshot().content_identity == incumbent.content_identity &&
                    (!republished || samples.snapshot().frame.revision > preview.frame.revision);
         });
@@ -382,7 +382,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
             CHECK(document.document->scene.categories[0].value == "retained");
         }
     } else {
-        await([&] { return samples.snapshot().frame.revision > preview.frame.revision; });
+        await_validation(mutex, changed, [&] { return samples.snapshot().frame.revision > preview.frame.revision; });
         CHECK(samples.snapshot().frame.clean_revision == preview.frame.clean_revision);
         CHECK(samples.snapshot().sample_identities[1].generation == 2U);
         CHECK_FALSE(samples.snapshot().sample_available[0]);
@@ -484,6 +484,7 @@ TEST_CASE("validation composition preserves independent nonempty box and mask pi
         CHECK(frame->classes()[1] == "truth");
     }
 }
+// CLEANUP-IGNORE: This storage-reuse case shares only aliases and one policy call with the independent pixel-oracle case.
 TEST_CASE("retained validation preparation follows physical storage and changed regions", "[controller][gpu][validation]") {
     namespace gpu = mmltk::frameworks::gpu;
     namespace rfdetr = mmltk::backend::models::rfdetr;

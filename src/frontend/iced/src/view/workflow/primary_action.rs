@@ -150,7 +150,9 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Decorated<'_, Message> 
         }
         tree.diff_children(std::slice::from_mut(&mut self.child));
     }
+    // CLEANUP-IGNORE: Iced's single-child size/layout forwarding is required independently of each widget's decoration policy.
     fn size(&self) -> Size<Length> {
+        // CLEANUP-IGNORE: This child-size call begins the same required Iced forwarding, not shared product behavior.
         self.child.as_widget().size()
     }
     fn layout(
@@ -173,7 +175,9 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Decorated<'_, Message> 
         self.child
             .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
+        // CLEANUP-IGNORE: Required child event forwarding precedes this button's distinct active-only animation policy.
     }
+    // CLEANUP-IGNORE: Each Iced wrapper forwards events before applying its independently owned redraw behavior.
     fn update(
         &mut self,
         tree: &mut widget::Tree,
@@ -205,8 +209,10 @@ impl<Message> Widget<Message, Theme, iced::Renderer> for Decorated<'_, Message> 
             {
                 shell.request_redraw();
             }
+            // CLEANUP-IGNORE: Iced requires the following child interaction/draw forwarding; retained button state and workspace state remain distinct.
         }
     }
+    // CLEANUP-IGNORE: Child interaction and draw forwarding are Iced trait obligations, not a shared rendering or resource owner.
     fn mouse_interaction(
         &self,
         tree: &widget::Tree,

@@ -1097,6 +1097,16 @@ mod tests {
         ]
     }
 
+    fn assert_validation_viewer_retained(app: &App, request: &crate::generated::UpscaleRequest) {
+        assert_eq!(app.model.requested_upscale.as_ref(), Some(request));
+        assert_eq!(app.model.sent_upscale.as_ref(), Some(request));
+        assert_eq!(
+            app.model.foreground_visual(),
+            Some(crate::generated::PresentationSourceKind::Upscale)
+        );
+        assert!(!app.presentation.stop_requested);
+    }
+
     #[test]
     fn compute_primary_stop_routes_to_each_native_owner_once() {
         for (page, endpoint) in [
@@ -1204,13 +1214,7 @@ mod tests {
                 for _ in 0..4 {
                     drop(app.on_validate(crate::view::validate::Outcome::Sample(message.clone())));
                 }
-                assert_eq!(app.model.requested_upscale.as_ref(), Some(&request));
-                assert_eq!(app.model.sent_upscale.as_ref(), Some(&request));
-                assert_eq!(
-                    app.model.foreground_visual(),
-                    Some(crate::generated::PresentationSourceKind::Upscale)
-                );
-                assert!(!app.presentation.stop_requested);
+                assert_validation_viewer_retained(&app, &request);
                 assert!(app.model.error.is_none());
                 assert!(capture.try_recv().is_err());
                 if let Some(pending) = pending {
@@ -1229,13 +1233,7 @@ mod tests {
             let (mut app, mut capture, request) = validation_viewer();
             app.connection = None;
             drop(app.on_validate(crate::view::validate::Outcome::Sample(message)));
-            assert_eq!(app.model.requested_upscale.as_ref(), Some(&request));
-            assert_eq!(app.model.sent_upscale.as_ref(), Some(&request));
-            assert_eq!(
-                app.model.foreground_visual(),
-                Some(crate::generated::PresentationSourceKind::Upscale)
-            );
-            assert!(!app.presentation.stop_requested);
+            assert_validation_viewer_retained(&app, &request);
             assert!(app.model.error.is_some());
             assert!(app.model.validation_navigation_available());
             assert!(capture.try_recv().is_err());
@@ -1653,6 +1651,7 @@ mod tests {
                 1,
             )),
         ));
+        // CLEANUP-IGNORE: Same-path confirmation independently asserts cancellation before its distinct restore settlement.
         assert!(
             app.model
                 .workflow
