@@ -8,6 +8,7 @@ use iced::{Fill, Center};
 pub const ATLAS_ID: &str = "validate.samples.atlas";
 #[derive(Debug, Clone)]
 pub enum Message {
+    Atlas(AtlasInput),
     Select(ValidationSampleIdentity),
     Close,
     Fit,
@@ -16,25 +17,75 @@ pub enum Message {
     Upscale(crate::generated::UpscaleKernel),
     OpenAnnotation,
 }
+#[derive(Debug, Clone, PartialEq)]
+struct AtlasSource {
+    binding: (u64, u64),
+    frame: crate::generated::VisualFrame,
+    content: u64,
+}
+#[derive(Debug, Clone)]
+pub struct AtlasInput {
+    source: AtlasSource,
+    kind: presentation_surface::SurfaceGestureKind,
+    selected: Option<ValidationSampleIdentity>,
+    pressed: bool,
+}
+#[derive(Default)]
+struct AtlasInteraction {
+    source: Option<AtlasSource>,
+    pressed: Option<ValidationSampleIdentity>,
+}
+impl AtlasInteraction {
+    fn synchronize(&mut self, source: Option<AtlasSource>) {
+        // Publication revisions carry exact hit metadata, but do not end a hold
+        // on the same retained atlas.
+        let same_source = self.source.as_ref().zip(source.as_ref()).is_some_and(|(old, new)| {
+            old.binding == new.binding && old.frame.source == new.frame.source
+                && old.content == new.content
+        });
+        if !same_source { self.pressed = None; }
+        self.source = source;
+    }
+    fn input(&mut self, input: AtlasInput) -> Option<ValidationSampleIdentity> {
+        if self.source.as_ref() != Some(&input.source) { return None; }
+        match input.kind {
+            presentation_surface::SurfaceGestureKind::Pointer if input.pressed => {
+                let selected = input.selected?;
+                if self.pressed.as_ref() == Some(&selected) { return None; }
+                self.pressed = Some(selected.clone());
+                Some(selected)
+            }
+            presentation_surface::SurfaceGestureKind::Pointer
+            | presentation_surface::SurfaceGestureKind::End
+            | presentation_surface::SurfaceGestureKind::Cancel => {
+                self.pressed = None;
+                None
+            }
+            presentation_surface::SurfaceGestureKind::Viewport => None,
+        }
+    }
+}
 pub struct Component {
     ground_truth: bool,
     prediction: bool,
     fit_revision: u64,
+    atlas: std::cell::RefCell<AtlasInteraction>,
 }
 impl Default for Component {
     fn default() -> Self {
-        Self { ground_truth: true, prediction: true, fit_revision: 0 }
+        Self { ground_truth: true, prediction: true, fit_revision: 0, atlas: Default::default() }
     }
 }
 impl Component {
-    pub fn update(&mut self, message: &Message) -> bool {
+    pub fn update(&mut self, message: Message) -> Option<Message> {
         match message {
+            Message::Atlas(input) => self.atlas.get_mut().input(input).map(Message::Select),
             Message::Labels(ground_truth, value) => {
-                if *ground_truth { self.ground_truth = *value; } else { self.prediction = *value; }
-                true
+                if ground_truth { self.ground_truth = value; } else { self.prediction = value; }
+                None
             }
-            Message::Fit => { self.fit_revision = self.fit_revision.wrapping_add(1); true }
-            _ => false,
+            Message::Fit => { self.fit_revision = self.fit_revision.wrapping_add(1); None }
+            message => Some(message),
         }
     }
     pub fn controls<'a>(&self, model: &crate::view_model::ApplicationModel) -> Element<'a, Message> {
@@ -78,14 +129,27 @@ impl Component {
         settings: &crate::view::settings::SettingsModel, input: crate::workspace_input::Binding) -> Element<'a, Message> {
         let (surface, labels, local) = match paired.filter(|(_, content)| !content.metadata.detail) {
             Some((surface, content)) => {
+                let source = AtlasSource {
+                    binding: (surface.high, surface.low),
+                    frame: content.metadata.frame.clone(),
+                    content: content.metadata.contentidentity,
+                };
+                self.atlas.borrow_mut().synchronize(Some(source.clone()));
                 let hit_metadata = content.metadata.clone();
                 let local: std::sync::Arc<dyn Fn(presentation_surface::SurfaceGesture) -> Option<Message> + Send + Sync> = std::sync::Arc::new(move |gesture| {
-                    if gesture.kind != presentation_surface::SurfaceGestureKind::Pointer || !gesture.sample.pressed { return None; }
-                    hit(&hit_metadata, gesture.sample.content_x, gesture.sample.content_y).map(Message::Select)
+                    if gesture.kind == presentation_surface::SurfaceGestureKind::Viewport { return None; }
+                    Some(Message::Atlas(AtlasInput {
+                        source: source.clone(), kind: gesture.kind,
+                        selected: hit(&hit_metadata, gesture.sample.content_x, gesture.sample.content_y),
+                        pressed: gesture.sample.pressed,
+                    }))
                 });
                 (surface, presentation_surface::labels::Source::Validation(content, self.ground_truth, self.prediction), Some(local))
             }
-            None => (Surface::empty(), presentation_surface::labels::Source::Hidden, None),
+            None => {
+                self.atlas.borrow_mut().synchronize(None);
+                (Surface::empty(), presentation_surface::labels::Source::Hidden, None)
+            }
         };
         container(presentation_surface::labels::view(presentation_surface::Program {
             surface, show_fps: crate::workspace_fps::enabled(settings),
@@ -98,9 +162,7 @@ impl Component {
         input: crate::workspace_input::Binding) -> Element<'a, Message> {
         let selected = content.metadata.selected.as_ref().expect("paired validation detail identity");
         let (previous, next) = neighbors(&content.metadata);
-        let available = model.settings_edit_available()
-            && !model.has_pending(crate::generated::ApplicationIntentEndpoint::ValidationSelectSample)
-            && !model.has_pending(crate::generated::ApplicationIntentEndpoint::ValidationCloseDetail);
+        let available = model.validation_navigation_available();
         let mut shown = surface;
         shown.fit_revision = self.fit_revision;
         let image = crate::view::image_viewer::image(shown,
@@ -132,6 +194,76 @@ fn neighbors(metadata: &crate::generated::ValidationImageMetadata) -> (Option<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use presentation_surface::SurfaceGestureKind;
+
+    fn source(metadata: &crate::generated::ValidationImageMetadata) -> AtlasSource {
+        AtlasSource { binding: (1, 2), frame: metadata.frame.clone(), content: metadata.contentidentity }
+    }
+    fn pointer(metadata: &crate::generated::ValidationImageMetadata, x: f32, y: f32) -> AtlasInput {
+        AtlasInput { source: source(metadata), kind: SurfaceGestureKind::Pointer, selected: hit(metadata, x, y), pressed: true }
+    }
+
+    #[test]
+    fn held_target_selects_once_and_keeps_exact_paired_identity() {
+        let metadata = crate::view_model::test_support::validation_image_metadata();
+        let mut component = Component::default();
+        component.atlas.get_mut().synchronize(Some(source(&metadata)));
+        assert!(matches!(component.update(Message::Atlas(pointer(&metadata, 10.0, 10.0))),
+            Some(Message::Select(identity)) if identity == metadata.samples[0].identity));
+        for x in 11..200 {
+            assert!(component.update(Message::Atlas(pointer(&metadata, x as f32, 10.0))).is_none());
+        }
+        assert!(matches!(component.update(Message::Atlas(pointer(&metadata, 300.0, 10.0))),
+            Some(Message::Select(identity)) if identity == metadata.samples[1].identity));
+        assert!(component.update(Message::Atlas(pointer(&metadata, 310.0, 10.0))).is_none());
+        for (x, y) in [(0.0, 200.0), (-1.0, 0.0), (512.0, 0.0), (0.0, 576.0), (f32::NAN, 0.0), (0.0, f32::INFINITY)] {
+            assert!(component.update(Message::Atlas(pointer(&metadata, x, y))).is_none());
+        }
+        assert!(component.update(Message::Atlas(pointer(&metadata, 310.0, 10.0))).is_none());
+    }
+
+    #[test]
+    fn release_end_and_cancel_allow_a_later_press() {
+        let metadata = crate::view_model::test_support::validation_image_metadata();
+        for kind in [SurfaceGestureKind::Pointer, SurfaceGestureKind::End, SurfaceGestureKind::Cancel] {
+            let mut state = AtlasInteraction::default();
+            state.synchronize(Some(source(&metadata)));
+            let input = pointer(&metadata, 10.0, 10.0);
+            assert!(state.input(input.clone()).is_some());
+            assert!(state.input(AtlasInput { kind, pressed: false, ..input.clone() }).is_none());
+            assert!(state.input(input).is_some());
+        }
+    }
+
+    #[test]
+    fn publications_preserve_the_hold_but_replaced_sources_reject_stale_callbacks() {
+        let mut metadata = crate::view_model::test_support::validation_image_metadata();
+        let mut state = AtlasInteraction::default();
+        state.synchronize(Some(source(&metadata)));
+        let old = pointer(&metadata, 10.0, 10.0);
+        assert!(state.input(old.clone()).is_some());
+        metadata.frame.revision += 1;
+        state.synchronize(Some(source(&metadata)));
+        assert!(state.input(AtlasInput { kind: SurfaceGestureKind::Cancel, ..old.clone() }).is_none());
+        assert!(state.input(pointer(&metadata, 10.0, 10.0)).is_none());
+        assert!(state.input(AtlasInput { selected: Some(metadata.samples[1].identity.clone()), ..old.clone() }).is_none());
+        for sample in &mut metadata.samples { sample.identity.generation += 1; }
+        metadata.contentidentity += 1;
+        state.synchronize(Some(source(&metadata)));
+        assert!(state.input(old).is_none());
+        let current = pointer(&metadata, 10.0, 10.0);
+        assert!(state.input(current.clone()).is_some());
+        state.synchronize(None);
+        assert!(state.input(current.clone()).is_none());
+        state.synchronize(Some(source(&metadata)));
+        assert!(state.input(current.clone()).is_some());
+        let mut replacement = source(&metadata);
+        replacement.binding.0 += 1;
+        state.synchronize(Some(replacement.clone()));
+        assert!(state.input(current.clone()).is_none());
+        assert!(state.input(AtlasInput { source: replacement, ..current }).is_some());
+    }
+
     #[test]
     fn grid_hits_and_navigation_use_only_paired_retained_identities() {
         let mut metadata = crate::view_model::test_support::validation_image_metadata();

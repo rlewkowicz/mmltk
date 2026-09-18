@@ -251,9 +251,7 @@ impl Component {
                 // CLEANUP-IGNORE: Validate closes its local settings outcome before workspace routing.
             ),
             Message::Samples(message) => {
-                if self.samples.update(&message) {
-                    return Ok(None);
-                }
+                let Some(message) = self.samples.update(message) else { return Ok(None); };
                 Outcome::Sample(message)
             }
         };

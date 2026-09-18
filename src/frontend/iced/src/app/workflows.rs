@@ -700,9 +700,7 @@ impl App {
                 use crate::view::validate::samples::Message as Sample;
                 match message {
                     Sample::Select(identity) => {
-                        self.abandon_viewer();
-                        self.model.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Validation));
-                        self.submit_intent(
+                        if self.model.validation_navigation_available() && self.submit_intent(
                             ApplicationIntentEndpoint::ValidationSelectSample,
                             |correlation| {
                                 crate::generated::encode_validation_SelectSample(
@@ -710,15 +708,19 @@ impl App {
                                     identity,
                                 )
                             },
-                        );
+                        ) {
+                            self.abandon_viewer();
+                            self.model.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Validation));
+                        }
                     }
                     Sample::Close => {
-                        self.abandon_viewer();
-                        self.model.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Validation));
-                        self.submit_intent(
+                        if self.model.validation_navigation_available() && self.submit_intent(
                             ApplicationIntentEndpoint::ValidationCloseDetail,
                             crate::generated::encode_validation_CloseDetail,
-                        );
+                        ) {
+                            self.abandon_viewer();
+                            self.model.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Validation));
+                        }
                     }
                     Sample::Overlays(overlays) => {
                         self.submit_intent(
@@ -740,7 +742,7 @@ impl App {
                     Sample::OpenAnnotation => {
                         if self.copy_viewer_to_annotation() { return self.transition_page(FeatureId::Annotate); }
                     }
-                    Sample::Fit | Sample::Labels(..) => {}
+                    Sample::Atlas(_) | Sample::Fit | Sample::Labels(..) => {}
                 }
             }
             crate::view::validate::Outcome::StartRequested => {
@@ -913,6 +915,92 @@ mod tests {
             Some(expected)
         );
         intent
+    }
+
+    fn validation_viewer() -> (App, Capture, crate::generated::UpscaleRequest) {
+        use crate::generated::{PresentationSourceKind, UpscaleKernel};
+        let (mut app, capture) = start_app();
+        app.workspace.select(FeatureId::Validate);
+        let metadata = crate::view_model::test_support::validation_image_metadata();
+        let request = crate::generated::UpscaleRequest {
+            source: metadata.frame, document: metadata.document, kernel: UpscaleKernel::Default,
+        };
+        app.model.requested_upscale = Some(request.clone());
+        app.model.sent_upscale = Some(request.clone());
+        app.model.set_foreground_visual(Some(PresentationSourceKind::Upscale));
+        (app, capture, request)
+    }
+
+    fn validation_navigation() -> [crate::view::validate::samples::Message; 2] {
+        use crate::view::validate::samples::Message as Sample;
+        [Sample::Select(crate::generated::ValidationSampleIdentity { generation: 7, datasetindex: 42 }), Sample::Close]
+    }
+
+    #[test]
+    fn validation_navigation_refusal_preserves_the_viewer_without_busy_or_replay() {
+        for message in validation_navigation() {
+            for disconnected in [false, true] {
+                let (mut app, mut capture, request) = validation_viewer();
+                let pending = (!disconnected).then(|| app.model.begin_intent(ApplicationIntentEndpoint::ValidationSetOverlays).unwrap());
+                if disconnected { app.model.connection = crate::view_model::ConnectionState::Reconnecting; }
+                for _ in 0..4 {
+                    drop(app.on_validate(crate::view::validate::Outcome::Sample(message.clone())));
+                }
+                assert_eq!(app.model.requested_upscale.as_ref(), Some(&request));
+                assert_eq!(app.model.sent_upscale.as_ref(), Some(&request));
+                assert_eq!(app.model.foreground_visual(), Some(crate::generated::PresentationSourceKind::Upscale));
+                assert!(!app.presentation.stop_requested);
+                assert!(app.model.error.is_none());
+                assert!(capture.try_recv().is_err());
+                if let Some(pending) = pending { app.model.abandon_intent(pending); }
+                app.model.connection = crate::view_model::ConnectionState::Connected;
+                app.dispatch_viewer_desired();
+                assert!(capture.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn validation_navigation_failed_submission_does_not_depart() {
+        for message in validation_navigation() {
+            let (mut app, mut capture, request) = validation_viewer();
+            app.connection = None;
+            drop(app.on_validate(crate::view::validate::Outcome::Sample(message)));
+            assert_eq!(app.model.requested_upscale.as_ref(), Some(&request));
+            assert_eq!(app.model.sent_upscale.as_ref(), Some(&request));
+            assert_eq!(app.model.foreground_visual(), Some(crate::generated::PresentationSourceKind::Upscale));
+            assert!(!app.presentation.stop_requested);
+            assert!(app.model.error.is_some());
+            assert!(app.model.validation_navigation_available());
+            assert!(capture.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn accepted_validation_navigation_submits_before_one_viewer_stop() {
+        use crate::view::validate::samples::Message as Sample;
+        for message in validation_navigation() {
+            let (mut app, mut capture, _) = validation_viewer();
+            drop(app.on_validate(crate::view::validate::Outcome::Sample(message.clone())));
+            let endpoint = match &message {
+                Sample::Select(_) => ApplicationIntentEndpoint::ValidationSelectSample,
+                _ => ApplicationIntentEndpoint::ValidationCloseDetail,
+            };
+            let navigation = next_intent(&mut capture, endpoint);
+            let expected = match &message {
+                Sample::Select(identity) => crate::generated::encode_validation_SelectSample(navigation.correlation, identity.clone()),
+                _ => crate::generated::encode_validation_CloseDetail(navigation.correlation),
+            };
+            assert_eq!(navigation, expected.record);
+            next_intent(&mut capture, ApplicationIntentEndpoint::UpscaleStop);
+            assert!(app.model.requested_upscale.is_none());
+            assert!(app.model.sent_upscale.is_none());
+            assert_eq!(app.model.foreground_visual(), Some(crate::generated::PresentationSourceKind::Validation));
+            assert!(!app.presentation.stop_requested);
+            drop(app.on_validate(crate::view::validate::Outcome::Sample(message)));
+            assert!(app.model.error.is_none());
+            assert!(capture.try_recv().is_err());
+        }
     }
 
     #[test]

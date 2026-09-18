@@ -2,6 +2,11 @@ use super::model_selection::model_settings_projection;
 use super::*;
 
 impl ApplicationModel {
+    pub fn validation_navigation_available(&self) -> bool {
+        self.settings_edit_available()
+            && !self.has_system_pending(crate::generated::ApplicationSystem::Validation)
+    }
+
     pub fn native_settings_unsettled(&self) -> bool {
         self.has_pending(ApplicationIntentEndpoint::ExploreUpdateFilter)
             || self.has_pending(ApplicationIntentEndpoint::SettingsUpdate)
@@ -435,6 +440,30 @@ impl ApplicationModel {
 mod tests {
     use super::*;
     use crate::view_model::test_support::*;
+    #[test]
+    fn validation_navigation_shares_connection_settings_and_system_admission() {
+        let mut model = bootstrapped();
+        assert!(model.validation_navigation_available());
+        for endpoint in [
+            ApplicationIntentEndpoint::ValidationStart,
+            ApplicationIntentEndpoint::ValidationStop,
+            ApplicationIntentEndpoint::ValidationSetOverlays,
+            ApplicationIntentEndpoint::ValidationSelectSample,
+            ApplicationIntentEndpoint::ValidationCloseDetail,
+            ApplicationIntentEndpoint::SettingsReset,
+        ] {
+            let pending = model.begin_intent(endpoint).unwrap();
+            assert!(!model.validation_navigation_available());
+            model.abandon_intent(pending);
+            assert!(model.validation_navigation_available());
+        }
+        model.connection = ConnectionState::Reconnecting;
+        assert!(!model.validation_navigation_available());
+        model.connection = ConnectionState::Connected;
+        model.settings_snapshot = None;
+        assert!(!model.validation_navigation_available());
+    }
+
     #[test]
     fn video_controls_wait_for_the_reply_after_an_earlier_state_event() {
         let mut model = bootstrapped();
