@@ -19,6 +19,13 @@ fn label_bounds(
     }
 }
 
+fn cell_bounds(geometry: PlacementGeometry, region: [u32; 4], cell: [u32; 4]) -> Rectangle {
+    Rectangle { x: geometry.x + (cell[0] as f32 - region[0] as f32) * geometry.width / region[2] as f32,
+        y: geometry.y + (cell[1] as f32 - region[1] as f32) * geometry.height / region[3] as f32,
+        width: cell[2] as f32 * geometry.width / region[2] as f32,
+        height: cell[3] as f32 * geometry.height / region[3] as f32 }
+}
+
 pub(crate) struct PredictionContent {
     pub(super) metadata: std::sync::Arc<crate::generated::PredictImageMetadata>,
     labels: Vec<CachedLabel>,
@@ -27,6 +34,8 @@ struct CachedLabel {
     text: String,
     width: f32,
     paragraph: iced::advanced::graphics::text::Paragraph,
+    background: Option<[u8; 3]>,
+    cell: Option<[u32; 4]>,
 }
 fn label_text<Content>(content: Content, width: f32) -> text::Text<Content> {
     text::Text {
@@ -52,6 +61,8 @@ impl CachedLabel {
             text,
             width,
             paragraph,
+            background: None,
+            cell: None,
         }
     }
 }
@@ -82,6 +93,7 @@ impl PredictionContent {
 pub(crate) struct ValidationContent {
     pub(crate) metadata: std::sync::Arc<crate::generated::ValidationImageMetadata>,
     labels: Vec<(usize, usize, crate::generated::AnnotationBox, CachedLabel)>,
+    pub(crate) upscale: Option<std::sync::Arc<crate::generated::UpscaleImageMetadata>>,
 }
 impl ValidationContent {
     pub(crate) fn new(
@@ -93,7 +105,7 @@ impl ValidationContent {
             .samples
             .iter()
             .enumerate()
-            .filter(|(_, sample)| sample.available)
+            .filter(|(_, sample)| sample.available && (!metadata.detail || metadata.selected.as_ref() == Some(&sample.identity)))
         {
             for (label_index, label) in sample.labels.iter().enumerate() {
                 let mut bounds = label.box_.clone();
@@ -107,11 +119,28 @@ impl ValidationContent {
                     sample_index,
                     label_index,
                     bounds,
-                    CachedLabel::new(label.name.clone()),
+                    { let mut cached = CachedLabel::new(label.name.clone());
+                      cached.background = Some(label.rgb);
+                      cached.cell = Some(if metadata.detail { [0, 0, metadata.frame.extent.width, metadata.frame.extent.height] }
+                          else { let width = metadata.frame.extent.width / 2; let height = metadata.frame.extent.height / 3;
+                              [sample_index as u32 % 2 * width, sample_index as u32 / 2 * height, width, height] }); cached },
                 ));
             }
         }
-        Self { metadata, labels }
+        Self { metadata, labels, upscale: None }
+    }
+    pub(crate) fn frame(&self) -> &crate::generated::VisualFrame {
+        self.upscale.as_ref().map_or(&self.metadata.frame, |value| &value.frame)
+    }
+    pub(crate) fn with_upscale(mut self, upscale: std::sync::Arc<crate::generated::UpscaleImageMetadata>) -> Self {
+        let scale_x = upscale.frame.extent.width as f32 / self.metadata.frame.extent.width as f32;
+        let scale_y = upscale.frame.extent.height as f32 / self.metadata.frame.extent.height as f32;
+        for (_, _, bounds, cached) in &mut self.labels {
+            if let Some(cell) = &mut cached.cell { cell[0] = (cell[0] as f32 * scale_x) as u32; cell[1] = (cell[1] as f32 * scale_y) as u32; cell[2] = (cell[2] as f32 * scale_x) as u32; cell[3] = (cell[3] as f32 * scale_y) as u32; }
+            for point in [&mut bounds.first, &mut bounds.second] { point.x *= scale_x; point.y *= scale_y; }
+        }
+        self.upscale = Some(upscale);
+        self
     }
 }
 
@@ -125,6 +154,15 @@ pub(crate) enum Source {
 }
 
 impl Source {
+    fn caption_layers(&self) -> [Self; 2] {
+        match self {
+            Self::Validation(content, gt, det) => [
+                Self::Validation(content.clone(), *gt, false),
+                Self::Validation(content.clone(), false, *det),
+            ],
+            _ => [self.clone(), Self::Hidden],
+        }
+    }
     fn visit(
         &self,
         mut label: impl FnMut(
@@ -187,7 +225,7 @@ impl Source {
             Self::Validation(content, ground_truth, predictions) => {
                 for (sample, index, bounds, cached) in &content.labels {
                     let item = &content.metadata.samples[*sample].labels[*index];
-                    if (item.groundtruth && !ground_truth) || (!item.groundtruth && !predictions) {
+                    if (item.groundtruth && (!ground_truth || !content.metadata.overlays.groundtruthlayer)) || (!item.groundtruth && (!predictions || !content.metadata.overlays.predictionlayer)) {
                         continue;
                     }
                     label(
@@ -399,62 +437,65 @@ impl<Message> Labelled<'_, Message> {
             let extent = placement.logical_extent(self.surface.content_extent());
             region = [0, 0, extent.0, extent.1];
         }
-        renderer.with_layer(clip, |renderer| {
-            self.source.visit(
-                |category, bounds, name, color, catalog_count, overlay, cached| {
-                    let mut rect = label_bounds(
-                        geometry,
-                        region,
-                        bounds,
-                        if cached.is_some() { "" } else { name },
-                    );
-                    if let Some(cached) = cached {
-                        rect.width = cached.width;
-                    }
-                    if rect.intersection(&clip).is_none() {
-                        return;
-                    }
-                    let color = class_color(color);
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: rect,
-                            ..Default::default()
-                        },
-                        color,
-                    );
-                    let position = Point::new(rect.x + 3.0, rect.y + 9.5);
-                    let foreground =
-                        if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.55 {
-                            Color::BLACK
-                        } else {
-                            Color::WHITE
-                        };
-                    if let Some(cached) = cached {
-                        renderer.fill_paragraph(&cached.paragraph, position, foreground, clip);
-                    } else {
-                        renderer.fill_text(
-                            label_text(name.to_owned(), rect.width),
-                            position,
-                            foreground,
-                            clip,
+        // Separate Iced layers keep Det backgrounds above GT glyphs too:
+        // the renderer batches a layer's quads before its text.
+        for source in self.source.caption_layers().into_iter().filter(|source| !matches!(source, Source::Hidden)) {
+            renderer.with_layer(clip, |renderer| {
+                source.visit(
+                    |category, bounds, name, color, catalog_count, overlay, cached| {
+                        let mut rect = label_bounds(
+                            geometry,
+                            region,
+                            bounds,
+                            if cached.is_some() { "" } else { name },
                         );
-                    }
-                    if crate::integration_control::reporting_enabled()
-                        && let Some(frame) = self.surface.frame
-                        && let Some(overlay) = overlay
-                    {
-                        crate::integration_control::report_viewer_label(
-                            category,
+                        if let Some(cached) = cached {
+                            rect.width = cached.width;
+                        }
+                        let Some(label_clip) = cached.and_then(|cached| cached.cell).map_or(Some(clip), |cell| cell_bounds(geometry, region, cell).intersection(&clip)) else { return; };
+                        let Some(background) = rect.intersection(&label_clip) else { return; };
+                        let color = cached.and_then(|cached| cached.background).map(|rgb| Color::from_rgb8(rgb[0], rgb[1], rgb[2])).unwrap_or_else(|| class_color(color));
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: if cached.is_some_and(|value| value.cell.is_some()) { background } else { rect },
+                                ..Default::default()
+                            },
                             color,
-                            catalog_count,
-                            overlay,
-                            frame,
-                            matches!(self.source, Source::Detail(..)),
                         );
-                    }
-                },
-            );
-        });
+                        let position = Point::new(rect.x + 3.0, rect.y + 9.5);
+                        let foreground =
+                            if color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722 > 0.55 {
+                                Color::BLACK
+                            } else {
+                                Color::WHITE
+                            };
+                        if let Some(cached) = cached {
+                            renderer.fill_paragraph(&cached.paragraph, position, foreground, label_clip);
+                        } else {
+                            renderer.fill_text(
+                                label_text(name.to_owned(), rect.width),
+                                position,
+                                foreground,
+                                label_clip,
+                            );
+                        }
+                        if crate::integration_control::reporting_enabled()
+                            && let Some(frame) = self.surface.frame
+                            && let Some(overlay) = overlay
+                        {
+                            crate::integration_control::report_viewer_label(
+                                category,
+                                color,
+                                catalog_count,
+                                overlay,
+                                frame,
+                                matches!(self.source, Source::Detail(..)),
+                            );
+                        }
+                    },
+                );
+            });
+        }
     }
 }
 
@@ -484,8 +525,8 @@ mod tests {
             crate::view_model::test_support::validation_image_metadata(),
         ));
         assert_eq!(content.labels.len(), 2);
-        assert_eq!(content.labels[0].2.first.x, 10.0);
-        assert_eq!(content.labels[0].2.first.y, 20.0);
+        assert!((content.labels[0].2.first.x - 51.2).abs() < 0.001);
+        assert!((content.labels[0].2.first.y - 38.4).abs() < 0.001);
         let pointer = content.labels[0].3.text.as_ptr();
         for (gt, predictions, expected) in [
             (true, true, 2),
@@ -508,6 +549,93 @@ mod tests {
         }
         assert_eq!(content.metadata.samples[0].identity.generation, 7);
         assert!(!content.metadata.samples[2].available);
+    }
+
+    #[test]
+    fn validation_caption_layers_preserve_order_and_detection_wins_all_visibility_combinations() {
+        use iced::advanced::renderer::Headless;
+        let mut renderer = iced::futures::executor::block_on(<iced::Renderer as Headless>::new(
+            Default::default(), Some("wgpu"),
+        )).expect("caption composition requires the container GPU backend");
+        let size = Size::new(512.0, 576.0);
+        let viewport = Rectangle::with_size(size);
+        let node = layout::Node::new(size);
+        for detail in [false, true] {
+            for flags in 0U8..16 {
+                let mut metadata = crate::view_model::test_support::validation_image_metadata();
+                metadata.detail = detail;
+                metadata.selected = detail.then(|| metadata.samples[0].identity.clone());
+                for sample in &mut metadata.samples[1..] { sample.available = false; }
+                if detail { metadata.samples[0].crop = crate::generated::VisualRegion { x: 0, y: 0, width: 512, height: 576 }; }
+                metadata.overlays.groundtruthlayer = flags & 1 != 0;
+                metadata.overlays.predictionlayer = flags & 2 != 0;
+                let mut gt = metadata.samples[0].labels[0].clone();
+                gt.groundtruth = true;
+                gt.rgb = [0, 255, 255];
+                gt.name = "MMMMMMMM".into();
+                let mut det = gt.clone();
+                det.groundtruth = false;
+                det.rgb = [255, 0, 0];
+                // Spaces leave the Det background unobstructed. Any surviving
+                // GT glyph in this rectangle proves incorrect Iced layer order.
+                det.name = "        ".into();
+                metadata.samples[0].labels = vec![det.clone(), gt.clone(), det, gt];
+                let content = std::sync::Arc::new(ValidationContent::new(metadata));
+                let source = Source::Validation(content.clone(), flags & 4 != 0, flags & 8 != 0);
+                let gt_visible = flags & 5 == 5;
+                let det_visible = flags & 10 == 10;
+                let mut seen = Vec::new();
+                let mut paragraphs = Vec::new();
+                for layer in source.caption_layers() {
+                    layer.visit(|_, _, _, _, _, _, cached| {
+                        let cached = cached.unwrap();
+                        seen.push(cached.background.unwrap());
+                        paragraphs.push(cached.text.as_ptr());
+                    });
+                }
+                let expected_paragraphs: Vec<_> = [1, 3, 0, 2].into_iter()
+                    .filter(|index| if index % 2 == 1 { gt_visible } else { det_visible })
+                    .map(|index| content.labels[index].3.text.as_ptr()).collect();
+                assert_eq!(paragraphs, expected_paragraphs);
+                let expected: Vec<_> = (0..if gt_visible { 2 } else { 0 }).map(|_| [0, 255, 255])
+                    .chain((0..if det_visible { 2 } else { 0 }).map(|_| [255, 0, 0])).collect();
+                assert_eq!(seen, expected);
+                let mut surface = Surface::empty();
+                surface.width = 512;
+                surface.height = 576;
+                let labelled = Labelled::<()> {
+                    child: iced::widget::space::horizontal().into(), surface, transform_surface: surface,
+                    placement: super::super::Placement::Contain, source, show_fps: false, control_id: "validation.caption.case",
+                };
+                renderer.reset(viewport);
+                labelled.draw_labels(&WorkspaceViewport::default(), &mut renderer, &crate::fluent_theme::app_theme(false),
+                                     Layout::new(&node), &viewport);
+                let pixels = renderer.screenshot(&iced::widget::shader::Viewport::with_physical_size(Size::new(512, 576), 1.0), Color::WHITE);
+                let pixel = |x: usize, y: usize| -> [u8; 3] { pixels[(y * 512 + x) * 4..(y * 512 + x) * 4 + 3].try_into().unwrap() };
+                let y = if detail { 116 } else { 39 };
+                assert_eq!(pixel(52, y), if det_visible { [255, 0, 0] } else if gt_visible { [0, 255, 255] } else { [255; 3] });
+                if det_visible {
+                    for row in y + 2..y + 14 {
+                        for column in 55..100 { assert_eq!(pixel(column, row), [255, 0, 0]); }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explore_captions_keep_the_original_single_render_layer() {
+        let explore = std::sync::Arc::new(crate::generated::ExploreImageMetadata::from(
+            &crate::view_model::test_support::explore_snapshot(),
+        ));
+        for visible in [false, true] {
+            let layers = Source::Gallery(explore.clone(), visible).caption_layers();
+            assert!(matches!(&layers[0], Source::Gallery(value, labels) if std::sync::Arc::ptr_eq(value, &explore) && *labels == visible));
+            assert!(matches!(&layers[1], Source::Hidden));
+            let layers = Source::Detail(super::super::DetailContent { explore: explore.clone(), upscale: None }, visible).caption_layers();
+            assert!(matches!(&layers[0], Source::Detail(value, labels) if std::sync::Arc::ptr_eq(&value.explore, &explore) && *labels == visible));
+            assert!(matches!(&layers[1], Source::Hidden));
+        }
     }
 
     #[test]

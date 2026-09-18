@@ -177,7 +177,7 @@ pub(super) fn upscale_settlement(
                 observed.pixels,
                 observed.button,
                 observed.repeat,
-                model.explore.requested_upscale,
+                model.requested_upscale,
                 native.map(|state| &state.input),
                 native.and_then(|state| state.pending.as_ref()),
                 native.and_then(|state| state.methods.get(kernel)),

@@ -39,6 +39,7 @@ class ValidationSystem final {
     [[nodiscard]] std::optional<ValidationImageMetadata> ImageSnapshot(const VisualFrame&) const;
     [[nodiscard]] VisualSourceObservation ObserveSource() const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+    [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
     void RequestWorkspace(VisualWorkspaceRequest);

@@ -57,19 +57,23 @@ class ValidationSystem::Impl final {
           factory_(std::move(factory)),
           events_(std::move(events)),
           configuration_{std::move(execution)},
+          previews_(visual.valid()),
           samples_(visual, [this] { Changed(); }) {
         if (!factory_) throw contracts::UnavailableError("compute runtime factory is unavailable");
-        if (visual.valid()) {
-            delivery_.samples_selected = [this](auto indices, auto) { samples_.Begin(operation().generation_frontier, indices); };
-            delivery_.sample = [this](auto sample) {
+    }
+    mmltk::backend::models::rfdetr::ValidationDelivery Delivery(std::uint64_t generation) {
+        mmltk::backend::models::rfdetr::ValidationDelivery delivery;
+        if (previews_) {
+            delivery.samples_selected = [this, generation](auto indices, auto) { samples_.Begin(generation, indices); };
+            delivery.sample = [this, generation](auto sample) {
                 try {
-                    samples_.Capture(std::move(sample));
+                    samples_.Capture(generation, std::move(sample));
                 } catch (const mmltk::backend::ml::runtime::CudaOperationError&) {
                     throw;
-                } catch (...) { /* An ordinary preview refusal cannot discard measured metrics. */
-                }
+                } catch (...) { /* Sample settlement retains the incumbent; metrics remain valid. */ }
             };
         }
+        return delivery;
     }
     ~Impl() { Shutdown(); }
     [[nodiscard]] contracts::ComputeUiState Start() {
@@ -86,6 +90,8 @@ class ValidationSystem::Impl final {
                     contracts::begin_compute(state_, *next, "Inspecting selected inputs");
                 },
             .work = [this, settings = settings.settings, selection](const std::stop_token stop) mutable -> direct::LocalRun::Notification {
+                const auto generation = operation().generation_frontier;
+                auto delivery = Delivery(generation);
                 auto terminal = run_checked_compute(
                     [&](const ComputeProgressSink& progress) {
                         if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
@@ -97,7 +103,7 @@ class ValidationSystem::Impl final {
                         if (stop.stop_requested()) return contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
                         if (!runtime_) runtime_ = factory_();
                         if (!runtime_) throw std::runtime_error("compute runtime is unavailable");
-                        auto result = runtime_->Run(std::move(*prepared), stop, progress, delivery_);
+                        auto result = runtime_->Run(std::move(*prepared), stop, progress, delivery);
                         {
                             std::scoped_lock lock(mutex_);
                             evaluation_ = std::move(result.evaluation);
@@ -107,11 +113,11 @@ class ValidationSystem::Impl final {
                     },
                     [this](const contracts::ComputeProgress& progress) { Progress(progress); });
                 if (terminal.outcome == contracts::ComputeOperationOutcome::Failed) runtime_.reset();
-                return Complete(std::move(terminal));
+                return Complete(generation, std::move(terminal));
             },
             .failure = [this](const std::exception_ptr failure) -> direct::LocalRun::Notification {
                 runtime_.reset();
-                return Complete(contracts::compute_failure_terminal(failure, "compute worker failed"));
+                return Complete(operation().generation_frontier, contracts::compute_failure_terminal(failure, "compute worker failed"));
             },
         });
         return operation();
@@ -131,10 +137,12 @@ class ValidationSystem::Impl final {
         std::scoped_lock lock(mutex_);
         return state_;
     }
-    [[nodiscard]] direct::LocalRun::Notification Complete(contracts::ComputeTerminal terminal) {
+    [[nodiscard]] direct::LocalRun::Notification Complete(std::uint64_t generation, contracts::ComputeTerminal terminal) {
+        samples_.Settle(generation, terminal.outcome == contracts::ComputeOperationOutcome::Succeeded);
         {
             std::scoped_lock lock(mutex_);
-            terminal.generation = state_.generation_frontier;
+            if (generation != state_.generation_frontier) return {};
+            terminal.generation = generation;
             contracts::complete_compute(state_, std::move(terminal));
         }
         return [this]() mutable noexcept { Changed(); };
@@ -174,8 +182,8 @@ class ValidationSystem::Impl final {
     std::optional<mmltk::backend::models::rfdetr::ValidationBackendResult> evaluation_;
     std::uint64_t evaluation_generation_ = 0U;
     WorkspaceInput input_;
+    bool previews_ = false;
     detail::ValidationSamples samples_;
-    mmltk::backend::models::rfdetr::ValidationDelivery delivery_;
 };
 ValidationSystem::ValidationSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, ValidationRuntimeFactory factory,
                                    SystemEventSink<event_type> events, std::optional<mmltk::frameworks::gpu::DeviceExecution> execution,
@@ -229,6 +237,7 @@ VisualSourceObservation ValidationSystem::ObserveSource() const {
     const auto image = impl_->samples_.snapshot();
     return {image.frame, image.frame.revision};
 }
+VisualDocumentRead ValidationSystem::BorrowDocument(const VisualFrame& frame) const { return impl_->samples_.BorrowDocument(frame); }
 mmltk::frameworks::gpu::BorrowedImageProductReadView ValidationSystem::BorrowFrame() const { return impl_->samples_.BorrowFrame(); }
 mmltk::frameworks::gpu::BorrowedImageWorkspace ValidationSystem::BorrowWorkspace() const { return impl_->samples_.BorrowWorkspace(); }
 mmltk::frameworks::gpu::ImageWorkspaceObservation ValidationSystem::ObserveWorkspace() const { return impl_->samples_.ObserveWorkspace(); }

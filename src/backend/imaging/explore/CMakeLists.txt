@@ -31,6 +31,7 @@ target_link_libraries(mmltk_backend_imaging_explore
     PUBLIC
         mmltk::backend::data
         mmltk::backend::imaging::primitives
+        mmltk::backend::imaging::raster
         mmltk::backend::models::rfdetr::augmentation
         CUDA::cudart
     PRIVATE

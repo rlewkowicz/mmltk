@@ -48,11 +48,11 @@ impl Picture {
     fn chart(self) -> bool {
         matches!(self, Self::Train | Self::Theme | Self::Narrow)
     }
-    fn control(self, index: u8) -> String {
+    fn control(self, _index: u8) -> String {
         match self {
             Self::Progress => "train.progress.bar".into(),
             Self::Train | Self::Theme | Self::Narrow => "train.metrics.plot".into(),
-            Self::Validation => format!("validate.sample.{index}"),
+            Self::Validation => crate::view::validate::samples::ATLAS_ID.into(),
             Self::Detail => "validate.detail.image".into(),
             _ => "workflow.visual.workspace".into(),
         }
@@ -128,6 +128,8 @@ pub(super) enum Step {
     Sample,
     HideBoxes,
     HiddenBoxes,
+    ValidationLayer(bool, u8),
+    ValidationLayerReady(bool, u8),
     CloseSample,
     ClosedSample,
     Predict,
@@ -165,6 +167,16 @@ pub(super) struct State {
     pixel_source: u64,
     pixel_presentation: u64,
     pixel_attempts: u8,
+    validation_layer: u8,
+}
+
+fn atlas_cell(bounds: Rectangle, index: u8) -> Rectangle {
+    Rectangle { x: bounds.x + f32::from(index % 2) * bounds.width / 2.0,
+        y: bounds.y + f32::from(index / 2) * bounds.height / 3.0,
+        width: bounds.width / 2.0, height: bounds.height / 3.0 }
+}
+fn layer_selection(index: u8) -> (bool, bool) {
+    match index { 1 => (false, true), 2 => (false, false), 3 => (true, false), _ => (true, true) }
 }
 
 fn source(index: u8) -> SourceKind {
@@ -355,7 +367,9 @@ impl State {
                     Picture::Progress => Step::LeaveTrain,
                     Picture::Train => Step::NoImageWorkspace,
                     Picture::Validation if index < 5 => Step::Pixels(picture, index + 1),
-                    Picture::Validation => Step::OpenSample,
+                    Picture::Validation if self.validation_layer < 4 => Step::ValidationLayer(false, self.validation_layer + 1),
+                    Picture::Validation => { self.validation_layer = 0; Step::OpenSample },
+                    Picture::Detail if self.validation_layer < 4 => Step::ValidationLayer(true, self.validation_layer + 1),
                     Picture::Detail => Step::CloseSample,
                     Picture::Compiled => Step::Source(1),
                     Picture::Image => Step::Source(2),
@@ -531,6 +545,12 @@ impl State {
         } else {
             bounds
         };
+        let bounds = match step {
+            Step::Pixels(Picture::Validation, index) => atlas_cell(bounds, index),
+            Step::OpenSample => atlas_cell(bounds, 0),
+            Step::ValidationLayer(..) => Rectangle { width: bounds.width.min(bounds.height), ..bounds },
+            _ => bounds,
+        };
         let input = crate::presentation_surface::physical_bounds(bounds, driver.input_scale);
         if let Step::Pixels(picture, index) = step {
             driver.phase = Phase::Workflows(Step::AwaitPixels(picture, index));
@@ -589,6 +609,7 @@ impl State {
             Step::StartValidate => Step::Validating,
             Step::OpenSample => Step::Sample,
             Step::HideBoxes => Step::HiddenBoxes,
+            Step::ValidationLayer(detail, index) => Step::ValidationLayerReady(detail, index),
             Step::CloseSample => Step::ClosedSample,
             Step::Predict => Step::Source(0),
             Step::Source(index) => Step::SourceReady(index),
@@ -943,7 +964,7 @@ impl State {
                 );
                 self.workflow_step(driver, Step::NoValidationAspect)
             }
-            Step::OpenSample => self.workflow_control(widgets, driver, "validate.sample.0"),
+            Step::OpenSample => self.workflow_control(widgets, driver, crate::view::validate::samples::ATLAS_ID),
             Step::Sample if validation.is_some_and(|value| value.detail) => {
                 self.workflow_step(driver, Step::HideBoxes)
             }
@@ -953,6 +974,12 @@ impl State {
                     .is_some_and(|value| value.detail && !value.overlays.predictionboxes) =>
             {
                 self.workflow_step(driver, Step::Pixels(Picture::Detail, 0))
+            }
+            Step::ValidationLayer(_, index) => self.workflow_control(widgets, driver, if index == 1 || index == 3 { "validate.gt.layer" } else { "validate.pred.layer" }),
+            Step::ValidationLayerReady(detail, index) if validation.is_some_and(|snapshot| snapshot.detail == detail && snapshot.overlayselection.value == snapshot.overlays
+                && (snapshot.overlays.groundtruthlayer, snapshot.overlays.predictionlayer) == layer_selection(index)) => {
+                self.validation_layer = index;
+                self.workflow_step(driver, Step::Pixels(if detail { Picture::Detail } else { Picture::Validation }, 0))
             }
             Step::CloseSample => self.workflow_control(widgets, driver, "validate.detail.close"),
             Step::ClosedSample if validation.is_some_and(|value| !value.detail) => {
@@ -1126,6 +1153,7 @@ impl State {
                                 // Measure the view only when its paired image has
                                 // the requested atlas/detail shape and overlay state.
                                 content.metadata.detail == (picture == Picture::Detail)
+                                    && (content.metadata.overlays.groundtruthlayer, content.metadata.overlays.predictionlayer) == layer_selection(self.validation_layer)
                                     && (picture != Picture::Detail
                                         || !content.metadata.overlays.predictionboxes)
                             })

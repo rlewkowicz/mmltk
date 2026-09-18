@@ -16,13 +16,15 @@ class ValidationSamples final {
                       PredictionPreviewPool::TransferOperations = {&cuMemcpyPeerAsync, &cudaEventRecord, &cudaStreamSynchronize, &cuMemHostRegister});
     ~ValidationSamples();
     void Begin(std::uint64_t generation, std::span<const std::uint32_t> indices);
-    void Capture(mmltk::backend::models::rfdetr::ValidationSampleView);
+    void Capture(std::uint64_t generation, mmltk::backend::models::rfdetr::ValidationSampleView);
+    void Settle(std::uint64_t generation, bool succeeded);
     void Select(ValidationSampleIdentity);
     void CloseDetail();
     void SetOverlays(ValidationOverlays);
     [[nodiscard]] ValidationSnapshot snapshot() const;
     [[nodiscard]] std::optional<ValidationImageMetadata> ImageSnapshot(const VisualFrame&) const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const;
+    [[nodiscard]] VisualDocumentRead BorrowDocument(const VisualFrame&) const;
     [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const;
     [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const;
     void RequestWorkspace(VisualWorkspaceRequest);

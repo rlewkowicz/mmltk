@@ -2,6 +2,8 @@ use crate::fluent_theme::Element;
 use iced::widget::{button, container, row, text};
 use iced::{Center, Length};
 
+pub const HEADER_HEIGHT: f32 = 38.0;
+
 pub const fn option_id(aspect: crate::generated::WorkspaceAspectRatio) -> &'static str {
     match aspect {
         crate::generated::WorkspaceAspectRatio::Widescreen => "workflow.aspect.widescreen",
@@ -81,6 +83,7 @@ pub fn selector<'a, Message: Clone + 'a>(
     container(options)
         .id("workflow.workspace.aspect")
         .padding([4, 8])
+        .height(HEADER_HEIGHT)
         .width(Length::Fill)
         .style(crate::fluent_theme::container_header)
         .into()

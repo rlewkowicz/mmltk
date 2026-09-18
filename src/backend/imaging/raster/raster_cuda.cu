@@ -226,6 +226,10 @@ __global__ void draw_analysis_overlay_rgba_pitched_kernel(const draw_launch::Ana
         }
     }
     apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, instances.instance_count, launch.box_thickness, pixel, launch.labels);
+    if (launch.add_rgb_to_existing) {
+        const auto existing = raster_math::load_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y);
+        pixel = raster_math::add_layer_rgb(existing, pixel);
+    }
     raster_math::store_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y, pixel);
 }
 __global__ void composite_rgba_over_bgr_pitched_kernel(const draw_launch::CompositeRgbaOverBgrPitchedLaunch launch) {

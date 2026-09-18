@@ -31,6 +31,8 @@ impl ApplicationModel {
         self.upscale_snapshot = None;
         self.workflow = WorkflowModel::default();
         self.explore.reset_transport();
+        self.requested_upscale = None;
+        self.sent_upscale = None;
         self.annotation = AnnotationModel::default();
         self.dialog_context = None;
         self.presentation_model = presentation::PresentationModel::default();
@@ -86,19 +88,20 @@ impl ApplicationModel {
                 let current_failure = match context {
                     ApplicationIntentEndpoint::TrainingOpenRun | ApplicationIntentEndpoint::TrainingHistory => self.workflow.output.fail(correlation),
                     ApplicationIntentEndpoint::TrainingInspectCheckpoint => self.workflow.train_continuation.fail(correlation, error.detail.clone()),
-                    ApplicationIntentEndpoint::UpscaleStart => self.explore.requested_upscale == self.explore.sent_upscale,
+                    ApplicationIntentEndpoint::UpscaleStart => self.requested_upscale == self.sent_upscale,
                     _ => true,
                 };
                 if context == ApplicationIntentEndpoint::UpscaleStart {
-                    if self.explore.requested_upscale == self.explore.sent_upscale {
-                        self.explore.requested_upscale = None;
+                    if self.requested_upscale == self.sent_upscale {
+                        let source_kind = self.viewer_native_kind();
+                        self.requested_upscale = None;
                         if self.presentation_model.foreground()
                             == Some(PresentationSourceKind::Upscale)
                         {
-                            self.set_foreground_visual(Some(PresentationSourceKind::Explore));
+                            self.set_foreground_visual(Some(source_kind));
                         }
                     }
-                    self.explore.sent_upscale = None;
+                    self.sent_upscale = None;
                 }
                 if matches!(
                     context,
@@ -428,7 +431,7 @@ impl ApplicationModel {
         let observation = merge_explore_snapshot(&mut self.explore.snapshot, snapshot)?;
         if observation == Observation::Installed {
             let snapshot = self.explore.snapshot.as_ref().expect("installed snapshot");
-            if let Some(request) = self.explore.requested_upscale.as_mut() {
+            if let Some(request) = self.requested_upscale.as_mut().filter(|request| request.source.source.kind == PresentationSourceKind::Explore) {
                 if !dataset_changed
                     && same_image
                     && snapshot.mode == crate::generated::ExploreMode::Detail
@@ -436,8 +439,8 @@ impl ApplicationModel {
                     request.source = snapshot.frame.clone();
                     request.document = snapshot.document.clone();
                 } else {
-                    self.explore.requested_upscale = None;
-                    self.explore.sent_upscale = None;
+                    self.requested_upscale = None;
+                    self.sent_upscale = None;
                     if self.presentation_model.foreground() == Some(PresentationSourceKind::Upscale)
                     {
                         self.set_foreground_visual(Some(PresentationSourceKind::Explore));
@@ -446,7 +449,7 @@ impl ApplicationModel {
             }
         }
         if observation == Observation::Installed
-            && self.explore.requested_upscale.is_some()
+            && self.requested_upscale.as_ref().is_some_and(|request| request.source.source.kind == PresentationSourceKind::Explore)
             && self.current_upscale().is_none()
         {
             self.set_foreground_visual(Some(PresentationSourceKind::Explore));

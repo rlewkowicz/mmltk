@@ -60,7 +60,7 @@ impl Controller {
         if self.suspended.is_none() {
             self.suspended = Some(SuspendedViewer {
                 route,
-                request: model.explore.requested_upscale.clone(),
+                request: model.requested_upscale.clone(),
             });
         }
     }
@@ -77,6 +77,38 @@ impl Controller {
     ) -> Option<ViewerOutcome> {
         if model.connection != crate::view_model::ConnectionState::Connected {
             return None;
+        }
+        if route == FeatureId::Validate {
+            let source = model.workflow.validation.as_ref().filter(|value| value.detail && value.selected.is_some()
+                && !model.has_pending(ApplicationIntentEndpoint::ValidationSelectSample)
+                && !model.has_pending(ApplicationIntentEndpoint::ValidationCloseDetail));
+            let identity = source.map(|value| (value.contentidentity, value.selected.as_ref().unwrap().datasetindex));
+            if let Some(suspended) = self.suspended.take() {
+                if suspended.route == route && identity == self.viewer
+                    && suspended.request.as_ref().is_some_and(|request| source.is_some_and(|snapshot|
+                        snapshot.frame == request.source && snapshot.document == request.document)) {
+                    return suspended.request.map(ViewerOutcome::Opened);
+                }
+                // A changed retained sample must reopen through its current native facts.
+                self.viewer = None;
+            }
+            if identity == self.viewer {
+                if let (Some(source), Some(request)) = (source, model.requested_upscale.as_ref())
+                    && request.source != source.frame {
+                    return Some(ViewerOutcome::Opened(crate::generated::UpscaleRequest {
+                        source: source.frame.clone(), document: source.document.clone(), kernel: request.kernel,
+                    }));
+                }
+                return None;
+            }
+            if let Some(source) = source {
+                let replaced = self.viewer.is_some();
+                self.suspended = None;
+                self.viewer = identity;
+                let request = crate::generated::UpscaleRequest { source: source.frame.clone(), document: source.document.clone(), kernel: crate::generated::UpscaleKernel::Default };
+                return Some(if replaced { ViewerOutcome::Replaced(request) } else { ViewerOutcome::Opened(request) });
+            }
+            return self.abandon_viewer();
         }
         let source = model.explore.snapshot.as_ref().filter(|snapshot| {
             route == FeatureId::Explore
@@ -279,7 +311,6 @@ impl App {
     pub(super) fn abandon_viewer(&mut self) {
         let outcome = self.presentation.abandon_viewer().or_else(|| {
             self.model
-                .explore
                 .requested_upscale
                 .is_some()
                 .then_some(ViewerOutcome::Abandoned)
@@ -288,9 +319,9 @@ impl App {
     }
 
     fn finish_viewer_departure(&mut self, stop: bool) {
+        let source = if self.workspace.active() == FeatureId::Validate { PresentationSourceKind::Validation } else { self.model.viewer_native_kind() };
         self.model.abandon_viewer();
-        self.model
-            .set_foreground_visual(Some(PresentationSourceKind::Explore));
+        self.model.set_foreground_visual(Some(source));
         self.presentation.stop_requested |= stop;
         self.dispatch_viewer_desired();
     }
@@ -321,7 +352,7 @@ impl App {
         // pending. Keep that exact request when applying the automatic open.
         if let Some(ViewerOutcome::Opened(request) | ViewerOutcome::Replaced(request)) =
             &mut outcome
-            && let Some(selected) = self.model.explore.requested_upscale.as_ref()
+            && let Some(selected) = self.model.requested_upscale.as_ref()
             && selected.source == request.source
             && selected.document == request.document
         {
@@ -582,7 +613,7 @@ mod tests {
         for changed in 0..4 {
             let (mut app, _) = viewer_app();
             app.reconcile_viewer();
-            let mut request = app.model.explore.requested_upscale.clone().unwrap();
+            let mut request = app.model.requested_upscale.clone().unwrap();
             request.kernel = UpscaleKernel::RealPlksr;
             app.model.request_upscale(request.clone());
             app.reconcile_viewer();
@@ -664,9 +695,9 @@ mod tests {
             assert_eq!(starts, usize::from(changed != 3));
             if changed == 3 {
                 assert!(app.presentation.viewer.is_none());
-                assert!(app.model.explore.requested_upscale.is_none());
+                assert!(app.model.requested_upscale.is_none());
             } else {
-                let restored = app.model.explore.requested_upscale.as_ref().unwrap();
+                let restored = app.model.requested_upscale.as_ref().unwrap();
                 assert_eq!(
                     restored.kernel,
                     if changed == 0 {
@@ -677,7 +708,7 @@ mod tests {
                 );
                 assert_eq!(restored.source, explore.frame);
                 assert_eq!(restored.document, explore.document);
-                assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(restored));
+                assert_eq!(app.model.sent_upscale.as_ref(), Some(restored));
             }
         }
     }
@@ -686,7 +717,7 @@ mod tests {
     fn direct_viewer_replacement_uses_one_abandonment_before_basic_dispatch() {
         let (mut app, _) = viewer_app();
         app.reconcile_viewer();
-        let mut request = app.model.explore.requested_upscale.clone().unwrap();
+        let mut request = app.model.requested_upscale.clone().unwrap();
         request.kernel = crate::generated::UpscaleKernel::RealPlksr;
         app.model.request_upscale(request);
         app.reconcile_viewer();
@@ -698,10 +729,10 @@ mod tests {
         let (sender, mut receiver) = Connection::test_channel();
         app.connection = Some(sender);
         app.reconcile_presentation(false);
-        let requested = app.model.explore.requested_upscale.clone().unwrap();
+        let requested = app.model.requested_upscale.clone().unwrap();
         assert_eq!(requested.kernel, crate::generated::UpscaleKernel::Default);
         assert_eq!(app.presentation.viewer.unwrap().1, 1);
-        assert!(app.model.explore.sent_upscale.is_none());
+        assert!(app.model.sent_upscale.is_none());
         let crate::transport_connection::CapturedRecord::Intent(stop) =
             receiver.try_recv().expect("expected replacement Stop")
         else {
@@ -714,7 +745,7 @@ mod tests {
             )
         );
         settle_upscale_stop(&mut app, stop.correlation);
-        assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&requested));
+        assert_eq!(app.model.sent_upscale.as_ref(), Some(&requested));
         let start = loop {
             let crate::transport_connection::CapturedRecord::Intent(intent) =
                 receiver.try_recv().expect("expected replacement Basic")
@@ -740,7 +771,7 @@ mod tests {
     fn viewer_owner_auto_runs_basic_once_and_abandons_only_on_departure() {
         let (mut app, _) = viewer_app();
         app.reconcile_viewer();
-        let request = app.model.explore.requested_upscale.clone().unwrap();
+        let request = app.model.requested_upscale.clone().unwrap();
         assert_eq!(request.kernel, crate::generated::UpscaleKernel::Default);
         app.model.request_upscale(crate::generated::UpscaleRequest {
             kernel: crate::generated::UpscaleKernel::RealPlksr,
@@ -748,7 +779,7 @@ mod tests {
         });
         app.reconcile_viewer();
         assert_eq!(
-            app.model.explore.requested_upscale.as_ref().unwrap().kernel,
+            app.model.requested_upscale.as_ref().unwrap().kernel,
             crate::generated::UpscaleKernel::RealPlksr
         );
         assert!(matches!(
@@ -856,7 +887,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         settle_upscale_stop(&mut app, stop.correlation);
         assert!(app.model.error.is_none());
-        let latest = app.model.explore.requested_upscale.clone().unwrap();
+        let latest = app.model.requested_upscale.clone().unwrap();
         let crate::transport_connection::CapturedRecord::Intent(start) = receiver
             .try_recv()
             .expect("expected restart after Stop settled")
@@ -889,7 +920,7 @@ mod tests {
                     .document
                     .clone(),
             });
-            app.model.explore.sent_upscale = app.model.explore.requested_upscale.clone();
+            app.model.sent_upscale = app.model.requested_upscale.clone();
             let (sender, mut receiver) = Connection::test_channel();
             app.connection = Some(sender);
             app.model
@@ -919,11 +950,11 @@ mod tests {
                     });
                 }
             }
-            let requested = app.model.explore.requested_upscale.clone().unwrap();
+            let requested = app.model.requested_upscale.clone().unwrap();
             assert_eq!(requested.kernel, crate::generated::UpscaleKernel::ShiftLut);
             assert_eq!(requested.source, revised_frame);
             assert_eq!(app.presentation.viewer, Some((revised.dataset.identity, 0)));
-            assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&requested));
+            assert_eq!(app.model.sent_upscale.as_ref(), Some(&requested));
             let mut dispatched = false;
             while let Ok(crate::transport_connection::CapturedRecord::Intent(intent)) =
                 receiver.try_recv()
@@ -1027,9 +1058,9 @@ mod tests {
                 stop_correlation.expect("expected authoritative route Stop"),
             );
             navigate(&mut app, FeatureId::Explore);
-            let request = app.model.explore.requested_upscale.as_ref().unwrap();
+            let request = app.model.requested_upscale.as_ref().unwrap();
             assert_eq!(request.kernel, crate::generated::UpscaleKernel::Default);
-            assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(request));
+            assert_eq!(app.model.sent_upscale.as_ref(), Some(request));
         }
     }
 
@@ -1075,7 +1106,7 @@ mod tests {
     ) {
         let (mut app, _) = viewer_app();
         app.reconcile_viewer();
-        let basic = app.model.explore.requested_upscale.clone().unwrap();
+        let basic = app.model.requested_upscale.clone().unwrap();
         let (sender, mut receiver) = Connection::test_channel();
         app.connection = Some(sender);
         app.dispatch_viewer_desired();
@@ -1473,8 +1504,8 @@ mod tests {
     fn assert_viewer_departed(app: &App) {
         assert_eq!(app.workspace.active(), FeatureId::Train);
         assert!(app.presentation.viewer.is_none());
-        assert!(app.model.explore.requested_upscale.is_none());
-        assert!(app.model.explore.sent_upscale.is_none());
+        assert!(app.model.requested_upscale.is_none());
+        assert!(app.model.sent_upscale.is_none());
         assert!(app.model.foreground_visual().is_none());
     }
 
@@ -1500,7 +1531,7 @@ mod tests {
                     .install(app.model.settings_snapshot.as_ref().unwrap());
             }
             app.reconcile_viewer();
-            let mut requested = app.model.explore.requested_upscale.clone().unwrap();
+            let mut requested = app.model.requested_upscale.clone().unwrap();
             requested.kernel = crate::generated::UpscaleKernel::ShiftLut;
             app.model.request_upscale(requested.clone());
             let viewer = app.presentation.viewer;
@@ -1521,10 +1552,10 @@ mod tests {
             navigate(&mut app, FeatureId::Explore);
             assert_eq!(app.presentation.viewer, viewer);
             assert_eq!(
-                app.model.explore.requested_upscale.as_ref(),
+                app.model.requested_upscale.as_ref(),
                 Some(&requested)
             );
-            assert!(app.model.explore.sent_upscale.is_none());
+            assert!(app.model.sent_upscale.is_none());
             assert_eq!(app.presentation.surface().unwrap().frame, Some(pending));
             assert_eq!(crate::presentation_surface::drawn_detail(), retained);
             assert!(receiver.try_recv().is_err());
@@ -1565,12 +1596,12 @@ mod tests {
             // After native Stop settles, no Settings or Presentation event is
             // needed to reenter this same Explore source.
             navigate(&mut app, FeatureId::Explore);
-            let basic = app.model.explore.requested_upscale.clone().unwrap();
+            let basic = app.model.requested_upscale.clone().unwrap();
             assert_eq!(basic.kernel, crate::generated::UpscaleKernel::Default);
             assert_eq!(basic.source, requested.source);
             assert_eq!(basic.document, requested.document);
             assert_eq!(app.presentation.viewer, viewer);
-            assert_eq!(app.model.explore.sent_upscale.as_ref(), Some(&basic));
+            assert_eq!(app.model.sent_upscale.as_ref(), Some(&basic));
             navigate(&mut app, FeatureId::Explore);
             assert_presentation_selection(&mut receiver, basic.source.source.clone());
             let crate::transport_connection::CapturedRecord::Intent(intent) =
@@ -1752,13 +1783,13 @@ mod tests {
             height: 1200,
         };
         let expected = upscale.frame.clone();
-        app.model.explore.requested_upscale = Some(crate::generated::UpscaleRequest {
+        app.model.requested_upscale = Some(crate::generated::UpscaleRequest {
             source: input,
             kernel: upscale.kernel,
             document: explore.document.clone(),
         });
         upscale.methods[0].available = true;
-        upscale.methods[0].completed = app.model.explore.requested_upscale.clone();
+        upscale.methods[0].completed = app.model.requested_upscale.clone();
         upscale.methods[0].frame = upscale.frame.clone();
         app.model
             .set_foreground_visual(Some(PresentationSourceKind::Upscale));

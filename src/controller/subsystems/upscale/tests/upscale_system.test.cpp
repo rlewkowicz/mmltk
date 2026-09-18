@@ -285,19 +285,24 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
     CHECK(runs->load() == 4U);
 }
 TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input provenance") {
+    const auto source_kind = GENERATE(PresentationSourceKind::Explore, PresentationSourceKind::Validation);
+    const auto displayed = [source_kind](VisualFrame frame) { frame.source.kind = source_kind; return frame; };
     auto backend = std::make_shared<FakeImageBackend>();
     MutableVisualSource source{backend, {16U, 8U}, 3U};
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
     auto runs = std::make_shared<std::atomic_uint32_t>(0U);
     EventGate events;
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
-                          [&source](const VisualFrame& frame) {
-                              auto result = source.BorrowExact(frame);
+                          [&source, source_kind](const VisualFrame& frame) {
+                              if (frame.source.kind != source_kind) return VisualDocumentRead{};
+                              auto native = frame;
+                              native.source.kind = PresentationSourceKind::Explore;
+                              auto result = source.BorrowExact(native);
                               result.image_metadata = std::make_shared<const mmltk::frameworks::serialization::wire::Value>(frame.revision);
                               return result;
                           },
                           [&events](UpscaleSystem::event_type) { events.Advance(); }};
-    const auto initial = source.frame();
+    const auto initial = displayed(source.frame());
     static_cast<void>(upscale.Start(test_upscale_request({.source = initial})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
     const auto completed_frame = upscale.snapshot().frame;
@@ -310,7 +315,7 @@ TEST_CASE("Upscale semantic revisions reuse clean pixels and retain exact input 
     backend->watched_copy_source.store(baseline.pixels.plane(1U).plane().data);
     CHECK(upscale.snapshot().input == initial);
     source.SetSemantics(55U);
-    const auto current = source.frame();
+    const auto current = displayed(source.frame());
     REQUIRE(current.clean_revision == initial.clean_revision);
     REQUIRE(current.revision != initial.revision);
     CHECK(upscale.ImageSourceMetadata(completed_frame) == retained_metadata);

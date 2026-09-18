@@ -14,6 +14,14 @@ struct RgbaPixelU8 {
     std::uint8_t b = 0U;
     std::uint8_t a = 0U;
 };
+// The established ground-truth layer keeps its alpha. Addition affects RGB only,
+// once between completed layers; transparent pixels preserve the other layer.
+__host__ __device__ inline RgbaPixelU8 add_layer_rgb(RgbaPixelU8 ground_truth, RgbaPixelU8 prediction) {
+    if (!ground_truth.a) return prediction;
+    if (!prediction.a) return ground_truth;
+    const auto add = [](unsigned a, unsigned b) { return static_cast<std::uint8_t>(a + b > 255U ? 255U : a + b); };
+    return {add(ground_truth.r, prediction.r), add(ground_truth.g, prediction.g), add(ground_truth.b, prediction.b), ground_truth.a};
+}
 __device__ __forceinline__ std::uint8_t clamp_to_u8(const float value) { return static_cast<std::uint8_t>(fminf(255.0f, fmaxf(0.0f, value))); }
 __device__ __forceinline__ std::uint8_t* pitched_pixel_ptr(std::uint8_t* base, const std::size_t pitch_bytes, const int x, const int y,
                                                            const std::size_t channel_count) {

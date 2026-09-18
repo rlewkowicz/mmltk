@@ -237,7 +237,7 @@ impl State {
                 if snapshot.settingsstate.ui.showworkspaceperformance != expected {
                     return Task::none();
                 }
-                if model.explore.requested_upscale != self.viewer_continuity_request
+                if model.requested_upscale != self.viewer_continuity_request
                     || model.current_upscale().is_none_or(|upscale| {
                         self.upscale_cached_frames[2].as_ref() != Some(&upscale.frame)
                     })
@@ -292,7 +292,7 @@ impl State {
             }
             Phase::ViewerDepart => {
                 if active != FeatureId::Train
-                    || model.explore.requested_upscale.is_some()
+                    || model.requested_upscale.is_some()
                     || model.has_pending(crate::generated::ApplicationIntentEndpoint::UpscaleStop)
                     || !route_edit_available(model, settings)
                 {
@@ -373,7 +373,7 @@ impl State {
                 let Some(upscale) = model.current_upscale() else {
                     return Task::none();
                 };
-                let Some(request) = model.explore.requested_upscale.as_ref() else {
+                let Some(request) = model.requested_upscale.as_ref() else {
                     return Task::none();
                 };
                 if request.kernel != crate::generated::UpscaleKernel::Default
@@ -478,7 +478,7 @@ impl State {
                 if model.connection != crate::view_model::ConnectionState::Connected
                     || model.error.is_some()
                     || active != FeatureId::Explore
-                    || model.explore.requested_upscale != self.viewer_continuity_request
+                    || model.requested_upscale != self.viewer_continuity_request
                 {
                     return Task::none();
                 }
@@ -2911,7 +2911,7 @@ impl State {
                 let Some(snapshot) = model.explore.snapshot.as_ref() else {
                     return Task::none();
                 };
-                let Some(request) = model.explore.requested_upscale.as_ref() else {
+                let Some(request) = model.requested_upscale.as_ref() else {
                     return Task::none();
                 };
                 let Some(upscale) = model.current_upscale() else {
@@ -3406,7 +3406,7 @@ impl State {
                             );
                             return Task::none();
                         }
-                        self.viewer_continuity_request = model.explore.requested_upscale.clone();
+                        self.viewer_continuity_request = model.requested_upscale.clone();
                         self.viewer_continuity_settings_revision = snapshot.revision;
                         self.viewer_continuity_performance =
                             snapshot.settingsstate.ui.showworkspaceperformance;

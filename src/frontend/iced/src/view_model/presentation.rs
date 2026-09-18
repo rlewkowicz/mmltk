@@ -58,17 +58,34 @@ impl ApplicationModel {
         })
     }
 
+    pub(crate) fn viewer_base_source(&self) -> Option<(&VisualFrame, &crate::generated::VisualDocumentFacts)> {
+        let validation = self.foreground_visual() == Some(PresentationSourceKind::Validation)
+            || (self.foreground_visual() == Some(PresentationSourceKind::Upscale)
+                && self.requested_upscale.as_ref().is_some_and(|request| request.source.source.kind == PresentationSourceKind::Validation));
+        if validation {
+            let snapshot = self.workflow.validation.as_ref().filter(|value| value.detail)?;
+            return Self::valid_visual_source(&snapshot.frame).map(|_| (&snapshot.frame, &snapshot.document));
+        }
+        let snapshot = self.explore.snapshot.as_ref()?;
+        (snapshot.mode == crate::generated::ExploreMode::Detail && snapshot.selectedimage.is_some()
+            && self.explore.requested_selection.is_none_or(|image| snapshot.selectedimage == Some(image)))
+            .then_some((&snapshot.frame, &snapshot.document))
+    }
+    pub(crate) fn viewer_native_kind(&self) -> PresentationSourceKind {
+        self.requested_upscale.as_ref().map_or(PresentationSourceKind::Explore, |request| request.source.source.kind)
+    }
     pub fn request_upscale(&mut self, request: crate::generated::UpscaleRequest) {
-        self.explore.requested_upscale = Some(request);
+        let source_kind = request.source.source.kind;
+        self.requested_upscale = Some(request);
         if self.current_upscale().is_some() {
             self.set_foreground_visual(Some(PresentationSourceKind::Upscale));
         } else {
-            self.set_foreground_visual(Some(PresentationSourceKind::Explore));
+            self.set_foreground_visual(Some(source_kind));
         }
     }
 
     pub fn displayed_upscale_kernel(&self) -> Option<crate::generated::UpscaleKernel> {
-        let explore = self.explore.snapshot.as_ref()?;
+        let (source, document) = self.viewer_base_source()?;
         let upscale = self.upscale_snapshot.as_ref()?;
         let (surface, _) = crate::presentation_surface::drawn_detail()?;
         let drawn = surface.frame?;
@@ -79,8 +96,8 @@ impl ApplicationModel {
             .find_map(|(method, kernel)| {
                 (method.available
                     && method.completed.as_ref().is_some_and(|request| {
-                        request.source == explore.frame
-                            && request.document == explore.document
+                        &request.source == source
+                            && &request.document == document
                             && request.kernel == kernel
                     })
                     && drawn.matches_content(&method.frame))
@@ -89,20 +106,15 @@ impl ApplicationModel {
     }
 
     pub fn current_upscale(&self) -> Option<&crate::generated::UpscaleSnapshot> {
-        let explore = self.explore.snapshot.as_ref()?;
-        let request = self.explore.requested_upscale.as_ref()?;
+        let (source, document) = self.viewer_base_source()?;
+        let request = self.requested_upscale.as_ref()?;
         let upscale = self.upscale_snapshot.as_ref()?;
-        (explore.mode == crate::generated::ExploreMode::Detail
-            && explore.selectedimage.is_some()
-            && self
-                .explore
-                .requested_selection
-                .is_none_or(|image| explore.selectedimage == Some(image))
+        (Self::valid_visual_source(source).is_some()
             && upscale.ready
             && upscale.kernel == request.kernel
             && upscale.input == request.source
-            && explore.frame == request.source
-            && explore.document == request.document
+            && source == &request.source
+            && document == &request.document
             && upscale.methods.iter().any(|method| {
                 method.available
                     && method.completed.as_ref() == Some(request)
@@ -182,10 +194,11 @@ impl ApplicationModel {
     }
 
     pub fn set_foreground_feature(&mut self, feature: FeatureId) {
-        if feature == FeatureId::Explore
+        if ((feature == FeatureId::Explore && self.viewer_native_kind() == PresentationSourceKind::Explore)
+            || (feature == FeatureId::Validate && self.viewer_native_kind() == PresentationSourceKind::Validation))
             && matches!(
                 self.presentation_model.foreground(),
-                Some(PresentationSourceKind::Explore | PresentationSourceKind::Upscale)
+                Some(PresentationSourceKind::Explore | PresentationSourceKind::Validation | PresentationSourceKind::Upscale)
             )
         {
             return;
@@ -195,8 +208,8 @@ impl ApplicationModel {
     }
 
     pub(crate) fn abandon_viewer(&mut self) {
-        self.explore.requested_upscale = None;
-        self.explore.sent_upscale = None;
+        self.requested_upscale = None;
+        self.sent_upscale = None;
         self.explore.requested_selection = None;
         self.explore.desired_selection = None;
     }
@@ -275,7 +288,7 @@ mod tests {
         explore.mode = crate::generated::ExploreMode::Detail;
         explore.selectedimage = Some(3);
         explore.frame = source.clone();
-        model.explore.requested_upscale = Some(crate::generated::UpscaleRequest {
+        model.requested_upscale = Some(crate::generated::UpscaleRequest {
             source: source.clone(),
             kernel,
             document: explore.document.clone(),
@@ -284,11 +297,41 @@ mod tests {
     }
 
     #[test]
+    fn validation_upscale_requests_keep_their_source_independent_of_explore() {
+        let mut model = bootstrapped();
+        let document = model.explore.snapshot.as_ref().unwrap().document.clone();
+        let validation = model.workflow.validation.as_mut().unwrap();
+        validation.detail = true;
+        validation.selected = Some(crate::generated::ValidationSampleIdentity { generation: 7, datasetindex: 42 });
+        validation.frame = visual_frame(PresentationSourceKind::Validation, 11);
+        validation.document = document.clone();
+        let source = validation.frame.clone();
+        model.set_foreground_feature(FeatureId::Validate);
+        let request = crate::generated::UpscaleRequest { source: source.clone(), document, kernel: crate::generated::UpscaleKernel::Default };
+        model.request_upscale(request.clone());
+        assert_eq!(model.foreground_visual(), Some(PresentationSourceKind::Validation));
+        let upscale = model.upscale_snapshot.as_mut().unwrap();
+        upscale.ready = true;
+        upscale.input = source;
+        upscale.frame = visual_frame(PresentationSourceKind::Upscale, 12);
+        upscale.methods[0].available = true;
+        upscale.methods[0].completed = Some(request.clone());
+        upscale.methods[0].frame = upscale.frame.clone();
+        model.request_upscale(request);
+        assert_eq!(model.foreground_visual(), Some(PresentationSourceKind::Upscale));
+        assert!(model.current_upscale().is_some());
+        model.explore.snapshot.as_mut().unwrap().frame.revision += 1;
+        assert!(model.current_upscale().is_some());
+        model.workflow.validation.as_mut().unwrap().frame.revision += 1;
+        assert!(model.current_upscale().is_none());
+    }
+
+    #[test]
     fn completed_method_requires_matching_draw_and_same_method_click_reselects_it() {
         let mut model = bootstrapped();
         let kernel = crate::generated::UpscaleKernel::ShiftLut;
         let source = select_upscale_source(&mut model, kernel);
-        let request = model.explore.requested_upscale.clone().unwrap();
+        let request = model.requested_upscale.clone().unwrap();
         let upscale = model.upscale_snapshot.as_mut().unwrap();
         upscale.ready = true;
         upscale.kernel = kernel;
@@ -299,13 +342,13 @@ mod tests {
         upscale.methods[1].frame = upscale.frame.clone();
         let frame = upscale.frame.clone();
         crate::presentation_surface::clear_drawn_detail();
-        model.explore.sent_upscale = Some(request.clone());
+        model.sent_upscale = Some(request.clone());
         model.request_upscale(request.clone());
         assert_eq!(
             model.presentation_model.foreground(),
             Some(PresentationSourceKind::Upscale)
         );
-        assert_eq!(model.explore.sent_upscale, Some(request.clone()));
+        assert_eq!(model.sent_upscale, Some(request.clone()));
         assert_eq!(model.displayed_upscale_kernel(), None);
         let drawn = crate::presentation_surface::FrameReady {
             source_high: 0,
@@ -373,7 +416,7 @@ mod tests {
         replacement.revision += 1;
         replacement.dataset.identity += 1;
         model.install_explore_snapshot(replacement, true).unwrap();
-        assert!(model.explore.requested_upscale.is_none());
+        assert!(model.requested_upscale.is_none());
         assert!(model.current_upscale().is_none());
     }
 
@@ -381,8 +424,8 @@ mod tests {
     fn upscale_failed_admission_can_be_explicitly_retried_without_retrying_automatically() {
         let mut model = bootstrapped();
         select_upscale_source(&mut model, crate::generated::UpscaleKernel::Default);
-        let request = model.explore.requested_upscale.clone().unwrap();
-        model.explore.sent_upscale = Some(request.clone());
+        let request = model.requested_upscale.clone().unwrap();
+        model.sent_upscale = Some(request.clone());
         let correlation = model
             .begin_intent(ApplicationIntentEndpoint::UpscaleStart)
             .unwrap();
@@ -399,14 +442,14 @@ mod tests {
                 kind: crate::generated::UpscaleFailureKind::Unavailable,
             },
         ));
-        assert!(model.explore.requested_upscale.is_none());
-        assert!(model.explore.sent_upscale.is_none());
+        assert!(model.requested_upscale.is_none());
+        assert!(model.sent_upscale.is_none());
         // The admitted reply still settles its correlation; retry is a later user intent.
         let reply = model.upscale_snapshot.clone().unwrap();
         model.reduce_reply(correlation, Ok(ApplicationReply::UpscaleStart(reply)));
         model.request_upscale(request.clone());
-        assert_eq!(model.explore.requested_upscale, Some(request));
-        assert!(model.explore.sent_upscale.is_none());
+        assert_eq!(model.requested_upscale, Some(request));
+        assert!(model.sent_upscale.is_none());
     }
 
     #[test]
@@ -855,7 +898,7 @@ mod tests {
         upscale.ready = true;
         upscale.frame = visual_frame(PresentationSourceKind::Upscale, 1);
         upscale.methods[0].available = true;
-        upscale.methods[0].completed = model.explore.requested_upscale.clone();
+        upscale.methods[0].completed = model.requested_upscale.clone();
         upscale.methods[0].frame = upscale.frame.clone();
         assert_eq!(
             model.reduce_event(ApplicationEvent::UpscaleUpscaleChanged(
@@ -881,7 +924,7 @@ mod tests {
         assert!(model.current_upscale().is_none());
         upscale.kernel = crate::generated::UpscaleKernel::RealPlksr;
         upscale.methods[2].available = true;
-        upscale.methods[2].completed = model.explore.requested_upscale.clone();
+        upscale.methods[2].completed = model.requested_upscale.clone();
         upscale.methods[2].frame = upscale.frame.clone();
         model.upscale_snapshot = Some(upscale.clone());
         assert!(model.current_upscale().is_some());

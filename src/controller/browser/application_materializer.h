@@ -218,7 +218,7 @@ template <class Composition>
                     const auto source = system->ImageSourceMetadata(frame);
                     if (!source) return std::nullopt;
                     Schema::VisitVisualSources([&]<class SourceCell, std::meta::info, class SourceProjection>() {
-                        if constexpr (SourceProjection::kind == PresentationSourceKind::Explore)
+                        if (SourceProjection::kind == snapshot.input.source.kind)
                             metadata.source = SystemSnapshot{.system_id = SourceCell::stable_id, .value = *source};
                     });
                     if (!metadata.source) return std::nullopt;

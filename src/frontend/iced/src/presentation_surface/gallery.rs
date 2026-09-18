@@ -68,7 +68,7 @@ pub(super) fn row_offset(layout: Placement, snapshot: &ExploreImageMetadata, wid
                     / snapshot.gallery.layout.columns.max(1) as f32
                     - first_row as f32 / columns.max(1) as f32)
         }
-        Placement::Contain => 0.0,
+        Placement::Contain | Placement::FixedGrid { .. } => 0.0,
     }
 }
 

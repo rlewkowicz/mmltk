@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <ranges>
 #include <set>
 #include <sstream>
@@ -317,6 +318,35 @@ class SyntheticVisualSystem final {
     void RequestWorkspace(VisualWorkspaceRequest) {}
     mutable std::size_t samples = 0U;
 };
+struct SyntheticDerivedSnapshot final {
+    std::uint64_t revision = 1U;
+    VisualFrame frame{};
+    VisualFrame input{};
+};
+MMLTK_REFLECT_FIELDS(SyntheticDerivedSnapshot)
+class SyntheticDerivedSystem final {
+   public:
+    using event_type = std::variant<SyntheticChanged>;
+    using visual_source = VisualSourceProjection<SyntheticDerivedSnapshot, PresentationSourceKind::Upscale,
+        mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::frame>,
+        mmltk::frameworks::reflection::member_path<&SyntheticDerivedSnapshot::revision>, SyntheticDerivedSnapshot>;
+    [[= contracts::reflection::Snapshot{64U * 1024U}]] SyntheticDerivedSnapshot snapshot() const {
+        return {.frame = visual_frame({PresentationSourceKind::Upscale, 1U}, {48U, 32U}, 9U), .input = input};
+    }
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageProductReadView BorrowFrame() const { return {}; }
+    [[nodiscard]] mmltk::frameworks::gpu::BorrowedImageWorkspace BorrowWorkspace() const { return {}; }
+    [[nodiscard]] mmltk::frameworks::gpu::ImageWorkspaceObservation ObserveWorkspace() const { return {}; }
+    void RequestWorkspace(VisualWorkspaceRequest) {}
+    auto ImageSourceMetadata(const VisualFrame&) const { return source; }
+    VisualFrame input{};
+    std::shared_ptr<const wire::Value> source;
+};
+struct DerivedVisualComposition final {
+    SyntheticVisualSystem<PresentationSourceKind::Explore>* explore = nullptr;
+    SyntheticVisualSystem<PresentationSourceKind::Validation>* validation = nullptr;
+    SyntheticDerivedSystem* derived = nullptr;
+    TestSettingsSystem* settings = nullptr;
+};
 struct SyntheticVisualComposition final {
     SyntheticVisualSystem<PresentationSourceKind::Predict>* producer = nullptr;
 };
@@ -476,6 +506,38 @@ struct InheritedSettings final : InheritedSettingsBase {
 MMLTK_REFLECT_FIELDS(DirectInheritanceSettings)
 MMLTK_REFLECT_FIELDS(InheritedSettingsBase)
 MMLTK_REFLECT_FIELDS(InheritedSettings)
+TEST_CASE("derived image envelopes select the exact reflected source system") {
+    SyntheticVisualSystem<PresentationSourceKind::Explore> explore;
+    SyntheticVisualSystem<PresentationSourceKind::Validation> validation;
+    SyntheticDerivedSystem derived;
+    TestSettingsSystem settings;
+    const auto readers = materialize_visual_source_readers(DerivedVisualComposition{&explore, &validation, &derived, &settings});
+    const auto found = std::ranges::find_if(readers, [](const auto& reader) { return reader.source.kind == PresentationSourceKind::Upscale; });
+    REQUIRE(found != readers.end());
+    for (const auto kind : {PresentationSourceKind::Explore, PresentationSourceKind::Validation}) {
+        derived.input = kind == PresentationSourceKind::Explore ? explore.snapshot().product : validation.snapshot().product;
+        auto source = mmltk::frameworks::serialization::reflected_transport_value(VisualImageMetadata{derived.input});
+        REQUIRE(source);
+        derived.source = std::make_shared<const wire::Value>(*source);
+        const auto bytes = found->image_metadata(derived.snapshot().frame);
+        REQUIRE(bytes);
+        auto decoded = wire::decode({.first = *bytes}, {.max_bytes = 4096U, .max_items = 1024U, .max_depth = wire::kMaximumNestingDepth});
+        REQUIRE(decoded);
+        std::uint64_t source_id = 0U, product_id = 0U;
+        ApplicationSchema<DerivedVisualComposition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
+            if (Projection::kind == kind) source_id = Cell::stable_id;
+            if (Projection::kind == PresentationSourceKind::Upscale) product_id = Cell::stable_id;
+        });
+        const auto product = mmltk::frameworks::serialization::reflected_transport_value(derived.snapshot());
+        REQUIRE(product);
+        const auto expected = mmltk::frameworks::serialization::reflected_transport_value(WorkspaceImageMetadata{
+            .schema_fingerprint = application_schema_fingerprint<DerivedVisualComposition>().words,
+            .frame = derived.snapshot().frame, .product = {.system_id = product_id, .value = *product},
+            .source = SystemSnapshot{.system_id = source_id, .value = *source}});
+        REQUIRE(expected);
+        CHECK(*decoded == *expected);
+    }
+}
 TEST_CASE("canonical application schema owns endpoint dispatch and stable identities", "[controller][browser][reflection]") {
     using Surface = ApplicationIntentSurface<TestSystems>;
     STATIC_REQUIRE(Surface::count == 2U);

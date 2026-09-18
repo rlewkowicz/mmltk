@@ -696,16 +696,12 @@ impl App {
 
     pub(super) fn on_validate(&mut self, outcome: crate::view::validate::Outcome) -> Task<Message> {
         match outcome {
-            crate::view::validate::Outcome::Details(query) => {
-                self.submit_intent(
-                    ApplicationIntentEndpoint::ValidationDetails,
-                    |correlation| crate::generated::encode_validation_Details(correlation, query),
-                );
-            }
             crate::view::validate::Outcome::Sample(message) => {
                 use crate::view::validate::samples::Message as Sample;
                 match message {
                     Sample::Select(identity) => {
+                        self.abandon_viewer();
+                        self.model.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Validation));
                         self.submit_intent(
                             ApplicationIntentEndpoint::ValidationSelectSample,
                             |correlation| {
@@ -717,6 +713,8 @@ impl App {
                         );
                     }
                     Sample::Close => {
+                        self.abandon_viewer();
+                        self.model.set_foreground_visual(Some(crate::generated::PresentationSourceKind::Validation));
                         self.submit_intent(
                             ApplicationIntentEndpoint::ValidationCloseDetail,
                             crate::generated::encode_validation_CloseDetail,
@@ -732,6 +730,15 @@ impl App {
                                 )
                             },
                         );
+                    }
+                    Sample::Upscale(kernel) => {
+                        if self.model.upscale_start_available() && let Some(request) = crate::presentation_surface::viewer_upscale_request(kernel) {
+                            self.model.request_upscale(request);
+                            self.dispatch_viewer_desired();
+                        }
+                    }
+                    Sample::OpenAnnotation => {
+                        if self.copy_viewer_to_annotation() { return self.transition_page(FeatureId::Annotate); }
                     }
                     Sample::Fit | Sample::Labels(..) => {}
                 }

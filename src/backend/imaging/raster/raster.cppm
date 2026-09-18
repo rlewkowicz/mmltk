@@ -89,6 +89,7 @@ struct InstanceOverlayRgbaWork final {
     int box_thickness = 1;
     NativeStream stream{};
     bool labels = true;
+    bool add_rgb_to_existing = false;
 };
 struct CompositeRgbaOverBgrWork final {
     MutableBytes base_bgr{};

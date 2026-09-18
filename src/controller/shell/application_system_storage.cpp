@@ -132,6 +132,7 @@ mmltk::frameworks::gpu::BorrowedImageProductReadView ApplicationSystemStorage::B
 ApplicationSystemStorage::~ApplicationSystemStorage() { presentation_notifications_.store(nullptr, std::memory_order_release); }
 VisualDocumentRead ApplicationSystemStorage::BorrowDocument(const VisualFrame& frame) const {
     if (frame.source.kind == PresentationSourceKind::Explore) return explore_->BorrowDocument(frame);
+    if (frame.source.kind == PresentationSourceKind::Validation) return validation_->BorrowDocument(frame);
     if (frame.source.kind == PresentationSourceKind::Upscale) return upscale_->BorrowDocument(frame);
     auto pixels = BorrowExactFrame(frame);
     if (!pixels.valid()) return {};

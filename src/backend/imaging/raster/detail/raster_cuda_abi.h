@@ -129,6 +129,7 @@ struct AnalysisOverlayRgbaPitchedLaunch {
     int box_thickness = 1;
     cudaStream_t stream = nullptr;
     bool labels = true;
+    bool add_rgb_to_existing = false;
 };
 struct CompositeRgbaOverBgrPitchedLaunch {
     MutableSurfaceU8 base_bgr;

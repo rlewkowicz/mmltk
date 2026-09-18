@@ -15,13 +15,11 @@ pub enum Message {
     Model(crate::view::workflow::model_card::Message),
     // CLEANUP-IGNORE: Validate retains its generated batch-size message before its workspace child message.
     BatchSizeChanged(u64),
-    Results(results::Message),
     Samples(samples::Message),
 }
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    Details(crate::generated::EvaluationDetailQuery),
     Sample(samples::Message),
     StartRequested,
     StopRequested,
@@ -34,15 +32,15 @@ pub enum Outcome {
 
 pub struct Component {
     model_card: crate::view::workflow::model_card::Component,
-    results: results::Component,
     samples: samples::Component,
+    pub(crate) input: crate::workspace_input::Binding,
 }
 
 impl Default for Component {
     fn default() -> Self {
         Self {
-            results: Default::default(),
             samples: Default::default(),
+            input: Default::default(),
             model_card: crate::view::workflow::model_card::Component::new(
                 // CLEANUP-IGNORE: Validate binds the child owner to its generated feature.
                 crate::generated::FeatureId::Validate,
@@ -92,7 +90,8 @@ impl Component {
                 .workflow
                 .validation
                 .as_ref()
-                .map(|snapshot| &snapshot.operation),
+                .map(|snapshot| &snapshot.operation)
+                .filter(|operation| operation.active || operation.terminal.outcome != crate::generated::ComputeOperationOutcome::Succeeded),
         );
         let setup = column![
             self.model_card
@@ -153,18 +152,26 @@ impl Component {
             crate::view::workflow::Composition::new(crate::generated::FeatureId::Validate, width)
                 .center_width()
                 - 2.0 * crate::view::workflow::CARD_PADDING;
-        let half = (center - 10.0) / 2.0;
-        let workspace = iced::widget::row![
-            container(self.results.view(model).map(Message::Results)).width(half),
-            container(
-                self.samples
-                    .view(surface, model, settings, half)
-                    .map(Message::Samples)
-            )
-            .width(half),
-        ]
-        .spacing(10)
-        .into();
+        let half = center / 2.0;
+        let paired = surface.and_then(crate::presentation_surface::drawable_validation);
+        let headings = iced::widget::row![
+            container(text("Metrics")).center_x(iced::Fill).width(half),
+            container(text("Validation Preview")).center_x(iced::Fill).width(half),
+        ].height(crate::view::aspect_ratio::HEADER_HEIGHT).align_y(iced::Center);
+        let atlas = self.samples.atlas(paired.clone(), settings, self.input.clone()).map(Message::Samples);
+        let controls = if paired.as_ref().is_some_and(|(_, content)| content.metadata.detail) {
+            iced::widget::space::horizontal().height(47).into()
+        } else { self.samples.controls(model).map(Message::Samples) };
+        let base = column![
+            headings,
+            iced::widget::row![container(results::view(model)).width(half), container(atlas).width(half)]
+                .height(center * 9.0 / 16.0),
+            controls,
+        ].spacing(crate::view::workflow::SECTION_SPACING).width(center);
+        let workspace = if let Some((surface, content)) = paired.filter(|(_, content)| content.metadata.detail) {
+            container(iced::widget::stack![base, self.samples.detail(surface, content, model, settings, self.input.clone()).map(Message::Samples)])
+                .clip(true).into()
+        } else { base.into() };
         let advanced = crate::view::shared::card(
             "Advanced",
             "Validation execution and generated constraints.",
@@ -243,15 +250,6 @@ impl Component {
                 })?,
                 // CLEANUP-IGNORE: Validate closes its local settings outcome before workspace routing.
             ),
-            Message::Results(message) => {
-                if self.results.update(&message) {
-                    return Ok(None);
-                }
-                let results::Message::Page(query) = message else {
-                    return Ok(None);
-                };
-                Outcome::Details(query)
-            }
             Message::Samples(message) => {
                 if self.samples.update(&message) {
                     return Ok(None);

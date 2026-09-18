@@ -567,10 +567,18 @@ impl ApplicationModel {
                 physical.operation = current.operation.clone();
                 physical.metrics = current.metrics.clone();
                 physical.detailrows = current.detailrows;
+                physical.overlayselection = current.overlayselection.clone();
                 if physical != *current {
                     return Err(UiError::protocol("inconsistent Validation frame revision"));
                 }
             }
+            if value.overlayselection.revision == current.overlayselection.revision
+                && value.overlayselection != current.overlayselection {
+                return Err(UiError::protocol("inconsistent Validation overlay selection revision"));
+            }
+            let selection = if value.overlayselection.revision < current.overlayselection.revision {
+                current.overlayselection.clone()
+            } else { value.overlayselection.clone() };
             let mut operation = current.operation.clone();
             let outcome =
                 super::reduction::merge_compute_state(&mut operation, value.operation.clone())?;
@@ -587,6 +595,7 @@ impl ApplicationModel {
                 value.detailrows = detail_rows;
             }
             value.operation = operation;
+            value.overlayselection = selection;
         }
         if self
             .workflow
@@ -929,6 +938,57 @@ mod validation_tests {
         model.install_settings_snapshot(settings).unwrap();
         assert_eq!(model.workflow.validation_details, retained);
     }
+    #[test]
+    fn validation_overlay_selection_settles_independently_from_physical_publication() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let mut snapshot = model.workflow.validation.clone().unwrap();
+        snapshot.frame = crate::view_model::test_support::visual_frame(PresentationSourceKind::Validation, 4);
+        model.install_validation_snapshot(snapshot.clone()).unwrap();
+        let applied = snapshot.overlays.clone();
+        let correlation = model.begin_intent(ApplicationIntentEndpoint::ValidationSetOverlays).unwrap();
+        model.reduce_reply(correlation, Err(crate::protocol::ApplicationError {
+            category: crate::generated::ApplicationErrorCategory::Failed,
+            detail: "overlay admission refused".into(),
+        }));
+        assert!(!model.has_pending(ApplicationIntentEndpoint::ValidationSetOverlays));
+        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, snapshot.overlayselection);
+        let correlation = model.begin_intent(ApplicationIntentEndpoint::ValidationSetOverlays).unwrap();
+        model.abandon_intent(correlation);
+        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, snapshot.overlayselection);
+        snapshot.overlayselection.revision += 1;
+        snapshot.overlayselection.value.groundtruthlayer = false;
+        model.project_validation_reply(11, ApplicationReply::ValidationSetOverlays(snapshot.clone()));
+        let selected = model.workflow.validation.as_ref().unwrap();
+        assert_eq!(selected.overlays, applied);
+        assert!(!selected.overlayselection.value.groundtruthlayer);
+        // A late reply for an older selection cannot undo a superseding target.
+        let older = snapshot.clone();
+        snapshot.overlayselection.revision += 1;
+        snapshot.overlayselection.value.predictionlayer = false;
+        model.install_validation_snapshot(snapshot.clone()).unwrap();
+        model.project_validation_reply(11, ApplicationReply::ValidationSetOverlays(older));
+        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, snapshot.overlayselection);
+        // Refused rendering restores the applied target without inventing a frame.
+        snapshot.overlayselection.revision += 1;
+        snapshot.overlayselection.value = applied.clone();
+        model.install_validation_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(model.workflow.validation.as_ref().unwrap().frame.revision, 4);
+        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection.value, applied);
+        snapshot.overlayselection.revision += 1;
+        snapshot.overlayselection.value.predictionlayer = false;
+        model.install_validation_snapshot(snapshot.clone()).unwrap();
+        snapshot.overlays = snapshot.overlayselection.value.clone();
+        snapshot.frame.revision += 1;
+        model.install_validation_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(model.workflow.validation.as_ref().unwrap().overlays, snapshot.overlayselection.value);
+        // The component has no preference to resurrect after transport reset.
+        model.clear_peer_state();
+        assert!(model.workflow.validation.is_none());
+        let bootstrap = crate::view_model::test_support::bootstrapped().workflow.validation.unwrap();
+        model.install_validation_snapshot(bootstrap.clone()).unwrap();
+        assert_eq!(model.workflow.validation.as_ref().unwrap().overlayselection, bootstrap.overlayselection);
+    }
+
     #[test]
     fn validation_equal_physical_revisions_require_identical_product_facts() {
         let mut model = crate::view_model::test_support::bootstrapped();

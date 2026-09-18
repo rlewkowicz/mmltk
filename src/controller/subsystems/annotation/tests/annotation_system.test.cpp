@@ -67,6 +67,36 @@ std::shared_ptr<VisualDocument> annotation_mask_document(std::string_view resour
     document->scene.objects = {{.name = contracts::AnnotationText::From("mask"), .shape = contracts::AnnotationShape::Mask, .box = {{1, 1}, {16, 16}}}};
     return document;
 }
+TEST_CASE("Annotation imports Validation ground truth and retains receiver pixels after source release") {
+    auto backend = std::make_shared<FakeImageBackend>();
+    std::optional<MutableVisualSource> source(std::in_place, backend, VisualExtent{16U, 16U}, 37U);
+    auto document = annotation_mask_document("validation://sample");
+    document->scene.categories[0].value = "ground truth";
+    document->scene.objects[0].mask.present = true;
+    document->mask_contains = [](std::size_t object, float x, float y) { return object == 0U && x >= 0.25F && x < 0.5F && y >= 0.25F && y < 0.5F; };
+    auto frame = source->frame();
+    frame.source.kind = PresentationSourceKind::Validation;
+    EventGate events;
+    AnnotationSystem annotation{kDevice, TestAnnotationAlgorithm::CreateRuntime(backend),
+        [&](const VisualFrame& requested) {
+            if (!source || requested != frame) return VisualDocumentRead{};
+            auto result = source->BorrowExact(source->frame());
+            result.document = document;
+            return result;
+        }, [&events](AnnotationSystem::event_type) { events.Advance(); }, mmltk::testsupport::annotation_render_evidence()};
+    mmltk::testsupport::open_annotation(annotation, events, frame);
+    const auto scene = annotation.snapshot().ui.scene;
+    REQUIRE(scene.objects.size() == 1U);
+    CHECK(scene.categories[0].value == "ground truth");
+    REQUIRE(scene.objects[0].mask.runs.size() == 4U);
+    CHECK(scene.objects[0].mask.runs.front() == contracts::AnnotationMaskRun{4U, 4U, 7U});
+    source.reset();
+    document.reset();
+    auto owned = annotation.BorrowFrame();
+    REQUIRE(owned.valid());
+    CHECK(*reinterpret_cast<const std::uint8_t*>(owned.plane(0U).plane().data) == 37U);
+    CHECK(annotation.snapshot().ui.scene == scene);
+}
 TEST_CASE("Annotation peer closure orders accepted input before replacement gestures") {
     auto backend = std::make_shared<FakeImageBackend>();
     OpenedExplore source{backend, {32U, 32U}};

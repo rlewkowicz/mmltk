@@ -10,6 +10,7 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/compute.h"
 #include "src/controller/presentation/visual_system_types.h"
+#include "src/controller/presentation/visual_document.h"
 namespace mmltk::controller {
 struct ValidationSampleIdentity final {
     std::uint64_t generation = 0U;
@@ -19,6 +20,7 @@ struct ValidationSampleIdentity final {
 struct ValidationLabel final {
     contracts::AnnotationBox box{};
     contracts::AnnotationColor color{};
+    std::array<std::uint8_t, 3> rgb{};
     std::uint32_t category = 0U;
     bool ground_truth = false;
     float confidence = 0.0F;
@@ -34,25 +36,36 @@ struct ValidationSampleMetadata final {
 struct ValidationOverlays final {
     bool prediction_boxes = true, prediction_masks = true;
     bool ground_truth_boxes = true, ground_truth_masks = true;
+    bool prediction_layer = true, ground_truth_layer = true;
     bool operator==(const ValidationOverlays&) const = default;
+};
+struct ValidationOverlaySelection final {
+    std::uint64_t revision = 0U;
+    ValidationOverlays value{};
+    bool operator==(const ValidationOverlaySelection&) const = default;
 };
 struct ValidationImageMetadata {
     VisualFrame frame{};
     ValidationOverlays overlays{};
     std::uint64_t content_identity = 0U;
     bool detail = false;
+    std::optional<ValidationSampleIdentity> selected;
+    VisualDocumentFacts document{};
     std::array<ValidationSampleMetadata, mmltk::backend::models::rfdetr::kValidationSampleCapacity> samples{};
 };
 struct ValidationSnapshot final {
     VisualFrame frame{};
     std::uint64_t content_identity = 0U;
     bool detail = false;
+    std::optional<ValidationSampleIdentity> selected;
+    VisualDocumentFacts document{};
     std::array<ValidationSampleIdentity, mmltk::backend::models::rfdetr::kValidationSampleCapacity> sample_identities{};
     std::array<bool, mmltk::backend::models::rfdetr::kValidationSampleCapacity> sample_available{};
     contracts::ComputeUiState operation{};
     std::optional<mmltk::backend::models::rfdetr::EvalSummary> metrics;
     std::uint32_t detail_rows = 0U;
     ValidationOverlays overlays{};
+    ValidationOverlaySelection overlay_selection{};
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] ValidationChanged final {
     ValidationSnapshot snapshot{};
@@ -64,6 +77,7 @@ MMLTK_REFLECT_FIELDS(ValidationSampleIdentity)
 MMLTK_REFLECT_FIELDS(ValidationLabel)
 MMLTK_REFLECT_FIELDS(ValidationSampleMetadata)
 MMLTK_REFLECT_FIELDS(ValidationOverlays)
+MMLTK_REFLECT_FIELDS(ValidationOverlaySelection)
 MMLTK_REFLECT_FIELDS(ValidationImageMetadata)
 MMLTK_REFLECT_FIELDS(ValidationSnapshot)
 MMLTK_REFLECT_FIELDS(ValidationChanged)

@@ -387,11 +387,7 @@ impl ApplicationModel {
 
     pub fn upscale_start_available(&self) -> bool {
         self.connection == ConnectionState::Connected
-            && self.explore.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.mode == crate::generated::ExploreMode::Detail
-                    && snapshot.selectedimage.is_some()
-                    && Self::valid_visual_source(&snapshot.frame).is_some()
-            })
+            && self.viewer_base_source().is_some_and(|(source, _)| Self::valid_visual_source(source).is_some())
     }
 
     pub fn annotation_save_available(&self) -> bool {

@@ -1,8 +1,8 @@
 use crate::fluent_theme::Element;
 use crate::presentation_surface::Surface;
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, checkbox, column, container, opaque, row, space, text};
-use iced::{Center, Fill, Length, Padding};
+use iced::widget::{button, checkbox, container, row, space};
+use iced::Center;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -82,7 +82,6 @@ pub(super) fn view<'a>(
     );
     let active = model.displayed_upscale_kernel();
     let pending = model
-        .explore
         .requested_upscale
         .as_ref()
         .filter(|request| active != Some(request.kernel))
@@ -94,31 +93,6 @@ pub(super) fn view<'a>(
                 .pending
                 .as_ref()
                 .map(|request| request.kernel)
-        });
-    let upscale = crate::generated::UPSCALE_KERNEL_VALUES
-        .iter()
-        .copied()
-        .fold(row![].spacing(5), |row, kernel| {
-            row.push(
-                container(
-                    button(text(if pending == Some(kernel) {
-                        format!("{}…", upscale_label(kernel))
-                    } else {
-                        upscale_label(kernel).to_owned()
-                    }))
-                    .style(if active == Some(kernel) {
-                        crate::fluent_theme::button_primary
-                    } else {
-                        crate::fluent_theme::button_secondary
-                    })
-                    .on_press_maybe(
-                        model
-                            .upscale_start_available()
-                            .then_some(Message::UpscaleRequested(kernel)),
-                    ),
-                )
-                .id(upscale_id(kernel)),
-            )
         });
     let source = row![
         container(button("Fit").on_press(Message::FitRequested)).id(super::DETAIL_FIT_ID),
@@ -133,84 +107,28 @@ pub(super) fn view<'a>(
     ]
     .spacing(7)
     .align_y(Center);
-    let panel = container(
-        column![
-            row![
-                text(format!("Sample #{}", selected)).size(20),
-                space::horizontal(),
-                container(
-                    button("Previous")
-                        .on_press_maybe(available.then_some(Message::PreviousRequested))
-                )
-                .id(super::DETAIL_PREVIOUS_ID),
-                container(
-                    button("Next").on_press_maybe(available.then_some(Message::NextRequested))
-                )
-                .id(super::DETAIL_NEXT_ID),
-                container(
-                    button("×")
-                        .on_press_maybe(available.then_some(Message::CloseRequested))
-                        .padding([2, 9])
-                )
-                .id(super::DETAIL_CLOSE_ID),
-            ]
-            .spacing(7)
-            .align_y(Center),
-            source,
-            container(image)
-                .id(super::DETAIL_WORKSPACE_ID)
-                .width(Fill)
-                .height(Fill)
-                .style(crate::fluent_theme::container_workspace),
-            row![
-                text("Wheel to zoom · right-drag to pan")
-                    .size(12)
-                    .style(crate::fluent_theme::text_secondary),
-                space::horizontal(),
-                text("Upscale"),
-                upscale,
-            ]
-            .spacing(7)
-            .align_y(Center),
-            container(
-                button("Open in Annotation")
-                    .on_press_maybe(
-                        (model.annotation_import_available() && !settings.has_local_edits())
-                            .then_some(Message::OpenAnnotationRequested),
-                    )
-                    .style(crate::fluent_theme::button_primary)
-            )
-            .id(super::DETAIL_ANNOTATE_ID),
-        ]
-        .spacing(10),
+    crate::view::image_viewer::panel(
+        selected, image, source.into(),
+        crate::view::image_viewer::PanelIds {
+            image: super::DETAIL_WORKSPACE_ID,
+            previous: super::DETAIL_PREVIOUS_ID,
+            next: super::DETAIL_NEXT_ID,
+            close: super::DETAIL_CLOSE_ID,
+            annotate: super::DETAIL_ANNOTATE_ID,
+            upscale: [super::DETAIL_UPSCALE_BASIC_ID, super::DETAIL_UPSCALE_FAST_ID, super::DETAIL_UPSCALE_NEURAL_ID],
+        },
+        available.then_some(Message::PreviousRequested),
+        available.then_some(Message::NextRequested),
+        available.then_some(Message::CloseRequested),
+        (model.annotation_import_available() && !settings.has_local_edits()).then_some(Message::OpenAnnotationRequested),
+        active, pending, model.upscale_start_available(), Message::UpscaleRequested,
     )
-    .padding(Padding::from([14, 14]))
-    .width(Length::FillPortion(4))
-    .height(Length::FillPortion(4))
-    .style(crate::fluent_theme::container_modal);
-
-    opaque(
-        container(panel)
-            .padding(32)
-            .center(Fill)
-            .width(Fill)
-            .height(Fill)
-            .style(|_theme| iced::widget::container::Style {
-                background: Some(iced::Color::BLACK.into()),
-                ..Default::default()
-            }),
-    )
-    .into()
 }
 
-fn upscale_label(kernel: crate::generated::UpscaleKernel) -> &'static str {
-    match kernel {
-        crate::generated::UpscaleKernel::Default => "Basic",
-        crate::generated::UpscaleKernel::ShiftLut => "Fast",
-        crate::generated::UpscaleKernel::RealPlksr => "Neural",
-    }
-}
+#[cfg(test)]
+use crate::view::image_viewer::upscale_label;
 
+#[cfg(test)]
 fn upscale_id(kernel: crate::generated::UpscaleKernel) -> &'static str {
     match kernel {
         crate::generated::UpscaleKernel::Default => super::DETAIL_UPSCALE_BASIC_ID,

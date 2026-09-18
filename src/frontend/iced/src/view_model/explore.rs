@@ -1,8 +1,6 @@
 #[derive(Debug, Clone, Default)]
 pub struct ExploreModel {
     pub snapshot: Option<crate::generated::ExploreSnapshot>,
-    pub requested_upscale: Option<crate::generated::UpscaleRequest>,
-    pub sent_upscale: Option<crate::generated::UpscaleRequest>,
     pub desired_overlay: Option<crate::generated::ExploreOverlay>,
     pub desired_filter: Option<crate::generated::ExploreFilterUpdate>,
     pub desired_augmentation: Option<crate::generated::ExploreAugmentationUpdate>,
@@ -209,6 +207,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                                 self.presentation_model.foreground(),
                                 Some(
                                     PresentationSourceKind::Explore
+                                        | PresentationSourceKind::Validation
                                         | PresentationSourceKind::Upscale
                                 )
                             )
@@ -222,7 +221,7 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
             ApplicationEvent::UpscaleUpscaleFailed(value) => {
                 let current_failure = value.kind == crate::generated::UpscaleFailureKind::Physical
                     || value.request.is_none()
-                    || value.request.as_ref() == self.explore.requested_upscale.as_ref();
+                    || value.request.as_ref() == self.requested_upscale.as_ref();
                 match merge_observation(
                     &mut self.upscale_snapshot,
                     value.snapshot,
@@ -232,20 +231,20 @@ impl crate::generated::UpscaleApplicationProjection<UiError> for ApplicationMode
                     Err(error) => self.error = Some(error),
                     Ok(Observation::Installed) => {
                         if self
-                            .explore
                             .requested_upscale
                             .as_ref()
                             .is_some_and(|request| value.request.as_ref() == Some(request))
                         {
-                            self.explore.requested_upscale = None;
+                            let source_kind = self.viewer_native_kind();
+                            self.requested_upscale = None;
                             if self.presentation_model.foreground()
                                 == Some(PresentationSourceKind::Upscale)
                             {
-                                self.set_foreground_visual(Some(PresentationSourceKind::Explore));
+                                self.set_foreground_visual(Some(source_kind));
                             }
                         }
-                        if value.request.as_ref() == self.explore.sent_upscale.as_ref() {
-                            self.explore.sent_upscale = None;
+                        if value.request.as_ref() == self.sent_upscale.as_ref() {
+                            self.sent_upscale = None;
                         }
                         if current_failure {
                             let (kind, title) = match value.kind {
@@ -432,7 +431,7 @@ mod tests {
         let first_correlation = model
             .begin_intent(ApplicationIntentEndpoint::UpscaleStart)
             .unwrap();
-        model.explore.sent_upscale = Some(first.clone());
+        model.sent_upscale = Some(first.clone());
         model.request_upscale(second.clone());
         let mut snapshot = model.upscale_snapshot.clone().unwrap();
         snapshot.revision += 1;
@@ -445,8 +444,8 @@ mod tests {
             },
         ));
         assert!(model.error.is_none());
-        assert!(model.explore.sent_upscale.is_none());
-        assert_eq!(model.explore.requested_upscale.as_ref(), Some(&second));
+        assert!(model.sent_upscale.is_none());
+        assert_eq!(model.requested_upscale.as_ref(), Some(&second));
         model.reduce_reply(
             first_correlation,
             Err(crate::protocol::ApplicationError {
@@ -456,7 +455,7 @@ mod tests {
         );
         assert!(model.error.is_none());
         assert!(!model.has_pending(ApplicationIntentEndpoint::UpscaleStart));
-        model.explore.sent_upscale = Some(second.clone());
+        model.sent_upscale = Some(second.clone());
         snapshot.revision += 1;
         snapshot.ready = true;
         snapshot.kernel = second.kernel;
@@ -470,7 +469,7 @@ mod tests {
             crate::generated::UpscaleChanged { snapshot },
         ));
         assert!(model.error.is_none());
-        assert_eq!(model.explore.requested_upscale.as_ref(), Some(&second));
+        assert_eq!(model.requested_upscale.as_ref(), Some(&second));
     }
 
     #[test]

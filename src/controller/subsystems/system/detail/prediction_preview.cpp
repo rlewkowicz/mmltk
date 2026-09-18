@@ -1,3 +1,4 @@
+#include "src/backend/imaging/raster/image_containment.h"
 #include "prediction_preview.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/ml/runtime/backend_factory.h"
@@ -91,6 +92,7 @@ struct PredictionPreviewFrame::State final {
     std::vector<std::uint8_t> ground_truth_colors;
     std::size_t ground_truth_offset = 0, scratch_offset = 0;
     bool composition = false, ground_truth_uploaded = false;
+    bool colors_prepared = false;
 };
 PredictionPreviewFrame::PredictionPreviewFrame(const gpu::DeviceContext& context, std::shared_ptr<gpu::TerminalCudaRetirementOwner> retirement,
                                                std::shared_ptr<void> source, gpu::CudaContextApi api)
@@ -265,6 +267,7 @@ std::shared_ptr<const PredictionPreviewFrame> PredictionPreviewPool::Capture(con
             state.ground_truth_offset = ground_truth_offset;
             state.scratch_offset = scratch_offset;
             state.composition = composition;
+            state.colors_prepared = false;
             state.ground_truth_uploaded = false;
             state.catalog = std::move(catalog);
             state.category_count = classes;
@@ -390,7 +393,13 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
             };
             if (submission->regions.size() != 1U ||
                 submission->regions.front().crop != VisualRegion{0U, 0U, submission->extent.width, submission->extent.height}) {
-                clear(clean);
+                if (submission->options.atlas_padding) {
+                    constexpr auto color = raster::kAtlasPadding;
+                    constexpr unsigned packed = unsigned(color.r) | (unsigned(color.g) << 8U) | (unsigned(color.b) << 16U) | (unsigned(color.a) << 24U);
+                    const auto status = cuMemsetD2D32Async(clean.data, clean.descriptor.pitch_bytes, packed, clean.descriptor.width, clean.descriptor.height,
+                                                        reinterpret_cast<CUstream>(stream));
+                    if (status != CUDA_SUCCESS) throw std::runtime_error("validation atlas padding failed: " + std::to_string(status));
+                } else clear(clean);
                 clear(semantic);
             }
             const auto plane_region = [](gpu::ImagePlaneView plane, VisualRegion crop) {
@@ -402,7 +411,7 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
             const auto& overlays = submission->options;
             for (const auto& region : submission->regions)
                 region.frame->DrawRegion(runtime, plane_region(clean, region.crop), plane_region(semantic, region.crop), stream, overlays.prediction_boxes,
-                                         overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks);
+                                         overlays.prediction_masks, overlays.ground_truth_boxes, overlays.ground_truth_masks, overlays.complementary_layers);
         });
         // PublishRetained's completion, including its outer stream settlement,
         // proves every source read and staging upload complete before release.
@@ -437,7 +446,7 @@ void PredictionPreviewComposition::Draw(gpu::SystemImageRuntime& runtime, gpu::S
     }
 }
 void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::ImagePlaneView clean, gpu::ImagePlaneView semantic, std::uintptr_t stream,
-                                        bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks) const {
+                                        bool prediction_boxes, bool prediction_masks, bool ground_truth_boxes, bool ground_truth_masks, bool complementary_layers) const {
     if (!CompatibleWith(runtime)) throw std::runtime_error("Preview belongs to a retired visual context");
     auto& state = *state_;
     std::lock_guard state_lock(state.mutex);
@@ -471,12 +480,16 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             checked(static_cast<cudaError_t>(
                 state.convert(reinterpret_cast<const float*>(data), state.extent.width, state.extent.height, clean_pixels, clean_pitch, cuda_stream)));
             checked(cudaMemset2DAsync(semantic_pixels, semantic_pitch, 0, pitch, state.extent.height, cuda_stream));
+            const auto draw_prediction = [&] {
             if (!state.predictions.empty() && (prediction_boxes || prediction_masks)) {
+                if (!state.colors_prepared) {
                 checked(static_cast<cudaError_t>(raster::build_category_colors_cuda({reinterpret_cast<const int*>(data + state.labels_offset),
                                                                                      state.predictions.size(),
                                                                                      state.category_count,
                                                                                      data + state.colors_offset,
                                                                                      {reinterpret_cast<void*>(stream)}})));
+                state.colors_prepared = true;
+                }
                 checked(static_cast<cudaError_t>(raster::raster_instance_overlay_rgba(
                     {.overlay = overlay,
                      .instances = {reinterpret_cast<const float*>(data + state.boxes_offset), data + state.colors_offset,
@@ -485,8 +498,11 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
                      .mask_alpha = 96U,
                      .box_thickness = prediction_boxes ? 2 : 0,
                      .stream = {reinterpret_cast<void*>(stream)},
-                     .labels = !state.composition})));
+                     .labels = !state.composition,
+                     .add_rgb_to_existing = complementary_layers && !state.ground_truth.empty() && (ground_truth_boxes || ground_truth_masks)})));
             }
+            };
+            if (!complementary_layers) draw_prediction();
             if (!state.ground_truth_uploaded && !state.ground_truth_runs.empty()) {
                 const auto bytes = state.ground_truth_runs.size() * sizeof(std::uint32_t);
                 auto* staging = static_cast<std::uint8_t*>(state.pinned->data()) + rgb_bytes;
@@ -496,8 +512,13 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
             }
             std::size_t word = 0U, gt_index = 0U;
             for (const auto& gt : state.ground_truth) {
-                const raster::RgbColor color{state.ground_truth_colors[gt_index * 3U], state.ground_truth_colors[gt_index * 3U + 1U],
+                raster::RgbColor color{state.ground_truth_colors[gt_index * 3U], state.ground_truth_colors[gt_index * 3U + 1U],
                                              state.ground_truth_colors[gt_index * 3U + 2U]};
+                if (complementary_layers) {
+                    color.r = 255U - color.r;
+                    color.g = 255U - color.g;
+                    color.b = 255U - color.b;
+                }
                 ++gt_index;
                 if (ground_truth_masks && !gt.mask.runs.empty())
                     checked(static_cast<cudaError_t>(
@@ -516,6 +537,7 @@ void PredictionPreviewFrame::DrawRegion(gpu::SystemImageRuntime& runtime, gpu::I
                                                          .stream = {reinterpret_cast<void*>(stream)}})));
                 word += gt.mask.runs.size() * 2U;
             }
+            if (complementary_layers) draw_prediction();
             if (scale) {
                 checked(
                     static_cast<cudaError_t>(raster::scale_rgba_nearest({clean_pixels, clean_pitch, overlay.width, overlay.height},

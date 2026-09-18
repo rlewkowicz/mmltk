@@ -97,6 +97,7 @@ impl Router {
         self.annotation.set_connection(connection.clone());
         self.explore.input.set_connection(connection.clone());
         self.predict.input.set_connection(connection.clone());
+        self.validate.input.set_connection(connection.clone());
         self.live.input.set_connection(connection);
     }
 

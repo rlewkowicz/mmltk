@@ -1,5 +1,6 @@
 module;
 #include <algorithm>
+#include "src/backend/imaging/raster/image_containment.h"
 #include <cstddef>
 #include <cstdint>
 #include "detail/explore_render_cuda_abi.h"
@@ -20,23 +21,9 @@ inline constexpr std::size_t kExploreRenderRleCapacity = 1U << 22U;
 using ExploreRenderCardDescriptor = detail::ExploreRenderCardDescriptorAbi;
 using ExploreRenderAnnotationDescriptor = detail::ExploreRenderAnnotationDescriptorAbi;
 using ExploreRenderClassDescriptor = detail::ExploreRenderClassDescriptorAbi;
-struct ExploreContainRect final {
-    std::uint32_t x = 0U;
-    std::uint32_t y = 0U;
-    std::uint32_t width = 0U;
-    std::uint32_t height = 0U;
-    [[nodiscard]] bool operator==(const ExploreContainRect&) const noexcept = default;
-};
-[[nodiscard]] inline ExploreContainRect make_explore_contain_rect(const std::uint32_t source_width, const std::uint32_t source_height,
-                                                                  const std::uint32_t card_extent) noexcept {
-    if (source_width == 0U || source_height == 0U || card_extent == 0U) return {};
-    std::uint32_t width = card_extent;
-    std::uint32_t height = card_extent;
-    if (source_width > source_height)
-        height = std::max(1U, static_cast<std::uint32_t>(static_cast<std::uint64_t>(card_extent) * source_height / source_width));
-    else if (source_height > source_width)
-        width = std::max(1U, static_cast<std::uint32_t>(static_cast<std::uint64_t>(card_extent) * source_width / source_height));
-    return {.x = (card_extent - width) / 2U, .y = (card_extent - height) / 2U, .width = width, .height = height};
+using ExploreContainRect = mmltk::backend::imaging::raster::ImageContainRect;
+[[nodiscard]] inline ExploreContainRect make_explore_contain_rect(std::uint32_t width, std::uint32_t height, std::uint32_t extent) noexcept {
+    return mmltk::backend::imaging::raster::contain_image(width, height, extent, extent);
 }
 // A tile is an independently patchable region of a persistent atlas.  Its
 // generation fields are copied from the owning lane request and remain part

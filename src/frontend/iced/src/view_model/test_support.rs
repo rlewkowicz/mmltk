@@ -209,9 +209,11 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
     use crate::generated::*;
     let snapshot = bootstrapped().workflow.validation.unwrap();
     ValidationImageMetadata {
-        frame: visual_frame(PresentationSourceKind::Validation, 1),
+        frame: { let mut frame = visual_frame(PresentationSourceKind::Validation, 1); frame.extent.width = 512; frame.extent.height = 576; frame },
         contentidentity: 9,
         detail: false,
+        selected: None,
+        document: snapshot.document,
         overlays: snapshot.overlays,
         samples: std::array::from_fn(|index| ValidationSampleMetadata {
             identity: ValidationSampleIdentity {
@@ -220,10 +222,10 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
             },
             available: index < 2,
             crop: VisualRegion {
-                x: index as u32 * 100,
-                y: 0,
-                width: 100,
-                height: 100,
+                x: index as u32 % 2 * 256 + 32,
+                y: index as u32 / 2 * 192,
+                width: 192,
+                height: 192,
             },
             originalextent: VisualExtent {
                 width: 200,
@@ -231,6 +233,7 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
             },
             labels: if index < 2 {
                 vec![ValidationLabel {
+                    rgb: [255, 0, 0],
                     box_: AnnotationBox {
                         first: AnnotationPoint { x: 20.0, y: 40.0 },
                         second: AnnotationPoint { x: 80.0, y: 90.0 },

@@ -134,6 +134,19 @@ fn valid_detail(source: &generated::ExploreImageMetadata) -> bool {
         && valid_content(&source.frame)
 }
 
+fn valid_validation(snapshot: &generated::ValidationImageMetadata) -> bool {
+    snapshot.contentidentity != 0 && valid_content(&snapshot.frame)
+        && snapshot.detail == snapshot.selected.is_some()
+        && (!snapshot.detail || snapshot.samples.iter().any(|sample|
+            sample.available && Some(&sample.identity) == snapshot.selected.as_ref()))
+        && snapshot.samples.iter().all(|sample| !sample.available
+            || (sample.identity.generation != 0 && sample.originalextent.width != 0 && sample.originalextent.height != 0
+                && ((snapshot.detail && Some(&sample.identity) != snapshot.selected.as_ref())
+                    || (sample.crop.width != 0 && sample.crop.height != 0
+                        && sample.crop.x.checked_add(sample.crop.width).is_some_and(|end| end <= snapshot.frame.extent.width)
+                        && sample.crop.y.checked_add(sample.crop.height).is_some_and(|end| end <= snapshot.frame.extent.height)))))
+}
+
 pub(crate) fn install(
     frame: FrameReady,
     width: u32,
@@ -181,16 +194,14 @@ pub(crate) fn install(
             Prepared::None
         }
         WorkspaceImageProduct::Upscale(snapshot) if snapshot.frame == metadata.frame => {
-            let Some(WorkspaceImageProduct::Explore(source)) = &source else {
-                return Err("missing graphics detail source metadata".into());
-            };
-            if source.frame != snapshot.input
-                || !valid_detail(source)
-                || !valid_content(&snapshot.frame)
-            {
-                return Err("graphics detail source identity mismatch".into());
+            if !valid_content(&snapshot.frame) { return Err("invalid derived image geometry".into()); }
+            match &source {
+                Some(WorkspaceImageProduct::Explore(source)) if source.frame == snapshot.input && valid_detail(source) => Prepared::None,
+                Some(WorkspaceImageProduct::Validation(source)) if source.frame == snapshot.input && source.detail && valid_validation(source) => {
+                    Prepared::Validation(Arc::new(super::labels::ValidationContent::new(source.clone()).with_upscale(snapshot.clone())))
+                }
+                _ => return Err("graphics detail source identity mismatch".into()),
             }
-            Prepared::None
         }
         WorkspaceImageProduct::Predict(snapshot)
             if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 =>
@@ -202,24 +213,7 @@ pub(crate) fn install(
         WorkspaceImageProduct::Validation(snapshot)
             if snapshot.frame == metadata.frame && snapshot.contentidentity != 0 =>
         {
-            if snapshot.samples.iter().any(|sample| {
-                sample.available
-                    && (sample.identity.generation == 0
-                        || sample.originalextent.width == 0
-                        || sample.originalextent.height == 0
-                        || sample.crop.width == 0
-                        || sample.crop.height == 0
-                        || sample
-                            .crop
-                            .x
-                            .checked_add(sample.crop.width)
-                            .is_none_or(|end| end > snapshot.frame.extent.width)
-                        || sample
-                            .crop
-                            .y
-                            .checked_add(sample.crop.height)
-                            .is_none_or(|end| end > snapshot.frame.extent.height))
-            }) {
+            if !valid_validation(snapshot) {
                 return Err("invalid validation sample image geometry".into());
             }
             Prepared::Validation(Arc::new(super::labels::ValidationContent::new(
@@ -249,7 +243,7 @@ pub(crate) fn install(
                 content
                     .validation()
                     .as_ref()
-                    .map(|content| (frame.content_session, content.metadata.contentidentity))
+                    .map(|content| (generated::presentation_source_session(generated::PresentationSourceKind::Validation), content.metadata.contentidentity))
             }),
         fit_revision: 0,
     };
@@ -397,6 +391,22 @@ pub(crate) fn install_explore(frame: FrameReady, snapshot: &generated::ExploreSn
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validation_geometry_requires_the_selected_retained_sample() {
+        let mut image = crate::view_model::test_support::validation_image_metadata();
+        assert!(valid_validation(&image));
+        image.detail = true;
+        assert!(!valid_validation(&image));
+        image.selected = Some(image.samples[0].identity.clone());
+        image.samples[1].crop = generated::VisualRegion { x: 0, y: 0, width: 0, height: 0 };
+        assert!(valid_validation(&image));
+        image.samples[0].available = false;
+        assert!(!valid_validation(&image));
+        image.samples[0].available = true;
+        image.samples[0].crop.width = image.frame.extent.width + 1;
+        assert!(!valid_validation(&image));
+    }
+
     #[test]
     fn accepted_first_validation_product_shares_metadata_and_cached_content() {
         super::super::reset_test_releases();
