@@ -152,6 +152,12 @@ struct TrainingCheckpoint final {
     EvaluatedWeights evaluated_weights = EvaluatedWeights::Ordinary;
 };
 MMLTK_REFLECT_FIELDS(TrainingCheckpoint)
+struct TrainingCheckpointCapability final {
+    bool operator==(const TrainingCheckpointCapability&) const = default;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path path;
+    bool resumable = false;
+};
+MMLTK_REFLECT_FIELDS(TrainingCheckpointCapability)
 enum class TrainingInspectionStatus : std::uint8_t { Idle, Running, Ready, Failed, Cancelled };
 MMLTK_REFLECT_ENUM(TrainingInspectionStatus)
 struct TrainingCheckpointInspection final {
@@ -159,7 +165,7 @@ struct TrainingCheckpointInspection final {
     std::uint64_t generation = 0;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path path;
     TrainingInspectionStatus status = TrainingInspectionStatus::Idle;
-    std::optional<TrainingCheckpoint> checkpoint;
+    std::optional<TrainingCheckpointCapability> checkpoint;
     [[= mmltk::frameworks::reflection::MaxBytes{1024}]] std::string error;
 };
 MMLTK_REFLECT_FIELDS(TrainingCheckpointInspection)

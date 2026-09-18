@@ -1,5 +1,6 @@
 #pragma once
 #include <filesystem>
+#include "src/backend/models/rfdetr/training/checkpoint.h"
 #include "src/common/system/execution_policy.h"
 #include <functional>
 #include <memory>
@@ -22,7 +23,7 @@ namespace mmltk::controller {
 class TrainingRuntime {
    public:
     virtual ~TrainingRuntime() = default;
-    [[nodiscard]] virtual mmltk::backend::models::rfdetr::TrainingCheckpoint InspectCheckpoint(const std::filesystem::path&, std::stop_token);
+    [[nodiscard]] virtual mmltk::backend::models::rfdetr::TrainingCheckpointAdmission InspectCheckpoint(const std::filesystem::path&, std::stop_token);
     [[nodiscard]] virtual contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
                                                            const std::function<void(const services::TrainProcessProgress&)>&) = 0;
     [[nodiscard]] virtual contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) = 0;
@@ -96,7 +97,7 @@ class TrainingSystem final {
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointInspection InspectCheckpoint(
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointInspection CancelCheckpointInspection();
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpoint PrepareResume(
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointCapability PrepareResume(
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Resume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Stop(contracts::WorkflowIntent<contracts::FeatureId::Train>) noexcept;

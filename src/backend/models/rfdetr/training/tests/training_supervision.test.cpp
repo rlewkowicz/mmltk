@@ -301,11 +301,25 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     write_archive(valid_path, 3.0F, false);
     torch::serialize::InputArchive valid;
     valid.load_from(valid_path.string());
+    std::unordered_map<std::string, torch::Tensor> tensors;
+    for (std::size_t index = 0; index < optimizer.parameters().size(); ++index)
+        tensors.emplace(optimizer.parameter_names()[index], optimizer.parameters()[index]);
+    REQUIRE(AdamW::InspectCheckpoint(valid, tensors) == optimizer.parameter_names());
+    std::stop_source stopped;
+    stopped.request_stop();
+    REQUIRE_THROWS(AdamW::InspectCheckpoint(valid, tensors, stopped.get_token()));
     optimizer.load(valid);
+    // The admitted archive remains a borrower: a loaded optimizer owns separate
+    // moments and scalar step storage even when both source and target are CPU.
+    torch::serialize::InputArchive source_parameter;
+    valid.read("param_000000", source_parameter);
+    mmltk::backend::ml::serialization::require_tensor(source_parameter, "step").fill_(99.0F);
+    mmltk::backend::ml::serialization::require_tensor(source_parameter, "exp_avg").fill_(99.0F);
     const auto malformed_path = root / "malformed.pt";
     write_archive(malformed_path, 7.0F, true);
     torch::serialize::InputArchive malformed;
     malformed.load_from(malformed_path.string());
+    REQUIRE_THROWS(AdamW::InspectCheckpoint(malformed, tensors));
     REQUIRE_THROWS(optimizer.load(malformed));
     const auto retained_path = root / "retained.pt";
     mmltk::backend::ml::cuda::TensorReadbackBuffers readback;
@@ -321,6 +335,7 @@ void test_native_optimizer_late_failure_preserves_live_state() {
     retained_input.read("param_000000", first_parameter);
     const auto retained_average = mmltk::backend::ml::serialization::require_tensor(first_parameter, "exp_avg");
     REQUIRE(torch::equal(retained_average, torch::full({2}, 3.0F)));
+    REQUIRE(mmltk::backend::ml::serialization::require_tensor(first_parameter, "step").item<float>() == 2.0F);
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
 }
@@ -1469,7 +1484,9 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             std::stop_source cancelled_inspection;
             cancelled_inspection.request_stop();
             REQUIRE_THROWS(rfdetr::inspect_training_checkpoint(result.checkpoint_path, cancelled_inspection.get_token()));
-            const auto inspection = rfdetr::inspect_training_checkpoint(result.checkpoint_path);
+            const auto admission = rfdetr::inspect_training_checkpoint(result.checkpoint_path);
+            const auto& inspection = admission.checkpoint();
+            REQUIRE_NOTHROW(admission.RequireUnchanged());
             REQUIRE(inspection.resumable);
             REQUIRE(inspection.configuration.has_value());
             REQUIRE(inspection.configuration->use_ema == request.use_ema);
@@ -1478,7 +1495,7 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             REQUIRE(std::isfinite(result.history.front().train_loss));
             REQUIRE(result.history.front().val_loss.has_value());
             REQUIRE(result.best_checkpoint_path.has_value());
-            REQUIRE_FALSE(rfdetr::inspect_training_checkpoint(*result.best_checkpoint_path).resumable);
+            REQUIRE_FALSE(rfdetr::inspect_training_checkpoint(*result.best_checkpoint_path).checkpoint().resumable);
             auto deployment_config = result.artifacts.config;
             deployment_config.training_supervision = {};
             rfdetr::NativeRfDetrModel deployment_model(deployment_config, rfdetr::testsupport::synthetic_training_layout(deployment_config.num_classes - 1));
@@ -1490,9 +1507,12 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             if (route_index == 0 && lanes == 1) {
                 const auto upstream = request.output_dir / "transfer.pth";
                 rfdetr::write_upstream_model_state(upstream, deployment_state);
-                const auto transfer = rfdetr::inspect_training_checkpoint(upstream);
+                const auto transfer_admission = rfdetr::inspect_training_checkpoint(upstream);
+                const auto& transfer = transfer_admission.checkpoint();
                 REQUIRE_FALSE(transfer.resumable);
                 REQUIRE_FALSE(transfer.configuration.has_value());
+                std::ofstream(upstream, std::ios::app) << "replacement";
+                REQUIRE_THROWS(transfer_admission.RequireUnchanged());
             }
 #endif
             const auto full_state = rfdetr::decode_model_state(result.checkpoint_path);

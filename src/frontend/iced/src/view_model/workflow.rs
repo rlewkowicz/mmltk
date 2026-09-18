@@ -24,7 +24,7 @@ pub enum CheckpointCapability {
     #[default]
     Idle,
     Pending { request: Option<u64>, generation: Option<u64> },
-    Ready(crate::generated::TrainingCheckpoint),
+    Ready(crate::generated::TrainingCheckpointCapability),
     Failed(String),
 }
 
@@ -35,20 +35,22 @@ pub struct Continuation {
     pub capability: CheckpointCapability,
     pub mode_chosen: bool,
     pub cancel_needed: bool,
+    pub refresh_requested: bool,
     observed: Option<crate::generated::TrainingCheckpointInspection>,
 }
 impl Default for Continuation {
     fn default() -> Self {
         Self { mode: ContinuationMode::Transfer, selection: None, capability: Default::default(),
-            mode_chosen: false, cancel_needed: false, observed: None }
+            mode_chosen: false, cancel_needed: false, refresh_requested: false, observed: None }
     }
 }
 impl Continuation {
     pub fn matches(&self, train: &crate::generated::TrainViewState) -> bool {
-        self.selection.as_ref().is_some_and(|(source, path, preset)|
+        !self.refresh_requested && self.selection.as_ref().is_some_and(|(source, path, preset)|
             *source == train.modelsource && *path == train.request.weightspath && *preset == train.request.presetname)
     }
     pub fn select(&mut self, train: &crate::generated::TrainViewState) {
+        self.refresh_requested = false;
         self.cancel_needed |= matches!(self.capability, CheckpointCapability::Pending { .. });
         self.selection = Some((train.modelsource, train.request.weightspath.clone(), train.request.presetname.clone()));
         self.capability = CheckpointCapability::Idle;
@@ -56,7 +58,7 @@ impl Continuation {
         self.mode_chosen = false;
         self.observed = None;
     }
-    pub fn checkpoint(&self) -> Option<&crate::generated::TrainingCheckpoint> {
+    pub fn checkpoint(&self) -> Option<&crate::generated::TrainingCheckpointCapability> {
         if let CheckpointCapability::Ready(value) = &self.capability { Some(value) } else { None }
     }
     pub fn request(&self) -> Option<u64> {
@@ -1004,10 +1006,8 @@ mod training_history_tests {
     fn inspect(path: &str, generation: u64, resumable: bool) -> TrainingCheckpointInspection {
         TrainingCheckpointInspection {
             generation, path: path.into(), status: TrainingInspectionStatus::Ready, error: String::new(),
-            checkpoint: Some(crate::generated::TrainingCheckpoint {
-                path: path.into(), attemptid: "saved-attempt".into(), originalweights: "/original/weights.pt".into(),
-                originalclassdescriptor: String::new(), resumable, epoch: 4, configuration: None,
-                classlayout: None, evaluatedweights: crate::generated::EvaluatedWeights::Ema,
+            checkpoint: Some(crate::generated::TrainingCheckpointCapability {
+                path: path.into(), resumable,
             }),
         }
     }

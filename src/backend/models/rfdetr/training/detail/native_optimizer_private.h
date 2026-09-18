@@ -94,6 +94,8 @@ class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, Native
     void load(torch::serialize::InputArchive& archive, std::stop_token stop = {});
 
    private:
+    friend NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState>;
+    void read_checkpoint(torch::serialize::InputArchive&, std::stop_token, bool materialize);
     void initialize_state();
     void step_group_eager(const Group& group);
     void step_group_foreach(const Group& group);
@@ -118,6 +120,8 @@ class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfi
     void load(torch::serialize::InputArchive& archive, std::stop_token stop = {});
 
    private:
+    friend NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState>;
+    void read_checkpoint(torch::serialize::InputArchive&, std::stop_token, bool materialize);
     void initialize_state();
 };
 class NativeOptimizer {

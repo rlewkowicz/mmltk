@@ -98,10 +98,15 @@ impl App {
         if self.model.workflow.output.synchronize(train, self.model.workflow.training.as_ref(), browse) {
             self.workspace.sync_workflows(&self.model);
         }
+        // A deliberate confirmation waits for admitted restoration/model replies
+        // to settle before replacing the continuation selection.
+        if self.model.workflow.train_continuation.refresh_requested
+            && (self.model.workflow.pending_start.is_some() || self.model.training_family_pending()) { return; }
         let restoring = self.model.workflow.pending_start.as_ref().is_some_and(|pending|
             matches!(pending.preparation, StartPreparation::Restoring { .. } | StartPreparation::Restored));
         if !restoring && !self.model.workflow.train_continuation.matches(train) {
-            let bootstrap = self.model.workflow.train_continuation.selection.is_none();
+            let bootstrap = self.model.workflow.train_continuation.selection.is_none()
+                && !self.model.workflow.train_continuation.refresh_requested;
             self.model.workflow.train_continuation.select(train);
             if bootstrap && self.model.workflow.training.as_ref().is_some_and(|snapshot|
                 snapshot.inspection.status == crate::generated::TrainingInspectionStatus::Running) {
@@ -170,6 +175,9 @@ impl App {
         let feature = pending.feature;
         if pending.preparation.cancelled() {
             self.advance_start_cancellation();
+            if self.model.workflow.pending_start.is_none() && self.model.workflow.train_continuation.refresh_requested {
+                self.advance_training_selection();
+            }
             return;
         }
         if self.workspace.active() != feature {
@@ -498,6 +506,17 @@ impl App {
         outcome: crate::view::workflow::model_card::Outcome,
     ) -> Task<Message> {
         match outcome {
+            crate::view::workflow::model_card::Outcome::ArtifactConfirmed(schedule) => {
+                if workflow == FeatureId::Train {
+                    if self.model.workflow.pending_start.as_ref().is_some_and(|pending| pending.feature == FeatureId::Train) {
+                        self.model.workflow.cancel_start("Start cancelled after confirming training weights.");
+                    }
+                    self.model.workflow.train_continuation.refresh_requested = true;
+                }
+                let task = self.handle_settings_schedule(schedule);
+                self.advance_start();
+                task
+            }
             crate::view::workflow::model_card::Outcome::SettingsEdited(schedule) => {
                 self.handle_settings_schedule(schedule)
             }
@@ -1051,28 +1070,109 @@ mod tests {
     }
 
     #[test]
+    fn deliberate_same_path_confirmation_refreshes_once_without_starting() {
+        for failed in [false, true] {
+            let (mut app, mut capture) = start_app();
+            let checkpoint = select_resumable(&mut app);
+            app.model.workflow.train_continuation.mode = crate::view_model::ContinuationMode::Transfer;
+            app.model.workflow.train_continuation.mode_chosen = true;
+            if failed {
+                app.model.workflow.train_continuation.capability = crate::view_model::CheckpointCapability::Failed("old failure".into());
+            }
+            // Ordinary updates preserve the chosen mode and do no archive work.
+            let mut unrelated = app.model.settings_snapshot.clone().unwrap();
+            unrelated.revision += 1;
+            unrelated.settingsstate.ui.darkmode = !unrelated.settingsstate.ui.darkmode;
+            app.model.project_settings_snapshot(unrelated.clone()).unwrap();
+            app.settings.install(&unrelated);
+            app.advance_start();
+            assert_eq!(app.model.workflow.train_continuation.mode, crate::view_model::ContinuationMode::Transfer);
+            assert!(capture.try_recv().is_err());
+            drop(app.on_model(FeatureId::Train, crate::view::workflow::model_card::Outcome::ArtifactConfirmed(EditSchedule::Debounce(1))));
+            let refresh = next_intent(&mut capture, ApplicationIntentEndpoint::TrainingInspectCheckpoint);
+            assert!(app.model.workflow.pending_start.is_none());
+            app.advance_start();
+            assert!(capture.try_recv().is_err());
+            let mut ready = app.model.workflow.training.as_ref().unwrap().inspection.clone();
+            ready.path = checkpoint.path.clone();
+            ready.generation += 1;
+            ready.status = crate::generated::TrainingInspectionStatus::Ready;
+            ready.checkpoint = Some(checkpoint);
+            app.model.reduce_reply(refresh.correlation, Ok(crate::generated::ApplicationReply::TrainingInspectCheckpoint(ready)));
+            app.advance_start();
+            assert_eq!(app.model.workflow.train_continuation.mode, crate::view_model::ContinuationMode::Resume);
+            assert!(app.model.workflow.pending_start.is_none());
+            assert!(capture.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn reconnect_recovers_compact_capability_without_inspecting_again() {
+        for status in [crate::generated::TrainingInspectionStatus::Ready, crate::generated::TrainingInspectionStatus::Failed] {
+            let (mut app, mut capture) = start_app();
+            let checkpoint = select_resumable(&mut app);
+            app.model.workflow.train_continuation = Default::default();
+            let inspection = &mut app.model.workflow.training.as_mut().unwrap().inspection;
+            inspection.generation = 7;
+            inspection.path = checkpoint.path.clone();
+            inspection.status = status;
+            inspection.checkpoint = (status == crate::generated::TrainingInspectionStatus::Ready).then_some(checkpoint.clone());
+            inspection.error = "saved failure".into();
+            app.advance_start();
+            assert!(capture.try_recv().is_err());
+            assert!(app.model.workflow.pending_start.is_none());
+            if status == crate::generated::TrainingInspectionStatus::Ready {
+                assert_eq!(app.model.workflow.train_continuation.checkpoint(), Some(&checkpoint));
+            } else {
+                assert!(matches!(app.model.workflow.train_continuation.capability, crate::view_model::CheckpointCapability::Failed(_)));
+            }
+            app.model.workflow.train_continuation = Default::default();
+            drop(app.on_model(FeatureId::Train, crate::view::workflow::model_card::Outcome::ArtifactConfirmed(EditSchedule::Debounce(1))));
+            next_intent(&mut capture, ApplicationIntentEndpoint::TrainingInspectCheckpoint);
+            assert!(app.model.workflow.pending_start.is_none());
+        }
+    }
+
+    #[test]
+    fn confirmation_waits_for_cancelled_restore_and_validate_has_no_continuation_effect() {
+        let (mut app, mut capture) = start_app();
+        let checkpoint = select_resumable(&mut app);
+        drop(app.on_model(FeatureId::Validate, crate::view::workflow::model_card::Outcome::ArtifactConfirmed(EditSchedule::Debounce(1))));
+        assert!(!app.model.workflow.train_continuation.refresh_requested);
+        assert_eq!(app.model.workflow.train_continuation.checkpoint(), Some(&checkpoint));
+        assert!(capture.try_recv().is_err());
+        app.request_start(FeatureId::Train);
+        let restore = next_intent(&mut capture, ApplicationIntentEndpoint::TrainingPrepareResume);
+        drop(app.on_model(FeatureId::Train, crate::view::workflow::model_card::Outcome::ArtifactConfirmed(EditSchedule::Debounce(1))));
+        assert!(app.model.workflow.pending_start.as_ref().unwrap().preparation.cancelled());
+        assert!(capture.try_recv().is_err());
+        app.model.reduce_reply(restore.correlation, Ok(crate::generated::ApplicationReply::TrainingPrepareResume(checkpoint)));
+        app.advance_start();
+        next_intent(&mut capture, ApplicationIntentEndpoint::TrainingInspectCheckpoint);
+        assert!(app.model.workflow.pending_start.is_none());
+        assert!(capture.try_recv().is_err());
+    }
+
+    #[test]
     fn unrequested_resume_reply_never_creates_start() {
         let (mut app, mut capture) = start_app();
         use crate::generated::TrainingApplicationProjection;
-        app.model.project_training_reply(71, crate::generated::ApplicationReply::TrainingPrepareResume(crate::generated::TrainingCheckpoint {
-            path: "/saved/full.pt".into(), attemptid: "old".into(), originalweights: String::new(), originalclassdescriptor: String::new(),
-            resumable: true, epoch: 1, configuration: None, classlayout: None, evaluatedweights: crate::generated::EvaluatedWeights::Ordinary,
+        app.model.project_training_reply(71, crate::generated::ApplicationReply::TrainingPrepareResume(crate::generated::TrainingCheckpointCapability {
+            path: "/saved/full.pt".into(), resumable: true,
         }));
         app.advance_start();
         assert!(app.model.workflow.pending_start.is_none());
         assert!(capture.try_recv().is_err());
     }
 
-    fn select_resumable(app: &mut App) -> crate::generated::TrainingCheckpoint {
+    fn select_resumable(app: &mut App) -> crate::generated::TrainingCheckpointCapability {
         let mut snapshot = app.model.settings_snapshot.clone().unwrap();
         snapshot.revision += 1;
         let train = &mut snapshot.settingsstate.workflows.train;
         train.modelsource = crate::generated::ModelSelectionSource::Custom;
         train.request.weightspath = "/saved/full.pt".into();
-        let checkpoint = crate::generated::TrainingCheckpoint {
-            path: train.request.weightspath.clone(), attemptid: "saved".into(), originalweights: String::new(), originalclassdescriptor: String::new(),
-            resumable: true, epoch: 2, configuration: Some(train.request.clone()), classlayout: None,
-            evaluatedweights: crate::generated::EvaluatedWeights::Ordinary,
+        let checkpoint = crate::generated::TrainingCheckpointCapability {
+            path: train.request.weightspath.clone(), resumable: true,
         };
         app.model.workflow.train_continuation.selection = Some((train.modelsource, train.request.weightspath.clone(), train.request.presetname.clone()));
         app.model.workflow.train_continuation.capability = crate::view_model::CheckpointCapability::Ready(checkpoint.clone());
@@ -1087,7 +1187,6 @@ mod tests {
         let (mut app, mut capture) = start_app();
         let mut checkpoint = select_resumable(&mut app);
         checkpoint.resumable = false;
-        checkpoint.configuration = None;
         app.model.workflow.train_continuation.capability = crate::view_model::CheckpointCapability::Idle;
         app.advance_start();
         let inspection = next_intent(&mut capture, ApplicationIntentEndpoint::TrainingInspectCheckpoint);

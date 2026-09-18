@@ -5,6 +5,7 @@
 #include "src/controller/services/settings_system.h"
 #include "src/common/system/tests/numa_topology_test_support.h"
 #include "src/common/system/tests/denied_syscall.h"
+#include "src/frameworks/reflection/record_projection.h"
 #include <linux/ioprio.h>
 #include <sched.h>
 #include <system_error>
@@ -47,10 +48,10 @@ namespace {
 }
 class FakeTrainingRuntime final : public TrainingRuntime {
    public:
-    using Inspection = std::function<mmltk::backend::models::rfdetr::TrainingCheckpoint(const std::filesystem::path&, std::stop_token)>;
+    using Inspection = std::function<mmltk::backend::models::rfdetr::TrainingCheckpointAdmission(const std::filesystem::path&, std::stop_token)>;
     FakeTrainingRuntime(std::shared_ptr<mmltk::testsupport::StopGate> gate, const bool fail, const bool inconclusive = false, Inspection inspection = {})
         : gate_(std::move(gate)), fail_(fail), inconclusive_(inconclusive), inspection_(std::move(inspection)) {}
-    mmltk::backend::models::rfdetr::TrainingCheckpoint InspectCheckpoint(const std::filesystem::path& path, std::stop_token stop) override {
+    mmltk::backend::models::rfdetr::TrainingCheckpointAdmission InspectCheckpoint(const std::filesystem::path& path, std::stop_token stop) override {
         return inspection_ ? inspection_(path, stop) : TrainingRuntime::InspectCheckpoint(path, stop);
     }
     contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, const std::stop_token stop,
@@ -183,7 +184,7 @@ TEST_CASE("checkpoint inspection replaces bounded worker work and guards cached 
         checkpoint.path = path;
         checkpoint.resumable = true;
         checkpoint.configuration = configuration;
-        return checkpoint;
+        return r::TrainingCheckpointAdmission(std::move(checkpoint), mmltk::common::io::FileSnapshot::Read(path));
     };
     TrainingSystem training{settings, dataset, model, policy,
         [&] { return std::make_unique<FakeTrainingRuntime>(std::make_shared<mmltk::testsupport::StopGate>(), false, false, inspect); },
@@ -221,6 +222,114 @@ TEST_CASE("checkpoint inspection replaces bounded worker work and guards cached 
     mmltk::testsupport::await_test_promise(entered, "shutdown inspection started");
     training.Shutdown();
     mmltk::testsupport::await_test_promise(cancelled, "shutdown joined inspection");
+}
+
+TEST_CASE("checkpoint capability projects only native path and resumability", "[controller][systems][training][reflection]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace reflection = mmltk::frameworks::reflection;
+    r::TrainingCheckpoint checkpoint;
+    checkpoint.path = "/saved/checkpoint.pt";
+    checkpoint.resumable = true;
+    checkpoint.configuration.emplace();
+    checkpoint.attempt_id = "native-only-attempt";
+    checkpoint.class_layout = r::unresolved_class_layout(2);
+    const auto capability = reflection::project_record<r::TrainingCheckpointCapability>(checkpoint);
+    CHECK(capability.path == checkpoint.path);
+    CHECK(capability.resumable);
+    std::size_t fields = 0;
+    reflection::visit_materialized_members<r::TrainingCheckpointCapability>([&]<class Field>(const auto&) {
+        constexpr auto name = reflection::materialized_member_name<Field::pointer>();
+        STATIC_REQUIRE((name == "path" || name == "resumable"));
+        ++fields;
+    });
+    CHECK(fields == 2);
+}
+
+TEST_CASE("Resume reuses exact admitted checkpoint evidence across preparation and launch", "[controller][systems][training][local]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    namespace io = mmltk::common::io;
+    const auto mutation = GENERATE(0, 1, 2, 3, 4, 5, 6);
+    const bool before_start = GENERATE(false, true);
+    mmltk::testsupport::ScopedTempDir root{"training-resume-admission"};
+    ApplicationDataFixture fixture{root.path()};
+    fixture.PrepareModel();
+    auto [settings, unused_dataset, model] = fixture.systems();
+    contracts::SettingsUpdateRequest manual;
+    manual.updates = {
+        {.path = "workflows.train.auto_output", .value = mmltk::frameworks::serialization::wire::FlatValue{false}},
+        {.path = "workflows.train.request.output_dir", .value = mmltk::frameworks::serialization::wire::FlatValue{(root.path() / "output").string()}},
+    };
+    (void)settings.Update(std::move(manual));
+    const auto configuration = settings.snapshot().settings_state.workflows.train.request;
+    const auto path = configuration.weights_path;
+    const auto companion = std::filesystem::path(path.string() + ".classes.json");
+    const auto layout = r::unresolved_class_layout(2);
+    std::ofstream(companion) << r::encode_class_descriptor({1, io::sha256_hex(io::sha256_file(path)), layout});
+    auto observation = std::make_shared<DatasetRuntimeObservation>();
+    DatasetSystem dataset{settings, [observation] { return std::make_unique<BlockingInspectRuntime>(observation); }};
+    auto train_gate = std::make_shared<mmltk::testsupport::StopGate>();
+    train_gate->Release();
+    std::atomic_int inspections = 0;
+    std::atomic_bool launched = false;
+    std::promise<r::TrainingCheckpointInspection> inspected, refreshed;
+    std::promise<TrainingSnapshot> settled;
+    TrainingSystem training{settings, dataset, model, std::nullopt, [&] {
+        return std::make_unique<FakeTrainingRuntime>(train_gate, false, false, [&](const auto& selected, std::stop_token stop) {
+            ++inspections;
+            r::TrainingCheckpoint checkpoint;
+            checkpoint.path = selected;
+            checkpoint.resumable = true;
+            checkpoint.configuration = configuration;
+            checkpoint.class_layout = layout;
+            return r::TrainingCheckpointAdmission(std::move(checkpoint), std::make_shared<const r::ClassArtifactAdmission>(selected, std::filesystem::path{}, nullptr, stop));
+        });
+    }, [&](TrainingSystem::event_type event) {
+        if (const auto* ready = std::get_if<TrainingInspectionChanged>(&event)) {
+            if (ready->inspection.generation == 1) inspected.set_value(ready->inspection);
+            else refreshed.set_value(ready->inspection);
+        }
+        if (std::holds_alternative<TrainingProgress>(event)) launched = true;
+        if (const auto* changed = std::get_if<TrainingChanged>(&event); changed && !changed->snapshot.local.active) settled.set_value(changed->snapshot);
+    }};
+    (void)training.InspectCheckpoint({path});
+    REQUIRE(mmltk::testsupport::await_test_promise(inspected, "checkpoint admitted").status == r::TrainingInspectionStatus::Ready);
+    const auto capability = training.PrepareResume({path});
+    CHECK(capability.path == path);
+    CHECK(capability.resumable);
+    CHECK(inspections == 1);
+    const auto change = [&] {
+        switch (mutation) {
+            case 1: std::ofstream(path, std::ios::app) << "replacement"; break;
+            case 2: std::filesystem::remove(path); break;
+            case 3: std::ofstream(companion, std::ios::app) << " "; break;
+            case 4: std::filesystem::remove(companion); break;
+            case 5: (void)training.CancelCheckpointInspection(); break;
+            case 6:
+                (void)training.InspectCheckpoint({path});
+                REQUIRE(mmltk::testsupport::await_test_promise(refreshed, "checkpoint refreshed").status == r::TrainingInspectionStatus::Ready);
+                break;
+            default: break;
+        }
+    };
+    if (before_start) {
+        change();
+        if (mutation != 0) {
+            CHECK_THROWS(training.Resume({path}));
+            CHECK_FALSE(launched);
+            CHECK_FALSE(std::filesystem::exists(configuration.output_dir));
+            return;
+        }
+    }
+    (void)training.Resume({path});
+    mmltk::testsupport::await_test_promise(observation->inspect_started, "resume input inspection");
+    if (!before_start) change();
+    observation->inspect_gate->Release();
+    const auto result = mmltk::testsupport::await_test_promise(settled, "resume settlement");
+    const bool valid = mutation == 0 || mutation == 5 || mutation == 6;
+    CHECK(result.local.terminal.outcome == (valid ? contracts::ComputeOperationOutcome::Succeeded : contracts::ComputeOperationOutcome::Failed));
+    CHECK(launched.load() == valid);
+    CHECK(inspections == (mutation == 6 ? 2 : 1));
+    if (!valid) CHECK_FALSE(std::filesystem::exists(configuration.output_dir));
 }
 
 TEST_CASE("checkpoint inspection policy denial fails construction before runtime admission", "[controller][systems][training]") {

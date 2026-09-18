@@ -36,6 +36,7 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum Outcome {
     SettingsEdited(crate::view::settings::EditSchedule),
+    ArtifactConfirmed(crate::view::settings::EditSchedule),
     BrowseRequested(crate::generated::FileDialogTarget),
     PrepareRequested,
     StopRequested,
@@ -253,7 +254,7 @@ impl Component {
                     ],
                 )?;
                 self.dismissed_dialog_generation = generation;
-                Outcome::SettingsEdited(schedule)
+                Outcome::ArtifactConfirmed(schedule)
             }
             Message::CancelArtifact(generation) => {
                 self.dismissed_dialog_generation = generation;
@@ -949,6 +950,27 @@ mod tests {
         };
         assert_eq!(widget_shape(FeatureId::Train), widget_shape(FeatureId::Validate));
 
+    }
+
+    #[test]
+    fn only_successful_confirmation_emits_the_distinct_selection_outcome() {
+        for workflow in [FeatureId::Train, FeatureId::Validate] {
+            let mut component = Component::new(workflow);
+            let mut settings = installed_settings_model();
+            for generation in [1, 2] {
+                assert!(matches!(component.update(Message::ConfirmArtifact {
+                    path: "/tmp/same.pt".into(), generation,
+                }, &mut settings).unwrap(), Some(Outcome::ArtifactConfirmed(_))));
+            }
+            let before = settings.draft.clone();
+            let queued = settings.queued_len();
+            assert!(component.update(Message::CancelArtifact(3), &mut settings).unwrap().is_none());
+            assert!(component.update(Message::ConfirmArtifact {
+                path: "/tmp/invalid.txt".into(), generation: 4,
+            }, &mut settings).is_err());
+            assert_eq!(settings.draft, before);
+            assert_eq!(settings.queued_len(), queued);
+        }
     }
 
     #[test]

@@ -20,6 +20,7 @@
 #include "detail/model_ema.h"
 #include <unordered_map>
 #include <type_traits>
+#include <utility>
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr::detail {
 void publish_native_checkpoint_archive(torch::serialize::OutputArchive& archive, const std::filesystem::path& destination,
@@ -150,15 +151,36 @@ std::vector<torch::Tensor> read_ema_shadow_archive(torch::serialize::InputArchiv
 }
 }  // namespace mmltk::backend::models::rfdetr::detail
 namespace mmltk::backend::models::rfdetr {
-TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path, std::stop_token stop) {
+TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, std::shared_ptr<const ClassArtifactAdmission> evidence)
+    : checkpoint_(std::move(checkpoint)), evidence_(std::move(evidence)) {
+    if (!std::get<0>(evidence_)) throw std::invalid_argument("missing checkpoint artifact evidence");
+}
+TrainingCheckpointAdmission::TrainingCheckpointAdmission(TrainingCheckpoint checkpoint, mmltk::common::io::FileSnapshot evidence)
+    : checkpoint_(std::move(checkpoint)), evidence_(evidence) {}
+void TrainingCheckpointAdmission::RequireUnchanged(std::stop_token stop) const {
     if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+    if (const auto* native = std::get_if<0>(&evidence_)) {
+        (*native)->RequireUnchanged(stop);
+        // Restoration uses the canonical path; also retain its identity when
+        // the selected artifact was reached through a symlink or another name.
+        (*native)->file()->snapshot.RequireUnchanged(checkpoint_.path);
+    } else {
+        std::get<1>(evidence_).RequireUnchanged(checkpoint_.path);
+    }
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+}
+TrainingCheckpointAdmission inspect_training_checkpoint(const std::filesystem::path& path, std::stop_token stop) {
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+    const auto identity = mmltk::common::io::FileSnapshot::Read(path);
     const auto container = identify_model_state_container(path);
     if (container == ModelStateContainer::Unknown) throw std::invalid_argument("unsupported training weights container");
     if (container == ModelStateContainer::Python) {
         // Container capability only. ModelSystem still owns complete transfer admission.
         TrainingCheckpoint result;
         result.path = std::filesystem::canonical(path);
-        return result;
+        identity.RequireUnchanged(path);
+        if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+        return {std::move(result), identity};
     }
     auto decoded = decode_native_model_state(path, stop);
     if (!decoded.class_artifact) throw std::runtime_error("training checkpoint lacks exact native artifact admission");
@@ -173,7 +195,7 @@ TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path
     const auto continuation = detail::read_training_continuation(archive);
     if (!continuation) {
         decoded.class_artifact->RequireUnchanged(stop);
-        return result;
+        return {std::move(result), decoded.class_artifact};
     }
     const auto& request = continuation->configuration;
     torch::serialize::InputArchive optimizer;
@@ -205,6 +227,6 @@ TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path
     result.configuration = request;
     result.evaluated_weights = request.use_ema ? EvaluatedWeights::Ema : EvaluatedWeights::Ordinary;
     result.resumable = true;
-    return result;
+    return {std::move(result), decoded.class_artifact};
 }
 }  // namespace mmltk::backend::models::rfdetr
