@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
+#include "src/common/system/execution_policy.h"
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/browser/application_event_publisher.h"
 #include "src/controller/presentation/visual_document.h"
@@ -64,8 +65,18 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
     model_ = std::make_unique<ModelSystem>(
         *settings_, [] { return std::make_unique<ArtifactModelRuntime>(); },
         browser::ApplicationEventPublisher<&ApplicationSystems::model>(events_, continuity_));
+    const DirectComputeConfiguration compute{
+        .execution = resolve_visual_device_execution(configuration.base_visual),
+    };
+    const mmltk::common::system::ExecutionPolicyRequest inspection_policy{
+        .cpu_affinity = compute.execution->placement.cpus,
+        .thread_name = "train-inspect",
+        .numa_node = compute.execution->placement.numa_node,
+        .target_nice = -10,
+        .storage_worker = true,
+    };
     training_ = std::make_unique<TrainingSystem>(
-        *settings_, *dataset_, *model_,
+        *settings_, *dataset_, *model_, inspection_policy,
         [provider = configuration.provider, executable = std::move(configuration.training_executable)] {
             return std::make_unique<NativeTrainingRuntime>(NativeTrainingConfiguration{
                 .provider = provider,
@@ -73,9 +84,6 @@ ApplicationSystemStorage::ApplicationSystemStorage(ApplicationSystemConfiguratio
             });
         },
         browser::ApplicationEventPublisher<&ApplicationSystems::training>(events_, continuity_));
-    const DirectComputeConfiguration compute{
-        .execution = resolve_visual_device_execution(configuration.base_visual),
-    };
     validation_ = std::make_unique<ValidationSystem>(
         *settings_, *dataset_, *model_, [compute] { return std::make_unique<CudaValidationRuntime>(compute); },
         browser::ApplicationEventPublisher<&ApplicationSystems::validation>(events_, continuity_, source_changed), compute.execution,

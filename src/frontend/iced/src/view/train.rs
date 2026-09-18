@@ -9,6 +9,8 @@ pub(crate) mod dataset;
 pub mod output;
 mod progress;
 
+use crate::view_model::ContinuationMode;
+
 pub const DATASET_CARD_ID: &str = "train.card.dataset";
 pub const COMPILE_DATASET_ID: &str = "train.compile_dataset";
 pub const DATASET_STATUS_ID: &str = "train.dataset.status";
@@ -23,6 +25,7 @@ pub const MATCH_FREE_ASSIGNMENT_ID: &str = "train.advanced.assignment.match_free
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Continuation(ContinuationMode),
     AspectSelected(crate::generated::WorkspaceAspectRatio),
     StartRequested,
     TrainingStopRequested,
@@ -41,6 +44,7 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    Continuation(ContinuationMode),
     // CLEANUP-IGNORE: Train's outcome begins with domain requests parallel to, but distinct from, raw messages.
     Output(output::Message),
     CompileRequested,
@@ -84,6 +88,29 @@ impl Component {
     }
 }
 
+fn continuation_controls<'a>(model: &'a ApplicationModel, train: Option<&crate::generated::TrainViewState>, enabled: bool) -> Element<'a, Message> {
+    let current = train.is_some_and(|train| model.workflow.train_continuation.matches(train));
+    let selected = if current { model.workflow.train_continuation.mode } else { ContinuationMode::Transfer };
+    let radio = |label, mode, available| {
+        iced::widget::radio(label, mode, Some(selected), Message::Continuation)
+            .style(move |theme, status| if available {
+                iced_fluent_theme::radio::default(theme, status)
+            } else { iced_fluent_theme::radio::disabled(theme, status) })
+    };
+    let mut controls = column![
+        radio("Transfer", ContinuationMode::Transfer, enabled),
+        radio("Resume", ContinuationMode::Resume, enabled && current && model.workflow.train_continuation.checkpoint().is_some_and(|checkpoint| checkpoint.resumable)),
+    ].spacing(crate::view::workflow::FIELD_SPACING);
+    if current {
+        match &model.workflow.train_continuation.capability {
+            crate::view_model::CheckpointCapability::Pending { .. } => controls = controls.push(text("Inspecting checkpoint…").size(12)),
+            crate::view_model::CheckpointCapability::Failed(detail) => controls = controls.push(text(detail).size(12)),
+            _ => {}
+        }
+    }
+    controls.into()
+}
+
 pub(crate) fn offer_identity(offer: &crate::generated::ProviderOffer) -> ProviderOfferIdentity {
     ProviderOfferIdentity {
         offerid: offer.offerid,
@@ -97,6 +124,7 @@ impl Component {
         message: Message,
     ) -> Result<Option<Outcome>, String> {
         let outcome = match message {
+            Message::Continuation(mode) => Outcome::Continuation(mode),
             Message::AspectSelected(aspect) => {
                 Outcome::SettingsEdited(crate::view::workspace::edit_aspect(model, aspect)?)
             }
@@ -174,7 +202,7 @@ impl Component {
             .map(|training| &training.local);
         let setup: Element<'a, Message> = column![
             self.model_card
-                .view(crate::view::workflow::model_card::State::from_settings(
+                .view_with(crate::view::workflow::model_card::State::from_settings(
                     crate::generated::FeatureId::Train,
                     settings.draft.as_ref(),
                     model.model_snapshot.as_ref(),
@@ -188,8 +216,7 @@ impl Component {
                             )
                         }),
                     model.model_stop_available(),
-                ))
-                .map(Message::Model),
+                ), continuation_controls(model, installed_train, settings_edit_available), Message::Model),
             dataset::view(
                 installed_train,
                 model,
@@ -335,6 +362,28 @@ impl Component {
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+
+    #[test]
+    fn only_train_installs_continuation_controls_inside_the_weights_card() {
+        let model = crate::view_model::test_support::bootstrapped();
+        let settings = crate::view::settings::installed_settings_model();
+        let state = |feature| crate::view::workflow::model_card::State::from_settings(
+            feature, settings.draft.as_ref(), None, None, true, true, false,
+        );
+        let component = crate::view::workflow::model_card::Component::default();
+        let train = component.view_with(
+            state(crate::generated::FeatureId::Train),
+            continuation_controls(&model, settings.draft.as_ref().map(|draft| &draft.workflows.train), true),
+            Message::Model,
+        );
+        let validate = crate::view::workflow::model_card::view(state(crate::generated::FeatureId::Validate), 0);
+        let train_tree = iced::advanced::widget::Tree::new(&train);
+        let validate_tree = iced::advanced::widget::Tree::new(&validate);
+        let body = |tree: &iced::advanced::widget::Tree| tree.children[0].children[0].children[2].children.len();
+        assert_eq!(body(&train_tree), 2);
+        assert_eq!(body(&validate_tree), 1);
+        assert_eq!(train_tree.children[0].children[0].children[2].children[1].children.len(), 2);
+    }
 
     #[test]
     fn train_messages_emit_specific_domain_outcomes() {

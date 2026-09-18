@@ -1,5 +1,7 @@
 #include "train_run_store.h"
-#include <chrono>
+#include <algorithm>
+#include <charconv>
+#include <limits>
 #include <format>
 #include "src/frameworks/serialization/reflected_json.h"
 namespace mmltk::controller::services {
@@ -24,9 +26,16 @@ r::TrainingRun ReadRun(const std::filesystem::path& directory) {
     return run;
 }
 }  // namespace
-r::TrainingRun TrainRunStore::Open(const std::filesystem::path& directory) {
+r::TrainingOpenedRun TrainRunStore::Open(const std::filesystem::path& directory) {
     if (generation_ == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("training history generation exhausted");
     auto canonical = std::filesystem::canonical(directory);
+    if (!std::filesystem::is_directory(canonical)) throw std::invalid_argument("training output is not a directory");
+    ++generation_;
+    run_.reset();
+    metrics_ = {};
+    directory_ = canonical;
+    if (!std::filesystem::exists(canonical / "run.json") && !std::filesystem::exists(canonical / "metrics.jsonl"))
+        return {generation_, directory_, std::nullopt};
     auto run = ReadRun(canonical);
     const auto identity = mmltk::common::io::FileSnapshot::Read(canonical / "metrics.jsonl");
     std::ifstream stream(canonical / "metrics.jsonl", std::ios::binary);
@@ -37,10 +46,9 @@ r::TrainingRun TrainRunStore::Open(const std::filesystem::path& directory) {
     directory_ = std::move(canonical);
     run_ = run;
     metrics_ = std::move(stream);
-    ++generation_;
     line_.clear();
     line_.reserve(line_bytes);
-    return run;
+    return {generation_, directory_, std::move(run)};
 }
 r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query) {
     if (!run_ || query.generation != generation_) throw std::runtime_error("training history query refers to a stale directory");
@@ -88,9 +96,10 @@ r::TrainingHistoryPage TrainRunStore::Read(const r::TrainingHistoryQuery& query)
     page.more = page.next_cursor < size && ((!page.records.empty() && consumed >= page_bytes) || page.records.size() == query.count);
     return page;
 }
-std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& selected, const std::optional<r::TrainingCheckpoint>& resume) {
+std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& selected, const std::optional<r::TrainingCheckpoint>& resume, const bool automatic) {
+    if (selected.empty()) throw std::invalid_argument("training output directory is empty");
     const auto root = std::filesystem::absolute(selected).lexically_normal();
-    if (resume && std::filesystem::exists(root / "run.json") && std::filesystem::exists(root / "metrics.jsonl")) {
+    if (!automatic && resume && std::filesystem::exists(root / "run.json") && std::filesystem::exists(root / "metrics.jsonl")) {
         std::optional<r::TrainingRun> run;
         try {
             run = ReadRun(root);
@@ -101,13 +110,25 @@ std::filesystem::path TrainRunStore::ResolveOutput(const std::filesystem::path& 
             return root;
         (void)run;
     }
-    if (!std::filesystem::exists(root) || std::filesystem::is_empty(root)) {
+    if (!automatic && !resume && (!std::filesystem::exists(root) || std::filesystem::is_empty(root))) {
         std::filesystem::create_directories(root);
         return root;
     }
-    const auto stamp = std::chrono::system_clock::now().time_since_epoch().count();
-    for (unsigned suffix = 0; suffix < 1024; ++suffix) {
-        const auto candidate = root / std::format("run-{}-{}", stamp, suffix);
+    std::filesystem::create_directories(root);
+    std::uint64_t next = 1;
+    for (const auto& entry : std::filesystem::directory_iterator(root)) {
+        const auto name = entry.path().filename().string();
+        if (!name.starts_with("run-")) continue;
+        std::uint64_t suffix = 0;
+        const auto parsed = std::from_chars(name.data() + 4, name.data() + name.size(), suffix);
+        if (parsed.ptr != name.data() + name.size()) continue;
+        if (parsed.ec == std::errc::result_out_of_range) throw std::runtime_error("training output suffix exhausted");
+        if (parsed.ec != std::errc{}) continue;
+        if (suffix == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("training output suffix exhausted");
+        next = std::max(next, suffix + 1);
+    }
+    for (; next != std::numeric_limits<std::uint64_t>::max(); ++next) {
+        const auto candidate = root / std::format("run-{:04}", next);
         if (std::filesystem::create_directory(candidate)) return candidate;
     }
     throw std::runtime_error("cannot allocate a fresh training output directory");

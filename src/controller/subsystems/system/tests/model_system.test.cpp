@@ -102,6 +102,8 @@ TEST_CASE("model keys separate workflow artifacts from dataset splits and reject
     CHECK(train_request->train_compiled_path == "/tmp/train.bin");
     CHECK(train_request->weights_path == "/tmp/train.pt");
     CHECK(train_request->test_compiled_path.empty());
+    CHECK(settings.workflows.train.request.output_dir.empty());
+    CHECK(train_request->output_dir == "./gui-train-output");
     auto explicit_test = settings;
     explicit_test.workflows.train.request.test_compiled_path = "/independent/test.bin";
     CHECK_FALSE(subsystems::system::ComputeIntentMaterializer::LocalTrain(explicit_test, inspection, train));

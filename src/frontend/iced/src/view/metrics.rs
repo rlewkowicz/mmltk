@@ -105,15 +105,17 @@ impl Component {
                 live_changed = self.live.ingest(record, true, &self.metrics);
             }
         }
-        let selected = model.workflow.training_run.is_some();
+        let selected = model.workflow.output.saved().is_some();
         let mut saved_changed = 0;
-        if let Some(opened) = &model.workflow.training_run {
+        if let Some(opened) = model.workflow.output.run() {
             if self.saved.generation != opened.generation {
                 self.saved.clear(&self.metrics);
-                self.saved.set_run(&opened.run.runid, opened.generation);
+                if let Some(run) = &opened.run {
+                    self.saved.set_run(&run.runid, opened.generation);
+                } else { self.saved.generation = opened.generation; }
                 saved_changed = u16::MAX;
             }
-            if let Some(page) = &model.workflow.training_history {
+            if let Some(page) = model.workflow.output.page() {
                 let key = (page.generation, page.nextcursor);
                 if page.generation == self.saved.generation && self.saved.page != Some(key) {
                     for record in &page.records {
@@ -122,6 +124,10 @@ impl Component {
                     self.saved.page = Some(key);
                 }
             }
+        }
+        if selected && model.workflow.output.run().is_none() && (self.saved.generation != 0 || !self.saved_selected) {
+            self.saved.clear(&self.metrics);
+            saved_changed = u16::MAX;
         }
         let changed = if selected != self.saved_selected {
             u16::MAX
@@ -672,7 +678,7 @@ pub(crate) mod tests {
         }
         if saved {
             select_saved_run(&mut model);
-            model.workflow.training_history = Some(TrainingHistoryPage {
+            model.workflow.output.saved_mut().unwrap().page = Some(TrainingHistoryPage {
                 generation: 3,
                 nextcursor: 100,
                 more: false,
@@ -808,8 +814,7 @@ pub(crate) mod tests {
         assert_center(&component, kind, [120.0, 0.5]);
         pan(&mut component, kind, &mut state);
         // Current live run is an explicit source transition with its own bounds.
-        model.workflow.training_run = None;
-        model.workflow.training_history = None;
+        model.workflow.output.live();
         component.rebase(&model, true);
         let mut state = PlotState::default();
         redraw(&mut component, kind, &mut state);
@@ -843,54 +848,8 @@ pub(crate) mod tests {
             .train
             .request
             .clone();
-        model.workflow.training_run = Some(TrainingOpenedRun {
-            generation: 3,
-            directory: "saved-output".into(),
-            run: TrainingRun {
-                formatversion: 2,
-                runid: "saved".into(),
-                attemptid: "saved-attempt".into(),
-                checkpointattemptid: String::new(),
-                sourcecheckpointattemptid: String::new(),
-                configuration,
-                execution: TrainingExecutionFacts {
-                    evallanes: 1,
-                    effectivebatchperrank: 4,
-                    effectivebatchglobal: 4,
-                    datasetlimits: TrainingDatasetLimits {
-                        trainmaxinstances: 1,
-                        valmaxinstances: 1,
-                        testmaxinstances: None,
-                        largestmaxinstances: 1,
-                        resolvednumqueries: 6,
-                        requirednumqueries: 1,
-                        automaticnumqueriescap: 6,
-                        querysource: "fixture".into(),
-                        requestedoverride: false,
-                        automatic: false,
-                    },
-                },
-                originalweights: "fixture.pt".into(),
-                originalclassdescriptor: String::new(),
-                evaluatedweights: EvaluatedWeights::Ordinary,
-                classlayout: ModelClassLayout {
-                    version: 1,
-                    foreground: OrderedClassCatalog { names: Vec::new() },
-                    classnameevidence: OrderedClassCatalog { names: Vec::new() },
-                    slots: Vec::new(),
-                    scores: ClassScoreEncoding::SigmoidLogits,
-                    noobject: NoObjectEncoding::AllNegative,
-                    provenance: ClassLayoutProvenance {
-                        origin: ClassLayoutOrigin::Unresolved,
-                        producer: "fixture".into(),
-                        artifactsha256: String::new(),
-                    },
-                    supervisioninforegroundorder: false,
-                },
-                resumeepoch: -1,
-                resumeoptimizerstep: 0,
-            },
-        });
+        model.workflow.output.select_saved("saved-output".into());
+        model.workflow.output.saved_mut().unwrap().run = Some(crate::view_model::test_support::saved_training_run(configuration));
     }
     #[test]
     fn hidden_navigation_saved_selection_and_preparation_preserve_independent_live_history() {
@@ -920,7 +879,7 @@ pub(crate) mod tests {
         saved.attemptid = "saved-attempt".into();
         saved.progress.epoch = 9;
         saved.progress.scalars.total = Some(77.0);
-        model.workflow.training_history = Some(TrainingHistoryPage {
+        model.workflow.output.saved_mut().unwrap().page = Some(TrainingHistoryPage {
             generation: 3,
             nextcursor: 100,
             more: false,
@@ -956,8 +915,7 @@ pub(crate) mod tests {
             .unwrap();
 
         // This is the same explicit selection clearing used by Current live run.
-        model.workflow.training_run = None;
-        model.workflow.training_history = None;
+        model.workflow.output.live();
         component.rebase(&model, true);
         assert!(!component.saved_selected);
         assert_eq!(component.charts[0].shapes[0], Some(shape));

@@ -1,4 +1,5 @@
 #pragma once
+#include <stop_token>
 #include "src/backend/models/rfdetr/core/model.h"
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +16,7 @@ class ModelEma final {
     ModelEma& operator=(ModelEma&&) noexcept = default;
     void update();
     [[nodiscard]] int64_t completed_updates() const noexcept { return completed_updates_; }
-    static void validate_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow);
+    static void validate_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow, std::stop_token stop = {});
     [[nodiscard]] static ModelEma from_cpu_shadow(const std::vector<torch::Tensor>& model_params, const std::vector<torch::Tensor>& cpu_shadow, double decay,
                                                   double tau, int64_t completed_updates);
     class Selection final {

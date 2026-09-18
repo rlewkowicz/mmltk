@@ -6,6 +6,8 @@
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -577,6 +579,7 @@ void test_ui_settings_round_trip() {
     train.request.train_compiled_path = "/tmp/train.bin";
     train.request.val_compiled_path = "/tmp/val.bin";
     train.request.test_compiled_path = "/tmp/test.bin";
+    train.auto_output = false;
     train.request.output_dir = "/tmp/train-output";
     train.request.weights_path = "/tmp/weights.pt";
     train.model_input = ModelArtifactInputKind::Weights;
@@ -1250,11 +1253,13 @@ void test_gui_json_persistence_enforces_reflected_field_policies() {
         PersistenceCase{"nonfinite JSON representation", [](nlohmann::json& document) { document["ui"]["ui_scale"] = nullptr; }, false, false},
         PersistenceCase{"path endpoint",
                         [](nlohmann::json& document) {
+                            document["workflows"]["train"]["training"]["auto_output"] = false;
                             document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes, 'x');
                         },
                         true, false},
         PersistenceCase{"path outside",
                         [](nlohmann::json& document) {
+                            document["workflows"]["train"]["training"]["auto_output"] = false;
                             document["workflows"]["train"]["training"]["output_dir"] = std::string(mmltk::frameworks::reflection::kMaximumPathBytes + 1U, 'x');
                         },
                         false, false},
@@ -1681,3 +1686,123 @@ TEST_CASE("test_explore_preview_candidate_is_atomic_and_persists_native_modes", 
 }
 TEST_CASE("test_copy_paste_default_and_persisted_overrides", "[gui][settings][copy_paste]") { test_copy_paste_default_and_persisted_overrides(); }
 TEST_CASE("test_apply_current_copy_paste_preference", "[.][acceptance][settings]") { test_apply_current_copy_paste_preference(); }
+
+TEST_CASE("checkpoint restore preserves output policy and installs explicit inherited splits", "[gui][settings][train]") {
+    namespace c = mmltk::controller::contracts;
+    using Value = mmltk::frameworks::serialization::wire::FlatValue;
+    for (const bool automatic : {false, true}) {
+        for (const bool independent : {false, true}) {
+            mmltk::testsupport::ScopedTempDir root{"training-restore-settings"};
+            const mmltk::controller::services::SettingsLocation location{(root.path() / "gui.json").string()};
+            mmltk::controller::SettingsSystem settings;
+            REQUIRE(settings.Load(location).applied());
+            c::SettingsUpdateRequest selected;
+            selected.updates = {
+                {.path = "workflows.train.auto_output", .value = Value{automatic}},
+                {.path = "workflows.train.request.output_dir", .value = Value{std::string{automatic ? "" : "/selected/output"}}},
+                {.path = "workflows.validate.request.compiled_path", .value = Value{std::string{independent ? "/independent/val.bin" : ""}}},
+            };
+            (void)settings.Update(std::move(selected));
+            auto request = settings.snapshot().settings_state.workflows.train.request;
+            request.train_compiled_path = "/restored/train.bin";
+            request.val_compiled_path = "/restored/val.bin";
+            request.output_dir = "/saved/old-output";
+            settings.RestoreTrainingCheckpoint(request, "/saved/checkpoint.pt");
+            const auto verify = [&](const auto& snapshot) {
+                const auto& train = snapshot.settings_state.workflows.train;
+                CHECK_FALSE(train.use_compiled_directory_defaults);
+                CHECK(train.request.train_compiled_path == request.train_compiled_path);
+                CHECK(train.request.val_compiled_path == request.val_compiled_path);
+                CHECK(train.auto_output == automatic);
+                CHECK(train.request.output_dir == (automatic ? "" : "/selected/output"));
+                CHECK(snapshot.validation_source == (independent ? "/independent/val.bin" : "/restored/val.bin"));
+            };
+            verify(settings.snapshot());
+            c::SettingsUpdateRequest unrelated;
+            unrelated.updates.push_back({.path = "workflows.train.request.epochs", .value = Value{std::int64_t{20}}});
+            verify(settings.Update(std::move(unrelated)));
+            mmltk::controller::SettingsSystem reloaded;
+            REQUIRE(reloaded.Load(location).applied());
+            verify(reloaded.snapshot());
+        }
+    }
+}
+
+TEST_CASE("manual output selection disables automatic output and enabling it clears the path", "[gui][settings][train]") {
+    auto settings = mmltk::controller::contracts::default_gui_settings_state();
+    REQUIRE(settings.workflows.train.auto_output);
+    REQUIRE(settings.workflows.train.request.output_dir.empty());
+    const mmltk::controller::contracts::SettingsValueUpdate selected{
+        .path = "workflows.train.request.output_dir", .value = mmltk::frameworks::serialization::wire::FlatValue{std::string{"/selected/output"}}};
+    REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&selected, 1}));
+    REQUIRE_FALSE(settings.workflows.train.auto_output);
+    REQUIRE(settings.workflows.train.request.output_dir == "/selected/output");
+    const mmltk::controller::contracts::SettingsValueUpdate automatic{
+        .path = "workflows.train.auto_output", .value = mmltk::frameworks::serialization::wire::FlatValue{true}};
+    REQUIRE(mmltk::controller::contracts::apply_gui_settings_values(settings, std::span{&automatic, 1}));
+    REQUIRE(settings.workflows.train.auto_output);
+    REQUIRE(settings.workflows.train.request.output_dir.empty());
+}
+
+TEST_CASE("schema 8 output preferences preserve legacy destinations and persist canonically", "[gui][settings][train]") {
+    struct Case {
+        std::string_view name;
+        std::optional<bool> automatic;
+        std::string_view path;
+        bool expected_automatic;
+        std::string_view expected_path;
+        bool repaired;
+    };
+    const std::array cases{
+        Case{"legacy-custom", std::nullopt, "/selected/output", false, "/selected/output", true},
+        Case{"legacy-default", std::nullopt, "./gui-train-output", false, "./gui-train-output", true},
+        Case{"legacy-empty", std::nullopt, "", true, "", true},
+        Case{"automatic-stray", true, "/old/run-0001", true, "", true},
+        Case{"automatic-empty", true, "", true, "", false},
+        Case{"manual-empty", false, "", false, "", false},
+        Case{"manual-selected", false, "/selected/output", false, "/selected/output", false},
+    };
+    for (const auto& test : cases) {
+        CAPTURE(test.name);
+        mmltk::testsupport::ScopedTempDir root{"output-preference-settings"};
+        auto expected = default_gui_settings_state();
+        auto document = snapshot_gui_settings(expected);
+        auto& training = document["workflows"]["train"]["training"];
+        training["output_dir"] = test.path;
+        if (test.automatic.has_value()) training["auto_output"] = *test.automatic;
+        else training.erase("auto_output");
+        expected.workflows.train.auto_output = test.expected_automatic;
+        expected.workflows.train.request.output_dir = test.expected_path;
+        const auto path = write_recipe_case(root, "gui.json", document);
+        auto loaded = default_gui_settings_state();
+        bool repaired = false;
+        REQUIRE(load_settings(path, loaded, nullptr, &repaired));
+        CHECK(loaded == expected);
+        CHECK(repaired == test.repaired);
+
+        mmltk::controller::SettingsSystem settings;
+        REQUIRE(settings.Load(mmltk::controller::services::SettingsLocation{path.string()}).applied());
+        CHECK(settings.snapshot().settings_state == expected);
+        auto persisted = nlohmann::json::parse(std::ifstream{path});
+        CHECK(persisted.at("workflows").at("train").at("training").at("auto_output") == test.expected_automatic);
+        CHECK(persisted.at("workflows").at("train").at("training").at("output_dir") == test.expected_path);
+        persisted.erase("settings_revision");
+        CHECK(persisted == snapshot_gui_settings(expected));
+        auto round_trip = default_gui_settings_state();
+        repaired = true;
+        REQUIRE(load_settings(write_recipe_case(root, "round-trip.json", persisted), round_trip, nullptr, &repaired));
+        CHECK(round_trip == expected);
+        CHECK_FALSE(repaired);
+    }
+}
+
+TEST_CASE("partial training settings retain an unspecified output policy", "[gui][settings][train]") {
+    for (const bool automatic : {false, true}) {
+        auto settings = default_gui_settings_state();
+        settings.workflows.train.auto_output = automatic;
+        settings.workflows.train.request.output_dir = automatic ? "" : "/selected/output";
+        const auto expected = settings;
+        apply_gui_settings({{"schema_version", kGuiSettingsSchemaVersion}, {"workflows", {{"train", {{"training", nlohmann::json::object()}}}}}}, settings);
+        CHECK(settings == expected);
+    }
+}

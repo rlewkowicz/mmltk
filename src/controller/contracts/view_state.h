@@ -153,7 +153,7 @@ struct TrainViewState : TrainExecutionPaneState {
         request.device_ids = {0};
         request.train_compiled_path = "./compiled/train.bin";
         request.val_compiled_path = "./compiled/val.bin";
-        request.output_dir = "./gui-train-output";
+        request.output_dir.clear();
         request.preset_name = kDefaultModelPresetName;
         request.resolution = kDefaultModelResolution;
         request.gpu_augmentation.enabled = true;
@@ -167,6 +167,7 @@ struct TrainViewState : TrainExecutionPaneState {
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]]
         [[= mmltk::controller::contracts::reflection::FileDialog<"Select compiled dataset", "Directories", "*">{
             .mode = mmltk::controller::contracts::FileDialogMode::OpenFolder}]] std::string compiled_dataset_dir = "./compiled";
+    bool auto_output = true;
     bool use_compiled_directory_defaults = true;
     bool overwrite_compiled_dataset = false;
     bool compile_dimensions = false;

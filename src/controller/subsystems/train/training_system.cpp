@@ -1,6 +1,10 @@
 #include "src/controller/subsystems/train/training_system.h"
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <future>
+#include <thread>
+#include "src/common/io/file_digest.h"
 #include <ranges>
 #include <stdexcept>
 #include <utility>
@@ -8,6 +12,7 @@
 #include "src/controller/services/train_process_client.h"
 #include "src/controller/services/train_run_store.h"
 #include "src/backend/models/rfdetr/training/checkpoint.h"
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/controller/subsystems/system/compute_intent_materializer.h"
 namespace mmltk::controller {
 namespace {
@@ -20,6 +25,9 @@ namespace {
     return {.disposition = Target::Inconclusive, .instance_id = instance};
 }
 }  // namespace
+mmltk::backend::models::rfdetr::TrainingCheckpoint TrainingRuntime::InspectCheckpoint(const std::filesystem::path& path, std::stop_token stop) {
+    return mmltk::backend::models::rfdetr::inspect_training_checkpoint(path, stop);
+}
 NativeTrainingRuntime::NativeTrainingRuntime(NativeTrainingConfiguration configuration) : config_(std::move(configuration)) {}
 contracts::ComputeTerminal NativeTrainingRuntime::Train(mmltk::backend::models::rfdetr::TrainRequest request, const std::stop_token stop,
                                                         const std::function<void(const services::TrainProcessProgress&)>& progress) {
@@ -99,9 +107,115 @@ class TrainingSystem::Impl final {
         int instance = 0;
         std::string launch_token;
     };
-    Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, RuntimeFactory factory, SystemEventSink<event_type> events)
+    Impl(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, std::optional<mmltk::common::system::ExecutionPolicyRequest> policy,
+         RuntimeFactory factory, SystemEventSink<event_type> events)
         : settings_(settings), dataset_(dataset), model_(model), factory_(std::move(factory)), events_(std::move(events)) {
         if (!factory_) throw contracts::UnavailableError("training runtime factory is unavailable");
+        std::promise<void> initialized;
+        auto ready = initialized.get_future();
+        inspection_worker_ = std::jthread([this, policy = std::move(policy), initialized = std::move(initialized)]() mutable {
+            std::optional<mmltk::common::system::ScopedExecutionPolicy> placement;
+            try {
+                if (policy) placement.emplace(*policy);
+            } catch (...) {
+                initialized.set_exception(std::current_exception());
+                return;
+            }
+            initialized.set_value();
+            InspectLoop();
+        });
+        // Constructor failure unwinds through jthread's join before any captured
+        // state disappears. No archive work is admitted until policy is verified.
+        ready.get();
+    }
+    ~Impl() { StopInspection(); }
+    void StopInspection() noexcept {
+        std::stop_source stop{std::nostopstate};
+        {
+            std::scoped_lock lock(mutex_);
+            inspection_shutdown_ = true;
+            inspection_pending_.reset();
+            stop = inspection_stop_;
+        }
+        stop.request_stop();
+        inspection_ready_.notify_one();
+        if (inspection_worker_.joinable()) inspection_worker_.join();
+    }
+    mmltk::backend::models::rfdetr::TrainingCheckpointInspection Inspect(std::filesystem::path path) {
+        using Status = mmltk::backend::models::rfdetr::TrainingInspectionStatus;
+        std::stop_source previous{std::nostopstate};
+        mmltk::backend::models::rfdetr::TrainingCheckpointInspection result;
+        {
+            std::scoped_lock lock(mutex_);
+            if (inspection_shutdown_) throw contracts::UnavailableError("checkpoint inspection is shutting down");
+            const auto generation = contracts::next_compute_generation(state_.inspection.generation);
+            if (!generation) throw contracts::FailedError("checkpoint inspection generation exhausted");
+            previous = inspection_stop_;
+            inspection_stop_ = path.empty() ? std::stop_source{std::nostopstate} : std::stop_source{};
+            state_.inspection = {.generation = *generation, .path = std::move(path), .status = Status::Running};
+            inspection_file_.reset();
+            if (state_.inspection.path.empty()) {
+                state_.inspection.status = Status::Cancelled;
+                inspection_pending_.reset();
+            } else {
+                inspection_pending_ = state_.inspection;
+            }
+            result = state_.inspection;
+            AdvanceObservation();
+        }
+        previous.request_stop();
+        inspection_ready_.notify_one();
+        return result;
+    }
+    void InspectLoop() noexcept {
+        using Status = mmltk::backend::models::rfdetr::TrainingInspectionStatus;
+        std::unique_ptr<TrainingRuntime> inspector;
+        for (;;) {
+            mmltk::backend::models::rfdetr::TrainingCheckpointInspection current;
+            std::stop_token stop;
+            {
+                std::unique_lock lock(mutex_);
+                inspection_ready_.wait(lock, [&] { return inspection_shutdown_ || inspection_pending_.has_value(); });
+                if (inspection_shutdown_) return;
+                current = std::move(*inspection_pending_);
+                inspection_pending_.reset();
+                stop = inspection_stop_.get_token();
+            }
+            std::optional<mmltk::common::io::FileSnapshot> identity;
+            try {
+                if (!inspector) inspector = factory_();
+                if (!inspector) throw std::runtime_error("checkpoint inspection runtime unavailable");
+                identity = mmltk::common::io::FileSnapshot::Read(current.path);
+                current.checkpoint = inspector->InspectCheckpoint(current.path, stop);
+                identity->RequireUnchanged(current.path);
+                current.status = Status::Ready;
+            } catch (const std::exception& error) {
+                current.status = Status::Failed;
+                current.error = std::string_view{error.what()}.substr(0, 1024);
+            } catch (...) {
+                current.status = Status::Failed;
+                current.error = "checkpoint inspection failed";
+            }
+            if (stop.stop_requested()) current.status = Status::Cancelled;
+            if (current.status != Status::Ready) { current.checkpoint.reset(); identity.reset(); }
+            {
+                std::scoped_lock lock(mutex_);
+                if (inspection_shutdown_ || state_.inspection.generation != current.generation) continue;
+                state_.inspection = current;
+                inspection_file_ = identity;
+                AdvanceObservation();
+            }
+            direct::PublishLazyNoexcept(events_, [&] { return event_type{TrainingInspectionChanged{std::move(current)}}; });
+        }
+    }
+    mmltk::backend::models::rfdetr::TrainingCheckpoint PreparedCheckpoint(const std::filesystem::path& path) const {
+        std::scoped_lock lock(mutex_);
+        const auto& inspection = state_.inspection;
+        if (inspection.status != mmltk::backend::models::rfdetr::TrainingInspectionStatus::Ready || !inspection.checkpoint || !inspection_file_ ||
+            (path != inspection.path && path != inspection.checkpoint->path))
+            throw contracts::InvalidIntentError("inspect the selected checkpoint before preparing resume");
+        inspection_file_->RequireUnchanged(inspection.path);
+        return *inspection.checkpoint;
     }
     TrainingRuntime& runtime() {
         if (!runtime_) runtime_ = factory_();
@@ -137,6 +251,7 @@ class TrainingSystem::Impl final {
                     const auto next = contracts::next_compute_generation(state_.local.generation_frontier);
                     if (!next) throw contracts::FailedError("training operation generation exhausted");
                     state_.activity = TrainingActivity::Local;
+                    state_.output_directory.clear();
                     state_.local.active = true;
                     state_.local.generation_frontier = *next;
                     state_.local.progress = {};
@@ -160,10 +275,13 @@ class TrainingSystem::Impl final {
                     } else {
                         auto request = subsystems::system::ComputeIntentMaterializer::LocalTrain(settings, inspection, selection);
                         if (!request) throw contracts::InvalidIntentError(request.error().detail);
-                        request->output_dir = services::TrainRunStore::ResolveOutput(
-                            request->output_dir, request->resume_path.empty()
-                                                     ? std::optional<mmltk::backend::models::rfdetr::TrainingCheckpoint>{}
-                                                     : std::optional{mmltk::backend::models::rfdetr::inspect_training_checkpoint(request->resume_path)});
+                        std::optional<mmltk::backend::models::rfdetr::TrainingCheckpoint> continuation;
+                        if (!request->resume_path.empty()) {
+                            continuation = mmltk::backend::models::rfdetr::inspect_training_checkpoint(request->resume_path, stop);
+                            if (!continuation->resumable) throw contracts::InvalidIntentError("selected artifact is not resumable");
+                        }
+                        if (stop.stop_requested()) throw mmltk::backend::models::rfdetr::ArtifactPublicationCancelled{};
+                        request->output_dir = services::TrainRunStore::ResolveOutput(request->output_dir, continuation, settings.workflows.train.auto_output);
                         {
                             std::scoped_lock lock(mutex_);
                             state_.output_directory = request->output_dir;
@@ -201,6 +319,8 @@ class TrainingSystem::Impl final {
                     if (malformed_progress.load(std::memory_order_relaxed) || !terminal.valid_worker_terminal())
                         throw std::runtime_error("local training runtime returned an invalid result");
                     failed = terminal.outcome == contracts::ComputeOperationOutcome::Failed;
+                } catch (const mmltk::backend::models::rfdetr::ArtifactPublicationCancelled&) {
+                    terminal = contracts::make_compute_terminal(contracts::ComputeOperationOutcome::Cancelled);
                 } catch (...) {
                     failed = true;
                     terminal = contracts::compute_failure_terminal(std::current_exception(), "local training failed");
@@ -427,40 +547,42 @@ class TrainingSystem::Impl final {
     TrainingSnapshot state_{};
     std::unique_ptr<TrainingRuntime> runtime_;
     std::optional<Pending> pending_;
+    std::condition_variable inspection_ready_;
+    std::optional<mmltk::backend::models::rfdetr::TrainingCheckpointInspection> inspection_pending_;
+    std::optional<mmltk::common::io::FileSnapshot> inspection_file_;
+    std::stop_source inspection_stop_;
+    bool inspection_shutdown_ = false;
+    std::jthread inspection_worker_;
     // CLEANUP-IGNORE: Training owns one LocalRun behind its sealed facade; compute systems have separate cores.
     direct::LocalRun run_;
 };
-TrainingSystem::TrainingSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model, RuntimeFactory factory, SystemEventSink<event_type> events)
-    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(factory), std::move(events))) {}
+TrainingSystem::TrainingSystem(SettingsSystem& settings, DatasetSystem& dataset, ModelSystem& model,
+                               std::optional<mmltk::common::system::ExecutionPolicyRequest> policy, RuntimeFactory factory,
+                               SystemEventSink<event_type> events)
+    : impl_(std::make_unique<Impl>(settings, dataset, model, std::move(policy), std::move(factory), std::move(events))) {}
 TrainingSystem::~TrainingSystem() = default;
 mmltk::backend::models::rfdetr::TrainingOpenedRun TrainingSystem::OpenRun(mmltk::backend::models::rfdetr::TrainingDirectoryQuery query) {
     std::lock_guard store_lock(impl_->run_store_mutex_);
-    auto run = impl_->run_store_.Open(query.directory);
-    {
-        std::lock_guard lock(impl_->mutex_);
-        impl_->state_.output_directory = impl_->run_store_.directory();
-        impl_->state_.history_generation = impl_->run_store_.generation();
-        impl_->AdvanceObservation();
-    }
-    direct::PublishLazyNoexcept(impl_->events_, [&] { return event_type{TrainingChanged{snapshot()}}; });
-    return {impl_->run_store_.generation(), impl_->run_store_.directory(), std::move(run)};
+    return impl_->run_store_.Open(query.directory);
 }
 mmltk::backend::models::rfdetr::TrainingHistoryPage TrainingSystem::History(mmltk::backend::models::rfdetr::TrainingHistoryQuery query) {
     std::lock_guard lock(impl_->run_store_mutex_);
     return impl_->run_store_.Read(query);
 }
-mmltk::backend::models::rfdetr::TrainingCheckpoint TrainingSystem::InspectCheckpoint(mmltk::backend::models::rfdetr::TrainingCheckpointQuery query) {
-    return mmltk::backend::models::rfdetr::inspect_training_checkpoint(query.path);
+mmltk::backend::models::rfdetr::TrainingCheckpointInspection TrainingSystem::InspectCheckpoint(mmltk::backend::models::rfdetr::TrainingCheckpointQuery query) {
+    if (query.path.empty()) throw contracts::InvalidIntentError("checkpoint path is empty");
+    return impl_->Inspect(std::move(query.path));
 }
+mmltk::backend::models::rfdetr::TrainingCheckpointInspection TrainingSystem::CancelCheckpointInspection() { return impl_->Inspect({}); }
 mmltk::backend::models::rfdetr::TrainingCheckpoint TrainingSystem::PrepareResume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery query) {
     if (snapshot().activity != TrainingActivity::Idle) throw contracts::BusyError("training is active");
-    auto checkpoint = InspectCheckpoint(std::move(query));
+    auto checkpoint = impl_->PreparedCheckpoint(query.path);
     if (!checkpoint.resumable || !checkpoint.configuration) throw contracts::InvalidIntentError("selected artifact is not a full resumable checkpoint");
     impl_->settings_.RestoreTrainingCheckpoint(*checkpoint.configuration, checkpoint.path);
     return checkpoint;
 }
 TrainingSnapshot TrainingSystem::Resume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery query) {
-    auto checkpoint = InspectCheckpoint(std::move(query));
+    auto checkpoint = impl_->PreparedCheckpoint(query.path);
     if (!checkpoint.resumable) throw contracts::InvalidIntentError("selected artifact is not resumable");
     return impl_->Start(checkpoint.path);
 }
@@ -484,6 +606,7 @@ TrainingSnapshot TrainingSystem::Stop(contracts::WorkflowIntent<contracts::Featu
 }
 void TrainingSystem::Shutdown() noexcept {
     static_cast<void>(Stop({}));
+    impl_->StopInspection();
     impl_->run_.StopAndJoin();
 }
 TrainingSnapshot TrainingSystem::Query(contracts::ProviderQueryIntent) { return impl_->Query(); }

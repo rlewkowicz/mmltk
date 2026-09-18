@@ -24,7 +24,7 @@ use reduction::{
     merge_model_snapshot, merge_observation, merge_presentation_snapshot,
 };
 pub use workflow::{
-    ModelSelectionReceipt, PendingStart, StartInputs, StartPreparation, WorkflowModel,
+    CheckpointCapability, ContinuationMode, HistoryLoad, ModelSelectionReceipt, PendingStart, StartInputs, StartPreparation, WorkflowModel,
 };
 
 use std::collections::BTreeMap;

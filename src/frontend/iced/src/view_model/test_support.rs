@@ -251,3 +251,55 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
         }),
     }
 }
+
+pub(crate) fn saved_training_run(configuration: crate::generated::TrainRequest) -> crate::generated::TrainingOpenedRun {
+    use crate::generated::*;
+    TrainingOpenedRun {
+        generation: 3,
+        directory: "saved-output".into(),
+        run: Some(TrainingRun {
+            formatversion: 2,
+            runid: "saved".into(),
+            attemptid: "saved-attempt".into(),
+            checkpointattemptid: String::new(),
+            sourcecheckpointattemptid: String::new(),
+            configuration,
+            execution: TrainingExecutionFacts {
+                evallanes: 1,
+                effectivebatchperrank: 4,
+                effectivebatchglobal: 4,
+                datasetlimits: TrainingDatasetLimits {
+                    trainmaxinstances: 1,
+                    valmaxinstances: 1,
+                    testmaxinstances: None,
+                    largestmaxinstances: 1,
+                    resolvednumqueries: 6,
+                    requirednumqueries: 1,
+                    automaticnumqueriescap: 6,
+                    querysource: "fixture".into(),
+                    requestedoverride: false,
+                    automatic: false,
+                },
+            },
+            originalweights: "fixture.pt".into(),
+            originalclassdescriptor: String::new(),
+            evaluatedweights: EvaluatedWeights::Ordinary,
+            classlayout: ModelClassLayout {
+                version: 1,
+                foreground: OrderedClassCatalog { names: Vec::new() },
+                classnameevidence: OrderedClassCatalog { names: Vec::new() },
+                slots: Vec::new(),
+                scores: ClassScoreEncoding::SigmoidLogits,
+                noobject: NoObjectEncoding::AllNegative,
+                provenance: ClassLayoutProvenance {
+                    origin: ClassLayoutOrigin::Unresolved,
+                    producer: "fixture".into(),
+                    artifactsha256: String::new(),
+                },
+                supervisioninforegroundorder: false,
+            },
+            resumeepoch: -1,
+            resumeoptimizerstep: 0,
+        }),
+    }
+}

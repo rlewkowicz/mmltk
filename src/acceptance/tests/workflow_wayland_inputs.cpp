@@ -67,6 +67,7 @@ void WorkflowWaylandInputs::Configure(contracts::GuiSettingsState& settings, con
     train.request.weights_path = weights_;
     train.request.train_compiled_path = compiled;
     train.request.val_compiled_path = compiled;
+    train.auto_output = false;
     train.request.output_dir = output / "training";
     train.request.resolution = 64;
     train.request.num_queries = 6;

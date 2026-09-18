@@ -132,13 +132,14 @@ void require_resume_training_supervision_config(torch::serialize::InputArchive& 
         throw std::runtime_error("native RF-DETR resume checkpoint training supervision configuration does not match");
     }
 }
-std::vector<torch::Tensor> read_ema_shadow_archive(torch::serialize::InputArchive& archive, std::span<const std::string> expected_names) {
+std::vector<torch::Tensor> read_ema_shadow_archive(torch::serialize::InputArchive& archive, std::span<const std::string> expected_names, std::stop_token stop) {
     const auto count = mmltk::backend::ml::serialization::require_int(archive, "entry_count");
     if (count < 0 || static_cast<std::uint64_t>(count) != expected_names.size())
         throw std::runtime_error("RF-DETR training checkpoint state count does not match the bounded active inventory");
     std::vector<torch::Tensor> shadow;
     shadow.reserve(expected_names.size());
     for (std::size_t index = 0; index < expected_names.size(); ++index) {
+        if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
         torch::serialize::InputArchive entry;
         archive.read(mmltk::backend::ml::serialization::archive_entry_name(index), entry);
         if (mmltk::backend::ml::serialization::require_string(entry, "name") != expected_names[index])
@@ -149,10 +150,19 @@ std::vector<torch::Tensor> read_ema_shadow_archive(torch::serialize::InputArchiv
 }
 }  // namespace mmltk::backend::models::rfdetr::detail
 namespace mmltk::backend::models::rfdetr {
-TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path) {
-    auto decoded = decode_native_model_state(path);
+TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path, std::stop_token stop) {
+    if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+    const auto container = identify_model_state_container(path);
+    if (container == ModelStateContainer::Unknown) throw std::invalid_argument("unsupported training weights container");
+    if (container == ModelStateContainer::Python) {
+        // Container capability only. ModelSystem still owns complete transfer admission.
+        TrainingCheckpoint result;
+        result.path = std::filesystem::canonical(path);
+        return result;
+    }
+    auto decoded = decode_native_model_state(path, stop);
     if (!decoded.class_artifact) throw std::runtime_error("training checkpoint lacks exact native artifact admission");
-    decoded.class_artifact->RequireUnchanged();
+    decoded.class_artifact->RequireUnchanged(stop);
     const auto& state = decoded;
     if (!state.admitted_archive()) throw std::runtime_error("training checkpoint lacks its native archive");
     auto& archive = *state.admitted_archive();
@@ -162,7 +172,7 @@ TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path
     result.original_weights = decoded.metadata.source_path;
     const auto continuation = detail::read_training_continuation(archive);
     if (!continuation) {
-        decoded.class_artifact->RequireUnchanged();
+        decoded.class_artifact->RequireUnchanged(stop);
         return result;
     }
     const auto& request = continuation->configuration;
@@ -170,19 +180,25 @@ TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path& path
     archive.read("optimizer", optimizer);
     std::unordered_map<std::string, torch::Tensor> tensors;
     tensors.reserve(state.entries().size());
-    for (const auto& entry : state.entries()) tensors.emplace(entry.name, entry.tensor);
-    const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors)
-                                                                      : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors);
+    for (const auto& entry : state.entries()) {
+        if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+        tensors.emplace(entry.name, entry.tensor);
+    }
+    const auto names = request.optimizer == TrainOptimizerKind::AdamW ? NativeAdamW::InspectCheckpoint(optimizer, tensors, stop)
+                                                                      : NativeMuonWithAuxAdam::InspectCheckpoint(optimizer, tensors, stop);
     if (request.use_ema) {
         torch::serialize::InputArchive ema;
         archive.read("ema_state", ema);
-        const auto shadow = detail::read_ema_shadow_archive(ema, names);
+        const auto shadow = detail::read_ema_shadow_archive(ema, names, stop);
         std::vector<torch::Tensor> parameters;
         parameters.reserve(names.size());
-        for (const auto& name : names) parameters.push_back(tensors.at(name));
-        ModelEma::validate_cpu_shadow(parameters, shadow);
+        for (const auto& name : names) {
+            if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+            parameters.push_back(tensors.at(name));
+        }
+        ModelEma::validate_cpu_shadow(parameters, shadow, stop);
     }
-    decoded.class_artifact->RequireUnchanged();
+    decoded.class_artifact->RequireUnchanged(stop);
     result.original_class_descriptor = continuation->values.training_original_descriptor;
     result.attempt_id = continuation->values.training_attempt_id;
     result.epoch = static_cast<int>(continuation->values.epoch);

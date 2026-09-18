@@ -22,6 +22,7 @@ void SettingsSystem::RestoreTrainingCheckpoint(mmltk::backend::models::rfdetr::T
         request.distributed_store_path.clear();
         if (request.device_ids.empty()) request.device_ids.push_back(request.device_id);
         candidate.workflows.train.request = std::move(request);
+        candidate.workflows.train.use_compiled_directory_defaults = false;
         using Row = contracts::TrainWeightsModelSelection;
         Row::source(candidate) = contracts::ModelSelectionSource::Custom;
         Row::input(candidate) = contracts::ModelArtifactInputKind::Weights;

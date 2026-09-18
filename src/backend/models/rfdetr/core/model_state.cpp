@@ -3,7 +3,12 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "src/backend/models/rfdetr/contract/weight_catalog.h"
+#include <algorithm>
+#include <array>
+#include <cstddef>
 #include <fstream>
+#include "src/common/io/file_memory.h"
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include <caffe2/serialize/inline_container.h>
 #include <filesystem>
 #include <meta>
@@ -105,12 +110,15 @@ void validate_decoded_model_state(const DecodedNativeModelState& state) {
         }
     }
 }
-bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path) {
+ModelStateContainer identify_model_state_container(const std::filesystem::path& checkpoint_path) {
     const auto path = canonical_path(checkpoint_path);
     std::ifstream stream(path, std::ios::binary);
     std::array<char, 4> signature{};
     stream.read(signature.data(), signature.size());
-    if (signature != std::array<char, 4>{'P', 'K', 3, 4}) return false;
+    if (!stream) throw std::invalid_argument("truncated checkpoint container");
+    if (signature != std::array<char, 4>{'P', 'K', 3, 4})
+        return static_cast<unsigned char>(signature[0]) == 0x80 && signature[1] >= 2 && signature[1] <= 5
+            ? ModelStateContainer::Python : ModelStateContainer::Unknown;
     try {
         caffe2::serialize::PyTorchStreamReader reader(path.string());
         // InputArchive is a TorchScript archive. Python pickle archives do not
@@ -119,17 +127,32 @@ bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path) {
         const bool native = std::ranges::any_of(records, [](const auto& name) { return name == "constants.pkl" || name.starts_with("code/"); });
         if (native && reader.getRecordSize("data.pkl") > 16U * kClassLayoutByteBudget)
             throw std::invalid_argument("native checkpoint metadata exceeds admission budget");
-        return native;
+        return native ? ModelStateContainer::Native : reader.hasRecord("data.pkl") ? ModelStateContainer::Python : ModelStateContainer::Unknown;
     } catch (const std::exception& error) { throw std::runtime_error("corrupt RF-DETR checkpoint archive: " + path.string() + ": " + error.what()); }
 }
-static DecodedNativeModelState load_native_model_state(const std::filesystem::path& checkpoint_path) {
+bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path) {
+    return identify_model_state_container(checkpoint_path) == ModelStateContainer::Native;
+}
+static DecodedNativeModelState load_native_model_state(const std::filesystem::path& checkpoint_path, std::stop_token stop) {
     const auto canonical = canonical_path(checkpoint_path);
     const auto path = canonical.string();
     const auto snapshot = mmltk::common::io::FileSnapshot::Read(canonical);
     if (!is_native_checkpoint_file(canonical)) throw std::invalid_argument("not an RF-DETR native archive");
     auto admitted_archive = std::make_unique<model_state_detail::InputArchive>();
     auto& archive = *admitted_archive;
-    archive.load_from(path, torch::Device(torch::kCPU));
+    const auto file = mmltk::common::io::FileHandle::open_readonly(path);
+    const auto bytes = file.size();
+    archive.load_from([&](std::uint64_t offset, void* target, std::size_t count) {
+        if (offset > bytes || count > bytes - offset) throw std::runtime_error("checkpoint archive read outside file");
+        std::size_t copied = 0;
+        while (copied != count) {
+            if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
+            const auto chunk = std::min<std::size_t>(count - copied, 1024U * 1024U);
+            file.pread_all(static_cast<std::byte*>(target) + copied, chunk, offset + copied);
+            copied += chunk;
+        }
+        return copied;
+    }, [&] { return bytes; }, torch::Device(torch::kCPU));
     if (!supported_format(mmltk::backend::ml::serialization::require_string(archive, "format"))) {
         throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + path);
     }
@@ -159,6 +182,7 @@ static DecodedNativeModelState load_native_model_state(const std::filesystem::pa
     std::vector<NormalizedModelStateEntry> entries;
     entries.reserve(static_cast<std::size_t>(entry_count));
     for (int64_t index = 0; index < entry_count; ++index) {
+        if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
         model_state_detail::InputArchive entry_archive;
         state_archive.read(mmltk::backend::ml::serialization::archive_entry_name(static_cast<std::size_t>(index)), entry_archive);
         NormalizedModelStateEntry entry;
@@ -186,7 +210,7 @@ DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoi
     digests->snapshot.RequireUnchanged(canonical);
     DecodedNativeModelState result;
     if (native) {
-        result = load_native_model_state(canonical);
+        result = load_native_model_state(canonical, stop);
         if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
     } else {
 #if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
@@ -235,10 +259,10 @@ DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoi
     result.class_artifact = std::move(admission);
     return result;
 }
-DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path) {
-    auto admission = std::make_shared<const ClassArtifactAdmission>(checkpoint_path);
-    auto result = load_native_model_state(admission->artifact_path());
-    result.metadata.class_layout = admission->Resolve(result.metadata.num_classes, result.metadata.class_layout);
+DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path, std::stop_token stop) {
+    auto admission = std::make_shared<const ClassArtifactAdmission>(checkpoint_path, std::filesystem::path{}, nullptr, stop);
+    auto result = load_native_model_state(admission->artifact_path(), stop);
+    result.metadata.class_layout = admission->Resolve(result.metadata.num_classes, result.metadata.class_layout, stop);
     result.class_artifact = std::move(admission);
     return result;
 }

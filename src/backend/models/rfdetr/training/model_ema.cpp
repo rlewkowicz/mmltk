@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/artifact_publication.h"
 #include "src/backend/models/rfdetr/core/model.h"
 #include "detail/model_ema.h"
 #include <ATen/ops/_foreach_add.h>
@@ -25,10 +26,11 @@ void ModelEma::update() {
 }
 ModelEma::ModelEma(const std::vector<torch::Tensor>& parameters, ShadowCandidate candidate, double decay, double tau, int64_t completed_updates)
     : decay_(decay), tau_(tau), completed_updates_(completed_updates), source_(parameters), shadow_(std::move(candidate.tensors)) {}
-void ModelEma::validate_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow) {
+void ModelEma::validate_cpu_shadow(const std::vector<torch::Tensor>& parameters, const std::vector<torch::Tensor>& cpu_shadow, std::stop_token stop) {
     if (parameters.size() != cpu_shadow.size()) throw std::invalid_argument("EMA CPU inventory differs from active parameters");
     // Validate the entire CPU inventory before any device allocation or copy.
     for (std::size_t index = 0; index < parameters.size(); ++index) {
+        if (stop.stop_requested()) throw ArtifactPublicationCancelled{};
         const auto& source = cpu_shadow[index];
         const auto& destination = parameters[index];
         if (!source.defined() || !source.device().is_cpu() || !source.is_floating_point() || source.sizes() != destination.sizes() ||

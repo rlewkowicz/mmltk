@@ -1,5 +1,6 @@
 #pragma once
 #include <filesystem>
+#include <stop_token>
 #include "src/backend/models/rfdetr/contract/training_metrics.h"
 namespace mmltk::backend::models::rfdetr {
 class NativeRfDetrModel;
@@ -13,5 +14,5 @@ DecodedNativeModelState normalize_checkpoint_to_native(const std::filesystem::pa
                                                        const std::filesystem::path& class_layout_path = {});
 ModelStateLoadSummary load_model_weights(NativeRfDetrModel& model, const std::filesystem::path& weights_path, bool strict = false);
 // CPU archive admission only: no model, zero-state allocation, or CUDA initialization.
-[[nodiscard]] TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path&);
+[[nodiscard]] TrainingCheckpoint inspect_training_checkpoint(const std::filesystem::path&, std::stop_token stop = {});
 }  // namespace mmltk::backend::models::rfdetr

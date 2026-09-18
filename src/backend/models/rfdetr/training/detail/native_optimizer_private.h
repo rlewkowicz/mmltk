@@ -1,4 +1,5 @@
 #pragma once
+#include <stop_token>
 #include "src/backend/models/rfdetr/core/model.h"
 #include "src/backend/models/rfdetr/contract/workflow_requests.h"
 #include <cstddef>
@@ -72,7 +73,7 @@ class NativeOptimizerStorage {
     NativeOptimizerStorage() = default;
     NativeOptimizerStorage(std::vector<Group> groups, std::vector<NamedParameter> params) : groups_(std::move(groups)), params_(std::move(params)) {}
     template <class Optimizer>
-    [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&);
+    [[nodiscard]] static std::vector<std::string> inspect_checkpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
     std::vector<Group> groups_;
     std::vector<NamedParameter> params_;
     std::vector<ParamState> state_;
@@ -81,7 +82,7 @@ class NativeOptimizerStorage {
 };
 class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, NativeAdamWParamState> {
    public:
-    [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&);
+    [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
     NativeAdamW() = default;
     NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, NativeOptimizerBackend backend);
     [[nodiscard]] NativeOptimizerBackend backend() const;
@@ -90,7 +91,7 @@ class NativeAdamW : public NativeOptimizerStorage<NativeAdamWGroupConfig, Native
     void set_lrs(const std::vector<double>& base_lrs, double scale);
     void step();
     void save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
-    void load(torch::serialize::InputArchive& archive);
+    void load(torch::serialize::InputArchive& archive, std::stop_token stop = {});
 
    private:
     void initialize_state();
@@ -105,7 +106,7 @@ const char* native_optimizer_backend_name(NativeOptimizerBackend backend);
 [[nodiscard]] bool muon_parameter_eligible(std::string_view name, const torch::Tensor& parameter);
 class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfig, NativeMuonParamState> {
    public:
-    [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&);
+    [[nodiscard]] static std::vector<std::string> InspectCheckpoint(torch::serialize::InputArchive&, const std::unordered_map<std::string, torch::Tensor>&, std::stop_token stop = {});
     NativeMuonWithAuxAdam() = default;
     NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params);
     [[nodiscard]] const char* backend_name() const;
@@ -114,7 +115,7 @@ class NativeMuonWithAuxAdam : public NativeOptimizerStorage<NativeMuonGroupConfi
     void set_muon_momentum(double momentum);
     void step();
     void save(torch::serialize::OutputArchive& archive, mmltk::backend::ml::cuda::TensorReadbackBuffers& readback, std::size_t first_slot) const;
-    void load(torch::serialize::InputArchive& archive);
+    void load(torch::serialize::InputArchive& archive, std::stop_token stop = {});
 
    private:
     void initialize_state();

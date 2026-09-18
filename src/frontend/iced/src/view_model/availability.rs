@@ -36,7 +36,7 @@ impl ApplicationModel {
             && !self.has_system_pending(crate::generated::ApplicationSystem::FileDialog)
     }
 
-    pub(super) fn training_family_pending(&self) -> bool {
+    pub(crate) fn training_family_pending(&self) -> bool {
         self.has_system_pending(crate::generated::ApplicationSystem::Training)
     }
 
@@ -117,9 +117,15 @@ impl ApplicationModel {
         }
         match page {
             FeatureId::Train => {
-                self.workflow.training.as_ref().is_some_and(|snapshot| {
+                let continuation = &self.workflow.train_continuation;
+                let inspected = settings.workflows.train.modelsource != crate::generated::ModelSelectionSource::Custom
+                    || (continuation.matches(&settings.workflows.train)
+                        && continuation.checkpoint().is_some());
+                inspected && self.workflow.training.as_ref().is_some_and(|snapshot| {
                     snapshot.activity == crate::generated::TrainingActivity::Idle
-                }) && !self.training_family_pending()
+                }) && (!self.training_family_pending()
+                    || self.has_pending(ApplicationIntentEndpoint::TrainingOpenRun)
+                    || self.has_pending(ApplicationIntentEndpoint::TrainingHistory))
             }
             FeatureId::Validate => self.compute_start_available_for(
                 self.workflow

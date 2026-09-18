@@ -87,8 +87,10 @@ struct ResolvedModelState {
     DecodedNativeModelState model_state;
 };
 void validate_decoded_model_state(const DecodedNativeModelState& state);
+enum class ModelStateContainer { Unknown, Python, Native };
+[[nodiscard]] ModelStateContainer identify_model_state_container(const std::filesystem::path&);
 [[nodiscard]] bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path);
-[[nodiscard]] DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path);
+[[nodiscard]] DecodedNativeModelState decode_native_model_state(const std::filesystem::path& checkpoint_path, std::stop_token stop = {});
 [[nodiscard]] DecodedNativeModelState decode_model_state(const std::filesystem::path& checkpoint_path,
                                                          std::shared_ptr<const ClassArtifactAdmission> admission = {},
                                                          const std::filesystem::path& class_layout_path = {}, std::stop_token stop = {});

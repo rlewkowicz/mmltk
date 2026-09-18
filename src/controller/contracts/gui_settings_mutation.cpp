@@ -275,9 +275,12 @@ std::expected<void, SettingsMutationError> apply_gui_settings_values(GuiSettings
     const auto& selected_train = candidate.workflows.train.request;
     if (selected_train.train_compiled_path != installed_train.train_compiled_path || selected_train.val_compiled_path != installed_train.val_compiled_path)
         candidate.workflows.train.use_compiled_directory_defaults = false;
+    if (selected_train.output_dir != installed_train.output_dir && candidate.workflows.train.auto_output == state.workflows.train.auto_output)
+        candidate.workflows.train.auto_output = false;
     apply_compiled_directory_defaults(candidate.workflows.train);
     normalize_canonical_source_transitions(state, candidate);
     if (!valid_settings(candidate)) return std::unexpected(SettingsMutationError::CrossFieldViolation);
+    if (candidate.workflows.train.auto_output) candidate.workflows.train.request.output_dir.clear();
     state = std::move(candidate);
     return {};
 }

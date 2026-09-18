@@ -12,7 +12,7 @@ impl App {
                 if let Some(authoritative) = self.model.settings_snapshot.clone() {
                     self.settings.settle_success(&authoritative);
                     if let Some(pending) = self.model.workflow.pending_start.as_mut()
-                        && pending.preparation == crate::view_model::StartPreparation::Waiting
+                        && matches!(pending.preparation, crate::view_model::StartPreparation::Waiting | crate::view_model::StartPreparation::ResumeQueued)
                         && let Some(inputs) = self.settings.draft().and_then(|draft| {
                             crate::view_model::StartInputs::capture(draft, pending.feature)
                         })

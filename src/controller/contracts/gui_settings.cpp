@@ -320,6 +320,7 @@ constexpr auto recipe_override_fields = [](auto& overrides, const auto& visit) {
 };
 constexpr auto train_training_fields = [](auto& state, const auto& visit) {
     auto& request = state.request;
+    visit("auto_output", state.auto_output);
     visit("output_dir", request.output_dir);
     visit("resume_path", request.resume_path);
     visit("batch_size", request.batch_size);
@@ -822,6 +823,10 @@ void apply_workflows(const nlohmann::json& j, GuiSettingsState& settings) {
             const JsonFieldReader read{*training};
             train_training_fields(s, read);
             train_execution_target_fields(s, read);
+            // Schema 8 predates the preference; its stored destinations were manual.
+            if (!training->contains("auto_output") && training->contains("output_dir")) {
+                s.auto_output = s.request.output_dir.empty();
+            }
         }
         if (const nlohmann::json* augmentation = find_object(train, kAugmentationKey)) {
             apply_gpu_augmentation_json(*augmentation, s.request.gpu_augmentation);
@@ -886,6 +891,7 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsState& state) {
         !mmltk::backend::models::rfdetr::training_supervision_config_valid(candidate.workflows.train.request.training_supervision)) {
         throw std::runtime_error("GUI settings violate typed field or cross-field constraints");
     }
+    if (candidate.workflows.train.auto_output) candidate.workflows.train.request.output_dir.clear();
     state = std::move(candidate);
 }
 namespace settings_json_detail {

@@ -103,6 +103,7 @@ std::expected<mmltk::backend::models::rfdetr::TrainRequest, ComputeIntentMateria
     const mmltk::controller::contracts::GuiSettingsState& settings, const mmltk::controller::contracts::ArtifactInspection& artifact,
     const mmltk::controller::contracts::ModelSelection& model) noexcept {
     auto request = settings.workflows.train.request;
+    if (settings.workflows.train.auto_output) request.output_dir = "./gui-train-output";
     const auto selected = require_model(settings, mmltk::controller::contracts::FeatureId::Train, model);
     if (!selected) return std::unexpected(selected.error());
     const auto training = current_training_split(settings, artifact);

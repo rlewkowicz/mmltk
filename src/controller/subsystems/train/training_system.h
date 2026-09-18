@@ -1,5 +1,6 @@
 #pragma once
 #include <filesystem>
+#include "src/common/system/execution_policy.h"
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -21,6 +22,7 @@ namespace mmltk::controller {
 class TrainingRuntime {
    public:
     virtual ~TrainingRuntime() = default;
+    [[nodiscard]] virtual mmltk::backend::models::rfdetr::TrainingCheckpoint InspectCheckpoint(const std::filesystem::path&, std::stop_token);
     [[nodiscard]] virtual contracts::ComputeTerminal Train(mmltk::backend::models::rfdetr::TrainRequest, std::stop_token,
                                                            const std::function<void(const services::TrainProcessProgress&)>&) = 0;
     [[nodiscard]] virtual contracts::ProviderQueryResult Query(const contracts::ProviderPreferences&, std::stop_token) = 0;
@@ -60,9 +62,9 @@ struct TrainingSnapshot final {
     contracts::ProviderOfferState offers{};
     contracts::RemoteSessionState remote{};
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path output_directory;
-    std::uint64_t history_generation = 0;
     std::optional<mmltk::backend::models::rfdetr::TrainingRecord> metrics;
     mmltk::backend::models::rfdetr::TrainingPersistence persistence{};
+    mmltk::backend::models::rfdetr::TrainingCheckpointInspection inspection;
     bool operator==(const TrainingSnapshot&) const = default;
 };
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Transient}]] TrainingProgress final {
@@ -75,19 +77,25 @@ struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Tra
 struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] TrainingChanged final {
     TrainingSnapshot snapshot{};
 };
+struct[[= contracts::reflection::Event{contracts::reflection::EventDelivery::Critical}]] TrainingInspectionChanged final {
+    mmltk::backend::models::rfdetr::TrainingCheckpointInspection inspection;
+};
+MMLTK_REFLECT_FIELDS(TrainingInspectionChanged)
 class TrainingSystem final {
    public:
-    using event_type = std::variant<TrainingProgress, TrainingChanged>;
+    using event_type = std::variant<TrainingProgress, TrainingChanged, TrainingInspectionChanged>;
     using RuntimeFactory = std::function<std::unique_ptr<TrainingRuntime>()>;
-    TrainingSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, RuntimeFactory, SystemEventSink<event_type> = {});
+    TrainingSystem(SettingsSystem&, DatasetSystem&, ModelSystem&, std::optional<mmltk::common::system::ExecutionPolicyRequest>, RuntimeFactory,
+                   SystemEventSink<event_type> = {});
     ~TrainingSystem();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Start(contracts::WorkflowIntent<contracts::FeatureId::Train>);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingOpenedRun OpenRun(
         mmltk::backend::models::rfdetr::TrainingDirectoryQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingHistoryPage History(
         mmltk::backend::models::rfdetr::TrainingHistoryQuery);
-    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpoint InspectCheckpoint(
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointInspection InspectCheckpoint(
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
+    [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpointInspection CancelCheckpointInspection();
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] mmltk::backend::models::rfdetr::TrainingCheckpoint PrepareResume(
         mmltk::backend::models::rfdetr::TrainingCheckpointQuery);
     [[= contracts::reflection::direct::IntentEndpoint{}]] [[nodiscard]] TrainingSnapshot Resume(mmltk::backend::models::rfdetr::TrainingCheckpointQuery);

@@ -83,8 +83,12 @@ impl ApplicationModel {
             context == ApplicationIntentEndpoint::PresentationSelect && result.is_err();
         match result {
             Err(error) => {
-                let current_failure = context != ApplicationIntentEndpoint::UpscaleStart
-                    || self.explore.requested_upscale == self.explore.sent_upscale;
+                let current_failure = match context {
+                    ApplicationIntentEndpoint::TrainingOpenRun | ApplicationIntentEndpoint::TrainingHistory => self.workflow.output.fail(correlation),
+                    ApplicationIntentEndpoint::TrainingInspectCheckpoint => self.workflow.train_continuation.fail(correlation, error.detail.clone()),
+                    ApplicationIntentEndpoint::UpscaleStart => self.explore.requested_upscale == self.explore.sent_upscale,
+                    _ => true,
+                };
                 if context == ApplicationIntentEndpoint::UpscaleStart {
                     if self.explore.requested_upscale == self.explore.sent_upscale {
                         self.explore.requested_upscale = None;
@@ -256,8 +260,13 @@ impl ApplicationModel {
 
     pub(super) fn install_training_snapshot(
         &mut self,
-        snapshot: crate::generated::TrainingSnapshot,
+        mut snapshot: crate::generated::TrainingSnapshot,
     ) -> Result<(Observation, Option<String>), UiError> {
+        if let Some(current) = self.workflow.training.as_mut() {
+            super::workflow::merge_checkpoint_inspection(&mut current.inspection, snapshot.inspection.clone())?;
+            snapshot.inspection = current.inspection.clone();
+        }
+        self.workflow.train_continuation.observe(snapshot.inspection.clone());
         let prior = self.workflow.training.as_ref().map(|value| {
             (
                 value.local.terminal.outcome,

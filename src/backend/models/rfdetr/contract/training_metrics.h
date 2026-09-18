@@ -129,7 +129,7 @@ MMLTK_REFLECT_FIELDS(TrainingRun)
 struct TrainingOpenedRun final {
     std::uint64_t generation = 0;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path directory;
-    TrainingRun run;
+    std::optional<TrainingRun> run;
 };
 MMLTK_REFLECT_FIELDS(TrainingOpenedRun)
 struct TrainingPersistence final {
@@ -140,6 +140,7 @@ struct TrainingPersistence final {
 };
 MMLTK_REFLECT_FIELDS(TrainingPersistence)
 struct TrainingCheckpoint final {
+    bool operator==(const TrainingCheckpoint&) const = default;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path path;
     [[= mmltk::frameworks::reflection::MaxBytes{64}]] std::string attempt_id;
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::string original_weights;
@@ -151,6 +152,17 @@ struct TrainingCheckpoint final {
     EvaluatedWeights evaluated_weights = EvaluatedWeights::Ordinary;
 };
 MMLTK_REFLECT_FIELDS(TrainingCheckpoint)
+enum class TrainingInspectionStatus : std::uint8_t { Idle, Running, Ready, Failed, Cancelled };
+MMLTK_REFLECT_ENUM(TrainingInspectionStatus)
+struct TrainingCheckpointInspection final {
+    bool operator==(const TrainingCheckpointInspection&) const = default;
+    std::uint64_t generation = 0;
+    [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path path;
+    TrainingInspectionStatus status = TrainingInspectionStatus::Idle;
+    std::optional<TrainingCheckpoint> checkpoint;
+    [[= mmltk::frameworks::reflection::MaxBytes{1024}]] std::string error;
+};
+MMLTK_REFLECT_FIELDS(TrainingCheckpointInspection)
 struct TrainingDirectoryQuery final {
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumPathBytes}]] std::filesystem::path directory;
 };

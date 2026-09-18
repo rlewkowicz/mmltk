@@ -1466,6 +1466,9 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             const auto result = rfdetr::run_training(request);
             require_selected_evaluation(request, result);
             if (result.test_summary) REQUIRE(*result.test_summary == result.history.front().val_summary);
+            std::stop_source cancelled_inspection;
+            cancelled_inspection.request_stop();
+            REQUIRE_THROWS(rfdetr::inspect_training_checkpoint(result.checkpoint_path, cancelled_inspection.get_token()));
             const auto inspection = rfdetr::inspect_training_checkpoint(result.checkpoint_path);
             REQUIRE(inspection.resumable);
             REQUIRE(inspection.configuration.has_value());
@@ -1483,6 +1486,15 @@ void test_all_supervision_routes_execute_fixture_backed_training() {
             REQUIRE(deployment_summary.unexpected_names.empty());
             REQUIRE(deployment_summary.incompatible_names.empty());
             const auto deployment_state = rfdetr::decode_model_state(*result.best_checkpoint_path);
+#if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
+            if (route_index == 0 && lanes == 1) {
+                const auto upstream = request.output_dir / "transfer.pth";
+                rfdetr::write_upstream_model_state(upstream, deployment_state);
+                const auto transfer = rfdetr::inspect_training_checkpoint(upstream);
+                REQUIRE_FALSE(transfer.resumable);
+                REQUIRE_FALSE(transfer.configuration.has_value());
+            }
+#endif
             const auto full_state = rfdetr::decode_model_state(result.checkpoint_path);
             std::unordered_map<std::string, torch::Tensor> expected_best;
             for (const auto& entry : full_state.entries()) expected_best.emplace(entry.name, entry.tensor);
@@ -1770,4 +1782,13 @@ TEST_CASE("training cache failed settlement retains tensors stream and source an
         CHECK_FALSE(retained.expired());
         if (failure_path != 0) CHECK_FALSE(retained_source.expired());
     }
+}
+
+TEST_CASE("checkpoint capability rejects unknown and damaged archive containers", "[rfdetr][training_supervision]") {
+    mmltk::testsupport::ScopedTempDir root{"checkpoint-container-capability"};
+    const auto path = root.path() / "weights.pth";
+    std::ofstream(path, std::ios::binary) << "not weights";
+    REQUIRE_THROWS(mmltk::backend::models::rfdetr::inspect_training_checkpoint(path));
+    std::ofstream(path, std::ios::binary) << "PK\003\004damaged";
+    REQUIRE_THROWS(mmltk::backend::models::rfdetr::inspect_training_checkpoint(path));
 }

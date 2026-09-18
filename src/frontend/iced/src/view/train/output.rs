@@ -1,186 +1,49 @@
 use crate::fluent_theme::Element;
 use crate::generated::{self, FeatureId};
 use crate::view_model::ApplicationModel;
-use iced::widget::{button, column, container, text};
+use iced::widget::{button, checkbox, column, container, text};
 #[derive(Debug, Clone)]
 pub enum Message {
-    DirectoryChanged(String),
+    Auto(bool),
     Browse(u64),
-    Open(String),
-    History(generated::TrainingHistoryQuery),
-    Inspect(String),
-    Resume(String),
-    Live,
 }
 pub fn view<'a>(
     model: &'a ApplicationModel,
     settings: &'a crate::view::settings::SettingsModel,
     chart_omissions: u64,
 ) -> Element<'a, Message> {
-    let request = settings
-        .draft
-        .as_ref()
-        .map(|value| &value.workflows.train.request);
-    let directory = request.map_or("", |value| value.outputdir.as_str());
-    let checkpoint = request.map_or("", |value| value.resumepath.as_str());
-    let available = !settings.has_local_edits() && model.settings_edit_available();
-    let dialogs = model
-        .workflow
-        .dialogs(FeatureId::Train)
-        .filter(|fact| {
-            [
-                generated::constraint_workflowstrainrequestoutputdir().stable_field_id,
-                generated::constraint_workflowstrainrequestresumepath().stable_field_id,
-            ]
-            .contains(&fact.stable_field_id)
-        })
-        .fold(column![], |column, fact| {
-            column.push(
-                container(
-                    button(fact.title).on_press_maybe(
-                        model
-                            .file_dialog_open_available(fact, FeatureId::Train)
-                            .then_some(Message::Browse(fact.stable_field_id)),
-                    ),
-                )
-                .id(format!("dialog.{}", fact.stable_field_id)),
-            )
-        });
+    let train = settings.draft.as_ref().map(|value| &value.workflows.train);
+    let automatic = train.is_none_or(|train| train.autooutput);
+    let selected = train.map_or("", |train| train.request.outputdir.as_str());
+    let active = model.workflow.training.as_ref()
+        .filter(|snapshot| model.workflow.output.saved().is_none() && !snapshot.outputdirectory.is_empty())
+        .map(|snapshot| snapshot.outputdirectory.as_str());
+    let directory = active.unwrap_or(if automatic { "" } else { selected });
+    let fact = model.workflow.dialogs(FeatureId::Train).find(|fact|
+        fact.stable_field_id == generated::constraint_workflowstrainrequestoutputdir().stable_field_id);
     let mut content = column![
-        crate::view::workflow::fields::text_field(
-            "Output directory",
-            generated::constraint_workflowstrainrequestoutputdir().stable_field_id,
-            directory,
-            model.settings_edit_available(),
-            Message::DirectoryChanged,
-        ),
-        dialogs,
-        button("Open saved run").on_press_maybe(
-            (available
-                && !directory.is_empty()
-                && !model.has_pending(generated::ApplicationIntentEndpoint::TrainingOpenRun))
-            .then(|| Message::Open(directory.to_owned()))
-        ),
-        button("Current live run").on_press(Message::Live),
-        button("Inspect checkpoint").on_press_maybe(
-            (available
-                && !checkpoint.is_empty()
-                && !model
-                    .has_pending(generated::ApplicationIntentEndpoint::TrainingInspectCheckpoint))
-            .then(|| Message::Inspect(checkpoint.to_owned()))
-        ),
-    ]
-    .spacing(crate::view::workflow::FIELD_SPACING);
+        checkbox(automatic).label("Auto Output").on_toggle_maybe(model.settings_edit_available().then_some(Message::Auto)),
+        container(button("Browse Output")
+            .style(crate::fluent_theme::button_primary)
+            .width(iced::Fill)
+            .on_press_maybe(fact.filter(|fact| !settings.has_local_edits() && model.file_dialog_open_available(fact, FeatureId::Train))
+                .map(|fact| Message::Browse(fact.stable_field_id))))
+            .id("train.output.browse"),
+        text(directory).size(12),
+    ].spacing(crate::view::workflow::FIELD_SPACING);
     if chart_omissions > 0 {
         content = content.push(text(format!("Charts omit {chart_omissions} older disconnected summaries; saved history remains unchanged.")));
     }
-    if !checkpoint.is_empty() {
-        content = content.push(text(checkpoint));
+    if let Some(run) = model.workflow.output.run().and_then(|opened| opened.run.as_ref())
+        && !run.runid.is_empty() {
+        content = content.push(text(format!("{} · {:?} weights", run.runid, run.evaluatedweights)));
     }
-    if let Some(opened) = &model.workflow.training_run {
-        let page = model
-            .workflow
-            .training_history
-            .as_ref()
-            .filter(|page| page.generation == opened.generation);
-        content = content
-            .push(text(format!(
-                "{} · {:?} weights",
-                opened.run.runid, opened.run.evaluatedweights
-            )))
-            .push(
-                button(if page.is_none() {
-                    "Load history"
-                } else {
-                    "More history"
-                })
-                .on_press_maybe(
-                    (page.is_none_or(|page| page.more)
-                        && !model
-                            .has_pending(generated::ApplicationIntentEndpoint::TrainingHistory))
-                    .then(|| {
-                        Message::History(generated::TrainingHistoryQuery {
-                            generation: opened.generation,
-                            cursor: page.map_or(0, |page| page.nextcursor),
-                            count: 32,
-                        })
-                    }),
-                ),
-            );
-    }
-    if let Some(inspected) = &model.workflow.training_checkpoint {
-        content = content.push(text(match &inspected.classlayout {
-            Some(layout) => format!(
-                "Saved class layout: {} foreground classes · {} outputs · {:?}",
-                layout.foreground.names.len(),
-                layout.slots.len(),
-                layout.provenance.origin
-            ),
-            None => "Class identity unresolved; inspect or supply the required model class layout."
-                .into(),
-        }));
-        content = content
-            .push(text(format!(
-                "{} · epoch {} · {}",
-                inspected.path,
-                inspected.epoch,
-                if inspected.resumable {
-                    "Full resumable checkpoint"
-                } else {
-                    "Not resumable"
-                }
-            )))
-            .push(
-                button("Resume").on_press_maybe(
-                    (available
-                        && inspected.resumable
-                        && model.workflow.pending_start.is_none()
-                        && !model.has_pending(
-                            generated::ApplicationIntentEndpoint::TrainingPrepareResume,
-                        )
-                        && model
-                            .workflow
-                            .training
-                            .as_ref()
-                            .is_some_and(|snapshot| !snapshot.local.active))
-                    .then(|| Message::Resume(inspected.path.clone())),
-                ),
-            );
-    }
-    let record = if let Some(opened) = &model.workflow.training_run {
-        model
-            .workflow
-            .training_history
-            .as_ref()
-            .filter(|page| page.generation == opened.generation)
-            .and_then(|page| page.records.last())
-    } else {
-        model
-            .workflow
-            .training
-            .as_ref()
-            .and_then(|snapshot| snapshot.metrics.as_ref())
-    };
+    let record = if model.workflow.output.saved().is_some() {
+        model.workflow.output.page().and_then(|page| page.records.last())
+    } else { model.workflow.training.as_ref().and_then(|snapshot| snapshot.metrics.as_ref()) };
     if let Some(record) = record {
-        if let Some(test) = &record.progress.test {
-            if test.bbox.available {
-                content = content.push(text(format!(
-                    "Final test · Box AP50 {:.3} · AP50:95 {:.3}",
-                    test.bbox.ap50, test.bbox.ap
-                )));
-            }
-            if let Some(mask) = test.mask.as_ref().filter(|m| m.available) {
-                content = content.push(text(format!(
-                    "Final test · Mask AP50 {:.3} · AP50:95 {:.3}",
-                    mask.ap50, mask.ap
-                )));
-            }
-        }
         if record.droppedbefore > 0 {
-            content = content.push(text(format!(
-                "History incomplete: {} records dropped",
-                record.droppedbefore
-            )));
+            content = content.push(text(format!("History incomplete: {} records dropped", record.droppedbefore)));
         }
         for (label, path) in [
             ("Full checkpoint", &record.progress.fullcheckpointpath),
@@ -192,25 +55,62 @@ pub fn view<'a>(
         }
     }
     if let Some(snapshot) = &model.workflow.training {
-        if !snapshot.outputdirectory.is_empty() {
-            content = content.push(text(format!(
-                "Active output directory: {}",
-                snapshot.outputdirectory
-            )));
-        }
         if snapshot.persistence.degraded {
-            content = content.push(text(format!(
-                "History incomplete: {} ({} dropped)",
-                snapshot.persistence.error, snapshot.persistence.droppedrecords
-            )));
+            content = content.push(text(format!("History incomplete: {} ({} dropped)", snapshot.persistence.error, snapshot.persistence.droppedrecords)));
         }
     }
-    crate::view::shared::identified(
-        "train.card.output",
-        crate::view::shared::card(
-            "Output",
-            "Open and inspect without starting training.",
-            content,
-        ),
-    )
+    crate::view::shared::identified("train.card.output", crate::view::shared::card("Output", "", content))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output_nodes(model: &ApplicationModel) -> usize {
+        fn count(tree: &iced::advanced::widget::Tree) -> usize {
+            1 + tree.children.iter().map(count).sum::<usize>()
+        }
+        let settings = crate::view::settings::installed_settings_model();
+        let output = view(model, &settings, 0);
+        count(&iced::advanced::widget::Tree::new(&output))
+    }
+
+    #[test]
+    fn output_facts_follow_live_and_saved_records_and_omit_empty_paths() {
+        let mut model = crate::view_model::test_support::bootstrapped();
+        let baseline = output_nodes(&model);
+        let mut live = crate::view::metrics::tests::record();
+        model.workflow.training.as_mut().unwrap().metrics = Some(live.clone());
+        assert_eq!(output_nodes(&model), baseline);
+        live.progress.fullcheckpointpath = "/live/full.pt".into();
+        model.workflow.training.as_mut().unwrap().metrics = Some(live.clone());
+        assert_eq!(output_nodes(&model), baseline + 1);
+        live.progress.checkpointpath = "/live/selected.pt".into();
+        model.workflow.training.as_mut().unwrap().metrics = Some(live);
+        assert_eq!(output_nodes(&model), baseline + 2);
+        let configuration = model.settings_snapshot.as_ref().unwrap().settingsstate.workflows.train.request.clone();
+        for weights in [generated::EvaluatedWeights::Ordinary, generated::EvaluatedWeights::Ema] {
+            let mut opened = crate::view_model::test_support::saved_training_run(configuration.clone());
+            opened.run.as_mut().unwrap().evaluatedweights = weights;
+            model.workflow.output.select_saved(opened.directory.clone());
+            model.workflow.output.saved_mut().unwrap().run = Some(opened);
+            // Only saved identity is visible; live checkpoint paths cannot leak.
+            assert_eq!(output_nodes(&model), baseline + 1);
+            for (full, selected) in [("", ""), ("/saved/full.pt", ""), ("", "/saved/selected.pt"), ("/saved/full.pt", "/saved/selected.pt")] {
+                let mut record = crate::view::metrics::tests::record();
+                record.progress.fullcheckpointpath = full.into();
+                record.progress.checkpointpath = selected.into();
+                model.workflow.output.saved_mut().unwrap().page = Some(generated::TrainingHistoryPage {
+                    generation: 3, nextcursor: 1, more: false, records: vec![record],
+                });
+                assert_eq!(output_nodes(&model), baseline + 1 + usize::from(!full.is_empty()) + usize::from(!selected.is_empty()));
+            }
+            let saved = model.workflow.output.saved_mut().unwrap();
+            saved.run.as_mut().unwrap().run.as_mut().unwrap().runid.clear();
+            saved.page = None;
+            assert_eq!(output_nodes(&model), baseline);
+        }
+        model.workflow.output.live();
+        assert_eq!(output_nodes(&model), baseline + 2);
+    }
 }
