@@ -1075,7 +1075,6 @@ mod tests {
         app.workspace.select(FeatureId::Validate);
         let metadata = crate::view_model::test_support::validation_image_metadata();
         let request = crate::generated::UpscaleRequest {
-            originalcontent: false,
             source: metadata.frame,
             document: metadata.document,
             kernel: UpscaleKernel::Default,

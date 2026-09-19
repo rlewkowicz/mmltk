@@ -18,11 +18,34 @@ template <class Root, auto Access, ApplicationOuterRoutingWriter Writer>
     }
     return result;
 }
+template <class Geometry, ApplicationOuterRoutingWriter Writer>
+void emit_visual_geometry_scale(Writer& writer) {
+    const auto type = writer.template rust_type<Geometry>();
+    auto& output = writer.output();
+    writer.reserve("impl " + type, "checked_scale", "canonical checked pixel geometry");
+    output << "impl " << type << " { pub fn checked_scale(&self, scale: u32) -> Option<Self> { Some(Self {\n";
+    visit_visual_geometry_members<Geometry>([&]<std::meta::info Member>() {
+        const auto field = writer.identifier(std::meta::identifier_of(Member), false);
+        output << field << ": self." << field << ".checked_mul(scale)?,\n";
+    });
+    output << "}) } }\n";
+}
 template <class Composition, ApplicationOuterRoutingWriter Writer>
 void emit_application_visual_projection(Writer& writer) {
     using Schema = ApplicationSchema<Composition>;
     constexpr auto count = Schema::VisualSourceCount();
     auto& output = writer.output();
+    emit_visual_geometry_scale<VisualExtent>(writer);
+    emit_visual_geometry_scale<VisualRegion>(writer);
+    Schema::VisitVisualSources([&]<class, std::meta::info, class Projection>() {
+        using Image = typename Projection::image_type;
+        if constexpr (requires { Image::output_scale; }) {
+            static_assert(Image::output_scale > 0U);
+            const auto type = writer.template rust_type<Image>();
+            writer.reserve("impl " + type, "OUTPUT_SCALE", "native output geometry scale");
+            output << "impl " << type << " { pub const OUTPUT_SCALE: u32 = " << Image::output_scale << "; }\n";
+        }
+    });
     for (const auto symbol : {"ApplicationVisualSnapshots", "ApplicationVisualObservation", "presentation_source_session", "visual_clean_content_identity"})
         writer.reserve("module", symbol, "canonical visual source projections");
     const auto kind_type = writer.template rust_type<PresentationSourceKind>();

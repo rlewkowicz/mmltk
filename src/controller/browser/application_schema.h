@@ -1440,6 +1440,7 @@ template <class Composition>
     application_schema_detail::append_type<ServerRecord>(sink);
     application_schema_detail::append_type<WorkspaceImageMetadata>(sink);
     sink.append("visual-source-projections");
+    sink.append("checked-pixel-geometry-scale-v1");
     application_schema_detail::append_type<VisualSourceObservation>(sink);
     application_schema_detail::append_type<VisualCleanContentIdentity>(sink);
     sink.append_number(ApplicationSchema<Composition>::VisualSourceCount());
@@ -1449,6 +1450,11 @@ template <class Composition>
     }
     ApplicationSchema<Composition>::VisitVisualSources([&]<class Cell, std::meta::info, class Projection>() {
         application_schema_detail::append_type<typename Projection::image_type>(sink);
+        using Image = typename Projection::image_type;
+        if constexpr (requires { Image::output_scale; }) {
+            sink.append("output-scale");
+            sink.append_number(Image::output_scale);
+        }
         sink.append_number(Cell::stable_id);
         sink.append(mmltk::frameworks::reflection::enum_name(Projection::kind));
         Projection::relation::VisitMembers([&]<class Entry>() {

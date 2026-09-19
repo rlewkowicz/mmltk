@@ -312,7 +312,6 @@ mod tests {
         explore.selectedimage = Some(3);
         explore.frame = source.clone();
         model.requested_upscale = Some(crate::generated::UpscaleRequest {
-            originalcontent: false,
             source: source.clone(),
             kernel,
             document: explore.document.clone(),
@@ -335,7 +334,6 @@ mod tests {
         let source = validation.frame.clone();
         model.set_foreground_feature(FeatureId::Validate);
         let request = crate::generated::UpscaleRequest {
-            originalcontent: false,
             source: source.clone(),
             document,
             kernel: crate::generated::UpscaleKernel::Default,
@@ -994,7 +992,6 @@ mod tests {
             let encoded = crate::generated::encode_upscale_Start(
                 41,
                 crate::generated::UpscaleRequest {
-                    originalcontent: false,
                     source: source.clone(),
                     kernel,
                     document: document.clone(),
@@ -1002,7 +999,7 @@ mod tests {
             );
             assert_eq!(encoded.endpoint, ApplicationIntentEndpoint::UpscaleStart);
             assert_eq!(encoded.record.correlation, 41);
-            assert_eq!(encoded.record.fields.len(), 4);
+            assert_eq!(encoded.record.fields.len(), 3);
             assert_eq!(
                 encoded.record.fields[2].value,
                 document.clone().into_application_value()

@@ -224,12 +224,10 @@ pub(crate) fn install(
             if !valid_content(&snapshot.frame)
                 || snapshot.frame.sourceextent != snapshot.input.sourceextent
                 || snapshot.input.sourceextent.width == 0 || snapshot.input.sourceextent.height == 0
-                || [snapshot.input.extent.width, snapshot.input.extent.height, snapshot.input.content.x,
-                    snapshot.input.content.y, snapshot.input.content.width, snapshot.input.content.height]
-                    .into_iter().map(|value| value.checked_mul(4))
-                    .ne([snapshot.frame.extent.width, snapshot.frame.extent.height, snapshot.frame.content.x,
-                         snapshot.frame.content.y, snapshot.frame.content.width, snapshot.frame.content.height]
-                        .into_iter().map(Some))
+                || snapshot.input.extent.checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE).as_ref()
+                    != Some(&snapshot.frame.extent)
+                || snapshot.input.content.checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE).as_ref()
+                    != Some(&snapshot.frame.content)
             {
                 return Err("invalid derived image geometry".into());
             }
@@ -445,6 +443,34 @@ pub(crate) fn install_explore(frame: FrameReady, snapshot: &generated::ExploreSn
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_pixel_geometry_scaling_checks_each_member() {
+        let scale = generated::UpscaleImageMetadata::OUTPUT_SCALE;
+        assert_eq!(scale, 4);
+        let region = generated::VisualRegion { x: 2, y: 3, width: 5, height: 7 };
+        assert_eq!(region.checked_scale(scale), Some(generated::VisualRegion {
+            x: 8, y: 12, width: 20, height: 28,
+        }));
+        assert_eq!(region.checked_scale(0), Some(generated::VisualRegion { x: 0, y: 0, width: 0, height: 0 }));
+        let limit = u32::MAX / scale;
+        assert_eq!(generated::VisualExtent { width: limit, height: limit }.checked_scale(scale),
+            Some(generated::VisualExtent { width: limit * scale, height: limit * scale }));
+        for member in 0..6 {
+            let mut extent = generated::VisualExtent { width: 1, height: 1 };
+            let mut region = generated::VisualRegion { x: 1, y: 1, width: 1, height: 1 };
+            match member {
+                0 => extent.width = limit + 1,
+                1 => extent.height = limit + 1,
+                2 => region.x = limit + 1,
+                3 => region.y = limit + 1,
+                4 => region.width = limit + 1,
+                _ => region.height = limit + 1,
+            }
+            assert_eq!(extent.checked_scale(scale).is_none(), member < 2);
+            assert_eq!(region.checked_scale(scale).is_none(), member >= 2);
+        }
+    }
+
     #[test]
     fn paired_geometry_rejects_missing_source_and_inconsistent_samples() {
         let (model, _) = crate::view_model::test_support::explore_presentation();

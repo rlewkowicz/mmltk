@@ -17,7 +17,6 @@
 #include "src/controller/presentation/visual_document.h"
 #include "src/backend/imaging/upscale/upscale_execution.h"
 namespace mmltk::controller {
-inline constexpr std::uint32_t kUpscaleOutputScale = 4U;
 [[nodiscard]] VisualExtent checked_upscale_output_extent(VisualExtent);
 enum class UpscaleKernel : std::uint8_t {
     Default,
@@ -30,7 +29,6 @@ struct UpscaleRequest final {
     VisualFrame source{};
     UpscaleKernel kernel = UpscaleKernel::Default;
     VisualDocumentFacts document{};
-    bool original_content = false;
     bool operator==(const UpscaleRequest&) const = default;
 };
 enum class UpscaleFailureKind : std::uint8_t { Failed, Unavailable, Physical };
@@ -54,6 +52,7 @@ struct UpscaleMethodSnapshot final {
     VisualFrame frame{};
 };
 struct UpscaleImageMetadata final {
+    static constexpr std::uint32_t output_scale = 4U;
     VisualFrame frame{};
     VisualFrame input{};
     contracts::AnnotationSceneContent scene{};

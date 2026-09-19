@@ -5,7 +5,6 @@
 #include "src/frameworks/gpu/system_image_runtime.h"
 #include "src/frameworks/gpu/cuda_error.h"
 #include <cuda.h>
-#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -16,13 +15,10 @@ import mmltk.backend.imaging.upscale.image_upscaler;
 import mmltk.backend.imaging.raster;
 namespace mmltk::controller {
 VisualExtent checked_upscale_output_extent(const VisualExtent source) {
-    if (!source.valid() || source.width > std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale ||
-        source.height > std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale)
+    const auto result = checked_visual_scale(source, UpscaleImageMetadata::output_scale);
+    if (!source.valid() || !result)
         throw contracts::InvalidIntentError("Upscale four-times extent is invalid or overflows");
-    return {
-        .width = source.width * kUpscaleOutputScale,
-        .height = source.height * kUpscaleOutputScale,
-    };
+    return *result;
 }
 namespace {
 namespace native_upscale = mmltk::backend::imaging::upscale;
@@ -280,7 +276,7 @@ class UpscaleSystem::Impl final {
     ~Impl() { Shutdown(); }
     void Warm(const VisualExtent extent) noexcept {
         std::scoped_lock admission_lock(mutex_);
-        if (!extent.valid() || extent.width > settings_.maximum_width / kUpscaleOutputScale || extent.height > settings_.maximum_height / kUpscaleOutputScale)
+        if (!extent.valid() || extent.width > settings_.maximum_width / UpscaleImageMetadata::output_scale || extent.height > settings_.maximum_height / UpscaleImageMetadata::output_scale)
             return;
         if (warm_extent_ == extent && (warm_admitted_ || warm_attempted_)) return;
         warm_extent_ = extent;
@@ -397,6 +393,8 @@ class UpscaleSystem::Impl final {
         if (!request.document.valid()) throw contracts::InvalidIntentError("Upscale document facts are invalid");
         if (!request.source.valid()) throw contracts::InvalidIntentError("Upscale source frame is invalid");
         const auto target = checked_upscale_output_extent(request.source.extent);
+        const auto content = checked_visual_scale(request.source.content, UpscaleImageMetadata::output_scale);
+        if (!content) throw contracts::InvalidIntentError("Upscale content geometry overflows");
         if (target.width > settings_.maximum_width || target.height > settings_.maximum_height)
             throw contracts::InvalidIntentError("Upscale four-times extent exceeds device bounds");
         {
@@ -452,7 +450,7 @@ class UpscaleSystem::Impl final {
             state_.methods[static_cast<std::size_t>(request.kernel)].failure.reset();
             RefreshAvailability(request);
             AdvanceRevision();
-            if (!worker_.SubmitLatest([this, request, target, demand, admission_link](
+            if (!worker_.SubmitLatest([this, request, target, content = *content, demand, admission_link](
                                           mmltk::frameworks::gpu::SystemImageRuntime& runtime,
                                           std::stop_token stop) mutable -> detail::VisualRuntimeOwner::Notification {
                     const auto current = [this, demand, stop] {
@@ -488,7 +486,7 @@ class UpscaleSystem::Impl final {
                             retained_input ? runtime.BorrowInput().plane(0U).plane().descriptor : source.pixels.plane(0U).plane().descriptor;
                         if (source_descriptor.width != request.source.extent.width || source_descriptor.height != request.source.extent.height)
                             throw contracts::UnavailableError("Upscale source geometry does not match its frame");
-                        auto document = retained_input ? input_document_ : scale_visual_document(source.document, kUpscaleOutputScale);
+                        auto document = retained_input ? input_document_ : scale_visual_document(source.document, UpscaleImageMetadata::output_scale);
                         auto image_metadata = retained_input ? input_image_metadata_ : source.image_metadata;
                         auto* const model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
                         if (model == nullptr) throw std::runtime_error("Upscale runtime model is unavailable");
@@ -600,8 +598,7 @@ class UpscaleSystem::Impl final {
                                     },
                                 .extent = target,
                                 .revision = record.product.revision(),
-                                .content = {request.source.content.x * kUpscaleOutputScale, request.source.content.y * kUpscaleOutputScale,
-                                            request.source.content.width * kUpscaleOutputScale, request.source.content.height * kUpscaleOutputScale},
+                                .content = content,
                                 .clean_revision = clean_revision,
                                 .source_extent = request.source.source_extent,
                             };

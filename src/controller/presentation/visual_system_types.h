@@ -1,5 +1,9 @@
 #pragma once
 #include <cstdint>
+#include <concepts>
+#include <limits>
+#include <meta>
+#include <optional>
 #include "mmltk/frameworks/reflection/member_relation.h"
 #include "src/controller/contracts/visual_source.h"
 #include "src/frameworks/reflection/reflected_field_policy.h"
@@ -22,6 +26,29 @@ struct VisualRegion final {
     [[nodiscard]] constexpr bool valid() const noexcept { return width != 0U && height != 0U; }
     bool operator==(const VisualRegion&) const = default;
 };
+// Pixel geometry only: provenance, normalized support and product policy stay with their owners.
+template <class Geometry, class Visitor>
+    requires(std::same_as<Geometry, VisualExtent> || std::same_as<Geometry, VisualRegion>)
+constexpr void visit_visual_geometry_members(Visitor&& visitor) {
+    template for (constexpr auto member : std::define_static_array(std::meta::nonstatic_data_members_of(^^Geometry, std::meta::access_context::unchecked()))) {
+        static_assert(std::same_as<typename[:std::meta::type_of(member):], std::uint32_t>);
+        visitor.template operator()<member>();
+    }
+}
+template <class Geometry>
+    requires(std::same_as<Geometry, VisualExtent> || std::same_as<Geometry, VisualRegion>)
+[[nodiscard]] constexpr std::optional<Geometry> checked_visual_scale(const Geometry& source, const std::uint32_t scale) {
+    Geometry result{};
+    bool valid = true;
+    visit_visual_geometry_members<Geometry>([&]<std::meta::info Member>() {
+        if (scale != 0U && source.[:Member:] > std::numeric_limits<std::uint32_t>::max() / scale)
+            valid = false;
+        else
+            result.[:Member:] = source.[:Member:] * scale;
+    });
+    if (!valid) return std::nullopt;
+    return result;
+}
 struct VisualFrame final {
     PresentationSourceIdentity source{};
     VisualExtent extent{};

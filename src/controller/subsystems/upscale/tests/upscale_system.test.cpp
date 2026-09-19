@@ -252,7 +252,7 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
     UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs, semantics),
                           [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); },
                           diagnostics};
-    for (const auto selected : {UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::Default}) {
+    for (const auto selected : {UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr, UpscaleKernel::Default}) {
         const auto request = test_upscale_request({.source = source.frame(), .kernel = selected});
         static_cast<void>(upscale.Start(request));
         REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().kernel == selected; }));
@@ -267,9 +267,8 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
         }
         const auto semantic_runs = semantics->load();
         const auto allocation = upscale.BorrowDocument(completed).pixels.plane(0U).plane().allocation;
-        for (const bool original : {false, true, false, true}) {
-            auto repeated = request;
-            repeated.original_content = original;
+        for (unsigned repeat = 0; repeat != 4U; ++repeat) {
+            const auto repeated = request;
             const auto selected_result = upscale.Start(repeated);
             CHECK(selected_result.ready);
             CHECK(selected_result.frame == completed);
@@ -280,7 +279,7 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
             CHECK(semantics->load() == semantic_runs);
         }
     }
-    CHECK(runs->load() == 2U);
+    CHECK(runs->load() == 3U);
     const auto retained = upscale.snapshot().frame;
     upscale.Stop();
     CHECK_FALSE(upscale.snapshot().ready);
@@ -289,13 +288,13 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
     source.Publish(previous.extent, 19U);
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame()})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == source.frame(); }));
-    CHECK(runs->load() == 3U);
+    CHECK(runs->load() == 4U);
     auto cropped = source.frame();
     cropped.content = {1U, 1U, 4U, 3U};
     cropped.source_extent = {4000U, 2000U};
     static_cast<void>(upscale.Start(test_upscale_request({.source = cropped})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == cropped; }));
-    CHECK(runs->load() == 4U);
+    CHECK(runs->load() == 5U);
     CHECK(upscale.snapshot().frame.source_extent == cropped.source_extent);
 }
 TEST_CASE("Validation clean identity reuses native Upscale while replacing paired semantics", "[controller][gpu][validation][upscale_gpu]") {
@@ -1461,12 +1460,23 @@ TEST_CASE("Upscale copies the admitted exact revision before a source update can
     CHECK(*reinterpret_cast<const std::uint8_t*>(product.plane(0U).plane().data) == 11U);
 }
 TEST_CASE("Upscale derives a checked fixed output envelope") {
-    CHECK(kUpscaleOutputScale == 4U);
+    constexpr auto scale = UpscaleImageMetadata::output_scale;
+    CHECK((checked_visual_scale(VisualRegion{2U, 3U, 5U, 7U}, scale) == VisualRegion{8U, 12U, 20U, 28U}));
+    CHECK((checked_visual_scale(VisualRegion{}, scale) == VisualRegion{}));
+    CHECK((checked_visual_scale(VisualExtent{1U, 2U}, 0U) == VisualExtent{}));
+    const auto boundary = std::numeric_limits<std::uint32_t>::max() / scale;
+    CHECK((checked_visual_scale(VisualExtent{boundary, boundary}, scale) == VisualExtent{boundary * scale, boundary * scale}));
+    visit_visual_geometry_members<VisualRegion>([&]<std::meta::info Member>() {
+        VisualRegion region{1U, 1U, 1U, 1U};
+        region.[:Member:] = boundary + 1U;
+        CHECK_FALSE(checked_visual_scale(region, scale));
+    });
+    CHECK(UpscaleImageMetadata::output_scale == 4U);
     CHECK((checked_upscale_output_extent({1U, 1U}) == VisualExtent{4U, 4U}));
     CHECK((checked_upscale_output_extent({320U, 180U}) == VisualExtent{1280U, 720U}));
     CHECK_THROWS_AS(checked_upscale_output_extent({}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(checked_upscale_output_extent({std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U, 1U}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(checked_upscale_output_extent({1U, std::numeric_limits<std::uint32_t>::max() / kUpscaleOutputScale + 1U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({std::numeric_limits<std::uint32_t>::max() / UpscaleImageMetadata::output_scale + 1U, 1U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({1U, std::numeric_limits<std::uint32_t>::max() / UpscaleImageMetadata::output_scale + 1U}), contracts::InvalidIntentError);
 }
 TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
     auto backend = std::make_shared<FakeImageBackend>();

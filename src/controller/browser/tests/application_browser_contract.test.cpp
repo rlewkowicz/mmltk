@@ -298,12 +298,13 @@ MMLTK_REFLECT_FIELDS(SyntheticVisualOperation)
 MMLTK_REFLECT_FIELDS(SyntheticVisualSnapshot)
 MMLTK_REFLECT_FIELDS(UnreflectedNestedVisualSnapshot)
 template <PresentationSourceKind Kind,
-          auto Revision = mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>>
+          auto Revision = mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>,
+          class Image = VisualImageMetadata>
 class SyntheticVisualSystem final {
    public:
     using event_type = std::variant<SyntheticChanged>;
     using visual_source =
-        VisualSourceProjection<SyntheticVisualSnapshot, Kind, mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>, Revision>;
+        VisualSourceProjection<SyntheticVisualSnapshot, Kind, mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::product>, Revision, Image>;
     [[= contracts::reflection::direct::IntentEndpoint{}]] std::uint32_t Apply(SyntheticRequest request) { return request.value; }
     [[= contracts::reflection::Snapshot{64U * 1024U}]] [[nodiscard]] SyntheticVisualSnapshot snapshot() const {
         ++samples;
@@ -368,6 +369,22 @@ struct AlternateVisualFingerprintComposition final {
     SyntheticVisualSystem<PresentationSourceKind::Predict,
                           mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::alternate>>* producer =
         nullptr;
+};
+struct DoubleScaleImage final {
+    static constexpr std::uint32_t output_scale = 2U;
+    VisualFrame frame{};
+};
+struct TripleScaleImage final {
+    static constexpr std::uint32_t output_scale = 3U;
+    VisualFrame frame{};
+};
+MMLTK_REFLECT_FIELDS(DoubleScaleImage)
+MMLTK_REFLECT_FIELDS(TripleScaleImage)
+template <class Image>
+struct ScaledVisualComposition final {
+    TestSettingsSystem* settings = nullptr;
+    SyntheticVisualSystem<PresentationSourceKind::Predict,
+                          mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>, Image>* producer = nullptr;
 };
 class RoutingTextWriter final {
    public:
@@ -666,6 +683,20 @@ TEST_CASE("visual producer projections derive nested observations and compositio
     collision.reserve("module", "ApplicationVisualSnapshots", "conflicting declaration");
     CHECK_THROWS_AS(emit_application_visual_projection<ExtendedVisualComposition>(collision), std::logic_error);
     CHECK(application_schema_fingerprint<VisualFingerprintComposition>() != application_schema_fingerprint<AlternateVisualFingerprintComposition>());
+    application_schema_detail::FingerprintSink double_structure;
+    application_schema_detail::FingerprintSink triple_structure;
+    application_schema_detail::append_type<DoubleScaleImage>(double_structure);
+    application_schema_detail::append_type<TripleScaleImage>(triple_structure);
+    CHECK(double_structure.words() == triple_structure.words());
+    CHECK(application_schema_fingerprint<ScaledVisualComposition<DoubleScaleImage>>() !=
+          application_schema_fingerprint<ScaledVisualComposition<TripleScaleImage>>());
+    std::ostringstream scaled_output;
+    RoutingTextWriter scaled_writer(scaled_output);
+    emit_application_visual_projection<ScaledVisualComposition<TripleScaleImage>>(scaled_writer);
+    CHECK(scaled_output.str().find("pub const OUTPUT_SCALE: u32 = 3;") != std::string::npos);
+    CHECK(scaled_output.str().find("pub fn checked_scale(&self, scale: u32) -> Option<Self>") != std::string::npos);
+    for (const auto field : {"width", "height", "x", "y"})
+        CHECK(scaled_output.str().find(std::string("self.") + field + ".checked_mul(scale)?") != std::string::npos);
 }
 TEST_CASE("materialized event publisher preserves transient and essential failure policy", "[controller][browser][reflection]") {
     std::size_t lost = 0U;

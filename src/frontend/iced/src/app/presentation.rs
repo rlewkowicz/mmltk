@@ -111,7 +111,6 @@ impl Controller {
                     && request.source != source.frame
                 {
                     return Some(ViewerOutcome::Opened(crate::generated::UpscaleRequest {
-                        originalcontent: false,
                         source: source.frame.clone(),
                         document: source.document.clone(),
                         kernel: request.kernel,
@@ -124,7 +123,6 @@ impl Controller {
                 self.suspended = None;
                 self.viewer = identity;
                 let request = crate::generated::UpscaleRequest {
-                    originalcontent: false,
                     source: source.frame.clone(),
                     document: source.document.clone(),
                     kernel: crate::generated::UpscaleKernel::Default,
@@ -173,7 +171,6 @@ impl Controller {
                 {
                     self.viewer = identity;
                     return Some(ViewerOutcome::Replaced(crate::generated::UpscaleRequest {
-                        originalcontent: false,
                         source: snapshot.frame.clone(),
                         document: snapshot.document.clone(),
                         kernel: crate::generated::UpscaleKernel::Default,
@@ -191,7 +188,6 @@ impl Controller {
             let replacing = self.viewer.is_some();
             self.viewer = identity;
             let request = crate::generated::UpscaleRequest {
-                originalcontent: false,
                 source: snapshot.frame.clone(),
                 kernel: crate::generated::UpscaleKernel::Default,
                 document: snapshot.document.clone(),
@@ -836,6 +832,70 @@ mod tests {
     }
 
     #[test]
+    fn original_toggles_preserve_pending_failed_and_completed_upscale_identity() {
+        for kernel in crate::generated::UPSCALE_KERNEL_VALUES.iter().copied() {
+            for status in 0..3 {
+                let (mut app, _) = viewer_app();
+                app.reconcile_viewer();
+                let request = crate::generated::UpscaleRequest {
+                    kernel,
+                    ..app.model.requested_upscale.clone().unwrap()
+                };
+                app.model.requested_upscale = Some(request.clone());
+                app.model.sent_upscale = Some(request.clone());
+                let native = app.model.upscale_snapshot.as_mut().unwrap();
+                native.kernel = kernel;
+                native.input = request.source.clone();
+                native.frame = request.source.clone();
+                native.frame.source.kind = PresentationSourceKind::Upscale;
+                native.frame.extent = request.source.extent.checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE).unwrap();
+                native.frame.content = request.source.content.checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE).unwrap();
+                native.busy = status == 0;
+                native.ready = status == 2;
+                native.pending = (status == 0).then_some(request.clone());
+                let method = &mut native.methods[kernel as usize];
+                method.available = true;
+                method.frame = native.frame.clone();
+                method.failed = status == 1;
+                method.failure = (status == 1).then_some(request.clone());
+                method.completed = (status == 2).then_some(request.clone());
+                let native = native.clone();
+                assert_eq!(app.model.current_upscale().is_some(), status == 2);
+                let identity = app.presentation.viewer;
+                let (sender, mut receiver) = Connection::test_channel();
+                app.connection = Some(sender);
+                for original in [true, false, true] {
+                    app.workspace.explore_state_for_test().choose_detail_original(original);
+                    drop(app.on_explore(crate::view::explore::Outcome::DetailUpdated(
+                        crate::generated::ExploreDetailUpdate { showoriginaldimensions: original },
+                    )));
+                    app.reconcile_viewer();
+                    app.dispatch_viewer_desired();
+                    while let Ok(record) = receiver.try_recv() {
+                        if let crate::transport_connection::CapturedRecord::Intent(intent) = record {
+                            assert_ne!(intent.endpoint_id, crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStart));
+                            assert_ne!(intent.endpoint_id, crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStop));
+                            if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::ExploreUpdateDetail) {
+                                let mut accepted = app.model.explore.snapshot.clone().unwrap();
+                                accepted.revision += 1;
+                                accepted.detail.showoriginaldimensions = original;
+                                app.reduce_reply(IntentReply {
+                                    correlation: intent.correlation,
+                                    result: Ok(crate::application_codec::IntoApplicationValue::into_application_transport_value(accepted)),
+                                });
+                            }
+                        }
+                    }
+                    assert_eq!(app.model.requested_upscale.as_ref(), Some(&request));
+                    assert_eq!(app.model.sent_upscale.as_ref(), Some(&request));
+                    assert_eq!(app.model.upscale_snapshot.as_ref(), Some(&native));
+                    assert_eq!(app.presentation.viewer, identity);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn viewer_dispatch_queues_latest_while_native_upscale_is_busy() {
         let (mut app, basic, start_correlation, mut receiver) = dispatch_automatic_basic();
 
@@ -942,7 +1002,6 @@ mod tests {
             app.reconcile_viewer();
             let source = app.model.explore.snapshot.as_ref().unwrap().frame.clone();
             app.model.request_upscale(crate::generated::UpscaleRequest {
-                originalcontent: false,
                 source,
                 kernel: crate::generated::UpscaleKernel::ShiftLut,
                 document: app
@@ -1820,7 +1879,6 @@ mod tests {
         };
         let expected = upscale.frame.clone();
         app.model.requested_upscale = Some(crate::generated::UpscaleRequest {
-            originalcontent: false,
             source: input,
             kernel: upscale.kernel,
             document: explore.document.clone(),

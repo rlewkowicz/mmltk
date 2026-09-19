@@ -599,10 +599,10 @@ pub(crate) fn viewer_upscale_request(
         {
             return None;
         }
+        surface.original_content(validation.frame())?;
         return Some(crate::generated::UpscaleRequest {
             source: validation.metadata.frame.clone(),
             document: validation.metadata.document.clone(),
-            originalcontent: surface.original_content(validation.frame())?,
             kernel,
         });
     }
@@ -612,10 +612,10 @@ pub(crate) fn viewer_upscale_request(
     {
         return None;
     }
+    surface.original_content(detail.frame())?;
     Some(crate::generated::UpscaleRequest {
         source: detail.explore.frame.clone(),
         document: detail.explore.document.clone(),
-        originalcontent: surface.original_content(detail.frame())?,
         kernel,
     })
 }
@@ -3399,6 +3399,11 @@ mod tests {
                     source: product,
                     originalcontent: original,
                 };
+                for kernel in crate::generated::UPSCALE_KERNEL_VALUES.iter().copied() {
+                    assert_eq!(viewer_upscale_request(kernel), Some(crate::generated::UpscaleRequest {
+                        source: source.frame.clone(), document: source.document.clone(), kernel,
+                    }));
+                }
                 assert_eq!(viewer_annotation_request(), Some(expected.clone()));
                 if !original {
                     record_drawn_detail(
@@ -3422,6 +3427,9 @@ mod tests {
                     }
                     record_drawn_detail(mixed, recorded);
                     assert!(viewer_annotation_request().is_none());
+                    if invalid != 3 { // Annotation also validates its independently recorded crop.
+                        assert!(viewer_upscale_request(crate::generated::UpscaleKernel::Default).is_none());
+                    }
                 }
                 record_drawn_detail(surface, crop);
                 metadata::retire(physical);
