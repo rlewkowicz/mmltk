@@ -114,6 +114,7 @@ struct __attribute__((packed)) FileHeader {
     mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     std::array<uint8_t, 51> _reserved{};
 };
+inline constexpr std::size_t COMPILED_CLASS_NAME_CAPACITY = FileHeader{}.class_names[0].size() - 1U;
 static_assert(sizeof(FileHeader) == 8328, "FileHeader must preserve the on-disk layout");
 struct __attribute__((packed)) RLEPair {
     uint32_t start;

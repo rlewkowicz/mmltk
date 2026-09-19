@@ -44,6 +44,9 @@
 #include "src/backend/data/benchmark_hash.h"
 #include "src/common/io/file_digest.h"
 #include "src/backend/data/compiled_file_utils.h"
+#include "src/backend/data/compiled_dataset.h"
+#include "src/backend/data/dataset_compiler.h"
+#include "src/backend/data/tests/test_fixture.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_loader.h"
 #include "src/backend/imaging/resample/image_resize.h"
@@ -1167,6 +1170,48 @@ TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordina
             }
             for (unsigned pixel = 0; pixel < actual.size(); ++pixel)
                 CHECK(actual[pixel] == (ordinal == 0U || ordinal == 3U || (ordinal == 2U && pixel % 4U < 3U && pixel / 4U < 3U)));
+        }
+    }
+}
+
+TEST_CASE("generic and benchmark writers share complete format headers", "[backend][data][benchmark][compiler]") {
+    namespace fixtures = mmltk::backend::data::testsupport;
+    namespace resize = mmltk::backend::imaging::resample;
+    const mmltk::testsupport::ScopedTempDir root("shared-compiled-header");
+    const fixtures::FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 8, .num_images = 1};
+    fixtures::create_synthetic_dataset(fixture);
+    const auto image_root = root.path() / "cached";
+    prepare_cached_image_directory(image_root);
+    write_cached_image_atomically(cached_image_path(image_root, 1U), make_jpeg(128U, 64U, 32U), {});
+    for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
+        for (const std::string& annotation : {
+                 std::string{},
+                 std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
+                 std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"17:3 33:3 49:3"})"}}) {
+            write_text(fs::path(fixtures::dataset_dir(fixture)) / "train/000001.jsonl", annotation);
+            auto config = fixtures::compiler_config(fixture);
+            config.num_workers = 1;
+            config.target_width = 16U;
+            config.target_height = 16U;
+            config.resize_mode = mode;
+            DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0U);
+            const auto generic = CompiledDataset::open(fixtures::compiled_bin_path(fixture));
+            PreparedBenchmarkSplit split;
+            split.class_names.assign(generic.class_names().begin(), generic.class_names().end());
+            split.sources.push_back({image_root});
+            split.images.push_back({1U, 16U, 8U, 0U, static_cast<std::uint16_t>(generic.labels().size()), 0U});
+            split.labels.assign(generic.labels().begin(), generic.labels().end());
+            split.rle_pairs.assign(generic.rle_pairs().begin(), generic.rle_pairs().end());
+            const auto output = root.path() / "benchmark.bin";
+            auto request = benchmark_write_request(split, output, 16U);
+            request.overwrite = true;
+            request.resize_mode = mode;
+            write_benchmark_split(request);
+            const auto benchmark = CompiledDataset::open(output);
+            CHECK(std::memcmp(&generic.header(), &benchmark.header(), sizeof(FileHeader)) == 0);
+            const auto sections = validate_compiled_file_sections(benchmark.header(), fs::file_size(output));
+            CHECK(sections.label_count == generic.labels().size());
+            CHECK(sections.rle_region_bytes == generic.rle_pairs().size_bytes());
         }
     }
 }

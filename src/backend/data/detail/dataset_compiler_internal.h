@@ -5,14 +5,15 @@
 #include <filesystem>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
+#include "src/backend/data/catalog/class_catalog.h"
+#include "src/backend/data/compiled_file_layout.h"
 #include "src/backend/data/dataset_compiler.h"
 #include "src/common/io/file_memory.h"
 namespace mmltk::backend::data::compiler_internal {
 struct DatasetScan {
-    std::unordered_map<std::string, uint8_t> class_map;
-    std::unordered_map<std::string, std::uint64_t> source_categories;
+    catalog::ClassCatalog class_catalog;
+    std::uint8_t source_category_base = 0;
     std::vector<DatasetCompileSplitPlan> splits;
 };
 struct LabelBlocks {
@@ -45,30 +46,6 @@ class ProgressBatch {
     ProgressCounter* counter_ = nullptr;
     size_t pending_ = 0U;
 };
-struct LayoutFinalizeInputs {
-    size_t label_count = 0;
-    size_t rle_count = 0;
-};
-struct FileHeaderInputs {
-    uint32_t num_images = 0;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    uint32_t channels = 0;
-    uint32_t max_instances_per_image = 0;
-    size_t image_stride = 0;
-    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
-};
-struct FileLayout {
-    size_t index_size = 0;
-    size_t label_block_size = 0;
-    size_t rle_block_size = 0;
-    size_t index_offset = sizeof(FileHeader);
-    size_t label_offset = 0;
-    size_t rle_offset = 0;
-    size_t pixel_offset = 0;
-    size_t pixel_blob_size = 0;
-    size_t total_size = 0;
-};
 struct PixelBlobWriteRequest {
     const std::filesystem::path& split_dir;
     uint32_t num_images = 0;
@@ -94,13 +71,10 @@ std::filesystem::path annotation_path(const std::filesystem::path& split_dir, ui
 DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::string>& splits,
                          mmltk::common::concurrency::CancellationObservation cancellation = {});
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config,
-                               const std::unordered_map<std::string, uint8_t>& class_map, const std::unordered_map<std::string, std::uint64_t>& source_categories, int num_workers, std::span<const int> worker_cpus,
+                               const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base, int num_workers, std::span<const int> worker_cpus,
                                ProgressCounter* completed_images = nullptr, std::atomic<bool>* failure_requested = nullptr,
                                mmltk::common::concurrency::CancellationObservation cancellation = {});
-FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride);
-void finalize_layout(FileLayout& layout, const LayoutFinalizeInputs& inputs);
 void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride);
-FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered_map<std::string, uint8_t>& class_map, const FileLayout& layout);
 void write_metadata_blocks(const mmltk::common::io::FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
                            mmltk::common::concurrency::CancellationObservation cancel_requested = {});
 void write_pixel_blob(const mmltk::common::io::FileHandle& fd, const PixelBlobWriteRequest& request);

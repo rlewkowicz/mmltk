@@ -3,17 +3,14 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 #include "src/backend/data/compiled_format.h"
 #include "src/common/io/file_memory.h"
-#include "src/common/math/checked_arithmetic.h"
 #include "src/common/system/cpu_affinity.h"
 #include "src/common/system/execution_policy.h"
 // CLEANUP-IGNORE: This layout implementation imports the concrete data and system owners used by its independent unit.
@@ -22,7 +19,6 @@ import mmltk.common.logging.profile_utils;
 #include "detail/dataset_compiler_internal.h"
 namespace mmltk::backend::data::compiler_internal {
 using mmltk::common::io::FileHandle;
-using mmltk::common::math::checked_cast;
 using mmltk::common::system::clamp_worker_count_to_cpus;
 int resolve_num_workers(int configured_workers, const std::span<const int> worker_cpus) {
     if (worker_cpus.empty()) { throw std::runtime_error("dataset compilation requires a non-empty CPU execution domain"); }
@@ -39,47 +35,8 @@ int resolve_num_workers(int configured_workers, const std::span<const int> worke
     }
     return static_cast<int>(allowed.size());
 }
-FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride) {
-    FileLayout layout;
-    layout.index_size = mmltk::common::math::checked_multiply(static_cast<size_t>(num_images), sizeof(ImageEntry), "compiled index size overflow");
-    layout.pixel_offset = mmltk::common::math::checked_add(mmltk::common::math::checked_add(layout.index_offset, layout.index_size, "compiled index end overflow"), HUGE_PAGE_SIZE - 1U, "compiled alignment overflow") & ~(HUGE_PAGE_SIZE - 1U);
-    layout.pixel_blob_size = mmltk::common::math::checked_multiply(static_cast<size_t>(num_images), image_stride, "compiled pixels overflow");
-    (void)mmltk::common::math::checked_add(layout.pixel_offset, layout.pixel_blob_size, "compiled pixel end overflow");
-    return layout;
-}
-void finalize_layout(FileLayout& layout, const LayoutFinalizeInputs& inputs) {
-    layout.label_block_size = mmltk::common::math::checked_multiply(inputs.label_count, sizeof(PackedInstance), "compiled layout overflow");
-    layout.rle_block_size = mmltk::common::math::checked_multiply(inputs.rle_count, sizeof(RLEPair), "compiled layout overflow");
-    layout.label_offset = mmltk::common::math::checked_add(layout.pixel_offset, layout.pixel_blob_size, "compiled layout overflow");
-    layout.rle_offset = mmltk::common::math::checked_add(layout.label_offset, layout.label_block_size, "compiled layout overflow");
-    layout.total_size = mmltk::common::math::checked_add(layout.rle_offset, layout.rle_block_size, "compiled layout overflow");
-}
 void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride) {
     for (size_t i = 0; i < index.size(); ++i) { index[i].pixel_offset = pixel_offset + i * image_stride; }
-}
-FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered_map<std::string, uint8_t>& class_map, const FileLayout& layout) {
-    FileHeader header{};
-    header.magic = MAGIC;
-    header.version = FORMAT_VERSION;
-    header.resize_mode = inputs.resize_mode;
-    header.num_images = inputs.num_images;
-    header.image_width = inputs.width;
-    header.image_height = inputs.height;
-    header.channels = inputs.channels;
-    header.num_classes = checked_cast<uint32_t>(class_map.size(), "too many classes for file header");
-    header.max_instances_per_image = inputs.max_instances_per_image;
-    header.index_offset = layout.index_offset;
-    header.label_offset = layout.label_offset;
-    header.pixel_offset = layout.pixel_offset;
-    header.mask_rle_offset = layout.rle_offset;
-    header.total_file_size = layout.total_size;
-    header.image_stride = inputs.image_stride;
-    for (const auto& [name, id] : class_map) {
-        if (id >= header.num_classes || name.empty() || name.size() >= header.class_names[id].size() || name.find('\0') != std::string::npos)
-            throw std::runtime_error("invalid compiled class name or index");
-        std::memcpy(header.class_names[id].data(), name.data(), name.size());
-    }
-    return header;
 }
 void write_metadata_blocks(const FileHandle& fd, const FileLayout& layout, const FileHeader& header, const LabelBlocks& label_blocks,
                            mmltk::common::concurrency::CancellationObservation cancel_requested) {

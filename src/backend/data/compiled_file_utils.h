@@ -13,6 +13,7 @@
 #include <vector>
 #include "src/common/concurrency/cancellation_observation.h"
 #include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled_file_layout.h"
 #include "src/backend/data/catalog/class_catalog.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/math/checked_arithmetic.h"
@@ -83,16 +84,16 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
         total_file_size < rle_offset) {
         throw std::runtime_error("compiled file layout is invalid");
     }
-    const auto expected_index_bytes =
-        mmltk::common::math::checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * sizeof(ImageEntry), "index size overflow");
-    if (pixel_offset != align_up(index_offset + expected_index_bytes, HUGE_PAGE_SIZE)) {
+    const auto layout = compute_pixel_layout(header.num_images,
+        mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"));
+    const auto expected_index_bytes = layout.index_size;
+    if (pixel_offset != layout.pixel_offset) {
         throw std::runtime_error("compiled file index or pixel alignment is invalid");
     }
     const size_t label_bytes = rle_offset - label_offset;
     if (label_bytes % sizeof(PackedInstance) != 0) { throw std::runtime_error("label block is not aligned to PackedInstance"); }
     const size_t pixel_blob_size = label_offset - pixel_offset;
-    const auto expected_pixel_blob_size =
-        mmltk::common::math::checked_cast<size_t>(mmltk::common::math::checked_multiply(static_cast<uint64_t>(header.num_images), header.image_stride, "pixel blob size overflow"), "pixel blob size overflow");
+    const auto expected_pixel_blob_size = layout.pixel_blob_size;
     if (pixel_blob_size != expected_pixel_blob_size) { throw std::runtime_error("compiled pixel blob size mismatch"); }
     const size_t rle_region_bytes = total_file_size - rle_offset;
     if (rle_region_bytes % sizeof(RLEPair) != 0U) { throw std::runtime_error("compiled RLE block is not aligned to RLEPair"); }
@@ -216,7 +217,7 @@ inline catalog::ClassCatalog compiled_class_catalog(const FileHeader& header) {
         std::string name(stored_name.data(), length);
         names.push_back(std::move(name));
     }
-    return catalog::ClassCatalog(std::move(names), 31U);
+    return catalog::ClassCatalog(std::move(names), COMPILED_CLASS_NAME_CAPACITY);
 }
 inline CompiledDatasetInfo inspect_compiled_dataset(const std::filesystem::path& path) {
     const mmltk::common::io::FileHandle file = mmltk::common::io::FileHandle::open_readonly(path.string());

@@ -49,6 +49,7 @@ mmltk_register_public_headers(
         benchmark_dataset_compiler.h
         compiled_image_stream.h
         compiled_dataset.h
+        compiled_file_layout.h
         compiled_format.h
         compiled_format_limits.h
         dataset_compile_phase.h
@@ -59,6 +60,7 @@ mmltk_register_public_headers(
         benchmark_hash.h
 )
 mmltk_register_ordinary_sources(mmltk_backend_data
+    compiled_file_layout.cpp
     compiled_dataset.cpp
     benchmark_annotations.cpp
     benchmark_cache.cpp
@@ -139,6 +141,8 @@ target_link_libraries(mmltk_backend_data
         CUDA::cuda_driver
         ${MMLTK_TURBOJPEG_LIBRARY}
 )
+
+mmltk_register_header_isolation(mmltk_backend_data)
 
 mmltk_target_precompiled_headers(mmltk_backend_data std json)
 

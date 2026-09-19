@@ -17,6 +17,7 @@
 #include <vector>
 #include "src/backend/data/compiled_file_utils.h"
 #include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled_file_layout.h"
 #include "src/common/io/file_memory.h"
 #include "src/common/system/cpu_affinity.h"
 // CLEANUP-IGNORE: This dataset compiler unit imports the exact storage and system owners it consumes.
@@ -150,8 +151,8 @@ DatasetCompilePlan DatasetCompiler::prepare(CompilerConfig config, const std::ve
     compiler_internal::DatasetScan scan = compiler_internal::scan_dataset(config, splits, cancellation);
     DatasetCompilePlan plan;
     plan.config = std::move(config);
-    plan.class_map = std::move(scan.class_map);
-    plan.source_categories = std::move(scan.source_categories);
+    plan.class_catalog = std::move(scan.class_catalog);
+    plan.source_category_base = scan.source_category_base;
     plan.splits = std::move(scan.splits);
     return plan;
 }
@@ -183,7 +184,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
     const std::span<const int> worker_cpus(effective_config.worker_cpus.data(), static_cast<size_t>(num_workers));
     const std::span<const int> label_cpus = worker_cpus.last(static_cast<size_t>(label_workers));
     mmltk::common::logging::profile_set_value("compiler.num_workers", static_cast<size_t>(num_workers));
-    const auto& class_map = plan.class_map;
+    const auto& class_catalog = plan.class_catalog;
+    if (class_catalog.empty() || plan.source_category_base > 1U) throw std::runtime_error("invalid generic compile catalog");
     const uint32_t num_images = plan.splits[split_index].image_count;
     mmltk::common::logging::profile_set_value("compiler.num_images", num_images);
     mmltk::common::logging::profile_set_value("compiler.image_stride_bytes", image_stride);
@@ -200,10 +202,10 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
             "stride={} bytes/img",
             effective_config.split, num_images, num_workers, initial_pixel_workers, label_workers, pixel_workers, width, height, image_stride);
     });
-    compiler_internal::FileLayout layout;
+    FileLayout layout;
     {
         mmltk::common::logging::ScopedProfile layout_profile{"compiler.compute_pixel_layout"};
-        layout = compiler_internal::compute_pixel_layout(num_images, image_stride);
+        layout = compute_pixel_layout(num_images, image_stride);
     }
     mmltk::common::logging::debug([&](spdlog::logger& log) {
         log.debug("[compile] Pixel layout: pixel_offset={} ({:.1f} MB aligned), pixels={:.2f} GB", layout.pixel_offset,
@@ -249,7 +251,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
         }
     });
     try {
-        label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_map, plan.source_categories, label_workers, label_cpus,
+        label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, label_workers, label_cpus,
                                                              telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
         if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
     } catch (...) {
@@ -265,18 +267,15 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
     mmltk::common::logging::debug([](spdlog::logger& log) { log.debug("[compile] Labels and pixels complete"); });
     {
         mmltk::common::logging::ScopedProfile layout_profile{"compiler.finalize_layout"};
-        compiler_internal::finalize_layout(layout, compiler_internal::LayoutFinalizeInputs{
-                                                       label_blocks.labels.size(),
-                                                       label_blocks.rle_pairs.size(),
-                                                   });
+        finalize_layout(layout, {label_blocks.labels.size(), label_blocks.rle_pairs.size()});
     }
     compiler_internal::assign_pixel_offsets(label_blocks.index, layout.pixel_offset, image_stride);
     throw_if_cancelled();
     mmltk::common::logging::debug(
         [&](spdlog::logger& log) { log.debug("[compile] Layout: total={:.2f} GB", static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0)); });
     fd.preallocate(layout.total_size);
-    const FileHeader header = compiler_internal::make_file_header(
-        compiler_internal::FileHeaderInputs{
+    const FileHeader header = make_file_header(
+        FileHeaderInputs{
             num_images,
             width,
             height,
@@ -285,7 +284,7 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
             image_stride,
             effective_config.resize_mode,
         },
-        class_map, layout);
+        class_catalog.names(), layout);
     validate_compiled_index_entries(label_blocks.index, header, label_blocks.labels.size(), cancellation);
     validate_compiled_original_image_dimensions(label_blocks.index, cancellation);
     const size_t used_rle_bytes = validate_compiled_label_entries(label_blocks.labels, header, layout.rle_block_size, cancellation);

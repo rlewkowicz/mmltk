@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
+#include "src/backend/data/catalog/class_catalog.h"
 #include <utility>
 #include <vector>
 #include "src/frameworks/reflection/field_policy.h"
@@ -157,8 +157,8 @@ struct DatasetCompileSplitPlan {
 };
 struct DatasetCompilePlan {
     CompilerConfig config;
-    std::unordered_map<std::string, std::uint8_t> class_map;
-    std::unordered_map<std::string, std::uint64_t> source_categories;
+    catalog::ClassCatalog class_catalog;
+    std::uint8_t source_category_base = 0;
     std::vector<DatasetCompileSplitPlan> splits;
     [[nodiscard]] size_t total_steps() const noexcept {
         size_t total = 0;

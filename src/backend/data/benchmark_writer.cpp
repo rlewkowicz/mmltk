@@ -21,6 +21,7 @@
 #include "src/backend/data/catalog/class_catalog.h"
 #include "detail/writable_pixel_range.h"
 #include "src/backend/data/compiled_file_utils.h"
+#include "src/backend/data/compiled_file_layout.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/imaging/resample/image_resize.h"
 #include "src/common/concurrency/event_cancellation.h"
@@ -45,10 +46,6 @@ namespace {
 }
 [[nodiscard]] std::size_t checked_size_multiply(const std::size_t left, const std::size_t right, const char* context) {
     return common_math::checked_multiply(left, right, context);
-}
-[[nodiscard]] std::size_t checked_align_up(const std::size_t value, const std::size_t alignment, const char* context) {
-    if (alignment == 0U || (alignment & (alignment - 1U)) != 0U) { throw std::invalid_argument("benchmark alignment must be a nonzero power of two"); }
-    return checked_size_add(value, alignment - 1U, context) & ~(alignment - 1U);
 }
 using detail::WritablePixelRange;
 class ReadOnlyMappedRange {
@@ -105,33 +102,6 @@ class ReadOnlyMappedRange {
     }
     if (expected_first_label != split.labels.size()) { throw std::runtime_error("benchmark labels contain unreferenced records"); }
     return index;
-}
-[[nodiscard]] FileHeader make_header(const PreparedBenchmarkSplit& split, const std::uint32_t resolution, const std::size_t image_stride,
-                                     const std::size_t index_offset, const std::size_t pixel_offset, const std::size_t label_offset,
-                                     const std::size_t rle_offset, const std::size_t total_size) {
-    FileHeader header{};
-    header.magic = MAGIC;
-    header.version = FORMAT_VERSION;
-    header.num_images = common_math::checked_cast<std::uint32_t>(split.images.size(), "benchmark image count overflow");
-    header.image_width = resolution;
-    header.image_height = resolution;
-    header.channels = 3U;
-    header.num_classes = common_math::checked_cast<std::uint32_t>(split.class_names.size(), "benchmark class count overflow");
-    header.index_offset = index_offset;
-    header.pixel_offset = pixel_offset;
-    header.label_offset = label_offset;
-    header.mask_rle_offset = rle_offset;
-    header.total_file_size = total_size;
-    header.image_stride = image_stride;
-    for (std::size_t class_index = 0U; class_index < split.class_names.size(); ++class_index) {
-        const std::string& name = split.class_names[class_index];
-        if (name.empty() || name.size() >= header.class_names[class_index].size()) { throw std::runtime_error("benchmark class name is empty or too long"); }
-        std::memcpy(header.class_names[class_index].data(), name.data(), name.size());
-    }
-    for (const EncodedImageRecord& image : split.images) {
-        header.max_instances_per_image = std::max<std::uint32_t>(header.max_instances_per_image, image.label_count);
-    }
-    return header;
 }
 void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHandle& output, const std::size_t pixel_offset, const std::size_t image_stride,
                    const std::size_t pixel_bytes) {
@@ -249,48 +219,44 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
         throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format");
     }
     if (request.split.images.empty() || request.split.class_names.empty()) { throw std::runtime_error("benchmark split must contain images and classes"); }
-    const catalog::ClassCatalog class_catalog(request.split.class_names, 31U);
+    const catalog::ClassCatalog class_catalog(request.split.class_names, COMPILED_CLASS_NAME_CAPACITY);
     if (request.split.class_names.size() > MAX_CLASSES) { throw std::runtime_error("benchmark split exceeds the compiled class limit"); }
     if (request.split.sources.empty()) { throw std::runtime_error("benchmark split has no cached image sources"); }
     const std::uint64_t image_stride_u64 = static_cast<std::uint64_t>(request.resolution) * request.resolution * 3U * sizeof(float);
     const std::size_t image_stride = common_math::checked_cast<std::size_t>(image_stride_u64, "benchmark image stride overflow");
-    const std::size_t index_offset = sizeof(FileHeader);
-    const std::size_t index_bytes = checked_size_multiply(request.split.images.size(), sizeof(ImageEntry), "benchmark index size overflow");
-    const std::size_t pixel_offset =
-        checked_align_up(checked_size_add(index_offset, index_bytes, "benchmark index end overflow"), HUGE_PAGE_SIZE, "benchmark pixel alignment overflow");
-    const std::size_t pixel_bytes = checked_size_multiply(request.split.images.size(), image_stride, "benchmark pixel blob overflow");
-    const std::size_t label_offset = checked_size_add(pixel_offset, pixel_bytes, "benchmark label offset overflow");
-    const std::size_t label_bytes = checked_size_multiply(request.split.labels.size(), sizeof(PackedInstance), "benchmark label block overflow");
-    const std::size_t rle_offset = checked_size_add(label_offset, label_bytes, "benchmark RLE offset overflow");
-    const std::size_t rle_bytes = checked_size_multiply(request.split.rle_pairs.size(), sizeof(RLEPair), "benchmark RLE block overflow");
-    const std::size_t total_size = checked_size_add(rle_offset, rle_bytes, "benchmark file size overflow");
-    std::vector<ImageEntry> index = build_index(request.split, pixel_offset, image_stride);
-    FileHeader header = make_header(request.split, request.resolution, image_stride, index_offset, pixel_offset, label_offset, rle_offset, total_size);
-    header.resize_mode = request.resize_mode;
+    const auto image_count = common_math::checked_cast<std::uint32_t>(request.split.images.size(), "benchmark image count overflow");
+    auto layout = compute_pixel_layout(image_count, image_stride);
+    finalize_layout(layout, {request.split.labels.size(), request.split.rle_pairs.size()});
+    std::vector<ImageEntry> index = build_index(request.split, layout.pixel_offset, image_stride);
+    std::uint32_t max_instances = 0U;
+    for (const auto& image : request.split.images) max_instances = std::max<std::uint32_t>(max_instances, image.label_count);
+    const FileHeader header = make_file_header(
+        {image_count, request.resolution, request.resolution, 3U, max_instances, image_stride, request.resize_mode},
+        class_catalog.names(), layout);
     validate_compiled_header(header);
     validate_compiled_index_entries(index, header, request.split.labels.size(), request.cancel_requested);
     validate_compiled_original_image_dimensions(index, request.cancel_requested);
     validate_compiled_annotation_provenance(index, request.split.labels, request.cancel_requested);
-    const std::size_t used_rle = validate_compiled_label_entries(request.split.labels, header, rle_bytes, request.cancel_requested);
-    if (used_rle != rle_bytes) { throw std::runtime_error("benchmark labels do not reference the complete mask block"); }
+    const std::size_t used_rle = validate_compiled_label_entries(request.split.labels, header, layout.rle_block_size, request.cancel_requested);
+    if (used_rle != layout.rle_block_size) { throw std::runtime_error("benchmark labels do not reference the complete mask block"); }
     validate_compiled_rle_pairs(request.split.labels, request.split.rle_pairs, static_cast<std::size_t>(request.resolution) * request.resolution,
                                 request.cancel_requested);
     (void)mmltk::common::io::ensure_parent_directory(request.output_path);
     std::string staging_path_text = request.output_path.string() + ".tmp.XXXXXX";
-    common_io::FileHandle output = common_io::FileHandle::create_unique_output(staging_path_text, total_size);
+    common_io::FileHandle output = common_io::FileHandle::create_unique_output(staging_path_text, layout.total_size);
     const std::filesystem::path staging_path(staging_path_text);
     StagingFileCleanup cleanup(staging_path);
-    decode_images(request, output, pixel_offset, image_stride, pixel_bytes);
+    decode_images(request, output, layout.pixel_offset, image_stride, layout.pixel_blob_size);
     output.pwrite_all(&header, sizeof(header), 0U);
-    output.pwrite_all(index.data(), index_bytes, index_offset);
-    output.pwrite_all(request.split.labels.data(), label_bytes, label_offset);
-    output.pwrite_all(request.split.rle_pairs.data(), rle_bytes, rle_offset);
+    output.pwrite_all(index.data(), layout.index_size, layout.index_offset);
+    output.pwrite_all(request.split.labels.data(), layout.label_block_size, layout.label_offset);
+    output.pwrite_all(request.split.rle_pairs.data(), layout.rle_block_size, layout.rle_offset);
     output.sync_data();
     output = common_io::FileHandle{};
     const common_io::FileHandle staged = common_io::FileHandle::open_readonly(staging_path.string());
     const FileHeader staged_header = read_compiled_header(staged);
     const CompiledFileSections sections = validate_compiled_file_sections(staged_header, staged.size());
-    if (sections.label_count != request.split.labels.size() || sections.rle_region_bytes != rle_bytes) {
+    if (sections.label_count != request.split.labels.size() || sections.rle_region_bytes != layout.rle_block_size) {
         throw std::runtime_error("staged benchmark split metadata does not match its compile plan");
     }
     const ReadOnlyMappedRange persisted_index(staged, sections.index_offset, sections.expected_index_bytes);
@@ -303,7 +269,7 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
     const std::size_t persisted_rle_bytes =
         validate_compiled_label_entries(persisted_label_span, staged_header, sections.rle_region_bytes, request.cancel_requested);
     validate_compiled_annotation_provenance(persisted_index_span, persisted_label_span, request.cancel_requested);
-    if (persisted_rle_bytes != rle_bytes) { throw std::runtime_error("persisted benchmark labels do not reference the complete mask block"); }
+    if (persisted_rle_bytes != layout.rle_block_size) { throw std::runtime_error("persisted benchmark labels do not reference the complete mask block"); }
     const ReadOnlyMappedRange persisted_rle(staged, sections.rle_offset, sections.rle_region_bytes);
     const auto persisted_rle_span = std::span(reinterpret_cast<const RLEPair*>(persisted_rle.data()), request.split.rle_pairs.size());
     validate_compiled_rle_pairs(persisted_label_span, persisted_rle_span, static_cast<std::size_t>(request.resolution) * request.resolution,

@@ -29,7 +29,6 @@
 #include <filesystem>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <vector>
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
@@ -185,7 +184,7 @@ void append_diagnostic(std::vector<CompileDiagnostic>* diagnostics, CompileDiagn
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std::filesystem::path& image_file,
-                         const std::unordered_map<std::string, uint8_t>& class_map, const CompilerConfig& config, ResizeObservation* resize_observation,
+                         const catalog::ClassCatalog& class_catalog, const CompilerConfig& config, ResizeObservation* resize_observation,
                          dataset::MaskResizeScratch& mask_scratch,
                          std::vector<CompileDiagnostic>* diagnostics) {
     mmltk::common::logging::ScopedProfile profile{"compiler.labels.parse_jsonl"};
@@ -226,13 +225,13 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
             parsed_labels.has_image_id = true;
         }
         const std::string class_name = record["class"].get<std::string>();
-        auto class_it = class_map.find(class_name);
-        if (class_it == class_map.end()) {
+        const auto class_id = class_catalog.resolve(class_name);
+        if (!class_id) {
             throw std::runtime_error("annotation class '" + class_name + "' is not declared in categories.json: " + annotation_file.string() + " at line " +
                                      std::to_string(line_number));
         }
         ParsedInstance instance{};
-        instance.class_id = class_it->second;
+        instance.class_id = checked_cast<std::uint8_t>(*class_id, "compiled class index overflow");
         try {
             auto& metadata = instance.metadata;
             metadata.source_ordinal = line_number;
@@ -382,32 +381,32 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
         check_cancelled();
         ParsedCategory parsed;
         parsed.name = category["name"].get<std::string>();
-        parsed.raw_id = category["id"].get<int>();
+        const auto& id = category["id"];
+        if (!id.is_number_integer() || (!id.is_number_unsigned() && id.get<std::int64_t>() < 0) ||
+            id.get<std::uint64_t>() > MAX_CLASSES)
+            throw std::runtime_error("class id must be an exact nonnegative integer in the supported range");
+        parsed.raw_id = static_cast<int>(id.get<std::uint64_t>());
         parsed_categories.push_back(std::move(parsed));
         min_raw_id = std::min(min_raw_id, parsed_categories.back().raw_id);
     }
     if (parsed_categories.empty()) { throw std::runtime_error("no classes found in categories.json"); }
     const int class_id_base = min_raw_id == 0 ? 0 : min_raw_id == 1 ? 1 : throw std::runtime_error("class ids must be dense and start at 0 or 1");
+    if (parsed_categories.size() > MAX_CLASSES) throw std::runtime_error("too many classes in categories.json");
+    scan.source_category_base = static_cast<std::uint8_t>(class_id_base);
+    std::vector<std::string> ordered_names(parsed_categories.size());
     std::array<bool, MAX_CLASSES> seen_ids{};
     for (const auto& category : parsed_categories) {
         check_cancelled();
         const int normalized_id = category.raw_id - class_id_base;
-        if (normalized_id < 0 || normalized_id >= static_cast<int>(MAX_CLASSES)) {
+        if (normalized_id < 0 || normalized_id >= static_cast<int>(ordered_names.size())) {
             throw std::runtime_error("class id out of supported range in categories.json");
         }
         const auto class_id = static_cast<uint8_t>(normalized_id);
         if (seen_ids[class_id]) { throw std::runtime_error("duplicate class id in categories.json"); }
         seen_ids[class_id] = true;
-        scan.source_categories.emplace(category.name, static_cast<std::uint64_t>(category.raw_id));
-        auto inserted = scan.class_map.emplace(category.name, class_id);
-        if (!inserted.second) { throw std::runtime_error("duplicate class name in categories.json"); }
+        ordered_names[class_id] = category.name;
     }
-    for (size_t i = 0; i < scan.class_map.size(); ++i) {
-        if (!seen_ids[i]) { throw std::runtime_error("class ids must be dense and start at 0 or 1"); }
-    }
-    std::vector<std::string> ordered_names(scan.class_map.size());
-    for (const auto& [name, index] : scan.class_map) ordered_names[index] = name;
-    const catalog::ClassCatalog validated_catalog(std::move(ordered_names), 31U);
+    scan.class_catalog = catalog::ClassCatalog(std::move(ordered_names), COMPILED_CLASS_NAME_CAPACITY);
     scan.splits.reserve(splits.size());
     for (const std::string& split : splits) {
         check_cancelled();
@@ -427,7 +426,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
     return scan;
 }
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config,
-                               const std::unordered_map<std::string, uint8_t>& class_map, const std::unordered_map<std::string, std::uint64_t>& source_categories, int num_workers, const std::span<const int> worker_cpus,
+                               const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base, int num_workers, const std::span<const int> worker_cpus,
                                ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
                                const mmltk::common::concurrency::CancellationObservation cancellation) {
     mmltk::common::logging::ScopedProfile profile{"compiler.labels.build_blocks"};
@@ -465,8 +464,6 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
 #endif
         return total_dropped_instances;
     };
-    std::array<std::uint64_t, MAX_CLASSES> source_category_ids{};
-    for (const auto& [name, dense] : class_map) source_category_ids[dense] = source_categories.at(name);
     std::atomic<bool> any_image_resize{false};
     std::atomic<bool> any_image_downscale{false};
     std::atomic<bool> worker_cancelled{false};
@@ -494,7 +491,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
                 }
                 try {
                     ResizeObservation resize_observation;
-                    ParsedLabels parsed_labels = parse_jsonl(annotation_path(split_dir, image_index), image_path(split_dir, image_index), class_map, config,
+                    ParsedLabels parsed_labels = parse_jsonl(annotation_path(split_dir, image_index), image_path(split_dir, image_index), class_catalog, config,
                                                              &resize_observation, mask_scratch, diagnostics);
                     if (resize_observation.needs_resize) { any_image_resize.store(true, std::memory_order_relaxed); }
                     if (resize_observation.needs_downscale) { any_image_downscale.store(true, std::memory_order_relaxed); }
@@ -510,7 +507,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t 
                     for (const ParsedInstance& instance : instances) {
                         auto packed = pack_instance(instance);
                         if ((packed.flags & kAnnotationCategory) == 0U) {
-                            packed.source_category_id = source_category_ids[packed.class_id];
+                            packed.source_category_id = static_cast<std::uint64_t>(packed.class_id) + source_category_base;
                             packed.flags |= kAnnotationCategory;
                         }
                         result.labels.push_back(packed);

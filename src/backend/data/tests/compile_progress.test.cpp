@@ -12,6 +12,7 @@
 #include <fstream>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/compiled_file_utils.h"
+#include "src/backend/data/compiled_file_layout.h"
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/compiled_format.h"
 #include "src/backend/data/dataset_compiler.h"
@@ -444,15 +446,32 @@ TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense 
             output << categories;
         };
         write();
-        const auto config = compiler_config(fixture);
-        const auto plan = DatasetCompiler::prepare(config, {fixture.split});
-        CHECK(plan.class_map.at("person") == 0);
-        CHECK(plan.class_map.at("ret") == 1);
-        CHECK(plan.class_map.at("glint") == 5);
+        auto config = compiler_config(fixture);
+        config.num_workers = 1;
+        fs::copy(fs::path(dataset_dir(fixture)) / fixture.split, fs::path(dataset_dir(fixture)) / "val", fs::copy_options::recursive);
+        auto prepared = DatasetCompiler::prepare(config, {fixture.split, "val"});
+        const auto plan = std::move(prepared);
+        CHECK(plan.class_catalog.resolve("person") == 0);
+        CHECK(plan.class_catalog.resolve("ret") == 1);
+        CHECK(plan.class_catalog.resolve("glint") == 5);
+        CHECK(plan.source_category_base == base);
+        for (std::size_t split = 0; split < plan.splits.size(); ++split) {
+            overwrite_annotation(fs::path(dataset_dir(fixture)) / plan.splits[split].split / "000001.jsonl",
+                R"({"class":"ret","bbox_xyxy":[1,1,3,3]})" "\n"
+                R"({"class":"person","bbox_xyxy":[1,1,3,3],"category_id":0})" "\n"
+                R"({"class":"person","bbox_xyxy":[1,1,3,3]})");
+            DatasetCompiler::compile(plan, split);
+            const auto store = CompiledDataset::open(fs::path(compiled_dir(fixture)) / (plan.splits[split].split + ".bin"));
+            REQUIRE(store.image_labels(0).size() == 3U);
+            CHECK(store.image_labels(0)[0].source_category_id == static_cast<std::uint64_t>(base + 1));
+            CHECK(store.image_labels(0)[1].source_category_id == 0U);
+            CHECK(store.image_labels(0)[2].source_category_id == static_cast<std::uint64_t>(base));
+            CHECK(std::ranges::equal(store.class_names(), plan.class_catalog.names()));
+        }
         const auto original = classes;
         classes.push_back({{"id", base + 6}, {"name", std::string(31, 'x')}});
         write();
-        CHECK(DatasetCompiler::prepare(config, {fixture.split}).class_map.at(std::string(31, 'x')) == 6);
+        CHECK(DatasetCompiler::prepare(config, {fixture.split}).class_catalog.resolve(std::string(31, 'x')) == 6);
         classes.back()["name"] = std::string(32, 'x');
         write();
         CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
@@ -464,7 +483,24 @@ TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense 
             write();
             CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
         }
-        CHECK_FALSE(fs::exists(fs::path(compiled_dir(fixture)) / "train.bin"));
+        classes = original;
+        classes[0]["name"] = std::string("bad\0name", 8);
+        write();
+        CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
+        classes = nlohmann::json::array();
+        for (std::uint32_t index = 0; index < MAX_CLASSES; ++index)
+            classes.push_back({{"id", index + base}, {"name", "class-" + std::to_string(index)}});
+        write();
+        const auto full = DatasetCompiler::prepare(config, {fixture.split});
+        CHECK(full.class_catalog.size() == MAX_CLASSES);
+        CHECK(full.class_catalog.resolve("class-255") == 255U);
+        classes = original;
+        write();
+        overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
+            R"({"class":"unknown","bbox_xyxy":[1,1,3,3]})");
+        CHECK_THROWS(DatasetCompiler::compile(plan, 0U));
+        const auto retained = CompiledDataset::open(compiled_bin_path(fixture));
+        CHECK(retained.image_labels(0)[0].source_category_id == static_cast<std::uint64_t>(base + 1));
     }
 }
 
@@ -679,4 +715,67 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
         write(image, label);
         CHECK_NOTHROW(CompiledDataset::open(path));
     }
+}
+
+TEST_CASE("category IDs reject arithmetic identity loss before publication", "[backend][data][catalog]") {
+    const mmltk::testsupport::ScopedTempDir root("exact-category-ids");
+    const FixtureSpec fixture{.root_dir = root.path().string(), .width = 8, .height = 8, .num_images = 1};
+    create_synthetic_dataset(fixture);
+    const auto config = compiler_config(fixture);
+    compile_existing_fixture(fixture);
+    const auto destination = compiled_bin_path(fixture);
+    const auto read_bytes = [&] {
+        std::ifstream file(destination, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    };
+    const auto original = read_bytes();
+    const std::vector<nlohmann::json> invalid_ids{0.5, 1.5, -1, -4294967295LL, 4294967296ULL, 4294967297ULL,
+                                                std::numeric_limits<std::uint64_t>::max(), "1", true};
+    for (const auto& id : invalid_ids) {
+        CAPTURE(id);
+        const nlohmann::json categories{{"classes", {{{"id", id}, {"name", "person"}}}}};
+        { std::ofstream file(fs::path(dataset_dir(fixture)) / "categories.json"); file << categories; }
+        CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
+        CHECK(read_bytes() == original);
+    }
+}
+TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[backend][data][compiler]") {
+    const auto boundary_count = static_cast<std::uint32_t>((HUGE_PAGE_SIZE - sizeof(FileHeader)) / sizeof(ImageEntry));
+    CHECK(compute_pixel_layout(boundary_count, 12U).pixel_offset == HUGE_PAGE_SIZE);
+    CHECK(compute_pixel_layout(boundary_count + 1U, 12U).pixel_offset == 2U * HUGE_PAGE_SIZE);
+    constexpr auto maximum = std::numeric_limits<std::size_t>::max();
+    CHECK_THROWS(compute_pixel_layout(2U, maximum));
+    CHECK_THROWS(compute_pixel_layout(1U, maximum));
+    auto layout = compute_pixel_layout(1U, 12U);
+    CHECK_THROWS(finalize_layout(layout, {maximum, 0U}));
+    CHECK_THROWS(finalize_layout(layout, {0U, maximum}));
+    CHECK_THROWS(finalize_layout(layout, {maximum / sizeof(PackedInstance), 0U}));
+    CHECK_THROWS(finalize_layout(layout, {0U, maximum / sizeof(RLEPair)}));
+    const std::vector<std::string> names{"person"};
+    for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+                            mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
+        for (const std::size_t count : {0U, 1U}) {
+            layout = compute_pixel_layout(1U, 12U);
+            const auto pixel_offset = layout.pixel_offset;
+            finalize_layout(layout, {count, count});
+            CHECK(layout.pixel_offset == pixel_offset);
+            const auto header = make_file_header({1U, 1U, 1U, 3U, static_cast<std::uint32_t>(count), 12U, mode}, names, layout);
+            validate_compiled_header(header);
+            const auto sections = validate_compiled_file_sections(header, layout.total_size);
+            CHECK(sections.label_count == count);
+            CHECK(sections.rle_region_bytes == count * sizeof(RLEPair));
+            CHECK(sections.pixel_blob_size == 12U);
+            CHECK(std::ranges::all_of(header._reserved, [](auto value) { return value == 0U; }));
+            auto invalid = header;
+            invalid.pixel_offset += HUGE_PAGE_SIZE;
+            CHECK_THROWS(validate_compiled_file_sections(invalid, layout.total_size));
+            invalid = header;
+            invalid.image_stride = maximum;
+            CHECK_THROWS(validate_compiled_file_sections(invalid, layout.total_size));
+            invalid = header;
+            ++invalid.total_file_size;
+            CHECK_THROWS(validate_compiled_file_sections(invalid, invalid.total_file_size));
+        }
+    }
+    CHECK_THROWS(make_file_header({1U, 1U, 1U, 3U, 65536U, 12U}, names, layout));
 }
