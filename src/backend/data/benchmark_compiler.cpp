@@ -503,9 +503,9 @@ struct PlannedBenchmarkInstance {
     std::vector<RLEPair> mask_rle;
 };
 SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, const std::vector<CachedImageDirectory>& directories,
-                                      const std::vector<std::uint64_t>* unavailable_image_ids, const std::uint32_t resolution, const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const bool require_every_image,
-                                      PreparedBenchmarkSplit* split,
-                                      mmltk::common::concurrency::CancellationObservation cancel_requested) {
+                                      const std::vector<std::uint64_t>* unavailable_image_ids, const std::uint32_t resolution,
+                                      const mmltk::backend::imaging::resample::ImageResizeMode resize_mode, const bool require_every_image,
+                                      PreparedBenchmarkSplit* split, mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if (directories.empty()) { throw std::runtime_error("benchmark source has no cached image directories"); }
     if (unavailable_image_ids != nullptr &&
         (!std::ranges::is_sorted(*unavailable_image_ids) || std::ranges::adjacent_find(*unavailable_image_ids) != unavailable_image_ids->end())) {
@@ -594,8 +594,9 @@ SourceCompileCount append_source_plan(const NormalizedAnnotationIndex& index, co
             first_label,
             common_math::checked_cast<std::uint16_t>(image_labels.size(), "per-image label count overflow"),
             common_math::checked_cast<std::uint16_t>(source_base + local_source, "benchmark cached source index overflow"),
-            index.source == BenchmarkDatasetSource::kCoco2017 ? AnnotationSource::Coco :
-                index.source == BenchmarkDatasetSource::kObjects365V2 ? AnnotationSource::Objects365 : AnnotationSource::OpenImages,
+            index.source == BenchmarkDatasetSource::kCoco2017       ? AnnotationSource::Coco
+            : index.source == BenchmarkDatasetSource::kObjects365V2 ? AnnotationSource::Objects365
+                                                                    : AnnotationSource::OpenImages,
         });
         for (PlannedBenchmarkInstance& instance : image_labels) {
             instance.label.mask_rle_offset = common_math::checked_cast<std::uint32_t>(
@@ -748,7 +749,8 @@ void publish_benchmark_manifest(const BenchmarkCompilerConfig& config, const std
 void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     using namespace benchmark_internal;
     if (config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Stretch &&
-        config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox) throw std::invalid_argument("invalid benchmark resize mode");
+        config.resize_mode != mmltk::backend::imaging::resample::ImageResizeMode::Letterbox)
+        throw std::invalid_argument("invalid benchmark resize mode");
     if (config.resolution == 0U || config.resolution > MAX_IMAGE_EXTENT) {
         throw std::runtime_error("benchmark resolution exceeds the compiled coordinate format");
     }
@@ -1295,8 +1297,8 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
             progress.activity("Preparing Open Images training labels");
         }
         prepared_counts.push_back(append_source_plan(*open_images, open_image_directories,
-                                                     open_images_unavailable_ids.empty() ? nullptr : &open_images_unavailable_ids, config.resolution, config.resize_mode, false,
-                                                     &prepared, cancel_requested));
+                                                     open_images_unavailable_ids.empty() ? nullptr : &open_images_unavailable_ids, config.resolution,
+                                                     config.resize_mode, false, &prepared, cancel_requested));
         if (report_progress) { progress.phase(DatasetCompilePhase::Labels, ++completed_label_plans, kLabelPlanCount); }
         train = std::move(prepared);
         source_counts = std::move(prepared_counts);
@@ -1429,14 +1431,28 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
             }
         }
     };
-    compile_split(
-        BenchmarkWriteRequest{
-            train, staging_dir / "train.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode},
-        0U);
-    compile_split(
-        BenchmarkWriteRequest{
-            validation, staging_dir / "val.bin", config.resolution, config.num_workers, {}, false, cancel_requested, {}, config.perceptual_downscale, config.resize_mode},
-        train.images.size());
+    compile_split(BenchmarkWriteRequest{train,
+                                        staging_dir / "train.bin",
+                                        config.resolution,
+                                        config.num_workers,
+                                        {},
+                                        false,
+                                        cancel_requested,
+                                        {},
+                                        config.perceptual_downscale,
+                                        config.resize_mode},
+                  0U);
+    compile_split(BenchmarkWriteRequest{validation,
+                                        staging_dir / "val.bin",
+                                        config.resolution,
+                                        config.num_workers,
+                                        {},
+                                        false,
+                                        cancel_requested,
+                                        {},
+                                        config.perceptual_downscale,
+                                        config.resize_mode},
+                  train.images.size());
     progress.activity("Finalizing rejected and quarantined records");
     std::ranges::sort(quarantined);
     quarantined.erase(

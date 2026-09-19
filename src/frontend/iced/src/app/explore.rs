@@ -158,8 +158,11 @@ impl App {
                     ));
                     return Task::none();
                 }
-                let Some(request) = crate::presentation_surface::viewer_upscale_request(kernel) else {
-                    self.model.error = Some(UiError::presentation("Explore displayed detail is unavailable."));
+                let Some(request) = crate::presentation_surface::viewer_upscale_request(kernel)
+                else {
+                    self.model.error = Some(UiError::presentation(
+                        "Explore displayed detail is unavailable.",
+                    ));
                     return Task::none();
                 };
                 if let Some(integration) = self.integration.as_mut() {

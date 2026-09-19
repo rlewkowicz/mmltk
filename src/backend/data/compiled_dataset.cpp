@@ -80,7 +80,8 @@ const float* CompiledDataset::image_pixels(const std::uint32_t compiled_index) c
 }
 mmltk::backend::imaging::resample::ImageResizeGeometry CompiledDataset::geometry(const std::uint32_t compiled_index) const {
     const mmltk::backend::data::ImageEntry& entry = image_entry(compiled_index);
-    return mmltk::backend::imaging::resample::compute_image_resize_geometry(entry.original_width, entry.original_height, header_.image_width, header_.image_height, header_.resize_mode);
+    return mmltk::backend::imaging::resample::compute_image_resize_geometry(entry.original_width, entry.original_height, header_.image_width,
+                                                                            header_.image_height, header_.resize_mode);
 }
 std::span<const LabelIndexEntry> CompiledDataset::label_index() const noexcept { return label_index_; }
 const float* CompiledDataset::pixel_blob() const noexcept { return reinterpret_cast<const float*>(mapping_.data() + header_.pixel_offset); }

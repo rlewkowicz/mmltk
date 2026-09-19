@@ -591,8 +591,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
             for (int64_t instance_index = 0; instance_index < static_cast<int64_t>(entry.num_instances); ++instance_index) {
                 const auto& instance = batch.labels[static_cast<size_t>(entry.label_begin) + static_cast<size_t>(instance_index)];
                 if (instance.is_crowd()) continue;
-                if (require_masks && !instance.has_mask())
-                    throw std::runtime_error("segmentation training requires decodable masks for every instance");
+                if (require_masks && !instance.has_mask()) throw std::runtime_error("segmentation training requires decodable masks for every instance");
                 if (instance.mask_rle_pairs != 0 && batch.rle_pairs == nullptr) throw std::runtime_error("mask_rle storage is missing");
                 const auto runs = instance.mask_rle_pairs != 0 ? std::span{batch.rle_pairs + instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair),
                                                                            static_cast<std::size_t>(instance.mask_rle_pairs)}

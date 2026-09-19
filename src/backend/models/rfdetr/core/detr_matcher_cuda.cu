@@ -36,8 +36,8 @@ __device__ __forceinline__ float cxcywh_generalized_iou(const float* lhs, const 
 template <typename Logit, typename Box>
 __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, const Box* pred_boxes, const int64_t* target_labels, const float* target_boxes,
                                     const int64_t* target_offsets, const int64_t* target_counts, int64_t batch_size, int64_t query_count, int64_t class_count,
-                                    int64_t output_query_stride, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost,
-                                    float giou_cost, float focal_alpha) {
+                                    int64_t output_query_stride, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost, float giou_cost,
+                                    float focal_alpha) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t total = batch_size * query_count * max_targets;
     if (index >= total) { return; }

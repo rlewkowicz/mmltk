@@ -879,7 +879,6 @@ TEST_CASE("RF-DETR fatal file diagnostics retain their named owner", "[core][cli
     CHECK(result.stderr_text.find("fatal: ", result.stderr_text.find("fatal: ") + 1U) == std::string::npos);
     assert_contains_substring(read_text_lines(log), "[rfdetr.cli]");
 }
-
 TEST_CASE("CLI compilation persists default and explicit resize geometry", "[core][cli][rfdetr][data]") {
     namespace data = mmltk::backend::data;
     using mmltk::backend::imaging::resample::ImageResizeMode;
@@ -892,8 +891,10 @@ TEST_CASE("CLI compilation persists default and explicit resize geometry", "[cor
             std::vector<std::string> command{mmltk_cli_path()};
             if (rfdetr) command.emplace_back("rfdetr");
             command.insert(command.end(), {"compile", "--source-dir", (root.path() / "dataset").string(), "--output-dir", output.string(), "--workers", "1"});
-            if (rfdetr) command.insert(command.end(), {"--resolution", "32"});
-            else command.insert(command.end(), {"--split", "train", "--width", "32", "--height", "32"});
+            if (rfdetr)
+                command.insert(command.end(), {"--resolution", "32"});
+            else
+                command.insert(command.end(), {"--split", "train", "--width", "32", "--height", "32"});
             if (letterbox) command.insert(command.end(), {"--resize-mode", "Letterbox"});
             const auto result = run_subprocess_capture_output(command);
             INFO(result.output_text);

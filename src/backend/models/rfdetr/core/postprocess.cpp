@@ -45,13 +45,12 @@ torch::Tensor fixed_box_scale(const torch::Tensor& boxes, const int64_t height, 
     cache = std::move(candidate);
     return cache.scale;
 }
-PostprocessCore postprocess_core(const OutputTensors& outputs, int64_t target_height, int64_t target_width,
-                                 int64_t num_select, ClassPostprocessLane* classes) {
+PostprocessCore postprocess_core(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select, ClassPostprocessLane* classes) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_total{"rfdetr.native.postprocess.total"};
     const auto out_logits = (classes ? classes->ValidateLogits(outputs.pred_logits) : outputs.pred_logits).to(torch::kFloat32);
     const auto out_bbox = outputs.pred_boxes.to(torch::kFloat32);
-    if (out_logits.dim() != 3 || out_bbox.dim() != 3 || out_bbox.size(2) != 4 ||
-        out_bbox.size(0) != out_logits.size(0) || out_bbox.size(1) != out_logits.size(1) || num_select < 0)
+    if (out_logits.dim() != 3 || out_bbox.dim() != 3 || out_bbox.size(2) != 4 || out_bbox.size(0) != out_logits.size(0) ||
+        out_bbox.size(1) != out_logits.size(1) || num_select < 0)
         throw std::invalid_argument("invalid RF-DETR postprocessing shapes or selection limit");
     if (out_logits.numel() != 0) static_cast<void>(checked_prediction_extent(out_logits.numel(), sizeof(std::int64_t), kMaximumPredictionTensorBytes));
     PostprocessCore core;
@@ -112,8 +111,7 @@ void ClassPostprocessLane::Prepare(const torch::Device& device) {
     const auto stream = device.is_cuda() ? at::cuda::getCurrentCUDAStream(device.index()).stream() : nullptr;
     if (references_.defined() && references_.device() == device && prepared_stream_ == stream) return;
     const auto references = layout_->physical_references();
-    references_ = torch::tensor(at::ArrayRef<std::int64_t>(references.data(), references.size()),
-                                torch::TensorOptions().dtype(torch::kInt64).device(device));
+    references_ = torch::tensor(at::ArrayRef<std::int64_t>(references.data(), references.size()), torch::TensorOptions().dtype(torch::kInt64).device(device));
     prepared_stream_ = stream;
 }
 torch::Tensor ClassPostprocessLane::ValidateLogits(const torch::Tensor& logits) const {

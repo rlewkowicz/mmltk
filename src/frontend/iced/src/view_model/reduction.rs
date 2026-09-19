@@ -888,7 +888,10 @@ pub(crate) fn invalid_visual_frame() -> VisualFrame {
         },
         revision: 0,
         cleanrevision: 0,
-        sourceextent: crate::generated::VisualExtent { width: 0, height: 0 },
+        sourceextent: crate::generated::VisualExtent {
+            width: 0,
+            height: 0,
+        },
         content: crate::generated::VisualRegion {
             x: 0,
             y: 0,

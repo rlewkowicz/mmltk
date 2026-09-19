@@ -848,8 +848,16 @@ mod tests {
                 native.input = request.source.clone();
                 native.frame = request.source.clone();
                 native.frame.source.kind = PresentationSourceKind::Upscale;
-                native.frame.extent = request.source.extent.checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE).unwrap();
-                native.frame.content = request.source.content.checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE).unwrap();
+                native.frame.extent = request
+                    .source
+                    .extent
+                    .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
+                    .unwrap();
+                native.frame.content = request
+                    .source
+                    .content
+                    .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
+                    .unwrap();
                 native.busy = status == 0;
                 native.ready = status == 2;
                 native.pending = (status == 0).then_some(request.clone());
@@ -865,17 +873,36 @@ mod tests {
                 let (sender, mut receiver) = Connection::test_channel();
                 app.connection = Some(sender);
                 for original in [true, false, true] {
-                    app.workspace.explore_state_for_test().choose_detail_original(original);
+                    app.workspace
+                        .explore_state_for_test()
+                        .choose_detail_original(original);
                     drop(app.on_explore(crate::view::explore::Outcome::DetailUpdated(
-                        crate::generated::ExploreDetailUpdate { showoriginaldimensions: original },
+                        crate::generated::ExploreDetailUpdate {
+                            showoriginaldimensions: original,
+                        },
                     )));
                     app.reconcile_viewer();
                     app.dispatch_viewer_desired();
                     while let Ok(record) = receiver.try_recv() {
-                        if let crate::transport_connection::CapturedRecord::Intent(intent) = record {
-                            assert_ne!(intent.endpoint_id, crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStart));
-                            assert_ne!(intent.endpoint_id, crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::UpscaleStop));
-                            if intent.endpoint_id == crate::generated::application_intent_endpoint_stable_id(ApplicationIntentEndpoint::ExploreUpdateDetail) {
+                        if let crate::transport_connection::CapturedRecord::Intent(intent) = record
+                        {
+                            assert_ne!(
+                                intent.endpoint_id,
+                                crate::generated::application_intent_endpoint_stable_id(
+                                    ApplicationIntentEndpoint::UpscaleStart
+                                )
+                            );
+                            assert_ne!(
+                                intent.endpoint_id,
+                                crate::generated::application_intent_endpoint_stable_id(
+                                    ApplicationIntentEndpoint::UpscaleStop
+                                )
+                            );
+                            if intent.endpoint_id
+                                == crate::generated::application_intent_endpoint_stable_id(
+                                    ApplicationIntentEndpoint::ExploreUpdateDetail,
+                                )
+                            {
                                 let mut accepted = app.model.explore.snapshot.clone().unwrap();
                                 accepted.revision += 1;
                                 accepted.detail.showoriginaldimensions = original;
@@ -1169,10 +1196,19 @@ mod tests {
                         .map(|image| (snapshot.dataset.identity, u64::from(image)))
                 }),
                 crop: (crop != [0, 0, frame.content_width, frame.content_height]).then_some(crop),
-                display_extent: (crop != [0, 0, frame.content_width, frame.content_height]).then(|| {
-                    let source = &app.model.explore.snapshot.as_ref().unwrap().frame.sourceextent;
-                    (source.width, source.height)
-                }),
+                display_extent: (crop != [0, 0, frame.content_width, frame.content_height]).then(
+                    || {
+                        let source = &app
+                            .model
+                            .explore
+                            .snapshot
+                            .as_ref()
+                            .unwrap()
+                            .frame
+                            .sourceextent;
+                        (source.width, source.height)
+                    },
+                ),
                 ..surface
             },
             crop,
@@ -1859,7 +1895,12 @@ mod tests {
         let (mut app, mut frame) = viewer_app();
         let explore = app.model.explore.snapshot.as_mut().unwrap();
         explore.detail.showoriginaldimensions = false;
-        explore.frame.content = crate::generated::VisualRegion { x: 10, y: 20, width: 500, height: 300 };
+        explore.frame.content = crate::generated::VisualRegion {
+            x: 10,
+            y: 20,
+            width: 500,
+            height: 300,
+        };
         let input = explore.frame.clone();
         let upscale = app.model.upscale_snapshot.as_mut().unwrap();
         upscale.ready = true;

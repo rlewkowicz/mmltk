@@ -77,7 +77,8 @@ void overwrite_annotation(const fs::path& annotation_path, const std::string& re
     REQUIRE(file.is_open());
     file << record << "\n";
 }
-void compile_resized_fixture(const FixtureSpec& fixture, mmltk::backend::imaging::resample::ImageResizeMode mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch) {
+void compile_resized_fixture(const FixtureSpec& fixture,
+                             mmltk::backend::imaging::resample::ImageResizeMode mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch) {
     auto config = compiler_config(fixture);
     config.resize_mode = mode;
     config.target_width = 8;
@@ -136,10 +137,10 @@ void test_partial_mask_vanish_keeps_instance() {
     REQUIRE(entry.num_instances == 1);
     const PackedInstance& instance = loader.label_data()[entry.label_begin];
     REQUIRE(instance.mask_rle_pairs == 2);
-    REQUIRE(instance.bbox_x1 == 0);
-    REQUIRE(instance.bbox_y1 == 0);
-    REQUIRE(instance.bbox_x2 == 3);
-    REQUIRE(instance.bbox_y2 == 3);
+    REQUIRE(instance.bbox_x1 == 0.0F);
+    REQUIRE(instance.bbox_y1 == 0.0F);
+    REQUIRE(instance.bbox_x2 == 3.0F);
+    REQUIRE(instance.bbox_y2 == 3.0F);
 }
 void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     const mmltk::testsupport::ScopedTempDir root("mmltk_compile_letterbox");
@@ -171,10 +172,10 @@ void test_native_compile_letterboxes_pixels_boxes_and_masks() {
     const LabelIndexEntry& entry = loader.label_index()[10];
     REQUIRE(entry.num_instances == 1U);
     const PackedInstance& instance = loader.label_data()[entry.label_begin];
-    REQUIRE(instance.bbox_x1 == 2);
-    REQUIRE(instance.bbox_y1 == 3);
-    REQUIRE(instance.bbox_x2 == 6);
-    REQUIRE(instance.bbox_y2 == 5);
+    REQUIRE(instance.bbox_x1 == 2.0F);
+    REQUIRE(instance.bbox_y1 == 3.0F);
+    REQUIRE(instance.bbox_x2 == 6.0F);
+    REQUIRE(instance.bbox_y2 == 5.0F);
     REQUIRE(instance.mask_rle_pairs != 0U);
     std::vector<uint8_t> dense_mask(plane, uint8_t{0});
     const size_t first_pair = static_cast<size_t>(instance.mask_rle_offset) / sizeof(RLEPair);
@@ -207,10 +208,10 @@ void test_compiled_tiny_masks_keep_outer_pixel_edges() {
     for (std::size_t index = 0; index < source_runs.size(); ++index) {
         const auto& instance = loader.label_data()[entry.label_begin + index];
         const auto source = source_runs[index];
-        CHECK(instance.bbox_x1 == static_cast<int>(source.start % 8));
-        CHECK(instance.bbox_y1 == static_cast<int>(source.start / 8 + 2));
-        CHECK(instance.bbox_x2 == static_cast<int>(source.start % 8 + source.length));
-        CHECK(instance.bbox_y2 == static_cast<int>(source.start / 8 + 3));
+        CHECK(instance.bbox_x1 == static_cast<PackedCoordinate>(source.start % 8));
+        CHECK(instance.bbox_y1 == static_cast<PackedCoordinate>(source.start / 8 + 2));
+        CHECK(instance.bbox_x2 == static_cast<PackedCoordinate>(source.start % 8 + source.length));
+        CHECK(instance.bbox_y2 == static_cast<PackedCoordinate>(source.start / 8 + 3));
         REQUIRE(instance.mask_rle_pairs == 1);
         const auto& compiled = loader.rle_data()[instance.mask_rle_offset / sizeof(RLEPair)];
         CHECK(compiled.start == source.start + 16);
@@ -457,9 +458,11 @@ TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense 
         CHECK(plan.source_category_base == base);
         for (std::size_t split = 0; split < plan.splits.size(); ++split) {
             overwrite_annotation(fs::path(dataset_dir(fixture)) / plan.splits[split].split / "000001.jsonl",
-                R"({"class":"ret","bbox_xyxy":[1,1,3,3]})" "\n"
-                R"({"class":"person","bbox_xyxy":[1,1,3,3],"category_id":0})" "\n"
-                R"({"class":"person","bbox_xyxy":[1,1,3,3]})");
+                                 R"({"class":"ret","bbox_xyxy":[1,1,3,3]})"
+                                 "\n"
+                                 R"({"class":"person","bbox_xyxy":[1,1,3,3],"category_id":0})"
+                                 "\n"
+                                 R"({"class":"person","bbox_xyxy":[1,1,3,3]})");
             DatasetCompiler::compile(plan, split);
             const auto store = CompiledDataset::open(fs::path(compiled_dir(fixture)) / (plan.splits[split].split + ".bin"));
             REQUIRE(store.image_labels(0).size() == 3U);
@@ -488,35 +491,36 @@ TEST_CASE("Compiler source IDs preserve catalog meaning through reordered dense 
         write();
         CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
         classes = nlohmann::json::array();
-        for (std::uint32_t index = 0; index < MAX_CLASSES; ++index)
-            classes.push_back({{"id", index + base}, {"name", "class-" + std::to_string(index)}});
+        for (std::uint32_t index = 0; index < MAX_CLASSES; ++index) classes.push_back({{"id", index + base}, {"name", "class-" + std::to_string(index)}});
         write();
         const auto full = DatasetCompiler::prepare(config, {fixture.split});
         CHECK(full.class_catalog.size() == MAX_CLASSES);
         CHECK(full.class_catalog.resolve("class-255") == 255U);
         classes = original;
         write();
-        overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
-            R"({"class":"unknown","bbox_xyxy":[1,1,3,3]})");
+        overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl", R"({"class":"unknown","bbox_xyxy":[1,1,3,3]})");
         CHECK_THROWS(DatasetCompiler::compile(plan, 0U));
         const auto retained = CompiledDataset::open(compiled_bin_path(fixture));
         CHECK(retained.image_labels(0)[0].source_category_id == static_cast<std::uint64_t>(base + 1));
     }
 }
-
 TEST_CASE("compiled annotations preserve continuous source meaning in both resize modes", "[backend][data][compiler]") {
     namespace resize = mmltk::backend::imaging::resample;
     const mmltk::testsupport::ScopedTempDir root("faithful-annotations");
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 8, .num_images = 1, .pixel_evidence = true};
     create_synthetic_dataset(fixture);
-    overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
-        R"({"class":"person","bbox_xyxy":[-0.5,1.25,12.5,6.75],"id":0,"image_id":0,"category_id":0,"area":7.25,"iscrowd":1,"ignore":1,"mask_rle_encoding":"row_major_start_length","mask_rle":""})" "\n"
-        R"({"class":"person","bbox_xyxy":[-0.5,1.25,12.5,6.75],"id":8,"image_id":0,"category_id":42})" "\n"
+    overwrite_annotation(
+        fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
+        R"({"class":"person","bbox_xyxy":[-0.5,1.25,12.5,6.75],"id":0,"image_id":0,"category_id":0,"area":7.25,"iscrowd":1,"ignore":1,"mask_rle_encoding":"row_major_start_length","mask_rle":""})"
+        "\n"
+        R"({"class":"person","bbox_xyxy":[-0.5,1.25,12.5,6.75],"id":8,"image_id":0,"category_id":42})"
+        "\n"
         R"({"class":"person","mask_rle_encoding":"row_major_start_length","mask_rle":"36:8 52:8 68:8 84:8"})");
     for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
         auto config = compiler_config(fixture);
         config.resize_mode = mode;
-        config.target_width = 8; config.target_height = 8;
+        config.target_width = 8;
+        config.target_height = 8;
         config.num_workers = 1;
         DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0U);
         const auto store = CompiledDataset::open(compiled_bin_path(fixture));
@@ -535,17 +539,24 @@ TEST_CASE("compiled annotations preserve continuous source meaning in both resiz
         CHECK(labels[0].bbox_y1 == (mode == resize::ImageResizeMode::Stretch ? 1.25F : 2.625F));
         CHECK(labels[0].bbox_x2 == labels[1].bbox_x2);
         CHECK(labels[0].original_area == 7.25);
-        CHECK(labels[0].is_crowd()); CHECK(labels[0].raw_ignore()); CHECK(labels[0].has_mask());
-        CHECK(labels[0].has_annotation_id()); CHECK(labels[0].annotation_id == 0U);
-        CHECK(labels[0].has_source_category()); CHECK(labels[0].source_category_id == 0U);
+        CHECK(labels[0].is_crowd());
+        CHECK(labels[0].raw_ignore());
+        CHECK(labels[0].has_mask());
+        CHECK(labels[0].has_annotation_id());
+        CHECK(labels[0].annotation_id == 0U);
+        CHECK(labels[0].has_source_category());
+        CHECK(labels[0].source_category_id == 0U);
         CHECK(labels[1].source_category_id == 42U);
         CHECK_FALSE(labels[1].has_mask());
-        CHECK(store.instance_rle(labels[0]).empty()); CHECK(store.masks_available());
+        CHECK(store.instance_rle(labels[0]).empty());
+        CHECK(store.masks_available());
         CHECK(labels[0].source_ordinal < labels[1].source_ordinal);
         CHECK(labels[1].source_ordinal < labels[2].source_ordinal);
-        CHECK(labels[2].bbox_x1 == 2.0F); CHECK(labels[2].bbox_x2 == 6.0F);
+        CHECK(labels[2].bbox_x1 == 2.0F);
+        CHECK(labels[2].bbox_x2 == 6.0F);
         CHECK(labels[2].original_area == 32.0);
-        CHECK(store.image_entry(0).has_source_image_id == 1U); CHECK(store.image_entry(0).source_image_id == 0U);
+        CHECK(store.image_entry(0).has_source_image_id == 1U);
+        CHECK(store.image_entry(0).source_image_id == 0U);
     }
 }
 TEST_CASE("format 8 admission rejects invalid metadata and old versions", "[backend][data][compiler]") {
@@ -561,7 +572,8 @@ TEST_CASE("format 8 admission rejects invalid metadata and old versions", "[back
         auto header = original.header();
         auto label = original.labels().front();
         change(header, label);
-        file.seekp(0); file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        file.seekp(0);
+        file.write(reinterpret_cast<const char*>(&header), sizeof(header));
         file.seekp(static_cast<std::streamoff>(original.header().label_offset));
         file.write(reinterpret_cast<const char*>(&label), sizeof(label));
         file.close();
@@ -581,7 +593,7 @@ TEST_CASE("known empty masks declare availability without RLE storage", "[backen
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1};
     create_synthetic_dataset(fixture);
     overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
-        R"({"class":"person","bbox_xyxy":[1.25,2.5,7.75,9.5],"mask_rle_encoding":"row_major_start_length","mask_rle":""})");
+                         R"({"class":"person","bbox_xyxy":[1.25,2.5,7.75,9.5],"mask_rle_encoding":"row_major_start_length","mask_rle":""})");
     compile_existing_fixture(fixture);
     const auto store = CompiledDataset::open(compiled_bin_path(fixture));
     REQUIRE(store.labels().size() == 1U);
@@ -595,11 +607,9 @@ TEST_CASE("generic bbox narrowing rejects overflow and collapsed corners", "[bac
     const mmltk::testsupport::ScopedTempDir root("bbox-narrowing");
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 16, .height = 16, .num_images = 1};
     create_synthetic_dataset(fixture);
-    for (const auto& [bbox, expected] : std::array{
-             std::pair{"[1e100,0,2e100,1]", "transformed bbox overflow"},
-             std::pair{"[1,0,1.000000000001,1]", "transformed bbox loses strict corner ordering"}}) {
-        overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl",
-                             std::string(R"({"class":"person","bbox_xyxy":)") + bbox + "}");
+    for (const auto& [bbox, expected] : std::array{std::pair{"[1e100,0,2e100,1]", "transformed bbox overflow"},
+                                                   std::pair{"[1,0,1.000000000001,1]", "transformed bbox loses strict corner ordering"}}) {
+        overwrite_annotation(fs::path(dataset_dir(fixture)) / "train/000001.jsonl", std::string(R"({"class":"person","bbox_xyxy":)") + bbox + "}");
         try {
             compile_existing_fixture(fixture);
             FAIL("invalid transformed bbox was accepted");
@@ -616,8 +626,7 @@ TEST_CASE("generic annotation flags admit only exact boolean or integer zero and
     create_synthetic_dataset(fixture);
     const auto annotation_path = fs::path(dataset_dir(fixture)) / "train/000001.jsonl";
     const auto record = [](const char* field, const char* value) {
-        return std::string(R"({"class":"person","bbox_xyxy":[1,1,7,5],"id":0,"image_id":0,"category_id":0,"area":7.25,")") +
-               field + "\":" + value + "}";
+        return std::string(R"({"class":"person","bbox_xyxy":[1,1,7,5],"id":0,"image_id":0,"category_id":0,"area":7.25,")") + field + "\":" + value + "}";
     };
     const auto read_artifact = [&] {
         std::ifstream file(compiled_bin_path(fixture), std::ios::binary);
@@ -628,11 +637,13 @@ TEST_CASE("generic annotation flags admit only exact boolean or integer zero and
     };
     for (const auto mode : {ImageResizeMode::Stretch, ImageResizeMode::Letterbox}) {
         auto config = compiler_config(fixture);
-        config.resize_mode = mode; config.target_width = 8; config.target_height = 8; config.num_workers = 1;
+        config.resize_mode = mode;
+        config.target_width = 8;
+        config.target_height = 8;
+        config.num_workers = 1;
         const auto compile = [&] { DatasetCompiler::compile(DatasetCompiler::prepare(config, {"train"}), 0U); };
         for (const char* field : {"iscrowd", "ignore"}) {
-            for (const auto& [value, enabled] : std::array{
-                     std::pair{"false", false}, std::pair{"true", true}, std::pair{"0", false}, std::pair{"1", true}}) {
+            for (const auto& [value, enabled] : std::array{std::pair{"false", false}, std::pair{"true", true}, std::pair{"0", false}, std::pair{"1", true}}) {
                 overwrite_annotation(annotation_path, record(field, value));
                 compile();
                 const auto store = CompiledDataset::open(compiled_bin_path(fixture));
@@ -641,10 +652,14 @@ TEST_CASE("generic annotation flags admit only exact boolean or integer zero and
                 CHECK(label.is_crowd() == (std::string_view(field) == "iscrowd" && enabled));
                 CHECK(label.raw_ignore() == (std::string_view(field) == "ignore" && enabled));
                 CHECK_FALSE(label.has_mask());
-                CHECK(label.has_annotation_id()); CHECK(label.annotation_id == 0U);
-                CHECK(label.has_source_category()); CHECK(label.source_category_id == 0U);
-                CHECK(label.source_ordinal == 1U); CHECK(label.original_area == 7.25);
-                CHECK(store.image_entry(0).has_source_image_id == 1U); CHECK(store.image_entry(0).source_image_id == 0U);
+                CHECK(label.has_annotation_id());
+                CHECK(label.annotation_id == 0U);
+                CHECK(label.has_source_category());
+                CHECK(label.source_category_id == 0U);
+                CHECK(label.source_ordinal == 1U);
+                CHECK(label.original_area == 7.25);
+                CHECK(store.image_entry(0).has_source_image_id == 1U);
+                CHECK(store.image_entry(0).source_image_id == 0U);
             }
             const auto accepted_artifact = read_artifact();
             for (const char* value : {"-1", "2", "4294967296", "4294967297", "-4294967296", "18446744073709551615", "1.0", "\"1\""}) {
@@ -670,7 +685,8 @@ TEST_CASE("compiler resize modes use canonical reflected admission", "[backend][
     STATIC_REQUIRE(entries[0].name == "Stretch");
     STATIC_REQUIRE(entries[1].name == "Letterbox");
     CompilerConfig config;
-    config.source_dir = "source"; config.output_dir = "output";
+    config.source_dir = "source";
+    config.output_dir = "output";
     for (const auto entry : entries) {
         config.resize_mode = entry.value;
         CHECK(validate_compiler_config(config).has_value());
@@ -699,7 +715,9 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
     for (const auto source : {AnnotationSource::Coco, AnnotationSource::Objects365, AnnotationSource::OpenImages}) {
         auto image = original.image_entry(0);
         auto label = original.labels()[0];
-        image.source = source; image.has_source_image_id = 1U; image.source_image_id = 0U;
+        image.source = source;
+        image.has_source_image_id = 1U;
+        image.source_image_id = 0U;
         label.flags |= kAnnotationCategory;
         label.source_category_id = source == AnnotationSource::OpenImages ? encode_open_images_category("/m/person") : 0U;
         write(image, label);
@@ -708,15 +726,16 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
         write(image, label);
         CHECK_THROWS(CompiledDataset::open(path));
         image.has_source_image_id = 1U;
-        label.flags &= ~kAnnotationCategory; label.source_category_id = 0U;
+        label.flags &= ~kAnnotationCategory;
+        label.source_category_id = 0U;
         write(image, label);
         CHECK_THROWS(CompiledDataset::open(path));
-        image.source = AnnotationSource::Generic; image.has_source_image_id = 0U;
+        image.source = AnnotationSource::Generic;
+        image.has_source_image_id = 0U;
         write(image, label);
         CHECK_NOTHROW(CompiledDataset::open(path));
     }
 }
-
 TEST_CASE("category IDs reject arithmetic identity loss before publication", "[backend][data][catalog]") {
     const mmltk::testsupport::ScopedTempDir root("exact-category-ids");
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 8, .height = 8, .num_images = 1};
@@ -729,12 +748,15 @@ TEST_CASE("category IDs reject arithmetic identity loss before publication", "[b
         return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
     };
     const auto original = read_bytes();
-    const std::vector<nlohmann::json> invalid_ids{0.5, 1.5, -1, -4294967295LL, 4294967296ULL, 4294967297ULL,
-                                                std::numeric_limits<std::uint64_t>::max(), "1", true};
+    const std::vector<nlohmann::json> invalid_ids{0.5, 1.5, -1, -4294967295LL, 4294967296ULL, 4294967297ULL, std::numeric_limits<std::uint64_t>::max(),
+                                                  "1", true};
     for (const auto& id : invalid_ids) {
         CAPTURE(id);
         const nlohmann::json categories{{"classes", {{{"id", id}, {"name", "person"}}}}};
-        { std::ofstream file(fs::path(dataset_dir(fixture)) / "categories.json"); file << categories; }
+        {
+            std::ofstream file(fs::path(dataset_dir(fixture)) / "categories.json");
+            file << categories;
+        }
         CHECK_THROWS(DatasetCompiler::prepare(config, {fixture.split}));
         CHECK(read_bytes() == original);
     }
@@ -752,8 +774,7 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
     CHECK_THROWS(finalize_layout(layout, {maximum / sizeof(PackedInstance), 0U}));
     CHECK_THROWS(finalize_layout(layout, {0U, maximum / sizeof(RLEPair)}));
     const std::vector<std::string> names{"person"};
-    for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-                            mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
+    for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
         for (const std::size_t count : {0U, 1U}) {
             layout = compute_pixel_layout(1U, 12U);
             const auto pixel_offset = layout.pixel_offset;

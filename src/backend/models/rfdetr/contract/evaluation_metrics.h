@@ -13,7 +13,9 @@
 #include "mmltk/frameworks/reflection/materializer.h"
 namespace mmltk::backend::models::rfdetr {
 inline constexpr std::size_t kDefaultEvaluationMaxDets = 500U;
-[[nodiscard]] constexpr std::size_t resolve_evaluation_max_dets(std::size_t requested) noexcept { return requested == 0 ? kDefaultEvaluationMaxDets : requested; }
+[[nodiscard]] constexpr std::size_t resolve_evaluation_max_dets(std::size_t requested) noexcept {
+    return requested == 0 ? kDefaultEvaluationMaxDets : requested;
+}
 inline constexpr std::size_t kValidationSampleCapacity = 6U;
 enum class EvaluationMetricKind : std::uint8_t { Box, Mask };
 enum class EvaluationArea : std::uint8_t { All, Small, Medium, Large };

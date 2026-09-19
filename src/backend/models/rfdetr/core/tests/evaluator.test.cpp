@@ -36,7 +36,8 @@ r::Prediction box(int category, std::array<float, 4> bounds, float score = 1.0F)
 class EvaluationFixture final {
    public:
     explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128,
-                               const std::vector<std::vector<nlohmann::json>>& metadata = {}) : root_("evaluator-answers") {
+                               const std::vector<std::vector<nlohmann::json>>& metadata = {})
+        : root_("evaluator-answers") {
         const data::testsupport::FixtureSpec fixture{root_.path().string(), "train", 128, 128, static_cast<int>(images.size()), 0, 0};
         data::testsupport::create_synthetic_dataset(fixture);
         constexpr std::array names{"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"};
@@ -51,9 +52,7 @@ class EvaluationFixture final {
                     if (!runs.empty()) runs += ' ';
                     runs += std::to_string(start) + ':' + std::to_string(count);
                 }
-                nlohmann::json record{{"class", names[annotation.class_reference]},
-                                      {"bbox_xyxy", annotation.bbox_xyxy},
-                                      {"image_size_wh", {128, 128}}};
+                nlohmann::json record{{"class", names[annotation.class_reference]}, {"bbox_xyxy", annotation.bbox_xyxy}, {"image_size_wh", {128, 128}}};
                 if (annotation.has_mask) {
                     record["mask_rle_encoding"] = "row_major_start_length";
                     record["mask_rle"] = runs;
@@ -362,7 +361,6 @@ TEST_CASE("known empty evaluation masks remain positive annotations and missing 
     CHECK(r::resolve_evaluation_metric_set(*missing.loader, true) == r::EvaluationMetricSet::BBox);
     CHECK_THROWS_AS(r::EvaluationDatasetOwner(*missing.loader, r::EvaluationMetricSet::BBoxAndMask), std::runtime_error);
 }
-
 TEST_CASE("COCO maxDets applies independently to each category", "[rfdetr][evaluation][gpu]") {
     const auto first = box(0, {0, 0, 32, 32}, .9F);
     const auto second = box(1, {64, 64, 96, 96}, .8F);

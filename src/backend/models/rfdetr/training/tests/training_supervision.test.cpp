@@ -1152,9 +1152,8 @@ void test_tiny_mask_training_outer_edges() {
                 const int y = int(run.start / 8);
                 // Geometric transforms preserve the declared full-canvas box;
                 // explicit erasure still trims the actual categorical support.
-                const auto edges = geometry == 3
-                                       ? rfdetr::test_support::small_object_edges({x, y, x + int(run.length), y + 1}, geometry)
-                                       : std::array<int, 4>{0, 0, 8, 4};
+                const auto edges =
+                    geometry == 3 ? rfdetr::test_support::small_object_edges({x, y, x + int(run.length), y + 1}, geometry) : std::array<int, 4>{0, 0, 8, 4};
                 const bool present = edges[0] < edges[2] && edges[1] < edges[3];
                 const std::array<float, 4> expected{float(edges[0]) / 8, float(edges[1]) / 4, float(edges[2]) / 8, float(edges[3]) / 4};
                 rfdetr::TargetScratch scratch(1);
@@ -1838,8 +1837,16 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
     const std::array entries{LabelIndexEntry{0, 2, 0}};
     const std::array indices{std::uint32_t{0}};
     std::array labels{
-        PackedInstance{.class_id = 0, .flags = kAnnotationCrowd, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 8, .bbox_y2 = 8},
-        PackedInstance{.class_id = 1, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.5F},
+        PackedInstance{
+            .class_id = 0, .flags = kAnnotationCrowd, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 8, .bbox_y2 = 8, .mask_rle_offset = 0, .mask_rle_pairs = 0},
+        PackedInstance{.class_id = 1,
+                       .flags = kAnnotationMask,
+                       .bbox_x1 = 1.25F,
+                       .bbox_y1 = 2.5F,
+                       .bbox_x2 = 6.25F,
+                       .bbox_y2 = 7.5F,
+                       .mask_rle_offset = 0,
+                       .mask_rle_pairs = 0},
     };
     const Batch batch{.num_images = 1, .label_index = entries.data(), .labels = labels.data(), .image_indices = indices.data()};
     rfdetr::TargetScratch scratch(1);
@@ -1866,9 +1873,9 @@ TEST_CASE("training excludes crowds and retains continuous targets with known em
         CHECK(boxes[0][3] == 5.F / 8);
         REQUIRE(targets.packed_masks);
         CHECK(targets.packed_masks->bits.cpu().sum().item<std::int64_t>() == 0);
-        CHECK(targets.all_area.cpu().item<float>() == 0);
+        CHECK(targets.all_area.cpu().item<float>() == 0.0F);
         CHECK(plan.images[0].cache_source_ordinal == 1);
-        CHECK(plan.images[0].cache_source_area == 0);
+        CHECK(plan.images[0].cache_source_area == 0.0F);
     }
     labels[1].flags = kAnnotationCrowd;
     rfdetr::AugmentationBatchPlan plan;

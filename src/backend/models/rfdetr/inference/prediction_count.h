@@ -2,14 +2,14 @@
 #include <memory>
 #include <torch/types.h>
 #include "src/backend/ml/runtime/analysis_provider.h"
-
 namespace mmltk::backend::models::rfdetr {
 class PredictionCountStorage final {
- public:
+   public:
     explicit PredictionCountStorage(int device);
     PredictionCountStorage(const PredictionCountStorage&) = delete;
     PredictionCountStorage& operator=(const PredictionCountStorage&) = delete;
- private:
+
+   private:
     torch::Tensor host_, device_;
     int device_index_;
     friend void publish_prediction_count(std::shared_ptr<PredictionCountStorage>& storage, const torch::Tensor& count,

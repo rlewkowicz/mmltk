@@ -251,8 +251,8 @@ void DatasetCompiler::compile(const DatasetCompilePlan& plan, const size_t split
         }
     });
     try {
-        label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, label_workers, label_cpus,
-                                                             telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
+        label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, effective_config, class_catalog, plan.source_category_base, label_workers,
+                                                             label_cpus, telemetry != nullptr ? &label_progress : nullptr, &failure_requested, cancellation);
         if (telemetry != nullptr) { telemetry->set_dropped_instances(label_blocks.dropped_instances); }
     } catch (...) {
         failure_requested.store(true, std::memory_order_relaxed);

@@ -35,4 +35,4 @@ class GpuBatchPreprocessor final {
     bool consumer_pending_ = false;
     bool has_run_ = false;
 };
-}
+}  // namespace mmltk::backend::models::rfdetr

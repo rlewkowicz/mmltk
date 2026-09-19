@@ -369,7 +369,10 @@ mod tests {
             },
             revision: 1,
             cleanrevision: 1,
-            sourceextent: crate::generated::VisualExtent { width: 640, height: 480 },
+            sourceextent: crate::generated::VisualExtent {
+                width: 640,
+                height: 480,
+            },
             content: crate::generated::VisualRegion {
                 x: 0,
                 y: 0,

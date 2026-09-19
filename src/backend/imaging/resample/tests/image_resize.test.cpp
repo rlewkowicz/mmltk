@@ -363,14 +363,17 @@ TEST_CASE("perceptual logical admission preserves format alignment alias and ove
     REQUIRE(std::memcmp(output.storage.data(), untouched.data(), untouched.size() * sizeof(float)) == 0);
     REQUIRE(padding_intact(float_output));
 }
-
 TEST_CASE("resize geometry explicitly chooses stretch or rounded letterbox", "[backend][data][image_resize]") {
     const auto stretch = compute_image_resize_geometry(65, 49, 31, 29, ImageResizeMode::Stretch);
-    CHECK(stretch.resized_width == 31U); CHECK(stretch.resized_height == 29U);
-    CHECK(stretch.offset_x == 0U); CHECK(stretch.offset_y == 0U);
+    CHECK(stretch.resized_width == 31U);
+    CHECK(stretch.resized_height == 29U);
+    CHECK(stretch.offset_x == 0U);
+    CHECK(stretch.offset_y == 0U);
     const auto letterbox = compute_image_resize_geometry(65, 49, 31, 29, ImageResizeMode::Letterbox);
-    CHECK(letterbox.resized_width == 31U); CHECK(letterbox.resized_height == 23U);
-    CHECK(letterbox.offset_x == 0U); CHECK(letterbox.offset_y == 3U);
+    CHECK(letterbox.resized_width == 31U);
+    CHECK(letterbox.resized_height == 23U);
+    CHECK(letterbox.offset_x == 0U);
+    CHECK(letterbox.offset_y == 3U);
     const auto thin = compute_image_resize_geometry(10000, 1, 8, 8, ImageResizeMode::Letterbox);
     CHECK(thin.resized_height == 1U);
     CHECK_THROWS(compute_image_resize_geometry(0, 1, 8, 8, ImageResizeMode::Stretch));

@@ -1,8 +1,8 @@
 use crate::fluent_theme::Element;
+use crate::generated::ImageResizeMode;
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use iced::Fill;
 use iced::widget::{button, checkbox, column, container, radio, row, text};
-use crate::generated::ImageResizeMode;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -190,7 +190,11 @@ pub fn view<'a>(
         );
     let resize_radio = |label, mode| {
         radio(label, mode, Some(train.compileresizemode), move |value| {
-            if enabled { Message::ResizeModeChanged(value) } else { Message::Ignore }
+            if enabled {
+                Message::ResizeModeChanged(value)
+            } else {
+                Message::Ignore
+            }
         })
         .style(move |theme, status| {
             if enabled {
@@ -202,9 +206,12 @@ pub fn view<'a>(
     };
     let fields = fields.push(
         row![
-            container(resize_radio("Stretch", ImageResizeMode::Stretch)).id("train.dataset.resize.stretch"),
-            container(resize_radio("Letterbox", ImageResizeMode::Letterbox)).id("train.dataset.resize.letterbox"),
-        ].spacing(crate::view::workflow::FIELD_SPACING),
+            container(resize_radio("Stretch", ImageResizeMode::Stretch))
+                .id("train.dataset.resize.stretch"),
+            container(resize_radio("Letterbox", ImageResizeMode::Letterbox))
+                .id("train.dataset.resize.letterbox"),
+        ]
+        .spacing(crate::view::workflow::FIELD_SPACING),
     );
     let fields = fields.push(
         container(crate::view::workflow::fields::toggle(
@@ -278,10 +285,22 @@ mod tests {
     #[test]
     fn resize_radios_settle_independently_of_perceptual_choice() {
         let mut model = installed_settings_model();
-        assert_eq!(model.draft.as_ref().unwrap().workflows.train.compileresizemode, ImageResizeMode::Stretch);
+        assert_eq!(
+            model
+                .draft
+                .as_ref()
+                .unwrap()
+                .workflows
+                .train
+                .compileresizemode,
+            ImageResizeMode::Stretch
+        );
         update(&mut model, Message::PerceptualDownscaleChanged(true)).unwrap();
         for mode in [ImageResizeMode::Letterbox, ImageResizeMode::Stretch] {
-            assert!(matches!(update(&mut model, Message::ResizeModeChanged(mode)), Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))));
+            assert!(matches!(
+                update(&mut model, Message::ResizeModeChanged(mode)),
+                Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))
+            ));
             let train = &model.draft.as_ref().unwrap().workflows.train;
             assert_eq!(train.compileresizemode, mode);
             assert!(train.compileperceptualdownscale);

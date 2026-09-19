@@ -93,7 +93,6 @@ TEST_CASE("Output names distinguish four-wide logits from boxes", "[rfdetr][layo
     info.outputs[0].shape[1] = 299;
     CHECK_THROWS(r::validate_rfdetr_output_layout(info));
 }
-
 TEST_CASE("Admitted preset candidate defaults agree across detection and segmentation", "[model][rfdetr][layout]") {
     namespace r = mmltk::backend::models::rfdetr;
     const std::array expected{300, 300, 300, 300, 100, 100, 200, 200, 300, 300};

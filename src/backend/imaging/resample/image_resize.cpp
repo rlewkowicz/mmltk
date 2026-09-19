@@ -28,7 +28,7 @@ struct RgbImageResizer::Impl {
     std::unique_ptr<perceptual::CpuDownscaler> perceptual;
 };
 ImageResizeGeometry compute_image_resize_geometry(const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width,
-                                   const std::uint32_t target_height, const ImageResizeMode mode) {
+                                                  const std::uint32_t target_height, const ImageResizeMode mode) {
     if (source_width == 0U || source_height == 0U || target_width == 0U || target_height == 0U) {
         throw std::runtime_error("letterbox source and target dimensions must be positive");
     }

@@ -62,7 +62,8 @@ void prepare_lookup(const MaskDimensions source, const std::uint32_t width, cons
     fill_center_scale_lookup(scratch->source_x, width, source.width, "scaled mask x overflow");
     fill_center_scale_lookup(scratch->source_y, height, source.height, "scaled mask y overflow");
 }
-void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions, const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
+void clear_padding(std::vector<std::uint8_t>* target, const MaskDimensions dimensions,
+                   const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
     const std::size_t top = static_cast<std::size_t>(letterbox.offset_y) * dimensions.width;
     std::fill_n(target->data(), top, std::uint8_t{0U});
     const std::uint32_t right = dimensions.width - letterbox.offset_x - letterbox.resized_width;

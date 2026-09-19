@@ -40,8 +40,7 @@ namespace rfdetr = mmltk::backend::models::rfdetr;
 TEST_CASE("shared preprocessing normalizes every RGB channel without mutating borrowed pixels", "[model][rfdetr][prediction][gpu]") {
     const auto original = torch::tensor({0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 0.125F});
     const auto source = original.to(torch::kCUDA);
-    const auto expected = (original.view({3, 2}) - torch::tensor({.485F, .456F, .406F}).view({3, 1})) /
-                          torch::tensor({.229F, .224F, .225F}).view({3, 1});
+    const auto expected = (original.view({3, 2}) - torch::tensor({.485F, .456F, .406F}).view({3, 1})) / torch::tensor({.229F, .224F, .225F}).view({3, 1});
     const mmltk::backend::data::Batch batch{.num_images = 1U, .device_images = source.data_ptr<float>()};
     for (const auto type : {at::kFloat, at::kHalf, at::kBFloat16}) {
         rfdetr::GpuBatchPreprocessor preprocessor(2, 1, 2, 0, type);
@@ -392,24 +391,24 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     empty_request.onnx_path = root / "empty.onnx";
     write_prediction_model(empty_request.onnx_path, 2, true, empty_layout);
     std::size_t empty_deliveries = 0;
-    const auto empty_result = session.Run(empty_request, command,
-        {.source_pixels = true, .completed = [&](const auto& record, auto pixels, const auto& annotations) {
-            ++empty_deliveries;
-            CHECK(record.detections.empty());
-            REQUIRE(pixels.rgb8);
-            REQUIRE(pixels.custody);
-            CHECK(annotations.value_capacity == 0);
-            CHECK(annotations.count.value() == 0);
-            CHECK(annotations.count.device_view() == nullptr);
-            CHECK(annotations.count.empty());
-            CHECK(annotations.boxes_xyxy.capacity_bytes == 0);
-            CHECK(annotations.class_references.capacity_bytes == 0);
-            CHECK(annotations.confidences.capacity_bytes == 0);
-            CHECK(annotations.masks.address == 0);
-            CHECK_FALSE(annotations.masks_available);
-            REQUIRE(annotations.class_catalog);
-            CHECK(annotations.class_catalog->empty());
-        }});
+    const auto empty_result =
+        session.Run(empty_request, command, {.source_pixels = true, .completed = [&](const auto& record, auto pixels, const auto& annotations) {
+                                                 ++empty_deliveries;
+                                                 CHECK(record.detections.empty());
+                                                 REQUIRE(pixels.rgb8);
+                                                 REQUIRE(pixels.custody);
+                                                 CHECK(annotations.value_capacity == 0);
+                                                 CHECK(annotations.count.value() == 0);
+                                                 CHECK(annotations.count.device_view() == nullptr);
+                                                 CHECK(annotations.count.empty());
+                                                 CHECK(annotations.boxes_xyxy.capacity_bytes == 0);
+                                                 CHECK(annotations.class_references.capacity_bytes == 0);
+                                                 CHECK(annotations.confidences.capacity_bytes == 0);
+                                                 CHECK(annotations.masks.address == 0);
+                                                 CHECK_FALSE(annotations.masks_available);
+                                                 REQUIRE(annotations.class_catalog);
+                                                 CHECK(annotations.class_catalog->empty());
+                                             }});
     CHECK(empty_result.processed_images == 2);
     CHECK(empty_deliveries == 2);
     CHECK_FALSE(empty_result.cancelled);
@@ -649,8 +648,8 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     const auto prior_boxes = boxes.clone();
     std::array<rfdetr::RfdetrMaskSelection, 1> selections;
     for (const bool retain_selection : {false, true}) {
-        auto submission = empty_backend->Run(input_buffer, annotations,
-            retain_selection ? std::span<rfdetr::RfdetrMaskSelection>(selections) : std::span<rfdetr::RfdetrMaskSelection>{}, true);
+        auto submission = empty_backend->Run(
+            input_buffer, annotations, retain_selection ? std::span<rfdetr::RfdetrMaskSelection>(selections) : std::span<rfdetr::RfdetrMaskSelection>{}, true);
         empty_backend->ReleaseAfterCompletion(std::move(submission));
         CHECK(annotations[0].count.value() == 0);
         CHECK(annotations[0].count.device_view() == nullptr);
@@ -1048,8 +1047,7 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
         compile_request.split = fixture.split;
         compile_request.compiled_path = root.path() / "validation-source.bin";
         compile_request.compile_workers = 1;
-        for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-                                mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
+        for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
             compile_request.compile_resize_mode = mode;
             const auto compiled_result = session.Run(compile_request, command);
             CHECK(compiled_result.processed_images == 1U);
@@ -1209,7 +1207,6 @@ TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[m
         CHECK_NOTHROW(admission.RequireUnchanged());
     }
 }
-
 TEST_CASE("Analysis counts validate complete products and settled capacity", "[model][rfdetr][prediction]") {
     namespace runtime = mmltk::backend::ml::runtime;
     runtime::AnalysisValueCount count;
@@ -1256,7 +1253,6 @@ TEST_CASE("Analysis counts validate complete products and settled capacity", "[m
     count.SetKnown(0, 0);
     CHECK(count.empty());
 }
-
 TEST_CASE("Prediction counts settle at readback and retain exact device custody", "[model][rfdetr][prediction][gpu]") {
     namespace runtime = mmltk::backend::ml::runtime;
     REQUIRE(cudaSetDevice(0) == cudaSuccess);
@@ -1303,16 +1299,16 @@ TEST_CASE("Prediction counts settle at readback and retain exact device custody"
     CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1}, options), output, 1));
     CHECK(output.count.empty());
 }
-
 TEST_CASE("Analysis providers distinguish empty known and pending counts", "[model][rfdetr][prediction]") {
     namespace runtime = mmltk::backend::ml::runtime;
     class Provider final : public runtime::AnalysisProvider {
-     public:
+       public:
         bool asynchronous = false;
         bool fail = false;
         bool retired = false;
         std::stop_source* cancel = nullptr;
-     private:
+
+       private:
         std::shared_ptr<std::int64_t> host_ = std::make_shared<std::int64_t>(1);
         runtime::AnalysisAnnotationStorage* output_ = nullptr;
         ProviderWorkResult DoAnalyze(const runtime::AnalysisRequest& request) noexcept override {
@@ -1323,8 +1319,11 @@ TEST_CASE("Analysis providers distinguish empty known and pending counts", "[mod
                 output_->count.SetKnown(output_->value_capacity, output_->value_capacity);
             if (cancel) cancel->request_stop();
             if (fail) return {.identity = request.identity, .terminal = runtime::AnalysisTerminal::DependencyFailure};
-            return {.identity = request.identity, .terminal = runtime::AnalysisTerminal::Completed, .completed_ns = 1,
-                    .output_count = 1, .completion = request.source_ready};
+            return {.identity = request.identity,
+                    .terminal = runtime::AnalysisTerminal::Completed,
+                    .completed_ns = 1,
+                    .output_count = 1,
+                    .completion = request.source_ready};
         }
         bool ObserveCompletion(const runtime::AnalysisCompletion&) noexcept override {
             output_->count.SettleAfterCompletion(output_->value_capacity);
@@ -1338,21 +1337,26 @@ TEST_CASE("Analysis providers distinguish empty known and pending counts", "[mod
     };
     const runtime::AnalysisRegion region{.width = 1, .height = 1};
     runtime::AnalysisAnnotationStorage output{
-        .source_region = region, .value_capacity = 1,
+        .source_region = region,
+        .value_capacity = 1,
         .boxes_xyxy = {.address = 1, .capacity_bytes = 16, .shape = {.rank = 2, .extents = {1, 4}}},
-        .class_references = {.address = 1, .capacity_bytes = 4, .shape = {.rank = 1, .extents = {1}},
-                             .element_type = runtime::AnalysisElementType::Int32},
+        .class_references = {.address = 1, .capacity_bytes = 4, .shape = {.rank = 1, .extents = {1}}, .element_type = runtime::AnalysisElementType::Int32},
         .confidences = {.address = 1, .capacity_bytes = 4, .shape = {.rank = 1, .extents = {1}}},
-        .colors_rgb = {.address = 1, .capacity_bytes = 3, .shape = {.rank = 2, .extents = {1, 3}},
-                       .element_type = runtime::AnalysisElementType::Uint8}};
+        .colors_rgb = {.address = 1, .capacity_bytes = 3, .shape = {.rank = 2, .extents = {1, 3}}, .element_type = runtime::AnalysisElementType::Uint8}};
     const runtime::AnalysisImageView source{
-        .pixels = {.address = 1, .capacity_bytes = 3, .shape = {.rank = 3, .extents = {1, 1, 3}},
-                   .element_type = runtime::AnalysisElementType::Uint8},
-        .pitch_bytes = 3, .width = 1, .height = 1, .channels = 3, .device = 0};
+        .pixels = {.address = 1, .capacity_bytes = 3, .shape = {.rank = 3, .extents = {1, 1, 3}}, .element_type = runtime::AnalysisElementType::Uint8},
+        .pitch_bytes = 3,
+        .width = 1,
+        .height = 1,
+        .channels = 3,
+        .device = 0};
     std::stop_source cancellation;
-    runtime::AnalysisRequest request{.identity = {1, 1}, .source = source,
+    runtime::AnalysisRequest request{.identity = {1, 1},
+                                     .source = source,
                                      .source_ready = {.device = 0, .event = 1, .producer_stream = 1},
-                                     .regions = {&region, 1}, .annotations = {&output, 1}, .cancellation = cancellation.get_token()};
+                                     .regions = {&region, 1},
+                                     .annotations = {&output, 1},
+                                     .cancellation = cancellation.get_token()};
     auto provider = std::make_shared<Provider>();
     SECTION("known host provider") {
         auto result = provider->Analyze(request);

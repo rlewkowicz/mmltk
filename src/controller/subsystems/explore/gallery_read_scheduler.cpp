@@ -348,13 +348,20 @@ void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product
                                       !product.annotated_indices.empty();
     if (copy_paste_requested) {
         lane.donor_index = rfdetr::select_augmentation_preview_donor_image(product.annotated_indices, compiled_index, lane.preview_key);
-        const auto donor_instances = product.store->image_labels(lane.donor_index);
-        auto eligible = donor_instances | std::views::filter([](const auto& instance) { return !instance.is_crowd(); });
-        const auto count = static_cast<std::size_t>(std::ranges::distance(eligible));
-        if (lane.donor_index != compiled_index && count != 0U) {
-            auto selected = eligible.begin();
-            std::ranges::advance(selected, static_cast<std::ptrdiff_t>(rfdetr::select_augmentation_preview_donor_instance(count, lane.preview_key)));
-            lane.donor_instance = *selected;
+        if (lane.donor_index != compiled_index) {
+            const auto donor_instances = product.store->image_labels(lane.donor_index);
+            const auto count = static_cast<std::size_t>(std::ranges::count_if(donor_instances, [](const auto& instance) { return !instance.is_crowd(); }));
+            if (count != 0U) {
+                auto remaining = rfdetr::select_augmentation_preview_donor_instance(count, lane.preview_key);
+                for (const auto& instance : donor_instances) {
+                    if (instance.is_crowd()) continue;
+                    if (remaining == 0U) {
+                        lane.donor_instance = instance;
+                        break;
+                    }
+                    --remaining;
+                }
+            }
         }
     }
     lane.layout = LayoutFor(product, compiled_index, lane.donor_instance.has_value(), lane.donor_instance ? lane.donor_instance->mask_rle_pairs : 0U);

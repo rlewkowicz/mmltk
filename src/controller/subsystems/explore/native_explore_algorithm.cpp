@@ -602,8 +602,7 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         };
         candidate.annotated_indices.reserve(candidate.summaries.size());
         for (std::size_t index = 0U; index != candidate.summaries.size(); ++index)
-            if (std::ranges::any_of(candidate.store.image_labels(static_cast<std::uint32_t>(index)),
-                                    [](const auto& instance) { return !instance.is_crowd(); }))
+            if (std::ranges::any_of(candidate.store.image_labels(static_cast<std::uint32_t>(index)), [](const auto& instance) { return !instance.is_crowd(); }))
                 candidate.annotated_indices.push_back(static_cast<std::uint32_t>(index));
         candidate.identity = explore_dataset_identity(source, candidate.store.header(), candidate.summaries);
         ExploreOrderFacts order_facts{

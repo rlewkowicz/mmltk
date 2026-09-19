@@ -149,8 +149,10 @@ ParsedRle parse_rle(const std::string_view rle) {
         const bool adjacent = !parsed.pairs.empty() && static_cast<size_t>(start) == previous_end;
         previous_end = static_cast<size_t>(start) + length;
         parsed.foreground += length;
-        if (adjacent) parsed.pairs.back().length = checked_cast<uint32_t>(static_cast<std::uint64_t>(parsed.pairs.back().length) + length, "mask run length overflow");
-        else parsed.pairs.push_back({start, length});
+        if (adjacent)
+            parsed.pairs.back().length = checked_cast<uint32_t>(static_cast<std::uint64_t>(parsed.pairs.back().length) + length, "mask run length overflow");
+        else
+            parsed.pairs.push_back({start, length});
     }
     return parsed;
 }
@@ -180,12 +182,13 @@ void validate_record_image_dimensions(const json& record, const std::filesystem:
 }
 void append_diagnostic(std::vector<CompileDiagnostic>* diagnostics, CompileDiagnostic diagnostic) noexcept {
     if (diagnostics == nullptr) return;
-    try { diagnostics->push_back(std::move(diagnostic)); } catch (...) {}
+    try {
+        diagnostics->push_back(std::move(diagnostic));
+    } catch (...) {}
 }
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std::filesystem::path& image_file,
-                         const catalog::ClassCatalog& class_catalog, const CompilerConfig& config, ResizeObservation* resize_observation,
-                         dataset::MaskResizeScratch& mask_scratch,
+ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std::filesystem::path& image_file, const catalog::ClassCatalog& class_catalog,
+                         const CompilerConfig& config, ResizeObservation* resize_observation, dataset::MaskResizeScratch& mask_scratch,
                          std::vector<CompileDiagnostic>* diagnostics) {
     mmltk::common::logging::ScopedProfile profile{"compiler.labels.parse_jsonl"};
     ParsedLabels parsed_labels;
@@ -197,7 +200,8 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
     const bool exact_target = source_dims.width == target_width && source_dims.height == target_height;
     const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
         exact_target ? mmltk::backend::imaging::resample::ImageResizeGeometry{target_width, target_height, 0U, 0U}
-                     : mmltk::backend::imaging::resample::compute_image_resize_geometry(source_dims.width, source_dims.height, target_width, target_height, config.resize_mode);
+                     : mmltk::backend::imaging::resample::compute_image_resize_geometry(source_dims.width, source_dims.height, target_width, target_height,
+                                                                                        config.resize_mode);
     const bool needs_resize = !exact_target;
     const bool needs_downscale = source_dims.width > letterbox.resized_width || source_dims.height > letterbox.resized_height;
     if (resize_observation != nullptr) {
@@ -240,7 +244,8 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
                 if (field == record.end()) return;
                 if (!field->is_boolean() && !field->is_number_integer()) throw std::runtime_error("annotation flag must be boolean or 0/1");
                 bool enabled = false;
-                if (field->is_boolean()) enabled = field->get<bool>();
+                if (field->is_boolean())
+                    enabled = field->get<bool>();
                 else if (field->is_number_unsigned()) {
                     const auto value = field->get<std::uint64_t>();
                     if (value > 1U) throw std::runtime_error("annotation flag must be 0/1");
@@ -283,39 +288,49 @@ ParsedLabels parse_jsonl(const std::filesystem::path& annotation_file, const std
                 }
             } else {
                 if (!source_bounds.has_foreground) throw std::runtime_error("annotation requires a bbox or a nonempty source mask");
-                source_box = {static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y),
-                              static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
+                source_box = {static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y), static_cast<double>(source_bounds.max_x),
+                              static_cast<double>(source_bounds.max_y)};
             }
-            if (!std::ranges::all_of(source_box, [](double value) { return std::isfinite(value); }) ||
-                source_box[2] <= source_box[0] || source_box[3] <= source_box[1]) throw std::runtime_error("invalid source bbox");
+            if (!std::ranges::all_of(source_box, [](double value) { return std::isfinite(value); }) || source_box[2] <= source_box[0] ||
+                source_box[3] <= source_box[1])
+                throw std::runtime_error("invalid source bbox");
             if (diagnostics != nullptr && has_mask && source_bounds.has_foreground && record.contains("bbox_xyxy")) {
                 const std::array<double, 4> mask_box{static_cast<double>(source_bounds.min_x), static_cast<double>(source_bounds.min_y),
                                                      static_cast<double>(source_bounds.max_x), static_cast<double>(source_bounds.max_y)};
                 if (source_box != mask_box) {
                     CompileDiagnostic diagnostic;
                     diagnostic.kind = CompileDiagnosticKind::kSourceBoundingBoxMismatch;
-                    diagnostic.annotation_path = annotation_file.string(); diagnostic.class_name = class_name; diagnostic.line = line_number;
-                    diagnostic.source_width = source_dims.width; diagnostic.source_height = source_dims.height;
-                    diagnostic.target_width = target_width; diagnostic.target_height = target_height;
+                    diagnostic.annotation_path = annotation_file.string();
+                    diagnostic.class_name = class_name;
+                    diagnostic.line = line_number;
+                    diagnostic.source_width = source_dims.width;
+                    diagnostic.source_height = source_dims.height;
+                    diagnostic.target_width = target_width;
+                    diagnostic.target_height = target_height;
                     diagnostic.source_foreground = parsed_rle.foreground;
-                    diagnostic.declared_bbox = source_box; diagnostic.mask_bbox = mask_box;
+                    diagnostic.declared_bbox = source_box;
+                    diagnostic.mask_bbox = mask_box;
                     append_diagnostic(diagnostics, std::move(diagnostic));
                 }
             }
-            metadata.original_area = record.contains("area") ? record["area"].get<double>() :
-                has_mask ? static_cast<double>(parsed_rle.foreground) : (source_box[2] - source_box[0]) * (source_box[3] - source_box[1]);
+            metadata.original_area = record.contains("area") ? record["area"].get<double>()
+                                     : has_mask              ? static_cast<double>(parsed_rle.foreground)
+                                                             : (source_box[2] - source_box[0]) * (source_box[3] - source_box[1]);
             if (!std::isfinite(metadata.original_area) || metadata.original_area < 0.0) throw std::runtime_error("invalid annotation area");
             for (size_t coordinate = 0; coordinate < 4U; ++coordinate) {
                 const bool x = (coordinate & 1U) == 0U;
-                const double scaled = source_box[coordinate] * (x ? letterbox.resized_width : letterbox.resized_height) /
-                                      (x ? source_dims.width : source_dims.height) + (x ? letterbox.offset_x : letterbox.offset_y);
+                const double scaled =
+                    source_box[coordinate] * (x ? letterbox.resized_width : letterbox.resized_height) / (x ? source_dims.width : source_dims.height) +
+                    (x ? letterbox.offset_x : letterbox.offset_y);
                 constexpr double limit = std::numeric_limits<float>::max();
                 if (!std::isfinite(scaled) || scaled < -limit || scaled > limit) throw std::runtime_error("transformed bbox overflow");
                 instance.bbox[coordinate] = static_cast<float>(scaled);
             }
             if (instance.bbox[2] <= instance.bbox[0] || instance.bbox[3] <= instance.bbox[1])
                 throw std::runtime_error("transformed bbox loses strict corner ordering");
-            instance.rle_pairs = needs_resize ? dataset::resize_row_major_mask(parsed_rle.pairs, source_dims, {target_width, target_height}, letterbox, &mask_scratch).pairs : std::move(parsed_rle.pairs);
+            instance.rle_pairs =
+                needs_resize ? dataset::resize_row_major_mask(parsed_rle.pairs, source_dims, {target_width, target_height}, letterbox, &mask_scratch).pairs
+                             : std::move(parsed_rle.pairs);
         } catch (const std::exception& error) {
             throw std::runtime_error(std::string(error.what()) + " in " + annotation_file.string() + " at line " + std::to_string(line_number) + " (source " +
                                      std::to_string(source_dims.width) + "x" + std::to_string(source_dims.height) + ", target " + std::to_string(target_width) +
@@ -382,8 +397,7 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
         ParsedCategory parsed;
         parsed.name = category["name"].get<std::string>();
         const auto& id = category["id"];
-        if (!id.is_number_integer() || (!id.is_number_unsigned() && id.get<std::int64_t>() < 0) ||
-            id.get<std::uint64_t>() > MAX_CLASSES)
+        if (!id.is_number_integer() || (!id.is_number_unsigned() && id.get<std::int64_t>() < 0) || id.get<std::uint64_t>() > MAX_CLASSES)
             throw std::runtime_error("class id must be an exact nonnegative integer in the supported range");
         parsed.raw_id = static_cast<int>(id.get<std::uint64_t>());
         parsed_categories.push_back(std::move(parsed));
@@ -426,8 +440,8 @@ DatasetScan scan_dataset(const CompilerConfig& config, const std::vector<std::st
     return scan;
 }
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images, const CompilerConfig& config,
-                               const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base, int num_workers, const std::span<const int> worker_cpus,
-                               ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
+                               const catalog::ClassCatalog& class_catalog, std::uint8_t source_category_base, int num_workers,
+                               const std::span<const int> worker_cpus, ProgressCounter* completed_images, std::atomic<bool>* failure_requested,
                                const mmltk::common::concurrency::CancellationObservation cancellation) {
     mmltk::common::logging::ScopedProfile profile{"compiler.labels.build_blocks"};
     auto record_worker_stats = [&](const std::vector<LabelWorkerStats>& worker_stats) {

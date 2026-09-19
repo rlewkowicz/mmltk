@@ -348,8 +348,10 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
             score_view.copy_(batch.scores.narrow(0, 0, batch_count), true);
             label_view.copy_(batch.labels.narrow(0, 0, batch_count), true);
             box_view.copy_(batch.boxes.narrow(0, 0, batch_count), true);
-            if (batch.counts.defined()) count_view.copy_(batch.counts.narrow(0, 0, batch_count), true);
-            else count_view.fill_(prediction_count);
+            if (batch.counts.defined())
+                count_view.copy_(batch.counts.narrow(0, 0, batch_count), true);
+            else
+                count_view.fill_(prediction_count);
         }
         if (batch.masks.has_value()) {
             const torch::Tensor& source_masks = *batch.masks;
@@ -468,10 +470,10 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
     const int64_t mask_batch_stride = has_masks ? staged.mask->masks_cpu.stride(0) : 0;
     const int64_t mask_prediction_stride = has_masks ? staged.mask->masks_cpu.stride(1) : 0;
     const auto started = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    SelectedPredictions selected =
-        select_predictions(static_cast<int>(staged.images[image_index].image_id), staged.bbox.scores_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
-                           staged.bbox.labels_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
-                           staged.bbox.boxes_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count), staged.category_count);
+    SelectedPredictions selected = select_predictions(
+        static_cast<int>(staged.images[image_index].image_id), staged.bbox.scores_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
+        staged.bbox.labels_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
+        staged.bbox.boxes_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count), staged.category_count);
     if (has_masks) {
         for (size_t prediction_index = 0; prediction_index < selected.predictions.size(); ++prediction_index) {
             const int64_t source_index = selected.mask_source_indices[prediction_index];

@@ -1412,11 +1412,15 @@ impl State {
             Step::OpenSample if model.validation_navigation_available() => {
                 self.workflow_control(widgets, driver, crate::view::validate::samples::ATLAS_ID)
             }
-            Step::Sample | Step::ValidationOriginalReady if validation.is_some_and(|value| value.detail) => {
+            Step::Sample | Step::ValidationOriginalReady
+                if validation.is_some_and(|value| value.detail) =>
+            {
                 let Some(receipt) = super::probe::current_receipt("validate.detail.image") else {
                     return Task::none();
                 };
-                let Some((_, content)) = crate::presentation_surface::drawable_validation(receipt.surface) else {
+                let Some((_, content)) =
+                    crate::presentation_surface::drawable_validation(receipt.surface)
+                else {
                     return Task::none();
                 };
                 let original = step == Step::Sample || self.validation_original == 1;
@@ -1424,17 +1428,32 @@ impl State {
                 if receipt.surface.original_content(frame) != Some(original) {
                     return Task::none();
                 }
-                let extent = if original { &frame.sourceextent } else { &frame.extent };
+                let extent = if original {
+                    &frame.sourceextent
+                } else {
+                    &frame.extent
+                };
                 let expected = extent.width as f32 / extent.height as f32;
                 if (receipt.image.width / receipt.image.height - expected).abs() > 0.01
                     || frame.sourceextent.width == frame.sourceextent.height
-                    || self.validation_frame.is_some_and(|previous| previous.frame != receipt.surface.frame)
+                    || self
+                        .validation_frame
+                        .is_some_and(|previous| previous.frame != receipt.surface.frame)
                 {
-                    driver.fail("Validation Original changed native pixels or lost source-aspect placement");
+                    driver.fail(
+                        "Validation Original changed native pixels or lost source-aspect placement",
+                    );
                     return Task::none();
                 }
-                completed("validation_original", [f64::from(u8::from(original)), expected as f64,
-                    receipt.image.width as f64, receipt.image.height as f64]);
+                completed(
+                    "validation_original",
+                    [
+                        f64::from(u8::from(original)),
+                        expected as f64,
+                        receipt.image.width as f64,
+                        receipt.image.height as f64,
+                    ],
+                );
                 if step == Step::Sample {
                     self.validation_frame = Some(receipt.surface);
                     self.workflow_step(driver, Step::HideBoxes)

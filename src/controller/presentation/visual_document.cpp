@@ -73,11 +73,11 @@ VisualExtent visual_materialized_extent(const VisualFrame& frame, const bool ori
     const auto crop = frame.content.valid() ? frame.content : VisualRegion{0U, 0U, frame.extent.width, frame.extent.height};
     if (!frame.source_extent.valid()) return {crop.width, crop.height};
     const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(
-        frame.source_extent.width, frame.source_extent.height, crop.width, crop.height,
-        mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+        frame.source_extent.width, frame.source_extent.height, crop.width, crop.height, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     return {geometry.resized_width, geometry.resized_height};
 }
-contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop, VisualExtent target) {
+contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop,
+                                                              VisualExtent target) {
     if (!crop.valid()) crop = {.width = extent.width, .height = extent.height};
     if (!extent.valid() || crop.x > extent.width || crop.y > extent.height || crop.width > extent.width - crop.x || crop.height > extent.height - crop.y ||
         crop.width > std::numeric_limits<std::uint16_t>::max() || crop.height > std::numeric_limits<std::uint16_t>::max())
@@ -97,8 +97,8 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
         object.mask.runs.clear();
         if (index >= document.mask_bounds.size()) throw contracts::InvalidIntentError("Annotation mask bounds are unavailable");
         const auto& bounds = document.mask_bounds[index];
-        if (!std::ranges::all_of(bounds, [](float value) { return std::isfinite(value) && value >= 0 && value <= 1; }) ||
-            bounds[0] > bounds[2] || bounds[1] > bounds[3])
+        if (!std::ranges::all_of(bounds, [](float value) { return std::isfinite(value) && value >= 0 && value <= 1; }) || bounds[0] > bounds[2] ||
+            bounds[1] > bounds[3])
             throw contracts::InvalidIntentError("Annotation mask bounds are invalid");
         if (bounds[0] == bounds[2] || bounds[1] == bounds[3]) continue;
         if (!document.mask_contains) throw contracts::InvalidIntentError("Annotation mask support is unavailable");

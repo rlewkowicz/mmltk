@@ -503,7 +503,7 @@ PreparedWaylandInputs::PreparedWaylandInputs()
         std::ofstream retained_instance{split / "000013.jsonl", std::ios::app};
         if (!retained_instance) throw std::runtime_error("cannot prepare retained empty-mask compiler evidence");
         retained_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
-                         << fixture->width << ',' << fixture->height << "]}\n";
+                          << fixture->width << ',' << fixture->height << "]}\n";
     }
     replace_synthetic_image(square_, 1, 384, 384);
     // This small prerequisite is compiled once. The primary browser owns

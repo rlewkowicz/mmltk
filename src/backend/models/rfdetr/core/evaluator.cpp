@@ -14,7 +14,7 @@ import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
 EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks) {
     const bool masks = request_masks && std::ranges::all_of(std::span{loader.label_data(), loader.num_label_instances()},
-                                                         [](const auto& annotation) { return annotation.has_mask(); });
+                                                            [](const auto& annotation) { return annotation.has_mask(); });
     return masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox;
 }
 using CompactImageMatchRecord = EvaluationDatasetOwner::MatchRecord;
@@ -766,9 +766,7 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
                     scratch.categories[category].areas[area].detail = &details_[base + area * row_width + category + 1U];
         const auto reduce_range = [&](const size_t begin, const size_t end) {
             for (size_t category = begin; category < end; ++category) {
-                reduce_category_matches(matches_by_category[category],
-                                        area_ground_truth_totals_[category], caps,
-                                        scratch.categories[category]);
+                reduce_category_matches(matches_by_category[category], area_ground_truth_totals_[category], caps, scratch.categories[category]);
             }
         };
         if (worker_pool != nullptr && catalog_->size() > 1U) {

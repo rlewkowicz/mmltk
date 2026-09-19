@@ -202,7 +202,7 @@ BenchmarkImageReadError::BenchmarkImageReadError(const std::uint16_t source_inde
 std::uint16_t BenchmarkImageReadError::source_index() const noexcept { return source_index_; }
 std::uint64_t BenchmarkImageReadError::source_image_id() const noexcept { return source_image_id_; }
 PackedInstance benchmark_canvas_box(const std::uint8_t class_id, const float x1, const float y1, const float x2, const float y2,
-                                       const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
+                                    const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox) {
     if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }
     PackedInstance result{};
     result.class_id = class_id;
@@ -212,7 +212,6 @@ PackedInstance benchmark_canvas_box(const std::uint8_t class_id, const float x1,
     result.bbox_y2 = y2 * static_cast<float>(letterbox.resized_height) + static_cast<float>(letterbox.offset_y);
     return result;
 }
-
 void write_benchmark_split(const BenchmarkWriteRequest& request) {
     mmltk::common::logging::ScopedProfile profile{"benchmark.writer.total"};
     if (request.resolution == 0U || request.resolution > MAX_IMAGE_EXTENT) {
@@ -230,9 +229,8 @@ void write_benchmark_split(const BenchmarkWriteRequest& request) {
     std::vector<ImageEntry> index = build_index(request.split, layout.pixel_offset, image_stride);
     std::uint32_t max_instances = 0U;
     for (const auto& image : request.split.images) max_instances = std::max<std::uint32_t>(max_instances, image.label_count);
-    const FileHeader header = make_file_header(
-        {image_count, request.resolution, request.resolution, 3U, max_instances, image_stride, request.resize_mode},
-        class_catalog.names(), layout);
+    const FileHeader header = make_file_header({image_count, request.resolution, request.resolution, 3U, max_instances, image_stride, request.resize_mode},
+                                               class_catalog.names(), layout);
     validate_compiled_header(header);
     validate_compiled_index_entries(index, header, request.split.labels.size(), request.cancel_requested);
     validate_compiled_original_image_dimensions(index, request.cancel_requested);

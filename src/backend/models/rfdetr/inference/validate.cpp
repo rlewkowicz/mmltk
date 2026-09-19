@@ -73,7 +73,9 @@ struct AlignmentSample final {
     std::vector<float> boxes;
     std::vector<Prediction> ground_truth;
     bool masks = false;
-    const auto is_sample = [&](std::int64_t index) { return index >= 0 && std::ranges::binary_search(samples, static_cast<std::uint32_t>(index)); };
+    const auto is_sample = [&](std::int64_t index) {
+        return std::in_range<std::uint32_t>(index) && std::ranges::binary_search(samples, static_cast<std::uint32_t>(index));
+    };
     const auto predictions = prediction_session.RunResolved(
         predict, artifact, command_stream,
         {
@@ -125,7 +127,8 @@ struct AlignmentSample final {
                                                                       masks ? std::span<const Prediction>{record.detections} : std::span<const Prediction>{}));
                     if (delivery.sample && is_sample(record.dataset_index)) {
                         ground_truth.clear();
-                        const auto& entry = loader.label_index()[record.dataset_index];
+                        const auto sample_index = static_cast<std::uint32_t>(record.dataset_index);
+                        const auto& entry = loader.label_index()[sample_index];
                         for (std::size_t ordinal = 0; ordinal < entry.num_instances; ++ordinal) {
                             const auto& packed = loader.label_data()[entry.label_begin + ordinal];
                             Prediction gt;
@@ -145,9 +148,9 @@ struct AlignmentSample final {
                             }
                             ground_truth.push_back(std::move(gt));
                         }
-                        const auto& source = loader.image_entry(record.dataset_index);
-                        delivery.sample({record, std::move(pixels), annotations, ground_truth, loader.geometry(record.dataset_index),
-                                         source.original_width, source.original_height});
+                        const auto& source = loader.image_entry(sample_index);
+                        delivery.sample({record, std::move(pixels), annotations, ground_truth, loader.geometry(sample_index), source.original_width,
+                                         source.original_height});
                     }
                     if (captured_predictions != nullptr && captured_predictions->size() < request.alignment_images) {
                         if (record.detections.empty())

@@ -977,7 +977,7 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
                                           clean.descriptor.height, reinterpret_cast<cudaStream_t>(stream)) == cudaSuccess);
             });
             const auto input = runtime.BorrowInput();
-            algorithm.Open(input.plane(0U).plane(), {});
+            algorithm.Open(input.plane(0U).plane(), {}, {64U, 64U});
         };
         open(49U);
         auto scene = std::make_shared<c::contracts::AnnotationSceneContent>(c::test_scene("test://native-raster"));
@@ -1186,13 +1186,11 @@ TEST_CASE("Annotation class admission preserves CBOR non-box content and journal
     CHECK(reopened.Open(std::move(invalid)).outcome == document::DocumentOutcome::Rejected);
     CHECK(reopened.ui().scene.objects == editor.ui().scene.objects);
 }
-
 TEST_CASE("Original imports restore stored aspect with fractional geometry without source-resolution allocation") {
     auto source = std::make_shared<VisualDocument>();
     source->scene = test_scene("compiled://stretch");
-    source->scene.objects.push_back({.name = contracts::AnnotationText::From("fractional"),
-                                     .shape = contracts::AnnotationShape::Box,
-                                     .box = {{4.5F, 8.25F}, {24.5F, 28.75F}}});
+    source->scene.objects.push_back(
+        {.name = contracts::AnnotationText::From("fractional"), .shape = contracts::AnnotationShape::Box, .box = {{4.5F, 8.25F}, {24.5F, 28.75F}}});
     VisualFrame frame;
     frame.extent = {32U, 32U};
     frame.content = {0U, 0U, 32U, 32U};
@@ -1218,10 +1216,14 @@ TEST_CASE("Document materialization bounds empty and sparse mask queries indepen
     source->scene = test_scene("compiled://bounded");
     for (unsigned index = 0; index < 3; ++index)
         source->scene.objects.push_back({.name = contracts::AnnotationText::From("object " + std::to_string(index)),
-            .box = {{24.25F, 24.5F}, {30.75F, 31.25F}}, .mask = {.present = index != 2}});
+                                         .box = {{24.25F, 24.5F}, {30.75F, 31.25F}},
+                                         .mask = {.present = index != 2}});
     source->mask_bounds = {{{0, 0, .0625F, .0625F}}, {}, {}};
     std::array<unsigned, 3> calls{};
-    source->mask_contains = [&calls](std::size_t index, float x, float y) { ++calls[index]; return x < .0625F && y < .0625F; };
+    source->mask_contains = [&calls](std::size_t index, float x, float y) {
+        ++calls[index];
+        return x < .0625F && y < .0625F;
+    };
     const auto imported = materialize_visual_document(*source, {32, 32}, {});
     CHECK(calls == std::array<unsigned, 3>{4, 0, 0});
     CHECK(imported.objects[0].mask.runs == std::vector<contracts::AnnotationMaskRun>{{0, 0, 1}, {1, 0, 1}});

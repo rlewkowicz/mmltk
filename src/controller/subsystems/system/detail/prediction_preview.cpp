@@ -73,7 +73,7 @@ struct PredictionPreviewFrame::State final {
     bool source_recorded = false;
     const std::uint8_t* rgb8 = nullptr;
     decltype(&cuMemHostRegister) register_host = &cuMemHostRegister;
-    decltype(&cudaMemcpyAsync) upload = &cudaMemcpyAsync;
+    decltype(PredictionPreviewPool::TransferOperations::upload) upload = &cudaMemcpyAsync;
     decltype(&raster::chw_float_to_rgba) convert = &raster::chw_float_to_rgba;
     mmltk::common::system::ExecutionPlacement placement;
     std::shared_ptr<void> decoded_source;

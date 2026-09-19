@@ -131,7 +131,8 @@ std::int32_t raster_instance_overlay_rgba(const InstanceOverlayRgbaWork& work) n
         !indexed_instances_fit(work.instances.instance_count, work.overlay.width, work.overlay.height) || !work.stream) {
         return cudaErrorInvalidValue;
     }
-    const MaskBoxLabelInputs launch_instances{work.masks, work.instances.boxes, work.instances.colors, work.instances.labels, work.instances.instance_count, work.instances.device_instance_count};
+    const MaskBoxLabelInputs launch_instances{
+        work.masks, work.instances.boxes, work.instances.colors, work.instances.labels, work.instances.instance_count, work.instances.device_instance_count};
     return detail::launch_draw_analysis_overlay_rgba_pitched({as_launch_surface(work.overlay), launch_instances, work.mask_alpha, work.box_thickness,
                                                               as_stream(work.stream), work.labels, work.add_rgb_to_existing});
 }

@@ -361,11 +361,11 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     require_explore_transport(h2d);
     mmltk::testsupport::ScopedTempDir root{"mmltk-compiled-dataset-explore"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 12);
-    const auto resize_mode = GENERATE(mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
-                                      mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+    const auto resize_mode =
+        GENERATE(mmltk::backend::imaging::resample::ImageResizeMode::Stretch, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     const auto non_square_compiled = mmltk::testsupport::compile_explore_fixture(
-        root.path(), "non-square-fixture", 12, {.source_width = 48, .source_height = 24, .compiled_width = 32U, .compiled_height = 32U,
-                                             .resize_mode = resize_mode});
+        root.path(), "non-square-fixture", 12,
+        {.source_width = 48, .source_height = 24, .compiled_width = 32U, .compiled_height = 32U, .resize_mode = resize_mode});
     std::filesystem::remove_all(root.path() / "non-square-fixture" / "dataset");
     const data::CompiledDatasetInfo info = data::inspect_compiled_dataset(compiled);
     REQUIRE(info.image_count == 12U);
@@ -395,9 +395,11 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
         REQUIRE(labels.size() == 1U);
         CHECK(labels.front().class_id == image - 10U);
         CHECK(std::abs(labels.front().bbox_x1 - 20.0F / 3.0F) < 1e-5F);
-        CHECK(std::abs(labels.front().bbox_y1 - (10.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) < 1e-5F);
-        CHECK(labels.front().bbox_x2 == 20);
-        CHECK(std::abs(labels.front().bbox_y2 - (23.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) < 1e-5F);
+        CHECK(std::abs(labels.front().bbox_y1 - (10.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) <
+              1e-5F);
+        CHECK(labels.front().bbox_x2 == 20.0F);
+        CHECK(std::abs(labels.front().bbox_y2 - (23.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) <
+              1e-5F);
         const auto runs = non_square_store.instance_rle(labels.front());
         REQUIRE_FALSE(runs.empty());
         CHECK(runs.front().start >= letterbox.offset_y * 32U);
@@ -762,8 +764,8 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(detail_extent_admission.detail.show_original_dimensions);
     CHECK(system.snapshot().frame == full_detail);
     CHECK(full_detail.source_extent == controller::VisualExtent{48U, 24U});
-    const auto expected_content = resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox
-                                      ? controller::VisualRegion{0U, 8U, 32U, 16U} : controller::VisualRegion{0U, 0U, 32U, 32U};
+    const auto expected_content = resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox ? controller::VisualRegion{0U, 8U, 32U, 16U}
+                                                                                                               : controller::VisualRegion{0U, 0U, 32U, 32U};
     CHECK(full_detail.content == expected_content);
     static_cast<void>(system.UpdateDetail({.show_original_dimensions = false}));
     CHECK(system.snapshot().frame == full_detail);
@@ -806,17 +808,17 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
 }
 void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     mmltk::testsupport::ScopedTempDir root{"mmltk-explore-tiny-support"};
-    const auto compiled = mmltk::testsupport::compile_explore_fixture(
-        root.path(), "tiny", 11, {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 4},
-        {.objects = 1, .runs_per_object = 1, .derive_boxes_from_masks = true});
+    const auto compiled =
+        mmltk::testsupport::compile_explore_fixture(root.path(), "tiny", 11, {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 4},
+                                                    {.objects = 1, .runs_per_object = 1, .derive_boxes_from_masks = true});
     const auto store = data::CompiledDataset::open(compiled);
     const auto labels = store.image_labels(10U);
     REQUIRE(labels.size() == 1);
     CHECK(labels[0].class_id == 0);
-    CHECK(labels[0].bbox_x1 == 0);
-    CHECK(labels[0].bbox_y1 == 0);
-    CHECK(labels[0].bbox_x2 == 1);
-    CHECK(labels[0].bbox_y2 == 1);
+    CHECK(labels[0].bbox_x1 == 0.0F);
+    CHECK(labels[0].bbox_y1 == 0.0F);
+    CHECK(labels[0].bbox_x2 == 1.0F);
+    CHECK(labels[0].bbox_y2 == 1.0F);
     const auto runs = store.instance_rle(labels[0]);
     REQUIRE(runs.size() == 1);
     CHECK(runs[0].start == 0);
@@ -901,14 +903,13 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
     const bool h2d = GENERATE(true, false);
     INFO("h2d_dataloader=" << h2d);
     require_explore_transport(h2d);
-    for (const auto annotations :
-         std::array{mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity, 1U},
-                    mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity - 1U, 1U},
-                    mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U, 32U},
-                    mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U - 1U, 32U},
-                    mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .crowd_only = true},
-                    mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .mixed_crowd = true},
-                    mmltk::testsupport::ExploreFixtureAnnotations{.objects = 1U, .runs_per_object = 0U}}) {
+    for (const auto annotations : std::array{mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity, 1U},
+                                             mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity - 1U, 1U},
+                                             mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U, 32U},
+                                             mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U - 1U, 32U},
+                                             mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .crowd_only = true},
+                                             mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .mixed_crowd = true},
+                                             mmltk::testsupport::ExploreFixtureAnnotations{.objects = 1U, .runs_per_object = 0U}}) {
         CAPTURE(annotations.objects, annotations.runs_per_object);
         mmltk::testsupport::ScopedTempDir root{"mmltk-explore-capacity"};
         const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "dense", 12, {}, annotations);
@@ -1453,8 +1454,9 @@ TEST_CASE("Compiled Explore imports independent masks through both geometries an
     namespace resize = mmltk::backend::imaging::resample;
     const auto mode = GENERATE(resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox);
     mmltk::testsupport::ScopedTempDir root{"mmltk-explore-independent-mask"};
-    const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "independent", 1,
-        {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 8, .resize_mode = mode}, {.independent_masks = true});
+    const auto compiled = mmltk::testsupport::compile_explore_fixture(
+        root.path(), "independent", 1, {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 8, .resize_mode = mode},
+        {.independent_masks = true});
     controller::SettingsSystem settings;
     load_explore_transport(settings, root.path() / "gui.json", true);
     NativeExploreFixture fixture(settings, true);
@@ -1466,8 +1468,8 @@ TEST_CASE("Compiled Explore imports independent masks through both geometries an
     const auto frame = system.snapshot().frame;
     auto borrowed = system.BorrowDocument(frame);
     REQUIRE(borrowed.valid());
-    const auto original = controller::materialize_visual_document(*borrowed.document, frame.extent, frame.content,
-        controller::visual_materialized_extent(frame, true));
+    const auto original =
+        controller::materialize_visual_document(*borrowed.document, frame.extent, frame.content, controller::visual_materialized_extent(frame, true));
     REQUIRE(original.objects.size() == 3);
     CHECK(original.objects[0].box == controller::contracts::AnnotationBox{{4.25F, 1.25F}, {7.75F, 3.75F}});
     CHECK(original.objects[0].mask.runs == std::vector<controller::contracts::AnnotationMaskRun>{{0, 0, 0}});

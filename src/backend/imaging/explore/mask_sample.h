@@ -8,8 +8,9 @@ namespace mmltk::backend::imaging::explore::detail {
                                                                      const ExploreRenderAnnotationDescriptorAbi& annotation, const std::uint32_t capacity,
                                                                      const std::uint32_t width, const std::uint32_t height, const float x,
                                                                      const float y) noexcept {
-    if (!annotation.mask_present || !pairs || width == 0U || height == 0U || annotation.rle_offset > capacity || annotation.rle_count > capacity - annotation.rle_offset ||
-        annotation.rle_count == 0U || x < annotation.mask_bounds[0] || x > annotation.mask_bounds[2] || y < annotation.mask_bounds[1] || y > annotation.mask_bounds[3])
+    if (!annotation.mask_present || !pairs || width == 0U || height == 0U || annotation.rle_offset > capacity ||
+        annotation.rle_count > capacity - annotation.rle_offset || annotation.rle_count == 0U || x < annotation.mask_bounds[0] ||
+        x > annotation.mask_bounds[2] || y < annotation.mask_bounds[1] || y > annotation.mask_bounds[3])
         return false;
     const float sx = annotation.inverse[0] * x + annotation.inverse[1] * y + annotation.inverse[2];
     const float sy = annotation.inverse[3] * x + annotation.inverse[4] * y + annotation.inverse[5];

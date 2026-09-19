@@ -292,8 +292,8 @@ class PredictionBackend final {
         count_storage_.resize(annotations.storage.size());
         for (std::size_t index = 0U; index < annotations.storage.size(); ++index) {
             auto& storage = annotations.storage[index];
-            const auto count = std::min({maximum_detections_, storage.value_capacity,
-                                         static_cast<std::size_t>(outputs.main.pred_logits.size(1) * outputs.main.pred_logits.size(2))});
+            const auto count = std::min(
+                {maximum_detections_, storage.value_capacity, static_cast<std::size_t>(outputs.main.pred_logits.size(1) * outputs.main.pred_logits.size(2))});
             storage.class_catalog = native_->class_layout()->catalog();
             storage.class_domain = native_->class_layout()->domain();
             storage.masks_available = false;
@@ -425,8 +425,8 @@ void execute_prediction_batch(const PredictRequest& options, PredictionBackend& 
     if (compiled) {
         for (std::size_t image = 0; image < batch_size; ++image) {
             const auto geometry = compiled->geometry(indices[image]);
-            clip_prediction_boxes_(annotations.boxes[image], geometry.offset_x, geometry.offset_y,
-                geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);
+            clip_prediction_boxes_(annotations.boxes[image], geometry.offset_x, geometry.offset_y, geometry.offset_x + geometry.resized_width,
+                                   geometry.offset_y + geometry.resized_height);
         }
     }
     if (annotations.storage.front().value_capacity != 0U) readback.Read(annotations);
@@ -712,7 +712,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
                                                                                   delivery.stop, source_retirement);
     if (delivery.begin) delivery.begin(result);
     const auto cuda = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, options.device_id);
-    const auto resolution = static_cast<std::int64_t>(backend.resolution());
+    const auto resolution = static_cast<int>(backend.resolution());
     auto normalized = torch::empty({1, 3, resolution, resolution}, cuda);
     GpuBatchPreprocessor preprocessor(1, resolution, resolution, options.device_id, backend.input_type());
     while (!delivery.stop.stop_requested() && (options.limit_images == 0U || result.processed_images < options.limit_images)) {
@@ -726,8 +726,8 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
         auto input = torch::from_blob(const_cast<float*>(frame->chw), at::IntArrayRef{shape}, cuda);
         at::upsample_bilinear2d_out(normalized, input, {resolution, resolution}, false);
         const auto model_input = preprocessor.run({.num_images = 1U, .device_images = normalized.data_ptr<float>()});
-        execute_prediction_batch(options, backend, model_input, 1U, frame->width, frame->height, delivery, annotations,
-                                 readback, {}, static_cast<std::int64_t>(result.processed_images));
+        execute_prediction_batch(options, backend, model_input, 1U, frame->width, frame->height, delivery, annotations, readback, {},
+                                 static_cast<std::int64_t>(result.processed_images));
         preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
         PredictionRecord record{.dataset_index = static_cast<std::int64_t>(frame->index),
                                 .image_id = static_cast<std::int64_t>(frame->index + 1U),
@@ -942,7 +942,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     const auto total = options.limit_images == 0U ? loader->num_images() : std::min(options.limit_images, loader->num_images());
     const auto image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids();
     GpuBatchPreprocessor preprocessor(static_cast<std::int64_t>(options.batch_size), static_cast<int>(loader->image_height()),
-                                            static_cast<int>(loader->image_width()), options.device_id, bound_backend.input_type());
+                                      static_cast<int>(loader->image_width()), options.device_id, bound_backend.input_type());
     const auto started = std::chrono::steady_clock::now();
     loader->begin_epoch();
     mmltk::backend::data::Batch batch{};

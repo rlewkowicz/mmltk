@@ -1475,8 +1475,10 @@ TEST_CASE("Upscale derives a checked fixed output envelope") {
     CHECK((checked_upscale_output_extent({1U, 1U}) == VisualExtent{4U, 4U}));
     CHECK((checked_upscale_output_extent({320U, 180U}) == VisualExtent{1280U, 720U}));
     CHECK_THROWS_AS(checked_upscale_output_extent({}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(checked_upscale_output_extent({std::numeric_limits<std::uint32_t>::max() / UpscaleImageMetadata::output_scale + 1U, 1U}), contracts::InvalidIntentError);
-    CHECK_THROWS_AS(checked_upscale_output_extent({1U, std::numeric_limits<std::uint32_t>::max() / UpscaleImageMetadata::output_scale + 1U}), contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({std::numeric_limits<std::uint32_t>::max() / UpscaleImageMetadata::output_scale + 1U, 1U}),
+                    contracts::InvalidIntentError);
+    CHECK_THROWS_AS(checked_upscale_output_extent({1U, std::numeric_limits<std::uint32_t>::max() / UpscaleImageMetadata::output_scale + 1U}),
+                    contracts::InvalidIntentError);
 }
 TEST_CASE("Upscale accepts output beyond the source systems base envelope") {
     auto backend = std::make_shared<FakeImageBackend>();

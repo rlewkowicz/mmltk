@@ -66,7 +66,7 @@ struct RfdetrAnalysisProvider::Impl final {
         const auto float_options = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, device);
         input_float = torch::empty({static_cast<std::int64_t>(runtime::kMaximumAnalysisRegions), 3, resolution, resolution}, float_options);
         preprocessor = std::make_unique<GpuBatchPreprocessor>(runtime::kMaximumAnalysisRegions, resolution, resolution, device,
-            backend->input_element_type() == element_type::Float16 ? at::kHalf : at::kFloat);
+                                                              backend->input_element_type() == element_type::Float16 ? at::kHalf : at::kFloat);
     }
     [[nodiscard]] c10::cuda::CUDAStream cuda_stream() const noexcept { return c10::cuda::getStreamFromExternal(stream, c10::DeviceIndex(device)); }
     std::shared_ptr<RfdetrRuntimeBackend> backend;

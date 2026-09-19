@@ -430,10 +430,15 @@ TEST_CASE("Validation documents preserve off-box empty and missing masks through
     }
     truth[0].has_mask = truth[1].has_mask = true;
     truth[0].mask = {.height = 8, .width = 8, .area = 1, .runs = {{16, 1}}};
-    truth[1].mask = {.height = 8, .width = 8};
+    truth[1].mask = {.height = 8, .width = 8, .runs = {}};
     const rfdetr::PredictionRecord record{.dataset_index = 0, .detections = source.detections()};
-    samples.Capture(1, {record, {.chw = source.pixels(), .width = 8, .height = 8, .device = 0, .custody = source.custody()},
-        source.annotations(), truth, {.resized_width = 8, .resized_height = 4, .offset_y = 2}, 8, 4});
+    samples.Capture(1, {record,
+                        {.chw = source.pixels(), .width = 8, .height = 8, .device = 0, .custody = source.custody()},
+                        source.annotations(),
+                        truth,
+                        {.resized_width = 8, .resized_height = 4, .offset_y = 2},
+                        8,
+                        4});
     await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0]; });
     samples.Select({1, 0});
     await_validation(mutex, changed, [&] { return samples.snapshot().detail; });

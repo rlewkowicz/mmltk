@@ -63,9 +63,9 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
         constexpr float margin = 8 * std::numeric_limits<float>::epsilon();
         const auto& forward = plan->forward;
         const float x_error = margin * (donor ? (1 + std::abs(1 / inverse[0]) + std::abs(inverse[2] / inverse[0]))
-                                                   : (1 + std::abs(forward[0]) + std::abs(forward[1]) + std::abs(forward[2])));
+                                              : (1 + std::abs(forward[0]) + std::abs(forward[1]) + std::abs(forward[2])));
         const float y_error = margin * (donor ? (1 + std::abs(1 / inverse[4]) + std::abs(inverse[5] / inverse[4]))
-                                                   : (1 + std::abs(forward[3]) + std::abs(forward[4]) + std::abs(forward[5])));
+                                              : (1 + std::abs(forward[3]) + std::abs(forward[4]) + std::abs(forward[5])));
         candidate[0] = std::max(0.0F, candidate[0] - x_error);
         candidate[1] = std::max(0.0F, candidate[1] - y_error);
         candidate[2] = std::min(1.0F, candidate[2] + x_error);

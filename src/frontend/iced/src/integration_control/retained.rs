@@ -1842,12 +1842,20 @@ impl State {
                 if self.original_roundtrip == 1 {
                     if drawn_revision != viewed.revision
                         || drawn.crop != [0, 0, viewed.extent.width, viewed.extent.height]
-                        || (drawn.image.width / drawn.image.height - viewed.extent.width as f32 / viewed.extent.height as f32).abs() > 0.002
+                        || (drawn.image.width / drawn.image.height
+                            - viewed.extent.width as f32 / viewed.extent.height as f32)
+                            .abs()
+                            > 0.002
                     {
                         return Task::none();
                     }
                     self.original_roundtrip = 2;
-                    driver.phase = Phase::DetailOriginal { revision: snapshot.revision, frame_revision, padded_width, padded_height };
+                    driver.phase = Phase::DetailOriginal {
+                        revision: snapshot.revision,
+                        frame_revision,
+                        padded_width,
+                        padded_height,
+                    };
                     return widgets.arm(driver, EXPLORE_DETAIL_ORIGINAL);
                 }
                 if drawn_revision != viewed.revision
@@ -1861,17 +1869,26 @@ impl State {
                 {
                     return Task::none();
                 }
-                if viewed.sourceextent.width != 0 && viewed.sourceextent.height != 0
-                    && (drawn.image.width / drawn.image.height - viewed.sourceextent.width as f32 / viewed.sourceextent.height as f32).abs() > 0.002
+                if viewed.sourceextent.width != 0
+                    && viewed.sourceextent.height != 0
+                    && (drawn.image.width / drawn.image.height
+                        - viewed.sourceextent.width as f32 / viewed.sourceextent.height as f32)
+                        .abs()
+                        > 0.002
                 {
                     return Task::none();
                 }
-                if !self.require_original_crop(driver, probes, viewed) {
+                if !self.require_original_crop(driver, probes, &viewed) {
                     return Task::none();
                 }
                 if self.original_roundtrip == 0 {
                     self.original_roundtrip = 1;
-                    driver.phase = Phase::DetailOriginal { revision: snapshot.revision, frame_revision, padded_width, padded_height };
+                    driver.phase = Phase::DetailOriginal {
+                        revision: snapshot.revision,
+                        frame_revision,
+                        padded_width,
+                        padded_height,
+                    };
                     return widgets.arm(driver, EXPLORE_DETAIL_ORIGINAL);
                 }
                 reporting::emit(|sink| {
@@ -3760,8 +3777,12 @@ impl State {
         if probes.draws().viewer.is_none_or(|(_, _, draw)| {
             let source = &frame.sourceextent;
             draw.crop != [content.x, content.y, content.width, content.height]
-                || (source.width != 0 && source.height != 0
-                    && (draw.image.width / draw.image.height - source.width as f32 / source.height as f32).abs() > 0.002)
+                || (source.width != 0
+                    && source.height != 0
+                    && (draw.image.width / draw.image.height
+                        - source.width as f32 / source.height as f32)
+                        .abs()
+                        > 0.002)
         }) {
             driver.fail("returning viewer lost the selected Original crop or source aspect");
             return false;

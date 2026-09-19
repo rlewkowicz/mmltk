@@ -84,12 +84,9 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
         total_file_size < rle_offset) {
         throw std::runtime_error("compiled file layout is invalid");
     }
-    const auto layout = compute_pixel_layout(header.num_images,
-        mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"));
+    const auto layout = compute_pixel_layout(header.num_images, mmltk::common::math::checked_cast<size_t>(header.image_stride, "image stride overflow"));
     const auto expected_index_bytes = layout.index_size;
-    if (pixel_offset != layout.pixel_offset) {
-        throw std::runtime_error("compiled file index or pixel alignment is invalid");
-    }
+    if (pixel_offset != layout.pixel_offset) { throw std::runtime_error("compiled file index or pixel alignment is invalid"); }
     const size_t label_bytes = rle_offset - label_offset;
     if (label_bytes % sizeof(PackedInstance) != 0) { throw std::runtime_error("label block is not aligned to PackedInstance"); }
     const size_t pixel_blob_size = label_offset - pixel_offset;
@@ -113,8 +110,8 @@ inline void validate_compiled_index_entries(const std::span<const ImageEntry> in
         if (entry.pixel_offset != expected_pixel_offset) {
             throw std::runtime_error("compiled pixel index is inconsistent at image " + std::to_string(image_index));
         }
-        if (entry._pad != 0U || entry.num_instances > header.max_instances_per_image || entry.label_offset != expected_label_offset || entry.label_offset % sizeof(PackedInstance) != 0U ||
-            entry.label_bytes != static_cast<uint32_t>(entry.num_instances) * sizeof(PackedInstance)) {
+        if (entry._pad != 0U || entry.num_instances > header.max_instances_per_image || entry.label_offset != expected_label_offset ||
+            entry.label_offset % sizeof(PackedInstance) != 0U || entry.label_bytes != static_cast<uint32_t>(entry.num_instances) * sizeof(PackedInstance)) {
             throw std::runtime_error("compiled label index is inconsistent at image " + std::to_string(image_index));
         }
         const size_t label_begin = entry.label_offset / sizeof(PackedInstance);
@@ -132,8 +129,8 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
     for (size_t image_index = 0U; image_index < index.size(); ++image_index) {
         throw_if_compiled_validation_cancelled(image_index, cancel_requested);
         const ImageEntry& entry = index[image_index];
-        if (entry.original_width == 0U || entry.original_height == 0U || entry.has_source_image_id > 1U ||
-            entry.source > AnnotationSource::OpenImages || (!entry.has_source_image_id && entry.source_image_id != 0U) || entry._reserved != 0U) {
+        if (entry.original_width == 0U || entry.original_height == 0U || entry.has_source_image_id > 1U || entry.source > AnnotationSource::OpenImages ||
+            (!entry.has_source_image_id && entry.source_image_id != 0U) || entry._reserved != 0U) {
             throw std::runtime_error("compiled original image dimensions are invalid at image " + std::to_string(image_index));
         }
     }
@@ -148,10 +145,9 @@ inline void validate_compiled_original_image_dimensions(const std::span<const Im
         if (instance.class_id >= header.num_classes) {
             throw std::runtime_error("compiled instance class id is out of bounds at label " + std::to_string(label_index));
         }
-        if (!std::isfinite(instance.bbox_x1) || !std::isfinite(instance.bbox_y1) || !std::isfinite(instance.bbox_x2) ||
-            !std::isfinite(instance.bbox_y2) || instance.bbox_x2 <= instance.bbox_x1 || instance.bbox_y2 <= instance.bbox_y1 ||
-            !std::isfinite(instance.original_area) || instance.original_area < 0.0 || (instance.flags & ~kAnnotationFlags) != 0U ||
-            (!instance.has_mask() && instance.mask_rle_pairs != 0U) ||
+        if (!std::isfinite(instance.bbox_x1) || !std::isfinite(instance.bbox_y1) || !std::isfinite(instance.bbox_x2) || !std::isfinite(instance.bbox_y2) ||
+            instance.bbox_x2 <= instance.bbox_x1 || instance.bbox_y2 <= instance.bbox_y1 || !std::isfinite(instance.original_area) ||
+            instance.original_area < 0.0 || (instance.flags & ~kAnnotationFlags) != 0U || (!instance.has_mask() && instance.mask_rle_pairs != 0U) ||
             ((instance.flags & kAnnotationId) == 0U && instance.annotation_id != 0U) ||
             ((instance.flags & kAnnotationCategory) == 0U && instance.source_category_id != 0U)) {
             throw std::runtime_error("compiled instance annotation metadata is invalid at label " + std::to_string(label_index));
@@ -191,7 +187,7 @@ inline void validate_compiled_rle_pairs(const std::span<const PackedInstance> la
     }
 }
 inline void validate_compiled_annotation_provenance(const std::span<const ImageEntry> images, const std::span<const PackedInstance> labels,
-                                                   mmltk::common::concurrency::CancellationObservation cancel_requested = {}) {
+                                                    mmltk::common::concurrency::CancellationObservation cancel_requested = {}) {
     std::size_t visited = 0U;
     for (const auto& image : images) {
         throw_if_compiled_validation_cancelled(visited++, cancel_requested);

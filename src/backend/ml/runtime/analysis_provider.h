@@ -65,7 +65,7 @@ struct AnalysisCompletion final {
 struct AnalysisAnnotationStorage final {
     AnalysisRegion source_region{};
     std::size_t value_capacity = 0U;
-    AnalysisValueCount count;
+    AnalysisValueCount count{};
     AnalysisDeviceBuffer boxes_xyxy{};
     AnalysisDeviceBuffer class_references{};
     AnalysisDeviceBuffer confidences{};
@@ -288,9 +288,9 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         for (std::size_t index = 0U; index < request.regions.size(); ++index) {
             const AnalysisRegion& region = request.regions[index];
             const AnalysisAnnotationStorage& output = request.annotations[index];
-            if (!region.valid() || output.source_region != region || !output.count.empty() ||
-                region.width > request.source.width || region.height > request.source.height || region.x > request.source.width - region.width ||
-                region.y > request.source.height - region.height || !ValidateAnnotationStorage(output)) {
+            if (!region.valid() || output.source_region != region || !output.count.empty() || region.width > request.source.width ||
+                region.height > request.source.height || region.x > request.source.width - region.width || region.y > request.source.height - region.height ||
+                !ValidateAnnotationStorage(output)) {
                 return false;
             }
         }
@@ -299,8 +299,7 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
     [[nodiscard]] static bool ValidateAnnotationStorage(const AnalysisAnnotationStorage& output) noexcept {
         if (output.value_capacity > std::numeric_limits<std::uint32_t>::max()) { return false; }
         if (output.value_capacity == 0U) {
-            return output.count.empty() && !output.masks_available &&
-                   output.boxes_xyxy.capacity_bytes == 0U && output.class_references.capacity_bytes == 0U &&
+            return output.count.empty() && !output.masks_available && output.boxes_xyxy.capacity_bytes == 0U && output.class_references.capacity_bytes == 0U &&
                    output.confidences.capacity_bytes == 0U && output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U;
         }
         const auto capacity = static_cast<std::uint32_t>(output.value_capacity);

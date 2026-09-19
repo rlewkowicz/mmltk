@@ -16,8 +16,7 @@ import mmltk.backend.imaging.raster;
 namespace mmltk::controller {
 VisualExtent checked_upscale_output_extent(const VisualExtent source) {
     const auto result = checked_visual_scale(source, UpscaleImageMetadata::output_scale);
-    if (!source.valid() || !result)
-        throw contracts::InvalidIntentError("Upscale four-times extent is invalid or overflows");
+    if (!source.valid() || !result) throw contracts::InvalidIntentError("Upscale four-times extent is invalid or overflows");
     return *result;
 }
 namespace {
@@ -276,7 +275,8 @@ class UpscaleSystem::Impl final {
     ~Impl() { Shutdown(); }
     void Warm(const VisualExtent extent) noexcept {
         std::scoped_lock admission_lock(mutex_);
-        if (!extent.valid() || extent.width > settings_.maximum_width / UpscaleImageMetadata::output_scale || extent.height > settings_.maximum_height / UpscaleImageMetadata::output_scale)
+        if (!extent.valid() || extent.width > settings_.maximum_width / UpscaleImageMetadata::output_scale ||
+            extent.height > settings_.maximum_height / UpscaleImageMetadata::output_scale)
             return;
         if (warm_extent_ == extent && (warm_admitted_ || warm_attempted_)) return;
         warm_extent_ = extent;

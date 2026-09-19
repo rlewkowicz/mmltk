@@ -27,10 +27,11 @@ class UnusedWeightOperations final : public services::ArtifactWeightOperations {
 };
 class DiagnosticCompiler final : public services::ArtifactCompilerOperations {
    private:
-    void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode, mmltk::common::concurrency::CancellationObservation,
-                           services::ArtifactProgressObserver) const override {}
-    void compile_benchmark(const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode, mmltk::common::concurrency::CancellationObservation,
-                           services::ArtifactProgressObserver, services::ArtifactBenchmarkTraceObserver trace) const override {
+    void compile_directory(const std::filesystem::path&, const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
+                           mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver) const override {}
+    void compile_benchmark(const std::filesystem::path&, std::uint32_t, bool, mmltk::backend::imaging::resample::ImageResizeMode,
+                           mmltk::common::concurrency::CancellationObservation, services::ArtifactProgressObserver,
+                           services::ArtifactBenchmarkTraceObserver trace) const override {
         trace("benchmark.direct", R"({"records":1})");
     }
 };

@@ -384,7 +384,8 @@ template <class Image>
 struct ScaledVisualComposition final {
     TestSettingsSystem* settings = nullptr;
     SyntheticVisualSystem<PresentationSourceKind::Predict,
-                          mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>, Image>* producer = nullptr;
+                          mmltk::frameworks::reflection::member_path<&SyntheticVisualSnapshot::operation, &SyntheticVisualOperation::revision>, Image>*
+        producer = nullptr;
 };
 class RoutingTextWriter final {
    public:

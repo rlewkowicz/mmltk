@@ -322,7 +322,12 @@ impl Component {
         );
         let source = row![
             container(button("Fit").on_press(Message::Fit)).id("validate.detail.fit"),
-            container(checkbox(self.original).label("Original").on_toggle(Message::Original)).id("validate.detail.original"),
+            container(
+                checkbox(self.original)
+                    .label("Original")
+                    .on_toggle(Message::Original)
+            )
+            .id("validate.detail.original"),
             self.controls(model)
         ]
         .spacing(7)

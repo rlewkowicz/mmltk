@@ -17,8 +17,7 @@ inline constexpr size_t HUGE_PAGE_SIZE = size_t{2} * 1024 * 1024;
 using PackedCoordinate = float;
 inline constexpr std::uint32_t MAX_IMAGE_EXTENT = 32767U;
 inline size_t align_up(size_t val, size_t alignment) { return (val + alignment - 1) & ~(alignment - 1); }
-inline constexpr std::uint8_t kAnnotationMask = 1U, kAnnotationCrowd = 2U, kAnnotationIgnore = 4U,
-    kAnnotationId = 8U, kAnnotationCategory = 16U;
+inline constexpr std::uint8_t kAnnotationMask = 1U, kAnnotationCrowd = 2U, kAnnotationIgnore = 4U, kAnnotationId = 8U, kAnnotationCategory = 16U;
 inline constexpr std::uint8_t kAnnotationFlags = kAnnotationMask | kAnnotationCrowd | kAnnotationIgnore | kAnnotationId | kAnnotationCategory;
 struct __attribute__((packed)) PackedInstance {
     uint8_t class_id;
@@ -40,13 +39,11 @@ enum class AnnotationSource : std::uint8_t { Generic, Coco, Objects365, OpenImag
 // Open Images MIDs are /m/ followed by at most eight ASCII identifier bytes.
 // Store those bytes little-endian, with zero padding; this is not a hash.
 inline std::uint64_t encode_open_images_category(std::string_view mid) {
-    if (!mid.starts_with("/m/") || mid.size() <= 3U || mid.size() > 11U)
-        throw std::runtime_error("Open Images category MID is not representable");
+    if (!mid.starts_with("/m/") || mid.size() <= 3U || mid.size() > 11U) throw std::runtime_error("Open Images category MID is not representable");
     std::uint64_t encoded = 0U;
     for (std::size_t index = 3U; index < mid.size(); ++index) {
         const char value = mid[index];
-        if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'z') || value == '_'))
-            throw std::runtime_error("invalid Open Images category MID");
+        if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'z') || value == '_')) throw std::runtime_error("invalid Open Images category MID");
         encoded |= static_cast<std::uint64_t>(static_cast<unsigned char>(value)) << ((index - 3U) * 8U);
     }
     return encoded;
@@ -70,7 +67,6 @@ inline std::string decode_open_images_category(std::uint64_t encoded) {
     return mid;
 }
 static_assert(sizeof(PackedInstance) == 56);
-
 struct __attribute__((packed)) ImageEntry {
     uint64_t pixel_offset;
     uint32_t label_offset;

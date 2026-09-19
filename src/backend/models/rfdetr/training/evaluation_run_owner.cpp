@@ -710,8 +710,8 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
                 static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_classes);
             for (std::size_t image = 0; image < batch.num_images; ++image) {
                 const auto geometry = loader.geometry(batch.image_indices[image]);
-                clip_prediction_boxes_(postprocessed.boxes[image], geometry.offset_x, geometry.offset_y,
-                    geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);
+                clip_prediction_boxes_(postprocessed.boxes[image], geometry.offset_x, geometry.offset_y, geometry.offset_x + geometry.resized_width,
+                                       geometry.offset_y + geometry.resized_height);
             }
             if (batch_timing) { evaluation_run.record_timing_stop(batch_timing, EvaluationCudaBatchTiming::Phase::Postprocess, evaluation_stream); }
             return postprocessed;

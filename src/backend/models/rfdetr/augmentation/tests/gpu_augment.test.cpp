@@ -263,9 +263,22 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
     const std::array runs{RLEPair{9, 3}, RLEPair{17, 3}, RLEPair{25, 3}, RLEPair{10, 2}, RLEPair{18, 2}, RLEPair{26, 2}};
-    PackedInstance source{.class_id = 2, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 0, .mask_rle_pairs = 3};
-    PackedInstance donor{
-        .class_id = 4, .flags = mmltk::backend::data::kAnnotationMask, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 5, .bbox_y2 = 5, .mask_rle_offset = 3 * sizeof(RLEPair), .mask_rle_pairs = 3};
+    PackedInstance source{.class_id = 2,
+                          .flags = mmltk::backend::data::kAnnotationMask,
+                          .bbox_x1 = 0,
+                          .bbox_y1 = 0,
+                          .bbox_x2 = 5,
+                          .bbox_y2 = 5,
+                          .mask_rle_offset = 0,
+                          .mask_rle_pairs = 3};
+    PackedInstance donor{.class_id = 4,
+                         .flags = mmltk::backend::data::kAnnotationMask,
+                         .bbox_x1 = 0,
+                         .bbox_y1 = 0,
+                         .bbox_x2 = 5,
+                         .bbox_y2 = 5,
+                         .mask_rle_offset = 3 * sizeof(RLEPair),
+                         .mask_rle_pairs = 3};
     AugmentationImagePlan plan;
     plan.paste_donor_slot = 0;
     plan.paste_source_box = {0, 0, 0.625F, 0.625F};
@@ -354,7 +367,7 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
             } else {
                 source.bbox_x2 = source.bbox_x1;
                 source.mask_rle_pairs = 0;
-        source.flags &= ~mmltk::backend::data::kAnnotationMask;
+                source.flags &= ~mmltk::backend::data::kAnnotationMask;
             }
             plan = {};
             for (const auto* identity : {static_cast<const AugmentationImagePlan*>(nullptr), static_cast<const AugmentationImagePlan*>(&plan)}) {
@@ -1107,7 +1120,7 @@ TEST_CASE("Preview presence and raster bounds stay independent through geometry 
     build();
     REQUIRE(output.size() == 3);
     CHECK(output[0].mask_bounds[0] <= .875F);
-    CHECK(output[0].mask_bounds[2] == 1);
+    CHECK(output[0].mask_bounds[2] == 1.0F);
     CHECK(output[0].mask_bounds[3] >= .25F);
     CHECK(output[0].box_xyxy == std::array<float, 4>{.25F / 8, 1.25F / 4, 3.75F / 8, 3.75F / 4});
     CHECK(output[1].mask_present);
@@ -1130,7 +1143,7 @@ TEST_CASE("Preview presence and raster bounds stay independent through geometry 
         REQUIRE(output.size() == 1);
         CHECK(output[0].mask_present == masked);
         if (masked) {
-            CHECK(output[0].mask_bounds[0] == 0);
+            CHECK(output[0].mask_bounds[0] == 0.0F);
             CHECK(output[0].mask_bounds[2] >= .125F);
             CHECK(output[0].mask_bounds[3] >= .25F);
         } else {
@@ -1141,8 +1154,14 @@ TEST_CASE("Preview presence and raster bounds stay independent through geometry 
 TEST_CASE("continuous augmentation boxes survive independent and empty mask support", "[backend][rfdetr][augmentation][support]") {
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
-    PackedInstance annotation{.flags = mmltk::backend::data::kAnnotationMask,
-                              .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.25F};
+    PackedInstance annotation{.class_id = 0,
+                              .flags = mmltk::backend::data::kAnnotationMask,
+                              .bbox_x1 = 1.25F,
+                              .bbox_y1 = 2.5F,
+                              .bbox_x2 = 6.25F,
+                              .bbox_y2 = 7.25F,
+                              .mask_rle_offset = 0,
+                              .mask_rle_pairs = 0};
     const std::array runs{RLEPair{27, 1}};
     for (const auto mask : {std::span<const RLEPair>{}, std::span<const RLEPair>{runs}}) {
         AugmentationImagePlan plan;
@@ -1165,7 +1184,7 @@ TEST_CASE("continuous augmentation boxes survive independent and empty mask supp
         const auto vanished_mask = map_augmentation_instance(annotation, 8, 8, &plan, mask);
         CHECK(vanished_mask.visible);
         CHECK(vanished_mask.output_box_xyxy == std::array<float, 4>{6.25F / 8, 2.5F / 8, 1, 7.25F / 8});
-        CHECK(vanished_mask.output_area == 0);
+        CHECK(vanished_mask.output_area == 0.0F);
     }
 }
 }  // namespace

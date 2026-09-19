@@ -638,8 +638,8 @@ void test_benchmark_cached_image_writer_and_loader() {
     split.name = "validation";
     split.class_names = {"person"};
     split.sources.push_back(CachedImageSource{image_root});
-    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
-        mmltk::backend::imaging::resample::compute_image_resize_geometry(16U, 8U, kNanoResolution, kNanoResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox = mmltk::backend::imaging::resample::compute_image_resize_geometry(
+        16U, 8U, kNanoResolution, kNanoResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     REQUIRE(letterbox.resized_width == kNanoResolution);
     REQUIRE(letterbox.resized_height == 192U);
     REQUIRE(letterbox.offset_x == 0U);
@@ -693,10 +693,10 @@ void test_benchmark_cached_image_writer_and_loader() {
     REQUIRE(index[0].original_height == 8U);
     REQUIRE(validate_compiled_label_entries(labels, header, sections.rle_region_bytes) == 0U);
     REQUIRE(std::ranges::all_of(labels, [](const PackedInstance& label) { return label.mask_rle_offset == 0U && label.mask_rle_pairs == 0U; }));
-    REQUIRE(labels[0].bbox_x1 == 0);
-    REQUIRE(labels[0].bbox_y1 == 96);
-    REQUIRE(labels[0].bbox_x2 == 384);
-    REQUIRE(labels[0].bbox_y2 == 288);
+    REQUIRE(labels[0].bbox_x1 == 0.0F);
+    REQUIRE(labels[0].bbox_y1 == 96.0F);
+    REQUIRE(labels[0].bbox_x2 == 384.0F);
+    REQUIRE(labels[0].bbox_y2 == 288.0F);
     DatasetLoader::Config loader_config;
     loader_config.loading.h2d_dataloader = true;
     loader_config.compiled_path = output.string();
@@ -923,12 +923,16 @@ TEST_CASE("benchmark annotations retain provenance crowd area masks and determin
                             {"categories", {{{"id", 1}, {"name", "person"}}, {{"id", 2}, {"name", "human"}}}},
                             {"annotations", nlohmann::json::array()}};
     for (unsigned ordinal = 0; ordinal != 128U; ++ordinal) {
-        document["annotations"].push_back({{"id", 127U - ordinal}, {"image_id", 0}, {"category_id", ordinal % 2U + 1U},
-                                           {"bbox", {-0.5, 1.25, 13.0, 5.5}}, {"area", 7.25}, {"iscrowd", ordinal % 2U},
-                                           {"ignore", true}, {"segmentation", nlohmann::json::array()}});
+        document["annotations"].push_back({{"id", 127U - ordinal},
+                                           {"image_id", 0},
+                                           {"category_id", ordinal % 2U + 1U},
+                                           {"bbox", {-0.5, 1.25, 13.0, 5.5}},
+                                           {"area", 7.25},
+                                           {"iscrowd", ordinal % 2U},
+                                           {"ignore", true},
+                                           {"segmentation", nlohmann::json::array()}});
     }
-    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1},
-                                       {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
     write_text(path, document.dump());
     const std::array<NumericCategoryMapping, 2> mappings{{{1U, 0U, "person"}, {2U, 0U, "human"}}};
     AnnotationParseOptions options;
@@ -972,28 +976,45 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
     mmltk::testsupport::ScopedTempDir root("benchmark-admission");
     const auto path = root.path() / "annotations.json";
     nlohmann::json document{{"images", {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}}}},
-                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+                            {"categories", {{{"id", 1}, {"name", "person"}}}},
+                            {"annotations", nlohmann::json::array()}};
     const nlohmann::json base{{"image_id", 0}, {"category_id", 1}, {"bbox", {-0.5, 1.25, 13.0, 5.5}}};
     const auto append = [&](nlohmann::json record) { document["annotations"].push_back(std::move(record)); };
     auto record = base;
-    record["segmentation"] = nlohmann::json::array(); append(record);
-    record.erase("bbox"); record["segmentation"] = {{"size", {8, 16}}, {"counts", {0, 1, 127}}}; append(record);
-    record = base; record["segmentation"] = {{0, 0, 2, 0, 2, 2, 0, 2}}; append(record);
-    record = base; record["segmentation"] = {{"size", {4, 4}}, {"counts", {16}}}; append(record);
-    record["segmentation"] = {{"size", {8, 16}}, {"counts", "!"}}; append(record);
-    record["segmentation"] = {{"size", {8, 16}}, {"counts", {127}}}; append(record);
-    record["segmentation"] = {{0, 0, 1, 1}}; append(record);
-    record = base; record["bbox"] = {1e100, 0.0, 1e100, 1.0}; append(record);
-    record["bbox"] = {0.0, 0.0, 1e200, 1e200}; append(record);
+    record["segmentation"] = nlohmann::json::array();
+    append(record);
+    record.erase("bbox");
+    record["segmentation"] = {{"size", {8, 16}}, {"counts", {0, 1, 127}}};
+    append(record);
+    record = base;
+    record["segmentation"] = {{0, 0, 2, 0, 2, 2, 0, 2}};
+    append(record);
+    record = base;
+    record["segmentation"] = {{"size", {4, 4}}, {"counts", {16}}};
+    append(record);
+    record["segmentation"] = {{"size", {8, 16}}, {"counts", "!"}};
+    append(record);
+    record["segmentation"] = {{"size", {8, 16}}, {"counts", {127}}};
+    append(record);
+    record["segmentation"] = {{0, 0, 1, 1}};
+    append(record);
+    record = base;
+    record["bbox"] = {1e100, 0.0, 1e100, 1.0};
+    append(record);
+    record["bbox"] = {0.0, 0.0, 1e200, 1e200};
+    append(record);
     constexpr unsigned rejected_capacity = 4096U;
-    record = base; record["segmentation"] = {{"size", {8, 16}}, {"counts", {127}}};
+    record = base;
+    record["segmentation"] = {{"size", {8, 16}}, {"counts", {127}}};
     for (unsigned rejected = 0; rejected < rejected_capacity; ++rejected) append(record);
     write_text(path, document.dump());
     const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
     const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
     for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2}) {
         AnnotationParseOptions options;
-        options.source = source; options.split = "train"; options.num_workers = 1;
+        options.source = source;
+        options.split = "train";
+        options.num_workers = 1;
         const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
         options.num_workers = 4;
         const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
@@ -1017,13 +1038,16 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
     const auto classes = root.path() / "classes.csv";
     const auto boxes = root.path() / "boxes.csv";
     write_text(classes, "/m/person,Person\n");
-    write_text(boxes, "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax\n"
-                      "0000000000000000,xclick,/m/person,1,-0.1,0.8,0.2,0.9\n"
-                      "0000000000000000,xclick,/m/person,1,1e100,2e100,0.2,0.9\n"
-                      "0000000000000000,xclick,/m/person,1,0,1e200,0,1e200\n");
+    write_text(boxes,
+               "ImageID,Source,LabelName,Confidence,XMin,XMax,YMin,YMax\n"
+               "0000000000000000,xclick,/m/person,1,-0.1,0.8,0.2,0.9\n"
+               "0000000000000000,xclick,/m/person,1,1e100,2e100,0.2,0.9\n"
+               "0000000000000000,xclick,/m/person,1,0,1e200,0,1e200\n");
     const std::array<StringCategoryMapping, 1> open_mappings{{{"/m/person", 0U, "Person"}}};
     AnnotationParseOptions options;
-    options.source = BenchmarkDatasetSource::kOpenImagesV7; options.split = "train"; options.num_workers = 1;
+    options.source = BenchmarkDatasetSource::kOpenImagesV7;
+    options.split = "train";
+    options.num_workers = 1;
     const auto sequential = parse_open_images_annotations(boxes, classes, digest, open_mappings, options);
     options.num_workers = 4;
     const auto parallel = parse_open_images_annotations(boxes, classes, digest, open_mappings, options);
@@ -1038,10 +1062,14 @@ TEST_CASE("normalized benchmark caches require source category presence", "[back
     const std::string digest(64U, '0');
     for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2, BenchmarkDatasetSource::kOpenImagesV7}) {
         NormalizedAnnotationIndex index;
-        index.source = source; index.split = "train"; index.annotation_sha256 = digest;
+        index.source = source;
+        index.split = "train";
+        index.annotation_sha256 = digest;
         index.images.push_back(NormalizedImage{0U, 0U, 1U, 1U, 1U, 0U, 0U});
         NormalizedBox box;
-        box.x2 = 1.0F; box.y2 = 1.0F; box.original_area = 1.0;
+        box.x2 = 1.0F;
+        box.y2 = 1.0F;
+        box.original_area = 1.0;
         box.flags = kAnnotationCategory;
         box.source_category_id = source == BenchmarkDatasetSource::kOpenImagesV7 ? encode_open_images_category("/m/person") : 0U;
         index.boxes.push_back(box);
@@ -1064,35 +1092,33 @@ TEST_CASE("normalized benchmark caches require source category presence", "[back
 TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[backend][data][benchmark][annotations]") {
     mmltk::testsupport::ScopedTempDir root("bbox-first-admission");
     const auto path = root.path() / "annotations.json";
-    nlohmann::ordered_json document{{"images", {
-                                {{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}},
-                                {{"id", 1}, {"width", 4096}, {"height", 4096}, {"file_name", "patch0/1.jpg"}}}},
-                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::ordered_json::array()}};
+    nlohmann::ordered_json document{{"images",
+                                     {{{"id", 0}, {"width", 16}, {"height", 8}, {"file_name", "patch0/0.jpg"}},
+                                      {{"id", 1}, {"width", 4096}, {"height", 4096}, {"file_name", "patch0/1.jpg"}}}},
+                                    {"categories", {{{"id", 1}, {"name", "person"}}}},
+                                    {"annotations", nlohmann::ordered_json::array()}};
     // Invalid compressed RLE must not override a supplied degenerate bbox.
-    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 0, 1}},
-                                       {"segmentation", {{"size", {8, 16}}, {"counts", "!"}}}});
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {0, 0, 0, 1}}, {"segmentation", {{"size", {8, 16}}, {"counts", "!"}}}});
     // This valid all-background mask would otherwise allocate 16 MiB.
-    document["annotations"].push_back({{"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, -1, 1}},
-                                       {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
+    document["annotations"].push_back(
+        {{"image_id", 1}, {"category_id", 1}, {"bbox", {0, 0, -1, 1}}, {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
     // Normalized-float admission also runs before that mask can be allocated.
-    document["annotations"].push_back({{"image_id", 1}, {"category_id", 1}, {"bbox", {1e100, 0.0, 1e100, 1.0}},
-                                       {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
-    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"bbox", {-1, -1, 3, 3}},
-                                       {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
-    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1},
-                                       {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
+    document["annotations"].push_back(
+        {{"image_id", 1}, {"category_id", 1}, {"bbox", {1e100, 0.0, 1e100, 1.0}}, {"segmentation", {{"size", {4096, 4096}}, {"counts", {16777216U}}}}});
+    document["annotations"].push_back(
+        {{"image_id", 0}, {"category_id", 1}, {"bbox", {-1, -1, 3, 3}}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
+    document["annotations"].push_back({{"image_id", 0}, {"category_id", 1}, {"segmentation", {{"size", {8, 16}}, {"counts", {0, 1, 127}}}}});
     // Decode-time failures must remain irrelevant to a degenerate supplied box,
     // even when segmentation is encountered before the box and identities.
-    const std::array<nlohmann::ordered_json, 3> invalid_segmentations{
-        nlohmann::ordered_json(false),
-        nlohmann::ordered_json{{"size", {8, 16}}},
-        nlohmann::ordered_json::array({nlohmann::ordered_json::array({0, 0, 1})})};
+    const std::array<nlohmann::ordered_json, 3> invalid_segmentations{nlohmann::ordered_json(false), nlohmann::ordered_json{{"size", {8, 16}}},
+                                                                      nlohmann::ordered_json::array({nlohmann::ordered_json::array({0, 0, 1})})};
     for (const auto& segmentation : invalid_segmentations) {
         for (const bool segmentation_first : {false, true}) {
             for (const int bbox_width : {0, 1}) {
                 nlohmann::ordered_json record = nlohmann::ordered_json::object();
                 if (segmentation_first) record["segmentation"] = segmentation;
-                record["image_id"] = 0; record["category_id"] = 1;
+                record["image_id"] = 0;
+                record["category_id"] = 1;
                 record["bbox"] = {0, 0, bbox_width, 1};
                 if (!segmentation_first) record["segmentation"] = segmentation;
                 document["annotations"].push_back(std::move(record));
@@ -1106,7 +1132,9 @@ TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[b
     const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
     for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2}) {
         AnnotationParseOptions options;
-        options.source = source; options.split = "train"; options.num_workers = 1;
+        options.source = source;
+        options.split = "train";
+        options.num_workers = 1;
         const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
         options.num_workers = 4;
         const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
@@ -1141,8 +1169,8 @@ TEST_CASE("benchmark supplied bbox admission precedes mask materialization", "[b
 TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordinates", "[backend][data][benchmark][annotations]") {
     mmltk::testsupport::ScopedTempDir root("polygon-bounds");
     const auto path = root.path() / "annotations.json";
-    nlohmann::json document{{"images", {{{"id", 0}, {"width", 4}, {"height", 4}}}},
-                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+    nlohmann::json document{
+        {"images", {{{"id", 0}, {"width", 4}, {"height", 4}}}}, {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
     const std::array<std::vector<double>, 4> polygons{{
         {-1e308, -1e308, 1e308, -1e308, 1e308, 1e308, -1e308, 1e308},
         {1e308, 1e308, 1e308, 9e307, 9e307, 9e307},
@@ -1156,7 +1184,9 @@ TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordina
     const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
     for (const unsigned workers : {1U, 4U}) {
         AnnotationParseOptions options;
-        options.source = BenchmarkDatasetSource::kCoco2017; options.split = "train"; options.num_workers = workers;
+        options.source = BenchmarkDatasetSource::kCoco2017;
+        options.split = "train";
+        options.num_workers = workers;
         const auto index = parse_coco_style_annotations(path, digest, mappings, options);
         REQUIRE(index.boxes.size() == polygons.size());
         CHECK(index.rejected.malformed_records == 0U);
@@ -1173,7 +1203,6 @@ TEST_CASE("benchmark polygon raster bounds handle extreme and half-open coordina
         }
     }
 }
-
 TEST_CASE("generic and benchmark writers share complete format headers", "[backend][data][benchmark][compiler]") {
     namespace fixtures = mmltk::backend::data::testsupport;
     namespace resize = mmltk::backend::imaging::resample;
@@ -1184,10 +1213,9 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
     prepare_cached_image_directory(image_root);
     write_cached_image_atomically(cached_image_path(image_root, 1U), make_jpeg(128U, 64U, 32U), {});
     for (const auto mode : {resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox}) {
-        for (const std::string& annotation : {
-                 std::string{},
-                 std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
-                 std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"17:3 33:3 49:3"})"}}) {
+        for (const std::string& annotation :
+             {std::string{}, std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":""})"},
+              std::string{R"({"class":"person","bbox_xyxy":[1,1,4,4],"mask_rle_encoding":"row_major_start_length","mask_rle":"17:3 33:3 49:3"})"}}) {
             write_text(fs::path(fixtures::dataset_dir(fixture)) / "train/000001.jsonl", annotation);
             auto config = fixtures::compiler_config(fixture);
             config.num_workers = 1;

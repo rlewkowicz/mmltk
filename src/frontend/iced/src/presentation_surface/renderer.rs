@@ -3400,9 +3400,14 @@ mod tests {
                     originalcontent: original,
                 };
                 for kernel in crate::generated::UPSCALE_KERNEL_VALUES.iter().copied() {
-                    assert_eq!(viewer_upscale_request(kernel), Some(crate::generated::UpscaleRequest {
-                        source: source.frame.clone(), document: source.document.clone(), kernel,
-                    }));
+                    assert_eq!(
+                        viewer_upscale_request(kernel),
+                        Some(crate::generated::UpscaleRequest {
+                            source: source.frame.clone(),
+                            document: source.document.clone(),
+                            kernel,
+                        })
+                    );
                 }
                 assert_eq!(viewer_annotation_request(), Some(expected.clone()));
                 if !original {
@@ -3427,8 +3432,12 @@ mod tests {
                     }
                     record_drawn_detail(mixed, recorded);
                     assert!(viewer_annotation_request().is_none());
-                    if invalid != 3 { // Annotation also validates its independently recorded crop.
-                        assert!(viewer_upscale_request(crate::generated::UpscaleKernel::Default).is_none());
+                    if invalid != 3 {
+                        // Annotation also validates its independently recorded crop.
+                        assert!(
+                            viewer_upscale_request(crate::generated::UpscaleKernel::Default)
+                                .is_none()
+                        );
                     }
                 }
                 record_drawn_detail(surface, crop);
@@ -3593,7 +3602,12 @@ mod tests {
         let (model, frame) = crate::view_model::test_support::explore_presentation();
         let mut source =
             crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
-        source.frame.content = crate::generated::VisualRegion { x: 2, y: 1, width: 8, height: 6 };
+        source.frame.content = crate::generated::VisualRegion {
+            x: 2,
+            y: 1,
+            width: 8,
+            height: 6,
+        };
         let mut upscale_frame = source.frame.clone();
         upscale_frame.extent.width *= 4;
         upscale_frame.extent.height *= 4;

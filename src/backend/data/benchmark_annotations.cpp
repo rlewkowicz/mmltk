@@ -292,7 +292,8 @@ void parallel_object_array(const PaddedMappedFile& file, const ByteRange array, 
         simdjson::ondemand::parser parser;
         for (std::size_t range_index = begin; range_index < end; ++range_index) {
             throw_if_benchmark_cancelled(cancel_requested);
-            for_each_object(file, ranges[range_index], parser, [&](simdjson::ondemand::object object, std::uint64_t ordinal) { callback(worker, object, ordinal); });
+            for_each_object(file, ranges[range_index], parser,
+                            [&](simdjson::ondemand::object object, std::uint64_t ordinal) { callback(worker, object, ordinal); });
         }
     });
 }
@@ -452,8 +453,8 @@ void parse_segmentation(simdjson::ondemand::value value, ParsedAnnotation::Segme
             parsed.has_area = true;
         } else if (key == "iscrowd" || key == "ignore") {
             auto flag_value = field.value();
-            const auto flag = flag_value.type().value() == simdjson::ondemand::json_type::boolean ?
-                static_cast<std::uint64_t>(flag_value.get_bool().value()) : flag_value.get_uint64().value();
+            const auto flag = flag_value.type().value() == simdjson::ondemand::json_type::boolean ? static_cast<std::uint64_t>(flag_value.get_bool().value())
+                                                                                                  : flag_value.get_uint64().value();
             if (flag > 1U) throw std::runtime_error("invalid annotation flag");
             if (flag) parsed.flags |= key == "iscrowd" ? kAnnotationCrowd : kAnnotationIgnore;
         } else if (key == "segmentation") {
@@ -642,8 +643,8 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
     }
     return dataset::encode_dense_row_major_mask(dense, dimensions).pairs;
 }
-[[nodiscard]] std::vector<RLEPair> materialize_segmentation(const ParsedAnnotation& annotation, const ParsedImage& image,
-                                                            const PaddedMappedFile& file, simdjson::ondemand::parser& parser) {
+[[nodiscard]] std::vector<RLEPair> materialize_segmentation(const ParsedAnnotation& annotation, const ParsedImage& image, const PaddedMappedFile& file,
+                                                            simdjson::ondemand::parser& parser) {
     if (!annotation.has_mask) return {};
     const auto raw = annotation.segmentation_json;
     const auto offset = static_cast<std::size_t>(raw.data() - file.data());
@@ -665,8 +666,8 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
 }
 [[nodiscard]] std::optional<BoxCandidate> normalize_coco_box(const ParsedAnnotation& annotation, const std::vector<ParsedImage>& images,
                                                              const std::unordered_map<std::uint64_t, std::uint32_t>& image_lookup,
-                                                             const CategoryLookup& categories, AnnotationRejectCounts* rejected,
-                                                             const PaddedMappedFile& file, simdjson::ondemand::parser& segmentation_parser) {
+                                                             const CategoryLookup& categories, AnnotationRejectCounts* rejected, const PaddedMappedFile& file,
+                                                             simdjson::ondemand::parser& segmentation_parser) {
     if (!annotation.complete) {
         ++rejected->malformed_records;
         return std::nullopt;
@@ -686,15 +687,24 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
     double x2 = x1 + annotation.bbox[2], y2 = y1 + annotation.bbox[3];
     if (!annotation.has_bbox) {
         mask = materialize_segmentation(annotation, metadata, file, segmentation_parser);
-        if (mask.empty()) { ++rejected->malformed_records; return std::nullopt; }
+        if (mask.empty()) {
+            ++rejected->malformed_records;
+            return std::nullopt;
+        }
         const auto bounds = dataset::row_major_mask_bounds(mask, {metadata.width, metadata.height});
-        x1 = bounds.min_x; y1 = bounds.min_y; x2 = bounds.max_x; y2 = bounds.max_y;
+        x1 = bounds.min_x;
+        y1 = bounds.min_y;
+        x2 = bounds.max_x;
+        y2 = bounds.max_y;
     }
     if (!std::isfinite(x1) || !std::isfinite(y1) || !std::isfinite(x2) || !std::isfinite(y2)) {
         ++rejected->malformed_records;
         return std::nullopt;
     }
-    if (x2 <= x1 || y2 <= y1) { ++rejected->degenerate_boxes; return std::nullopt; }
+    if (x2 <= x1 || y2 <= y1) {
+        ++rejected->degenerate_boxes;
+        return std::nullopt;
+    }
     BoxCandidate result;
     result.image_index = image->second;
     if (!store_normalized_coordinates(result.box, {x1 / metadata.width, y1 / metadata.height, x2 / metadata.width, y2 / metadata.height})) {
@@ -748,8 +758,8 @@ void rasterize_coco_polygons(const std::vector<std::vector<double>>& polygons, c
                           {"duplicates", index.rejected.duplicate_boxes}};
 }
 void compact_annotations(NormalizedAnnotationIndex* index, const std::vector<ParsedImage>& parsed_images, const std::vector<std::uint64_t>& offsets,
-                             const std::span<const std::uint64_t> accepted_ends, std::vector<NormalizedBox> boxes, std::vector<std::vector<RLEPair>> masks, const bool keep_empty,
-                             mmltk::common::concurrency::CancellationObservation cancel_requested) {
+                         const std::span<const std::uint64_t> accepted_ends, std::vector<NormalizedBox> boxes, std::vector<std::vector<RLEPair>> masks,
+                         const bool keep_empty, mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if (offsets.size() != parsed_images.size() + 1U || accepted_ends.size() != parsed_images.size())
         throw std::runtime_error("accepted annotation image ranges are inconsistent");
     std::size_t accepted_boxes = 0U;
@@ -1019,18 +1029,16 @@ void validate_normalized_records(const NormalizedAnnotationIndex& index, mmltk::
         for (std::uint64_t box_index = image.first_box; box_index < image.first_box + image.box_count; ++box_index) {
             const NormalizedBox& box = index.boxes[checked_cast<std::size_t>(box_index, "box index overflow")];
             if (box.class_id >= coco80_class_names().size() || !std::isfinite(box.x1) || !std::isfinite(box.y1) || !std::isfinite(box.x2) ||
-                !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1 ||
-                !std::isfinite(box.original_area) || box.original_area < 0.0 || (box.flags & ~kAnnotationFlags) != 0U ||
-                (box.flags & kAnnotationCategory) == 0U ||
-                ((box.flags & kAnnotationMask) == 0U && box.mask_rle_pairs != 0U) ||
-                ((box.flags & kAnnotationId) == 0U && box.annotation_id != 0U) ||
-                ((box.flags & kAnnotationCategory) == 0U && box.source_category_id != 0U) ||
-                box.mask_rle_offset != expected_mask_offset || expected_mask_offset > index.mask_rle_pairs.size() ||
-                box.mask_rle_pairs > index.mask_rle_pairs.size() - expected_mask_offset ||
+                !std::isfinite(box.y2) || box.x2 <= box.x1 || box.y2 <= box.y1 || !std::isfinite(box.original_area) || box.original_area < 0.0 ||
+                (box.flags & ~kAnnotationFlags) != 0U || (box.flags & kAnnotationCategory) == 0U ||
+                ((box.flags & kAnnotationMask) == 0U && box.mask_rle_pairs != 0U) || ((box.flags & kAnnotationId) == 0U && box.annotation_id != 0U) ||
+                ((box.flags & kAnnotationCategory) == 0U && box.source_category_id != 0U) || box.mask_rle_offset != expected_mask_offset ||
+                expected_mask_offset > index.mask_rle_pairs.size() || box.mask_rle_pairs > index.mask_rle_pairs.size() - expected_mask_offset ||
                 !std::ranges::all_of(box.reserved, [](const std::uint8_t value) { return value == 0U; })) {
                 throw std::runtime_error("normalized benchmark box record is invalid");
             }
-            if (index.source == BenchmarkDatasetSource::kOpenImagesV7 && (box.flags & kAnnotationCategory) != 0U && !valid_open_images_category(box.source_category_id))
+            if (index.source == BenchmarkDatasetSource::kOpenImagesV7 && (box.flags & kAnnotationCategory) != 0U &&
+                !valid_open_images_category(box.source_category_id))
                 throw std::runtime_error("invalid normalized Open Images source category");
             const std::uint64_t mask_pixels = static_cast<std::uint64_t>(image.width) * image.height;
             std::uint64_t previous_end = 0U;
@@ -1087,14 +1095,18 @@ NormalizedAnnotationIndex parse_coco_style_annotations(const std::filesystem::pa
             std::optional<std::uint32_t> category_id;
             for (auto field : object) {
                 const simdjson::ondemand::raw_json_string key = field.key();
-                if (key == "image_id") image_id = field.value().get_uint64().value();
-                else if (key == "category_id") category_id = checked_cast<std::uint32_t>(field.value().get_uint64().value(), "category ID overflow");
+                if (key == "image_id")
+                    image_id = field.value().get_uint64().value();
+                else if (key == "category_id")
+                    category_id = checked_cast<std::uint32_t>(field.value().get_uint64().value(), "category ID overflow");
             }
             if (!image_id || !category_id || *category_id >= category_lookup.target_by_id.size() || category_lookup.target_by_id[*category_id] < 0) return;
             const auto image = image_lookup.find(*image_id);
             if (image == image_lookup.end()) return;
             image_index = image->second;
-        } catch (const simdjson::simdjson_error&) { return; } catch (const std::runtime_error&) { return; }
+        } catch (const simdjson::simdjson_error&) { return; } catch (const std::runtime_error&) {
+            return;
+        }
         const auto previous = std::atomic_ref<std::uint32_t>(counts[*image_index]).fetch_add(1U, std::memory_order_relaxed);
         if (previous == std::numeric_limits<std::uint32_t>::max()) throw std::overflow_error("benchmark per-image annotation capacity overflow");
     });
@@ -1112,34 +1124,38 @@ NormalizedAnnotationIndex parse_coco_style_annotations(const std::filesystem::pa
     // Independent worker-local parsers retain their capacity and cannot invalidate
     // the outer document while decoding a borrowed segmentation slice.
     std::vector<simdjson::ondemand::parser> segmentation_parsers(static_cast<std::size_t>(workers));
-    parallel_object_array(file, annotations_array, workers, options.cancel_requested, [&](const int worker, simdjson::ondemand::object object, std::uint64_t ordinal) {
-        auto& rejected = worker_rejected[static_cast<std::size_t>(worker)];
-        ++rejected.raw_records;
-        std::optional<BoxCandidate> candidate;
-        try {
-            const auto annotation = parse_annotation_object(object);
-            candidate = normalize_coco_box(annotation, images, image_lookup, category_lookup, &rejected, file,
-                                           segmentation_parsers[static_cast<std::size_t>(worker)]);
-        } catch (const simdjson::simdjson_error&) {
-            ++rejected.malformed_records;
-            return;
-        } catch (const std::runtime_error&) {
-            ++rejected.malformed_records;
-            return;
-        }
-        if (candidate) {
-            const std::uint64_t destination = std::atomic_ref<std::uint64_t>(cursors[candidate->image_index]).fetch_add(1U, std::memory_order_relaxed);
-            if (destination >= offsets[candidate->image_index + 1U]) { throw std::runtime_error("benchmark annotation fill exceeds its counted image span"); }
-            const std::size_t target = checked_cast<std::size_t>(destination, "benchmark normalized box offset overflow");
-            candidate->box.source_ordinal = ordinal;
-            candidate->box.mask_rle_offset = destination;
-            candidate->box.mask_rle_pairs = checked_cast<std::uint32_t>(candidate->mask_rle.size(), "normalized mask run count overflow");
-            boxes[target] = candidate->box;
-            masks[target] = std::move(candidate->mask_rle);
-        }
-    });
+    parallel_object_array(
+        file, annotations_array, workers, options.cancel_requested, [&](const int worker, simdjson::ondemand::object object, std::uint64_t ordinal) {
+            auto& rejected = worker_rejected[static_cast<std::size_t>(worker)];
+            ++rejected.raw_records;
+            std::optional<BoxCandidate> candidate;
+            try {
+                const auto annotation = parse_annotation_object(object);
+                candidate = normalize_coco_box(annotation, images, image_lookup, category_lookup, &rejected, file,
+                                               segmentation_parsers[static_cast<std::size_t>(worker)]);
+            } catch (const simdjson::simdjson_error&) {
+                ++rejected.malformed_records;
+                return;
+            } catch (const std::runtime_error&) {
+                ++rejected.malformed_records;
+                return;
+            }
+            if (candidate) {
+                const std::uint64_t destination = std::atomic_ref<std::uint64_t>(cursors[candidate->image_index]).fetch_add(1U, std::memory_order_relaxed);
+                if (destination >= offsets[candidate->image_index + 1U]) {
+                    throw std::runtime_error("benchmark annotation fill exceeds its counted image span");
+                }
+                const std::size_t target = checked_cast<std::size_t>(destination, "benchmark normalized box offset overflow");
+                candidate->box.source_ordinal = ordinal;
+                candidate->box.mask_rle_offset = destination;
+                candidate->box.mask_rle_pairs = checked_cast<std::uint32_t>(candidate->mask_rle.size(), "normalized mask run count overflow");
+                boxes[target] = candidate->box;
+                masks[target] = std::move(candidate->mask_rle);
+            }
+        });
     NormalizedAnnotationIndex result = begin_normalized_index_result(options.source, options.split, std::move(annotation_sha256), worker_rejected);
-    compact_annotations(&result, images, offsets, cursors, std::move(boxes), std::move(masks), options.keep_images_without_mapped_boxes, options.cancel_requested);
+    compact_annotations(&result, images, offsets, cursors, std::move(boxes), std::move(masks), options.keep_images_without_mapped_boxes,
+                        options.cancel_requested);
     validate_normalized_records(result, options.cancel_requested);
     trace_benchmark_event(options.trace, "benchmark.annotations.indexed", [&] {
         nlohmann::json event = normalized_index_trace_json(result);

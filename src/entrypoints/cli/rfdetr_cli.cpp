@@ -147,7 +147,8 @@ inline constexpr std::array kEvaluateOptions{
     reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::tensorrt_path>("--tensorrt", "TensorRT engine path", "Model input"),
     reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::preset_name>("--preset", "Declared preset", "Model input"),
     reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::resolution>("--resolution", "Square model resolution", "Model input"),
-    reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::candidate_count>("--candidate-count", "Selected candidate count (0: admitted model default)", "Model input"),
+    reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::candidate_count>(
+        "--candidate-count", "Selected candidate count (0: admitted model default)", "Model input"),
     reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::batch_size>("--batch-size", "Evaluation batch size", "Execution"),
     reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::device_id>("--device-id", "CUDA device id", "Execution"),
     reflection::option<rfdetr::EvaluateRequest, &rfdetr::EvaluateRequest::limit_images>("--limit-images", "Image limit", "Execution"),
@@ -205,7 +206,8 @@ inline constexpr std::array kPredictOptions{
     reflection::option<PredictCliRequest, reflection::member_path<&PredictCliRequest::request, &rfdetr::PredictRequest::compilation_mode>>(
         "--compile-mode", "Native compilation mode", "Execution")};
 inline constexpr std::array kValidateOptions{
-    reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::compile_resize_mode>("--resize-mode", "Compile image geometry: Stretch or Letterbox", "Dataset"),
+    reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::compile_resize_mode>("--resize-mode", "Compile image geometry: Stretch or Letterbox",
+                                                                                               "Dataset"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::negative_flag<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::numa_node>("--numa-node", "GPU-local NUMA node (-1 automatic)", "Execution"),
@@ -227,7 +229,8 @@ inline constexpr std::array kValidateOptions{
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::eval_order>("--eval-order", "Backend evaluation order", "Output"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::batch_size>("--batch-size", "Evaluation batch size", "Execution"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::limit_images>("--limit-images", "Image limit", "Execution"),
-    reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::candidate_count>("--candidate-count", "Selected candidate count (0: admitted model default)", "Execution"),
+    reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::candidate_count>("--candidate-count",
+                                                                                           "Selected candidate count (0: admitted model default)", "Execution"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::eval_max_dets>("--eval-max-dets", "Detection cap", "Execution"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::alignment_images>("--alignment-images", "Backend alignment sample count",
                                                                                             "Execution"),

@@ -112,9 +112,7 @@ thread_local! {
 }
 
 pub(super) fn valid_content(frame: &generated::VisualFrame) -> bool {
-    frame.source.instance != 0
-        && frame.revision != 0
-        && valid_region(&frame.content, &frame.extent)
+    frame.source.instance != 0 && frame.revision != 0 && valid_region(&frame.content, &frame.extent)
 }
 
 fn valid_region(region: &generated::VisualRegion, extent: &generated::VisualExtent) -> bool {
@@ -145,7 +143,8 @@ fn valid_validation(snapshot: &generated::ValidationImageMetadata) -> bool {
         && snapshot.detail == snapshot.selected.is_some()
         && (!snapshot.detail
             || snapshot.samples.iter().any(|sample| {
-                sample.available && Some(&sample.identity) == snapshot.selected.as_ref()
+                sample.available
+                    && Some(&sample.identity) == snapshot.selected.as_ref()
                     && snapshot.frame.extent == sample.pixelextent
                     && snapshot.frame.content == sample.content
                     && snapshot.frame.sourceextent == sample.sourceextent
@@ -223,10 +222,19 @@ pub(crate) fn install(
         WorkspaceImageProduct::Upscale(snapshot) if snapshot.frame == metadata.frame => {
             if !valid_content(&snapshot.frame)
                 || snapshot.frame.sourceextent != snapshot.input.sourceextent
-                || snapshot.input.sourceextent.width == 0 || snapshot.input.sourceextent.height == 0
-                || snapshot.input.extent.checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE).as_ref()
+                || snapshot.input.sourceextent.width == 0
+                || snapshot.input.sourceextent.height == 0
+                || snapshot
+                    .input
+                    .extent
+                    .checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE)
+                    .as_ref()
                     != Some(&snapshot.frame.extent)
-                || snapshot.input.content.checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE).as_ref()
+                || snapshot
+                    .input
+                    .content
+                    .checked_scale(generated::UpscaleImageMetadata::OUTPUT_SCALE)
+                    .as_ref()
                     != Some(&snapshot.frame.content)
             {
                 return Err("invalid derived image geometry".into());
@@ -447,17 +455,53 @@ mod tests {
     fn generated_pixel_geometry_scaling_checks_each_member() {
         let scale = generated::UpscaleImageMetadata::OUTPUT_SCALE;
         assert_eq!(scale, 4);
-        let region = generated::VisualRegion { x: 2, y: 3, width: 5, height: 7 };
-        assert_eq!(region.checked_scale(scale), Some(generated::VisualRegion {
-            x: 8, y: 12, width: 20, height: 28,
-        }));
-        assert_eq!(region.checked_scale(0), Some(generated::VisualRegion { x: 0, y: 0, width: 0, height: 0 }));
+        let region = generated::VisualRegion {
+            x: 2,
+            y: 3,
+            width: 5,
+            height: 7,
+        };
+        assert_eq!(
+            region.checked_scale(scale),
+            Some(generated::VisualRegion {
+                x: 8,
+                y: 12,
+                width: 20,
+                height: 28,
+            })
+        );
+        assert_eq!(
+            region.checked_scale(0),
+            Some(generated::VisualRegion {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0
+            })
+        );
         let limit = u32::MAX / scale;
-        assert_eq!(generated::VisualExtent { width: limit, height: limit }.checked_scale(scale),
-            Some(generated::VisualExtent { width: limit * scale, height: limit * scale }));
+        assert_eq!(
+            generated::VisualExtent {
+                width: limit,
+                height: limit
+            }
+            .checked_scale(scale),
+            Some(generated::VisualExtent {
+                width: limit * scale,
+                height: limit * scale
+            })
+        );
         for member in 0..6 {
-            let mut extent = generated::VisualExtent { width: 1, height: 1 };
-            let mut region = generated::VisualRegion { x: 1, y: 1, width: 1, height: 1 };
+            let mut extent = generated::VisualExtent {
+                width: 1,
+                height: 1,
+            };
+            let mut region = generated::VisualRegion {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            };
             match member {
                 0 => extent.width = limit + 1,
                 1 => extent.height = limit + 1,
@@ -474,9 +518,22 @@ mod tests {
     #[test]
     fn paired_geometry_rejects_missing_source_and_inconsistent_samples() {
         let (model, _) = crate::view_model::test_support::explore_presentation();
-        let mut detail = generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
-        for region in [generated::VisualRegion { x: 0, y: 0, width: 640, height: 480 },
-                       generated::VisualRegion { x: 0, y: 80, width: 640, height: 320 }] {
+        let mut detail =
+            generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+        for region in [
+            generated::VisualRegion {
+                x: 0,
+                y: 0,
+                width: 640,
+                height: 480,
+            },
+            generated::VisualRegion {
+                x: 0,
+                y: 80,
+                width: 640,
+                height: 320,
+            },
+        ] {
             detail.frame.content = region;
             assert!(valid_detail(&detail));
             for (width, height) in [(0, 480), (640, 0)] {
@@ -486,15 +543,32 @@ mod tests {
             }
         }
         let mut image = crate::view_model::test_support::validation_image_metadata();
-        for region in [generated::VisualRegion { x: 0, y: 0, width: 200, height: 200 },
-                       generated::VisualRegion { x: 0, y: 50, width: 200, height: 100 }] {
+        for region in [
+            generated::VisualRegion {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            },
+            generated::VisualRegion {
+                x: 0,
+                y: 50,
+                width: 200,
+                height: 100,
+            },
+        ] {
             image.detail = true;
             image.selected = Some(image.samples[0].identity.clone());
             image.samples[0].content = region.clone();
             image.frame.content = region;
             image.frame.extent = image.samples[0].pixelextent.clone();
             image.frame.sourceextent = image.samples[0].sourceextent.clone();
-            image.samples[0].crop = generated::VisualRegion { x: 0, y: 0, width: 200, height: 200 };
+            image.samples[0].crop = generated::VisualRegion {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            };
             assert!(valid_validation(&image));
             for invalid in 0..5 {
                 let mut changed = image.clone();
@@ -619,8 +693,14 @@ mod tests {
                 3 => changed.frame.content.x += 1,
                 _ => changed.input.extent.width = u32::MAX,
             }
-            let bytes = encode(changed.frame.clone(), encode_product(generated::ApplicationSystem::Upscale, changed),
-                Some(encode_product(generated::ApplicationSystem::Validation, source.clone())));
+            let bytes = encode(
+                changed.frame.clone(),
+                encode_product(generated::ApplicationSystem::Upscale, changed),
+                Some(encode_product(
+                    generated::ApplicationSystem::Validation,
+                    source.clone(),
+                )),
+            );
             assert!(install(physical, 800, 800, 2, &bytes).is_err());
             assert!(pending(physical).is_none());
         }

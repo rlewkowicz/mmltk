@@ -799,8 +799,18 @@ fn validate_server_fixture() -> Result<(), Box<dyn std::error::Error>> {
                     width: 640,
                     height: 640,
                 }
-            && sample_image.samples[0].sourceextent == generated::VisualExtent { width: 1280, height: 640 }
-            && sample_image.samples[0].content == generated::VisualRegion { x: 0, y: 160, width: 640, height: 320 }
+            && sample_image.samples[0].sourceextent
+                == generated::VisualExtent {
+                    width: 1280,
+                    height: 640,
+                }
+            && sample_image.samples[0].content
+                == generated::VisualRegion {
+                    x: 0,
+                    y: 160,
+                    width: 640,
+                    height: 320,
+                }
             && sample_image.overlays.predictionlayer
             && sample_image.overlays.groundtruthlayer
             && sample_image.samples[0].labels[0].groundtruth

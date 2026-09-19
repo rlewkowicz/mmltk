@@ -63,7 +63,10 @@ pub(crate) fn visual_frame(kind: PresentationSourceKind, revision: u64) -> Visua
         },
         revision,
         cleanrevision: revision,
-        sourceextent: crate::generated::VisualExtent { width: 640, height: 480 },
+        sourceextent: crate::generated::VisualExtent {
+            width: 640,
+            height: 480,
+        },
         content: crate::generated::VisualRegion {
             x: 0,
             y: 0,
@@ -241,8 +244,16 @@ pub(crate) fn validation_image_metadata() -> crate::generated::ValidationImageMe
                 width: 192,
                 height: 192,
             },
-            sourceextent: VisualExtent { width: 400, height: 200 },
-            content: VisualRegion { x: 0, y: 0, width: 200, height: 200 },
+            sourceextent: VisualExtent {
+                width: 400,
+                height: 200,
+            },
+            content: VisualRegion {
+                x: 0,
+                y: 0,
+                width: 200,
+                height: 200,
+            },
             pixelextent: VisualExtent {
                 width: 200,
                 height: 200,

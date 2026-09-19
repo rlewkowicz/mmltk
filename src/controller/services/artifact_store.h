@@ -74,9 +74,11 @@ class ArtifactCompilerOperations {
    private:
     friend class ArtifactStore;
     virtual void compile_directory(const std::filesystem::path& source, const std::filesystem::path& output, std::uint32_t resolution,
-                                   bool perceptual_downscale, mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver) const = 0;
-    virtual void compile_benchmark(const std::filesystem::path& output, std::uint32_t resolution, bool perceptual_downscale, mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
-                                   mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver, ArtifactBenchmarkTraceObserver) const = 0;
+                                   bool perceptual_downscale, mmltk::backend::imaging::resample::ImageResizeMode resize_mode,
+                                   mmltk::common::concurrency::CancellationObservation, ArtifactProgressObserver) const = 0;
+    virtual void compile_benchmark(const std::filesystem::path& output, std::uint32_t resolution, bool perceptual_downscale,
+                                   mmltk::backend::imaging::resample::ImageResizeMode resize_mode, mmltk::common::concurrency::CancellationObservation,
+                                   ArtifactProgressObserver, ArtifactBenchmarkTraceObserver) const = 0;
 };
 struct ArtifactCompileResult final {
     std::filesystem::path output;

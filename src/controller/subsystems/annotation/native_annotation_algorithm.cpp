@@ -52,8 +52,10 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     [[nodiscard]] domain::AnnotationColor Sample(const domain::AnnotationPoint point) override {
         if (!sample_host_) sample_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
         sample_host_->ensure_bytes(4);
-        const auto x = std::min(static_cast<unsigned>(point.x * static_cast<float>(crop_.width) / static_cast<float>(target_.width)), crop_.width - 1U) + crop_.x;
-        const auto y = std::min(static_cast<unsigned>(point.y * static_cast<float>(crop_.height) / static_cast<float>(target_.height)), crop_.height - 1U) + crop_.y;
+        const auto x =
+            std::min(static_cast<unsigned>(point.x * static_cast<float>(crop_.width) / static_cast<float>(target_.width)), crop_.width - 1U) + crop_.x;
+        const auto y =
+            std::min(static_cast<unsigned>(point.y * static_cast<float>(crop_.height) / static_cast<float>(target_.height)), crop_.height - 1U) + crop_.y;
         if (cudaMemcpy(sample_host_->data(), reinterpret_cast<const void*>(source_.data + y * source_.descriptor.pitch_bytes + x * 4U), 4,
                        cudaMemcpyDeviceToHost) != cudaSuccess)
             throw std::runtime_error("Annotation color sample failed");
@@ -203,8 +205,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                               static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)};
             if (!source.valid()) throw std::runtime_error("Annotation clean baseline source is unavailable");
             const auto status = input.width == output.width && input.height == output.height
-                                    ? cudaMemcpy2DAsync(output.pixels, output.pitch_bytes, input.pixels, input.pitch_bytes,
-                                                        clean.descriptor.row_bytes(), clean.descriptor.height, cudaMemcpyDeviceToDevice, stream)
+                                    ? cudaMemcpy2DAsync(output.pixels, output.pitch_bytes, input.pixels, input.pitch_bytes, clean.descriptor.row_bytes(),
+                                                        clean.descriptor.height, cudaMemcpyDeviceToDevice, stream)
                                     : static_cast<cudaError_t>(raster::scale_rgba_nearest(input, output, stream_value));
             if (status != cudaSuccess) throw std::runtime_error("Annotation clean baseline preparation failed");
         }

@@ -760,7 +760,7 @@ TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask 
         std::uint32_t foreground = 0;
         for (std::uint32_t slot = 0; slot < 3; ++slot)
             record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt}
-                                                   : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
+                                                    : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
         r::ClassPostprocessLane classes(std::make_shared<const r::ResolvedClassLayout>(record));
         classes.Prepare(torch::kCPU);
         r::OutputTensors outputs;

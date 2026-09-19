@@ -97,7 +97,7 @@ class PredictionPreviewPool final {
         decltype(&cudaEventRecord) record;
         decltype(&cudaStreamSynchronize) settle;
         decltype(&cuMemHostRegister) register_host;
-        decltype(&cudaMemcpyAsync) upload = &cudaMemcpyAsync;
+        cudaError_t (*upload)(void*, const void*, std::size_t, cudaMemcpyKind, cudaStream_t) = &cudaMemcpyAsync;
         mmltk::frameworks::gpu::CudaContextApi context_api{};
         decltype(&mmltk::backend::imaging::raster::chw_float_to_rgba) convert = &mmltk::backend::imaging::raster::chw_float_to_rgba;
         decltype(&cudaStreamWaitEvent) wait = &cudaStreamWaitEvent;
