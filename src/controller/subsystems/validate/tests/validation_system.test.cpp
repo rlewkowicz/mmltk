@@ -408,6 +408,51 @@ TEST_CASE("validation preview generations settle to retained source custody with
     image = {};
     samples.Shutdown();
 }
+TEST_CASE("Validation documents preserve off-box empty and missing masks through crop and upscale", "[controller][gpu][validation]") {
+    namespace gpu = mmltk::frameworks::gpu;
+    namespace rfdetr = mmltk::backend::models::rfdetr;
+    const auto execution = gpu::resolve_device_execution(0, mmltk::common::system::NumaTopology::Capture());
+    std::mutex mutex;
+    std::condition_variable changed;
+    detail::ValidationSamples samples({.device = 0, .maximum_width = 96, .maximum_height = 96}, [&] {
+        std::scoped_lock lock(mutex);
+        changed.notify_all();
+    });
+    const std::array<std::uint32_t, 1> indices{0};
+    samples.Begin(1, indices);
+    const auto catalog = std::make_shared<const mmltk::backend::data::catalog::ClassCatalog>(std::vector<std::string>{"object"});
+    std::array<float, 8 * 8 * 3> pixels{};
+    auto source = PredictionSource::Device(execution, {8, 8}, pixels, {}, catalog);
+    std::array<rfdetr::Prediction, 3> truth{};
+    for (auto& object : truth) {
+        object.class_reference = 0;
+        object.bbox_xyxy = {4.25F, 3.25F, 7.75F, 5.75F};
+    }
+    truth[0].has_mask = truth[1].has_mask = true;
+    truth[0].mask = {.height = 8, .width = 8, .area = 1, .runs = {{16, 1}}};
+    truth[1].mask = {.height = 8, .width = 8};
+    const rfdetr::PredictionRecord record{.dataset_index = 0, .detections = source.detections()};
+    samples.Capture(1, {record, {.chw = source.pixels(), .width = 8, .height = 8, .device = 0, .custody = source.custody()},
+        source.annotations(), truth, {.resized_width = 8, .resized_height = 4, .offset_y = 2}, 8, 4});
+    await_validation(mutex, changed, [&] { return samples.snapshot().sample_available[0]; });
+    samples.Select({1, 0});
+    await_validation(mutex, changed, [&] { return samples.snapshot().detail; });
+    const auto frame = samples.snapshot().frame;
+    auto borrowed = samples.BorrowDocument(frame);
+    REQUIRE(borrowed.valid());
+    const auto imported = materialize_visual_document(*borrowed.document, frame.extent, frame.content);
+    REQUIRE(imported.objects.size() == 3);
+    CHECK(imported.objects[0].box == contracts::AnnotationBox{{4.25F, 1.25F}, {7.75F, 3.75F}});
+    CHECK(imported.objects[0].mask.runs == std::vector<contracts::AnnotationMaskRun>{{0, 0, 0}});
+    CHECK(imported.objects[1].mask.present);
+    CHECK(imported.objects[1].mask.runs.empty());
+    CHECK_FALSE(imported.objects[2].mask.present);
+    const auto scaled = scale_visual_document(borrowed.document, 4);
+    const auto enlarged = materialize_visual_document(*scaled, {32, 32}, {0, 8, 32, 16});
+    CHECK(enlarged.objects[0].mask.runs == std::vector<contracts::AnnotationMaskRun>{{0, 0, 3}, {1, 0, 3}, {2, 0, 3}, {3, 0, 3}});
+    borrowed = {};
+    samples.Shutdown();
+}
 TEST_CASE("validation requires a nonzero rectangular two by three atlas envelope", "[controller][validation]") {
     CHECK_THROWS_AS(detail::ValidationSamples({.device = 0, .maximum_width = 2U, .maximum_height = 2U}, {}), contracts::InvalidIntentError);
     CHECK_THROWS_AS(detail::ValidationSamples({.device = 0, .maximum_width = 3U, .maximum_height = 1U}, {}), contracts::InvalidIntentError);

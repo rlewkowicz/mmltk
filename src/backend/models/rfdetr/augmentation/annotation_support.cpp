@@ -3,26 +3,15 @@
 #include "src/backend/imaging/sampling.h"
 #include <cmath>
 #include <stdexcept>
+#include <limits>
 namespace mmltk::backend::models::rfdetr {
 namespace {
 constexpr std::array<float, 6> identity{1, 0, 0, 0, 1, 0};
 AugmentationAnnotationSupport mask_extent(std::span<const mmltk::backend::data::RLEPair> runs, int width, int height) {
-    AugmentationAnnotationSupport support{{1, 1, 0, 0}, 0, true};
-    const float image_width = static_cast<float>(width), image_height = static_cast<float>(height);
-    std::uint64_t end = 0;
-    for (const auto& run : runs) {
-        if (run.length == 0 || run.start < end || static_cast<std::uint64_t>(run.start) + run.length > static_cast<std::uint64_t>(width) * height)
-            throw std::runtime_error("mask_rle run is empty, overlaps a previous run, or exceeds compiled image bounds");
-        end = static_cast<std::uint64_t>(run.start) + run.length;
-        support.area_pixels += static_cast<float>(run.length);
-        const auto first_y = static_cast<std::uint64_t>(run.start) / width;
-        const auto last_y = (end - 1) / width;
-        auto& bounds = support.box_xyxy;
-        bounds[0] = std::min(bounds[0], first_y == last_y ? static_cast<float>(run.start % width) / image_width : 0.0F);
-        bounds[2] = std::max(bounds[2], first_y == last_y ? static_cast<float>((end - 1) % width + 1) / image_width : 1.0F);
-        bounds[1] = std::min(bounds[1], static_cast<float>(first_y) / image_height);
-        bounds[3] = std::max(bounds[3], static_cast<float>(last_y + 1) / image_height);
-    }
+    AugmentationAnnotationSupport support;
+    support.box_xyxy = mmltk::backend::imaging::sampling::rle_support_bounds(runs, width, height);
+    support.present = !runs.empty();
+    for (const auto& run : runs) support.area_pixels += static_cast<float>(run.length);
     return support;
 }
 bool contains(const std::array<float, 4>& box, std::span<const mmltk::backend::data::RLEPair> runs, const std::array<float, 6>& inverse, float x, float y,
@@ -59,6 +48,7 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
         auto result = original;
         result.box_xyxy = transform_augmentation_box_xyxy(source_box, identity);
         if (mask_present && source_mask.empty()) result.area_pixels = 0;
+        if (!source_mask.empty()) result.mask_bounds = original.box_xyxy;
         return result;
     }
     const auto& inverse = donor ? plan->paste_inverse : plan->inverse;
@@ -67,6 +57,21 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
         const float scale = 1 / inverse[0];
         candidate = transform_augmentation_box_xyxy(original.box_xyxy, {scale, 0, -inverse[2] * scale, 0, scale, -inverse[5] * scale});
     }
+    // Inverse point sampling can round a transformed edge outward. Keep a
+    // small arithmetic envelope for those edge samples, independent of boxes.
+    if (!source_mask.empty() && augmentation_box_area(candidate) > 0) {
+        constexpr float margin = 8 * std::numeric_limits<float>::epsilon();
+        const auto& forward = plan->forward;
+        const float x_error = margin * (donor ? (1 + std::abs(1 / inverse[0]) + std::abs(inverse[2] / inverse[0]))
+                                                   : (1 + std::abs(forward[0]) + std::abs(forward[1]) + std::abs(forward[2])));
+        const float y_error = margin * (donor ? (1 + std::abs(1 / inverse[4]) + std::abs(inverse[5] / inverse[4]))
+                                                   : (1 + std::abs(forward[3]) + std::abs(forward[4]) + std::abs(forward[5])));
+        candidate[0] = std::max(0.0F, candidate[0] - x_error);
+        candidate[1] = std::max(0.0F, candidate[1] - y_error);
+        candidate[2] = std::min(1.0F, candidate[2] + x_error);
+        candidate[3] = std::min(1.0F, candidate[3] + y_error);
+    }
+    const auto raster_bounds = !source_mask.empty() ? candidate : std::array<float, 4>{};
     const auto detection_box = transform_augmentation_box_xyxy(source_box, plan->forward);
     const bool has_paste = !donor && plan->paste_donor_slot >= 0 && (!plan->paste_masked || plan->paste_support_count != 0);
     const bool modifies_visibility = donor || has_paste || plan->erasure.dropout_probability > 0 || plan->erasure.rectangular != 0;
@@ -79,6 +84,7 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
     const std::span<const mmltk::backend::data::RLEPair> donor_mask =
         has_paste && plan->paste_masked ? std::span{plan->paste_support, plan->paste_support_count} : std::span<const mmltk::backend::data::RLEPair>{};
     AugmentationAnnotationSupport result;
+    result.mask_bounds = raster_bounds;
     int min_x = width, min_y = height, max_x = -1, max_y = -1;
     const int x0 = std::clamp(static_cast<int>(std::floor(candidate[0] * image_width)), 0, width);
     const int x1 = std::clamp(static_cast<int>(std::ceil(candidate[2] * image_width)), 0, width);

@@ -8,6 +8,7 @@ struct AugmentationAnnotationSupport {
     std::array<float, 4> box_xyxy{};
     float area_pixels = 0;
     bool present = false;
+    std::array<float, 4> mask_bounds{};
 };
 [[nodiscard]] bool augmentation_changes_support(const AugmentationImagePlan* plan) noexcept;
 [[nodiscard]] AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std::array<float, 4>& source_box,

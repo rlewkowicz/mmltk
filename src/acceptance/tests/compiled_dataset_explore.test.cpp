@@ -807,7 +807,8 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
 void test_compiled_explore_magnified_tiny_mask_and_transfer() {
     mmltk::testsupport::ScopedTempDir root{"mmltk-explore-tiny-support"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(
-        root.path(), "tiny", 11, {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 4}, {.objects = 1, .runs_per_object = 1});
+        root.path(), "tiny", 11, {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 4},
+        {.objects = 1, .runs_per_object = 1, .derive_boxes_from_masks = true});
     const auto store = data::CompiledDataset::open(compiled);
     const auto labels = store.image_labels(10U);
     REQUIRE(labels.size() == 1);
@@ -1448,6 +1449,41 @@ void test_native_explore_transaction_faults_and_inactive_release() {
     }
 }
 }  // namespace
+TEST_CASE("Compiled Explore imports independent masks through both geometries and upscale", "[acceptance][explore][support]") {
+    namespace resize = mmltk::backend::imaging::resample;
+    const auto mode = GENERATE(resize::ImageResizeMode::Stretch, resize::ImageResizeMode::Letterbox);
+    mmltk::testsupport::ScopedTempDir root{"mmltk-explore-independent-mask"};
+    const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "independent", 1,
+        {.source_width = 8, .source_height = 4, .compiled_width = 8, .compiled_height = 8, .resize_mode = mode}, {.independent_masks = true});
+    controller::SettingsSystem settings;
+    load_explore_transport(settings, root.path() / "gui.json", true);
+    NativeExploreFixture fixture(settings, true);
+    auto& system = fixture.system;
+    static_cast<void>(system.Open({.viewport = {.extent = {32, 32}, .row_count = 1, .columns = 1}, .compiled_source = compiled.string()}));
+    wait_for_native_gallery(fixture.audit, system, 0, 0, 1);
+    static_cast<void>(system.Select({.compiled_index = 0}));
+    REQUIRE(fixture.audit.Wait([&] { return !system.snapshot().busy && system.snapshot().mode == controller::ExploreMode::Detail; }));
+    const auto frame = system.snapshot().frame;
+    auto borrowed = system.BorrowDocument(frame);
+    REQUIRE(borrowed.valid());
+    const auto original = controller::materialize_visual_document(*borrowed.document, frame.extent, frame.content,
+        controller::visual_materialized_extent(frame, true));
+    REQUIRE(original.objects.size() == 3);
+    CHECK(original.objects[0].box == controller::contracts::AnnotationBox{{4.25F, 1.25F}, {7.75F, 3.75F}});
+    CHECK(original.objects[0].mask.runs == std::vector<controller::contracts::AnnotationMaskRun>{{0, 0, 0}});
+    CHECK(original.objects[1].mask.present);
+    CHECK(original.objects[1].mask.runs.empty());
+    CHECK_FALSE(original.objects[2].mask.present);
+    const auto canvas = controller::materialize_visual_document(*borrowed.document, frame.extent, {});
+    CHECK(canvas.objects[0].mask.runs.size() == (mode == resize::ImageResizeMode::Stretch ? 2 : 1));
+    const auto scaled = controller::scale_visual_document(borrowed.document, 4);
+    const controller::VisualRegion crop{frame.content.x * 4, frame.content.y * 4, frame.content.width * 4, frame.content.height * 4};
+    const auto enlarged = controller::materialize_visual_document(*scaled, {32, 32}, crop, {32, 16});
+    CHECK(enlarged.objects[0].mask.runs == std::vector<controller::contracts::AnnotationMaskRun>{{0, 0, 3}, {1, 0, 3}, {2, 0, 3}, {3, 0, 3}});
+    borrowed = {};
+    system.Shutdown();
+    CHECK_FALSE(fixture.audit.failed());
+}
 TEST_CASE("test_compiled_dataset_explore_projection_navigation_and_streaming", "[acceptance][backend-data][explore]") {
     test_compiled_dataset_explore_projection_navigation_and_streaming();
 }

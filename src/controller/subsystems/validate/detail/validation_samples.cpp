@@ -1,3 +1,4 @@
+#include "src/backend/imaging/sampling.h"
 #include "src/backend/imaging/raster/class_palette.h"
 #include "src/backend/imaging/raster/image_containment.h"
 #include "src/frameworks/serialization/reflected_cbor.h"
@@ -229,6 +230,8 @@ class ValidationSamples::Impl final {
                 object.category = static_cast<std::uint16_t>(gt.class_reference);
                 object.box = {{gt.bbox_xyxy[0], gt.bbox_xyxy[1]}, {gt.bbox_xyxy[2], gt.bbox_xyxy[3]}};
                 object.mask.present = gt.has_mask;
+                document->mask_bounds.push_back(gt.has_mask ? mmltk::backend::imaging::sampling::rle_support_bounds(
+                    std::span{gt.mask.runs}, gt.mask.width, gt.mask.height) : std::array<float, 4>{});
                 object.shape = object.mask.present ? contracts::AnnotationShape::Mask : contracts::AnnotationShape::Box;
                 document->scene.objects.push_back(std::move(object));
             }

@@ -446,9 +446,11 @@ class SemanticOracleBuffers final {
 }
 [[nodiscard]] std::array<ExploreRenderAnnotationDescriptor, 2U> make_occlusion_annotations(const std::array<float, 4U>& donor_box) noexcept {
     return {
-        ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U, .class_id = 0U, .occluder_index = 1},
+        ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U, .occluder_index = 1},
         ExploreRenderAnnotationDescriptor{
             .box_xyxy = {donor_box[0U], donor_box[1U], donor_box[2U], donor_box[3U]},
+            .mask_bounds = {0, 0, 1, 1},
+            .mask_present = true,
             .rle_offset = 1U,
             .rle_count = 1U,
             .class_id = 1U,
@@ -571,8 +573,9 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
             if (!present) continue;
             const std::array<float, 4> expected{float(edges[0]) / 8, float(edges[1]) / 4, float(edges[2]) / 8, float(edges[3]) / 4};
             REQUIRE(resolved.box_xyxy == expected);
-            ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {expected[0], expected[1], expected[2], expected[3]},
+            ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {expected[0], expected[1], expected[2], expected[3]}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true,
                                                          .rle_count = static_cast<std::uint32_t>(runs.size())};
+            std::ranges::copy(resolved.mask_bounds, annotation.mask_bounds);
             std::ranges::copy(plan.inverse, annotation.inverse);
             for (const auto extent : {3U, 8U, 13U, 32U}) {
                 const PixelOracleGeometry geometry{.width = width, .height = height, .extent = extent};
@@ -635,7 +638,7 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
 TEST_CASE("Explore cropped detail clips exterior edges without painting surviving pixels", "[backend][imaging][explore][cuda][support]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
-    const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.5F}, .rle_count = 1}};
+    const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.25F, 0.25F, 0.75F, 0.5F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1}};
     const std::array runs{mmltk::backend::data::RLEPair{10, 4}};
     const std::array classes{ExploreRenderClassDescriptor{}};
     const PixelOracleGeometry geometry{.width = 8, .height = 4, .extent = 13, .crop_x = 3, .crop_y = 1, .crop_width = 2, .crop_height = 1};
@@ -837,7 +840,7 @@ TEST_CASE("Explore atlas semantic planes compose through the Presentation raster
     SemanticOracleBuffers oracle;
     constexpr std::array<std::uint8_t, 4U> kBase{0U, 0U, 255U, 255U};
     constexpr std::array<std::uint8_t, 4U> kPadding{24U, 18U, 35U, 255U};
-    ExploreRenderAnnotationDescriptor source{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U, .class_id = 0U};
+    ExploreRenderAnnotationDescriptor source{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U};
     const std::array single_run{mmltk::backend::data::RLEPair{.start = 0U, .length = 1U}};
     std::array classes{ExploreRenderClassDescriptor{}, ExploreRenderClassDescriptor{}};
     const auto visible = oracle.RenderAtlas(std::span{&source, 1U}, single_run, classes);
@@ -884,7 +887,7 @@ TEST_CASE("Explore atlas semantic planes compose through the Presentation raster
 TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition pixels", "[backend][imaging][explore][cuda]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
     SemanticOracleBuffers oracle;
-    ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U, .class_id = 0U};
+    ExploreRenderAnnotationDescriptor annotation{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U, .class_id = 0U};
     const std::array runs{mmltk::backend::data::RLEPair{.start = 5U, .length = 1U}};
     std::array classes{ExploreRenderClassDescriptor{}};
     const auto visible = oracle.RenderDetail(std::span{&annotation, 1U}, runs, classes);
@@ -907,6 +910,24 @@ TEST_CASE("Explore CUDA masks admit checked RLE and produce semantic composition
     CHECK(transformed.nonzero_alpha == 1U);
     CHECK(transformed.pixels[6U][3U] == 92U);
     CHECK(transformed.pixels[5U][3U] == 0U);
+}
+TEST_CASE("Explore masks render outside fractional detection boxes and empty donors never occlude", "[backend][imaging][explore][cuda]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    SemanticOracleBuffers oracle;
+    auto annotations = make_occlusion_annotations({0, 0, 1, 1});
+    annotations[0].box_xyxy[0] = .6F;
+    annotations[0].box_xyxy[1] = .6F;
+    annotations[0].box_xyxy[2] = .9F;
+    annotations[0].box_xyxy[3] = .9F;
+    annotations[1].rle_count = 0;
+    const std::array runs{mmltk::backend::data::RLEPair{0, 1}};
+    std::array classes{ExploreRenderClassDescriptor{}, ExploreRenderClassDescriptor{.visible = 0}};
+    const auto known_empty = oracle.RenderDetail(annotations, runs, classes);
+    CHECK(known_empty.nonzero_alpha == 1);
+    CHECK(known_empty.pixels[0][3] != 0);
+    annotations[1].mask_present = false; // Rectangular paste support is an explicit distinct policy.
+    const auto rectangle = oracle.RenderDetail(annotations, runs, classes);
+    CHECK(rectangle.nonzero_alpha == 0);
 }
 TEST_CASE("Explore renderer rejects semantic descriptors beyond admitted storage", "[backend][imaging][explore]") {
     const auto* const address = reinterpret_cast<const std::byte*>(1U);
@@ -954,7 +975,7 @@ TEST_CASE("Explore detail and atlas mask support follows final spatial erasure",
     if (mmltk::testsupport::checked_cuda_device_count() == 0) { SKIP("CUDA unavailable"); }
     SemanticOracleBuffers oracle;
     namespace rfdetr = mmltk::backend::models::rfdetr;
-    const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .rle_count = 1U}};
+    const std::array annotations{ExploreRenderAnnotationDescriptor{.box_xyxy = {0.0F, 0.0F, 1.0F, 1.0F}, .mask_bounds = {0, 0, 1, 1}, .mask_present = true, .rle_count = 1U}};
     const std::array runs{mmltk::backend::data::RLEPair{.start = 0U, .length = 16U}};
     const std::array classes{ExploreRenderClassDescriptor{}};
     const std::array erasures{

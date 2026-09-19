@@ -34,6 +34,8 @@ struct ExploreRenderCardDescriptorAbi final {
 };
 struct ExploreRenderAnnotationDescriptorAbi final {
     float box_xyxy[4U]{};
+    float mask_bounds[4U]{};
+    bool mask_present = false;
     float inverse[6U]{1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
     std::uint32_t rle_offset = 0U;
     std::uint32_t rle_count = 0U;

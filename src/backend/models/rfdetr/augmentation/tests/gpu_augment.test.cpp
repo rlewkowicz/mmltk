@@ -1079,6 +1079,65 @@ TEST_CASE("perceptual donor reductions preserve mask box and class support", "[b
         CHECK(outside_pixels[mode] > 0);
     }
 }
+TEST_CASE("Preview presence and raster bounds stay independent through geometry donors and erasure", "[backend][rfdetr][augmentation][support]") {
+    using mmltk::backend::data::PackedInstance;
+    using mmltk::backend::data::RLEPair;
+    const std::array runs{RLEPair{0, 1}};
+    std::array<PackedInstance, 3> instances{};
+    for (auto& item : instances) {
+        item.bbox_x1 = 4.25F;
+        item.bbox_y1 = 1.25F;
+        item.bbox_x2 = 7.75F;
+        item.bbox_y2 = 3.75F;
+    }
+    instances[0].flags = instances[1].flags = mmltk::backend::data::kAnnotationMask;
+    instances[0].mask_rle_pairs = 1;
+    std::vector<AugmentationPreviewAnnotation> output;
+    AugmentationImagePlan plan;
+    const auto build = [&] { build_augmentation_preview_annotations(instances, nullptr, &plan, 8, 4, output, runs); };
+    build();
+    REQUIRE(output.size() == 3);
+    CHECK(output[0].mask_present);
+    CHECK(output[0].mask_bounds == std::array<float, 4>{0, 0, .125F, .25F});
+    CHECK(output[1].mask_present);
+    CHECK(output[1].mask_bounds == std::array<float, 4>{});
+    CHECK_FALSE(output[2].mask_present);
+    plan.forward = {-1, 0, 1, 0, 1, 0};
+    plan.inverse = plan.forward;
+    build();
+    REQUIRE(output.size() == 3);
+    CHECK(output[0].mask_bounds[0] <= .875F);
+    CHECK(output[0].mask_bounds[2] == 1);
+    CHECK(output[0].mask_bounds[3] >= .25F);
+    CHECK(output[0].box_xyxy == std::array<float, 4>{.25F / 8, 1.25F / 4, 3.75F / 8, 3.75F / 4});
+    CHECK(output[1].mask_present);
+    CHECK(output[1].mask_bounds == std::array<float, 4>{});
+    plan = {};
+    plan.erasure.rectangular = 1;
+    plan.erasure.x1 = .125F;
+    plan.erasure.y1 = .25F;
+    build();
+    CHECK(std::ranges::none_of(output, [](const auto& item) { return item.source_ordinal == 0; }));
+    for (bool masked : {false, true}) {
+        plan = {};
+        plan.paste_donor_slot = 0;
+        plan.paste_masked = masked;
+        plan.paste_source_box = {.5F, .25F, 1, 1};
+        plan.paste_output_box = plan.paste_source_box;
+        plan.paste_support = runs.data();
+        plan.paste_support_count = runs.size();
+        build_augmentation_preview_annotations({}, &instances[0], &plan, 8, 4, output, {});
+        REQUIRE(output.size() == 1);
+        CHECK(output[0].mask_present == masked);
+        if (masked) {
+            CHECK(output[0].mask_bounds[0] == 0);
+            CHECK(output[0].mask_bounds[2] >= .125F);
+            CHECK(output[0].mask_bounds[3] >= .25F);
+        } else {
+            CHECK(output[0].mask_bounds == std::array<float, 4>{});
+        }
+    }
+}
 TEST_CASE("continuous augmentation boxes survive independent and empty mask support", "[backend][rfdetr][augmentation][support]") {
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;

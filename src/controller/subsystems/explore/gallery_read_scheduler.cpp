@@ -196,6 +196,7 @@ void GalleryReadScheduler::ReadLanePayload(Lane& lane) {
         const auto runs = lane.store->instance_rle(label);
         store_payload(lane.pinned.data(), lane.layout.rle.offset + rle_cursor * sizeof(data::RLEPair), runs);
         const explore::ExploreRenderAnnotationDescriptor annotation{
+            .mask_present = label.has_mask(),
             .rle_offset = static_cast<std::uint32_t>(rle_cursor),
             .rle_count = static_cast<std::uint32_t>(runs.size()),
             .card_index = lane.destination_slot,

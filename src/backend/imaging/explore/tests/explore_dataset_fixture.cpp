@@ -28,8 +28,10 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
             std::ofstream output{std::filesystem::path{backend::data::testsupport::dataset_dir(fixture)} / fixture.split / filename.str(), std::ios::trunc};
             for (std::size_t object = 0U; object < annotations.objects; ++object) {
                 output << "{\"iscrowd\":" << ((annotations.crowd_only || (annotations.mixed_crowd && object % 2U == 0U)) ? "true" : "false")
-                       << ",\"class\":\"person\",\"bbox_xyxy\":[0,0," << dimensions.source_width << ',' << dimensions.source_height
-                       << "],\"mask_rle_encoding\":\"row_major_start_length\",\"mask_rle\":\"";
+                       << ",\"class\":\"person\"";
+                if (!annotations.derive_boxes_from_masks)
+                    output << ",\"bbox_xyxy\":[0,0," << dimensions.source_width << ',' << dimensions.source_height << ']';
+                output << ",\"mask_rle_encoding\":\"row_major_start_length\",\"mask_rle\":\"";
                 for (std::size_t row = 0U; row < annotations.runs_per_object; ++row) {
                     if (row != 0U) output << ' ';
                     output << row * static_cast<std::size_t>(dimensions.source_width) << ":1";
@@ -61,6 +63,17 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
                 write(fixture_support::ring_runs, "ret");
             if (!output) throw std::runtime_error("Explore ring fixture write failed");
         }
+    }
+    if (annotations.independent_masks) {
+        if (dimensions.source_width != 8 || dimensions.source_height != 4)
+            throw std::invalid_argument("independent mask fixture requires 8 by 4 images");
+        std::ofstream output{std::filesystem::path{backend::data::testsupport::dataset_dir(fixture)} / fixture.split / "000001.jsonl"};
+        for (unsigned object = 0; object < 3; ++object) {
+            output << R"({"class":"person","bbox_xyxy":[4.25,1.25,7.75,3.75],"image_size_wh":[8,4])";
+            if (object != 2) output << R"(,"mask_rle_encoding":"row_major_start_length","mask_rle":")" << (object == 0 ? "0:1" : "") << '"';
+            output << "}\n";
+        }
+        if (!output) throw std::runtime_error("Explore independent mask fixture write failed");
     }
     mmltk::backend::data::CompilerConfig config;
     config.source_dir = backend::data::testsupport::dataset_dir(fixture);

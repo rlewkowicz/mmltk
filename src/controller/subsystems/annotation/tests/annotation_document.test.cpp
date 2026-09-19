@@ -399,6 +399,7 @@ TEST_CASE("Viewed masks import full catalogs and retain editable runs through hi
         .mask = {.present = true},
         .category = 79U,
     });
+    source->mask_bounds = {{{0.125F, 0.0F, 0.875F, 1.0F}}};
     source->mask_contains = [](std::size_t, float x, float y) {
         const auto row = static_cast<unsigned>(y * 64.0F);
         return (row % 2U) == 0U && x >= 0.125F && x < 0.875F;
@@ -1204,11 +1205,40 @@ TEST_CASE("Original imports restore stored aspect with fractional geometry witho
     CHECK(imported.frame_height == 16U);
     CHECK(imported.objects.front().box == contracts::AnnotationBox{{4.5F, 4.125F}, {24.5F, 14.375F}});
     source->scene.objects.front().mask.present = true;
+    source->mask_bounds = {{{0, 0, 1.0F / 32.0F, 1.0F / 32.0F}}};
     source->mask_contains = [](std::size_t, float x, float y) { return x < 1.0F / 32.0F && y < 1.0F / 32.0F; };
     const auto masked = materialize_visual_document(*source, frame.extent, frame.content, target);
     REQUIRE(masked.objects.front().mask.runs.size() == 1U);
     CHECK(masked.objects.front().mask.runs.front() == contracts::AnnotationMaskRun{0U, 0U, 0U});
     frame.content = {0U, 8U, 32U, 16U};
     CHECK(visual_materialized_extent(frame, true) == target);
+}
+TEST_CASE("Document materialization bounds empty and sparse mask queries independently of boxes") {
+    auto source = std::make_shared<VisualDocument>();
+    source->scene = test_scene("compiled://bounded");
+    for (unsigned index = 0; index < 3; ++index)
+        source->scene.objects.push_back({.name = contracts::AnnotationText::From("object " + std::to_string(index)),
+            .box = {{24.25F, 24.5F}, {30.75F, 31.25F}}, .mask = {.present = index != 2}});
+    source->mask_bounds = {{{0, 0, .0625F, .0625F}}, {}, {}};
+    std::array<unsigned, 3> calls{};
+    source->mask_contains = [&calls](std::size_t index, float x, float y) { ++calls[index]; return x < .0625F && y < .0625F; };
+    const auto imported = materialize_visual_document(*source, {32, 32}, {});
+    CHECK(calls == std::array<unsigned, 3>{4, 0, 0});
+    CHECK(imported.objects[0].mask.runs == std::vector<contracts::AnnotationMaskRun>{{0, 0, 1}, {1, 0, 1}});
+    CHECK(imported.objects[1].mask.present);
+    CHECK(imported.objects[1].mask.runs.empty());
+    CHECK_FALSE(imported.objects[2].mask.present);
+    CHECK(imported.objects[0].box == source->scene.objects[0].box);
+    calls = {};
+    const auto scaled = scale_visual_document(source, 4);
+    const auto enlarged = materialize_visual_document(*scaled, {128, 128}, {});
+    CHECK(calls == std::array<unsigned, 3>{64, 0, 0});
+    CHECK(enlarged.objects[0].mask.runs.size() == 8);
+    calls = {};
+    const auto cropped = materialize_visual_document(*source, {32, 32}, {8, 8, 16, 16}, {32, 16});
+    CHECK(calls == std::array<unsigned, 3>{});
+    CHECK(cropped.objects[0].mask.runs.empty());
+    source->mask_bounds[0][0] = -1;
+    CHECK_THROWS_AS(materialize_visual_document(*source, {32, 32}, {}), contracts::InvalidIntentError);
 }
 }  // namespace mmltk::controller

@@ -73,6 +73,7 @@ TEST_CASE("Annotation imports Validation ground truth and retains receiver pixel
     auto document = annotation_mask_document("validation://sample");
     document->scene.categories[0].value = "ground truth";
     document->scene.objects[0].mask.present = true;
+    document->mask_bounds = {{{0.25F, 0.25F, 0.5F, 0.5F}}};
     document->mask_contains = [](std::size_t object, float x, float y) { return object == 0U && x >= 0.25F && x < 0.5F && y >= 0.25F && y < 0.5F; };
     auto frame = source->frame();
     frame.source.kind = PresentationSourceKind::Validation;
@@ -245,6 +246,7 @@ TEST_CASE("Annotation rejects an oversized incoming document without changing it
     SECTION("materialized mask capacity") {
         rejected_document->scene.objects.push_back(
             {.shape = contracts::AnnotationShape::Mask, .box = {{0.0F, 0.0F}, {512.0F, 256.0F}}, .mask = {.present = true}});
+        rejected_document->mask_bounds.resize(rejected_document->scene.objects.size(), {0, 0, 1, 1});
         rejected_document->mask_contains = [](std::size_t, float x, float) { return static_cast<unsigned>(x * 512.0F) % 2U == 0U; };
     }
     bool reject_incoming = false;

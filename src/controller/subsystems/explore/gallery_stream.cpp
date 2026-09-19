@@ -1273,6 +1273,8 @@ explore::ExploreRenderCardDescriptor GalleryStream::Impl::AssembleImageMeaning(c
                                                                 .rle_count = static_cast<std::uint32_t>(lane.layout.donor_rle.count)};
         std::copy(projected.box_xyxy.begin(), projected.box_xyxy.end(), std::begin(annotation.box_xyxy));
         std::copy(projected.inverse.begin(), projected.inverse.end(), std::begin(annotation.inverse));
+        std::copy(projected.mask_bounds.begin(), projected.mask_bounds.end(), std::begin(annotation.mask_bounds));
+        annotation.mask_present = projected.mask_present;
         annotation.class_id = projected.class_id;
         annotation.card_index = static_cast<std::uint32_t>(card_index);
         annotation.rle_offset += static_cast<std::uint32_t>(rle_count);
@@ -1626,7 +1628,8 @@ void GalleryStream::Impl::RenderDetail(const ExploreRenderPlan& plan, std::share
         object.category = annotation.class_id;
         object.box = {{annotation.box_xyxy[0] * document_width, annotation.box_xyxy[1] * document_height},
                       {annotation.box_xyxy[2] * document_width, annotation.box_xyxy[3] * document_height}};
-        object.mask.present = annotation.rle_count != 0U;
+        object.mask.present = annotation.mask_present;
+        document->mask_bounds.push_back({annotation.mask_bounds[0], annotation.mask_bounds[1], annotation.mask_bounds[2], annotation.mask_bounds[3]});
         object.shape = object.mask.present ? contracts::AnnotationShape::Mask : contracts::AnnotationShape::Box;
         document->scene.objects.push_back(std::move(object));
     }

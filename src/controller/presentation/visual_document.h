@@ -1,5 +1,7 @@
 #pragma once
 #include <functional>
+#include <array>
+#include <vector>
 #include <cstdint>
 #include <memory>
 #include "src/controller/contracts/annotation.h"
@@ -21,9 +23,12 @@ MMLTK_REFLECT_FIELDS(VisualDocumentFacts)
 // by the importing document, never by gallery publication.
 struct VisualDocument final {
     VisualDocument() = default;
-    VisualDocument(const VisualDocument& other) : scene(other.scene), mask_contains(other.mask_contains) {}
+    VisualDocument(const VisualDocument& other) : scene(other.scene), mask_contains(other.mask_contains), mask_bounds(other.mask_bounds) {}
     contracts::AnnotationSceneContent scene{};
     std::function<bool(std::size_t, float, float)> mask_contains{};
+    // Object-indexed normalized support bounds, checked on import.
+    // Every present mask has an entry; empty masks use {0,0,0,0}.
+    std::vector<std::array<float, 4>> mask_bounds{};
     [[nodiscard]] VisualDocumentFacts facts() const { return {scene.document, meaning_identity_}; }
 
    private:

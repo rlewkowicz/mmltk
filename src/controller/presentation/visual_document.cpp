@@ -95,29 +95,45 @@ contracts::AnnotationSceneContent materialize_visual_document(const VisualDocume
         auto& object = scene.objects[index];
         if (!object.mask.present) continue;
         object.mask.runs.clear();
+        if (index >= document.mask_bounds.size()) throw contracts::InvalidIntentError("Annotation mask bounds are unavailable");
+        const auto& bounds = document.mask_bounds[index];
+        if (!std::ranges::all_of(bounds, [](float value) { return std::isfinite(value) && value >= 0 && value <= 1; }) ||
+            bounds[0] > bounds[2] || bounds[1] > bounds[3])
+            throw contracts::InvalidIntentError("Annotation mask bounds are invalid");
+        if (bounds[0] == bounds[2] || bounds[1] == bounds[3]) continue;
         if (!document.mask_contains) throw contracts::InvalidIntentError("Annotation mask support is unavailable");
-        // A supplied detection box is independent of segmentation support.
-        // Import the selected raster extent, including support outside that box.
-        const auto first_x = 0U, first_y = 0U;
-        const auto last_x = target.width, last_y = target.height;
+        const auto coordinate = [](std::uint32_t pixel, std::uint32_t offset, std::uint32_t size, std::uint32_t output, std::uint32_t full) {
+            return (static_cast<float>(offset) + std::floor(static_cast<float>(pixel) * static_cast<float>(size) / static_cast<float>(output)) + 0.5F) /
+                   static_cast<float>(full);
+        };
+        // Binary search the actual nearest-sampling coordinates. This includes
+        // ties at closed support edges and avoids inverse-rounding omissions.
+        const auto interval = [&](float low, float high, std::uint32_t offset, std::uint32_t size, std::uint32_t output, std::uint32_t full) {
+            const auto pixels = std::views::iota(0U, output);
+            const auto first = std::ranges::lower_bound(pixels, low, {}, [&](auto pixel) { return coordinate(pixel, offset, size, output, full); });
+            const auto last = std::ranges::upper_bound(pixels, high, {}, [&](auto pixel) { return coordinate(pixel, offset, size, output, full); });
+            return std::pair{static_cast<std::uint32_t>(first - pixels.begin()), static_cast<std::uint32_t>(last - pixels.begin())};
+        };
+        const auto [first_x, last_x] = interval(bounds[0], bounds[2], crop.x, crop.width, target.width, extent.width);
+        const auto [first_y, last_y] = interval(bounds[1], bounds[3], crop.y, crop.height, target.height, extent.height);
         for (auto y = first_y; y < last_y; ++y) {
-            auto x = first_x;
-            const auto supported = [&](std::uint32_t px) {
-                return document.mask_contains(index, (static_cast<float>(crop.x) + std::floor(static_cast<float>(px) * static_cast<float>(crop.width) / static_cast<float>(target.width)) + 0.5F) / static_cast<float>(extent.width),
-                                              (static_cast<float>(crop.y) + std::floor(static_cast<float>(y) * static_cast<float>(crop.height) / static_cast<float>(target.height)) + 0.5F) / static_cast<float>(extent.height));
-            };
-            while (x < last_x) {
-                if (!supported(x)) {
-                    ++x;
-                    continue;
-                }
-                const auto first = x++;
-                while (x < last_x && supported(x)) ++x;
+            const auto normalized_y = coordinate(y, crop.y, crop.height, target.height, extent.height);
+            auto run_start = last_x;
+            const auto append = [&](std::uint32_t end) {
                 if (total_runs == contracts::kAnnotationMaskRunCapacity)
                     throw contracts::InvalidIntentError("Annotation import exceeds the document mask-run capacity");
-                object.mask.runs.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(x - 1U)});
+                object.mask.runs.push_back({static_cast<std::uint16_t>(y), static_cast<std::uint16_t>(run_start), static_cast<std::uint16_t>(end - 1U)});
                 ++total_runs;
+            };
+            for (auto x = first_x; x < last_x; ++x) {
+                const bool supported = document.mask_contains(index, coordinate(x, crop.x, crop.width, target.width, extent.width), normalized_y);
+                if (supported && run_start == last_x) run_start = x;
+                if (!supported && run_start != last_x) {
+                    append(x);
+                    run_start = last_x;
+                }
             }
+            if (run_start != last_x) append(last_x);
         }
     }
     if (!scene.valid()) throw contracts::InvalidIntentError("Annotation import exceeds the document geometry or catalog capacity");

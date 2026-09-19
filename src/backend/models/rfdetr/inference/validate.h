@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include "src/backend/imaging/resample/image_resize.h"
 #include <cstdint>
 #include <memory>
 #include <functional>
