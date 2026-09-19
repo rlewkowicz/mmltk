@@ -1086,7 +1086,7 @@ NormalizedAnnotationIndex parse_coco_style_annotations(const std::filesystem::pa
             std::optional<std::uint64_t> image_id;
             std::optional<std::uint32_t> category_id;
             for (auto field : object) {
-                const auto key = field.key();
+                const simdjson::ondemand::raw_json_string key = field.key();
                 if (key == "image_id") image_id = field.value().get_uint64().value();
                 else if (key == "category_id") category_id = checked_cast<std::uint32_t>(field.value().get_uint64().value(), "category ID overflow");
             }

@@ -776,7 +776,6 @@ impl State {
                 if matches!(phase, Phase::AwaitCompileProgress)
                     && (dataset.active || compile_succeeded)
                     && (!dataset.progress.activity.is_empty() || dataset.progress.total != 0)
-                    && dataset.progress.droppedinstances != 0
                 {
                     reporting::emit(|sink| {
                         sink.record(

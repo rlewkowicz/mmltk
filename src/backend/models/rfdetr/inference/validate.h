@@ -43,6 +43,8 @@ struct ValidationSampleView final {
     PredictionPixels pixels;
     const mmltk::backend::ml::runtime::AnalysisAnnotationStorage& annotations;
     std::span<const Prediction> ground_truth;
+    mmltk::backend::imaging::resample::ImageResizeGeometry content{};
+    std::uint32_t source_width = 0U, source_height = 0U;
 };
 struct ValidationDelivery final {
     std::stop_token stop{};

@@ -31,8 +31,9 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 .full_image = full_damage_,
                 .baseline = {baseline.product_owner, baseline.product_revision}};
     }
-    void Open(const mmltk::frameworks::gpu::ImagePlaneView source, const VisualRegion crop) override {
-        crop_ = crop;
+    void Open(const mmltk::frameworks::gpu::ImagePlaneView source, const VisualRegion crop, const VisualExtent target) override {
+        crop_ = crop.valid() ? crop : VisualRegion{0U, 0U, source.descriptor.width, source.descriptor.height};
+        target_ = target;
         source_ = source;
         allocations_.clear();
         geometry_.clear();
@@ -51,8 +52,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     [[nodiscard]] domain::AnnotationColor Sample(const domain::AnnotationPoint point) override {
         if (!sample_host_) sample_host_ = mmltk::frameworks::gpu::PinnedHostBuffer::ForCurrentDevice();
         sample_host_->ensure_bytes(4);
-        const auto x = std::min(static_cast<unsigned>(point.x), (crop_.valid() ? crop_.width : source_.descriptor.width) - 1) + crop_.x;
-        const auto y = std::min(static_cast<unsigned>(point.y), (crop_.valid() ? crop_.height : source_.descriptor.height) - 1) + crop_.y;
+        const auto x = std::min(static_cast<unsigned>(point.x * static_cast<float>(crop_.width) / static_cast<float>(target_.width)), crop_.width - 1U) + crop_.x;
+        const auto y = std::min(static_cast<unsigned>(point.y * static_cast<float>(crop_.height) / static_cast<float>(target_.height)), crop_.height - 1U) + crop_.y;
         if (cudaMemcpy(sample_host_->data(), reinterpret_cast<const void*>(source_.data + y * source_.descriptor.pitch_bytes + x * 4U), 4,
                        cudaMemcpyDeviceToHost) != cudaSuccess)
             throw std::runtime_error("Annotation color sample failed");
@@ -196,11 +197,16 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                 retained.width != clean.descriptor.width || retained.height != clean.descriptor.height ||
                                 retained.semantic != semantic.allocation.identity;
         if (initialize) {
-            if (!source.valid() || cudaMemcpy2DAsync(reinterpret_cast<void*>(clean.data), clean.descriptor.pitch_bytes,
-                                                     reinterpret_cast<const void*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
-                                                     source.descriptor.pitch_bytes, clean.descriptor.row_bytes(), clean.descriptor.height,
-                                                     cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
-                throw std::runtime_error("Annotation clean baseline preparation failed");
+            const raster::ConstBytes input{reinterpret_cast<const std::uint8_t*>(source.data + crop_.y * source.descriptor.pitch_bytes + crop_.x * 4U),
+                                           source.descriptor.pitch_bytes, static_cast<int>(crop_.width), static_cast<int>(crop_.height)};
+            const raster::MutableBytes output{reinterpret_cast<std::uint8_t*>(clean.data), clean.descriptor.pitch_bytes,
+                                              static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height)};
+            if (!source.valid()) throw std::runtime_error("Annotation clean baseline source is unavailable");
+            const auto status = input.width == output.width && input.height == output.height
+                                    ? cudaMemcpy2DAsync(output.pixels, output.pitch_bytes, input.pixels, input.pitch_bytes,
+                                                        clean.descriptor.row_bytes(), clean.descriptor.height, cudaMemcpyDeviceToDevice, stream)
+                                    : static_cast<cudaError_t>(raster::scale_rgba_nearest(input, output, stream_value));
+            if (status != cudaSuccess) throw std::runtime_error("Annotation clean baseline preparation failed");
         }
         raster::IntRect clip{static_cast<int>(clean.descriptor.width), static_cast<int>(clean.descriptor.height), 0, 0};
         const auto damage = [&](raster::IntRect bounds) {
@@ -452,6 +458,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
     }
     const std::exception_ptr release_failure_ = std::make_exception_ptr(std::runtime_error("Annotation mask release failed"));
     VisualRegion crop_{};
+    VisualExtent target_{};
     // The runtime owns this input until the next Open or resource teardown.
     mmltk::frameworks::gpu::ImagePlaneView source_{};
     std::unique_ptr<mmltk::frameworks::gpu::PinnedHostBuffer> sample_host_;

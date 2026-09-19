@@ -68,6 +68,7 @@ struct CompileCliRequest final {
     [[= reflection::Minimum<int>{0}]] int cuda_device_id = 0;
     bool overwrite = false;
     bool perceptual_downscale = false;
+    mmltk::backend::imaging::resample::ImageResizeMode resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
 };
 struct InfoCliRequest final {
     [[= reflection::MaxBytes{reflection::kMaximumPathBytes}]] std::filesystem::path onnx_path;
@@ -92,6 +93,7 @@ MMLTK_REFLECT_FIELDS(NormalizeWeightsRequest)
 MMLTK_REFLECT_FIELDS(PredictCliRequest)
 MMLTK_REFLECT_FIELDS(TrainCliRequest)
 inline constexpr std::array kCompileOptions{
+    reflection::option<CompileCliRequest, &CompileCliRequest::resize_mode>("--resize-mode", "Image geometry: Stretch or Letterbox", "Dataset"),
     reflection::option<CompileCliRequest, &CompileCliRequest::perceptual_downscale>("--perceptual-downscale", "Perceptual shrinking", "Dataset"),
     reflection::option<CompileCliRequest, &CompileCliRequest::source_dir>("--source-dir", "Source dataset root", "Dataset"),
     reflection::option<CompileCliRequest, &CompileCliRequest::output_dir>("--output-dir", "Compiled output directory", "Dataset"),
@@ -203,6 +205,7 @@ inline constexpr std::array kPredictOptions{
     reflection::option<PredictCliRequest, reflection::member_path<&PredictCliRequest::request, &rfdetr::PredictRequest::compilation_mode>>(
         "--compile-mode", "Native compilation mode", "Execution")};
 inline constexpr std::array kValidateOptions{
+    reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::compile_resize_mode>("--resize-mode", "Compile image geometry: Stretch or Letterbox", "Dataset"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::class_layout_path>("--class-layout", "Digest-bound class descriptor", "Model input"),
     reflection::negative_flag<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::h2d_dataloader>("--gdrcopy", "Use GDRCopy image loading", "Execution"),
     reflection::option<rfdetr::ValidateRequest, &rfdetr::ValidateRequest::numa_node>("--numa-node", "GPU-local NUMA node (-1 automatic)", "Execution"),
@@ -653,6 +656,7 @@ void run_compile(const CompileCliRequest& request) {
         config.num_workers = request.num_workers;
         config.overwrite = request.overwrite;
         config.perceptual_downscale = request.perceptual_downscale;
+        config.resize_mode = request.resize_mode;
         config.cancel_requested = mmltk::common::concurrency::CancellationObservation::Atomic(benchmark_cancel_requested);
         config.progress = [](const data::BenchmarkCompileProgress& progress) {
             if (!progress.activity.empty()) spdmon::ProgressBar::log(progress.activity);
@@ -668,6 +672,7 @@ void run_compile(const CompileCliRequest& request) {
     }
     data::CompilerConfig config;
     config.perceptual_downscale = request.perceptual_downscale;
+    config.resize_mode = request.resize_mode;
     config.source_dir = request.source_dir.string();
     config.output_dir = request.output_dir.string();
     config.target_width = static_cast<std::uint32_t>(request.resolution);

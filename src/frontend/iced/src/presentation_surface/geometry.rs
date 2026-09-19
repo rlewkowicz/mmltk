@@ -261,7 +261,7 @@ impl ViewportOwner {
                 width: bounds.width,
                 height: bounds.height,
             },
-            surface.content_extent(),
+            surface.display_extent(),
             placement,
             self.transform_for(surface),
         )?;
@@ -446,7 +446,7 @@ pub(super) fn geometry_key(
     placement: Placement,
     transform: ViewTransform,
 ) -> GeometryKey {
-    let content = surface.content_extent();
+    let content = surface.display_extent();
     let [x, y, _, _] = surface.content_region();
     let draw_extent = placement_geometry(bounds, content, placement, transform)
         .map_or([0.0, 0.0], |geometry| [geometry.width, geometry.height]);
@@ -483,6 +483,29 @@ mod tests {
     use super::super::{same_allocation, surface_for_content_session};
     use super::*;
     use crate::view_model::test_support::physical_frame as frame_ready;
+    #[test]
+    fn original_aspect_separates_sampling_placement_and_inverse_coordinates() {
+        let mut frame = crate::view_model::test_support::visual_frame(
+            crate::generated::PresentationSourceKind::Explore, 1);
+        frame.extent = crate::generated::VisualExtent { width: 640, height: 480 };
+        frame.sourceextent = crate::generated::VisualExtent { width: 4000, height: 1000 };
+        let mut surface = surface_for_content_session(1);
+        for content in [[0, 0, 640, 480], [0, 160, 640, 160]] {
+            frame.content = crate::generated::VisualRegion { x: content[0], y: content[1], width: content[2], height: content[3] };
+            surface.configure_original(&frame, true);
+            let bounds = Rectangle::with_size(iced::Size::new(800.0, 600.0));
+            let placed = placement_geometry(bounds, surface.display_extent(), Placement::Contain, ViewTransform::FIT).unwrap();
+            assert_eq!((placed.width, placed.height), (800.0, 200.0));
+            assert_eq!(content_uv_scale(surface), [1.0, content[3] as f32 / 480.0]);
+            assert_eq!(inverse_content_point(placed, Point::new(400.0, 300.0), surface.content_extent()), Some((320.0, content[3] as f32 / 2.0)));
+            surface.configure_original(&frame, false);
+            let canvas = placement_geometry(bounds, surface.display_extent(), Placement::Contain, ViewTransform::FIT).unwrap();
+            assert_eq!((canvas.width, canvas.height), (800.0, 600.0));
+            surface.configure_original(&frame, true);
+            assert_eq!(surface.content_region(), content);
+        }
+    }
+
     #[test]
     fn rectangular_fixed_grid_shares_border_geometry_without_scroll_or_zoom() {
         let bounds = Rectangle {
@@ -1140,6 +1163,7 @@ mod tests {
             height: 720,
             frame: Some(frame_ready(1, 2, 3, 640, 360)),
             crop: None,
+            display_extent: None,
             viewer_identity: None,
             fit_revision: 0,
         });
@@ -1484,7 +1508,7 @@ mod tests {
         };
         let geometry = placement_geometry(
             bounds,
-            surface.content_extent(),
+            surface.display_extent(),
             placement,
             ViewTransform::FIT,
         )

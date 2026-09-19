@@ -109,7 +109,7 @@ class AnnotationAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
         return {};
     }
     ~AnnotationAlgorithm() override = default;
-    virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion) = 0;
+    virtual void Open(mmltk::frameworks::gpu::ImagePlaneView source, VisualRegion, VisualExtent) = 0;
     [[nodiscard]] virtual contracts::AnnotationColor Sample(contracts::AnnotationPoint) = 0;
     // Source is the retained immutable document baseline. The algorithm owns
     // allocation-local initialization, damage and reusable raster inputs.

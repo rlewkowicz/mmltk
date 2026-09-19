@@ -419,6 +419,7 @@ mod tests {
         explore.frame =
             super::super::test_support::visual_frame(PresentationSourceKind::Explore, 1);
         let first = crate::generated::UpscaleRequest {
+            originalcontent: false,
             source: explore.frame.clone(),
             document: explore.document.clone(),
             kernel: crate::generated::UpscaleKernel::Default,

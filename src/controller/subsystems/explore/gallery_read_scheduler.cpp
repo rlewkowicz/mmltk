@@ -14,7 +14,7 @@ namespace data = mmltk::backend::data;
 namespace explore = mmltk::backend::imaging::explore;
 namespace rfdetr = mmltk::backend::models::rfdetr;
 namespace {
-[[nodiscard]] float normalized(const data::PackedCoordinate coordinate, const std::uint32_t extent) noexcept {
+[[nodiscard]] float normalized(const float coordinate, const std::uint32_t extent) noexcept {
     return extent == 0U ? 0.0F : std::clamp(static_cast<float>(coordinate) / static_cast<float>(extent), 0.0F, 1.0F);
 }
 void pack_rle_mask(const std::span<const data::RLEPair> runs, const std::span<std::uint64_t> words, const std::size_t pixel_count) noexcept {
@@ -348,8 +348,13 @@ void GalleryReadScheduler::PrepareLaneStorage(const GalleryProductState& product
     if (copy_paste_requested) {
         lane.donor_index = rfdetr::select_augmentation_preview_donor_image(product.annotated_indices, compiled_index, lane.preview_key);
         const auto donor_instances = product.store->image_labels(lane.donor_index);
-        if (lane.donor_index != compiled_index && !donor_instances.empty())
-            lane.donor_instance = donor_instances[rfdetr::select_augmentation_preview_donor_instance(donor_instances.size(), lane.preview_key)];
+        auto eligible = donor_instances | std::views::filter([](const auto& instance) { return !instance.is_crowd(); });
+        const auto count = static_cast<std::size_t>(std::ranges::distance(eligible));
+        if (lane.donor_index != compiled_index && count != 0U) {
+            auto selected = eligible.begin();
+            std::ranges::advance(selected, static_cast<std::ptrdiff_t>(rfdetr::select_augmentation_preview_donor_instance(count, lane.preview_key)));
+            lane.donor_instance = *selected;
+        }
     }
     lane.layout = LayoutFor(product, compiled_index, lane.donor_instance.has_value(), lane.donor_instance ? lane.donor_instance->mask_rle_pairs : 0U);
     image_stream_.prepare_metadata(lane.index, lane.layout.bytes);

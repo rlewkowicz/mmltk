@@ -379,7 +379,7 @@ TEST_CASE("validation preview generations settle to retained source custody with
         CHECK(after.sample_available == incumbent.sample_available);
         const auto metadata = samples.ImageSnapshot(after.frame);
         REQUIRE(metadata);
-        CHECK(metadata->samples[0].original_extent == incumbent_metadata->samples[0].original_extent);
+        CHECK(metadata->samples[0].pixel_extent == incumbent_metadata->samples[0].pixel_extent);
         if (detail_open) {
             auto document = samples.BorrowDocument(after.frame);
             REQUIRE(document.valid());

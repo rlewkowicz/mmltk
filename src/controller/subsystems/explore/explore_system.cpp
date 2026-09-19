@@ -1014,6 +1014,7 @@ class ExploreSystem::Impl final {
         const auto clean_revision = retained.valid() && prior.output.valid() ? prior.frame.clean_revision : clean_changed ? revision : previous_clean_revision;
         auto frame = visual_frame({PresentationSourceKind::Explore, 1U}, product_extent, revision);
         frame.content = plan.mode == ExploreMode::Detail ? algorithm.DetailContent(plan) : VisualRegion{};
+        frame.source_extent = plan.mode == ExploreMode::Detail ? algorithm.DetailSourceExtent(plan) : VisualExtent{};
         frame.clean_revision = clean_revision;
         PreparedProduct rendered{
             .output = std::move(output),

@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include "src/backend/imaging/resample/image_resize.h"
 #include <concepts>
 #include <cstdint>
 #include <filesystem>
@@ -171,6 +172,7 @@ struct TrainViewState : TrainExecutionPaneState {
     bool use_compiled_directory_defaults = true;
     bool overwrite_compiled_dataset = false;
     bool compile_dimensions = false;
+    mmltk::backend::imaging::resample::ImageResizeMode compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     bool compile_perceptual_downscale = false;
     bool compile_benchmark_dataset_override = false;
     bool visualize_augmentation_in_explore = false;

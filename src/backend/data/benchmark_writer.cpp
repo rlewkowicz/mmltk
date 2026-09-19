@@ -206,10 +206,10 @@ PackedInstance benchmark_canvas_box(const std::uint8_t class_id, const float x1,
     if (letterbox.resized_width == 0U || letterbox.resized_height == 0U) { throw std::runtime_error("benchmark box requires a valid letterbox"); }
     PackedInstance result{};
     result.class_id = class_id;
-    result.bbox_x1 = x1 * letterbox.resized_width + letterbox.offset_x;
-    result.bbox_y1 = y1 * letterbox.resized_height + letterbox.offset_y;
-    result.bbox_x2 = x2 * letterbox.resized_width + letterbox.offset_x;
-    result.bbox_y2 = y2 * letterbox.resized_height + letterbox.offset_y;
+    result.bbox_x1 = x1 * static_cast<float>(letterbox.resized_width) + static_cast<float>(letterbox.offset_x);
+    result.bbox_y1 = y1 * static_cast<float>(letterbox.resized_height) + static_cast<float>(letterbox.offset_y);
+    result.bbox_x2 = x2 * static_cast<float>(letterbox.resized_width) + static_cast<float>(letterbox.offset_x);
+    result.bbox_y2 = y2 * static_cast<float>(letterbox.resized_height) + static_cast<float>(letterbox.offset_y);
     return result;
 }
 

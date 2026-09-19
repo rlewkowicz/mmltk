@@ -48,7 +48,7 @@ class TestAnnotationAlgorithm final : public AnnotationAlgorithm {
                               [probe = std::move(probe)] { return std::make_unique<TestAnnotationAlgorithm>(probe); });
     }
     explicit TestAnnotationAlgorithm(std::shared_ptr<AnnotationRenderProbe> probe = {}) : probe_(std::move(probe)) {}
-    void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion) override {
+    void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion, VisualExtent) override {
         if (probe_) probe_->Wait(probe_->open_hold);
         if (probe_ && probe_->fail_open.exchange(false)) throw std::runtime_error("deterministic source preparation failure");
     }

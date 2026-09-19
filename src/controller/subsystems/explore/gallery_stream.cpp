@@ -1201,7 +1201,7 @@ const rfdetr::AugmentationBatchPlan* GalleryStream::Impl::PrepareImages(const st
             donor.dataset_index = lane.donor_index;
             donor.area = static_cast<float>((label.bbox_x2 - label.bbox_x1) * (label.bbox_y2 - label.bbox_y1));
             std::memcpy(donor.box.data(), static_cast<const std::byte*>(lane.pinned.data()) + lane.layout.donor_box, 4U * sizeof(float));
-            donor.has_mask = lane.layout.donor_rle.count != 0U;
+            donor.has_mask = label.has_mask();
             if (!scheduler_.current_demand_(State().plan.generation)) return nullptr;
             ensure_gallery_cuda(cudaMemcpyAsync(static_cast<float*>(descriptors_.storage_.buffers_.donor_boxes_device_.data()) + slot * 4U,
                                                 static_cast<const std::byte*>(lane.pinned.data()) + lane.layout.donor_box, 4U * sizeof(float),

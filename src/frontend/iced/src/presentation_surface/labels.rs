@@ -111,9 +111,9 @@ impl ValidationContent {
                 let mut bounds = label.box_.clone();
                 for point in [&mut bounds.first, &mut bounds.second] {
                     point.x = sample.crop.x as f32
-                        + point.x * sample.crop.width as f32 / sample.originalextent.width as f32;
+                        + point.x * sample.crop.width as f32 / sample.pixelextent.width as f32;
                     point.y = sample.crop.y as f32
-                        + point.y * sample.crop.height as f32 / sample.originalextent.height as f32;
+                        + point.y * sample.crop.height as f32 / sample.pixelextent.height as f32;
                 }
                 labels.push((sample_index, label_index, bounds, {
                     let mut cached = CachedLabel::new(label.name.clone());
@@ -445,7 +445,7 @@ impl<Message> Labelled<'_, Message> {
         }
         let Some(geometry) = placement_geometry(
             bounds,
-            self.surface.content_extent(),
+            self.surface.display_extent(),
             placement,
             state.viewport.transform_for(self.transform_surface),
         ) else {

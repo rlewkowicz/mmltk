@@ -112,19 +112,22 @@ thread_local! {
 }
 
 pub(super) fn valid_content(frame: &generated::VisualFrame) -> bool {
-    let region = &frame.content;
     frame.source.instance != 0
         && frame.revision != 0
-        && region.width != 0
+        && valid_region(&frame.content, &frame.extent)
+}
+
+fn valid_region(region: &generated::VisualRegion, extent: &generated::VisualExtent) -> bool {
+    region.width != 0
         && region.height != 0
         && region
             .x
             .checked_add(region.width)
-            .is_some_and(|end| end <= frame.extent.width)
+            .is_some_and(|end| end <= extent.width)
         && region
             .y
             .checked_add(region.height)
-            .is_some_and(|end| end <= frame.extent.height)
+            .is_some_and(|end| end <= extent.height)
 }
 
 fn valid_detail(source: &generated::ExploreImageMetadata) -> bool {
@@ -132,6 +135,8 @@ fn valid_detail(source: &generated::ExploreImageMetadata) -> bool {
         && source.dataset.identity != 0
         && source.selectedimage.is_some()
         && valid_content(&source.frame)
+        && source.frame.sourceextent.width != 0
+        && source.frame.sourceextent.height != 0
 }
 
 fn valid_validation(snapshot: &generated::ValidationImageMetadata) -> bool {
@@ -141,12 +146,18 @@ fn valid_validation(snapshot: &generated::ValidationImageMetadata) -> bool {
         && (!snapshot.detail
             || snapshot.samples.iter().any(|sample| {
                 sample.available && Some(&sample.identity) == snapshot.selected.as_ref()
+                    && snapshot.frame.extent == sample.pixelextent
+                    && snapshot.frame.content == sample.content
+                    && snapshot.frame.sourceextent == sample.sourceextent
             }))
         && snapshot.samples.iter().all(|sample| {
             !sample.available
                 || (sample.identity.generation != 0
-                    && sample.originalextent.width != 0
-                    && sample.originalextent.height != 0
+                    && sample.pixelextent.width != 0
+                    && sample.pixelextent.height != 0
+                    && sample.sourceextent.width != 0
+                    && sample.sourceextent.height != 0
+                    && valid_region(&sample.content, &sample.pixelextent)
                     && ((snapshot.detail && Some(&sample.identity) != snapshot.selected.as_ref())
                         || (sample.crop.width != 0
                             && sample.crop.height != 0
@@ -210,7 +221,16 @@ pub(crate) fn install(
             Prepared::None
         }
         WorkspaceImageProduct::Upscale(snapshot) if snapshot.frame == metadata.frame => {
-            if !valid_content(&snapshot.frame) {
+            if !valid_content(&snapshot.frame)
+                || snapshot.frame.sourceextent != snapshot.input.sourceextent
+                || snapshot.input.sourceextent.width == 0 || snapshot.input.sourceextent.height == 0
+                || [snapshot.input.extent.width, snapshot.input.extent.height, snapshot.input.content.x,
+                    snapshot.input.content.y, snapshot.input.content.width, snapshot.input.content.height]
+                    .into_iter().map(|value| value.checked_mul(4))
+                    .ne([snapshot.frame.extent.width, snapshot.frame.extent.height, snapshot.frame.content.x,
+                         snapshot.frame.content.y, snapshot.frame.content.width, snapshot.frame.content.height]
+                        .into_iter().map(Some))
+            {
                 return Err("invalid derived image geometry".into());
             }
             match &source {
@@ -264,6 +284,7 @@ pub(crate) fn install(
         height,
         frame: Some(frame),
         crop: None,
+        display_extent: None,
         viewer_identity: content
             .prediction()
             .as_ref()
@@ -425,12 +446,55 @@ pub(crate) fn install_explore(frame: FrameReady, snapshot: &generated::ExploreSn
 mod tests {
     use super::*;
     #[test]
+    fn paired_geometry_rejects_missing_source_and_inconsistent_samples() {
+        let (model, _) = crate::view_model::test_support::explore_presentation();
+        let mut detail = generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+        for region in [generated::VisualRegion { x: 0, y: 0, width: 640, height: 480 },
+                       generated::VisualRegion { x: 0, y: 80, width: 640, height: 320 }] {
+            detail.frame.content = region;
+            assert!(valid_detail(&detail));
+            for (width, height) in [(0, 480), (640, 0)] {
+                let mut invalid = detail.clone();
+                invalid.frame.sourceextent = generated::VisualExtent { width, height };
+                assert!(!valid_detail(&invalid));
+            }
+        }
+        let mut image = crate::view_model::test_support::validation_image_metadata();
+        for region in [generated::VisualRegion { x: 0, y: 0, width: 200, height: 200 },
+                       generated::VisualRegion { x: 0, y: 50, width: 200, height: 100 }] {
+            image.detail = true;
+            image.selected = Some(image.samples[0].identity.clone());
+            image.samples[0].content = region.clone();
+            image.frame.content = region;
+            image.frame.extent = image.samples[0].pixelextent.clone();
+            image.frame.sourceextent = image.samples[0].sourceextent.clone();
+            image.samples[0].crop = generated::VisualRegion { x: 0, y: 0, width: 200, height: 200 };
+            assert!(valid_validation(&image));
+            for invalid in 0..5 {
+                let mut changed = image.clone();
+                match invalid {
+                    0 => changed.frame.sourceextent.width = 0,
+                    1 => changed.samples[0].sourceextent.height += 1,
+                    2 => changed.samples[0].content.x = u32::MAX,
+                    3 => changed.samples[0].content.height += 1,
+                    _ => changed.samples[1].content.width = 201,
+                }
+                assert!(!valid_validation(&changed));
+            }
+        }
+    }
+
+    #[test]
     fn validation_geometry_requires_the_selected_retained_sample() {
         let mut image = crate::view_model::test_support::validation_image_metadata();
         assert!(valid_validation(&image));
         image.detail = true;
         assert!(!valid_validation(&image));
         image.selected = Some(image.samples[0].identity.clone());
+        image.frame.extent = image.samples[0].pixelextent.clone();
+        image.frame.content = image.samples[0].content.clone();
+        image.frame.sourceextent = image.samples[0].sourceextent.clone();
+        image.samples[0].crop = image.frame.content.clone();
         image.samples[1].crop = generated::VisualRegion {
             x: 0,
             y: 0,
@@ -475,7 +539,8 @@ mod tests {
         let mut source = original;
         source.detail = true;
         source.selected = Some(source.samples[0].identity.clone());
-        source.frame.extent = source.samples[0].originalextent.clone();
+        source.frame.extent = source.samples[0].pixelextent.clone();
+        source.frame.sourceextent = source.samples[0].sourceextent.clone();
         source.frame.content = generated::VisualRegion {
             x: 0,
             y: 0,
@@ -519,6 +584,20 @@ mod tests {
         super::super::reset_test_releases();
         install(physical, 800, 800, 1, &bytes).unwrap();
         retire(physical);
+        for invalid in 0..5 {
+            let mut changed = derived.clone();
+            match invalid {
+                0 => changed.frame.sourceextent.width = 0,
+                1 => changed.frame.sourceextent.height += 1,
+                2 => changed.frame.content.width -= 1,
+                3 => changed.frame.content.x += 1,
+                _ => changed.input.extent.width = u32::MAX,
+            }
+            let bytes = encode(changed.frame.clone(), encode_product(generated::ApplicationSystem::Upscale, changed),
+                Some(encode_product(generated::ApplicationSystem::Validation, source.clone())));
+            assert!(install(physical, 800, 800, 2, &bytes).is_err());
+            assert!(pending(physical).is_none());
+        }
         source.frame.revision += 1;
         let invalid = encode(
             derived_frame,

@@ -181,7 +181,10 @@ class ValidationSamples::Impl final {
         }
         ValidationSampleMetadata metadata;
         metadata.available = true;
-        metadata.original_extent = {sample.pixels.width, sample.pixels.height};
+        metadata.pixel_extent = {sample.pixels.width, sample.pixels.height};
+        metadata.source_extent = {sample.source_width, sample.source_height};
+        metadata.content = {sample.content.offset_x, sample.content.offset_y, sample.content.resized_width, sample.content.resized_height};
+        if (!metadata.content.valid()) metadata.content = {0U, 0U, sample.pixels.width, sample.pixels.height};
         const auto palette = mmltk::controller::annotation_class_palette(raw->classes().size());
         const auto labels = [&](std::span<const rfdetr::Prediction> predictions, bool ground_truth) {
             for (const auto& prediction : predictions) {
@@ -214,8 +217,8 @@ class ValidationSamples::Impl final {
             metadata.identity = (*found)->metadata.identity;
             auto document = std::make_shared<VisualDocument>();
             document->scene.document = contracts::WorkspaceResource::From("validation://sample", (*found)->content_identity);
-            document->scene.frame_width = static_cast<std::uint16_t>(metadata.original_extent.width);
-            document->scene.frame_height = static_cast<std::uint16_t>(metadata.original_extent.height);
+            document->scene.frame_width = static_cast<std::uint16_t>(metadata.pixel_extent.width);
+            document->scene.frame_height = static_cast<std::uint16_t>(metadata.pixel_extent.height);
             document->scene.frame_ready = true;
             document->scene.frame_index = metadata.identity.dataset_index;
             document->scene.palette = palette;
@@ -354,7 +357,7 @@ class ValidationSamples::Impl final {
                 const auto found =
                     std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot && slot->raw && slot->metadata.identity == *selected; });
                 if (found == drawing->samples.end()) return {};
-                extent = (*found)->metadata.original_extent;
+                extent = (*found)->metadata.pixel_extent;
                 image.content_identity = (*found)->content_identity;
                 image.document = (*found)->document->facts();
                 clean_revision = (*found)->clean_revision;
@@ -368,7 +371,7 @@ class ValidationSamples::Impl final {
                 metadata = sample->metadata;
                 if (!sample->raw || (selected && sample->metadata.identity != *selected)) continue;
                 const auto contained =
-                    mmltk::backend::imaging::raster::contain_image(metadata.original_extent.width, metadata.original_extent.height, cell_width, cell_height);
+                    mmltk::backend::imaging::raster::contain_image(metadata.pixel_extent.width, metadata.pixel_extent.height, cell_width, cell_height);
                 metadata.crop = selected ? VisualRegion{0U, 0U, extent.width, extent.height}
                                          : VisualRegion{static_cast<std::uint32_t>(index % 2U) * cell_width + contained.x,
                                                         static_cast<std::uint32_t>(index / 2U) * cell_height + contained.y, contained.width, contained.height};
@@ -382,6 +385,11 @@ class ValidationSamples::Impl final {
             image.frame = visual_frame({PresentationSourceKind::Validation, 1U}, extent, candidate.revision());
             image.frame.content = {0U, 0U, extent.width, extent.height};
             image.frame.clean_revision = clean_revision;
+            if (selected) {
+                const auto found = std::ranges::find_if(drawing->samples, [&](const auto& slot) { return slot && slot->metadata.identity == *selected; });
+                image.frame.content = (*found)->metadata.content;
+                image.frame.source_extent = (*found)->metadata.source_extent;
+            }
             {
                 std::scoped_lock lock(mutex_);
                 if (attempt != request_revision_) return {};

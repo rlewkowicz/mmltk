@@ -45,6 +45,8 @@ struct InfoCommandRequest final {
 MMLTK_REFLECT_FIELDS(BenchCommandRequest)
 MMLTK_REFLECT_FIELDS(InfoCommandRequest)
 inline constexpr std::array kCompileOptions{
+    reflection::option<data::CompilerConfig, &data::CompilerConfig::resize_mode>("--resize-mode", "Image geometry: Stretch or Letterbox", "Dataset"),
+    reflection::option<data::CompilerConfig, &data::CompilerConfig::perceptual_downscale>("--perceptual-downscale", "Perceptual shrinking", "Dataset"),
     reflection::option<data::CompilerConfig, &data::CompilerConfig::source_dir>("--source-dir", "Source dataset directory", "Dataset", "source_dir", {}, true),
     reflection::option<data::CompilerConfig, &data::CompilerConfig::output_dir>("--output-dir", "Compiled binary output directory", "Dataset", "output_dir", {},
                                                                                 true),

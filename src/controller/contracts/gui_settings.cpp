@@ -283,6 +283,7 @@ constexpr auto train_dataset_fields = [](auto& state, const auto& visit) {
     visit("test_compiled_path", state.request.test_compiled_path);
     visit("overwrite", state.overwrite_compiled_dataset);
     visit("compile_dimensions", state.compile_dimensions);
+    visit("resize_mode", state.compile_resize_mode);
     visit("perceptual_downscale", state.compile_perceptual_downscale);
     visit("compile_benchmark_dataset_override", state.compile_benchmark_dataset_override);
 };
@@ -494,6 +495,7 @@ constexpr auto validation_fields = [](auto& state, const auto& visit) {
     visit("recompile", state.recompile);
     visit("profile", state.profile);
     visit("write_report_json", state.write_report_json);
+    visit("compile_resize_mode", state.compile_resize_mode);
     visit("compile_workers", state.compile_workers);
     visit("compile_cuda_mask_batch_size", state.compile_cuda_mask_batch_size);
     visit("compile_cuda_device_id", state.compile_cuda_device_id);

@@ -27,7 +27,8 @@ std::filesystem::path compile_explore_fixture(const std::filesystem::path& tempo
             filename << std::setfill('0') << std::setw(6) << image << ".jsonl";
             std::ofstream output{std::filesystem::path{backend::data::testsupport::dataset_dir(fixture)} / fixture.split / filename.str(), std::ios::trunc};
             for (std::size_t object = 0U; object < annotations.objects; ++object) {
-                output << "{\"class\":\"person\",\"bbox_xyxy\":[0,0," << dimensions.source_width << ',' << dimensions.source_height
+                output << "{\"iscrowd\":" << ((annotations.crowd_only || (annotations.mixed_crowd && object % 2U == 0U)) ? "true" : "false")
+                       << ",\"class\":\"person\",\"bbox_xyxy\":[0,0," << dimensions.source_width << ',' << dimensions.source_height
                        << "],\"mask_rle_encoding\":\"row_major_start_length\",\"mask_rle\":\"";
                 for (std::size_t row = 0U; row < annotations.runs_per_object; ++row) {
                     if (row != 0U) output << ' ';

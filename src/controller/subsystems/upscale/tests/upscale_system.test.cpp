@@ -242,13 +242,14 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
     MutableVisualSource source{backend, {16U, 8U}, 3U};
     auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
     auto runs = std::make_shared<std::atomic_uint32_t>(0U);
+    auto semantics = std::make_shared<std::atomic_uint32_t>(0U);
     std::atomic_uint32_t copies{0U};
     EventGate events;
     const VisualDiagnosticSink diagnostics{.context = &copies, .write = [](void* context, VisualDiagnosticFact fact) noexcept {
                                                if (fact.operation == VisualDiagnosticOperation::CopyCompleted)
                                                    static_cast<std::atomic_uint32_t*>(context)->fetch_add(1U);
                                            }};
-    UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs),
+    UpscaleSystem upscale{kDevice, TestUpscaleAlgorithm::CreateRuntime(backend, kernel, runs, semantics),
                           [&source](const VisualFrame& frame) { return source.BorrowExact(frame); }, [&events](UpscaleSystem::event_type) { events.Advance(); },
                           diagnostics};
     for (const auto selected : {UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::Default}) {
@@ -264,11 +265,20 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
             REQUIRE(output.valid());
             CHECK(*reinterpret_cast<const std::uint8_t*>(output.pixels.plane(0U).plane().data) == static_cast<std::uint8_t>(selected) + 1U);
         }
-        static_cast<void>(upscale.Start(request));
-        REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
-        CHECK(upscale.snapshot().frame == completed);
-        CHECK(copies.load() == copied);
-        CHECK(runs->load() == inferred);
+        const auto semantic_runs = semantics->load();
+        const auto allocation = upscale.BorrowDocument(completed).pixels.plane(0U).plane().allocation;
+        for (const bool original : {false, true, false, true}) {
+            auto repeated = request;
+            repeated.original_content = original;
+            const auto selected_result = upscale.Start(repeated);
+            CHECK(selected_result.ready);
+            CHECK(selected_result.frame == completed);
+            CHECK(selected_result.methods[static_cast<std::size_t>(selected)].completed == repeated);
+            CHECK(upscale.BorrowDocument(completed).pixels.plane(0U).plane().allocation == allocation);
+            CHECK(copies.load() == copied);
+            CHECK(runs->load() == inferred);
+            CHECK(semantics->load() == semantic_runs);
+        }
     }
     CHECK(runs->load() == 2U);
     const auto retained = upscale.snapshot().frame;
@@ -282,9 +292,11 @@ TEST_CASE("Upscale exact repeats avoid copying and method switches preserve comp
     CHECK(runs->load() == 3U);
     auto cropped = source.frame();
     cropped.content = {1U, 1U, 4U, 3U};
+    cropped.source_extent = {4000U, 2000U};
     static_cast<void>(upscale.Start(test_upscale_request({.source = cropped})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == cropped; }));
     CHECK(runs->load() == 4U);
+    CHECK(upscale.snapshot().frame.source_extent == cropped.source_extent);
 }
 TEST_CASE("Validation clean identity reuses native Upscale while replacing paired semantics", "[controller][gpu][validation][upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");

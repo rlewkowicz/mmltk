@@ -20,7 +20,9 @@ target_link_libraries(mmltk_controller_visual_contract
         mmltk::controller::contracts
         mmltk::frameworks::gpu
         mmltk::frameworks::reflection)
-target_link_libraries(mmltk_controller_visual_contract PRIVATE mmltk::backend::imaging::primitives)
+target_link_libraries(mmltk_controller_visual_contract PRIVATE
+    mmltk::backend::imaging::primitives
+    mmltk::backend::imaging::resample)
 mmltk_register_header_isolation(mmltk_controller_visual_contract)
 
 add_library(mmltk_controller_visual_runtime STATIC)

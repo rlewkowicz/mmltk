@@ -126,6 +126,8 @@ pub(super) enum Step {
     NoValidationAspect,
     OpenSample,
     Sample,
+    ValidationOriginal,
+    ValidationOriginalReady,
     HideBoxes,
     HiddenBoxes,
     ValidationLayer(bool, u8),
@@ -176,6 +178,8 @@ pub(super) struct State {
     pixel_attempts: u8,
     progress_epoch: Option<u64>,
     validation_layer: u8,
+    validation_original: u8,
+    validation_frame: Option<crate::presentation_surface::Surface>,
     export_pixels: bool,
     primary_pixels: [bool; 4],
     primary_reveal: [Option<(u64, u64)>; 4],
@@ -671,6 +675,7 @@ impl State {
                     Picture::Validation if self.validation_layer < 4 => Step::ValidationLayer(false, self.validation_layer + 1),
                     Picture::Validation => { self.validation_layer = 0; Step::OpenSample },
                     Picture::Detail if self.validation_layer < 4 => Step::ValidationLayer(true, self.validation_layer + 1),
+                    Picture::Detail if self.validation_original < 2 => Step::ValidationOriginal,
                     Picture::Detail => Step::CloseSample,
                     Picture::Compiled => Step::Source(1),
                     Picture::Image => Step::Source(2),
@@ -867,7 +872,7 @@ impl State {
         let bounds = match step {
             Step::Pixels(Picture::Validation, index) => atlas_cell(bounds, index),
             Step::OpenSample => atlas_cell(bounds, 0),
-            Step::ValidationLayer(..) => Rectangle {
+            Step::ValidationOriginal | Step::ValidationLayer(..) => Rectangle {
                 width: bounds.width.min(bounds.height),
                 ..bounds
             },
@@ -930,6 +935,7 @@ impl State {
             Step::Validate => Step::StartValidate,
             Step::StartValidate => Step::Validating,
             Step::OpenSample => Step::Sample,
+            Step::ValidationOriginal => Step::ValidationOriginalReady,
             Step::HideBoxes => Step::HiddenBoxes,
             Step::ValidationLayer(detail, index) => Step::ValidationLayerReady(detail, index),
             Step::CloseSample => Step::ClosedSample,
@@ -1406,8 +1412,43 @@ impl State {
             Step::OpenSample if model.validation_navigation_available() => {
                 self.workflow_control(widgets, driver, crate::view::validate::samples::ATLAS_ID)
             }
-            Step::Sample if validation.is_some_and(|value| value.detail) => {
-                self.workflow_step(driver, Step::HideBoxes)
+            Step::Sample | Step::ValidationOriginalReady if validation.is_some_and(|value| value.detail) => {
+                let Some(receipt) = super::probe::current_receipt("validate.detail.image") else {
+                    return Task::none();
+                };
+                let Some((_, content)) = crate::presentation_surface::drawable_validation(receipt.surface) else {
+                    return Task::none();
+                };
+                let original = step == Step::Sample || self.validation_original == 1;
+                let frame = content.frame();
+                if receipt.surface.original_content(frame) != Some(original) {
+                    return Task::none();
+                }
+                let extent = if original { &frame.sourceextent } else { &frame.extent };
+                let expected = extent.width as f32 / extent.height as f32;
+                if (receipt.image.width / receipt.image.height - expected).abs() > 0.01
+                    || frame.sourceextent.width == frame.sourceextent.height
+                    || self.validation_frame.is_some_and(|previous| previous.frame != receipt.surface.frame)
+                {
+                    driver.fail("Validation Original changed native pixels or lost source-aspect placement");
+                    return Task::none();
+                }
+                completed("validation_original", [f64::from(u8::from(original)), expected as f64,
+                    receipt.image.width as f64, receipt.image.height as f64]);
+                if step == Step::Sample {
+                    self.validation_frame = Some(receipt.surface);
+                    self.workflow_step(driver, Step::HideBoxes)
+                } else {
+                    self.validation_original += 1;
+                    self.workflow_step(driver, Step::Pixels(Picture::Detail, 0))
+                }
+            }
+            Step::ValidationOriginal if model.validation_navigation_available() => {
+                let Some(receipt) = super::probe::current_receipt("validate.detail.image") else {
+                    return Task::none();
+                };
+                self.validation_frame = Some(receipt.surface);
+                self.workflow_control(widgets, driver, "validate.detail.original")
             }
             Step::HideBoxes if model.validation_navigation_available() => {
                 self.workflow_control(widgets, driver, "validate.pred.boxes")

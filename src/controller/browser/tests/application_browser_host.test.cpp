@@ -236,7 +236,7 @@ class RunningHost final {
 };
 class HostAnnotationAlgorithm final : public AnnotationAlgorithm {
    public:
-    void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion) override {}
+    void Open(mmltk::frameworks::gpu::ImagePlaneView, VisualRegion, VisualExtent) override {}
     contracts::AnnotationColor Sample(contracts::AnnotationPoint) override { return {}; }
     void Render(const AnnotationRenderState&, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView clean,
                 const mmltk::frameworks::gpu::ImagePlaneView semantic, std::uintptr_t) const override {

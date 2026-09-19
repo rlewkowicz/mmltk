@@ -349,9 +349,10 @@ class AnnotationSystem::Impl final {
                     if (descriptor.width > settings_.maximum_width || descriptor.height > settings_.maximum_height)
                         return [this] { Post([this] { FinishRejected("Annotation source exceeds the configured device bounds"); }); };
                     const auto crop = request.original_content ? request.source.content : VisualRegion{};
+                    const auto target = visual_materialized_extent(request.source, request.original_content);
                     contracts::AnnotationSceneContent scene;
                     try {
-                        scene = materialize_visual_document(*source.document, request.source.extent, crop);
+                        scene = materialize_visual_document(*source.document, request.source.extent, crop, target);
                     } catch (const contracts::InvalidIntentError& error) {
                         return [this, detail = std::string(error.what())] { Post([this, detail] { FinishRejected(detail); }); };
                     }
@@ -374,7 +375,7 @@ class AnnotationSystem::Impl final {
                     const auto plane = input.plane(0U).plane();
                     std::exception_ptr preparation_failure;
                     try {
-                        algorithm.Open(plane, crop);
+                        algorithm.Open(plane, crop, target);
                     } catch (...) { preparation_failure = std::current_exception(); }
                     if (preparation_failure) return [this, preparation_failure] { Post([this, preparation_failure] { Failed(preparation_failure); }); };
                     std::optional<mmltk::common::system::ExecutionPolicyRequest> policy;

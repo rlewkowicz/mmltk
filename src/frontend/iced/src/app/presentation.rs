@@ -111,6 +111,7 @@ impl Controller {
                     && request.source != source.frame
                 {
                     return Some(ViewerOutcome::Opened(crate::generated::UpscaleRequest {
+                        originalcontent: false,
                         source: source.frame.clone(),
                         document: source.document.clone(),
                         kernel: request.kernel,
@@ -123,6 +124,7 @@ impl Controller {
                 self.suspended = None;
                 self.viewer = identity;
                 let request = crate::generated::UpscaleRequest {
+                    originalcontent: false,
                     source: source.frame.clone(),
                     document: source.document.clone(),
                     kernel: crate::generated::UpscaleKernel::Default,
@@ -171,6 +173,7 @@ impl Controller {
                 {
                     self.viewer = identity;
                     return Some(ViewerOutcome::Replaced(crate::generated::UpscaleRequest {
+                        originalcontent: false,
                         source: snapshot.frame.clone(),
                         document: snapshot.document.clone(),
                         kernel: crate::generated::UpscaleKernel::Default,
@@ -188,6 +191,7 @@ impl Controller {
             let replacing = self.viewer.is_some();
             self.viewer = identity;
             let request = crate::generated::UpscaleRequest {
+                originalcontent: false,
                 source: snapshot.frame.clone(),
                 kernel: crate::generated::UpscaleKernel::Default,
                 document: snapshot.document.clone(),
@@ -938,6 +942,7 @@ mod tests {
             app.reconcile_viewer();
             let source = app.model.explore.snapshot.as_ref().unwrap().frame.clone();
             app.model.request_upscale(crate::generated::UpscaleRequest {
+                originalcontent: false,
                 source,
                 kernel: crate::generated::UpscaleKernel::ShiftLut,
                 document: app
@@ -1105,6 +1110,10 @@ mod tests {
                         .map(|image| (snapshot.dataset.identity, u64::from(image)))
                 }),
                 crop: (crop != [0, 0, frame.content_width, frame.content_height]).then_some(crop),
+                display_extent: (crop != [0, 0, frame.content_width, frame.content_height]).then(|| {
+                    let source = &app.model.explore.snapshot.as_ref().unwrap().frame.sourceextent;
+                    (source.width, source.height)
+                }),
                 ..surface
             },
             crop,
@@ -1791,6 +1800,7 @@ mod tests {
         let (mut app, mut frame) = viewer_app();
         let explore = app.model.explore.snapshot.as_mut().unwrap();
         explore.detail.showoriginaldimensions = false;
+        explore.frame.content = crate::generated::VisualRegion { x: 10, y: 20, width: 500, height: 300 };
         let input = explore.frame.clone();
         let upscale = app.model.upscale_snapshot.as_mut().unwrap();
         upscale.ready = true;
@@ -1810,6 +1820,7 @@ mod tests {
         };
         let expected = upscale.frame.clone();
         app.model.requested_upscale = Some(crate::generated::UpscaleRequest {
+            originalcontent: false,
             source: input,
             kernel: upscale.kernel,
             document: explore.document.clone(),

@@ -857,7 +857,16 @@ impl State {
                         return Task::none();
                     };
                     let expected = if request.originalcontent {
-                        [request.source.content.width, request.source.content.height]
+                        let crop = &request.source.content;
+                        let source = &request.source.sourceextent;
+                        if source.width != 0 && source.height != 0 {
+                            let scale = (f64::from(crop.width) / f64::from(source.width))
+                                .min(f64::from(crop.height) / f64::from(source.height));
+                            [(f64::from(source.width) * scale).round().max(1.0) as u32,
+                             (f64::from(source.height) * scale).round().max(1.0) as u32]
+                        } else {
+                            [crop.width, crop.height]
+                        }
                     } else {
                         [request.source.extent.width, request.source.extent.height]
                     };
@@ -867,7 +876,7 @@ impl State {
                         || u32::from(scene.framewidth) != expected[0]
                         || u32::from(scene.frameheight) != expected[1]
                     {
-                        driver.fail("Annotation did not copy the viewed upscale crop");
+                        driver.fail("Annotation did not materialize the viewed upscale aspect and crop");
                         return Task::none();
                     }
                     self.copy_before = Some(object.clone());

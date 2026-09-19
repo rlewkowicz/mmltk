@@ -28,6 +28,7 @@ struct VisualFrame final {
     std::uint64_t revision = 0U;
     VisualRegion content{};
     std::uint64_t clean_revision = 0U;
+    VisualExtent source_extent{};
     bool operator==(const VisualFrame&) const = default;
     [[nodiscard]] constexpr bool valid() const noexcept { return source.valid() && extent.valid() && revision != 0U; }
 };

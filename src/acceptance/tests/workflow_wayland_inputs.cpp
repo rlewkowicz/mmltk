@@ -18,7 +18,7 @@ namespace contracts = mmltk::controller::contracts;
 WorkflowWaylandInputs::WorkflowWaylandInputs(const std::filesystem::path& root)
     // Keep real work outstanding across the trainer's one-second live-progress
     // publication interval, rather than observing only epoch-boundary records.
-    : fixture_{.root_dir = root.string(), .split = "train", .width = 64, .height = 64, .num_images = 256, .background_images = 0, .pixel_evidence = true},
+    : fixture_{.root_dir = root.string(), .split = "train", .width = 128, .height = 64, .num_images = 256, .background_images = 0, .pixel_evidence = true},
       weights_(root / "workflow.pt"),
       video_(root / "workflow.y4m") {
     data::testsupport::create_synthetic_dataset(fixture_);

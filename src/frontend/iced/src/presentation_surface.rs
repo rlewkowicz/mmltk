@@ -47,6 +47,7 @@ pub struct Surface {
     // Only accept_publication + SampleRead can authorize an external read.
     pub frame: Option<FrameReady>,
     pub crop: Option<[u32; 4]>,
+    pub display_extent: Option<(u32, u32)>,
     pub viewer_identity: Option<(u64, u64)>,
     pub fit_revision: u64,
 }
@@ -60,6 +61,7 @@ impl Surface {
             height: 0,
             frame: None,
             crop: None,
+            display_extent: None,
             viewer_identity: None,
             fit_revision: 0,
         }
@@ -77,6 +79,25 @@ impl Surface {
                     && y.checked_add(*h).is_some_and(|end| end <= height)
             })
             .unwrap_or([0, 0, width, height])
+    }
+
+    fn display_extent(self) -> (u32, u32) {
+        self.display_extent.filter(|(w, h)| *w != 0 && *h != 0).unwrap_or_else(|| self.content_extent())
+    }
+
+    pub(crate) fn configure_original(&mut self, frame: &crate::generated::VisualFrame, original: bool) {
+        self.crop = original.then_some([frame.content.x, frame.content.y, frame.content.width, frame.content.height]);
+        self.display_extent = original.then_some((frame.sourceextent.width, frame.sourceextent.height));
+    }
+
+    pub(crate) fn original_content(self, frame: &crate::generated::VisualFrame) -> Option<bool> {
+        let full = [0, 0, frame.extent.width, frame.extent.height];
+        match self.display_extent {
+            Some(aspect) if aspect.0 != 0 && aspect.1 != 0 && aspect == (frame.sourceextent.width, frame.sourceextent.height)
+                && self.crop == Some([frame.content.x, frame.content.y, frame.content.width, frame.content.height]) => Some(true),
+            None if self.crop.is_none() || self.crop == Some(full) => Some(false),
+            _ => None,
+        }
     }
 
     fn content_extent(self) -> (u32, u32) {
@@ -211,6 +232,7 @@ fn surface_for_content_session(content_session: u64) -> Surface {
             480,
         )),
         crop: None,
+        display_extent: None,
         viewer_identity: None,
         fit_revision: 0,
     }

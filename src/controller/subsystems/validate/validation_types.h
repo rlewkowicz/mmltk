@@ -30,7 +30,9 @@ struct ValidationSampleMetadata final {
     ValidationSampleIdentity identity{};
     bool available = false;
     VisualRegion crop{};
-    VisualExtent original_extent{};
+    VisualExtent pixel_extent{};
+    VisualExtent source_extent{};
+    VisualRegion content{};
     [[= mmltk::frameworks::reflection::MaxItems{2U * contracts::kAnnotationObjectCapacity}]] std::vector<ValidationLabel> labels;
 };
 struct ValidationOverlays final {

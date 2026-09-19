@@ -165,6 +165,7 @@ impl Component {
             Message::StopRemoteRequested => Outcome::StopRemoteRequested,
             Message::RetryReconciliationRequested => Outcome::RetryReconciliationRequested,
             Message::Dataset(message) => match dataset::update(model, message)? {
+                dataset::Outcome::Ignored => return Ok(None),
                 dataset::Outcome::SettingsEdited(schedule) => Outcome::SettingsEdited(schedule),
                 dataset::Outcome::Browse(id) => Outcome::DialogRequested(id),
                 dataset::Outcome::Compile => Outcome::CompileRequested,

@@ -276,6 +276,7 @@ class ExploreAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     [[nodiscard]] virtual ExploreOrderFacts Visible(ExploreViewport, const ExploreOrderCandidate* = nullptr) const = 0;
     [[nodiscard]] virtual bool Contains(std::uint32_t) const = 0;
     [[nodiscard]] virtual VisualExtent DetailExtent(const ExploreRenderPlan& plan) const { return plan.viewport.extent; }
+    [[nodiscard]] virtual VisualExtent DetailSourceExtent(const ExploreRenderPlan&) const { return {}; }
     [[nodiscard]] virtual VisualRegion DetailContent(const ExploreRenderPlan&) const { return {}; }
     [[nodiscard]] virtual std::shared_ptr<const VisualDocument> Document() const { return {}; }
     [[nodiscard]] virtual std::vector<ExploreLabel> Labels() const { return {}; }

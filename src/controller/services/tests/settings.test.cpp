@@ -587,6 +587,8 @@ void test_ui_settings_round_trip() {
     train.overwrite_compiled_dataset = true;
     train.compile_dimensions = true;
     train.compile_perceptual_downscale = true;
+    train.compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
+    validate.request.compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox;
     train.request.gpu_augmentation.perceptual_downscale = true;
     train.request.cpu_affinity = "0-3";
     train.request.progress_bar = true;
@@ -786,6 +788,8 @@ void test_ui_settings_round_trip() {
     REQUIRE((loaded_train.overwrite_compiled_dataset));
     REQUIRE((loaded_train.compile_dimensions));
     CHECK(loaded_train.compile_perceptual_downscale);
+    CHECK(loaded_train.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+    CHECK(loaded_validate.request.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     CHECK(loaded_train.request.gpu_augmentation.perceptual_downscale);
     REQUIRE((loaded_train.request.resolution == 512));
     REQUIRE((loaded_train.request.weights_path == "/tmp/weights.pt"));
@@ -871,6 +875,8 @@ void test_fresh_defaults_use_capture_only_annotate() {
     REQUIRE((!train.overwrite_compiled_dataset));
     REQUIRE((!train.compile_dimensions));
     CHECK_FALSE(train.compile_perceptual_downscale);
+    CHECK(train.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
+    CHECK(validate.request.compile_resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Stretch);
     CHECK_FALSE(train.request.gpu_augmentation.perceptual_downscale);
     REQUIRE((train.request.num_queries == 0));
     REQUIRE((train.request.eval_max_dets == 0));

@@ -902,6 +902,7 @@ fn atlas_pixel_evidence_covers_only_ready_interiors_inside_the_real_clip() {
             height: 200,
             frame: None,
             crop: None,
+            display_extent: None,
             viewer_identity: None,
             fit_revision: 0,
         },

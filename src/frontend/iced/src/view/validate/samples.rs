@@ -12,6 +12,7 @@ pub enum Message {
     Select(ValidationSampleIdentity),
     Close,
     Fit,
+    Original(bool),
     Labels(bool, bool),
     Overlays(ValidationOverlays),
     Upscale(crate::generated::UpscaleKernel),
@@ -80,6 +81,7 @@ pub struct Component {
     ground_truth: bool,
     prediction: bool,
     fit_revision: u64,
+    original: bool,
     atlas: std::cell::RefCell<AtlasInteraction>,
 }
 impl Default for Component {
@@ -88,6 +90,7 @@ impl Default for Component {
             ground_truth: true,
             prediction: true,
             fit_revision: 0,
+            original: true,
             atlas: Default::default(),
         }
     }
@@ -102,6 +105,10 @@ impl Component {
                 } else {
                     self.prediction = value;
                 }
+                None
+            }
+            Message::Original(value) => {
+                self.original = value;
                 None
             }
             Message::Fit => {
@@ -301,6 +308,7 @@ impl Component {
         let available = model.validation_navigation_available();
         let mut shown = surface;
         shown.fit_revision = self.fit_revision;
+        shown.configure_original(content.frame(), self.original);
         let image = crate::view::image_viewer::image(
             shown,
             presentation_surface::labels::Source::Validation(
@@ -314,6 +322,7 @@ impl Component {
         );
         let source = row![
             container(button("Fit").on_press(Message::Fit)).id("validate.detail.fit"),
+            container(checkbox(self.original).label("Original").on_toggle(Message::Original)).id("validate.detail.original"),
             self.controls(model)
         ]
         .spacing(7)

@@ -602,6 +602,7 @@ pub(crate) fn viewer_upscale_request(
         return Some(crate::generated::UpscaleRequest {
             source: validation.metadata.frame.clone(),
             document: validation.metadata.document.clone(),
+            originalcontent: surface.original_content(validation.frame())?,
             kernel,
         });
     }
@@ -614,6 +615,7 @@ pub(crate) fn viewer_upscale_request(
     Some(crate::generated::UpscaleRequest {
         source: detail.explore.frame.clone(),
         document: detail.explore.document.clone(),
+        originalcontent: surface.original_content(detail.frame())?,
         kernel,
     })
 }
@@ -631,12 +633,13 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
             && frame.belongs_to(surface)
             && metadata::product(frame).as_ref() == Some(source)
             && frame.matches_content(source)
-            && crop == [0, 0, source.extent.width, source.extent.height]
+            && crop == surface.content_region()
+            && metadata::valid_content(source)
             && surface.viewer_identity == paired.surface.viewer_identity
         {
             return Some(crate::generated::AnnotationOpen {
                 source: source.clone(),
-                originalcontent: true,
+                originalcontent: surface.original_content(source)?,
             });
         }
         return None;
@@ -659,18 +662,10 @@ pub(crate) fn viewer_annotation_request() -> Option<crate::generated::Annotation
     {
         return None;
     }
-    let region = &source.content;
-    let content = [region.x, region.y, region.width, region.height];
-    let full = [0, 0, source.extent.width, source.extent.height];
-    if !metadata::valid_content(source) {
+    if !metadata::valid_content(source) || crop != surface.content_region() {
         return None;
     }
-    let originalcontent = match surface.crop {
-        Some(applied) if applied == content && crop == content => true,
-        Some(applied) if applied == full && crop == full => false,
-        None if crop == full => false,
-        _ => return None,
-    };
+    let originalcontent = surface.original_content(source)?;
     Some(crate::generated::AnnotationOpen {
         source: source.clone(),
         originalcontent,
@@ -1445,10 +1440,7 @@ impl DetailContent {
             .viewer_identity()
             .map(|(dataset, image)| (dataset, u64::from(image)));
         surface.fit_revision = fit_revision;
-        surface.crop = original.then(|| {
-            let region = &self.frame().content;
-            [region.x, region.y, region.width, region.height]
-        });
+        surface.configure_original(self.frame(), original);
         surface
     }
 
@@ -1786,7 +1778,7 @@ impl SurfaceRenderer {
             placement = gallery::placement(snapshot);
         }
         let Some(geometry) =
-            placement_geometry(bounds, surface.content_extent(), placement, transform)
+            placement_geometry(bounds, surface.display_extent(), placement, transform)
         else {
             trace_image(
                 "sample_draw_rejected",
@@ -3350,6 +3342,12 @@ mod tests {
                 let mut product = source.frame.clone();
                 let (encoded, provenance) = if upscale {
                     product.source.kind = crate::generated::PresentationSourceKind::Upscale;
+                    product.extent.width *= 4;
+                    product.extent.height *= 4;
+                    product.content.x *= 4;
+                    product.content.y *= 4;
+                    product.content.width *= 4;
+                    product.content.height *= 4;
                     (
                         metadata::encode_product(
                             crate::generated::ApplicationSystem::Upscale,
@@ -3378,6 +3376,8 @@ mod tests {
                         product.source.kind,
                     ),
                     presentation_revision: old.presentation_revision + 1,
+                    content_width: product.extent.width,
+                    content_height: product.extent.height,
                     slot: 1,
                     ..old
                 };
@@ -3583,9 +3583,12 @@ mod tests {
     fn upscale_detail_crop_and_identity_follow_its_retained_source_projection() {
         reset_test_releases();
         let (model, frame) = crate::view_model::test_support::explore_presentation();
-        let source =
+        let mut source =
             crate::generated::ExploreImageMetadata::from(model.explore.snapshot.as_ref().unwrap());
+        source.frame.content = crate::generated::VisualRegion { x: 2, y: 1, width: 8, height: 6 };
         let mut upscale_frame = source.frame.clone();
+        upscale_frame.extent.width *= 4;
+        upscale_frame.extent.height *= 4;
         upscale_frame.source.kind = crate::generated::PresentationSourceKind::Upscale;
         upscale_frame.revision += 1;
         upscale_frame.content = crate::generated::VisualRegion {
@@ -3604,6 +3607,8 @@ mod tests {
                 upscale.frame.source.kind,
             ),
             content_sequence: upscale.frame.revision,
+            content_width: upscale.frame.extent.width,
+            content_height: upscale.frame.extent.height,
             presentation_revision: frame.presentation_revision + 1,
             slot: 1,
             ..frame
@@ -3618,8 +3623,8 @@ mod tests {
         );
         metadata::install(
             physical,
-            frame.content_width,
-            frame.content_height,
+            physical.content_width,
+            physical.content_height,
             2,
             &bytes,
         )

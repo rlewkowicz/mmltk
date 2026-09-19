@@ -1,10 +1,12 @@
 use crate::fluent_theme::Element;
 use crate::view::settings::{EditCadence, EditSchedule, SettingsModel};
 use iced::Fill;
-use iced::widget::{button, checkbox, column, container, text};
+use iced::widget::{button, checkbox, column, container, radio, row, text};
+use crate::generated::ImageResizeMode;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Ignore,
     BenchmarkChanged(bool),
     SourceChanged(String),
     CompiledDirectoryChanged(String),
@@ -15,6 +17,7 @@ pub enum Message {
     OverwriteChanged(bool),
     CompileDimensionsChanged(bool),
     PerceptualDownscaleChanged(bool),
+    ResizeModeChanged(ImageResizeMode),
     ResolutionChanged(i32),
     Browse(u64),
     Compile,
@@ -23,6 +26,7 @@ pub enum Message {
 
 #[derive(Debug, Clone)]
 pub enum Outcome {
+    Ignored,
     SettingsEdited(EditSchedule),
     Browse(u64),
     Compile,
@@ -32,6 +36,7 @@ pub enum Outcome {
 pub fn update(model: &mut SettingsModel, message: Message) -> Result<Outcome, String> {
     let cadence = EditCadence::Debounced;
     let schedule = match message {
+        Message::Ignore => return Ok(Outcome::Ignored),
         Message::BenchmarkChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompilebenchmarkdatasetoverride(draft, value)
         })?,
@@ -58,6 +63,9 @@ pub fn update(model: &mut SettingsModel, message: Message) -> Result<Outcome, St
         })?,
         Message::OverwriteChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstrainoverwritecompileddataset(draft, value)
+        })?,
+        Message::ResizeModeChanged(value) => model.edit(cadence, |draft| {
+            crate::generated::edit_workflowstraincompileresizemode(draft, value)
         })?,
         Message::PerceptualDownscaleChanged(value) => model.edit(cadence, |draft| {
             crate::generated::edit_workflowstraincompileperceptualdownscale(draft, value)
@@ -180,6 +188,24 @@ pub fn view<'a>(
             ))
             .id(super::COMPILE_DIMENSIONS_ID),
         );
+    let resize_radio = |label, mode| {
+        radio(label, mode, Some(train.compileresizemode), move |value| {
+            if enabled { Message::ResizeModeChanged(value) } else { Message::Ignore }
+        })
+        .style(move |theme, status| {
+            if enabled {
+                iced_fluent_theme::radio::default(theme, status)
+            } else {
+                iced_fluent_theme::radio::disabled(theme, status)
+            }
+        })
+    };
+    let fields = fields.push(
+        row![
+            container(resize_radio("Stretch", ImageResizeMode::Stretch)).id("train.dataset.resize.stretch"),
+            container(resize_radio("Letterbox", ImageResizeMode::Letterbox)).id("train.dataset.resize.letterbox"),
+        ].spacing(crate::view::workflow::FIELD_SPACING),
+    );
     let fields = fields.push(
         container(crate::view::workflow::fields::toggle(
             "Perceptual downscaling",
@@ -248,6 +274,19 @@ pub fn view<'a>(
 mod tests {
     use super::*;
     use crate::view::settings::installed_settings_model;
+
+    #[test]
+    fn resize_radios_settle_independently_of_perceptual_choice() {
+        let mut model = installed_settings_model();
+        assert_eq!(model.draft.as_ref().unwrap().workflows.train.compileresizemode, ImageResizeMode::Stretch);
+        update(&mut model, Message::PerceptualDownscaleChanged(true)).unwrap();
+        for mode in [ImageResizeMode::Letterbox, ImageResizeMode::Stretch] {
+            assert!(matches!(update(&mut model, Message::ResizeModeChanged(mode)), Ok(Outcome::SettingsEdited(EditSchedule::Debounce(_)))));
+            let train = &model.draft.as_ref().unwrap().workflows.train;
+            assert_eq!(train.compileresizemode, mode);
+            assert!(train.compileperceptualdownscale);
+        }
+    }
 
     #[test]
     fn inference_toggles_retain_optional_test_path() {

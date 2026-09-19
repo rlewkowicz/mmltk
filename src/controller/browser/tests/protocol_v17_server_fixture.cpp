@@ -218,7 +218,9 @@ int main(const int argument_count, char* const* const arguments) {
     sample.identity = {7U, 3U};
     sample.available = true;
     sample.crop = {0U, 0U, 256U, 256U};
-    sample.original_extent = {640U, 640U};
+    sample.pixel_extent = {640U, 640U};
+    sample.source_extent = {1280U, 640U};
+    sample.content = {0U, 160U, 640U, 320U};
     sample.labels.push_back(ValidationLabel{.box = {{1.25F, 2.5F}, {15.0F, 19.0F}},
                                             .color = {},
                                             .rgb = {17U, 93U, 201U},

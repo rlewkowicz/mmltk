@@ -158,36 +158,14 @@ impl App {
                     ));
                     return Task::none();
                 }
-                let source = self
-                    .model
-                    .explore
-                    .snapshot
-                    .as_ref()
-                    .map(|snapshot| snapshot.frame.clone());
-                let Some(source) =
-                    source.filter(|frame| ApplicationModel::valid_visual_source(frame).is_some())
-                else {
-                    self.model.error = Some(UiError::presentation(
-                        "Explore detail frame is unavailable.",
-                    ));
+                let Some(request) = crate::presentation_surface::viewer_upscale_request(kernel) else {
+                    self.model.error = Some(UiError::presentation("Explore displayed detail is unavailable."));
                     return Task::none();
                 };
                 if let Some(integration) = self.integration.as_mut() {
                     integration.observe_upscale_request(kernel);
                 }
-                self.model
-                    .request_upscale(crate::generated::UpscaleRequest {
-                        source,
-                        kernel,
-                        document: self
-                            .model
-                            .explore
-                            .snapshot
-                            .as_ref()
-                            .expect("selected source")
-                            .document
-                            .clone(),
-                    });
+                self.model.request_upscale(request);
                 self.dispatch_explore_desired();
             }
             crate::view::explore::Outcome::OverlayUpdated(request) => {

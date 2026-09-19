@@ -16,6 +16,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/data/compiled_dataset.h"
 #include "src/backend/models/rfdetr/inference/dataset_batch_lease.h"
 #include <array>
 #include <algorithm>
@@ -1039,6 +1040,33 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     request.h2d_dataloader = true;
     rfdetr::ValidationSession session;
     const auto selected_digest = io::sha256_file(descriptor);
+    {
+        auto compile_request = request;
+        compile_request.save_engine_path.clear();
+        compile_request.eval_order = "onnx";
+        compile_request.source_dir = data::testsupport::dataset_dir(fixture);
+        compile_request.split = fixture.split;
+        compile_request.compiled_path = root.path() / "validation-source.bin";
+        compile_request.compile_workers = 1;
+        for (const auto mode : {mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+                                mmltk::backend::imaging::resample::ImageResizeMode::Letterbox}) {
+            compile_request.compile_resize_mode = mode;
+            const auto compiled_result = session.Run(compile_request, command);
+            CHECK(compiled_result.processed_images == 1U);
+            CHECK(data::CompiledDataset::open(compile_request.compiled_path).header().resize_mode == mode);
+            compile_request.recompile = true;
+        }
+        compile_request.recompile = false;
+        compile_request.source_dir = root.path() / "missing-source";
+        CHECK(session.Run(compile_request, command).processed_images == 1U);
+        compile_request.recompile = true;
+        CHECK_THROWS(session.Run(compile_request, command));
+        CHECK(data::CompiledDataset::open(compile_request.compiled_path).header().resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+        compile_request.recompile = false;
+        compile_request.compiled_path = root.path() / "missing.bin";
+        compile_request.source_dir.clear();
+        CHECK_THROWS(session.Run(compile_request, command));
+    }
     const auto only = session.Run(request, command);
     CHECK(only.eval_order == std::vector<std::string>{"tensorrt"});
     CHECK(only.limits.resolved_candidate_count == 2);

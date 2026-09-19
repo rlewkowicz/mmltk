@@ -41,6 +41,9 @@ target_link_libraries(mmltk_backend_models_rfdetr_contract
         mmltk::common::types
 )
 
+mmltk_link_declarations(mmltk_backend_models_rfdetr_contract PUBLIC
+    mmltk::backend::imaging::resample)
+
 function(mmltk_add_backend_models_rfdetr_contract_tests)
     set(sources
         ${CMAKE_SOURCE_DIR}/src/backend/models/rfdetr/contract/tests/training_supervision.test.cpp

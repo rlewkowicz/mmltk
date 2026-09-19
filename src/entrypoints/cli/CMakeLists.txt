@@ -68,6 +68,7 @@ function(mmltk_add_entrypoints_cli_tests)
     target_link_libraries(mmltk_entrypoints_cli_tests PRIVATE
         mmltk_test_support
         mmltk_entrypoints_cli_test_support
+        mmltk_backend_data_test_support
         mmltk::frameworks::reflection
     )
     catch_discover_tests(

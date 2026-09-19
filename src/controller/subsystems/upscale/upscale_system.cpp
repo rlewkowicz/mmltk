@@ -406,13 +406,15 @@ class UpscaleSystem::Impl final {
                 return state_;
             }
             auto& cached = records_[static_cast<std::size_t>(request.kernel)];
-            if (cached.product.valid() && cached.request == request && cached.frame.extent == target) {
+            if (cached.product.valid() && SameSource(cached.request, request) && cached.request.kernel == request.kernel && cached.frame.extent == target) {
                 if (state_.pending && !SameSource(*state_.pending, request)) {
                     ++demand_;
                     state_.pending.reset();
                     state_.busy = false;
                 }
-                Select(cached);
+                cached.request = request;
+                state_.methods[static_cast<std::size_t>(request.kernel)].completed = request;
+                if (!state_.ready || state_.frame != cached.frame || state_.kernel != request.kernel) Select(cached);
                 desired_ = request;
                 RefreshAvailability(request);
                 AdvanceRevision();
@@ -601,6 +603,7 @@ class UpscaleSystem::Impl final {
                                 .content = {request.source.content.x * kUpscaleOutputScale, request.source.content.y * kUpscaleOutputScale,
                                             request.source.content.width * kUpscaleOutputScale, request.source.content.height * kUpscaleOutputScale},
                                 .clean_revision = clean_revision,
+                                .source_extent = request.source.source_extent,
                             };
                             state_.methods[static_cast<std::size_t>(request.kernel)] = {
                                 .available = true,

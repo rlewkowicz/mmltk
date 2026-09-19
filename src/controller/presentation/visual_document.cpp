@@ -1,5 +1,6 @@
 #include "src/controller/presentation/visual_document.h"
 #include <algorithm>
+#include "src/backend/imaging/resample/image_resize.h"
 #include <atomic>
 #include <cmath>
 #include <limits>
@@ -38,6 +39,7 @@ consteval bool contains_annotation_point() {
 struct PointProjection final {
     float scale = 1.0F;
     VisualRegion crop{};
+    VisualExtent target{};
     void Apply(contracts::AnnotationPoint& point) const {
         point.x *= scale;
         point.y *= scale;
@@ -45,6 +47,10 @@ struct PointProjection final {
         if (crop.valid()) {
             point.x = std::clamp(point.x - static_cast<float>(crop.x), 0.0F, static_cast<float>(crop.width));
             point.y = std::clamp(point.y - static_cast<float>(crop.y), 0.0F, static_cast<float>(crop.height));
+            if (target.valid()) {
+                point.x *= static_cast<float>(target.width) / static_cast<float>(crop.width);
+                point.y *= static_cast<float>(target.height) / static_cast<float>(crop.height);
+            }
         }
     }
 };
@@ -62,31 +68,43 @@ void project_spatial_members(T& value, const PointProjection projection) {
     }
 }
 }  // namespace
-contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop) {
+VisualExtent visual_materialized_extent(const VisualFrame& frame, const bool original) {
+    if (!original) return frame.extent;
+    const auto crop = frame.content.valid() ? frame.content : VisualRegion{0U, 0U, frame.extent.width, frame.extent.height};
+    if (!frame.source_extent.valid()) return {crop.width, crop.height};
+    const auto geometry = mmltk::backend::imaging::resample::compute_image_resize_geometry(
+        frame.source_extent.width, frame.source_extent.height, crop.width, crop.height,
+        mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
+    return {geometry.resized_width, geometry.resized_height};
+}
+contracts::AnnotationSceneContent materialize_visual_document(const VisualDocument& document, const VisualExtent extent, VisualRegion crop, VisualExtent target) {
     if (!crop.valid()) crop = {.width = extent.width, .height = extent.height};
     if (!extent.valid() || crop.x > extent.width || crop.y > extent.height || crop.width > extent.width - crop.x || crop.height > extent.height - crop.y ||
         crop.width > std::numeric_limits<std::uint16_t>::max() || crop.height > std::numeric_limits<std::uint16_t>::max())
         throw contracts::InvalidIntentError("Annotation crop is outside the image extent");
+    if (!target.valid()) target = {crop.width, crop.height};
+    if (target.width > std::numeric_limits<std::uint16_t>::max() || target.height > std::numeric_limits<std::uint16_t>::max())
+        throw contracts::InvalidIntentError("Annotation target exceeds the document extent");
     auto scene = document.scene;
-    scene.frame_width = static_cast<std::uint16_t>(crop.width);
-    scene.frame_height = static_cast<std::uint16_t>(crop.height);
+    scene.frame_width = static_cast<std::uint16_t>(target.width);
+    scene.frame_height = static_cast<std::uint16_t>(target.height);
     scene.frame_ready = true;
-    project_spatial_members(scene.objects, {.crop = crop});
+    project_spatial_members(scene.objects, {.crop = crop, .target = target});
     std::size_t total_runs = 0U;
     for (std::size_t index = 0U; index < scene.objects.size(); ++index) {
         auto& object = scene.objects[index];
         if (!object.mask.present) continue;
         object.mask.runs.clear();
         if (!document.mask_contains) throw contracts::InvalidIntentError("Annotation mask support is unavailable");
-        const auto first_x = static_cast<std::uint32_t>(std::floor(object.box.first.x));
-        const auto last_x = std::min(crop.width, static_cast<std::uint32_t>(std::ceil(object.box.second.x)));
-        const auto first_y = static_cast<std::uint32_t>(std::floor(object.box.first.y));
-        const auto last_y = std::min(crop.height, static_cast<std::uint32_t>(std::ceil(object.box.second.y)));
+        // A supplied detection box is independent of segmentation support.
+        // Import the selected raster extent, including support outside that box.
+        const auto first_x = 0U, first_y = 0U;
+        const auto last_x = target.width, last_y = target.height;
         for (auto y = first_y; y < last_y; ++y) {
             auto x = first_x;
             const auto supported = [&](std::uint32_t px) {
-                return document.mask_contains(index, (static_cast<float>(crop.x + px) + 0.5F) / static_cast<float>(extent.width),
-                                              (static_cast<float>(crop.y + y) + 0.5F) / static_cast<float>(extent.height));
+                return document.mask_contains(index, (static_cast<float>(crop.x) + std::floor(static_cast<float>(px) * static_cast<float>(crop.width) / static_cast<float>(target.width)) + 0.5F) / static_cast<float>(extent.width),
+                                              (static_cast<float>(crop.y) + std::floor(static_cast<float>(y) * static_cast<float>(crop.height) / static_cast<float>(target.height)) + 0.5F) / static_cast<float>(extent.height));
             };
             while (x < last_x) {
                 if (!supported(x)) {

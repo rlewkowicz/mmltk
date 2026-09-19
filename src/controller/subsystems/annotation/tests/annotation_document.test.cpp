@@ -1185,4 +1185,30 @@ TEST_CASE("Annotation class admission preserves CBOR non-box content and journal
     CHECK(reopened.Open(std::move(invalid)).outcome == document::DocumentOutcome::Rejected);
     CHECK(reopened.ui().scene.objects == editor.ui().scene.objects);
 }
+
+TEST_CASE("Original imports restore stored aspect with fractional geometry without source-resolution allocation") {
+    auto source = std::make_shared<VisualDocument>();
+    source->scene = test_scene("compiled://stretch");
+    source->scene.objects.push_back({.name = contracts::AnnotationText::From("fractional"),
+                                     .shape = contracts::AnnotationShape::Box,
+                                     .box = {{4.5F, 8.25F}, {24.5F, 28.75F}}});
+    VisualFrame frame;
+    frame.extent = {32U, 32U};
+    frame.content = {0U, 0U, 32U, 32U};
+    frame.source_extent = {4000U, 2000U};
+    const auto target = visual_materialized_extent(frame, true);
+    CHECK(target == VisualExtent{32U, 16U});
+    CHECK(visual_materialized_extent(frame, false) == frame.extent);
+    const auto imported = materialize_visual_document(*source, frame.extent, frame.content, target);
+    CHECK(imported.frame_width == 32U);
+    CHECK(imported.frame_height == 16U);
+    CHECK(imported.objects.front().box == contracts::AnnotationBox{{4.5F, 4.125F}, {24.5F, 14.375F}});
+    source->scene.objects.front().mask.present = true;
+    source->mask_contains = [](std::size_t, float x, float y) { return x < 1.0F / 32.0F && y < 1.0F / 32.0F; };
+    const auto masked = materialize_visual_document(*source, frame.extent, frame.content, target);
+    REQUIRE(masked.objects.front().mask.runs.size() == 1U);
+    CHECK(masked.objects.front().mask.runs.front() == contracts::AnnotationMaskRun{0U, 0U, 0U});
+    frame.content = {0U, 8U, 32U, 16U};
+    CHECK(visual_materialized_extent(frame, true) == target);
+}
 }  // namespace mmltk::controller

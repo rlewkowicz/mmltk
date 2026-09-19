@@ -602,7 +602,9 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         };
         candidate.annotated_indices.reserve(candidate.summaries.size());
         for (std::size_t index = 0U; index != candidate.summaries.size(); ++index)
-            if (candidate.summaries[index].instance_count != 0U) candidate.annotated_indices.push_back(static_cast<std::uint32_t>(index));
+            if (std::ranges::any_of(candidate.store.image_labels(static_cast<std::uint32_t>(index)),
+                                    [](const auto& instance) { return !instance.is_crowd(); }))
+                candidate.annotated_indices.push_back(static_cast<std::uint32_t>(index));
         candidate.identity = explore_dataset_identity(source, candidate.store.header(), candidate.summaries);
         ExploreOrderFacts order_facts{
             .matching_count = static_cast<std::uint32_t>(candidate.order.size()),
@@ -709,6 +711,11 @@ class NativeExploreAlgorithm final : public ExploreAlgorithm {
         const auto count = static_cast<std::int64_t>(order.size());
         const auto position = static_cast<std::int64_t>(committed_->inverse[selected]);
         return order[static_cast<std::size_t>((position + offset % count + count) % count)];
+    }
+    [[nodiscard]] VisualExtent DetailSourceExtent(const ExploreRenderPlan& plan) const override {
+        if (!plan.selected_image) return {};
+        const auto& entry = committed_->store.image_entries()[*plan.selected_image];
+        return {entry.original_width, entry.original_height};
     }
     [[nodiscard]] VisualRegion DetailContent(const ExploreRenderPlan& plan) const override {
         if (!plan.selected_image) return {};

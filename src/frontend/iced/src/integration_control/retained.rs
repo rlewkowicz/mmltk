@@ -36,6 +36,7 @@ use iced::{Rectangle, Task};
 /// Mutable observations owned by this scenario or mechanism.
 pub(super) struct State {
     explore_paste_read: bool,
+    original_roundtrip: u8,
     gallery_completion_held: Option<(u64, u32)>,
     sweep_baseline: Option<(u64, crate::generated::ExploreViewport)>,
     explore_dataset_pane: Option<Rectangle>,
@@ -76,6 +77,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             explore_paste_read: false,
+            original_roundtrip: 0,
             gallery_completion_held: None,
             sweep_baseline: None,
             explore_dataset_pane: None,
@@ -1808,7 +1810,7 @@ impl State {
                 };
                 if snapshot.revision <= revision
                     || snapshot.busy
-                    || !snapshot.detail.showoriginaldimensions
+                    || snapshot.detail.showoriginaldimensions != (self.original_roundtrip != 1)
                 {
                     return Task::none();
                 }
@@ -1837,6 +1839,17 @@ impl State {
                     return Task::none();
                 };
                 let viewed_content = &viewed.content;
+                if self.original_roundtrip == 1 {
+                    if drawn_revision != viewed.revision
+                        || drawn.crop != [0, 0, viewed.extent.width, viewed.extent.height]
+                        || (drawn.image.width / drawn.image.height - viewed.extent.width as f32 / viewed.extent.height as f32).abs() > 0.002
+                    {
+                        return Task::none();
+                    }
+                    self.original_roundtrip = 2;
+                    driver.phase = Phase::DetailOriginal { revision: snapshot.revision, frame_revision, padded_width, padded_height };
+                    return widgets.arm(driver, EXPLORE_DETAIL_ORIGINAL);
+                }
                 if drawn_revision != viewed.revision
                     || drawn.crop
                         != [
@@ -1847,6 +1860,19 @@ impl State {
                         ]
                 {
                     return Task::none();
+                }
+                if viewed.sourceextent.width != 0 && viewed.sourceextent.height != 0
+                    && (drawn.image.width / drawn.image.height - viewed.sourceextent.width as f32 / viewed.sourceextent.height as f32).abs() > 0.002
+                {
+                    return Task::none();
+                }
+                if !self.require_original_crop(driver, probes, viewed) {
+                    return Task::none();
+                }
+                if self.original_roundtrip == 0 {
+                    self.original_roundtrip = 1;
+                    driver.phase = Phase::DetailOriginal { revision: snapshot.revision, frame_revision, padded_width, padded_height };
+                    return widgets.arm(driver, EXPLORE_DETAIL_ORIGINAL);
                 }
                 reporting::emit(|sink| {
                     sink.record(
@@ -3732,9 +3758,12 @@ impl State {
     ) -> bool {
         let content = &frame.content;
         if probes.draws().viewer.is_none_or(|(_, _, draw)| {
+            let source = &frame.sourceextent;
             draw.crop != [content.x, content.y, content.width, content.height]
+                || (source.width != 0 && source.height != 0
+                    && (draw.image.width / draw.image.height - source.width as f32 / source.height as f32).abs() > 0.002)
         }) {
-            driver.fail("returning viewer lost the selected Original-content crop");
+            driver.fail("returning viewer lost the selected Original crop or source aspect");
             return false;
         }
         true

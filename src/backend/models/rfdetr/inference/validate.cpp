@@ -1,5 +1,8 @@
 #include "src/backend/models/rfdetr/core/evaluator.h"
 #include "src/backend/data/compiled_format.h"
+#include "src/backend/data/dataset_compiler.h"
+#include "src/common/io/staging_directory.h"
+#include "src/common/io/file_memory.h"
 #include "src/backend/models/rfdetr/inference/prediction_delivery.h"
 #include "src/backend/models/rfdetr/inference/validate.h"
 #include "src/backend/models/rfdetr/core/evaluation.h"
@@ -142,7 +145,9 @@ struct AlignmentSample final {
                             }
                             ground_truth.push_back(std::move(gt));
                         }
-                        delivery.sample({record, std::move(pixels), annotations, ground_truth});
+                        const auto& source = loader.image_entry(record.dataset_index);
+                        delivery.sample({record, std::move(pixels), annotations, ground_truth, loader.geometry(record.dataset_index),
+                                         source.original_width, source.original_height});
                     }
                     if (captured_predictions != nullptr && captured_predictions->size() < request.alignment_images) {
                         if (record.detections.empty())
@@ -235,6 +240,12 @@ mmltk::backend::ml::runtime::RuntimeStatus ValidationSession::Close() noexcept {
 ValidateRequest finalize_validate_request(ValidateRequest request) {
     validate_validate_request(request);
     request.compiled_path = std::filesystem::absolute(request.compiled_path);
+    if (!request.source_dir.empty()) {
+        request.source_dir = std::filesystem::absolute(request.source_dir);
+        if (request.split.empty()) request.split = request.compiled_path.stem().string();
+        if (request.split.empty() || request.split == "." || request.split == ".." || std::filesystem::path(request.split).filename() != request.split)
+            throw std::invalid_argument("validation compilation requires a source split name");
+    }
     return request;
 }
 ValidationRunResult run_validation(const ValidateRequest& request) {
@@ -363,6 +374,34 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
                 prepared.preset_name = build.preset_name;
                 if (selected_descriptor) static_cast<void>(file_for(prepared));
             }
+    }
+    if (delivery.stop.stop_requested()) return {.cancelled = true};
+    if (options.recompile || (!std::filesystem::exists(options.compiled_path) && !options.source_dir.empty())) {
+        std::filesystem::create_directories(options.compiled_path.parent_path());
+        mmltk::common::io::StagingDirectory staging{options.compiled_path, ".", ".compile-XXXXXX", "stage validation dataset"};
+        mmltk::backend::data::CompilerConfig config;
+        config.source_dir = options.source_dir.string();
+        config.output_dir = staging.path().string();
+        config.target_width = static_cast<std::uint32_t>(options.resolution);
+        config.target_height = static_cast<std::uint32_t>(options.resolution);
+        config.resize_mode = options.compile_resize_mode;
+        config.num_workers = options.compile_workers;
+        config.cuda_mask_batch_size = options.compile_cuda_mask_batch_size;
+        config.cuda_device_id = options.compile_cuda_device_id;
+        struct CompileStop final {
+            const std::stop_token& stop;
+            [[nodiscard]] bool cancelled() const noexcept { return stop.stop_requested(); }
+        } stop{delivery.stop};
+        const auto cancellation = mmltk::common::concurrency::CancellationObservation::Borrow(stop);
+        try {
+            auto plan = mmltk::backend::data::DatasetCompiler::prepare(std::move(config), {options.split}, cancellation);
+            mmltk::backend::data::DatasetCompiler::compile(plan, 0U, nullptr, cancellation);
+        } catch (...) {
+            if (delivery.stop.stop_requested()) return {.cancelled = true};
+            throw;
+        }
+        if (delivery.stop.stop_requested()) return {.cancelled = true};
+        mmltk::common::io::publish_staged_path_atomically(staging.path() / (options.split + ".bin"), options.compiled_path);
     }
     if (delivery.stop.stop_requested()) return {.cancelled = true};
     auto loader = inference_detail::make_loader(options.compiled_path, options.batch_size, options, options.prefetch_factor);

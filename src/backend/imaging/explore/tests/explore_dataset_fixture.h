@@ -16,6 +16,8 @@ struct ExploreFixtureAnnotations final {
     std::size_t objects = 0U;
     std::size_t runs_per_object = 0U;
     bool ring_and_dots = false;
+    bool crowd_only = false;
+    bool mixed_crowd = false;
 };
 [[nodiscard]] std::filesystem::path compile_explore_fixture(const std::filesystem::path& temporary_root, std::string_view fixture_name = "fixture",
                                                             int num_images = 2, ExploreFixtureDimensions dimensions = {},

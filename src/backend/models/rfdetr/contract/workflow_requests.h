@@ -1,4 +1,5 @@
 #pragma once
+#include "src/backend/imaging/resample/image_resize.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "src/backend/data/data_loading_options.h"
 #include "src/frameworks/reflection/field_policy.h"
@@ -102,6 +103,7 @@ struct ValidateRequest : ModelArtifactRequest, InferenceExecutionConfig {
     std::size_t eval_max_dets = 0U;
     std::size_t alignment_images = 16U;
     [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t prefetch_factor = 2U;
+    mmltk::backend::imaging::resample::ImageResizeMode compile_resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch;
     [[= mmltk::frameworks::reflection::Minimum<int>{-1}]] int compile_workers = -1;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int compile_cuda_mask_batch_size = 0;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int compile_cuda_device_id = 0;

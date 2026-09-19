@@ -26,6 +26,8 @@
 #include "src/entrypoints/cli/tests/support/cli_path.h"
 #include "src/test_support/subprocess_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
+#include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/data/compiled_dataset.h"
 namespace {
 thread_local bool g_count_cli_allocations = false;
 thread_local std::size_t g_cli_allocation_count = 0U;
@@ -846,6 +848,7 @@ TEST_CASE("RF-DETR help exposes independent augmentation and compiler resampling
             CHECK(result.stdout_text.find("--aug-perceptual-downscale") != std::string::npos);
         } else {
             CHECK(result.stdout_text.find("--perceptual-downscale") != std::string::npos);
+            CHECK(result.stdout_text.find("--resize-mode") != std::string::npos);
         }
     }
 }
@@ -875,4 +878,45 @@ TEST_CASE("RF-DETR fatal file diagnostics retain their named owner", "[core][cli
     CHECK(result.stderr_text.find("fatal: ") != std::string::npos);
     CHECK(result.stderr_text.find("fatal: ", result.stderr_text.find("fatal: ") + 1U) == std::string::npos);
     assert_contains_substring(read_text_lines(log), "[rfdetr.cli]");
+}
+
+TEST_CASE("CLI compilation persists default and explicit resize geometry", "[core][cli][rfdetr][data]") {
+    namespace data = mmltk::backend::data;
+    using mmltk::backend::imaging::resample::ImageResizeMode;
+    const ScopedTempDir root{"mmltk-cli-resize"};
+    data::testsupport::create_synthetic_dataset({root.path().string(), "train", 64, 32, 1, 1, 0, true});
+    fs::copy(root.path() / "dataset/train", root.path() / "dataset/val", fs::copy_options::recursive);
+    for (const bool rfdetr : {false, true}) {
+        for (const bool letterbox : {false, true}) {
+            const auto output = root.path() / (std::string(rfdetr ? "rfdetr" : "generic") + (letterbox ? "-letterbox" : "-default"));
+            std::vector<std::string> command{mmltk_cli_path()};
+            if (rfdetr) command.emplace_back("rfdetr");
+            command.insert(command.end(), {"compile", "--source-dir", (root.path() / "dataset").string(), "--output-dir", output.string(), "--workers", "1"});
+            if (rfdetr) command.insert(command.end(), {"--resolution", "32"});
+            else command.insert(command.end(), {"--split", "train", "--width", "32", "--height", "32"});
+            if (letterbox) command.insert(command.end(), {"--resize-mode", "Letterbox"});
+            const auto result = run_subprocess_capture_output(command);
+            INFO(result.output_text);
+            REQUIRE(result.exit_code == 0);
+            for (const auto* split : {"train", "val"}) {
+                if (!rfdetr && std::string_view(split) == "val") continue;
+                const auto compiled = data::CompiledDataset::open(output / (std::string(split) + ".bin"));
+                CHECK(compiled.header().resize_mode == (letterbox ? ImageResizeMode::Letterbox : ImageResizeMode::Stretch));
+                const auto geometry = compiled.geometry(0U);
+                CHECK(geometry.resized_width == 32U);
+                CHECK(geometry.resized_height == (letterbox ? 16U : 32U));
+                CHECK(geometry.offset_y == (letterbox ? 8U : 0U));
+            }
+        }
+    }
+}
+TEST_CASE("CLI rejects invalid resize modes through ordinary option parsing", "[core][cli][rfdetr][data]") {
+    for (auto command : std::vector<std::vector<std::string>>{{"compile"}, {"rfdetr", "compile"}, {"rfdetr", "validate"}}) {
+        command.insert(command.begin(), mmltk_cli_path());
+        command.insert(command.end(), {"--resize-mode", "InvalidResizeMode"});
+        const auto result = run_subprocess_capture_output(command);
+        CHECK(result.exit_code != 0);
+        CHECK(result.output_text.find("resize-mode") != std::string::npos);
+        CHECK(result.output_text.find("invalid enum value") != std::string::npos);
+    }
 }

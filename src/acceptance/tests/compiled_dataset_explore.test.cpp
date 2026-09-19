@@ -361,9 +361,12 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     require_explore_transport(h2d);
     mmltk::testsupport::ScopedTempDir root{"mmltk-compiled-dataset-explore"};
     const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "fixture", 12);
+    const auto resize_mode = GENERATE(mmltk::backend::imaging::resample::ImageResizeMode::Stretch,
+                                      mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     const auto non_square_compiled = mmltk::testsupport::compile_explore_fixture(
         root.path(), "non-square-fixture", 12, {.source_width = 48, .source_height = 24, .compiled_width = 32U, .compiled_height = 32U,
-                                             .resize_mode = mmltk::backend::imaging::resample::ImageResizeMode::Letterbox});
+                                             .resize_mode = resize_mode});
+    std::filesystem::remove_all(root.path() / "non-square-fixture" / "dataset");
     const data::CompiledDatasetInfo info = data::inspect_compiled_dataset(compiled);
     REQUIRE(info.image_count == 12U);
     REQUIRE(info.width == 32U);
@@ -384,17 +387,17 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     CHECK(non_square_store.class_names()[1] == "ret");
     const auto letterbox = non_square_store.geometry(10U);
     CHECK(letterbox.resized_width == 32U);
-    CHECK(letterbox.resized_height == 16U);
+    CHECK(letterbox.resized_height == (resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox ? 16U : 32U));
     CHECK(letterbox.offset_x == 0U);
-    CHECK(letterbox.offset_y == 8U);
+    CHECK(letterbox.offset_y == (resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox ? 8U : 0U));
     for (const std::uint32_t image : {10U, 11U}) {
         const auto labels = non_square_store.image_labels(image);
         REQUIRE(labels.size() == 1U);
         CHECK(labels.front().class_id == image - 10U);
         CHECK(std::abs(labels.front().bbox_x1 - 20.0F / 3.0F) < 1e-5F);
-        CHECK(std::abs(labels.front().bbox_y1 - 44.0F / 3.0F) < 1e-5F);
+        CHECK(std::abs(labels.front().bbox_y1 - (10.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) < 1e-5F);
         CHECK(labels.front().bbox_x2 == 20);
-        CHECK(std::abs(labels.front().bbox_y2 - 70.0F / 3.0F) < 1e-5F);
+        CHECK(std::abs(labels.front().bbox_y2 - (23.0F * static_cast<float>(letterbox.resized_height) / 24.0F + static_cast<float>(letterbox.offset_y))) < 1e-5F);
         const auto runs = non_square_store.instance_rle(labels.front());
         REQUIRE_FALSE(runs.empty());
         CHECK(runs.front().start >= letterbox.offset_y * 32U);
@@ -758,12 +761,19 @@ void test_compiled_dataset_explore_projection_navigation_and_streaming() {
     detail_extent_admission = system.UpdateDetail({.show_original_dimensions = true});
     CHECK(detail_extent_admission.detail.show_original_dimensions);
     CHECK(system.snapshot().frame == full_detail);
-    CHECK((full_detail.content == controller::VisualRegion{0U, 8U, 32U, 16U}));
+    CHECK(full_detail.source_extent == controller::VisualExtent{48U, 24U});
+    const auto expected_content = resize_mode == mmltk::backend::imaging::resample::ImageResizeMode::Letterbox
+                                      ? controller::VisualRegion{0U, 8U, 32U, 16U} : controller::VisualRegion{0U, 0U, 32U, 32U};
+    CHECK(full_detail.content == expected_content);
+    static_cast<void>(system.UpdateDetail({.show_original_dimensions = false}));
+    CHECK(system.snapshot().frame == full_detail);
+    static_cast<void>(system.UpdateDetail({.show_original_dimensions = true}));
     auto borrowed_document = system.BorrowDocument(full_detail);
     REQUIRE(borrowed_document.valid());
     CHECK(borrowed_document.document->scene.objects == detail_scene.objects);
     for (const auto& object : borrowed_document.document->scene.objects) CHECK(object.mask.runs.empty());
-    const auto document = controller::materialize_visual_document(*borrowed_document.document, full_detail.extent, full_detail.content);
+    const auto document = controller::materialize_visual_document(*borrowed_document.document, full_detail.extent, full_detail.content,
+                                                                  controller::visual_materialized_extent(full_detail, true));
     CHECK(document.frame_width == 32U);
     CHECK(document.frame_height == 16U);
     CHECK(document.categories.size() == system.snapshot().dataset.class_names.size());
@@ -894,17 +904,22 @@ void test_compiled_explore_optional_donors_respect_source_capacity() {
          std::array{mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity, 1U},
                     mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationObjectCapacity - 1U, 1U},
                     mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U, 32U},
-                    mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U - 1U, 32U}}) {
+                    mmltk::testsupport::ExploreFixtureAnnotations{controller::contracts::kAnnotationMaskRunCapacity / 32U - 1U, 32U},
+                    mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .crowd_only = true},
+                    mmltk::testsupport::ExploreFixtureAnnotations{.objects = 2U, .runs_per_object = 1U, .mixed_crowd = true},
+                    mmltk::testsupport::ExploreFixtureAnnotations{.objects = 1U, .runs_per_object = 0U}}) {
         CAPTURE(annotations.objects, annotations.runs_per_object);
         mmltk::testsupport::ScopedTempDir root{"mmltk-explore-capacity"};
         const auto compiled = mmltk::testsupport::compile_explore_fixture(root.path(), "dense", 12, {}, annotations);
         const auto store = mmltk::backend::data::CompiledDataset::open(compiled);
         const auto labels = store.image_labels(10U);
         REQUIRE(labels.size() == annotations.objects);
+        for (const auto& label : labels) CHECK(label.has_mask());
+        if (annotations.crowd_only) CHECK(std::ranges::all_of(labels, [](const auto& label) { return label.is_crowd(); }));
         std::size_t runs = 0U;
         for (const auto& label : labels) runs += store.instance_rle(label).size();
         REQUIRE(runs == annotations.objects * annotations.runs_per_object);
-        const bool donor_fits = annotations.objects < controller::contracts::kAnnotationObjectCapacity &&
+        const bool donor_fits = !annotations.crowd_only && annotations.objects < controller::contracts::kAnnotationObjectCapacity &&
                                 annotations.runs_per_object <= controller::contracts::kAnnotationMaskRunCapacity - runs;
         controller::SettingsSystem settings;
         load_explore_transport(settings, root.path() / "gui.json", h2d);

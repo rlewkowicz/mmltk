@@ -30,6 +30,7 @@ struct UpscaleRequest final {
     VisualFrame source{};
     UpscaleKernel kernel = UpscaleKernel::Default;
     VisualDocumentFacts document{};
+    bool original_content = false;
     bool operator==(const UpscaleRequest&) const = default;
 };
 enum class UpscaleFailureKind : std::uint8_t { Failed, Unavailable, Physical };

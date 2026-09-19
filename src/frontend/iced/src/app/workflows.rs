@@ -894,7 +894,7 @@ impl App {
                             return self.transition_page(FeatureId::Annotate);
                         }
                     }
-                    Sample::Atlas(_) | Sample::Fit | Sample::Labels(..) => {}
+                    Sample::Atlas(_) | Sample::Fit | Sample::Original(_) | Sample::Labels(..) => {}
                 }
             }
             crate::view::validate::Outcome::StartRequested => {
@@ -1075,6 +1075,7 @@ mod tests {
         app.workspace.select(FeatureId::Validate);
         let metadata = crate::view_model::test_support::validation_image_metadata();
         let request = crate::generated::UpscaleRequest {
+            originalcontent: false,
             source: metadata.frame,
             document: metadata.document,
             kernel: UpscaleKernel::Default,

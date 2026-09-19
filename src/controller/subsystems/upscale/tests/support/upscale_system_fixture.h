@@ -20,16 +20,17 @@ using namespace std::chrono_literals;
 class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
     void Semantics(const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        if (semantics_) semantics_->fetch_add(1U);
         Fill(target, source.valid() ? *reinterpret_cast<const std::uint8_t*>(source.data) : 0U);
     }
     explicit TestUpscaleAlgorithm(std::shared_ptr<std::atomic<UpscaleKernel>> kernel, std::shared_ptr<MutationCommitProbe> gate = {},
-                                  std::shared_ptr<std::atomic_uint32_t> runs = {}, std::uint32_t gate_run = 1U)
-        : kernel_(std::move(kernel)), gate_(std::move(gate)), runs_(std::move(runs)), gate_run_(gate_run) {}
+                                  std::shared_ptr<std::atomic_uint32_t> runs = {}, std::uint32_t gate_run = 1U, std::shared_ptr<std::atomic_uint32_t> semantics = {})
+        : kernel_(std::move(kernel)), gate_(std::move(gate)), runs_(std::move(runs)), gate_run_(gate_run), semantics_(std::move(semantics)) {}
     [[nodiscard]] static VisualRuntimeFactory CreateRuntime(std::shared_ptr<FakeImageBackend> backend, std::shared_ptr<std::atomic<UpscaleKernel>> kernel,
-                                                            std::shared_ptr<std::atomic_uint32_t> runs) {
+                                                            std::shared_ptr<std::atomic_uint32_t> runs, std::shared_ptr<std::atomic_uint32_t> semantics = {}) {
         return RuntimeFactory(
             0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
-            [kernel = std::move(kernel), runs = std::move(runs)] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, runs); }, 4U);
+            [kernel = std::move(kernel), runs = std::move(runs), semantics = std::move(semantics)] { return std::make_unique<TestUpscaleAlgorithm>(kernel, nullptr, runs, 1U, semantics); }, 4U);
     }
     void Warm() override {}
     void Run(const UpscaleKernel kernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
@@ -49,6 +50,7 @@ class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
     std::shared_ptr<MutationCommitProbe> gate_;
     std::shared_ptr<std::atomic_uint32_t> runs_;
     std::uint32_t gate_run_;
+    std::shared_ptr<std::atomic_uint32_t> semantics_;
 };
 struct UpscaleExtentProbe final {
     std::mutex mutex;

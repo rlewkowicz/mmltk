@@ -427,9 +427,11 @@ class ArtifactNotifications final {
         }
     }
 }
-void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution) {
+void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution,
+                             const mmltk::backend::imaging::resample::ImageResizeMode mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch) {
     using namespace mmltk::backend::data;
-    const auto plan = DatasetCompiler::prepare({.source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
+    const auto plan = DatasetCompiler::prepare({.resize_mode = mode,
+                                                .source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
                                                 .output_dir = mmltk::backend::data::testsupport::compiled_dir(fixture),
                                                 .split = fixture.split,
                                                 .target_width = resolution,
@@ -498,15 +500,15 @@ PreparedWaylandInputs::PreparedWaylandInputs()
         replace_synthetic_image(*fixture, 11, 192, 384);
         const auto split = std::filesystem::path(dataset_dir(*fixture)) / fixture->split;
         std::filesystem::copy_file(split / "000012.jsonl", split / "000001.jsonl", std::filesystem::copy_options::overwrite_existing);
-        std::ofstream dropped_instance{split / "000013.jsonl", std::ios::app};
-        if (!dropped_instance) throw std::runtime_error("cannot prepare dropped-instance compiler evidence");
-        dropped_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
+        std::ofstream retained_instance{split / "000013.jsonl", std::ios::app};
+        if (!retained_instance) throw std::runtime_error("cannot prepare retained empty-mask compiler evidence");
+        retained_instance << R"({"class":"person","bbox_xyxy":[1,0,2,1],"mask_rle_encoding":"row_major_start_length","mask_rle":"1:1","image_size_wh":[)"
                          << fixture->width << ',' << fixture->height << "]}\n";
     }
     replace_synthetic_image(square_, 1, 384, 384);
     // This small prerequisite is compiled once. The primary browser owns
     // the one real 512-pixel compile/control/error workflow.
-    compile_wayland_fixture(square_, 384U);
+    compile_wayland_fixture(square_, 384U, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     prepare_wayland_upscale_assets();
 }
 const mmltk::testsupport::WorkflowWaylandInputs& PreparedWaylandInputs::workflows() {
@@ -523,6 +525,7 @@ const mmltk::backend::data::testsupport::FixtureSpec& PreparedWaylandInputs::pro
                                    std::filesystem::path(dataset_dir(probe_)) / probe_.split / "000001.jsonl",
                                    std::filesystem::copy_options::overwrite_existing);
         compile_wayland_fixture(probe_, kCompiledResolution);
+        std::filesystem::remove_all(dataset_dir(probe_));
     }
     return probe_;
 }
