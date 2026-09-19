@@ -3,6 +3,7 @@
 #include "src/backend/imaging/resample/image_resize_cuda.h"
 #include "src/backend/imaging/resample/detail/perceptual_downscale_completion.h"
 #include "src/backend/imaging/resample/tests/perceptual_downscale_reference.h"
+#include "src/backend/imaging/resample/tests/perceptual_downscale_traversal.h"
 #include "src/frameworks/gpu/image_buffer.h"
 #include "src/frameworks/gpu/imported_image_buffer.h"
 #include "src/frameworks/gpu/tests/vulkan_workspace_fixture.h"
@@ -15,6 +16,8 @@
 #include <cuda_runtime.h>
 #include <catch2/catch_test_macros.hpp>
 #include <cstring>
+#include <array>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -175,6 +178,132 @@ struct FakeCompletion {
     }
 };
 }  // namespace
+TEST_CASE("CUDA perceptual serial traversal retains every accumulator bit", "[backend][data][image_resize][perceptual][cuda]") {
+    if (!has_cuda()) SKIP("CUDA unavailable; exact traversal acceptance is not established");
+    CudaFixture fixture;
+    cudaDeviceProp properties{};
+    cuda_check(cudaGetDeviceProperties(&properties, 0));
+    INFO("CUDA device 0: " << properties.name << " CC " << properties.major << "." << properties.minor);
+    constexpr std::array cases{
+        std::array{1U, 19U, 1U, 7U}, std::array{19U, 1U, 7U, 1U}, std::array{17U, 13U, 7U, 5U},
+        std::array{32U, 24U, 8U, 6U}, std::array{14U, 14U, 2U, 2U}, std::array{15U, 14U, 2U, 2U},
+        std::array{16U, 16U, 2U, 2U}, std::array{257U, 5U, 19U, 3U}, std::array{67U, 61U, 1U, 1U}};
+    for (auto format : formats)
+        for (const auto& dims : cases)
+            for (unsigned pattern : {0U, 5U, 6U, 7U}) {
+                INFO("format " << static_cast<int>(format) << " source " << dims[0] << "x" << dims[1]
+                               << " destination " << dims[2] << "x" << dims[3] << " pattern " << pattern);
+                // Offset subview retains padded rows and independent plane slices.
+                Image source(dims[0] + 2, dims[1] + 2, format, 7);
+                source.fill(pattern);
+                if (format == RgbPixelFormat::PlanarUnitSrgbF32) {
+                    source.set(1, 1, 0, std::numeric_limits<double>::quiet_NaN());
+                    source.set(1, 1, 1, std::numeric_limits<double>::infinity());
+                    source.set(1, 1, 2, -1);
+                }
+                auto input = fixture.upload(source);
+                auto view = input->read();
+                const auto offset = view.layout.row_stride_bytes + (format == RgbPixelFormat::RGB8 ? 3U : 4U);
+                view.data = static_cast<const std::uint8_t*>(view.data) + offset;
+                view.layout.width = dims[0];
+                view.layout.height = dims[1];
+                view.layout.capacity_bytes -= offset;
+                const auto count = std::size_t(dims[2]) * dims[3];
+                const auto bytes = 2 * count * sizeof(TraversalMoments);
+                auto result_layout = input->layout;
+                result_layout.capacity_bytes = bytes;
+                auto results = std::make_shared<DeviceImage>(result_layout);
+                cuda_check(compare_traversal(view, dims[2], dims[3], static_cast<TraversalMoments*>(results->pixels), fixture.stream));
+                cuda_check(cudaMemcpyAsync(fixture.staging->data(), results->pixels, bytes, cudaMemcpyDeviceToHost, fixture.stream));
+                cuda_check(cudaEventRecord(fixture.readback, fixture.stream));
+                cuda_check(cudaEventSynchronize(fixture.readback));
+                const auto* actual = static_cast<const TraversalMoments*>(fixture.staging->data());
+                for (std::size_t i = 0; i < count; ++i)
+                    for (unsigned field = 0; field < 8; ++field) {
+                        INFO("footprint " << i << " moment field " << field);
+                        REQUIRE(actual[2 * i].bits[field] == actual[2 * i + 1].bits[field]);
+                    }
+            }
+}
+TEST_CASE("CUDA perceptual allocation-local preparation matches fresh owners", "[backend][data][image_resize][perceptual][cuda]") {
+    if (!has_cuda()) SKIP("CUDA unavailable; preparation reuse acceptance is not established");
+    CudaFixture fixture(2);
+    GpuPerceptualDownscaler retained(*fixture.context_owner, fixture.retirement);
+    constexpr std::array sequence{RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8,
+                                  RgbPixelFormat::PlanarUnitSrgbF32, RgbPixelFormat::RGB8};
+    for (const auto& dims : {std::array{19U, 15U, 9U, 7U}, std::array{19U, 15U, 9U, 7U},
+                            std::array{7U, 5U, 3U, 2U}, std::array{129U, 127U, 65U, 63U}}) {
+        struct PreparedCase {
+            Image source;
+            std::shared_ptr<DeviceImage> input, output, expected;
+        };
+        std::vector<PreparedCase> prepared;
+        for (auto format : sequence) {
+            Image source(dims[0], dims[1], format, 7), shape(dims[2], dims[3], format, 11);
+            source.fill(7);
+            auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(shape.layout), expected = std::make_shared<DeviceImage>(shape.layout);
+            cuda_check(cudaMemsetAsync(output->pixels, 0xCD, output->layout.capacity_bytes, fixture.stream));
+            cuda_check(cudaMemsetAsync(expected->pixels, 0xCD, expected->layout.capacity_bytes, fixture.stream));
+            prepared.push_back({std::move(source), std::move(input), std::move(output), std::move(expected)});
+        }
+        cuda_check(cudaEventRecord(fixture.readback, fixture.stream));
+        cuda_check(cudaEventSynchronize(fixture.readback));
+        // Submit the entire format transition sequence without settling the
+        // owner. Cross-stream dependencies must cover pending preparation.
+        for (std::size_t i = 0; i < prepared.size(); ++i) {
+            auto& item = prepared[i];
+            retained.downscale(item.input->read(), item.output->write(), i % 2 ? fixture.other : fixture.stream, item.input, item.output);
+        }
+        retained.finish();
+        for (auto& item : prepared) {
+            GpuPerceptualDownscaler fresh(*fixture.context_owner, fixture.retirement);
+            fresh.downscale(item.input->read(), item.expected->write(), fixture.stream, item.input, item.expected);
+            fresh.finish();
+            const auto actual = fixture.download(item.output, fixture.stream);
+            const auto oracle = fixture.download(item.expected, fixture.stream);
+            REQUIRE(std::memcmp(actual.storage.data(), oracle.storage.data(), item.output->layout.capacity_bytes) == 0);
+            REQUIRE(padding_intact(actual));
+            REQUIRE(maximum_error(actual, reference(item.source, dims[2], dims[3])) <= reference_tolerance(item.source.layout.format));
+        }
+    }
+}
+TEST_CASE("CUDA perceptual settled preparation survives admission failure and retry", "[backend][data][image_resize][perceptual][cuda]") {
+    if (!has_cuda()) SKIP("CUDA unavailable; settled preparation retry acceptance is not established");
+    CudaFixture fixture(2);
+    for (auto format : {RgbPixelFormat::RGB8, RgbPixelFormat::RGBA8}) {
+        INFO("format " << static_cast<int>(format));
+        Image source(19, 15, format, 7), shape(9, 7, format, 11);
+        source.fill(7);
+        auto input = fixture.upload(source), output = std::make_shared<DeviceImage>(shape.layout), expected = std::make_shared<DeviceImage>(shape.layout);
+        cuda_check(cudaMemsetAsync(output->pixels, 0xCD, output->layout.capacity_bytes, fixture.stream));
+        cuda_check(cudaMemsetAsync(expected->pixels, 0xCD, expected->layout.capacity_bytes, fixture.stream));
+        GpuPerceptualDownscaler retained(*fixture.context_owner, fixture.retirement);
+        retained.downscale(input->read(), output->write(), fixture.stream, input, output);
+        // Complete the recorded byte-table submission externally. The owner
+        // has not settled its submission, as its retained custody demonstrates.
+        cuda_check(cudaEventRecord(fixture.readback, fixture.stream));
+        cuda_check(cudaEventSynchronize(fixture.readback));
+        REQUIRE(input.use_count() == 2);
+        REQUIRE(output.use_count() == 2);
+        // Host storage passes layout/custody validation, then fails span
+        // admission after the public call has settled the completed submission.
+        REQUIRE_THROWS_AS(retained.downscale(source.read(), output->write(), fixture.other, input, output), std::invalid_argument);
+        REQUIRE(input.use_count() == 1);
+        REQUIRE(output.use_count() == 1);
+        REQUIRE_FALSE(fixture.retirement.fact().terminal);
+        retained.downscale(input->read(), output->write(), fixture.other, input, output);
+        retained.finish();
+        GpuPerceptualDownscaler fresh(*fixture.context_owner, fixture.retirement);
+        fresh.downscale(input->read(), expected->write(), fixture.stream, input, expected);
+        fresh.finish();
+        const auto actual = fixture.download(output, fixture.other);
+        const auto oracle = fixture.download(expected, fixture.stream);
+        REQUIRE(std::memcmp(actual.storage.data(), oracle.storage.data(), shape.layout.capacity_bytes) == 0);
+        REQUIRE(padding_intact(actual));
+        REQUIRE(maximum_error(actual, reference(source, 9, 7)) <= reference_tolerance(format));
+        REQUIRE_FALSE(fixture.retirement.fact().terminal);
+    }
+}
 TEST_CASE("CUDA perceptual resampling agrees with independent CPU geometry and color", "[backend][data][image_resize][perceptual][cuda]") {
     if (!has_cuda()) SKIP("CUDA unavailable; device acceptance is not established");
     CudaFixture fixture;

@@ -2,7 +2,7 @@
 // Öztireli/Gross (2015) perceptual downscaling; provenance in detail/perceptual_downscale_math.h.
 #include "src/backend/imaging/resample/image_resize_cuda.h"
 #include "src/backend/imaging/resample/detail/perceptual_downscale_views.h"
-#include "src/backend/imaging/resample/detail/perceptual_downscale_math.h"
+#include "src/backend/imaging/resample/detail/perceptual_downscale_accumulation.cuh"
 #include "src/backend/imaging/resample/detail/perceptual_downscale_completion.h"
 #include "src/common/math/checked_arithmetic.h"
 #include "src/frameworks/gpu/image_buffer.h"
@@ -55,29 +55,13 @@ Workspace bind_workspace(void* storage, std::uint32_t width, std::uint32_t heigh
     result.alpha = alpha ? reinterpret_cast<float*>(result.coefficients + pixels) : nullptr;
     return result;
 }
-__global__ void prepare_kernel(Workspace work, std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh) {
-    for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < static_cast<std::size_t>(max(max(dw, dh), 256U));
+__global__ void prepare_kernel(Workspace work, std::uint32_t sw, std::uint32_t sh, std::uint32_t dw, std::uint32_t dh, bool axes, bool transfer) {
+    for (std::size_t i = blockIdx.x * std::size_t(blockDim.x) + threadIdx.x; i < static_cast<std::size_t>(max(axes ? max(dw, dh) : 0U, transfer ? 256U : 0U));
          i += std::size_t(blockDim.x) * gridDim.x) {
-        if (i < 256) work.transfer->linear[i] = decode(float(i) * (1.0F / 255.0F));
-        if (i < dw) work.x[i] = footprint(sw, dw, static_cast<std::uint32_t>(i));
-        if (i < dh) work.y[i] = footprint(sh, dh, static_cast<std::uint32_t>(i));
+        if (transfer && i < 256) work.transfer->linear[i] = decode(float(i) * (1.0F / 255.0F));
+        if (axes && i < dw) work.x[i] = footprint(sw, dw, static_cast<std::uint32_t>(i));
+        if (axes && i < dh) work.y[i] = footprint(sh, dh, static_cast<std::uint32_t>(i));
     }
-}
-template <RgbPixelFormat Format, bool Integer>
-__device__ void accumulate(RgbConstImageView source, const Workspace& work, Footprint fx, Footprint fy, std::size_t offset, std::size_t step,
-                           MomentAccumulator& sum, float& alpha) {
-    const std::size_t width = std::size_t(fx.end) - fx.first;
-    const std::size_t count = width * (std::size_t(fy.end) - fy.first);
-    float alpha_error = 0;
-    for (std::size_t j = offset; j < count; j += step) {
-        const auto x = fx.first + static_cast<std::uint32_t>(j % width), y = fy.first + static_cast<std::uint32_t>(j / width);
-        const float weight = Integer ? 1.0F : fx.weight(x) * fy.weight(y);
-        float coverage = 1;
-        const Color color = load<Format>(source, x, y, *work.transfer, coverage);
-        sum.add(color, weight);
-        if constexpr (Format == RgbPixelFormat::RGBA8) compensated_add(weight * coverage, alpha, alpha_error);
-    }
-    if constexpr (Format == RgbPixelFormat::RGBA8) alpha = sum.weight > 0 ? (alpha - alpha_error) / sum.weight : 0;
 }
 template <RgbPixelFormat Format>
 __device__ void write_moment(Workspace work, std::size_t i, Moment sum, float alpha) {
@@ -90,7 +74,7 @@ __global__ void small_moments(RgbConstImageView source, Workspace work, std::uin
         const auto fx = work.x[i % width], fy = work.y[i / width];
         MomentAccumulator sum;
         float alpha = 0;
-        accumulate<Format, Integer>(source, work, fx, fy, 0, 1, sum, alpha);
+        accumulate_serial<Format, Integer>(source, *work.transfer, fx, fy, sum, alpha);
         write_moment<Format>(work, i, sum.finish(), alpha);
     }
 }
@@ -105,7 +89,7 @@ __global__ void large_moments(RgbConstImageView source, Workspace work, std::uin
         const auto fx = work.x[i % width], fy = work.y[i / width];
         MomentAccumulator accumulator;
         float alpha = 0;
-        accumulate<Format, Integer>(source, work, fx, fy, threadIdx.x, blockDim.x, accumulator, alpha);
+        accumulate_strided<Format, Integer>(source, *work.transfer, fx, fy, threadIdx.x, blockDim.x, accumulator, alpha);
         Moment sum = accumulator.finish();
         for (int k = 0; k < 3; ++k) {
             partial[k][threadIdx.x] = sum.mean[k];
@@ -218,6 +202,20 @@ struct GpuPerceptualDownscaler::Impl {
     std::size_t capacity = 0;
     std::uint32_t sw = 0, sh = 0, dw = 0, dh = 0;
     bool alpha = false;
+    bool transfer_ready = false;
+    perceptual::CudaDownscaleCompletion::Submission* transfer_pending = nullptr;
+    void settle_transfer() noexcept {
+        // Called immediately after successful settlement, before reserve can
+        // reuse a completed slot. Pending content remains stream-ordered.
+        if (transfer_pending && !transfer_pending->pending) {
+            transfer_ready = true;
+            transfer_pending = nullptr;
+        }
+    }
+    void invalidate_transfer() noexcept {
+        transfer_ready = false;
+        transfer_pending = nullptr;
+    }
     Impl(frameworks::gpu::DeviceContext owner, frameworks::gpu::TerminalCudaRetirementAuthority& authority)
         : context(std::move(owner)), retirement(authority), lease(frameworks::gpu::ReserveTerminalCudaLease(authority)) {
         CUcontext previous = nullptr;
@@ -313,6 +311,7 @@ void GpuPerceptualDownscaler::finish() {
         retire(status);
         require_cuda(status);
     }
+    impl_->settle_transfer();
 }
 void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImageView destination, cudaStream_t stream,
                                         std::shared_ptr<const void> source_custody, std::shared_ptr<const void> destination_custody) {
@@ -327,6 +326,7 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
         retire(settled);
         require_cuda(settled);
     }
+    impl_->settle_transfer();
     Impl::admit(impl_, impl_->check_span(source.data, validated.source_extent));
     Impl::admit(impl_, impl_->check_span(destination.data, validated.destination_extent));
     Impl::admit(impl_, impl_->check_stream(stream));
@@ -355,16 +355,23 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
             const bool grow = required > impl_->capacity;
             require_cuda(impl_->storage.RetryPending([&](void* p) noexcept { return cudaFreeAsync(p, stream); }).failure);
             if (grow) {
+                impl_->invalidate_transfer();
                 require_cuda(impl_->storage.AllocateCandidate([&](void*& p) noexcept { return cudaMallocAsync(&p, required, stream); }).failure);
                 require_cuda(impl_->storage.PromoteCandidate([&](void* p) noexcept { return cudaFreeAsync(p, stream); }).failure);
                 impl_->capacity = required;
             }
             const Workspace work = bind_workspace(impl_->storage.active(), destination.layout.width, destination.layout.height, alpha);
-            if (grow || impl_->sw != source.layout.width || impl_->sh != source.layout.height || impl_->dw != destination.layout.width ||
-                impl_->dh != destination.layout.height || impl_->alpha != alpha) {
-                prepare_kernel<<<blocks(std::max<std::size_t>({destination.layout.width, destination.layout.height, 256})), threads, 0, stream>>>(
-                    work, source.layout.width, source.layout.height, destination.layout.width, destination.layout.height);
+            const bool prepare_axes = grow || impl_->sw != source.layout.width || impl_->sh != source.layout.height || impl_->dw != destination.layout.width ||
+                impl_->dh != destination.layout.height || impl_->alpha != alpha;
+            const bool prepare_transfer = source.layout.format != RgbPixelFormat::PlanarUnitSrgbF32 &&
+                                          !impl_->transfer_ready && !impl_->transfer_pending;
+            if (prepare_axes || prepare_transfer) {
+                const auto count = std::max<std::size_t>({prepare_axes ? destination.layout.width : 0U,
+                                                         prepare_axes ? destination.layout.height : 0U, prepare_transfer ? 256U : 0U});
+                prepare_kernel<<<blocks(count), threads, 0, stream>>>(
+                    work, source.layout.width, source.layout.height, destination.layout.width, destination.layout.height, prepare_axes, prepare_transfer);
                 require_cuda(cudaGetLastError());
+                if (prepare_transfer) impl_->transfer_pending = &slot;
                 impl_->sw = source.layout.width;
                 impl_->sh = source.layout.height;
                 impl_->dw = destination.layout.width;
@@ -380,6 +387,7 @@ void GpuPerceptualDownscaler::downscale(RgbConstImageView source, RgbMutableImag
         require_cuda(impl_->completion.record(slot));
     } catch (...) {
         const auto original = std::current_exception();
+        impl_->invalidate_transfer();
         // Include every operation that might have reached this exact stream.
         // If the event cannot be recorded, settle the stream before releasing
         // any borrowed view. Unproved settlement quarantines the whole owner.
