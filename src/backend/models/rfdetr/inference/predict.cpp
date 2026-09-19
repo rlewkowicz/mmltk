@@ -223,7 +223,7 @@ class PredictionBackend final {
     [[nodiscard]] bool has_masks() const noexcept { return native_ ? artifacts_.config.segmentation : runtime_->has_masks(); }
     [[nodiscard]] std::size_t capacity(std::size_t batch, std::uint32_t width, std::uint32_t height, bool masks) const {
         return PredictionCapacity::Resolve(maximum_detections_, batch, artifacts_.config.num_queries, artifacts_.config.num_classes, width, height, masks,
-                                           class_layout()->eligible_slots().size())
+                                           class_layout()->eligible_count())
             .candidates;
     }
     [[nodiscard]] std::size_t candidate_count() const noexcept { return maximum_detections_; }
@@ -345,7 +345,7 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
             tensor.resize_(shape);
     };
     const auto count = static_cast<std::int64_t>(batch);
-    const auto limit = static_cast<std::int64_t>(std::max<std::size_t>(capacity, 1U));
+    const auto limit = static_cast<std::int64_t>(capacity);
     resize(result.boxes, {count, limit, 4}, at::kFloat);
     resize(result.labels, {count, limit}, at::kInt);
     resize(result.scores, {count, limit}, at::kFloat);

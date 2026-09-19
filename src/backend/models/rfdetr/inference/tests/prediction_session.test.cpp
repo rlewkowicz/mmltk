@@ -381,6 +381,34 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
                                     .processed_images;
     CHECK(preview_images == 2U);
     CHECK_FALSE(session.HasUnsafeCustody());
+    auto empty_layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog{});
+    empty_layout.slots.resize(2, {rfdetr::ClassSlotRole::Unused, {}});
+    auto empty_request = request;
+    empty_request.onnx_path = root / "empty.onnx";
+    write_prediction_model(empty_request.onnx_path, 2, true, empty_layout);
+    std::size_t empty_deliveries = 0;
+    const auto empty_result = session.Run(empty_request, command,
+        {.source_pixels = true, .completed = [&](const auto& record, auto pixels, const auto& annotations) {
+            ++empty_deliveries;
+            CHECK(record.detections.empty());
+            REQUIRE(pixels.rgb8);
+            REQUIRE(pixels.custody);
+            CHECK(annotations.value_capacity == 0);
+            CHECK(annotations.value_count == 0);
+            CHECK(annotations.device_value_count == nullptr);
+            CHECK(annotations.completed_value_count == nullptr);
+            CHECK_FALSE(annotations.count_custody);
+            CHECK(annotations.boxes_xyxy.capacity_bytes == 0);
+            CHECK(annotations.class_references.capacity_bytes == 0);
+            CHECK(annotations.confidences.capacity_bytes == 0);
+            CHECK(annotations.masks.address == 0);
+            CHECK_FALSE(annotations.masks_available);
+            REQUIRE(annotations.class_catalog);
+            CHECK(annotations.class_catalog->empty());
+        }});
+    CHECK(empty_result.processed_images == 2);
+    CHECK(empty_deliveries == 2);
+    CHECK_FALSE(empty_result.cancelled);
     rfdetr::PredictionSession context_poisoned;
     CHECK_THROWS_AS(
         context_poisoned.Run(request, command, {.completed = [](const auto&, auto, const auto&) { throw mmltk::frameworks::gpu::CudaContextFailure(true); }}),
@@ -588,6 +616,36 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     run(*bbox_backend, false);
     CHECK_FALSE(annotations[0].masks_available);
     CHECK(torch::equal(masks, produced));
+    auto empty_layout = rfdetr::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog{});
+    empty_layout.slots.resize(2, {rfdetr::ClassSlotRole::Unused, {}});
+    artifacts.onnx_path = root / "empty.onnx";
+    write_prediction_model(artifacts.onnx_path, 2, true, empty_layout);
+    auto empty_backend = rfdetr::make_rfdetr_runtime_backend({.artifacts = artifacts,
+                                                              .backend = "onnx",
+                                                              .device = 0,
+                                                              .command_stream = {reinterpret_cast<std::uintptr_t>(stream), true},
+                                                              .static_resolution = 8,
+                                                              .maximum_detections = 2,
+                                                              .allow_fp16 = false});
+    // Caller storage may retain capacity even though this model has no eligible slots.
+    const auto prior_boxes = boxes.clone();
+    std::array<rfdetr::RfdetrMaskSelection, 1> selections;
+    for (const bool retain_selection : {false, true}) {
+        auto submission = empty_backend->Run(input_buffer, annotations,
+            retain_selection ? std::span<rfdetr::RfdetrMaskSelection>(selections) : std::span<rfdetr::RfdetrMaskSelection>{}, true);
+        empty_backend->ReleaseAfterCompletion(std::move(submission));
+        CHECK(annotations[0].value_count == 0);
+        CHECK(annotations[0].device_value_count == nullptr);
+        CHECK(annotations[0].completed_value_count == nullptr);
+        CHECK_FALSE(annotations[0].count_custody);
+        CHECK_FALSE(annotations[0].masks_available);
+        CHECK(selections[0].query_indices.device_data == nullptr);
+        CHECK_FALSE(selections[0].mask_logits);
+        REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+        CHECK(torch::equal(boxes, prior_boxes));
+        CHECK(torch::equal(masks, produced));
+    }
+    CHECK(empty_backend->Close() == runtime::kRuntimeSuccess);
     CHECK(bbox_backend->Close() == runtime::kRuntimeSuccess);
     CHECK(backend->Close() == runtime::kRuntimeSuccess);
 }

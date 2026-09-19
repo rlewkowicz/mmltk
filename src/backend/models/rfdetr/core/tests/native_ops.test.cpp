@@ -791,7 +791,17 @@ TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask 
     const auto empty_selection = r::select_output_batch_fixed_size(outputs, 10, 20, 500, false, &empty);
     CHECK(empty_selection.counts.item<int64_t>() == 0);
     CHECK(empty_selection.labels.numel() == 0);
+    CHECK(empty_selection.scores.storage().nbytes() == 0);
+    CHECK(empty_selection.labels.storage().nbytes() == 0);
+    CHECK(empty_selection.boxes.storage().nbytes() == 0);
     CHECK(empty_selection.boxes.size(1) == 0);
+    outputs.pred_masks = torch::ones({1, 2, 1, 1});
+    const auto empty_masks = r::postprocess_output_batch_fixed_size(outputs, 10, 20, 500, &empty);
+    REQUIRE(empty_masks.masks);
+    CHECK(empty_masks.masks->numel() == 0);
+    CHECK(empty_masks.masks->storage().nbytes() == 0);
+    outputs.pred_logits = torch::zeros({1, 2, 2});
+    CHECK_THROWS(r::select_output_batch_fixed_size(outputs, 10, 20, 500, false, &empty));
 }
 TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and independent final results", "[model][rfdetr][layout]") {
     namespace r = mmltk::backend::models::rfdetr;
@@ -812,7 +822,7 @@ TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and indepe
     const auto next = r::select_output_batch_fixed_size(outputs, 8, 8, 4, false, &lane);
     CHECK(torch::equal(first.labels, saved));
     CHECK(first.labels.data_ptr() != next.labels.data_ptr());
-    r::ClassPostprocessLane coco(std::make_shared<const r::ResolvedClassLayout>(r::coco_class_layout({})));
+    r::ClassPostprocessLane coco(std::make_shared<const r::ResolvedClassLayout>(r::coco_class_layout({r::ClassLayoutOrigin::VerifiedAsset, "fixture", {}})));
     coco.Prepare(torch::kCPU);
     outputs.pred_logits = torch::full({1, 1, 91}, -8.F);
     outputs.pred_logits[0][0][0] = 9.F;
@@ -826,6 +836,14 @@ TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and indepe
     outputs.pred_boxes = torch::tensor({-.25F, 1.2F, 1.F, 1.F}).view({1, 1, 4});
     const auto clipped = r::select_output_batch_fixed_size(outputs, 10, 20, 3, false, &coco);
     CHECK(torch::allclose(clipped.boxes[0][0], torch::tensor({0.F, 7.F, 5.F, 10.F})));
+    const auto discarded = r::select_output_batch_fixed_size(outputs, 10, 20, 2, false, &coco);
+    CHECK(discarded.counts.item<int64_t>() == 0);
+    CHECK(discarded.scores.size(1) == 2);
+    r::ClassPostprocessLane raw(std::make_shared<const r::ResolvedClassLayout>(r::unresolved_class_layout(91)));
+    raw.Prepare(torch::kCPU);
+    const auto unresolved = r::select_output_batch_fixed_size(outputs, 10, 20, 3, false, &raw);
+    CHECK(unresolved.counts.item<int64_t>() == 3);
+    CHECK(torch::equal(unresolved.labels[0], torch::tensor({0L, 12L, 90L}, torch::kInt64)));
     const auto none = r::select_output_batch_fixed_size(outputs, 10, 20, 0, false, &coco);
     CHECK(none.counts.item<int64_t>() == 0);
     CHECK(none.boxes.size(1) == 0);

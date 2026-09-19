@@ -24,7 +24,7 @@ class ClassPostprocessLane final {
     void Prepare(const torch::Device& device);
     [[nodiscard]] torch::Tensor ValidateLogits(const torch::Tensor& logits) const;
     [[nodiscard]] torch::Tensor References(const torch::Tensor& physical_indices) const;
-    [[nodiscard]] std::size_t eligible_count() const noexcept { return layout_->eligible_slots().size(); }
+    [[nodiscard]] std::size_t eligible_count() const noexcept { return layout_->eligible_count(); }
 
    private:
     std::shared_ptr<const ResolvedClassLayout> layout_;

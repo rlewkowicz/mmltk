@@ -1,4 +1,8 @@
 #include "src/backend/models/rfdetr/core/class_layout.h"
+#include <algorithm>
+#include <array>
+#include <stdexcept>
+#include <utility>
 #include "src/common/io/file_digest.h"
 #include "src/frameworks/serialization/json_wire.h"
 #include "src/backend/data/catalog/coco_catalog.h"
@@ -63,14 +67,12 @@ ResolvedClassLayout::ResolvedClassLayout(ModelClassLayout record) : record_(std:
         throw std::invalid_argument("unknown score encoding");
     if (record_.scores == ClassScoreEncoding::SoftmaxLogits && record_.no_object == NoObjectEncoding::AllNegative)
         throw std::invalid_argument("softmax cannot encode all-negative no-object targets");
-    eligible_slots_.reserve(record_.slots.size());
-    class_references_.reserve(record_.slots.size());
+    physical_references_.resize(record_.slots.size(), -1);
     for (std::size_t index = 0; index < record_.slots.size(); ++index) {
         const auto& slot = record_.slots[index];
         if (slot.role != ClassSlotRole::Foreground && slot.role != ClassSlotRole::Unresolved) continue;
-        eligible_slots_.push_back(static_cast<std::int64_t>(index));
-        class_references_.push_back(semantic_ ? *slot.foreground_index : static_cast<std::int64_t>(index));
-        prefix_identity_ = prefix_identity_ && index == eligible_slots_.size() - 1 && class_references_.back() == static_cast<std::int64_t>(index);
+        physical_references_[index] = slot.role == ClassSlotRole::Foreground ? *slot.foreground_index : static_cast<std::int64_t>(index);
+        ++eligible_count_;
     }
 }
 catalog::ClassReferenceDomain ResolvedClassLayout::domain() const noexcept {

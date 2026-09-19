@@ -18,9 +18,9 @@ class ResolvedClassLayout final {
     [[nodiscard]] const std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog>& catalog() const noexcept { return catalog_; }
     [[nodiscard]] bool semantic() const noexcept { return semantic_; }
     [[nodiscard]] std::size_t output_width() const noexcept { return record_.slots.size(); }
-    [[nodiscard]] std::span<const std::int64_t> eligible_slots() const noexcept { return eligible_slots_; }
-    [[nodiscard]] std::span<const std::int64_t> class_references() const noexcept { return class_references_; }
-    [[nodiscard]] bool prefix_identity() const noexcept { return prefix_identity_; }
+    // Indexed by physical slot; -1 marks unused/background outputs.
+    [[nodiscard]] std::span<const std::int64_t> physical_references() const noexcept { return physical_references_; }
+    [[nodiscard]] std::size_t eligible_count() const noexcept { return eligible_count_; }
     [[nodiscard]] mmltk::backend::data::catalog::ClassReferenceDomain domain() const noexcept;
     [[nodiscard]] ModelClassLayoutSummary summary() const;
     void require_execution(bool require_semantic = false) const;
@@ -28,9 +28,9 @@ class ResolvedClassLayout final {
    private:
     ModelClassLayout record_;
     std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> catalog_;
-    std::vector<std::int64_t> eligible_slots_, class_references_;
+    std::vector<std::int64_t> physical_references_;
+    std::size_t eligible_count_ = 0;
     bool semantic_ = true;
-    bool prefix_identity_ = true;
 };
 [[nodiscard]] ModelClassLayout native_training_class_layout(const mmltk::backend::data::catalog::ClassCatalog& catalog);
 [[nodiscard]] ModelClassLayout unresolved_class_layout(std::size_t output_width);

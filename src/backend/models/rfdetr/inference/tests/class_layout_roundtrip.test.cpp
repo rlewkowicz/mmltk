@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <chrono>
 #include <stop_token>
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -56,11 +57,28 @@ TEST_CASE("Digest-bound class bundles survive renaming and reject stale companio
     std::filesystem::remove_all(root);
 }
 TEST_CASE("Zero foreground preserves physical logits bounds without detection allocation", "[model][rfdetr][layout][capacity]") {
-    const auto capacity = r::PredictionCapacity::Resolve(500, 2, 300, 1, 64, 64, true, 0);
+    const r::ResolvedClassLayout empty(r::native_training_class_layout(c::ClassCatalog{}));
+    const auto capacity = r::PredictionCapacity::Resolve(500, 2, 300, empty.output_width(), 64, 64, true, empty.eligible_count());
     CHECK(capacity.candidates == 0);
     CHECK(capacity.mask_bytes == 0);
     CHECK(r::PredictionCapacity::Resolve(0, 2, 300, 1, 64, 64, true, 0).candidates == 0);
     CHECK_THROWS(r::PredictionCapacity::Resolve(500, 2, 300, 1, 64, 64, false, 2));
+    CHECK_THROWS(r::PredictionCapacity::Resolve(500, 2, 0, 1, 64, 64, false, 0));
+    CHECK_THROWS(r::PredictionCapacity::Resolve(500, 2, 300, 0, 64, 64, false, 0));
+    CHECK_THROWS(r::PredictionCapacity::Resolve(500, std::numeric_limits<std::size_t>::max(), 300, 1, 64, 64, false, 0));
+    CHECK_THROWS(r::PredictionCapacity::Resolve(500, 2, 300, 1, 65536, 65536, true, 0));
+}
+TEST_CASE("Nonempty class layouts retain full physical ranking capacity", "[model][rfdetr][layout][capacity]") {
+    auto permutation = r::native_training_class_layout(c::ClassCatalog({"cat", "dog"}));
+    permutation.slots = {{r::ClassSlotRole::Foreground, 1U}, {r::ClassSlotRole::Unused, {}}, {r::ClassSlotRole::Foreground, 0U}};
+    for (const auto& record : {permutation, r::coco_class_layout({r::ClassLayoutOrigin::VerifiedAsset, "fixture", {}}), r::unresolved_class_layout(91)}) {
+        const r::ResolvedClassLayout layout(record);
+        const auto physical = 2 * layout.output_width();
+        const auto capacity = r::PredictionCapacity::Resolve(500, 1, 2, layout.output_width(), 64, 64, true, layout.eligible_count());
+        CHECK(capacity.candidates == physical);
+        CHECK(capacity.mask_bytes == 64U * 64U);
+        CHECK(r::PredictionCapacity::Resolve(1, 1, 2, layout.output_width(), 64, 64, false, layout.eligible_count()).candidates == 1);
+    }
 }
 TEST_CASE("RF-DETR publication restores the complete bundle at every cancellation boundary", "[model][rfdetr][layout][publication]") {
     const mmltk::testsupport::ScopedTempDir root("class-bundle-publication");

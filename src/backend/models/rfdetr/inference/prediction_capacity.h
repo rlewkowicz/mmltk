@@ -1,5 +1,10 @@
 #pragma once
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <optional>
+#include <stdexcept>
 #include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/common/system/numa_memory.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
@@ -19,7 +24,7 @@ struct PredictionCapacity final {
         static_cast<void>(checked_prediction_extent(batch, available, kMaximumPredictionTensorBytes / sizeof(float)));
         const auto eligible = eligible_classes.value_or(static_cast<std::size_t>(classes));
         if (eligible > static_cast<std::size_t>(classes)) throw std::invalid_argument("eligible class count exceeds physical logits width");
-        const auto count = std::min(requested, available);
+        const auto count = eligible == 0 ? 0U : std::min(requested, available);
         if (count) static_cast<void>(checked_prediction_extent(batch, count, kMaximumPredictionTensorBytes / (4U * sizeof(float))));
         const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
         return {count, pixels, masks && count ? checked_prediction_extent(pixels, sizeof(std::uint8_t), kMaximumPredictionTensorBytes) : 0U};

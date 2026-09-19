@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
-#include <vector>
+#include <c10/util/ArrayRef.h>
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
@@ -57,14 +57,14 @@ PostprocessCore postprocess_core(const OutputTensors& outputs, int64_t target_he
     PostprocessCore core;
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_topk{"rfdetr.native.postprocess.topk"};
-        const auto prob = out_logits.sigmoid();
-        const auto flat_prob = prob.flatten(1);
-        const int64_t k = classes && classes->eligible_count() == 0 ? 0 : std::min<int64_t>(num_select, flat_prob.size(1));
+        const auto flat_logits = out_logits.flatten(1);
+        const int64_t k = classes && classes->eligible_count() == 0 ? 0 : std::min<int64_t>(num_select, flat_logits.size(1));
         if (k == 0) {
-            core.scores = flat_prob.narrow(1, 0, 0);
+            core.scores = torch::empty({out_logits.size(0), 0}, out_logits.options());
             core.query_indices = torch::empty({out_logits.size(0), 0}, out_logits.options().dtype(torch::kInt64));
             core.labels = core.query_indices;
         } else {
+            const auto flat_prob = flat_logits.sigmoid();
             // Stable physical flattened order is the tie breaker, before slot filtering.
             const auto sorted_indices = at::argsort(flat_prob, true, 1, true);
             const auto topk_indexes = sorted_indices.narrow(1, 0, k);
@@ -111,11 +111,9 @@ void clip_prediction_boxes_(const torch::Tensor& boxes, double left, double top,
 void ClassPostprocessLane::Prepare(const torch::Device& device) {
     const auto stream = device.is_cuda() ? at::cuda::getCurrentCUDAStream(device.index()).stream() : nullptr;
     if (references_.defined() && references_.device() == device && prepared_stream_ == stream) return;
-    std::vector<std::int64_t> references(layout_->output_width(), -1);
-    const auto slots = layout_->eligible_slots();
-    const auto values = layout_->class_references();
-    for (std::size_t index = 0; index < slots.size(); ++index) references[slots[index]] = values[index];
-    references_ = torch::tensor(references, torch::TensorOptions().dtype(torch::kInt64).device(device));
+    const auto references = layout_->physical_references();
+    references_ = torch::tensor(at::ArrayRef<std::int64_t>(references.data(), references.size()),
+                                torch::TensorOptions().dtype(torch::kInt64).device(device));
     prepared_stream_ = stream;
 }
 torch::Tensor ClassPostprocessLane::ValidateLogits(const torch::Tensor& logits) const {

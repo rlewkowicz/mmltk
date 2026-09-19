@@ -10,8 +10,9 @@ TEST_CASE("Native sigmoid layout preserves foreground zero and reserved output",
     const r::ResolvedClassLayout layout(r::native_training_class_layout(catalog::ClassCatalog({"background", "person", "car"})));
     CHECK(layout.semantic());
     CHECK(layout.output_width() == 4U);
-    CHECK(layout.eligible_slots().size() == 3U);
-    CHECK(layout.class_references()[0] == 0);
+    CHECK(layout.eligible_count() == 3U);
+    CHECK(layout.physical_references()[0] == 0);
+    CHECK(layout.physical_references()[3] == -1);
     CHECK(layout.record().slots[3].role == r::ClassSlotRole::Unused);
     CHECK(layout.record().no_object == r::NoObjectEncoding::AllNegative);
     CHECK(r::decode_class_layout(r::encode_class_layout(layout.record())) == layout.record());
@@ -19,7 +20,7 @@ TEST_CASE("Native sigmoid layout preserves foreground zero and reserved output",
     for (unsigned index = 0; index < 256; ++index) names.push_back("class-" + std::to_string(index));
     const r::ResolvedClassLayout full(r::native_training_class_layout(catalog::ClassCatalog(std::move(names))));
     CHECK(full.output_width() == 257U);
-    CHECK(full.class_references()[255] == 255);
+    CHECK(full.physical_references()[255] == 255);
 }
 TEST_CASE("Declared background can occupy each physical position", "[rfdetr][layout]") {
     for (unsigned background = 0; background < 3; ++background) {
@@ -30,24 +31,35 @@ TEST_CASE("Declared background can occupy each physical position", "[rfdetr][lay
             record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt}
                                                     : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
         const r::ResolvedClassLayout layout(record);
-        CHECK(layout.eligible_slots().size() == 2);
-        CHECK(layout.eligible_slots()[0] != background);
-        CHECK(layout.eligible_slots()[1] != background);
+        CHECK(layout.eligible_count() == 2);
+        CHECK(layout.physical_references()[background] == -1);
+        foreground = 0;
+        for (unsigned slot = 0; slot < 3; ++slot)
+            if (slot != background) {
+                CHECK(layout.physical_references()[slot] == foreground);
+                ++foreground;
+            }
     }
     const r::ResolvedClassLayout empty(r::native_training_class_layout(catalog::ClassCatalog{}));
-    CHECK(empty.eligible_slots().empty());
+    CHECK(empty.eligible_count() == 0);
+    REQUIRE(empty.physical_references().size() == 1);
+    CHECK(empty.physical_references()[0] == -1);
 }
 TEST_CASE("Unbound external identity stays raw and COCO last slot stays foreground", "[rfdetr][layout]") {
     const r::ResolvedClassLayout raw(r::unresolved_class_layout(91));
     CHECK_FALSE(raw.semantic());
     CHECK(raw.domain() == catalog::ClassReferenceDomain::RawOutputSlot);
-    CHECK(raw.class_references()[90] == 90);
+    CHECK(raw.physical_references()[90] == 90);
     CHECK_THROWS(raw.require_execution(true));
     const r::ResolvedClassLayout coco(r::coco_class_layout({r::ClassLayoutOrigin::VerifiedAsset, "fixture", {}}));
-    CHECK(coco.eligible_slots()[0] == 1);
-    CHECK(coco.eligible_slots()[11] == 13);
-    CHECK(coco.eligible_slots()[79] == 90);
-    CHECK(coco.class_references()[79] == 79);
+    CHECK(raw.eligible_count() == 91);
+    CHECK(coco.eligible_count() == 80);
+    REQUIRE(coco.physical_references().size() == 91);
+    CHECK(coco.physical_references()[0] == -1);
+    CHECK(coco.physical_references()[1] == 0);
+    CHECK(coco.physical_references()[12] == -1);
+    CHECK(coco.physical_references()[13] == 11);
+    CHECK(coco.physical_references()[90] == 79);
 }
 TEST_CASE("Class layout rejects ambiguous roles and unsupported execution", "[rfdetr][layout]") {
     auto record = r::native_training_class_layout(catalog::ClassCatalog({"cat", "dog"}));

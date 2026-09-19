@@ -137,7 +137,7 @@ TEST_CASE("Python artifacts preserve explicit layouts and keep ambiguous names r
     CHECK(admitted.metadata.class_layout == source.metadata.class_layout);
     const r::ResolvedClassLayout semantic(admitted.metadata.class_layout);
     CHECK(semantic.catalog()->names()[79] == "toothbrush");
-    CHECK(semantic.class_references().back() == 79);
+    CHECK(semantic.physical_references().back() == 79);
     auto synthetic_entries = source.consume_entries();
     synthetic_entries.push_back({"training_supervision.retained_fixture", torch::ones({1})});
     r::testsupport::set_synthetic_model_state(source, std::move(synthetic_entries));

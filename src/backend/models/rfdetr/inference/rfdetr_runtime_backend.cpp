@@ -327,7 +327,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
         const auto capacity =
             PredictionCapacity::Resolve(std::min(maximum_detections_, annotation.value_capacity), static_cast<std::size_t>(batch), logits.shape.extents[1],
                                         logits.shape.extents[2], annotation.source_region.width, annotation.source_region.height,
-                                        annotation.masks.address != 0U, state_->layout->eligible_slots().size())
+                                        annotation.masks.address != 0U, state_->layout->eligible_count())
                 .candidates;
         if (!annotation.source_region.valid()) { throw std::invalid_argument("RF-DETR annotation region or capacity is invalid"); }
         if (capacity != 0U)
@@ -407,7 +407,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                         auto& annotation = bound_call.annotations[index];
                         const auto limit = std::min({bound_owner.maximum_detections_, annotation.value_capacity,
                                                      static_cast<std::size_t>(logits.size(1) * logits.size(2))});
-                        if (limit == 0) {
+                        if (limit == 0 || bound_owner.state_->layout->eligible_count() == 0) {
                             if (!bound_call.selections.empty()) bound_call.selections[index] = {};
                             continue;
                         }
