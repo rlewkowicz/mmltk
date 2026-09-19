@@ -22,7 +22,6 @@ struct EncodedRowMajorMask {
     RowMajorMaskBounds bounds;
 };
 struct MaskResizeScratch {
-    std::vector<std::uint8_t> source_mask;
     std::vector<std::uint8_t> target_mask;
     std::vector<std::uint32_t> source_x;
     std::vector<std::uint32_t> source_y;

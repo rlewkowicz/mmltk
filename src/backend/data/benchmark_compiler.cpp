@@ -364,7 +364,9 @@ class RequiredImageDecodeError : public std::runtime_error {
             progress->source_activity(source,
                                       "Downloading " + archive_name + " image archive with " + std::to_string(download_connections) + " download connections");
             const std::vector<DownloadResult> downloads = download_artifacts(
-                {request}, download_connections, cancel_requested, [&](const DownloadProgress& update) { transfer_progress->update(update, progress); }, trace);
+                {request}, download_connections, cancel_requested,
+                progress->transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { transfer_progress->update(update, progress); }}
+                                                      : DownloadProgressSink{}, trace);
             progress->source_activity(source, "Opening " + archive_name + " image archive");
             JpegValidator jpeg_validator;
             CachedImageDirectory extracted = extract_selected_archive_images(ArchiveExtractionRequest{
@@ -853,7 +855,9 @@ void compile_benchmark_dataset(BenchmarkCompilerConfig config) {
     // budget and progress sink; downloading and indexing results by artifact id happens here once.
     const auto fetch_annotation_artifacts = [&](const std::vector<DownloadRequest>& requests, const std::size_t workers, ArtifactProgressTotals* totals) {
         const std::vector<DownloadResult> downloads =
-            download_artifacts(requests, workers, cancel_requested, [&](const DownloadProgress& update) { totals->update(update, &progress); }, trace);
+            download_artifacts(requests, workers, cancel_requested,
+                               progress.transfer_observer_enabled() ? DownloadProgressSink{[&](const DownloadProgress& update) { totals->update(update, &progress); }}
+                                                                    : DownloadProgressSink{}, trace);
         for (std::size_t index = 0U; index < downloads.size(); ++index) {
             annotation_downloads.insert_or_assign(requests[index].artifact_id, downloads[index]);
         }

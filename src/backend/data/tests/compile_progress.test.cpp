@@ -36,6 +36,7 @@
 #include "src/common/concurrency/event_cancellation.h"
 #include "src/common/io/file_memory.h"
 #include "src/backend/data/tests/test_fixture.h"
+#include "src/backend/data/detail/mask_rle_utils.h"
 using namespace mmltk::backend::data;
 using mmltk::common::io::FileHandle;
 using namespace mmltk::backend::data::testsupport;
@@ -805,4 +806,54 @@ TEST_CASE("compiled layout checks alignment and arithmetic without storage", "[b
         }
     }
     CHECK_THROWS(make_file_header({1U, 1U, 1U, 3U, 65536U, 12U}, names, layout));
+}
+TEST_CASE("categorical resize agrees exactly with dense nearest-center sampling", "[backend][data][compiler][mask]") {
+    using namespace mmltk::backend::data::dataset;
+    using namespace mmltk::backend::imaging::resample;
+    const MaskDimensions source_size{11U, 7U};
+    const std::vector<std::vector<RLEPair>> masks{{}, {{0U, 77U}}, {{0U, 1U}, {76U, 1U}}, {{8U, 21U}, {31U, 9U}},
+                                               {{0U, 4U}, {4U, 7U}, {14U, 11U}, {25U, 3U}}, {{38U, 1U}}};
+    MaskResizeScratch scratch;
+    const auto check_bounds = [](const RowMajorMaskBounds& actual, const RowMajorMaskBounds& expected) {
+        CHECK(actual.has_foreground == expected.has_foreground);
+        CHECK(actual.min_x == expected.min_x);
+        CHECK(actual.min_y == expected.min_y);
+        CHECK(actual.max_x == expected.max_x);
+        CHECK(actual.max_y == expected.max_y);
+    };
+    for (const auto target_size : {MaskDimensions{1U, 1U}, MaskDimensions{3U, 2U}, MaskDimensions{11U, 7U}, MaskDimensions{23U, 19U}, MaskDimensions{19U, 3U}})
+        for (const auto mode : {ImageResizeMode::Stretch, ImageResizeMode::Letterbox})
+            for (const auto& pairs : masks) {
+                INFO("target " << target_size.width << "x" << target_size.height << " mode " << static_cast<int>(mode) << " runs " << pairs.size());
+                const auto geometry = compute_image_resize_geometry(source_size.width, source_size.height, target_size.width, target_size.height, mode);
+                std::vector<std::uint8_t> source, target(std::size_t(target_size.width) * target_size.height, 0U);
+                RowMajorMaskBounds expected_source, actual_source;
+                materialize_row_major_mask(pairs, source_size, &source, &expected_source);
+                for (std::uint32_t y = 0U; y < geometry.resized_height; ++y) {
+                    const auto sy = std::min<std::uint64_t>(source_size.height - 1U, ((2ULL * y + 1U) * source_size.height) / (2ULL * geometry.resized_height));
+                    for (std::uint32_t x = 0U; x < geometry.resized_width; ++x) {
+                        const auto sx = std::min<std::uint64_t>(source_size.width - 1U, ((2ULL * x + 1U) * source_size.width) / (2ULL * geometry.resized_width));
+                        target[std::size_t(y + geometry.offset_y) * target_size.width + x + geometry.offset_x] = source[sy * source_size.width + sx];
+                    }
+                }
+                const auto expected = encode_dense_row_major_mask(target, target_size);
+                const auto actual = resize_row_major_mask(pairs, source_size, target_size, geometry, &scratch, &actual_source);
+                REQUIRE(actual.pairs.size() == expected.pairs.size());
+                for (std::size_t i = 0; i < actual.pairs.size(); ++i) {
+                    CHECK(actual.pairs[i].start == expected.pairs[i].start);
+                    CHECK(actual.pairs[i].length == expected.pairs[i].length);
+                }
+                check_bounds(actual.bounds, expected.bounds);
+                check_bounds(actual_source, expected_source);
+            }
+    const auto geometry = compute_image_resize_geometry(11U, 7U, 1U, 1U, ImageResizeMode::Stretch);
+    for (const auto& invalid : std::vector<std::vector<RLEPair>>{{{0U, 1U}, {77U, 1U}}, {{0U, 1U}, {76U, 0U}}, {{0U, 5U}, {4U, 2U}},
+                                                               {{70U, 8U}}, {{std::numeric_limits<std::uint32_t>::max(), 2U}}})
+        CHECK_THROWS_AS(resize_row_major_mask(invalid, source_size, {1U, 1U}, geometry, &scratch), std::runtime_error);
+    const std::array<RLEPair, 1> valid{{{0U, 1U}}};
+    CHECK_THROWS_AS(resize_row_major_mask(valid, source_size, {1U, 1U}, {1U, 1U, std::numeric_limits<std::uint32_t>::max(), 0U}, &scratch), std::invalid_argument);
+    RowMajorMaskBounds sentinel{1U, 2U, 3U, 4U, true};
+    CHECK(resize_row_major_mask({}, {}, {1U, 1U}, geometry, &scratch, &sentinel).pairs.empty());
+    CHECK(sentinel.min_x == 1U);
+    CHECK(sentinel.has_foreground);
 }

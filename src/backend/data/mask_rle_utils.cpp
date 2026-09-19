@@ -114,16 +114,22 @@ EncodedRowMajorMask encode_dense_row_major_mask(const std::span<const std::uint8
     }
     return encoded;
 }
-RowMajorMaskBounds row_major_mask_bounds(const std::span<const RLEPair> pairs, const MaskDimensions dimensions) {
+namespace {
+void inspect_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, RowMajorMaskBounds* bounds) {
     const auto pixels = checked_pixel_count(dimensions);
-    RowMajorMaskBounds bounds;
+    if (bounds != nullptr) *bounds = {};
     std::size_t previous_end = 0U;
     for (const auto pair : pairs) {
         if (pair.length == 0U || pair.start < previous_end || pair.start > pixels || pair.length > pixels - pair.start)
             throw std::runtime_error("row-major mask contains an invalid run");
         previous_end = static_cast<std::size_t>(pair.start) + pair.length;
-        include_run(&bounds, pair.start, previous_end, dimensions.width);
+        include_run(bounds, pair.start, previous_end, dimensions.width);
     }
+}
+}  // namespace
+RowMajorMaskBounds row_major_mask_bounds(const std::span<const RLEPair> pairs, const MaskDimensions dimensions) {
+    RowMajorMaskBounds bounds;
+    inspect_row_major_mask(pairs, dimensions, &bounds);
     return bounds;
 }
 void materialize_row_major_mask(const std::span<const RLEPair> pairs, const MaskDimensions dimensions, std::vector<std::uint8_t>* dense,
@@ -149,18 +155,28 @@ EncodedRowMajorMask resize_row_major_mask(const std::span<const RLEPair> pairs, 
                                           const mmltk::backend::imaging::resample::ImageResizeGeometry& letterbox, MaskResizeScratch* scratch,
                                           RowMajorMaskBounds* source_bounds) {
     if (scratch == nullptr || letterbox.resized_width == 0U || letterbox.resized_height == 0U ||
-        letterbox.offset_x + letterbox.resized_width > target_dimensions.width || letterbox.offset_y + letterbox.resized_height > target_dimensions.height) {
+        letterbox.resized_width > target_dimensions.width || letterbox.resized_height > target_dimensions.height ||
+        letterbox.offset_x > target_dimensions.width - letterbox.resized_width || letterbox.offset_y > target_dimensions.height - letterbox.resized_height) {
         throw std::invalid_argument("mask resize parameters are invalid");
     }
     if (pairs.empty()) { return {}; }
-    materialize_row_major_mask(pairs, source_dimensions, &scratch->source_mask, source_bounds);
+    inspect_row_major_mask(pairs, source_dimensions, source_bounds);
     scratch->target_mask.resize(checked_pixel_count(target_dimensions));
     clear_padding(&scratch->target_mask, target_dimensions, letterbox);
     prepare_lookup(source_dimensions, letterbox.resized_width, letterbox.resized_height, scratch);
+    std::size_t run = 0U;
     for (std::uint32_t y = 0U; y < letterbox.resized_height; ++y) {
-        const std::uint8_t* source = scratch->source_mask.data() + static_cast<std::size_t>(scratch->source_y[y]) * source_dimensions.width;
         std::uint8_t* target = scratch->target_mask.data() + static_cast<std::size_t>(letterbox.offset_y + y) * target_dimensions.width + letterbox.offset_x;
-        for (std::uint32_t x = 0U; x < letterbox.resized_width; ++x) { target[x] = source[scratch->source_x[x]]; }
+        if (y != 0U && scratch->source_y[y] == scratch->source_y[y - 1U]) {
+            std::copy_n(target - target_dimensions.width, letterbox.resized_width, target);
+            continue;
+        }
+        const auto row = static_cast<std::size_t>(scratch->source_y[y]) * source_dimensions.width;
+        for (std::uint32_t x = 0U; x < letterbox.resized_width; ++x) {
+            const auto pixel = row + scratch->source_x[x];
+            while (run < pairs.size() && static_cast<std::size_t>(pairs[run].start) + pairs[run].length <= pixel) ++run;
+            target[x] = static_cast<std::uint8_t>(run < pairs.size() && pairs[run].start <= pixel);
+        }
     }
     return encode_dense_row_major_mask(scratch->target_mask, target_dimensions);
 }

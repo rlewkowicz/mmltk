@@ -578,10 +578,11 @@ class SegmentedDownloadState {
         return segments_.at(index);
     }
     void report_in_flight(const std::size_t index, const std::uint64_t bytes) {
+        if (!progress_) return;
         const std::lock_guard lock(mutex_);
         in_flight_.at(index) = bytes;
         const Clock::time_point now = Clock::now();
-        if (!progress_ || (last_progress_.time_since_epoch().count() != 0 && now - last_progress_ < std::chrono::milliseconds{100})) { return; }
+        if (last_progress_.time_since_epoch().count() != 0 && now - last_progress_ < std::chrono::milliseconds{100}) { return; }
         emit_progress_locked(false);
         last_progress_ = now;
     }

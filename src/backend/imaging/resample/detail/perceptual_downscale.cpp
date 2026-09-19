@@ -129,7 +129,7 @@ void CpuDownscaler::prepare(const RgbImageLayout& source, const RgbImageLayout& 
     height_ = height;
     prepared_ = true;
 }
-template <RgbPixelFormat Format, bool Integer>
+template <RgbPixelFormat Format, bool Integer, bool QuantizedPlanar>
 void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destination) {
     const auto width = destination.layout.width, height = destination.layout.height;
     auto fill_row = [&](std::uint32_t y) {
@@ -174,9 +174,17 @@ void CpuDownscaler::execute(RgbConstImageView source, RgbMutableImageView destin
             const auto left = x ? x - 1 : 0;
             float alpha = 1;
             if constexpr (Format == RgbPixelFormat::RGBA8) alpha = alpha_[y % 2][x];
-            store<Format>(destination, x, y, reconstruct(row[x], current[x], current[left], previous[x], previous[left]), alpha, transfer_);
+            store<Format, QuantizedPlanar>(destination, x, y, reconstruct(row[x], current[x], current[left], previous[x], previous[left]), alpha, transfer_);
         }
     }
+}
+void CpuDownscaler::run_quantized_planar(RgbConstImageView source, RgbMutableImageView destination) {
+    (void)validate_pair(source, destination, true);
+    prepare(source.layout, destination.layout);
+    if (source.layout.width % destination.layout.width == 0 && source.layout.height % destination.layout.height == 0)
+        execute<RgbPixelFormat::RGB8, true, true>(source, destination);
+    else
+        execute<RgbPixelFormat::RGB8, false, true>(source, destination);
 }
 void CpuDownscaler::run(RgbConstImageView source, RgbMutableImageView destination) {
     if (validate_pair(source, destination)) {

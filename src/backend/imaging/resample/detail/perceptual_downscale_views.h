@@ -16,5 +16,5 @@ struct ValidatedResize {
     bool identity;
     explicit operator bool() const noexcept { return identity; }
 };
-ValidatedResize validate_pair(RgbConstImageView source, RgbMutableImageView destination);
+ValidatedResize validate_pair(RgbConstImageView source, RgbMutableImageView destination, bool quantized_planar = false);
 }  // namespace mmltk::backend::imaging::resample::perceptual

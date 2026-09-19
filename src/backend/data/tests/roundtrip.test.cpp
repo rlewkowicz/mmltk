@@ -7,6 +7,7 @@
 #include "src/test_support/async_test_utils.hpp"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,9 @@
 #include <string>
 #include <vector>
 #include "src/backend/data/compiled_format.h"
+#include "src/backend/data/compiled_file_layout.h"
+#include "src/common/io/file_memory.h"
+#include <limits>
 #include "src/backend/data/compiled_dataset.h"
 #include "src/backend/data/compiled_image_stream.h"
 #include "src/frameworks/gpu/image_buffer.h"
@@ -160,6 +164,81 @@ void exercise_compiled_stream(const std::string& path, bool h2d) {
     stream.close();
     REQUIRE_FALSE(stream.owns_resources());
 }
+void exercise_schedule_capacity(const std::string& path, const bool h2d) {
+    const auto source = CompiledDataset::open(path);
+    struct Schedule {
+        std::size_t batch;
+        int prefetch;
+        std::uint32_t shards, rank;
+        bool drop;
+    };
+    const std::array cases{Schedule{32U, 8, 1U, 0U, false}, Schedule{7U, 8, 3U, 2U, false}, Schedule{7U, 8, 4U, 3U, false},
+                           Schedule{32U, 8, 1U, 0U, true}, Schedule{4U, 2, 1U, 0U, false}, Schedule{10U, 2, 1U, 0U, false},
+                           Schedule{7U, 8, 1U, 0U, true}};
+    for (const auto schedule : cases)
+        for (const bool shuffle : {false, true}) {
+            INFO("batch " << schedule.batch << " prefetch " << schedule.prefetch << " shards " << schedule.shards << " rank " << schedule.rank
+                           << " drop " << schedule.drop << " shuffle " << shuffle << " H2D " << h2d);
+            DatasetLoader::Config config;
+            config.compiled_path = path;
+            config.batch_size = schedule.batch;
+            config.prefetch_factor = schedule.prefetch;
+            config.gather_workers = schedule.prefetch;
+            config.batch_shard_count = schedule.shards;
+            config.batch_shard_rank = schedule.rank;
+            config.drop_last = schedule.drop;
+            config.shuffle = shuffle;
+            config.loading.h2d_dataloader = h2d;
+            DatasetLoader loader(config);
+            const auto count = source.header().num_images;
+            std::vector<std::size_t> starts;
+            for (std::size_t start = 0U, ordinal = 0U; start < count; start += schedule.batch, ++ordinal) {
+                if (schedule.drop && count - start < schedule.batch) break;
+                if (ordinal % schedule.shards == schedule.rank) starts.push_back(start);
+            }
+            CHECK(loader.num_batches() == starts.size());
+            for (unsigned epoch = 0U; epoch < 2U; ++epoch) {
+                loader.begin_epoch();
+                Batch batch{};
+                std::size_t ordinal = 0U;
+                std::vector<std::uint32_t> seen;
+                while (loader.next_batch(batch)) {
+                    REQUIRE(ordinal < starts.size());
+                    CHECK(batch.num_images == std::min(schedule.batch, count - starts[ordinal]));
+                    CHECK(batch.image_capacity_bytes == batch.num_images * source.header().image_stride);
+                    CHECK(batch.slot_index < std::min<std::size_t>(schedule.prefetch, starts.size()));
+                    loader.wait_batch(batch);
+                    const auto host = loader.host_images(batch);
+                    std::vector<float> received(host.size());
+                    ensure_cuda_ok(cudaMemcpy(received.data(), batch.device_images, batch.image_capacity_bytes, cudaMemcpyDeviceToHost), "scheduled batch pixels");
+                    CHECK(std::memcmp(received.data(), host.data(), batch.image_capacity_bytes) == 0);
+                    for (std::size_t image = 0U; image < batch.num_images; ++image) {
+                        const auto index = batch.image_indices[image];
+                        CHECK(index < count);
+                        if (!shuffle) CHECK(index == starts[ordinal] + image);
+                        REQUIRE(std::memcmp(host.data() + image * source.header().image_stride / sizeof(float), source.image_pixels(index),
+                                            source.header().image_stride) == 0);
+                        seen.push_back(index);
+                    }
+                    loader.release_batch(batch);
+                    ++ordinal;
+                }
+                CHECK(ordinal == starts.size());
+                std::ranges::sort(seen);
+                CHECK(std::ranges::adjacent_find(seen) == seen.end());
+                loader.synchronize();
+            }
+            loader.stop_workers();
+            Batch stopped{};
+            CHECK_FALSE(loader.next_batch(stopped));
+        }
+    DatasetLoader::Config overflow;
+    overflow.compiled_path = path;
+    overflow.loading.h2d_dataloader = h2d;
+    overflow.batch_size = std::numeric_limits<std::size_t>::max();
+    overflow.drop_last = true;
+    CHECK_THROWS_AS(DatasetLoader(overflow), std::overflow_error);
+}
 void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cudaStream_t compute_stream) {
     const std::string bin_path = compiled_bin_path(fixture);
     const std::string dataset_dir_path = dataset_dir(fixture);
@@ -170,6 +249,7 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     const size_t IMAGE_STRIDE = static_cast<size_t>(3) * H * W * sizeof(float);
     const size_t STRIDE_FLOATS = IMAGE_STRIDE / sizeof(float);
     INFO("h2d_dataloader=" << h2d);
+    exercise_schedule_capacity(bin_path, h2d);
     exercise_compiled_stream(bin_path, h2d);
     ensure_cuda_ok(cudaSetDevice(0), "restore primary training context after isolated stream coverage");
     {
@@ -362,6 +442,26 @@ void exercise_roundtrip_transport(const FixtureSpec& fixture, const bool h2d, cu
     REQUIRE(sharded_seen.size() == static_cast<size_t>(NUM_IMAGES));
     for (uint32_t i = 0; i < static_cast<uint32_t>(sharded_seen.size()); ++i) { REQUIRE(sharded_seen[i] == i); }
     printf("Batch sharding: %zu images across %u shards\n", sharded_seen.size(), shard0_cfg.batch_shard_count);
+    {
+        auto failed_config = direct_cfg;
+        failed_config.batch_size = static_cast<std::size_t>(NUM_IMAGES) + 1U;
+        failed_config.prefetch_factor = 8;
+        DatasetLoader failed(failed_config, {}, +[](cudaEvent_t, cudaStream_t) { return cudaErrorUnknown; });
+        Batch retained{};
+        REQUIRE(failed.next_batch(retained));
+        const mmltk::testsupport::ScopedTestCleanup release_retained([&] {
+            failed.stop_workers();
+            failed.release_batch(retained, compute_stream);
+        });
+        failed.wait_batch(retained);
+        failed.handoff_batch(retained, compute_stream);
+        REQUIRE_THROWS(failed.release_batch(retained, compute_stream));
+        CHECK(retained.image_capacity_bytes == static_cast<std::size_t>(NUM_IMAGES) * IMAGE_STRIDE);
+        CHECK_FALSE(retained.image_custody.expired());
+        CHECK(failed.host_images(retained).size() == static_cast<std::size_t>(NUM_IMAGES) * STRIDE_FLOATS);
+        // A refused event record retains the lease; stopped release settles the
+        // exact consumer stream before returning that same slot's custody.
+    }
     DatasetLoader::Config partial_cfg = direct_cfg;
     partial_cfg.batch_size = 7U;
     DatasetLoader partial_loader(partial_cfg);
@@ -475,6 +575,9 @@ void test_roundtrip_end_to_end() {
     const int H = fixture.height;
     const int NUM_IMAGES = fixture.num_images;
     ensure_cuda_ok(cudaSetDevice(0), "cudaSetDevice");
+    cudaDeviceProp device{};
+    ensure_cuda_ok(cudaGetDeviceProperties(&device, 0), "selected data test device");
+    INFO("CUDA device 0: " << device.name << " CC " << device.major << "." << device.minor);
     const mmltk::frameworks::gpu::DeviceContext context(0, mmltk::frameworks::gpu::cuda_image_copy_backend(),
                                                         mmltk::frameworks::gpu::DeviceContextMode::PrimaryInterop);
     mmltk::frameworks::gpu::ImageStream owned_stream(context);
@@ -533,6 +636,7 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
     const FixtureSpec fixture{.root_dir = root.path().string(), .width = 65, .height = 49, .num_images = 2, .background_images = 0};
     create_synthetic_dataset(fixture);
     auto config = compiler_config(fixture);
+    config.resize_mode = GENERATE(mmltk::backend::imaging::resample::ImageResizeMode::Stretch, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     config.output_dir = (root.path() / "ordinary").string();
     config.target_width = 31;
     config.target_height = 31;
@@ -561,6 +665,12 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
                 for (unsigned channel = 0; channel != 3; ++channel) pixels.set(x, y, channel, source[channel * 65U * 49U + y * 65U + x]);
         const auto expected = oracle::reference(pixels, geometry.resized_width, geometry.resized_height);
         const auto* actual = selected.image_pixels(image);
+        std::vector<std::uint8_t> packed(65U * 49U * 3U);
+        for (unsigned y = 0U; y < 49U; ++y)
+            for (unsigned x = 0U; x < 65U; ++x)
+                for (unsigned k = 0U; k < 3U; ++k) packed[(y * 65U + x) * 3U + k] = static_cast<std::uint8_t>(std::lround(pixels.at(x, y, k) * 255.0));
+        const auto exact = expected_resized_rgb(packed, 65, 49, 31, 31, config.resize_mode, true);
+        CHECK(std::memcmp(actual, exact.data(), exact.size() * sizeof(float)) == 0);
         for (unsigned channel = 0; channel != 3; ++channel)
             for (unsigned y = 0; y != 31; ++y)
                 for (unsigned x = 0; x != 31; ++x) {
@@ -571,4 +681,18 @@ TEST_CASE("perceptual compiler changes shrinking RGB while preserving format cat
                     CHECK(std::abs(actual[channel * 31U * 31U + y * 31U + x] - answer) <= 1.0 / 255 + 1e-6);
                 }
     }
+}
+
+TEST_CASE("empty compiled datasets retain their format admission failure", "[backend][data][roundtrip]") {
+    mmltk::testsupport::ScopedTempDir root("empty-compiled");
+    const auto path = root.path() / "empty.bin";
+    auto layout = compute_pixel_layout(0U, 12U);
+    finalize_layout(layout, {});
+    const std::vector<std::string> classes{"person"};
+    const auto header = make_file_header({0U, 1U, 1U, 3U, 0U, 12U}, classes, layout);
+    const auto file = mmltk::common::io::FileHandle::create_output(path.string(), layout.total_size);
+    file.pwrite_all(&header, sizeof(header), 0U);
+    DatasetLoader::Config config;
+    config.compiled_path = path.string();
+    CHECK_THROWS_AS(DatasetLoader(config), std::runtime_error);
 }

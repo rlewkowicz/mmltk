@@ -70,11 +70,6 @@ class ReadOnlyMappedRange {
     common_io::MappedByteRegion region_;
     const std::uint8_t* data_ = nullptr;
 };
-[[nodiscard]] std::size_t checked_rgb_bytes(const std::uint32_t width, const std::uint32_t height) {
-    if (width == 0U || height == 0U) { throw std::runtime_error("benchmark image dimensions must be positive"); }
-    const std::uint64_t pixels = static_cast<std::uint64_t>(width) * height;
-    return common_math::checked_cast<std::size_t>(pixels * 3U, "benchmark RGB buffer size overflow");
-}
 [[nodiscard]] std::vector<ImageEntry> build_index(const PreparedBenchmarkSplit& split, const std::uint64_t pixel_offset, const std::uint64_t image_stride) {
     std::vector<ImageEntry> index(split.images.size());
     std::size_t expected_first_label = 0U;
@@ -124,9 +119,6 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
         std::vector<std::uint8_t> encoded;
         std::vector<std::uint8_t> decoded;
         std::vector<std::uint8_t> cmyk;
-        std::vector<std::uint8_t> resized;
-        const std::size_t target_bytes = checked_rgb_bytes(request.resolution, request.resolution);
-        resized.reserve(target_bytes);
         constexpr std::uint32_t kSchedulingBatch = 8U;
         while (!worker_failed.load(std::memory_order_relaxed)) {
             const std::uint32_t begin = next_image.fetch_add(kSchedulingBatch, std::memory_order_relaxed);
@@ -141,8 +133,6 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                     }
                     std::array<char, 24> relative_path{};
                     (void)format_cached_image_relative_path(image.source_image_id, relative_path);
-                    int jpeg_width = 0;
-                    int jpeg_height = 0;
                     try {
                         const int image_descriptor =
                             ::openat(source_directories[image.source_index].get(), relative_path.data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -155,31 +145,19 @@ void decode_images(const BenchmarkWriteRequest& request, const common_io::FileHa
                         encoded.resize(encoded_size);
                         image_file.pread_all(encoded.data(), encoded.size(), 0U);
                         const BenchmarkJpegHeader jpeg_header = jpeg.read_header(encoded, image.source_width, image.source_height);
-                        jpeg_width = common_math::checked_cast<int>(jpeg_header.width, "benchmark JPEG width overflow");
-                        jpeg_height = common_math::checked_cast<int>(jpeg_header.height, "benchmark JPEG height overflow");
+                        (void)common_math::checked_cast<int>(jpeg_header.width, "benchmark JPEG width overflow");
+                        (void)common_math::checked_cast<int>(jpeg_header.height, "benchmark JPEG height overflow");
                         jpeg.decode_rgb(encoded, jpeg_header, &decoded, &cmyk);
                     } catch (const std::bad_alloc&) { throw; } catch (const BenchmarkImageReadError&) {
                         throw;
                     } catch (const std::exception& error) { throw BenchmarkImageReadError(image.source_index, image.source_image_id, error.what()); }
-                    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox = mmltk::backend::imaging::resample::compute_image_resize_geometry(
-                        image.source_width, image.source_height, request.resolution, request.resolution, request.resize_mode);
-                    const std::uint8_t* source_pixels = decoded.data();
-                    if (image.source_width != letterbox.resized_width || image.source_height != letterbox.resized_height) {
-                        resized.resize(checked_rgb_bytes(letterbox.resized_width, letterbox.resized_height));
-                        resizer.resize(decoded.data(), jpeg_width, jpeg_height, resized.data(),
-                                       common_math::checked_cast<int>(letterbox.resized_width, "benchmark letterbox width overflow"),
-                                       common_math::checked_cast<int>(letterbox.resized_height, "benchmark letterbox height overflow"));
-                        source_pixels = resized.data();
-                    }
-                    float* destination = output_pixels.image(image_index, image_stride);
-                    if (letterbox.resized_width == request.resolution && letterbox.resized_height == request.resolution && letterbox.offset_x == 0U &&
-                        letterbox.offset_y == 0U) {
-                        mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(source_pixels, destination, request.resolution, request.resolution);
-                    } else {
-                        mmltk::backend::imaging::resample::letterboxed_rgb_hwc_u8_to_nchw_f32(source_pixels, destination, letterbox.resized_width,
-                                                                                              letterbox.resized_height, request.resolution, request.resolution,
-                                                                                              letterbox.offset_x, letterbox.offset_y);
-                    }
+                    resizer.resize_to_planar(
+                        {decoded.data(), {image.source_width, image.source_height, static_cast<std::size_t>(image.source_width) * 3U, 0U,
+                                          decoded.size(), mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
+                        {output_pixels.image(image_index, image_stride),
+                         {request.resolution, request.resolution, static_cast<std::size_t>(request.resolution) * sizeof(float),
+                          static_cast<std::size_t>(request.resolution) * request.resolution * sizeof(float), image_stride,
+                          mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}}, request.resize_mode);
                     if (request.progress) { request.progress(); }
                 }
             } catch (...) {

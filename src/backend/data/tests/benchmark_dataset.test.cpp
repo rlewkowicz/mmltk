@@ -39,6 +39,8 @@
 #include "detail/benchmark_images.h"
 #include "detail/benchmark_sampling.h"
 #include "detail/benchmark_writer.h"
+#include "detail/benchmark_jpeg.h"
+#include "detail/benchmark_progress.h"
 #include "src/test_support/filesystem_test_utils.hpp"
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
@@ -120,7 +122,9 @@ std::vector<std::uint8_t> make_payload(const std::size_t bytes) {
 }
 class HttpServer {
    public:
-    explicit HttpServer(std::span<const std::uint8_t> payload) : payload_(payload), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
+    explicit HttpServer(std::span<const std::uint8_t> payload) : HttpServer(payload, payload.size()) {}
+    explicit HttpServer(std::size_t generated_bytes) : HttpServer({}, generated_bytes) {}
+    HttpServer(std::span<const std::uint8_t> payload, std::size_t bytes) : payload_(payload), payload_size_(bytes), listener_(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
         require_condition(listener_.get() >= 0, "failed to create benchmark HTTP socket");
         const int reuse = 1;
         require_condition(::setsockopt(listener_.get(), SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0, "failed to configure benchmark HTTP socket");
@@ -161,6 +165,11 @@ class HttpServer {
     [[nodiscard]] bool WaitPartial() const { return partial_.WaitEntered(3s); }
     void ReleasePartial() const { partial_.Release(); }
     [[nodiscard]] std::string url(const std::string& path) const { return "http://127.0.0.1:" + std::to_string(port_) + "/" + path; }
+    void TruncateNextTransfer() { truncate_next_.store(true, std::memory_order_release); }
+    [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> ranges() {
+        const std::scoped_lock lock(client_mutex_);
+        return ranges_;
+    }
     void fail_next(const int count) { failures_remaining_.store(count, std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t ranged_requests() const { return ranged_requests_.load(std::memory_order_relaxed); }
@@ -223,6 +232,7 @@ class HttpServer {
         }
         failures_remaining_.store(0, std::memory_order_relaxed);
         std::size_t begin = 0U;
+        std::size_t end = payload_size_ - 1U;
         bool ranged = false;
         const std::size_t range_header = request.find("\r\nRange: bytes=");
         if (range_header != std::string::npos) {
@@ -231,36 +241,56 @@ class HttpServer {
             if (dash != std::string::npos) {
                 const auto parsed = std::from_chars(request.data() + number_begin, request.data() + dash, begin);
                 require_condition(parsed.ec == std::errc{} && parsed.ptr == request.data() + dash, "invalid HTTP range");
-                ranged = begin < payload_.size();
+                const auto range_end = request.find("\r\n", dash);
+                if (range_end != dash + 1U) {
+                    const auto last = std::from_chars(request.data() + dash + 1U, request.data() + range_end, end);
+                    require_condition(last.ec == std::errc{} && last.ptr == request.data() + range_end, "invalid HTTP range end");
+                }
+                ranged = begin <= end && end < payload_size_;
             }
         }
         if (ranged) {
             ranged_requests_.fetch_add(1U, std::memory_order_relaxed);
+            const std::scoped_lock lock(client_mutex_);
+            ranges_.emplace_back(begin, end);
         } else {
             begin = 0U;
         }
-        const std::size_t bytes = payload_.size() - begin;
+        const std::size_t bytes = end + 1U - begin;
         std::string header = std::string(ranged ? "HTTP/1.1 206 Partial Content\r\n" : "HTTP/1.1 200 OK\r\n") + "Content-Length: " + std::to_string(bytes) +
                              "\r\nAccept-Ranges: bytes\r\nETag: \"benchmark-test-etag\"\r\n"
                              "Last-Modified: Thu, 23 Jul 2026 12:00:00 GMT\r\n";
         if (ranged) {
             header +=
-                "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(payload_.size() - 1U) + "/" + std::to_string(payload_.size()) + "\r\n";
+                "Content-Range: bytes " + std::to_string(begin) + "-" + std::to_string(end) + "/" + std::to_string(payload_size_) + "\r\n";
         }
         header += "Connection: close\r\n\r\n";
         if (!send_all(client, header.data(), header.size())) { return; }
         constexpr std::size_t chunk = std::size_t{16U} * 1024U;
-        const bool gated = gate_next_.exchange(false, std::memory_order_acq_rel);
+        if (request.starts_with("HEAD ")) return;
+        const bool gated = bytes >= partial_bytes && gate_next_.exchange(false, std::memory_order_acq_rel);
+        const bool truncated = bytes >= partial_bytes && truncate_next_.exchange(false, std::memory_order_acq_rel);
+        std::array<std::uint8_t, chunk> generated{};
         std::size_t offset = begin;
-        while (offset < payload_.size()) {
-            const std::size_t current = std::min(chunk, payload_.size() - offset);
-            if (!send_all(client, payload_.data() + offset, current)) { return; }
+        while (offset <= end) {
+            const std::size_t current = std::min(chunk, end + 1U - offset);
+            const auto* data = payload_.data();
+            if (payload_.empty()) {
+                for (std::size_t i = 0; i < current; ++i) generated[i] = static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
+                data = generated.data();
+            } else {
+                data += offset;
+            }
+            if (!send_all(client, data, current)) { return; }
             offset += current;
+            if (truncated && offset - begin >= partial_bytes) return;
             if (gated && offset - begin == partial_bytes) partial_.receipt().ArriveAndWait();
             if (stop_.load(std::memory_order_acquire)) return;
         }
     }
     const std::span<const std::uint8_t> payload_;
+    const std::size_t payload_size_;
+    std::vector<std::pair<std::size_t, std::size_t>> ranges_;
     mmltk::common::io::ScopedFd listener_;
     std::array<char, 16U * 1024U> receive_{};
     std::mutex client_mutex_;
@@ -270,6 +300,7 @@ class HttpServer {
     std::uint16_t port_ = 0U;
     std::atomic<bool> stop_{false};
     std::atomic<bool> gate_next_{false};
+    std::atomic<bool> truncate_next_{false};
     std::atomic<int> failures_remaining_{0};
     std::atomic<std::uint64_t> requests_{0U};
     std::atomic<std::uint64_t> ranged_requests_{0U};
@@ -1056,6 +1087,12 @@ TEST_CASE("benchmark semantic admission isolates malformed masks and numeric ove
     CHECK(parallel.rejected.raw_records == 3U);
     CHECK(parallel.rejected.malformed_records == 2U);
     CHECK(reject_json(parallel.rejected) == reject_json(sequential.rejected));
+    CHECK(parallel.mask_rle_pairs.empty());
+    CHECK(parallel.boxes.front().mask_rle_offset == 0U);
+    CHECK(parallel.boxes.front().mask_rle_pairs == 0U);
+    store_normalized_annotation_index(root.path() / "open-sequential.index", sequential, {});
+    store_normalized_annotation_index(root.path() / "open-parallel.index", parallel, {});
+    CHECK(mmltk::common::io::sha256_file(root.path() / "open-sequential.index") == mmltk::common::io::sha256_file(root.path() / "open-parallel.index"));
 }
 TEST_CASE("normalized benchmark caches require source category presence", "[backend][data][benchmark][annotations]") {
     mmltk::testsupport::ScopedTempDir root("normalized-provenance");
@@ -1242,4 +1279,189 @@ TEST_CASE("generic and benchmark writers share complete format headers", "[backe
             CHECK(sections.rle_region_bytes == generic.rle_pairs().size_bytes());
         }
     }
+}
+TEST_CASE("segmented downloads retain durable ranges through failure cancellation and unobserved resume", "[backend][data][benchmark][download]") {
+    mmltk::testsupport::ScopedTempDir root("segmented-download");
+    constexpr std::size_t bytes = 512U * 1024U * 1024U;
+    HttpServer server(bytes);
+    DownloadRequest request{"segmented", server.url("segmented"), root.path() / "artifact.bin", root.path() / "artifact.lock", bytes, {}, 1U};
+    server.TruncateNextTransfer();
+    std::mutex progress_mutex;
+    std::vector<DownloadProgress> updates;
+    REQUIRE_THROWS(download_artifacts({request}, 2U, {}, [&](const DownloadProgress& progress) {
+        const std::scoped_lock lock(progress_mutex);
+        updates.push_back(progress);
+    }));
+    REQUIRE_FALSE(updates.empty());
+    CHECK(std::ranges::all_of(updates, [](const DownloadProgress& progress) { return progress.total_bytes == bytes && progress.completed_bytes <= bytes; }));
+    CHECK(std::ranges::any_of(updates, [](const DownloadProgress& progress) { return progress.completed_bytes > 0U; }));
+    REQUIRE_FALSE(fs::exists(request.destination));
+    REQUIRE(fs::file_size(request.destination.string() + ".part") == bytes);
+    const auto metadata_path = request.destination.string() + ".part.json";
+    const auto partial = read_json_file(metadata_path);
+    REQUIRE(partial.at("mode") == "segmented");
+    REQUIRE(partial.at("segments").size() == 2U);
+    std::uint64_t completed = 0U;
+    for (const auto& segment : partial.at("segments")) completed += segment.at("completed").get<std::uint64_t>();
+    REQUIRE(completed > 0U);
+    REQUIRE(completed < bytes);
+    const auto first_ranges = server.ranges();
+    REQUIRE(std::ranges::find(first_ranges, std::pair<std::size_t, std::size_t>{0U, bytes / 2U - 1U}) != first_ranges.end());
+    REQUIRE(std::ranges::find(first_ranges, std::pair<std::size_t, std::size_t>{bytes / 2U, bytes - 1U}) != first_ranges.end());
+
+    // The fixture gates physical response bytes, independently of progress callbacks.
+    std::atomic<bool> cancel{false};
+    server.GateNextTransfer();
+    auto download = std::async(std::launch::async, [&] {
+        try {
+            (void)download_artifacts({request}, 2U, mmltk::common::concurrency::CancellationObservation::Atomic(cancel));
+            return false;
+        } catch (const std::exception&) { return true; }
+    });
+    const mmltk::testsupport::ScopedTestCleanup settle([&] {
+        cancel.store(true, std::memory_order_release);
+        server.ReleasePartial();
+    });
+    REQUIRE(server.WaitPartial());
+    cancel.store(true, std::memory_order_release);
+    REQUIRE(mmltk::testsupport::await_test_future(download, "unobserved segmented cancellation", 5s));
+    REQUIRE_FALSE(fs::exists(request.destination));
+    REQUIRE(fs::file_size(request.destination.string() + ".part") == bytes);
+    REQUIRE(read_json_file(metadata_path).at("mode") == "segmented");
+    server.ReleasePartial();
+
+    request.maximum_attempts = 3U;
+    server.TruncateNextTransfer();
+    std::atomic<bool> traced_retry{false}, traced_complete{false};
+    const auto resumed = download_artifacts({request}, 2U, {}, {}, [&](const std::string_view event, const nlohmann::json&) {
+        if (event == "benchmark.download.segment_retry") traced_retry.store(true, std::memory_order_relaxed);
+        if (event == "benchmark.download.segmented_complete") traced_complete.store(true, std::memory_order_relaxed);
+    });
+    CHECK(traced_retry.load(std::memory_order_relaxed));
+    CHECK(traced_complete.load(std::memory_order_relaxed));
+    REQUIRE(resumed.size() == 1U);
+    CHECK(resumed.front().resumed);
+    CHECK(resumed.front().attempts == 2U);
+    REQUIRE(fs::file_size(request.destination) == bytes);
+    CHECK_FALSE(fs::exists(metadata_path));
+    CHECK_FALSE(fs::exists(request.destination.string() + ".part"));
+    const FileHandle file = FileHandle::open_readonly(request.destination.string());
+    std::array<std::uint8_t, 64U * 1024U> block{};
+    bool exact = true;
+    for (std::size_t offset = 0U; offset < bytes; offset += block.size()) {
+        file.pread_all(block.data(), block.size(), offset);
+        for (std::size_t i = 0U; i < block.size(); ++i)
+            exact &= block[i] == static_cast<std::uint8_t>(((offset + i) * 131U + 17U) & 0xFFU);
+    }
+    CHECK(exact);
+    server.Check();
+}
+TEST_CASE("benchmark shrinking JPEGs preserve the RGB8 intermediate projection exactly", "[backend][data][benchmark][writer][perceptual]") {
+    using namespace mmltk::backend::imaging::resample;
+    mmltk::testsupport::ScopedTempDir root("shrinking-jpeg");
+    const auto image_root = root.path() / "images";
+    prepare_cached_image_directory(image_root);
+    constexpr std::uint32_t width = 65U, height = 49U, target = 17U;
+    std::vector<std::uint8_t> rgb(width * height * 3U);
+    for (std::size_t i = 0U; i < rgb.size(); ++i) rgb[i] = static_cast<std::uint8_t>((i * 17U + i / 13U) & 255U);
+    std::vector<std::uint8_t> jpeg;
+    REQUIRE(stbi_write_jpg_to_func(append_bytes, &jpeg, width, height, 3, rgb.data(), 95) != 0);
+    write_cached_image_atomically(cached_image_path(image_root, 1U), jpeg, {});
+    BenchmarkJpegDecoder decoder;
+    std::vector<std::uint8_t> decoded, cmyk;
+    const auto header = decoder.read_header(jpeg, width, height);
+    decoder.decode_rgb(jpeg, header, &decoded, &cmyk);
+    PreparedBenchmarkSplit split;
+    split.name = "train";
+    split.class_names = {"person"};
+    split.sources = {{image_root}};
+    split.images = {{1U, width, height, 0U, 0U, 0U}};
+    for (const auto mode : {ImageResizeMode::Stretch, ImageResizeMode::Letterbox}) {
+        const auto output = root.path() / (mode == ImageResizeMode::Stretch ? "stretch.bin" : "letterbox.bin");
+        auto request = benchmark_write_request(split, output, target);
+        request.perceptual_downscale = true;
+        request.resize_mode = mode;
+        write_benchmark_split(request);
+        const auto compiled = CompiledDataset::open(output);
+        const auto expected = mmltk::backend::data::testsupport::expected_resized_rgb(decoded, width, height, target, target, mode, true);
+        CHECK(std::memcmp(compiled.image_pixels(0), expected.data(), expected.size() * sizeof(float)) == 0);
+        CHECK(compiled.header().resize_mode == mode);
+    }
+}
+TEST_CASE("transfer observers are independent of trace-only pixel observers", "[backend][data][benchmark][progress]") {
+    const BenchmarkTraceSink quiet;
+    ProgressReporter unobserved({}, quiet);
+    CHECK_FALSE(unobserved.transfer_observer_enabled());
+    CHECK_FALSE(unobserved.pixel_observer_enabled());
+    std::size_t traces = 0U;
+    const BenchmarkTraceSink trace = [&](std::string_view, const nlohmann::json&) { ++traces; };
+    ProgressReporter traced({}, trace);
+    CHECK_FALSE(traced.transfer_observer_enabled());
+    CHECK(traced.pixel_observer_enabled());
+    traced.source_bytes(BenchmarkDatasetSource::kCoco2017, 1U, 2U, 1U, false, false);
+    CHECK(traces == 0U);
+    traced.pixel_attempt(0U, 1U, "train", 1U);
+    traced.pixel_completed();
+    CHECK(traces == 1U);
+    std::vector<BenchmarkCompileProgress> updates;
+    ProgressReporter observed([&](const BenchmarkCompileProgress& update) { updates.push_back(update); }, quiet);
+    CHECK(observed.transfer_observer_enabled());
+    CHECK(observed.pixel_observer_enabled());
+    observed.phase(DatasetCompilePhase::Downloading);
+    observed.source_bytes(BenchmarkDatasetSource::kCoco2017, 5U, 11U, 2U, false, true);
+    REQUIRE_FALSE(updates.empty());
+    CHECK(updates.back().sources[0].completed_bytes == 5U);
+    CHECK(updates.back().sources[0].total_bytes == 11U);
+    CHECK(updates.back().sources[0].retry_count == 2U);
+    CHECK(updates.back().sources[0].resumed);
+}
+TEST_CASE("parser workers reset segmentation scratch across masks rejections and dimension changes", "[backend][data][benchmark][annotations]") {
+    mmltk::testsupport::ScopedTempDir root("segmentation-scratch");
+    const auto path = root.path() / "annotations.json";
+    nlohmann::json document{{"images", {{{"id", 1}, {"width", 16}, {"height", 8}, {"file_name", "patch0/1.jpg"}},
+                                      {{"id", 2}, {"width", 4}, {"height", 4}, {"file_name", "patch0/2.jpg"}},
+                                      {{"id", 3}, {"width", 4}, {"height", 4}, {"file_name", "patch0/3.jpg"}}}},
+                            {"categories", {{{"id", 1}, {"name", "person"}}}}, {"annotations", nlohmann::json::array()}};
+    for (unsigned cycle = 0U; cycle < 256U; ++cycle)
+        for (unsigned kind = 0U; kind < 7U; ++kind) {
+            const bool small = (cycle + kind) % 2U != 0U;
+            nlohmann::json record{{"image_id", small ? 2 : 1}, {"category_id", 1}, {"id", cycle * 7U + kind}, {"bbox", {0, 0, 2, 2}}};
+            if (kind == 0U) record["segmentation"] = {{0, 0, 2, 0, 2, 2, 0, 2}};
+            if (kind == 1U) record["segmentation"] = {{"size", {small ? 4 : 8, small ? 4 : 16}}, {"counts", {0, 1, small ? 15 : 127}}};
+            if (kind == 2U) record["segmentation"] = {{"size", {small ? 4 : 8, small ? 4 : 16}}, {"counts", small ? "01?" : "01o3"}};
+            if (kind == 3U) record["segmentation"] = {{"size", {small ? 4 : 8, small ? 4 : 16}}, {"counts", {0, 2, 1}}};
+            if (kind == 4U) record["segmentation"] = nlohmann::json::array();
+            if (kind == 5U) {
+                record["bbox"] = {0, 0, 0, 0};
+                record["segmentation"] = {{0, 0, 4, 0, 4, 4, 0, 4}};
+            }
+            document["annotations"].push_back(std::move(record));
+        }
+    write_text(path, document.dump());
+    const auto digest = mmltk::common::io::sha256_hex(mmltk::common::io::sha256_file(path));
+    const std::array<NumericCategoryMapping, 1> mappings{{{1U, 0U, "person"}}};
+    for (const auto source : {BenchmarkDatasetSource::kCoco2017, BenchmarkDatasetSource::kObjects365V2})
+        for (const bool keep_empty : {false, true}) {
+            AnnotationParseOptions options;
+            options.source = source;
+            options.split = "train";
+            options.num_workers = 1;
+            options.keep_images_without_mapped_boxes = keep_empty;
+            const auto sequential = parse_coco_style_annotations(path, digest, mappings, options);
+            options.num_workers = 4;
+            const auto parallel = parse_coco_style_annotations(path, digest, mappings, options);
+            CHECK(parallel.images.size() == (keep_empty ? 3U : 2U));
+            REQUIRE(parallel.boxes.size() == 256U * 5U);
+            CHECK(parallel.rejected.malformed_records == 256U);
+            CHECK(parallel.rejected.degenerate_boxes == 256U);
+            store_normalized_annotation_index(root.path() / "sequential.index", sequential, {});
+            store_normalized_annotation_index(root.path() / "parallel.index", parallel, {});
+            CHECK(mmltk::common::io::sha256_file(root.path() / "sequential.index") == mmltk::common::io::sha256_file(root.path() / "parallel.index"));
+            for (const auto& box : parallel.boxes) {
+                const auto kind = box.annotation_id % 7U;
+                CHECK(box.original_area == (kind == 0U || kind == 6U ? 4.0 : kind == 4U ? 0.0 : 1.0));
+                CHECK(((box.flags & kAnnotationMask) != 0U) == (kind != 6U));
+                if (kind == 4U || kind == 6U) CHECK(box.mask_rle_pairs == 0U);
+            }
+        }
 }

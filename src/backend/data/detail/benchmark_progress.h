@@ -15,6 +15,7 @@ class ProgressReporter {
     void pixel_attempt(const std::uint64_t completed, const std::uint64_t total, const std::string_view split, const std::uint64_t split_total);
     void pixel_completed();
     void source_activity(const BenchmarkDatasetSource source, std::string activity);
+    [[nodiscard]] bool transfer_observer_enabled() const noexcept;
     [[nodiscard]] bool pixel_observer_enabled() const noexcept;
     void projected(const std::uint64_t bytes);
     void rejected(const std::uint64_t dropped, const std::uint64_t quarantined);

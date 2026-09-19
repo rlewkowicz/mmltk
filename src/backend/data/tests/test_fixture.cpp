@@ -132,6 +132,21 @@ std::vector<float> expected_nchw_stub(const std::string& path, int width, int he
     }
     return nchw;
 }
+std::vector<float> expected_resized_rgb(std::span<const std::uint8_t> rgb, const std::uint32_t width, const std::uint32_t height,
+                                       const std::uint32_t target_width, const std::uint32_t target_height,
+                                       const mmltk::backend::imaging::resample::ImageResizeMode mode, const bool perceptual) {
+    using namespace mmltk::backend::imaging::resample;
+    if (rgb.size() != std::size_t(width) * height * 3U) throw std::invalid_argument("RGB fixture extent mismatch");
+    const auto geometry = compute_image_resize_geometry(width, height, target_width, target_height, mode);
+    RgbImageResizer resizer(1, perceptual);
+    std::vector<std::uint8_t> bytes(std::size_t(geometry.resized_width) * geometry.resized_height * 3U);
+    resizer.resize(rgb.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width),
+                   static_cast<int>(geometry.resized_height));
+    std::vector<float> expected(std::size_t(target_width) * target_height * 3U);
+    letterboxed_rgb_hwc_u8_to_nchw_f32(bytes.data(), expected.data(), geometry.resized_width, geometry.resized_height, target_width, target_height,
+                                      geometry.offset_x, geometry.offset_y);
+    return expected;
+}
 void assert_image_matches(const float* actual, const std::vector<float>& expected) {
     if (expected.size() <= 8) { throw std::runtime_error("expected image fixture must contain more than eight samples"); }
     for (size_t i = 0; i < expected.size(); ++i) {

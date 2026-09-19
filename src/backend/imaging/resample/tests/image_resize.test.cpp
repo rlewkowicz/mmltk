@@ -379,3 +379,93 @@ TEST_CASE("resize geometry explicitly chooses stretch or rounded letterbox", "[b
     CHECK_THROWS(compute_image_resize_geometry(0, 1, 8, 8, ImageResizeMode::Stretch));
     CHECK_THROWS(compute_image_resize_geometry(1, 1, 8, 8, static_cast<ImageResizeMode>(255)));
 }
+namespace {
+void check_compiler_projection(RgbImageResizer& resizer, const std::vector<std::uint8_t>& source, std::uint32_t width, std::uint32_t height,
+                                std::uint32_t target_width, std::uint32_t target_height, ImageResizeMode mode) {
+    const auto geometry = compute_image_resize_geometry(width, height, target_width, target_height, mode);
+    std::vector<std::uint8_t> bytes(std::size_t(geometry.resized_width) * geometry.resized_height * 3U);
+    resizer.resize(source.data(), static_cast<int>(width), static_cast<int>(height), bytes.data(), static_cast<int>(geometry.resized_width),
+                   static_cast<int>(geometry.resized_height));
+    const auto plane = std::size_t(target_width) * target_height;
+    std::vector<float> expected(plane * 3U + 8U, -17.0F), actual(expected);
+    letterboxed_rgb_hwc_u8_to_nchw_f32(bytes.data(), expected.data(), geometry.resized_width, geometry.resized_height, target_width, target_height,
+                                      geometry.offset_x, geometry.offset_y);
+    resizer.resize_to_planar({source.data(), {width, height, std::size_t(width) * 3U, 0U, source.size(), RgbPixelFormat::RGB8}},
+                             {actual.data(), {target_width, target_height, std::size_t(target_width) * sizeof(float), plane * sizeof(float),
+                                              plane * 3U * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32}}, mode);
+    REQUIRE(std::memcmp(actual.data(), expected.data(), expected.size() * sizeof(float)) == 0);
+}
+}  // namespace
+TEST_CASE("compiler planar projection preserves every quantized RGB8 bit", "[backend][data][image_resize][perceptual]") {
+    constexpr std::array<std::array<std::uint32_t, 4>, 13> sizes{{
+        {32, 18, 16, 9}, {34, 18, 17, 9}, {16, 10, 8, 5}, {14, 10, 7, 5}, {17, 13, 9, 7}, {17, 13, 17, 5}, {17, 13, 7, 13},
+        {17, 13, 1, 1}, {1, 17, 1, 7}, {31, 3, 9, 11}, {17, 13, 17, 13}, {17, 13, 23, 19}, {17, 13, 9, 19}}};
+    for (const bool enabled : {false, true}) {
+        RgbImageResizer resizer(1, enabled);
+        for (const auto& dims : sizes)
+            for (const auto mode : {ImageResizeMode::Stretch, ImageResizeMode::Letterbox})
+                for (unsigned pattern = 0U; pattern < 4U; ++pattern) {
+                    INFO("enabled " << enabled << " source " << dims[0] << "x" << dims[1] << " target " << dims[2] << "x" << dims[3]
+                                     << " mode " << static_cast<int>(mode) << " pattern " << pattern);
+                    auto source = make_test_image(static_cast<int>(dims[0]), static_cast<int>(dims[1]));
+                    std::uint32_t random = 0x792719U;
+                    for (std::size_t i = 0; i < source.size(); ++i) {
+                        random = random * 1664525U + 1013904223U;
+                        if (pattern == 0U) source[i] = 11U;
+                        if (pattern == 1U) source[i] = (i / 3U % dims[0] >= dims[0] / 2U) ? 255U : 0U;
+                        if (pattern == 2U) source[i] = ((i / 3U + i / 3U / dims[0]) & 1U) ? 255U : 0U;
+                        if (pattern == 3U) source[i] = static_cast<std::uint8_t>(random >> 24U);
+                    }
+                    check_compiler_projection(resizer, source, dims[0], dims[1], dims[2], dims[3], mode);
+                }
+        for (unsigned code = 0U; code < 256U; ++code) {
+            const std::vector<std::uint8_t> source(34U * 6U * 3U, static_cast<std::uint8_t>(code));
+            check_compiler_projection(resizer, source, 34, 6, 17, 3, ImageResizeMode::Stretch);
+            check_compiler_projection(resizer, source, 34, 6, 19, 5, ImageResizeMode::Letterbox);
+        }
+    }
+}
+TEST_CASE("quantized planar preparation failure leaves the complete canvas untouched and permits retry", "[backend][data][image_resize][perceptual]") {
+    using Access = perceptual::CpuDownscalerTestAccess;
+    using Step = Access::Step;
+    for (const auto step : {Step::HorizontalAxis, Step::VerticalAxis, Step::FirstMoment, Step::SecondMoment, Step::FirstCoefficient, Step::SecondCoefficient}) {
+        perceptual::CpuDownscaler owner;
+        test_perceptual::Image source(19, 13, RgbPixelFormat::RGB8, 3), destination(9, 7, RgbPixelFormat::PlanarUnitSrgbF32, 5);
+        source.fill(5);
+        const auto untouched = destination.storage;
+        Access::fail_before(owner, step);
+        REQUIRE_THROWS_AS(owner.run_quantized_planar(source.read(), destination.write()), std::bad_alloc);
+        CHECK(std::memcmp(untouched.data(), destination.storage.data(), untouched.size() * sizeof(float)) == 0);
+        owner.run_quantized_planar(source.read(), destination.write());
+        test_perceptual::Image bytes(9, 7, RgbPixelFormat::RGB8, 5);
+        RgbImageResizer reference;
+        reference.downscale(source.read(), bytes.write());
+        for (unsigned y = 0U; y < 7U; ++y)
+            for (unsigned x = 0U; x < 9U; ++x)
+                for (unsigned k = 0U; k < 3U; ++k) {
+                    const auto code = static_cast<unsigned>(std::lround(bytes.at(x, y, k) * 255.0));
+                    const float expected = float(code) * (1.0F / 255.0F);
+                    CHECK(static_cast<float>(destination.at(x, y, k)) == expected);
+                }
+        CHECK(test_perceptual::padding_intact(destination));
+    }
+}
+TEST_CASE("compiler projection rejects invalid canvases before writing padding", "[backend][data][image_resize][perceptual]") {
+    const auto source = make_test_image(19, 13);
+    std::vector<float> destination(11U * 11U * 3U, -19.0F);
+    const RgbConstImageView input{source.data(), {19U, 13U, 57U, 0U, source.size(), RgbPixelFormat::RGB8}};
+    const RgbMutableImageView output{destination.data(), {11U, 11U, 44U, 484U, destination.size() * sizeof(float), RgbPixelFormat::PlanarUnitSrgbF32}};
+    RgbImageResizer resizer(1, true);
+    auto bad = output;
+    --bad.layout.capacity_bytes;
+    CHECK_THROWS(resizer.resize_to_planar(input, bad, ImageResizeMode::Letterbox));
+    bad = output;
+    bad.layout.plane_stride_bytes -= sizeof(float);
+    CHECK_THROWS(resizer.resize_to_planar(input, bad, ImageResizeMode::Letterbox));
+    CHECK_THROWS(resizer.resize_to_planar(input, output, static_cast<ImageResizeMode>(255)));
+    auto alias = input;
+    alias.data = destination.data();
+    CHECK_THROWS(resizer.resize_to_planar(alias, output, ImageResizeMode::Letterbox));
+    CHECK(std::ranges::all_of(destination, [](float value) { return value == -19.0F; }));
+    check_compiler_projection(resizer, source, 19, 13, 11, 11, ImageResizeMode::Letterbox);
+}

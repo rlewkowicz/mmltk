@@ -168,7 +168,7 @@ MMLTK_PERCEPTUAL_HD inline Color load(RgbConstImageView view, std::uint32_t x, s
     }
     return transform(r, g, b);
 }
-template <RgbPixelFormat Format>
+template <RgbPixelFormat Format, bool QuantizedPlanar = false>
 MMLTK_PERCEPTUAL_HD inline void store(RgbMutableImageView view, std::uint32_t x, std::uint32_t y, Color value, float alpha, const TransferTable& table) {
     const Color rgb = inverse(value);
     float channels[3]{rgb.y, rgb.cb, rgb.cr};
@@ -179,7 +179,9 @@ MMLTK_PERCEPTUAL_HD inline void store(RgbMutableImageView view, std::uint32_t x,
             linear = alpha > 0.0F ? unit(linear / alpha) : 0.0F;
         else
             linear = unit(linear);
-        if constexpr (Format == RgbPixelFormat::PlanarUnitSrgbF32) {
+        if constexpr (QuantizedPlanar) {
+            reinterpret_cast<float*>(row + std::size_t(k) * view.layout.plane_stride_bytes)[x] = float(table.quantize(linear)) * (1.0F / 255.0F);
+        } else if constexpr (Format == RgbPixelFormat::PlanarUnitSrgbF32) {
             reinterpret_cast<float*>(row + std::size_t(k) * view.layout.plane_stride_bytes)[x] = static_cast<float>(encode(linear));
         } else {
             constexpr unsigned count = Format == RgbPixelFormat::RGBA8 ? 4 : 3;

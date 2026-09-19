@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 #include "avir.h"
 namespace mmltk::backend::imaging::resample {  // Model-independent resampling.
 namespace {
@@ -25,6 +26,7 @@ void warm_up_avir_rgb_resize_path() {
 struct RgbImageResizer::Impl {
     avir::CImageResizer<> resizer{8};
     bool perceptual_enabled = false;
+    std::vector<std::uint8_t> byte_scratch;
     std::unique_ptr<perceptual::CpuDownscaler> perceptual;
 };
 ImageResizeGeometry compute_image_resize_geometry(const std::uint32_t source_width, const std::uint32_t source_height, const std::uint32_t target_width,
@@ -204,6 +206,52 @@ void RgbImageResizer::resize(const uint8_t* src, int src_width, int src_height, 
         return;
     }
     impl_->resizer.resizeImage(src, src_width, src_height, 0, dst, dst_width, dst_height, 3, 0.0, nullptr);
+}
+ImageResizeGeometry RgbImageResizer::resize_to_planar(RgbConstImageView source, RgbMutableImageView destination, const ImageResizeMode mode) {
+    const auto source_bytes = perceptual::validate_view(source.data, source.layout);
+    const auto destination_bytes = perceptual::validate_view(destination.data, destination.layout);
+    const auto& input = source.layout;
+    const auto& output = destination.layout;
+    if (input.format != RgbPixelFormat::RGB8 || output.format != RgbPixelFormat::PlanarUnitSrgbF32 ||
+        input.row_stride_bytes != std::size_t(input.width) * 3U || output.row_stride_bytes != std::size_t(output.width) * sizeof(float) ||
+        output.plane_stride_bytes != output.row_stride_bytes * output.height)
+        throw std::invalid_argument("compiler resize requires packed RGB8 and contiguous planar float storage");
+    const auto a = reinterpret_cast<std::uintptr_t>(source.data), b = reinterpret_cast<std::uintptr_t>(destination.data);
+    if (a < b + destination_bytes && b < a + source_bytes) throw std::invalid_argument("compiler resize input/output storage overlaps");
+    const auto geometry = compute_image_resize_geometry(input.width, input.height, output.width, output.height, mode);
+    const auto source_width = common::math::checked_cast<int>(input.width, "image width too large");
+    const auto source_height = common::math::checked_cast<int>(input.height, "image height too large");
+    const auto width = common::math::checked_cast<int>(geometry.resized_width, "image width too large");
+    const auto height = common::math::checked_cast<int>(geometry.resized_height, "image height too large");
+    const bool changed = input.width != geometry.resized_width || input.height != geometry.resized_height;
+    auto* pixels = static_cast<float*>(destination.data);
+    if (changed && impl_->perceptual_enabled && geometry.resized_width <= input.width && geometry.resized_height <= input.height) {
+        const auto offset = std::size_t(geometry.offset_y) * output.row_stride_bytes + std::size_t(geometry.offset_x) * sizeof(float);
+        auto content = destination;
+        content.data = static_cast<std::uint8_t*>(destination.data) + offset;
+        content.layout.width = geometry.resized_width;
+        content.layout.height = geometry.resized_height;
+        content.layout.capacity_bytes -= offset;
+        if (!impl_->perceptual) impl_->perceptual = std::make_unique<perceptual::CpuDownscaler>();
+        impl_->perceptual->run_quantized_planar(source, content);
+        for (unsigned plane = 0; plane < 3; ++plane)
+            clear_letterbox_padding(pixels + plane * (output.plane_stride_bytes / sizeof(float)), output.width, output.height,
+                                    geometry.resized_width, geometry.resized_height, geometry.offset_x, geometry.offset_y);
+        return geometry;
+    }
+    const auto* bytes = static_cast<const std::uint8_t*>(source.data);
+    if (changed) {
+        const auto count = common::math::checked_multiply<std::size_t>(geometry.resized_width, geometry.resized_height, "perceptual image extent overflow");
+        impl_->byte_scratch.resize(common::math::checked_multiply(count, 3U, "perceptual image extent overflow"));
+        resize(bytes, source_width, source_height, impl_->byte_scratch.data(), width, height);
+        bytes = impl_->byte_scratch.data();
+    }
+    if (geometry.resized_width == output.width && geometry.resized_height == output.height)
+        rgb_hwc_u8_to_nchw_f32(bytes, pixels, output.width, output.height);
+    else
+        letterboxed_rgb_hwc_u8_to_nchw_f32(bytes, pixels, geometry.resized_width, geometry.resized_height, output.width, output.height,
+                                          geometry.offset_x, geometry.offset_y);
+    return geometry;
 }
 void RgbImageResizer::downscale(RgbConstImageView source, RgbMutableImageView destination) {
     if (perceptual::validate_pair(source, destination)) {

@@ -99,6 +99,7 @@ void ProgressReporter::source_activity(const BenchmarkDatasetSource source, std:
     set_activity_unlocked(std::move(activity));
     emit();
 }
+bool ProgressReporter::transfer_observer_enabled() const noexcept { return static_cast<bool>(callback_); }
 bool ProgressReporter::pixel_observer_enabled() const noexcept { return callback_ || (trace_ != nullptr && static_cast<bool>(*trace_)); }
 void ProgressReporter::projected(const std::uint64_t bytes) {
     if (!callback_) { return; }

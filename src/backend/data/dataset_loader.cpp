@@ -219,8 +219,11 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
                                                                                                config.loading.numa_node, config.cpu_affinity);
     const auto& cpus = execution.placement.cpus;
     const int requested = config.gather_workers > 0 ? config.gather_workers : config.prefetch_factor;
-    const auto workers = static_cast<size_t>(clamp_worker_count_to_cpus(std::min(requested, config.prefetch_factor), cpus.size(), 1, 1));
-    state.slots.resize(static_cast<size_t>(config.prefetch_factor));
+    const auto useful_slots = std::max<std::size_t>(1U, std::min(static_cast<std::size_t>(config.prefetch_factor), state.batch_starts.size()));
+    const auto workers = static_cast<size_t>(clamp_worker_count_to_cpus(std::min(requested, static_cast<int>(useful_slots)), cpus.size(), 1, 1));
+    state.slots.resize(useful_slots);
+    // Scheduled starts increase; only the last global batch can be short.
+    const auto maximum_count = state.batch_starts.empty() ? 0U : std::min(config.batch_size, state.order.size() - state.batch_starts.front());
     state.stream = std::make_unique<CompiledImageStream>(CompiledImageStream::Config{.slots = state.slots.size(),
                                                                                      .workers = workers,
                                                                                      .device = config.device_id,
@@ -236,10 +239,10 @@ DatasetLoader::DatasetLoader(const Config& config, std::shared_ptr<mmltk::framew
     try {
         mmltk::frameworks::gpu::ensure_cuda_ok(cudaFree(nullptr), "dataset loader context initialization");
         state.stream->bind_current_context();
-        for (size_t index = 0; index < state.slots.size(); ++index) {
-            if (config.loading.h2d_dataloader) state.stream->prepare_host(index, config.batch_size * stride);
-            state.stream->prepare_device(index, config.batch_size * stride);
-            state.slots[index].reads.reserve(config.batch_size);
+        for (size_t index = 0; maximum_count != 0U && index < state.slots.size(); ++index) {
+            if (config.loading.h2d_dataloader) state.stream->prepare_host(index, maximum_count * stride);
+            state.stream->prepare_device(index, maximum_count * stride);
+            state.slots[index].reads.reserve(maximum_count);
         }
     } catch (...) {
         const auto error = std::current_exception();

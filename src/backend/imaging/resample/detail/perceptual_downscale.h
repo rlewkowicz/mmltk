@@ -13,6 +13,7 @@ class CpuDownscaler final {
    public:
     CpuDownscaler();
     void run(RgbConstImageView source, RgbMutableImageView destination);
+    void run_quantized_planar(RgbConstImageView source, RgbMutableImageView destination);
 
    private:
     friend struct CpuDownscalerTestAccess;
@@ -32,7 +33,7 @@ class CpuDownscaler final {
     PreparationStep fail_before_ = PreparationStep::None;
     void preparation_checkpoint(PreparationStep step);
     void prepare(const RgbImageLayout& source, const RgbImageLayout& destination);
-    template <RgbPixelFormat Format, bool Integer>
+    template <RgbPixelFormat Format, bool Integer, bool QuantizedPlanar = false>
     void execute(RgbConstImageView source, RgbMutableImageView destination);
     TransferTable transfer_;
     bool prepared_ = false;

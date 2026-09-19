@@ -29,15 +29,10 @@ using mmltk::common::concurrency::parallel_for_range_indexed;
 using mmltk::common::io::FileHandle;
 using mmltk::common::math::checked_cast;
 namespace {
-void hwc_uint8_to_nchw_float(const uint8_t* src, float* dst, int height, int width) {
-    mmltk::common::logging::ScopedProfile profile{"compiler.pixels.convert.avx2"};
-    mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(src, dst, checked_cast<uint32_t>(width, "image width too large"),
-                                                              checked_cast<uint32_t>(height, "image height too large"));
-}
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePixelRange& pixel_blob, uint32_t image_index, uint32_t target_width,
                         uint32_t target_height, mmltk::backend::imaging::resample::RgbImageResizer& image_resizer, size_t image_stride,
-                        std::vector<uint8_t>& resize_scratch, mmltk::backend::imaging::resample::ImageResizeMode resize_mode) {
+                        mmltk::backend::imaging::resample::ImageResizeMode resize_mode) {
     const int width = checked_cast<int>(target_width, "image width too large");
     const int height = checked_cast<int>(target_height, "image height too large");
     const std::filesystem::path img_path = image_path(split_dir, image_index);
@@ -53,43 +48,21 @@ void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePi
     if (!raw_pixels) { throw std::runtime_error("failed to load image file: " + img_path.string()); }
     const uint32_t source_width = checked_cast<uint32_t>(raw_width, "image width too large");
     const uint32_t source_height = checked_cast<uint32_t>(raw_height, "image height too large");
-    if (source_width == target_width && source_height == target_height) {
-        mmltk::common::logging::profile_add_value("compiler.pixels.convert_bytes", static_cast<size_t>(width) * height * 3U);
-        hwc_uint8_to_nchw_float(raw_pixels.get(), dst, height, width);
-        return;
+    mmltk::backend::imaging::resample::ImageResizeGeometry geometry;
+    {
+        mmltk::common::logging::ScopedProfile profile{"compiler.pixels.resize"};
+        geometry = image_resizer.resize_to_planar(
+            {raw_pixels.get(), {source_width, source_height, static_cast<size_t>(source_width) * 3U, 0U,
+                                static_cast<size_t>(source_width) * source_height * 3U, mmltk::backend::imaging::resample::RgbPixelFormat::RGB8}},
+            {dst, {target_width, target_height, static_cast<size_t>(target_width) * sizeof(float),
+                   static_cast<size_t>(target_width) * target_height * sizeof(float), image_stride,
+                   mmltk::backend::imaging::resample::RgbPixelFormat::PlanarUnitSrgbF32}}, resize_mode);
     }
-    const mmltk::backend::imaging::resample::ImageResizeGeometry letterbox =
-        mmltk::backend::imaging::resample::compute_image_resize_geometry(source_width, source_height, target_width, target_height, resize_mode);
-    const uint8_t* src_pixels = raw_pixels.get();
-    if (static_cast<uint32_t>(raw_width) != letterbox.resized_width || static_cast<uint32_t>(raw_height) != letterbox.resized_height) {
-        const size_t resized_bytes = static_cast<size_t>(letterbox.resized_width) * letterbox.resized_height * 3U;
-        if (resize_scratch.capacity() < resized_bytes) {
-            mmltk::common::logging::profile_add_value("compiler.pixels.resize_scratch_grows", 1);
-            mmltk::common::logging::profile_add_value("compiler.pixels.resize_scratch_bytes", resized_bytes);
-        }
-        {
-            mmltk::common::logging::ScopedProfile profile{"compiler.pixels.resize"};
-            resize_scratch.resize(resized_bytes);
-            image_resizer.resize(raw_pixels.get(), raw_width, raw_height, resize_scratch.data(),
-                                 checked_cast<int>(letterbox.resized_width, "letterbox width too large"),
-                                 checked_cast<int>(letterbox.resized_height, "letterbox height too large"));
-        }
+    if (source_width != geometry.resized_width || source_height != geometry.resized_height)
         mmltk::common::logging::profile_add_value("compiler.pixels.resize_count", 1);
-        src_pixels = resize_scratch.data();
-    }
-    const bool has_padding =
-        letterbox.resized_width != target_width || letterbox.resized_height != target_height || letterbox.offset_x != 0U || letterbox.offset_y != 0U;
-    if (has_padding) {
+    if (geometry.resized_width != target_width || geometry.resized_height != target_height)
         mmltk::common::logging::profile_add_value("compiler.pixels.letterbox_count", 1);
-        {
-            mmltk::common::logging::ScopedProfile profile{"compiler.pixels.convert.letterbox_avx2"};
-            mmltk::backend::imaging::resample::letterboxed_rgb_hwc_u8_to_nchw_f32(src_pixels, dst, letterbox.resized_width, letterbox.resized_height,
-                                                                                  target_width, target_height, letterbox.offset_x, letterbox.offset_y);
-        }
-    } else {
-        hwc_uint8_to_nchw_float(src_pixels, dst, height, width);
-    }
-    mmltk::common::logging::profile_add_value("compiler.pixels.convert_bytes", static_cast<size_t>(width) * height * 3);
+    mmltk::common::logging::profile_add_value("compiler.pixels.convert_bytes", static_cast<size_t>(width) * height * 3U);
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
@@ -99,14 +72,13 @@ void decode_pixel_worker(const std::filesystem::path& split_dir, const WritableP
                          std::atomic<bool>* failure_requested, mmltk::backend::imaging::resample::ImageResizeMode resize_mode) {
     mmltk::common::logging::ScopedProfile profile{"compiler.pixels.decode_worker"};
     mmltk::backend::imaging::resample::RgbImageResizer image_resizer(resize_threads_per_image, perceptual_downscale);
-    std::vector<uint8_t> resize_scratch;
     ProgressBatch progress(completed_images);
     while (true) {
         if ((cancel_requested.requested()) || (failure_requested != nullptr && failure_requested->load(std::memory_order_relaxed))) { break; }
         const uint32_t image_index = next_image.fetch_add(1, std::memory_order_relaxed);
         if (image_index >= num_images) { break; }
         try {
-            decode_pixel_image(split_dir, pixel_blob, image_index, target_width, target_height, image_resizer, image_stride, resize_scratch, resize_mode);
+            decode_pixel_image(split_dir, pixel_blob, image_index, target_width, target_height, image_resizer, image_stride, resize_mode);
             progress.increment();
         } catch (...) {
             if (failure_requested != nullptr) { failure_requested->store(true, std::memory_order_relaxed); }

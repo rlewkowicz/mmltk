@@ -52,6 +52,10 @@ class RgbImageResizer {
     RgbImageResizer(RgbImageResizer&&) noexcept;
     RgbImageResizer& operator=(RgbImageResizer&&) noexcept;
     void resize(const uint8_t* src, int src_width, int src_height, uint8_t* dst, int dst_width, int dst_height);
+    // Compiler projection: tightly packed RGB8 to a tightly packed planar
+    // canvas. Perceptual output retains RGB8 quantization before conversion.
+    // Admission and fallible preparation finish before any canvas write.
+    ImageResizeGeometry resize_to_planar(RgbConstImageView source, RgbMutableImageView destination, ImageResizeMode mode);
     // Explicit checked perceptual operation. Same format on both sides; no
     // enlargement. Identity copies exactly (an exact alias is a no-op); all
     // other overlapping spans are rejected. Nonfinite/out-of-unit float input

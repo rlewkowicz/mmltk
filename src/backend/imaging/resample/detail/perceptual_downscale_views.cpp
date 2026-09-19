@@ -33,12 +33,13 @@ std::size_t validate_view(const void* pointer, const RgbImageLayout& l) {
         throw std::overflow_error("perceptual image address overflow");
     return extent;
 }
-ValidatedResize validate_pair(RgbConstImageView source, RgbMutableImageView destination) {
+ValidatedResize validate_pair(RgbConstImageView source, RgbMutableImageView destination, const bool quantized_planar) {
     const auto source_bytes = validate_view(source.data, source.layout), destination_bytes = validate_view(destination.data, destination.layout);
-    if (source.layout.format != destination.layout.format) throw std::invalid_argument("perceptual image formats must match");
+    if (quantized_planar ? (source.layout.format != RgbPixelFormat::RGB8 || destination.layout.format != RgbPixelFormat::PlanarUnitSrgbF32)
+                         : source.layout.format != destination.layout.format) throw std::invalid_argument("perceptual image formats must match");
     if (source.layout.width < destination.layout.width || source.layout.height < destination.layout.height)
         throw std::invalid_argument("perceptual resampling cannot enlarge images");
-    const bool identity = source.layout.width == destination.layout.width && source.layout.height == destination.layout.height;
+    const bool identity = !quantized_planar && source.layout.width == destination.layout.width && source.layout.height == destination.layout.height;
     const auto a = reinterpret_cast<std::uintptr_t>(source.data), b = reinterpret_cast<std::uintptr_t>(destination.data);
     if (a < b + destination_bytes && b < a + source_bytes &&
         !(identity && a == b && source.layout.row_stride_bytes == destination.layout.row_stride_bytes &&
