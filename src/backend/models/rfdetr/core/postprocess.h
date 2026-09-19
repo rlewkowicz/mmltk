@@ -16,22 +16,22 @@
 #include <torch/types.h>
 namespace mmltk::backend::models::rfdetr {}
 namespace mmltk::backend::models::rfdetr {
+// Coordinate clipping is independent of corner ordering. Bounds are image content in canvas pixels.
+void clip_prediction_boxes_(const torch::Tensor& boxes, double left, double top, double right, double bottom);
 class ClassPostprocessLane final {
    public:
     explicit ClassPostprocessLane(std::shared_ptr<const ResolvedClassLayout> layout) : layout_(std::move(layout)) { layout_->require_execution(); }
     void Prepare(const torch::Device& device);
-    // Borrowed scratch: consume on the prepared stream before the next Gather.
-    // Postprocessed final scores/labels/boxes never alias this workspace.
-    [[nodiscard]] torch::Tensor Gather(const torch::Tensor& logits);
-    [[nodiscard]] torch::Tensor References(const torch::Tensor& eligible_indices) const;
+    [[nodiscard]] torch::Tensor ValidateLogits(const torch::Tensor& logits) const;
+    [[nodiscard]] torch::Tensor References(const torch::Tensor& physical_indices) const;
     [[nodiscard]] std::size_t eligible_count() const noexcept { return layout_->eligible_slots().size(); }
 
    private:
     std::shared_ptr<const ResolvedClassLayout> layout_;
-    torch::Tensor slots_, references_, gather_;
+    torch::Tensor references_;
     cudaStream_t prepared_stream_ = nullptr;
-    bool prefix_identity_ = false;
 };
+// Fixed-capacity products contain a compact valid prefix described by device counts.
 // Top-k products retain their originating query until the consumer selects survivors.
 // Mask logits remain at model resolution; selection never expands them.
 struct PostprocessedSelection {
@@ -40,6 +40,7 @@ struct PostprocessedSelection {
     torch::Tensor boxes{};
     torch::Tensor query_indices{};
     std::optional<torch::Tensor> mask_logits{};
+    torch::Tensor counts{};
 };
 PostprocessedSelection select_output_batch_fixed_size(const OutputTensors&, int64_t height, int64_t width, int64_t count, bool require_masks = false,
                                                       ClassPostprocessLane* classes = nullptr);
@@ -83,16 +84,9 @@ struct PostprocessedBatch {
     torch::Tensor labels;
     torch::Tensor boxes;
     std::optional<torch::Tensor> masks;
+    torch::Tensor counts{};
     [[nodiscard]] int64_t size() const { return scores.defined() ? scores.size(0) : 0; }
 };
-std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const torch::Tensor& target_sizes, int64_t num_select,
-                                           ClassPostprocessLane* classes = nullptr);
-std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs, const torch::Tensor& target_sizes, int64_t num_select,
-                                           ClassPostprocessLane* classes = nullptr);
-std::vector<TensorMap> postprocess_outputs_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select,
-                                                      ClassPostprocessLane* classes = nullptr);
 PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select,
                                                        ClassPostprocessLane* classes = nullptr);
-PostprocessedBatch postprocessed_batch_from_result(const TensorMap& result);
-std::vector<TensorMap> split_postprocessed_batch(const PostprocessedBatch& batch);
 }  // namespace mmltk::backend::models::rfdetr

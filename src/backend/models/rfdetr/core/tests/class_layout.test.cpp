@@ -1,3 +1,6 @@
+#include <array>
+#include "src/backend/models/rfdetr/contract/model_config.h"
+#include "src/backend/models/rfdetr/contract/preset_catalog.h"
 #include <catch2/catch_test_macros.hpp>
 #include "src/backend/models/rfdetr/core/class_layout.h"
 #include "src/backend/models/rfdetr/core/model_info.h"
@@ -77,4 +80,14 @@ TEST_CASE("Output names distinguish four-wide logits from boxes", "[rfdetr][layo
     CHECK_NOTHROW(r::validate_rfdetr_output_layout(info));
     info.outputs[0].shape[1] = 299;
     CHECK_THROWS(r::validate_rfdetr_output_layout(info));
+}
+
+TEST_CASE("Admitted preset candidate defaults agree across detection and segmentation", "[model][rfdetr][layout]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    const std::array expected{300, 300, 300, 300, 100, 100, 200, 200, 300, 300};
+    REQUIRE(r::kPresetCatalog.size() == expected.size());
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        CHECK(r::kPresetCatalog[index].selected_query_count == expected[index]);
+        CHECK(r::native_config_from_preset(r::kPresetCatalog[index]).num_select == expected[index]);
+    }
 }

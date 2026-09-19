@@ -487,7 +487,7 @@ constexpr auto validation_fields = [](auto& state, const auto& visit) {
     visit("resolution", state.resolution);
     visit("limit_images", state.limit_images);
     visit("alignment_images", state.alignment_images);
-    visit("num_queries", state.num_queries);
+    visit("candidate_count", state.candidate_count);
     visit("eval_max_dets", state.eval_max_dets);
     visit("batch_size", state.batch_size);
     visit("prefetch_factor", state.prefetch_factor);

@@ -602,7 +602,7 @@ void test_ui_settings_round_trip() {
     validate.request.onnx_path = "/tmp/models/validate.onnx";
     validate.request.tensorrt_path = "/tmp/models/validate.engine";
     validate.request.save_engine_path = "/tmp/models/save.engine";
-    validate.request.num_queries = 211;
+    validate.request.candidate_count = 211;
     validate.request.eval_max_dets = 213;
     validate.request.profile = true;
     predict.source.kind = SourceKind::SingleImage;
@@ -720,7 +720,7 @@ void test_ui_settings_round_trip() {
     REQUIRE((saved.at("workflows").at("train").at("training").at("recipe_overrides").at("lr") == true));
     REQUIRE((saved.at("workflows").at("train").at("training").at("lr_scheduler") == "cosine"));
     REQUIRE((saved.at("workflows").at("validate").at("dataset_paths").at("compiled_path") == "/tmp/validate.bin"));
-    REQUIRE((saved.at("workflows").at("validate").at("validation").at("num_queries") == 211));
+    REQUIRE((saved.at("workflows").at("validate").at("validation").at("candidate_count") == 211));
     REQUIRE((saved.at("workflows").at("validate").at("validation").at("eval_max_dets") == 213));
     REQUIRE((saved.at("workflows").at("predict").at("predict").at("output_path") == "/tmp/predictions.json"));
     REQUIRE((saved.at("workflows").at("annotate").at("annotate").at("output_dir") == "/tmp/annotated-scenes"));
@@ -805,7 +805,7 @@ void test_ui_settings_round_trip() {
     REQUIRE((loaded.workflows.train.request.lr_scheduler == mmltk::backend::models::rfdetr::TrainLrSchedulerKind::Step));
     REQUIRE((loaded_validate.request.compiled_path == "/tmp/validate.bin"));
     REQUIRE((loaded_validate.request.save_engine_path == "/tmp/models/save.engine"));
-    REQUIRE((loaded_validate.request.num_queries == 211));
+    REQUIRE((loaded_validate.request.candidate_count == 211));
     REQUIRE((loaded_validate.request.eval_max_dets == 213));
     REQUIRE((loaded_predict.source.kind == SourceKind::SingleImage));
     REQUIRE((loaded_predict.source.single_image_path == "/tmp/input.png"));
@@ -875,7 +875,7 @@ void test_fresh_defaults_use_capture_only_annotate() {
     REQUIRE((train.request.num_queries == 0));
     REQUIRE((train.request.eval_max_dets == 0));
     REQUIRE((validate.model_input == ModelArtifactInputKind::Weights));
-    REQUIRE((validate.request.num_queries == 0));
+    REQUIRE((validate.request.candidate_count == 0));
     REQUIRE((validate.request.eval_max_dets == 0));
     REQUIRE((predict.model_input == ModelArtifactInputKind::Weights));
     REQUIRE((predict.request.weights_path.empty()));

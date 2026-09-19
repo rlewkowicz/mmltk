@@ -38,6 +38,8 @@ void test_validate_help_lists_recompile_compile_options() {
     });
     REQUIRE((result.exit_code == 0));
     REQUIRE((result.output_text.find("--recompile") != std::string::npos));
+    CHECK(result.output_text.find("--candidate-count") != std::string::npos);
+    CHECK(result.output_text.find("--num-queries") == std::string::npos);
     REQUIRE((result.output_text.find("--compile-workers") != std::string::npos));
     REQUIRE((result.output_text.find("--compile-cuda-mask-batch-size") != std::string::npos));
     REQUIRE((result.output_text.find("--compile-cuda-device-id") != std::string::npos));

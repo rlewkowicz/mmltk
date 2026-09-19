@@ -102,7 +102,7 @@ void accumulate_prediction_transfer_bytes(EvaluationProfileRecord& profile, cons
         const size_t pixels_per_mask = static_cast<size_t>(processed.masks->size(2)) * static_cast<size_t>(processed.masks->size(3));
         mask_bytes = prediction_count * ((pixels_per_mask + 7U) / 8U);
     }
-    profile.transferred_bytes += bbox_bytes + mask_bytes;
+    profile.transferred_bytes += bbox_bytes + mask_bytes + (processed.counts.defined() ? image_count * sizeof(std::int64_t) : 0U);
     profile.mask_transferred_bytes += mask_bytes;
 }
 const char* evaluation_precision_name(const at::ScalarType scalar_type) noexcept {
@@ -177,14 +177,14 @@ struct SelectedPredictions {
     std::vector<int64_t> mask_source_indices;
 };
 SelectedPredictions select_predictions(int image_id, const torch::Tensor& scores, const torch::Tensor& labels, const torch::Tensor& boxes,
-                                       size_t category_count, size_t max_dets_per_image) {
+                                       size_t category_count) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_eval_select_predictions{"rfdetr.native.eval.select_predictions"};
     const auto* score_ptr = scores.data_ptr<float>();
     const auto* label_ptr = labels.data_ptr<int64_t>();
     const auto* box_ptr = boxes.data_ptr<float>();
     const int64_t total = scores.size(0);
     SelectedPredictions out;
-    out.predictions.reserve(std::min<size_t>(static_cast<size_t>(total), max_dets_per_image));
+    out.predictions.reserve(static_cast<size_t>(total));
     out.mask_source_indices.reserve(out.predictions.capacity());
     for (int64_t index = 0; index < total; ++index) {
         const int64_t label = label_ptr[index];
@@ -193,10 +193,9 @@ SelectedPredictions select_predictions(int image_id, const torch::Tensor& scores
         prediction.image_id = image_id;
         prediction.class_reference = static_cast<int>(label);
         prediction.score = score_ptr[index];
-        prediction.bbox_xyxy = xyxy_clamped(box_ptr + index * 4);
+        prediction.bbox_xyxy = ordered_xyxy(box_ptr + index * 4);
         out.predictions.push_back(std::move(prediction));
         out.mask_source_indices.push_back(index);
-        if (out.predictions.size() >= max_dets_per_image) { break; }
     }
     return out;
 }
@@ -269,6 +268,7 @@ void PinnedBBoxPredictionBuffers::ensure_capacity(int64_t batch_count, int64_t p
     scores_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity}, torch::kFloat32);
     labels_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity}, torch::kInt64);
     boxes_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity, prediction_capacity, 4}, torch::kFloat32);
+    counts_cpu = mmltk::backend::ml::cuda::numa_empty({batch_capacity}, torch::kInt64);
 }
 void PinnedMaskPredictionBuffers::ensure_capacity(const int64_t batch_count, const int64_t prediction_count, const int64_t batch_capacity,
                                                   const int64_t prediction_capacity, const uint32_t height, const uint32_t width, const int device_id) {
@@ -332,6 +332,7 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
     const auto score_view = buffers.bbox.scores_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
     const auto label_view = buffers.bbox.labels_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
     const auto box_view = buffers.bbox.boxes_cpu.narrow(0, 0, batch_count).narrow(1, 0, prediction_count);
+    const auto count_view = buffers.bbox.counts_cpu.narrow(0, 0, batch_count);
     if (score_view.stride(1) != 1 || label_view.stride(1) != 1 || box_view.stride(1) != 4 || box_view.stride(2) != 1) {
         throw std::logic_error("pinned prediction bbox buffers have unexpected strides");
     }
@@ -347,6 +348,8 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
             score_view.copy_(batch.scores.narrow(0, 0, batch_count), true);
             label_view.copy_(batch.labels.narrow(0, 0, batch_count), true);
             box_view.copy_(batch.boxes.narrow(0, 0, batch_count), true);
+            if (batch.counts.defined()) count_view.copy_(batch.counts.narrow(0, 0, batch_count), true);
+            else count_view.fill_(prediction_count);
         }
         if (batch.masks.has_value()) {
             const torch::Tensor& source_masks = *batch.masks;
@@ -385,7 +388,7 @@ StagedPredictionBatch stage_prediction_batch(PostprocessedBatch batch, size_t ca
     }
     return StagedPredictionBatch{
         std::move(images),
-        StagedBBoxPredictionBatch{score_view, label_view, box_view},
+        StagedBBoxPredictionBatch{score_view, label_view, box_view, count_view},
         std::move(staged_mask),
         std::move(batch),
         category_count,
@@ -421,6 +424,8 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
         throw std::out_of_range("staged prediction image index exceeds the active image count");
     }
     synchronize_staged_prediction_batch(staged, profile);
+    const auto count = staged.bbox.counts_cpu[image_index].item<int64_t>();
+    if (count < 0 || count > staged.bbox.scores_cpu.size(1)) throw std::runtime_error("invalid settled prediction count");
     PredictionBatchItem result;
     result.dataset_index = staged.images[image_index].dataset_index;
     result.image_id = staged.images[image_index].image_id;
@@ -432,7 +437,7 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
             staged.bbox.scores_cpu.data_ptr<float>() + image_offset * staged.bbox.scores_cpu.stride(0),
             staged.bbox.labels_cpu.data_ptr<std::int64_t>() + image_offset * staged.bbox.labels_cpu.stride(0),
             staged.bbox.boxes_cpu.data_ptr<float>() + image_offset * staged.bbox.boxes_cpu.stride(0),
-            static_cast<size_t>(staged.bbox.scores_cpu.size(1)),
+            static_cast<size_t>(count),
             staged.bbox.scores_cpu.stride(1),
             staged.bbox.labels_cpu.stride(1),
             staged.bbox.boxes_cpu.stride(1),
@@ -464,9 +469,9 @@ PredictionBatchItem encode_staged_prediction_image(StagedPredictionBatch& staged
     const int64_t mask_prediction_stride = has_masks ? staged.mask->masks_cpu.stride(1) : 0;
     const auto started = profile != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SelectedPredictions selected =
-        select_predictions(static_cast<int>(staged.images[image_index].image_id), staged.bbox.scores_cpu.select(0, static_cast<int64_t>(image_index)),
-                           staged.bbox.labels_cpu.select(0, static_cast<int64_t>(image_index)),
-                           staged.bbox.boxes_cpu.select(0, static_cast<int64_t>(image_index)), staged.category_count, staged.max_dets_per_image);
+        select_predictions(static_cast<int>(staged.images[image_index].image_id), staged.bbox.scores_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
+                           staged.bbox.labels_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count),
+                           staged.bbox.boxes_cpu.select(0, static_cast<int64_t>(image_index)).narrow(0, 0, count), staged.category_count);
     if (has_masks) {
         for (size_t prediction_index = 0; prediction_index < selected.predictions.size(); ++prediction_index) {
             const int64_t source_index = selected.mask_source_indices[prediction_index];

@@ -3,6 +3,7 @@ module;
 #include "src/backend/models/rfdetr/core/class_artifact.h"
 #include "src/backend/models/rfdetr/core/detail/class_artifact_files.h"
 #include "prediction_capacity.h"
+#include "prediction_count.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -235,6 +236,7 @@ ResolvedModelArtifacts describe_inference_artifact(const ModelArtifactRequest& r
 struct OutputStorage final {
     std::vector<torch::Tensor> tensors;
     std::vector<runtime::RuntimeTensorBuffer> buffers;
+    std::vector<std::shared_ptr<PredictionCountStorage>> counts;
 };
 struct RfdetrRuntimeBackend::State final {
     std::shared_ptr<const ResolvedClassLayout> layout;
@@ -319,6 +321,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
     const std::int64_t batch = input.shape.extents[0];
     const auto output_storage = state_->outputs;
     if (!selections.empty()) state_->selections.resize(selections.size());
+    output_storage->counts.resize(annotations.size());
     for (auto& annotation : annotations) {
         const auto& logits = lane_->model_info().outputs[state_->logits];
         const auto capacity =
@@ -337,6 +340,9 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
             validate_annotation_buffer(annotation.confidences, runtime::AnalysisElementType::Float32, capacity * sizeof(float), 1U,
                                        static_cast<std::uint32_t>(capacity), 0U, "confidence");
         annotation.value_count = 0U;
+        annotation.device_value_count = nullptr;
+        annotation.completed_value_count = nullptr;
+        annotation.count_custody.reset();
         annotation.masks_available = false;
         annotation.class_domain = state_->layout->domain();
         annotation.class_catalog = state_->layout->catalog();
@@ -400,7 +406,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                     for (std::size_t index = 0U; index < bound_call.annotations.size(); ++index) {
                         auto& annotation = bound_call.annotations[index];
                         const auto limit = std::min({bound_owner.maximum_detections_, annotation.value_capacity,
-                                                     static_cast<std::size_t>(logits.size(1) * bound_owner.state_->layout->eligible_slots().size())});
+                                                     static_cast<std::size_t>(logits.size(1) * logits.size(2))});
                         if (limit == 0) {
                             if (!bound_call.selections.empty()) bound_call.selections[index] = {};
                             continue;
@@ -416,6 +422,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                                         : std::nullopt,
                             },
                             region.height, region.width, static_cast<std::int64_t>(limit), bound_call.include_masks, bound_owner.state_->classes.get());
+                        publish_prediction_count(bound_call.outputs->counts[index], selected.counts, annotation, bound_device);
                         PostprocessedBatch processed{selected.scores, selected.labels, selected.boxes, std::nullopt};
                         if (!bound_call.selections.empty()) {
                             auto& custody = bound_owner.state_->selections[index];
@@ -425,7 +432,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                             destination = {.query_indices = {.device_data = selected.query_indices.data_ptr(),
                                                              .capacity_bytes = static_cast<std::size_t>(selected.query_indices.numel() *
                                                                                                         selected.query_indices.element_size()),
-                                                             .shape = {.rank = 2U, .extents = {1, static_cast<std::int64_t>(limit)}},
+                                                             .shape = {.rank = 2U, .extents = {1, selected.query_indices.size(1)}},
                                                              .element_type = runtime::RuntimeElementType::Int64},
                                            .custody = custody};
                             if (selected.mask_logits) {
@@ -471,10 +478,6 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
                                                         reinterpret_cast<cudaStream_t>(bound_stream));
                         }
                     }
-                    for (auto& annotation : bound_call.annotations) {
-                        annotation.value_count = std::min({bound_owner.maximum_detections_, annotation.value_capacity,
-                                                           static_cast<std::size_t>(logits.size(1) * bound_owner.state_->layout->eligible_slots().size())});
-                    }
                 });
             },
     };
@@ -482,7 +485,12 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
         std::shared_ptr<void> retained_storage = output_storage;
         return lane_->Run(input, output_storage->buffers, binding, continuation, std::move(retained_storage));
     } catch (...) {
-        for (auto& annotation : annotations) { annotation.value_count = 0U; }
+        for (auto& annotation : annotations) {
+            annotation.value_count = 0U;
+            annotation.device_value_count = nullptr;
+            annotation.completed_value_count = nullptr;
+            annotation.count_custody.reset();
+        }
         throw;
     }
 }

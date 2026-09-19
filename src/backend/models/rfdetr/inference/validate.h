@@ -33,10 +33,9 @@ struct ValidationDeltaSummary {
 };
 struct ValidationLimitResolution {
     std::uint32_t persisted_max_instances_per_image = 0;
-    std::size_t resolved_num_queries = 0;
-    std::size_t automatic_num_queries_cap = 0;
+    std::size_t resolved_candidate_count = 0;
     std::size_t resolved_eval_max_dets = 0;
-    bool num_queries_automatic = false;
+    bool candidate_count_automatic = false;
     bool eval_max_dets_automatic = false;
 };
 struct ValidationSampleView final {

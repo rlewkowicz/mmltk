@@ -74,7 +74,8 @@ void encode_mask_values_into(const uint32_t height, const uint32_t width, Encode
 }
 void encode_mask_from_packed_data_into(const std::uint8_t* data, std::uint32_t height, std::uint32_t width, EncodedMask& mask);
 EncodedMask encode_mask_from_packed_data(const std::uint8_t* data, std::uint32_t height, std::uint32_t width);
-inline std::array<float, 4> xyxy_clamped(const float* box_values) {
+// Ordering does not clip. Producers clip predictions to their image-content bounds.
+inline std::array<float, 4> ordered_xyxy(const float* box_values) {
     const float x1 = box_values[0];
     const float y1 = box_values[1];
     const float x2 = box_values[2];

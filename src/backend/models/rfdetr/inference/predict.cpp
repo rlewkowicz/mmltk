@@ -46,8 +46,9 @@ module;
 #include "src/backend/models/rfdetr/core/model_info.h"
 #include "src/backend/models/rfdetr/core/model_state.h"
 #include "stb_image.h"
-#include "inference_preprocessor.h"
+#include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
 #include "prediction_capacity.h"
+#include "prediction_count.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
 #include "prediction_raw_preparation.h"
 #include "src/backend/media/video/video_file_source.h"
@@ -155,13 +156,14 @@ class PredictionBackend final {
     PredictionBackend(const PredictRequest& options, ResolvedInferenceArtifact artifact, const runtime::BorrowedCommandStream command_stream,
                       std::stop_token stop)
         : artifact_(std::move(artifact)), maximum_detections_(options.max_dets_per_image), device_(options.device_id), command_stream_(command_stream) {
-        validate_prediction_candidates(maximum_detections_);
+        if (maximum_detections_ != 0) validate_prediction_candidates(maximum_detections_);
         switch (artifact_.kind) {
             case InferenceArtifactKind::Weights: {
                 auto resolved =
                     resolve_model_state(artifact_.path, options.preset_name, options.resolution, options.class_layout_path, artifact_.admission, stop);
                 artifact_.admission = resolved.model_state.class_artifact;
                 artifacts_ = std::move(resolved.artifacts);
+                if (maximum_detections_ == 0) maximum_detections_ = artifacts_.config.num_select;
                 static_cast<void>(PredictionCapacity::Resolve(maximum_detections_, 1U, artifacts_.config.num_queries, artifacts_.config.num_classes,
                                                               artifacts_.config.resolution, artifacts_.config.resolution, false));
                 native_ = std::make_unique<NativeRfDetrModel>(artifacts_.config, artifacts_.class_layout);
@@ -185,13 +187,15 @@ class PredictionBackend final {
             case InferenceArtifactKind::TensorRt: break;
             default: throw std::invalid_argument("invalid RF-DETR inference artifact kind");
         }
+        artifacts_ = describe_inference_artifact(options, artifact_, options.resolution);
+        if (maximum_detections_ == 0) maximum_detections_ = artifacts_.config.num_select;
         runtime_ = make_rfdetr_runtime_backend({
             .artifacts = options,
             .backend = artifact_.backend_name,
             .device = options.device_id,
             .command_stream = command_stream,
             .static_resolution = options.resolution > 0 ? static_cast<std::uint32_t>(options.resolution) : 0U,
-            .maximum_detections = options.max_dets_per_image,
+            .maximum_detections = maximum_detections_,
             .save_compiled_model_path = {},
             .allow_fp16 = options.allow_fp16,
             .admission = artifact_.admission,
@@ -199,16 +203,14 @@ class PredictionBackend final {
         });
         artifact_.admission = runtime_->class_artifact();
         resolution_ = runtime_->static_resolution();
-        artifacts_ = describe_inference_artifact(options, artifact_, resolution_);
+        artifacts_.config.resolution = static_cast<int>(resolution_);
         artifacts_.class_layout = runtime_->class_layout()->record();
         artifacts_.artifact_sha256 = runtime_->artifact_sha256();
         const auto& shape = runtime_->logits_shape();
-        const auto capacity = PredictionCapacity::Resolve(maximum_detections_, 1U, shape.extents[1], shape.extents[2], resolution_, resolution_, false);
+        static_cast<void>(PredictionCapacity::Resolve(maximum_detections_, 1U, shape.extents[1], shape.extents[2], resolution_, resolution_, false));
         artifacts_.config.num_queries = static_cast<int>(shape.extents[1]);
-        artifacts_.config.num_select = static_cast<int>(capacity.candidates);
         artifacts_.config.num_classes = static_cast<int>(shape.extents[2]);
         artifacts_.source_num_queries = artifacts_.config.num_queries;
-        artifacts_.source_num_select = artifacts_.config.num_select;
     }
     ~PredictionBackend() { static_cast<void>(Close()); }
     [[nodiscard]] const std::shared_ptr<const ClassArtifactAdmission>& class_artifact() const noexcept { return artifact_.admission; }
@@ -224,6 +226,7 @@ class PredictionBackend final {
                                            class_layout()->eligible_slots().size())
             .candidates;
     }
+    [[nodiscard]] std::size_t candidate_count() const noexcept { return maximum_detections_; }
     [[nodiscard]] const ResolvedModelArtifacts& artifacts() const noexcept { return artifacts_; }
     [[nodiscard]] const std::shared_ptr<const ResolvedClassLayout>& class_layout() const noexcept {
         return native_ ? native_->class_layout() : runtime_->class_layout();
@@ -234,7 +237,7 @@ class PredictionBackend final {
             runtime_->ReleaseAfterCompletion(std::move(submission));
             for (std::size_t index = 0; index < annotations.runtime_selections.size(); ++index) {
                 const auto& selected = annotations.runtime_selections[index];
-                if (annotations.storage[index].value_count == 0) {
+                if (selected.query_indices.device_data == nullptr) {
                     annotations.selections[index] = {};
                     continue;
                 }
@@ -286,10 +289,11 @@ class PredictionBackend final {
         auto mask = torch::zeros({input.size(0), input.size(2), input.size(3)}, input.options().dtype(torch::kBool));
         const ModelOutputs outputs = (*native_).forward(NestedTensor{input, std::move(mask)}, annotations.want_masks);
         assert_inference_output_dtype(outputs.main.pred_logits, outputs.main.pred_boxes, native_input_type_, "native RF-DETR inference");
+        count_storage_.resize(annotations.storage.size());
         for (std::size_t index = 0U; index < annotations.storage.size(); ++index) {
             auto& storage = annotations.storage[index];
             const auto count = std::min({maximum_detections_, storage.value_capacity,
-                                         static_cast<std::size_t>(outputs.main.pred_logits.size(1) * class_postprocess_->eligible_count())});
+                                         static_cast<std::size_t>(outputs.main.pred_logits.size(1) * outputs.main.pred_logits.size(2))});
             storage.class_catalog = native_->class_layout()->catalog();
             storage.class_domain = native_->class_layout()->domain();
             storage.masks_available = false;
@@ -307,12 +311,12 @@ class PredictionBackend final {
                                       : std::nullopt,
                 },
                 storage.source_region.height, storage.source_region.width, static_cast<std::int64_t>(count), annotations.want_masks, class_postprocess_.get());
-            const auto active = static_cast<std::int64_t>(count);
+            const auto active = processed.scores.size(1);
             annotations.boxes[index].narrow(0, 0, active).copy_(processed.boxes[0].to(at::kFloat));
             annotations.labels[index].narrow(0, 0, active).copy_(processed.labels[0].to(at::kInt));
             annotations.scores[index].narrow(0, 0, active).copy_(processed.scores[0].to(at::kFloat));
             annotations.selections[index] = processed;
-            storage.value_count = count;
+            publish_prediction_count(count_storage_[index], processed.counts, storage, device_);
             storage.class_catalog = native_->class_layout()->catalog();
             storage.class_domain = native_->class_layout()->domain();
         }
@@ -322,6 +326,7 @@ class PredictionBackend final {
     std::shared_ptr<RfdetrRuntimeBackend> runtime_;
     std::unique_ptr<NativeRfDetrModel> native_;
     std::unique_ptr<ClassPostprocessLane> class_postprocess_;
+    std::vector<std::shared_ptr<PredictionCountStorage>> count_storage_;
     std::size_t maximum_detections_ = 0U;
     std::uint32_t resolution_ = 0U;
     int device_ = 0;
@@ -381,7 +386,7 @@ void prepare_annotations(AnnotationBatch& result, std::size_t batch, std::size_t
 }
 struct PredictionReadback final {
     explicit PredictionReadback(int device) : boxes(device), labels(device), scores(device), masks(device), indices(device) {}
-    void Read(const AnnotationBatch& batch) {
+    void Read(AnnotationBatch& batch) {
         box_values = boxes.view(batch.boxes.sizes(), at::kFloat);
         label_values = labels.view(batch.labels.sizes(), at::kInt);
         score_values = scores.view(batch.scores.sizes(), at::kFloat);
@@ -391,6 +396,7 @@ struct PredictionReadback final {
         const auto stream = c10::cuda::getCurrentCUDAStream(batch.boxes.get_device());
         const auto status = cudaStreamSynchronize(stream.stream());
         if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction readback completion"};
+        for (auto& annotation : batch.storage) annotation.SettleValueCount();
         index_values = indices.view(batch.labels.sizes(), at::kLong);
     }
     mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks, indices;
@@ -400,7 +406,8 @@ struct PredictionReadback final {
 };
 void execute_prediction_batch(const PredictRequest& options, PredictionBackend& backend, const torch::Tensor& input, std::size_t batch_size,
                               std::uint32_t width, std::uint32_t height, const PredictionDelivery& delivery, AnnotationBatch& annotations,
-                              PredictionReadback& readback, std::span<const std::uint32_t> indices = {}, std::int64_t first_index = 0) {
+                              PredictionReadback& readback, std::span<const std::uint32_t> indices = {}, std::int64_t first_index = 0,
+                              const mmltk::backend::data::DatasetLoader* compiled = nullptr) {
     annotations.demand.resize(batch_size);
     bool masks = false, pixels = false;
     for (std::size_t image = 0; image < batch_size; ++image) {
@@ -415,6 +422,13 @@ void execute_prediction_batch(const PredictRequest& options, PredictionBackend& 
     }
     prepare_annotations(annotations, batch_size, backend.capacity(batch_size, width, height, masks), width, height, options.device_id, masks, pixels);
     backend.Execute(input, annotations);
+    if (compiled) {
+        for (std::size_t image = 0; image < batch_size; ++image) {
+            const auto geometry = compiled->geometry(indices[image]);
+            clip_prediction_boxes_(annotations.boxes[image], geometry.offset_x, geometry.offset_y,
+                geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);
+        }
+    }
     if (annotations.storage.front().value_capacity != 0U) readback.Read(annotations);
 }
 struct PredictionSourceStorage final {
@@ -511,6 +525,9 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         annotation = scalar_layout;
         annotation.masks = {};
         annotation.value_count = result.size();
+        annotation.device_value_count = nullptr;
+        annotation.completed_value_count = nullptr;
+        annotation.count_custody.reset();
         // Reused compact buffers pair the callback metadata with precisely these survivors.
         const auto compact = [&](torch::Tensor& destination, const torch::Tensor& candidates) {
             if (!destination.defined()) destination = torch::empty({0}, candidates.options());
@@ -645,9 +662,7 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
     const auto resolution = static_cast<int>(backend.resolution());
     auto host = mmltk::backend::ml::cuda::numa_empty({1, 3, resolution, resolution}, at::kFloat, options.device_id);
     auto device = torch::empty(host.sizes(), torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, static_cast<c10::DeviceIndex>(options.device_id)));
-    const auto mean = torch::tensor({0.485F, 0.456F, 0.406F}, device.options()).view({1, 3, 1, 1});
-    const auto deviation = torch::tensor({0.229F, 0.224F, 0.225F}, device.options()).view({1, 3, 1, 1});
-    auto converted = backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(host.sizes(), device.options().dtype(backend.input_type()));
+    GpuBatchPreprocessor preprocessor(1, resolution, resolution, options.device_id, backend.input_type());
     mmltk::backend::imaging::resample::RgbImageResizer resizer(1);
     std::vector<std::uint8_t> resized(static_cast<std::size_t>(resolution) * resolution * 3U);
     const auto started = std::chrono::steady_clock::now();
@@ -670,11 +685,10 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
         }
         mmltk::backend::imaging::resample::rgb_hwc_u8_to_nchw_f32(input_pixels, host.data_ptr<float>(), resolution, resolution);
         device.copy_(host, true);
-        device.sub_(mean).div_(deviation);
-        if (converted.defined()) converted.copy_(device);
-        const auto& normalized = converted.defined() ? converted : device;
+        const auto normalized = preprocessor.run({.num_images = 1U, .device_images = device.data_ptr<float>()});
         execute_prediction_batch(options, backend, normalized, 1U, static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height), delivery, annotations,
                                  readback, {}, static_cast<std::int64_t>(result.processed_images));
+        preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
         PredictionRecord record;
         record.dataset_index = static_cast<std::int64_t>(index);
         record.image_id = source.image_id != 0 ? source.image_id : static_cast<std::int64_t>(index + 1U);
@@ -701,11 +715,9 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
                                                                                   delivery.stop, source_retirement);
     if (delivery.begin) delivery.begin(result);
     const auto cuda = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, options.device_id);
-    const auto mean = torch::tensor({0.485F, 0.456F, 0.406F}, cuda).view({1, 3, 1, 1});
-    const auto deviation = torch::tensor({0.229F, 0.224F, 0.225F}, cuda).view({1, 3, 1, 1});
     const auto resolution = static_cast<std::int64_t>(backend.resolution());
     auto normalized = torch::empty({1, 3, resolution, resolution}, cuda);
-    auto converted = backend.input_type() == at::kFloat ? torch::Tensor{} : torch::empty(normalized.sizes(), cuda.dtype(backend.input_type()));
+    GpuBatchPreprocessor preprocessor(1, resolution, resolution, options.device_id, backend.input_type());
     while (!delivery.stop.stop_requested() && (options.limit_images == 0U || result.processed_images < options.limit_images)) {
         auto frame = source->Next();
         if (!frame) break;
@@ -716,10 +728,10 @@ void complete_prediction_record(PredictionRecord& record, std::size_t index, con
         const std::array<std::int64_t, 4> shape{1, 3, frame->height, frame->width};
         auto input = torch::from_blob(const_cast<float*>(frame->chw), at::IntArrayRef{shape}, cuda);
         at::upsample_bilinear2d_out(normalized, input, {resolution, resolution}, false);
-        normalized.sub_(mean).div_(deviation);
-        if (converted.defined()) converted.copy_(normalized);
-        execute_prediction_batch(options, backend, converted.defined() ? converted : normalized, 1U, frame->width, frame->height, delivery, annotations,
+        const auto model_input = preprocessor.run({.num_images = 1U, .device_images = normalized.data_ptr<float>()});
+        execute_prediction_batch(options, backend, model_input, 1U, frame->width, frame->height, delivery, annotations,
                                  readback, {}, static_cast<std::int64_t>(result.processed_images));
+        preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(command_stream.native_handle));
         PredictionRecord record{.dataset_index = static_cast<std::int64_t>(frame->index),
                                 .image_id = static_cast<std::int64_t>(frame->index + 1U),
                                 .source_name = options.video_path.string()};
@@ -917,6 +929,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     result.backend_name = bound_backend.name();
     result.artifacts = bound_backend.artifacts();
     result.artifacts.class_layout = bound_backend.class_layout()->record();
+    result.candidate_count = bound_backend.candidate_count();
     result.masks_available = bound_backend.has_masks();
     result.class_catalog = bound_backend.class_layout()->catalog();
     result.class_domain = bound_backend.class_layout()->domain();
@@ -931,7 +944,7 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
     if (delivery.begin) delivery.begin(result);
     const auto total = options.limit_images == 0U ? loader->num_images() : std::min(options.limit_images, loader->num_images());
     const auto image_ids = EvaluationDatasetOwner(*loader, EvaluationMetricSet::BBox).image_ids();
-    InferenceBatchPreprocessor preprocessor(static_cast<std::int64_t>(options.batch_size), static_cast<int>(loader->image_height()),
+    GpuBatchPreprocessor preprocessor(static_cast<std::int64_t>(options.batch_size), static_cast<int>(loader->image_height()),
                                             static_cast<int>(loader->image_width()), options.device_id, bound_backend.input_type());
     const auto started = std::chrono::steady_clock::now();
     loader->begin_epoch();
@@ -950,9 +963,10 @@ PredictionRunResult PredictionSession::State::RunResolved(const PredictRequest& 
         }
         auto active_batch = batch;
         active_batch.num_images = std::min(batch.num_images, total - result.processed_images);
-        auto normalized = preprocessor.Run(active_batch);
+        auto normalized = preprocessor.run(active_batch);
         execute_prediction_batch(options, bound_backend, normalized, active_batch.num_images, loader->image_width(), loader->image_height(), delivery,
-                                 annotations, *readback, {batch.image_indices, active_batch.num_images});
+                                 annotations, *readback, {batch.image_indices, active_batch.num_images}, 0, loader.get());
+        preprocessor.record_consumer(reinterpret_cast<cudaStream_t>(execution_stream.native_handle));
         for (std::size_t image = 0U; image < active_batch.num_images && !delivery.stop.stop_requested(); ++image) {
             PredictionRecord record;
             record.dataset_index = static_cast<std::int64_t>(batch.image_indices[image]);

@@ -74,7 +74,7 @@ struct PredictRequest : ModelArtifactRequest, InferenceExecutionConfig {
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string backend = "auto";
     [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
     [[= mmltk::frameworks::reflection::Minimum<std::size_t>{
-        1U}]][[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
+        0U}]][[= mmltk::frameworks::reflection::Maximum<std::size_t>{kMaximumPredictionCandidates}]] std::size_t max_dets_per_image = 500U;
     [[= mmltk::frameworks::reflection::Minimum<int>{0}]] int lanes = 0;
     [[= mmltk::frameworks::reflection::Minimum<float>{
         0.0F}]][[= mmltk::frameworks::reflection::Maximum<float>{1.0F}]][[= mmltk::frameworks::reflection::Finite{}]] float threshold = 0.0F;
@@ -98,7 +98,7 @@ struct ValidateRequest : ModelArtifactRequest, InferenceExecutionConfig {
     [[= mmltk::frameworks::reflection::MaxBytes{mmltk::frameworks::reflection::kMaximumNameBytes}]] std::string split;
     [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t batch_size = 1U;
     std::size_t limit_images = 0U;
-    std::size_t num_queries = 0U;
+    std::size_t candidate_count = 0U;
     std::size_t eval_max_dets = 0U;
     std::size_t alignment_images = 16U;
     [[= mmltk::frameworks::reflection::Minimum<std::size_t>{1U}]] std::size_t prefetch_factor = 2U;

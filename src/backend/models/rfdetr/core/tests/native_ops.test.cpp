@@ -533,18 +533,15 @@ void require_postprocess_geometries(const GeometrySelections& selections) {
 }
 void test_postprocess() {
     const auto outputs = make_outputs();
-    const auto target_sizes = torch::tensor({{100, 100}}, torch::TensorOptions().dtype(torch::kInt64));
-    const auto results = mmltk::backend::models::rfdetr::postprocess_outputs(outputs, target_sizes, 2);
-    REQUIRE(results.size() == 1);
-    const auto& result = results.front();
-    REQUIRE(result.count("scores") == 1);
-    REQUIRE(result.count("labels") == 1);
-    REQUIRE(result.count("boxes") == 1);
-    REQUIRE(result.at("scores").size(0) == 2);
-    REQUIRE(result.at("labels").size(0) == 2);
-    REQUIRE(result.at("boxes").size(0) == 2);
-    REQUIRE(result.at("boxes").size(1) == 4);
-    const auto boxes = result.at("boxes").cpu();
+    const auto result = mmltk::backend::models::rfdetr::postprocess_output_batch_fixed_size(
+        {outputs.main.pred_logits, outputs.main.pred_boxes, outputs.main.pred_masks}, 100, 100, 2);
+    REQUIRE(result.size() == 1);
+    REQUIRE(result.counts[0].item<int64_t>() == 2);
+    REQUIRE(result.scores.size(1) == 2);
+    REQUIRE(result.labels.size(1) == 2);
+    REQUIRE(result.boxes.size(1) == 2);
+    REQUIRE(result.boxes.size(2) == 4);
+    const auto boxes = result.boxes[0].cpu();
     const auto box_values = boxes.accessor<float, 2>();
     REQUIRE(std::fabs(box_values[0][0] - 40.0f) < 1e-4f);
     REQUIRE(std::fabs(box_values[0][1] - 40.0f) < 1e-4f);
@@ -754,7 +751,7 @@ TEST_CASE("mask materialization follows selected query identity and bounded reus
     output.pred_masks = torch::ones({1, 2, 1, 1});
     CHECK_THROWS_AS(rfdetr::select_output_batch_fixed_size(output, 2, 2, 2, true), std::invalid_argument);
 }
-TEST_CASE("Declared class slots are filtered before ranking without losing query masks", "[model][rfdetr][layout]") {
+TEST_CASE("Physical ranking precedes slot filtering and keeps stable query mask identity", "[model][rfdetr][layout]") {
     namespace r = mmltk::backend::models::rfdetr;
     namespace catalog = mmltk::backend::data::catalog;
     for (std::uint32_t background = 0; background < 3; ++background) {
@@ -763,126 +760,102 @@ TEST_CASE("Declared class slots are filtered before ranking without losing query
         std::uint32_t foreground = 0;
         for (std::uint32_t slot = 0; slot < 3; ++slot)
             record.slots[slot] = slot == background ? r::ModelClassSlot{r::ClassSlotRole::Background, std::nullopt}
-                                                    : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
-        auto layout = std::make_shared<const r::ResolvedClassLayout>(record);
-        r::ClassPostprocessLane classes(layout);
+                                                   : r::ModelClassSlot{r::ClassSlotRole::Foreground, foreground++};
+        r::ClassPostprocessLane classes(std::make_shared<const r::ResolvedClassLayout>(record));
         classes.Prepare(torch::kCPU);
         r::OutputTensors outputs;
         outputs.pred_logits = torch::full({1, 2, 3}, -8.F);
         outputs.pred_logits.select(2, background).fill_(100.F);
-        const auto first_slot = background == 0 ? 1 : 0;
-        const auto last_slot = background == 2 ? 1 : 2;
-        outputs.pred_logits[0][0][first_slot] = 4.F;
-        outputs.pred_logits[0][1][last_slot] = 3.F;
+        outputs.pred_logits[0][0][background == 0 ? 1 : 0] = 4.F;
+        outputs.pred_logits[0][1][background == 2 ? 1 : 2] = 3.F;
         outputs.pred_boxes = torch::tensor({.25F, .25F, .2F, .2F, .75F, .75F, .2F, .2F}).view({1, 2, 4});
         outputs.pred_masks = torch::tensor({8.F, -8.F}).view({1, 2, 1, 1});
-        const auto selected = r::select_output_batch_fixed_size(outputs, 10, 20, 2, true, &classes);
-        REQUIRE(selected.labels[0][0].item<std::int64_t>() == 0);
-        REQUIRE(selected.labels[0][1].item<std::int64_t>() == 1);
-        REQUIRE(selected.query_indices[0][0].item<std::int64_t>() == 0);
-        REQUIRE(selected.query_indices[0][1].item<std::int64_t>() == 1);
-        CHECK(selected.scores[0][0].item<float>() < .99F);
+        const auto discarded = r::select_output_batch_fixed_size(outputs, 10, 20, 2, true, &classes);
+        CHECK(discarded.counts.item<int64_t>() == 0);
+        CHECK(discarded.scores.size(1) == 2);
+        CHECK(discarded.query_indices.size(1) == 2);
+        const auto selected = r::select_output_batch_fixed_size(outputs, 10, 20, 4, true, &classes);
+        REQUIRE(selected.counts.item<int64_t>() == 2);
+        CHECK(selected.labels[0][0].item<int64_t>() == 0);
+        CHECK(selected.labels[0][1].item<int64_t>() == 1);
+        CHECK(selected.query_indices[0][0].item<int64_t>() == 0);
+        CHECK(selected.query_indices[0][1].item<int64_t>() == 1);
         r::SelectedMaskWorkspace masks;
         const auto materialized = masks.Materialize(*selected.mask_logits, selected.query_indices, 10, 20);
         CHECK(materialized[0][0].all().item<bool>());
         CHECK_FALSE(materialized[0][1].any().item<bool>());
     }
-    auto empty = std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(catalog::ClassCatalog{}));
-    r::ClassPostprocessLane classes(empty);
-    classes.Prepare(torch::kCPU);
+    r::ClassPostprocessLane empty(std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(catalog::ClassCatalog{})));
+    empty.Prepare(torch::kCPU);
     r::OutputTensors outputs{.pred_logits = torch::full({1, 2, 1}, 100.F), .pred_boxes = torch::zeros({1, 2, 4})};
-    const auto selected = r::select_output_batch_fixed_size(outputs, 10, 20, 500, false, &classes);
-    CHECK(selected.labels.numel() == 0);
-    CHECK(selected.boxes.size(1) == 0);
+    const auto empty_selection = r::select_output_batch_fixed_size(outputs, 10, 20, 500, false, &empty);
+    CHECK(empty_selection.counts.item<int64_t>() == 0);
+    CHECK(empty_selection.labels.numel() == 0);
+    CHECK(empty_selection.boxes.size(1) == 0);
 }
-TEST_CASE("Class lanes retain gather capacity and independently owned final labels", "[model][rfdetr][layout]") {
+TEST_CASE("Class lanes retain physical ties, permutation, sparse COCO and independent final results", "[model][rfdetr][layout]") {
     namespace r = mmltk::backend::models::rfdetr;
     auto record = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}));
     record.slots = {{r::ClassSlotRole::Foreground, 1U}, {r::ClassSlotRole::Unused, {}}, {r::ClassSlotRole::Foreground, 0U}};
     r::ClassPostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
     lane.Prepare(torch::kCPU);
-    const auto logits = torch::tensor({1.F, 100.F, 2.F, 4.F, 100.F, 3.F}).view({1, 2, 3});
-    const auto expected = torch::tensor({1.F, 2.F, 4.F, 3.F}).view({1, 2, 2});
-    auto gathered = lane.Gather(logits.repeat({3, 1, 1}));
-    const auto address = gathered.data_ptr();
-    CHECK(torch::equal(gathered, expected.repeat({3, 1, 1})));
-    for (const auto batch : {1, 2, 3, 1}) {
-        auto value = lane.Gather(logits.repeat({batch, 1, 1}));
-        CHECK(value.data_ptr() == address);
-        CHECK(torch::equal(value, expected.repeat({batch, 1, 1})));
-    }
-    const auto larger = lane.Gather(logits.repeat({4, 1, 1}));
-    CHECK(larger.data_ptr() != address);
-    CHECK(torch::equal(larger, expected.repeat({4, 1, 1})));
-    CHECK(lane.Gather(logits).data_ptr() == larger.data_ptr());
-    r::OutputTensors output{.pred_logits = logits, .pred_boxes = torch::ones({1, 2, 4})};
-    const auto first = r::select_output_batch_fixed_size(output, 8, 8, 2, false, &lane);
-    const auto labels = first.labels.clone();
-    const auto scores = first.scores.clone();
-    output.pred_logits = -logits;
-    const auto next = r::select_output_batch_fixed_size(output, 8, 8, 2, false, &lane);
-    CHECK(torch::equal(first.labels, labels));
-    CHECK(torch::equal(first.scores, scores));
+    const auto logits = torch::zeros({1, 2, 3});
+    CHECK(lane.ValidateLogits(logits).data_ptr() == logits.data_ptr());
+    CHECK_THROWS(lane.ValidateLogits(torch::zeros({1, 2, 4})));
+    r::OutputTensors outputs{.pred_logits = logits, .pred_boxes = torch::ones({1, 2, 4})};
+    const auto first = r::select_output_batch_fixed_size(outputs, 8, 8, 4, false, &lane);
+    REQUIRE(first.counts.item<int64_t>() == 3);
+    CHECK(torch::equal(first.labels[0].narrow(0, 0, 3), torch::tensor({1L, 0L, 1L}, torch::kInt64)));
+    CHECK(torch::equal(first.query_indices[0].narrow(0, 0, 3), torch::tensor({0L, 0L, 1L}, torch::kInt64)));
+    const auto saved = first.labels.clone();
+    outputs.pred_logits = torch::randn_like(logits);
+    const auto next = r::select_output_batch_fixed_size(outputs, 8, 8, 4, false, &lane);
+    CHECK(torch::equal(first.labels, saved));
     CHECK(first.labels.data_ptr() != next.labels.data_ptr());
-    CHECK(first.labels[0][0].item<int64_t>() == 1);
-    CHECK(first.labels[0][1].item<int64_t>() == 0);
-    const auto doubled = lane.Gather(logits.to(torch::ScalarType::Double));
-    CHECK(doubled.data_ptr() != address);
-    CHECK(torch::equal(doubled, expected.to(torch::ScalarType::Double)));
-    CHECK(lane.Gather(logits.to(torch::ScalarType::Double)).data_ptr() == doubled.data_ptr());
-    CHECK(lane.Gather(torch::zeros({0, 2, 3})).numel() == 0);
-    CHECK(lane.Gather(torch::zeros({1, 0, 3})).numel() == 0);
-    CHECK_THROWS(lane.Gather(torch::zeros({1, 2, 4})));
-    CHECK(lane.Gather(logits.to(torch::ScalarType::Double)).data_ptr() == doubled.data_ptr());
-    r::ClassPostprocessLane empty(
-        std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog{})));
-    empty.Prepare(torch::kCPU);
-    const auto empty_input = torch::zeros({2, 3, 1});
-    CHECK(empty.Gather(empty_input).numel() == 0);
-    r::ClassPostprocessLane dense(
-        std::make_shared<const r::ResolvedClassLayout>(r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat", "dog"}))));
-    dense.Prepare(torch::kCPU);
-    CHECK(dense.Gather(logits).data_ptr() == logits.data_ptr());
+    r::ClassPostprocessLane coco(std::make_shared<const r::ResolvedClassLayout>(r::coco_class_layout({})));
+    coco.Prepare(torch::kCPU);
+    outputs.pred_logits = torch::full({1, 1, 91}, -8.F);
+    outputs.pred_logits[0][0][0] = 9.F;
+    outputs.pred_logits[0][0][12] = 8.F;
+    outputs.pred_logits[0][0][90] = 7.F;
+    outputs.pred_boxes = torch::ones({1, 1, 4});
+    const auto sparse = r::select_output_batch_fixed_size(outputs, 10, 20, 3, false, &coco);
+    REQUIRE(sparse.counts.item<int64_t>() == 1);
+    CHECK(sparse.labels[0][0].item<int64_t>() == 79);
+    CHECK(torch::equal(sparse.boxes[0][0], torch::tensor({10.F, 5.F, 20.F, 10.F})));
+    outputs.pred_boxes = torch::tensor({-.25F, 1.2F, 1.F, 1.F}).view({1, 1, 4});
+    const auto clipped = r::select_output_batch_fixed_size(outputs, 10, 20, 3, false, &coco);
+    CHECK(torch::allclose(clipped.boxes[0][0], torch::tensor({0.F, 7.F, 5.F, 10.F})));
+    const auto none = r::select_output_batch_fixed_size(outputs, 10, 20, 0, false, &coco);
+    CHECK(none.counts.item<int64_t>() == 0);
+    CHECK(none.boxes.size(1) == 0);
+    auto boxes = torch::tensor({-10.F, -20.F, 50.F, 60.F}).view({1, 4});
+    r::clip_prediction_boxes_(boxes, 2, 4, 18, 9);
+    CHECK(torch::equal(boxes, torch::tensor({2.F, 4.F, 18.F, 9.F}).view({1, 4})));
 }
-TEST_CASE("Class lane device and stream rebind retains earlier final results", "[model][rfdetr][layout][gpu]") {
+TEST_CASE("Class lane device and stream rebind retains earlier final references", "[model][rfdetr][layout][gpu]") {
     namespace r = mmltk::backend::models::rfdetr;
     auto record = r::native_training_class_layout(mmltk::backend::data::catalog::ClassCatalog({"cat"}));
-    record.slots = {{r::ClassSlotRole::Unused, {}}, {r::ClassSlotRole::Foreground, 0U}};
     r::ClassPostprocessLane lane(std::make_shared<const r::ResolvedClassLayout>(record));
-    lane.Prepare(torch::kCPU);
-    const auto cpu = torch::tensor({99.F, 3.F}).view({1, 1, 2});
-    auto previous = lane.Gather(cpu);
-    const auto device = torch::Device(torch::kCUDA, 0);
     const auto first_stream = c10::cuda::getStreamFromPool(false, 0);
     const auto second_stream = c10::cuda::getStreamFromPool(false, 0);
-    torch::Tensor first_labels, first_scratch;
+    torch::Tensor first;
     {
         c10::cuda::CUDAStreamGuard guard(first_stream);
-        lane.Prepare(device);
-        const auto input = cpu.to(device);
-        first_scratch = lane.Gather(input);
-        const auto& scratch = first_scratch;
-        CHECK(scratch.data_ptr() != previous.data_ptr());
-        CHECK(lane.Gather(input).data_ptr() == scratch.data_ptr());
-        first_labels = lane.References(torch::zeros({1, 1}, input.options().dtype(torch::kInt64)));
+        lane.Prepare(torch::Device(torch::kCUDA, 0));
+        first = lane.References(torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, 0)));
     }
     {
         c10::cuda::CUDAStreamGuard guard(second_stream);
-        const auto input = cpu.to(device);
-        CHECK_THROWS(lane.Gather(input));
-        lane.Prepare(device);
-        const auto scratch = lane.Gather(input);
-        CHECK(scratch.data_ptr() != first_scratch.data_ptr());
-        CHECK(scratch.cpu().item<float>() == 3.F);
-        CHECK(lane.Gather(input).data_ptr() == scratch.data_ptr());
+        const auto indices = torch::zeros({1}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, 0));
+        CHECK_THROWS(lane.References(indices));
+        lane.Prepare(indices.device());
+        CHECK(lane.References(indices).cpu().item<int64_t>() == 0);
     }
     {
         c10::cuda::CUDAStreamGuard guard(first_stream);
-        CHECK(first_labels.cpu().item<int64_t>() == 0);
+        CHECK(first.cpu().item<int64_t>() == 0);
     }
-    lane.Prepare(torch::kCPU);
-    CHECK(lane.Gather(cpu).item<float>() == 3.F);
-    CHECK(previous.item<float>() == 3.F);
 }
 TEST_CASE("matcher focal alpha changes dense and CUDA assignments consistently", "[model][rfdetr][matcher]") {
     namespace r = mmltk::backend::models::rfdetr;

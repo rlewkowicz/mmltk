@@ -23,6 +23,7 @@ struct PredictionRunResult {
     std::string backend_name{};
     std::shared_ptr<const mmltk::backend::data::catalog::ClassCatalog> class_catalog{};
     mmltk::backend::data::catalog::ClassReferenceDomain class_domain = mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot;
+    std::size_t candidate_count = 0;
     bool masks_available = false;
     bool cancelled = false;
     std::size_t processed_images = 0;

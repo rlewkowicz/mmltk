@@ -21,7 +21,7 @@ EvaluationRunResult run_evaluation(const EvaluateRequest& request) {
     validation.compiled_path = options.compiled_path;
     validation.batch_size = options.batch_size;
     validation.limit_images = options.limit_images;
-    validation.num_queries = options.num_queries;
+    validation.candidate_count = options.candidate_count;
     validation.eval_max_dets = options.eval_max_dets;
     validation.eval_order = resolve_inference_artifact(options, options.backend).backend_name;
     auto validation_result = run_validation(validation);

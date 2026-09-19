@@ -9,9 +9,11 @@ module;
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include "src/backend/imaging/raster/image_operations.h"
+#include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
 #include "src/backend/ml/runtime/analysis_provider.h"
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/ml/runtime/tensorrt_runtime.h"
@@ -63,18 +65,25 @@ struct RfdetrAnalysisProvider::Impl final {
         c10::cuda::CUDAStreamGuard stream_guard{cuda_stream()};
         const auto float_options = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, device);
         input_float = torch::empty({static_cast<std::int64_t>(runtime::kMaximumAnalysisRegions), 3, resolution, resolution}, float_options);
-        const auto normalization_options = torch::TensorOptions().dtype(at::kFloat).device(torch::kCUDA, device);
-        mean = torch::tensor({0.485F, 0.456F, 0.406F}, normalization_options).view({1, 3, 1, 1});
-        standard_deviation = torch::tensor({0.229F, 0.224F, 0.225F}, normalization_options).view({1, 3, 1, 1});
-        if (backend->input_element_type() == element_type::Float16) { input_runtime = torch::empty_like(input_float, input_float.options().dtype(at::kHalf)); }
+        preprocessor = std::make_unique<GpuBatchPreprocessor>(runtime::kMaximumAnalysisRegions, resolution, resolution, device,
+            backend->input_element_type() == element_type::Float16 ? at::kHalf : at::kFloat);
     }
     [[nodiscard]] c10::cuda::CUDAStream cuda_stream() const noexcept { return c10::cuda::getStreamFromExternal(stream, c10::DeviceIndex(device)); }
     std::shared_ptr<RfdetrRuntimeBackend> backend;
     torch::Tensor input_float;
-    torch::Tensor input_runtime;
-    torch::Tensor mean;
-    torch::Tensor standard_deviation;
+    std::unique_ptr<GpuBatchPreprocessor> preprocessor;
     std::optional<runtime::RuntimeSubmission> active_submission;
+    std::span<runtime::AnalysisAnnotationStorage> active_annotations;
+    void ClearCounts() noexcept {
+        for (auto& annotation : active_annotations) {
+            annotation.value_count = 0;
+            annotation.device_value_count = nullptr;
+            annotation.completed_value_count = nullptr;
+            annotation.count_custody.reset();
+            annotation.masks_available = false;
+        }
+        active_annotations = {};
+    }
     std::uint32_t resolution = 0U;
     std::int32_t device = -1;
     cudaStream_t stream = nullptr;
@@ -94,6 +103,7 @@ RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(con
         c10::cuda::CUDAStreamGuard stream_guard{impl_->cuda_stream()};
         mmltk::frameworks::gpu::ensure_cuda_ok(cudaStreamWaitEvent(impl_->stream, reinterpret_cast<cudaEvent_t>(request.source_ready.event), 0U),
                                                "RF-DETR analysis source readiness");
+        impl_->active_annotations = request.annotations;
         const std::size_t count = request.regions.size();
         auto input_float = impl_->input_float.narrow(0, 0, static_cast<std::int64_t>(count));
         for (std::size_t index = 0U; index < count; ++index) {
@@ -105,13 +115,7 @@ RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(con
                                                        impl_->resolution, impl_->resolution, reinterpret_cast<std::uintptr_t>(impl_->stream))),
                                                    "RF-DETR analysis preprocessing");
         }
-        input_float.sub_(impl_->mean).div_(impl_->standard_deviation);
-        torch::Tensor input = input_float;
-        if (impl_->input_runtime.defined()) {
-            auto runtime_input = impl_->input_runtime.narrow(0, 0, static_cast<std::int64_t>(count));
-            runtime_input.copy_(input_float);
-            input = std::move(runtime_input);
-        }
+        auto input = impl_->preprocessor->run({.num_images = count, .device_images = input_float.data_ptr<float>()});
         runtime::RuntimeShape shape{.rank = 4U};
         for (std::size_t axis = 0U; axis < 4U; ++axis) { shape.extents[axis] = input.size(static_cast<std::int64_t>(axis)); }
         const auto element_type = input.scalar_type() == at::kHalf ? runtime::RuntimeElementType::Float16 : runtime::RuntimeElementType::Float32;
@@ -120,6 +124,7 @@ RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(con
                                                               .shape = shape,
                                                               .element_type = element_type},
                                                              request.annotations, {}, impl_->backend->has_masks()));
+        impl_->preprocessor->record_consumer(impl_->stream);
         const auto& submission = *impl_->active_submission;
         return {
             .identity = request.identity,
@@ -130,7 +135,7 @@ RfdetrAnalysisProvider::ProviderWorkResult RfdetrAnalysisProvider::DoAnalyze(con
         };
     } catch (...) {
         impl_->active_submission.reset();
-        for (auto& annotation : request.annotations) { annotation.value_count = 0U; }
+        impl_->ClearCounts();
         return {.identity = request.identity, .terminal = runtime::AnalysisTerminal::ExecutionFailure};
     }
 }
@@ -145,9 +150,12 @@ bool RfdetrAnalysisProvider::ObserveCompletion(const runtime::AnalysisCompletion
         auto settled = std::move(*impl_->active_submission);
         impl_->active_submission.reset();
         impl_->backend->ReleaseAfterCompletion(std::move(settled));
+        for (auto& annotation : impl_->active_annotations) annotation.SettleValueCount();
+        impl_->active_annotations = {};
         return true;
     } catch (...) {
         impl_->active_submission.reset();
+        impl_->ClearCounts();
         return false;
     }
 }
@@ -158,13 +166,13 @@ void RfdetrAnalysisProvider::RetireIssuedWork(const ProviderWorkResult&) noexcep
         impl_->active_submission.reset();
         impl_->backend->ReleaseAfterCompletion(std::move(issued));
     } catch (...) { impl_->active_submission.reset(); }
+    impl_->ClearCounts();
 }
 void RfdetrAnalysisProvider::DoShutdown() noexcept {
     impl_->active_submission.reset();
-    impl_->input_runtime.reset();
+    impl_->ClearCounts();
+    impl_->preprocessor.reset();
     impl_->input_float.reset();
-    impl_->mean.reset();
-    impl_->standard_deviation.reset();
     impl_->backend.reset();
 }
 }  // namespace mmltk::backend::models::rfdetr

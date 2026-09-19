@@ -649,7 +649,7 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
     scratch.staged_boxes.resize(bbox.count);
     for (const auto& category_predictions : scratch.predictions_by_category) {
         for (const std::uint32_t prediction_index : category_predictions) {
-            scratch.staged_boxes[prediction_index] = xyxy_clamped(bbox.boxes_xyxy + static_cast<std::ptrdiff_t>(prediction_index) * bbox.box_stride);
+            scratch.staged_boxes[prediction_index] = ordered_xyxy(bbox.boxes_xyxy + static_cast<std::ptrdiff_t>(prediction_index) * bbox.box_stride);
         }
     }
     const auto category_ground_truth_span = [&](const size_t category_index) {

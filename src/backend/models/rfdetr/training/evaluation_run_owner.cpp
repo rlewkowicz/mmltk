@@ -1,3 +1,4 @@
+#include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
 #include "src/backend/ml/cuda/torch_cuda_utils.h"
 #include "src/backend/models/rfdetr/core/detection_ops.h"
 #include "src/backend/models/rfdetr/core/execution_precision.h"
@@ -429,7 +430,8 @@ struct TrainingValidationRuntime::Impl {
           query_count_automatic_(query_count_automatic) {
         if (!loader_) { throw std::invalid_argument("training validation runtime requires a dataset loader"); }
         metric_set = resolve_evaluation_metric_set(*loader_, metric_set == EvaluationMetricSet::BBoxAndMask);
-        detection_limit_ = resolve_dataset_limit(loader_->max_instances_per_image(), options.eval_max_dets);
+        detection_limit_ = resolve_dataset_limit(loader_->max_instances_per_image(), resolve_evaluation_max_dets(options.eval_max_dets));
+        detection_limit_.automatic = options.eval_max_dets == 0;
         torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(options.device_id));
         amp_enabled_ = options.amp;
         inference_dtype_ = amp_enabled_ ? resolve_cuda_autocast_dtype() : at::kFloat;
@@ -706,6 +708,11 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
             PostprocessedBatch postprocessed = postprocess_output_batch_fixed_size(
                 OutputTensors{evaluated_outputs->main.pred_logits, evaluated_outputs->main.pred_boxes, evaluated_outputs->main.pred_masks},
                 static_cast<int64_t>(loader.image_height()), static_cast<int64_t>(loader.image_width()), model.config().num_select, &evaluation_classes);
+            for (std::size_t image = 0; image < batch.num_images; ++image) {
+                const auto geometry = loader.geometry(batch.image_indices[image]);
+                clip_prediction_boxes_(postprocessed.boxes[image], geometry.offset_x, geometry.offset_y,
+                    geometry.offset_x + geometry.resized_width, geometry.offset_y + geometry.resized_height);
+            }
             if (batch_timing) { evaluation_run.record_timing_stop(batch_timing, EvaluationCudaBatchTiming::Phase::Postprocess, evaluation_stream); }
             return postprocessed;
         }();
@@ -720,7 +727,7 @@ EvalPassResult evaluate_model(const TrainRequest& options, TrainingValidationRun
             const auto labels = processed.labels[image_index];
             const auto boxes = processed.boxes[image_index];
             const torch::Tensor masks = processed.masks.has_value() ? (*processed.masks)[image_index] : torch::Tensor();
-            const auto keep = scores.gt(0.35f);
+            const auto keep = scores.gt(0.35f).logical_and(labels.ge(0));
             const auto keep_indices = keep.nonzero().squeeze(1);
             torch::Tensor filtered_masks;
             if (masks.defined()) { filtered_masks = masks.index_select(0, keep_indices).clone(); }

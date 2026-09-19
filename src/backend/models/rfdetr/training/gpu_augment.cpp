@@ -28,66 +28,7 @@ void require(const bool condition, const std::string_view message) {
 [[nodiscard]] std::size_t tensor_bytes(const torch::Tensor& tensor) noexcept {
     return tensor.defined() ? static_cast<std::size_t>(tensor.numel()) * tensor.element_size() : 0U;
 }
-GpuPreprocessOutputType preprocess_output_type(const at::ScalarType output_type) {
-    switch (output_type) {
-        case at::kFloat: return GpuPreprocessOutputType::Float32;
-        case at::kHalf: return GpuPreprocessOutputType::Float16;
-        case torch::kBFloat16: return GpuPreprocessOutputType::BFloat16;
-        default:
-            require(false,
-                    "GPU batch preprocessing supports only FP32, FP16, and "
-                    "BF16 output");
-    }
-    return GpuPreprocessOutputType::Float32;
-}
 }  // namespace
-GpuBatchPreprocessor::GpuBatchPreprocessor(const std::int64_t batch_capacity, const int height, const int width, const int device_id,
-                                           const at::ScalarType output_type)
-    : batch_capacity_(batch_capacity), height_(height), width_(width), device_id_(device_id), output_type_(output_type) {
-    require(batch_capacity_ > 0 && height_ > 0 && width_ > 0, "invalid GPU preprocessing tensor shape");
-    (void)preprocess_output_type(output_type_);
-    TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
-    output_ = torch::empty({batch_capacity_, 3, height_, width_},
-                           torch::TensorOptions().dtype(output_type_).device(mmltk::backend::ml::cuda::cuda_device(device_id_)));
-    ensure_cuda_ok(cudaEventCreateWithFlags(&consumer_complete_, cudaEventDisableTiming), "cudaEventCreateWithFlags for GPU preprocessing consumer");
-}
-GpuBatchPreprocessor::~GpuBatchPreprocessor() {
-    if (consumer_complete_ != nullptr) {
-        int previous_device = -1;
-        const bool restore_device = cudaGetDevice(&previous_device) == cudaSuccess && previous_device != device_id_ && cudaSetDevice(device_id_) == cudaSuccess;
-        if (consumer_pending_) {
-            (void)cudaEventSynchronize(consumer_complete_);
-        } else if (has_run_) {
-            (void)cudaDeviceSynchronize();
-        }
-        cudaEventDestroy(consumer_complete_);
-        if (restore_device) { (void)cudaSetDevice(previous_device); }
-        consumer_complete_ = nullptr;
-    }
-}
-torch::Tensor GpuBatchPreprocessor::run(const mmltk::backend::data::Batch& batch, std::int64_t output_batch_size) {
-    const auto active_batch_size = static_cast<std::int64_t>(batch.num_images);
-    if (output_batch_size == 0) { output_batch_size = active_batch_size; }
-    require(active_batch_size > 0 && active_batch_size <= output_batch_size, "GPU preprocessing requires a non-empty active batch within the output batch");
-    require(output_batch_size <= batch_capacity_, "GPU preprocessing batch exceeds preallocated capacity");
-    require(batch.device_images != nullptr, "GPU preprocessing requires loader device images");
-    const auto device_index = checked_device_index(device_id_);
-    TorchCudaDeviceGuard device_guard(device_index);
-    const cudaStream_t stream = current_torch_cuda_stream_object(device_index).stream();
-    if (consumer_pending_) {
-        ensure_cuda_ok(cudaStreamWaitEvent(stream, consumer_complete_, 0), "cudaStreamWaitEvent for GPU preprocessing buffer reuse");
-        consumer_pending_ = false;
-    }
-    normalize_gpu_batch(batch.device_images, output_.data_ptr(), active_batch_size, output_batch_size, height_, width_, preprocess_output_type(output_type_),
-                        stream);
-    has_run_ = true;
-    return output_batch_size == batch_capacity_ ? output_ : output_.narrow(0, 0, output_batch_size);
-}
-void GpuBatchPreprocessor::record_consumer(cudaStream_t stream) {
-    TorchCudaDeviceGuard device_guard(checked_device_index(device_id_));
-    ensure_cuda_ok(cudaEventRecord(consumer_complete_, stream), "cudaEventRecord for GPU preprocessing consumer");
-    consumer_pending_ = true;
-}
 GpuBatchAugmenter::GpuBatchAugmenter(const GpuAugmentationConfig& config, const std::int64_t batch_capacity, const int height, const int width,
                                      mmltk::frameworks::gpu::DeviceContext context)
     : config_(config),

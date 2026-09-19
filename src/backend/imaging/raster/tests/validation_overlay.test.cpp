@@ -25,18 +25,20 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
         std::array<std::uint8_t, 6> colors{70, 80, 90, 10, 20, 30};
         std::array<int, 2> labels{0, 1};
         std::array<bool, 8> masks{true, true, false, true, true, true, false, true};
+        std::int64_t count = 2;
     } input;
     Input* device = nullptr;
     REQUIRE(cudaMalloc(reinterpret_cast<void**>(&device), sizeof(Input)) == cudaSuccess);
     auto release = [](Input* value) { static_cast<void>(cudaFree(value)); };
     std::unique_ptr<Input, decltype(release)> storage(device, release);
-    const auto draw = [&](bool add) {
+    const auto draw = [&](bool add, bool device_count = false) {
         REQUIRE(cudaMemcpyAsync(device, &input, sizeof(input), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
         REQUIRE(raster::raster_instance_overlay_rgba(
                     {.overlay = {reinterpret_cast<std::uint8_t*>(device), 16U, 4, 1},
                      .instances = {reinterpret_cast<const float*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, boxes)),
                                    reinterpret_cast<const std::uint8_t*>(device) + offsetof(Input, colors),
-                                   reinterpret_cast<const int*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, labels)), 2},
+                                   reinterpret_cast<const int*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, labels)), 2,
+                                   device_count ? reinterpret_cast<const std::int64_t*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, count)) : nullptr},
                      .masks = reinterpret_cast<const bool*>(reinterpret_cast<std::uint8_t*>(device) + offsetof(Input, masks)),
                      .mask_alpha = 96U,
                      .box_thickness = 0,
@@ -49,5 +51,9 @@ TEST_CASE("validation adds completed layers once with unchanged alpha and ordina
         return output;
     };
     CHECK(draw(true) == std::array<std::uint8_t, 16>{255, 255, 255, 96, 255, 60, 40, 177, 3, 4, 5, 81, 10, 20, 30, 96});
-    CHECK(draw(false) == std::array<std::uint8_t, 16>{10, 20, 30, 96, 10, 20, 30, 96, 0, 0, 0, 0, 10, 20, 30, 96});
+    CHECK(draw(false) == std::array<std::uint8_t, 16>{10, 20, 30, 96, 10, 20, 30, 96, 0, 0, 0, 0, 10, 20, 30, 96});    input.count = 1;
+    CHECK(draw(false, true) == std::array<std::uint8_t, 16>{70, 80, 90, 96, 70, 80, 90, 96, 0, 0, 0, 0, 70, 80, 90, 96});
+    input.count = 0;
+    CHECK(draw(false, true) == std::array<std::uint8_t, 16>{});
+
 }

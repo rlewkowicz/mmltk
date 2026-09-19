@@ -155,12 +155,17 @@ __device__ void apply_boxes_and_labels(int x, int y, const float* boxes, const u
         if (is_edge || is_label) { apply_box_color(pixel, colors, i * 3); }
     }
 }
+template <typename InstancesT>
+__device__ int resolved_instance_count(const InstancesT& instances) {
+    const auto requested = instances.device_instance_count ? *instances.device_instance_count : static_cast<std::int64_t>(instances.instance_count);
+    return requested <= 0 ? 0 : requested >= instances.instance_count ? instances.instance_count : static_cast<int>(requested);
+}
 template <typename PixelT, typename InstancesT>
 __device__ void blend_instance_masks(PixelT& pixel, const InstancesT& instances, const int image_width, const int image_height, const int x, const int y,
                                      const float mask_alpha) {
     const int image_area = image_width * image_height;
     const int pixel_index = y * image_width + x;
-    for (int i = 0; i < instances.instance_count; ++i) {
+    for (int i = 0, count = resolved_instance_count(instances); i < count; ++i) {
         if (!instances.masks[i * image_area + pixel_index]) { continue; }
         pixel = raster_math::blend_rgb(pixel, instances.colors[i * 3], instances.colors[i * 3 + 1], instances.colors[i * 3 + 2], mask_alpha);
     }
@@ -172,7 +177,7 @@ __device__ void blend_launch_masks(PixelT& pixel, const LaunchT& launch, const i
 template <typename LaunchT, typename PixelT>
 __device__ void apply_launch_boxes_and_labels(const int x, const int y, const LaunchT& launch, PixelT& pixel) {
     const auto& instances = launch.instances;
-    apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, instances.instance_count, launch.box_thickness, pixel);
+    apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, resolved_instance_count(instances), launch.box_thickness, pixel);
 }
 template <typename OverlayT, typename ColorT>
 __device__ bool store_segment_hit_rgba_pixel(const OverlayT& overlay, const int x, const int y, const float px, const float py, const float ax, const float ay,
@@ -214,18 +219,19 @@ __global__ void draw_masks_boxes_labels_bgr_pitched_kernel(const draw_launch::Ma
 __global__ void draw_analysis_overlay_rgba_pitched_kernel(const draw_launch::AnalysisOverlayRgbaPitchedLaunch launch) {
     const auto& overlay = launch.overlay;
     const auto& instances = launch.instances;
+    const int count = resolved_instance_count(instances);
     const int x = global_thread_x();
     const int y = global_thread_y();
     if (x >= overlay.width || y >= overlay.height) { return; }
     raster_math::RgbaPixelU8 pixel{};
     if (instances.masks != nullptr) {
-        for (int i = 0; i < instances.instance_count; ++i) {
+        for (int i = 0; i < count; ++i) {
             if (!instances.masks[i * overlay.width * overlay.height + y * overlay.width + x]) { continue; }
             raster_math::apply_rgb(&pixel.r, &pixel.g, &pixel.b, instances.colors, i * 3);
             pixel.a = launch.mask_alpha;
         }
     }
-    apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, instances.instance_count, launch.box_thickness, pixel, launch.labels);
+    apply_boxes_and_labels(x, y, instances.boxes, instances.colors, instances.labels, count, launch.box_thickness, pixel, launch.labels);
     if (launch.add_rgb_to_existing) {
         const auto existing = raster_math::load_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y);
         pixel = raster_math::add_layer_rgb(existing, pixel);

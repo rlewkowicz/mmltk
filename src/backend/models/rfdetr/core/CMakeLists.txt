@@ -47,7 +47,8 @@ mmltk_register_public_headers(
         detection_ops.h
         sample_output.h
         execution_precision.h
-        postprocess.h)
+        postprocess.h
+        gpu_batch_preprocessor.h)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_core detail/class_artifact_files.h)
 mmltk_register_retained_module_importers(mmltk_backend_models_rfdetr_core model.cpp runtime.cpp)
 mmltk_register_ordinary_sources(
@@ -69,6 +70,7 @@ mmltk_register_retained_module_importers(
     training_supervision.cpp)
 mmltk_register_ordinary_sources(
     mmltk_backend_models_rfdetr_core
+    gpu_batch_preprocessor.cpp
     detection_geometry.cpp
     detection_types.cpp
     nested_tensor.cpp

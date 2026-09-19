@@ -19,10 +19,7 @@ struct PredictionCapacity final {
         static_cast<void>(checked_prediction_extent(batch, available, kMaximumPredictionTensorBytes / sizeof(float)));
         const auto eligible = eligible_classes.value_or(static_cast<std::size_t>(classes));
         if (eligible > static_cast<std::size_t>(classes)) throw std::invalid_argument("eligible class count exceeds physical logits width");
-        const auto eligible_candidates = eligible == 0 ? 0U
-                                                       : checked_prediction_extent(static_cast<std::size_t>(queries), eligible,
-                                                                                   static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()));
-        const auto count = std::min(requested, eligible_candidates);
+        const auto count = std::min(requested, available);
         if (count) static_cast<void>(checked_prediction_extent(batch, count, kMaximumPredictionTensorBytes / (4U * sizeof(float))));
         const auto pixels = checked_prediction_extent(width, height, kMaximumEncodedMaskPixels);
         return {count, pixels, masks && count ? checked_prediction_extent(pixels, sizeof(std::uint8_t), kMaximumPredictionTensorBytes) : 0U};

@@ -1,8 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
-#include <torch/nn/functional/vision.h>
 #include "src/backend/models/rfdetr/core/postprocess.h"
 #include "src/backend/models/rfdetr/core/detail/detection_geometry.h"
 #include "src/backend/models/rfdetr/contract/prediction_limits.h"
+#include <ATen/ops/argsort.h>
 #include <ATen/ops/gather.h>
 #include <ATen/ops/index_select.h>
 #include <ATen/ops/gt.h>
@@ -21,6 +21,7 @@ struct PostprocessCore {
     torch::Tensor labels;
     torch::Tensor boxes;
     torch::Tensor query_indices;
+    torch::Tensor counts;
 };
 struct FixedBoxScaleCacheEntry {
     torch::Device device = torch::kCPU;
@@ -44,100 +45,94 @@ torch::Tensor fixed_box_scale(const torch::Tensor& boxes, const int64_t height, 
     cache = std::move(candidate);
     return cache.scale;
 }
-PostprocessCore postprocess_core(const OutputTensors& outputs, const torch::Tensor* target_sizes, std::optional<std::pair<int64_t, int64_t>> fixed_size,
+PostprocessCore postprocess_core(const OutputTensors& outputs, int64_t target_height, int64_t target_width,
                                  int64_t num_select, ClassPostprocessLane* classes) {
     mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_total{"rfdetr.native.postprocess.total"};
-    const auto out_logits = (classes ? classes->Gather(outputs.pred_logits) : outputs.pred_logits).to(torch::kFloat32);
+    const auto out_logits = (classes ? classes->ValidateLogits(outputs.pred_logits) : outputs.pred_logits).to(torch::kFloat32);
     const auto out_bbox = outputs.pred_boxes.to(torch::kFloat32);
-    if (target_sizes != nullptr && (out_logits.size(0) != target_sizes->size(0) || target_sizes->size(1) != 2)) {
-        throw std::runtime_error("target_sizes must be [batch,2] and aligned with RF-DETR outputs");
-    }
-    if (!fixed_size.has_value() && target_sizes == nullptr) { throw std::runtime_error("postprocess_outputs requires target_sizes or a fixed target size"); }
+    if (out_logits.dim() != 3 || out_bbox.dim() != 3 || out_bbox.size(2) != 4 ||
+        out_bbox.size(0) != out_logits.size(0) || out_bbox.size(1) != out_logits.size(1) || num_select < 0)
+        throw std::invalid_argument("invalid RF-DETR postprocessing shapes or selection limit");
+    if (out_logits.numel() != 0) static_cast<void>(checked_prediction_extent(out_logits.numel(), sizeof(std::int64_t), kMaximumPredictionTensorBytes));
     PostprocessCore core;
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_topk{"rfdetr.native.postprocess.topk"};
         const auto prob = out_logits.sigmoid();
         const auto flat_prob = prob.flatten(1);
-        const int64_t k = std::min<int64_t>(num_select, flat_prob.size(1));
-        if (out_logits.size(2) == 0) {
+        const int64_t k = classes && classes->eligible_count() == 0 ? 0 : std::min<int64_t>(num_select, flat_prob.size(1));
+        if (k == 0) {
             core.scores = flat_prob.narrow(1, 0, 0);
             core.query_indices = torch::empty({out_logits.size(0), 0}, out_logits.options().dtype(torch::kInt64));
             core.labels = core.query_indices;
         } else {
-            const auto topk = flat_prob.topk(k, 1);
-            core.scores = std::get<0>(topk);
-            const auto topk_indexes = std::get<1>(topk).to(torch::kInt64);
+            // Stable physical flattened order is the tie breaker, before slot filtering.
+            const auto sorted_indices = at::argsort(flat_prob, true, 1, true);
+            const auto topk_indexes = sorted_indices.narrow(1, 0, k);
+            core.scores = flat_prob.gather(1, topk_indexes);
             core.query_indices = torch::floor_divide(topk_indexes, out_logits.size(2));
             core.labels = topk_indexes.remainder(out_logits.size(2));
             if (classes) core.labels = classes->References(core.labels);
+            if (!classes || classes->eligible_count() == static_cast<std::size_t>(out_logits.size(2))) {
+                core.counts = torch::full({out_logits.size(0)}, k, out_logits.options().dtype(torch::kInt64));
+            } else {
+                const auto valid = core.labels.ge(0);
+                const auto prefix = valid.to(torch::kInt64).cumsum(1);
+                core.counts = prefix.select(1, k - 1).clone();
+                // Linear stable partition without a dynamic shape or a host wait.
+                const auto ordinal = torch::arange(k, core.query_indices.options()).unsqueeze(0).expand_as(core.query_indices);
+                const auto destinations = torch::where(valid, prefix - 1, core.counts.unsqueeze(1) + ordinal - prefix);
+                const auto order = torch::empty_like(core.query_indices).scatter_(1, destinations, ordinal);
+                core.scores = core.scores.gather(1, order);
+                core.labels = core.labels.gather(1, order);
+                core.query_indices = core.query_indices.gather(1, order);
+            }
         }
     }
-    core.boxes = box_cxcywh_to_xyxy(out_bbox, BoxExtentPolicy::ClampNonnegative);
+    if (!core.counts.defined()) core.counts = torch::zeros({out_logits.size(0)}, out_logits.options().dtype(torch::kInt64));
+    core.boxes = box_cxcywh_to_xyxy(out_bbox, BoxExtentPolicy::Preserve);
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_gather_boxes{"rfdetr.native.postprocess.gather_boxes"};
         core.boxes = core.boxes.gather(1, core.query_indices.unsqueeze(-1).expand({core.query_indices.size(0), core.query_indices.size(1), 4}));
     }
     {
         mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_scale_boxes{"rfdetr.native.postprocess.scale_boxes"};
-        if (fixed_size.has_value()) {
-            const auto [target_height, target_width] = *fixed_size;
-            core.boxes = core.boxes * fixed_box_scale(core.boxes, target_height, target_width);
-        } else {
-            const auto img_h = target_sizes->select(1, 0);
-            const auto img_w = target_sizes->select(1, 1);
-            const auto scale = torch::stack({img_w, img_h, img_w, img_h}, 1);
-            core.boxes = core.boxes * scale.unsqueeze(1);
-        }
+        core.boxes = core.boxes.clamp(0, 1) * fixed_box_scale(core.boxes, target_height, target_width);
     }
     return core;
 }
 }  // namespace
+void clip_prediction_boxes_(const torch::Tensor& boxes, double left, double top, double right, double bottom) {
+    if (left > right || top > bottom) throw std::invalid_argument("invalid prediction clipping bounds");
+    boxes.select(-1, 0).clamp_(left, right);
+    boxes.select(-1, 2).clamp_(left, right);
+    boxes.select(-1, 1).clamp_(top, bottom);
+    boxes.select(-1, 3).clamp_(top, bottom);
+}
 void ClassPostprocessLane::Prepare(const torch::Device& device) {
-    prefix_identity_ = layout_->prefix_identity();
-    if (prefix_identity_ || eligible_count() == 0) return;
     const auto stream = device.is_cuda() ? at::cuda::getCurrentCUDAStream(device.index()).stream() : nullptr;
-    if (slots_.defined() && slots_.device() == device && prepared_stream_ == stream) return;
-    const auto options = torch::TensorOptions().dtype(torch::kInt64).device(device);
-    auto slots = torch::tensor(std::vector<std::int64_t>(layout_->eligible_slots().begin(), layout_->eligible_slots().end()), options);
-    auto references = torch::tensor(std::vector<std::int64_t>(layout_->class_references().begin(), layout_->class_references().end()), options);
-    auto gather = gather_.defined() ? torch::empty({gather_.numel()}, gather_.options().device(device)) : torch::Tensor{};
-    // Allocation and upload precede commit. Old tensors retain their original
-    // allocator stream; queued consumers never borrow the replacement storage.
-    slots_ = std::move(slots);
-    references_ = std::move(references);
-    gather_ = std::move(gather);
+    if (references_.defined() && references_.device() == device && prepared_stream_ == stream) return;
+    std::vector<std::int64_t> references(layout_->output_width(), -1);
+    const auto slots = layout_->eligible_slots();
+    const auto values = layout_->class_references();
+    for (std::size_t index = 0; index < slots.size(); ++index) references[slots[index]] = values[index];
+    references_ = torch::tensor(references, torch::TensorOptions().dtype(torch::kInt64).device(device));
     prepared_stream_ = stream;
 }
-torch::Tensor ClassPostprocessLane::Gather(const torch::Tensor& logits) {
+torch::Tensor ClassPostprocessLane::ValidateLogits(const torch::Tensor& logits) const {
     if (logits.dim() != 3 || static_cast<std::size_t>(logits.size(2)) != layout_->output_width())
         throw std::invalid_argument("logit width disagrees with admitted class layout");
-    if (prefix_identity_ || eligible_count() == 0) return logits.narrow(2, 0, eligible_count());
-    const auto stream = logits.is_cuda() ? at::cuda::getCurrentCUDAStream(logits.get_device()).stream() : nullptr;
-    if (!slots_.defined() || slots_.device() != logits.device() || prepared_stream_ != stream)
-        throw std::invalid_argument("class postprocessor was not prepared on this device and stream");
-    if (logits.numel() == 0) return logits.narrow(2, 0, eligible_count());
-    const auto rows = checked_prediction_extent(logits.size(0), logits.size(1), kMaximumPredictionTensorBytes);
-    const auto values = checked_prediction_extent(rows, eligible_count(), kMaximumPredictionTensorBytes);
-    static_cast<void>(checked_prediction_extent(values, logits.element_size(), kMaximumPredictionTensorBytes));
-    const bool replace = !gather_.defined() || gather_.scalar_type() != logits.scalar_type() || static_cast<std::size_t>(gather_.numel()) < values;
-    auto candidate = replace ? torch::empty({static_cast<std::int64_t>(values)}, logits.options()) : gather_;
-    auto output = candidate.narrow(0, 0, static_cast<std::int64_t>(values)).view({logits.size(0), logits.size(1), static_cast<std::int64_t>(eligible_count())});
-    at::index_select_out(output, logits, 2, slots_);
-    if (replace) gather_ = std::move(candidate);
-    return output;
+    return logits;
 }
 torch::Tensor ClassPostprocessLane::References(const torch::Tensor& indices) const {
-    if (prefix_identity_ || eligible_count() == 0) return indices;
     const auto stream = indices.is_cuda() ? at::cuda::getCurrentCUDAStream(indices.get_device()).stream() : nullptr;
-    if (indices.device() != references_.device() || prepared_stream_ != stream) throw std::invalid_argument("class references used outside the prepared lane");
-    // This allocation is the independently owned final label result, not
-    // temporary remap scratch. Earlier returned labels survive subsequent Runs.
+    if (!references_.defined() || indices.device() != references_.device() || prepared_stream_ != stream)
+        throw std::invalid_argument("class references used outside the prepared lane");
     return references_.index_select(0, indices.flatten()).view(indices.sizes());
 }
 PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outputs, int64_t height, int64_t width, int64_t count, bool require_masks,
                                                       ClassPostprocessLane* classes) {
     if (require_masks && !outputs.pred_masks) throw std::runtime_error("RF-DETR requested masks are absent");
-    auto core = postprocess_core(outputs, nullptr, std::make_pair(height, width), count, classes);
+    auto core = postprocess_core(outputs, height, width, count, classes);
     if (outputs.pred_masks &&
         (outputs.pred_masks->dim() != 4 || outputs.pred_masks->size(0) != outputs.pred_logits.size(0) ||
          outputs.pred_masks->size(1) != outputs.pred_logits.size(1) || outputs.pred_masks->size(2) <= 0 || outputs.pred_masks->size(3) <= 0 ||
@@ -145,7 +140,7 @@ PostprocessedSelection select_output_batch_fixed_size(const OutputTensors& outpu
         throw std::invalid_argument("RF-DETR mask logits are incompatible with selected queries");
     if (outputs.pred_masks)
         static_cast<void>(checked_prediction_extent(outputs.pred_masks->numel(), outputs.pred_masks->element_size(), kMaximumPredictionTensorBytes));
-    return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks};
+    return {std::move(core.scores), std::move(core.labels), std::move(core.boxes), std::move(core.query_indices), outputs.pred_masks, std::move(core.counts)};
 }
 SelectedMaskCapacity SelectedMaskWorkspace::RetainedCapacity(std::size_t host_bytes) const {
     const auto capacity = [](const auto& tensor) -> std::size_t { return tensor.defined() ? tensor.storage().nbytes() : 0U; };
@@ -186,79 +181,8 @@ torch::Tensor materialize_selected_masks(const torch::Tensor& logits, const torc
 PostprocessedBatch postprocess_output_batch_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select,
                                                        ClassPostprocessLane* classes) {
     auto selected = select_output_batch_fixed_size(outputs, target_height, target_width, num_select, false, classes);
-    PostprocessedBatch result{selected.scores, selected.labels, selected.boxes, std::nullopt};
+    PostprocessedBatch result{selected.scores, selected.labels, selected.boxes, std::nullopt, selected.counts};
     if (selected.mask_logits) result.masks = materialize_selected_masks(*selected.mask_logits, selected.query_indices, target_height, target_width);
     return result;
-}
-std::vector<TensorMap> split_postprocessed_batch(const PostprocessedBatch& batch) {
-    std::vector<TensorMap> results;
-    results.reserve(static_cast<size_t>(batch.size()));
-    for (int64_t image_index = 0; image_index < batch.size(); ++image_index) {
-        TensorMap result;
-        result["scores"] = batch.scores[image_index];
-        result["labels"] = batch.labels[image_index];
-        result["boxes"] = batch.boxes[image_index];
-        if (batch.masks.has_value()) { result["masks"] = (*batch.masks)[image_index]; }
-        results.push_back(std::move(result));
-    }
-    return results;
-}
-PostprocessedBatch postprocessed_batch_from_result(const TensorMap& result) {
-    PostprocessedBatch batch;
-    batch.scores = result.at("scores").unsqueeze(0);
-    batch.labels = result.at("labels").unsqueeze(0);
-    batch.boxes = result.at("boxes").unsqueeze(0);
-    if (const auto masks = result.find("masks"); masks != result.end()) {
-        torch::Tensor mask_values = masks->second;
-        if (mask_values.dim() == 4 && mask_values.size(1) == 1) { mask_values = mask_values.squeeze(1); }
-        if (mask_values.dim() != 3) { throw std::runtime_error("predicted masks must be [num_predictions,height,width]"); }
-        batch.masks = mask_values.unsqueeze(0);
-    }
-    return batch;
-}
-std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const torch::Tensor& target_sizes, int64_t num_select, ClassPostprocessLane* classes) {
-    PostprocessCore core = postprocess_core(outputs, &target_sizes, std::nullopt, num_select, classes);
-    std::vector<TensorMap> results;
-    results.reserve(static_cast<size_t>(outputs.pred_logits.size(0)));
-    if (outputs.pred_masks.has_value()) {
-        const auto& out_masks = *outputs.pred_masks;
-        mmltk::common::logging::ScopedProfile profile_rfdetr_native_postprocess_masks{"rfdetr.native.postprocess.masks"};
-        for (int64_t batch = 0; batch < out_masks.size(0); ++batch) {
-            TensorMap result;
-            result["scores"] = core.scores[batch];
-            result["labels"] = core.labels[batch];
-            result["boxes"] = core.boxes[batch];
-            const auto gather_index =
-                core.query_indices[batch].unsqueeze(-1).unsqueeze(-1).expand({core.query_indices.size(1), out_masks.size(-2), out_masks.size(-1)});
-            auto masks = out_masks[batch].gather(0, gather_index);
-            const auto size_cpu = target_sizes[batch].to(torch::kCPU);
-            const int64_t height = size_cpu[0].item<int64_t>();
-            const int64_t width = size_cpu[1].item<int64_t>();
-            auto interpolate_options = torch::nn::functional::InterpolateFuncOptions();
-            interpolate_options.size(std::vector<int64_t>{height, width});
-            interpolate_options.mode(torch::kBilinear);
-            interpolate_options.align_corners(false);
-            masks = torch::nn::functional::interpolate(masks.unsqueeze(1), interpolate_options).gt(0.0);
-            result["masks"] = masks;
-            results.push_back(std::move(result));
-        }
-    } else {
-        for (int64_t batch = 0; batch < outputs.pred_logits.size(0); ++batch) {
-            TensorMap result;
-            result["scores"] = core.scores[batch];
-            result["labels"] = core.labels[batch];
-            result["boxes"] = core.boxes[batch];
-            results.push_back(std::move(result));
-        }
-    }
-    return results;
-}
-std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs, const torch::Tensor& target_sizes, const int64_t num_select,
-                                           ClassPostprocessLane* classes) {
-    return postprocess_outputs(OutputTensors{outputs.main.pred_logits, outputs.main.pred_boxes, outputs.main.pred_masks}, target_sizes, num_select, classes);
-}
-std::vector<TensorMap> postprocess_outputs_fixed_size(const OutputTensors& outputs, int64_t target_height, int64_t target_width, int64_t num_select,
-                                                      ClassPostprocessLane* classes) {
-    return split_postprocessed_batch(postprocess_output_batch_fixed_size(outputs, target_height, target_width, num_select, classes));
 }
 }  // namespace mmltk::backend::models::rfdetr

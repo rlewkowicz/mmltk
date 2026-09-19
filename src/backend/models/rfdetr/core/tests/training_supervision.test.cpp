@@ -261,9 +261,9 @@ rfdetr::OutputLayer oracle_layer(const torch::Tensor& features) {
 void test_geometry_preserves_consumer_policies_and_batch_isolation() {
     const auto malformed = torch::tensor({{0.5F, 0.5F, -0.2F, -0.4F}});
     const auto criterion = rfdetr::box_cxcywh_to_xyxy(malformed, rfdetr::BoxExtentPolicy::Preserve);
-    const auto postprocess = rfdetr::box_cxcywh_to_xyxy(malformed);
+    const auto nonnegative_extent = rfdetr::box_cxcywh_to_xyxy(malformed);
     REQUIRE(criterion.index({0, 0}).item<float>() > criterion.index({0, 2}).item<float>());
-    REQUIRE(postprocess.index({0, 0}).item<float>() == postprocess.index({0, 2}).item<float>());
+    REQUIRE(nonnegative_extent.index({0, 0}).item<float>() == nonnegative_extent.index({0, 2}).item<float>());
     const auto lhs = torch::tensor({{{0.0F, 0.0F, 1.0F, 1.0F}}, {{10.0F, 10.0F, 11.0F, 11.0F}}});
     const auto rhs = torch::tensor({{{0.0F, 0.0F, 1.0F, 1.0F}}, {{10.0F, 10.0F, 11.0F, 11.0F}}});
     const auto giou = rfdetr::batched_pairwise_generalized_box_iou(lhs, rhs);
@@ -272,10 +272,12 @@ void test_geometry_preserves_consumer_policies_and_batch_isolation() {
     rfdetr::OutputTensors postprocess_input;
     postprocess_input.pred_logits = torch::tensor({{{10.0F}}});
     postprocess_input.pred_boxes = malformed.unsqueeze(0);
-    const auto postprocessed = rfdetr::postprocess_outputs_fixed_size(postprocess_input, 100, 200, 1);
-    const auto& postprocessed_box = postprocessed.front().at("boxes");
-    REQUIRE(postprocessed_box.index({0, 0}).item<float>() == postprocessed_box.index({0, 2}).item<float>());
-    REQUIRE(postprocessed_box.index({0, 1}).item<float>() == postprocessed_box.index({0, 3}).item<float>());
+    const auto postprocessed = rfdetr::postprocess_output_batch_fixed_size(postprocess_input, 100, 200, 1);
+    REQUIRE(postprocessed.counts[0].item<int64_t>() == 1);
+    const auto postprocessed_box = postprocessed.boxes[0];
+    REQUIRE(torch::allclose(postprocessed_box, torch::tensor({{120.F, 70.F, 80.F, 30.F}})));
+    REQUIRE(postprocessed_box.index({0, 0}).item<float>() > postprocessed_box.index({0, 2}).item<float>());
+    REQUIRE(postprocessed_box.index({0, 1}).item<float>() > postprocessed_box.index({0, 3}).item<float>());
     rfdetr::ModelOutputs criterion_outputs;
     criterion_outputs.main.pred_logits = torch::tensor({{{10.0F, -10.0F, -10.0F}}});
     criterion_outputs.main.pred_boxes = malformed.unsqueeze(0);
@@ -286,7 +288,7 @@ void test_geometry_preserves_consumer_policies_and_batch_isolation() {
     const auto losses = rfdetr::detection_loss_dict(criterion_outputs, criterion_targets, criterion_config, true, 1.0);
     const auto target_xyxy = rfdetr::box_cxcywh_to_xyxy(criterion_targets.all_boxes, rfdetr::BoxExtentPolicy::Preserve);
     const auto preserve_expected = 1.0F - rfdetr::aligned_generalized_box_iou(criterion, target_xyxy).index({0});
-    const auto clamp_expected = 1.0F - rfdetr::aligned_generalized_box_iou(postprocess, target_xyxy).index({0});
+    const auto clamp_expected = 1.0F - rfdetr::aligned_generalized_box_iou(nonnegative_extent, target_xyxy).index({0});
     REQUIRE(torch::allclose(losses.at("loss_giou"), preserve_expected));
     REQUIRE_FALSE(torch::allclose(losses.at("loss_giou"), clamp_expected));
 }
@@ -1187,9 +1189,10 @@ void test_production_dn_forward_preserves_reference_and_output_boundaries() {
         rfdetr::OutputTensors postprocess_input;
         postprocess_input.pred_logits = inference.main.pred_logits;
         postprocess_input.pred_boxes = inference.main.pred_boxes;
-        const auto postprocessed = rfdetr::postprocess_outputs_fixed_size(postprocess_input, 64, 64, config.num_select);
+        const auto postprocessed = rfdetr::postprocess_output_batch_fixed_size(postprocess_input, 64, 64, config.num_select);
         REQUIRE(postprocessed.size() == 1);
-        REQUIRE(postprocessed.front().at("boxes").size(0) == config.num_select);
+        REQUIRE(postprocessed.boxes.size(1) == config.num_select);
+        REQUIRE(postprocessed.counts[0].item<int64_t>() == config.num_select);
     };
     run_case(rfdetr::TrainAssignmentKind::Hungarian, true, true, 112);
     run_case(rfdetr::TrainAssignmentKind::MatchFree, false, false, 113);

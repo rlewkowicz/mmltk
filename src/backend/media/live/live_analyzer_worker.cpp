@@ -148,6 +148,9 @@ bool LiveAnalyzerWorker::process_latest() {
     const runtime::AnalysisRegion region{0U, 0U, source.width, source.height};
     annotation.source_region = region;
     annotation.value_count = 0U;
+    annotation.device_value_count = nullptr;
+    annotation.completed_value_count = nullptr;
+    annotation.count_custody.reset();
     annotation.masks.shape = {3U, {static_cast<std::uint32_t>(annotation.value_capacity), region.height, region.width}};
     auto scope = cuda_.scope();
     if (!scope) {

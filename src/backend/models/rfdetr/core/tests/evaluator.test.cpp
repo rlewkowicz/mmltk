@@ -362,3 +362,14 @@ TEST_CASE("known empty evaluation masks remain positive annotations and missing 
     CHECK(r::resolve_evaluation_metric_set(*missing.loader, true) == r::EvaluationMetricSet::BBox);
     CHECK_THROWS_AS(r::EvaluationDatasetOwner(*missing.loader, r::EvaluationMetricSet::BBoxAndMask), std::runtime_error);
 }
+
+TEST_CASE("COCO maxDets applies independently to each category", "[rfdetr][evaluation][gpu]") {
+    const auto first = box(0, {0, 0, 32, 32}, .9F);
+    const auto second = box(1, {64, 64, 96, 96}, .8F);
+    EvaluationFixture fixture({{first, second}});
+    r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBox);
+    owner.merge_matches(match(owner, 0, {first, second}, 1));
+    CHECK(owner.evaluate(1, r::EvaluationDetailRetention::Detailed).bbox.ap == Approx(1.0));
+    CHECK(r::resolve_evaluation_max_dets(0) == 500);
+    CHECK(r::resolve_evaluation_max_dets(1) == 1);
+}

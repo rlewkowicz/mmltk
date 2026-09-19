@@ -25,32 +25,38 @@
 #include <fstream>
 #include <string>
 #include <unistd.h>
-#include "src/backend/models/rfdetr/inference/inference_preprocessor.h"
+#include "src/backend/models/rfdetr/core/gpu_batch_preprocessor.h"
 #include "src/backend/models/rfdetr/inference/prediction_capacity.h"
+#include "src/backend/models/rfdetr/inference/prediction_count.h"
 #include "src/backend/models/rfdetr/inference/prediction_raw_preparation.h"
 import mmltk.backend.models.rfdetr.inference.prediction;
 import mmltk.backend.models.rfdetr.model_export;
 namespace rfdetr = mmltk::backend::models::rfdetr;
-TEST_CASE("compiled preprocessing preserves unit-range float CHW channels", "[model][rfdetr][prediction][gpu]") {
-    const auto source = torch::tensor({0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 0.125F}).to(torch::kCUDA);
+TEST_CASE("shared preprocessing normalizes every RGB channel without mutating borrowed pixels", "[model][rfdetr][prediction][gpu]") {
+    const auto original = torch::tensor({0.0F, 0.25F, 0.5F, 0.75F, 1.0F, 0.125F});
+    const auto source = original.to(torch::kCUDA);
+    const auto expected = (original.view({3, 2}) - torch::tensor({.485F, .456F, .406F}).view({3, 1})) /
+                          torch::tensor({.229F, .224F, .225F}).view({3, 1});
     const mmltk::backend::data::Batch batch{.num_images = 1U, .device_images = source.data_ptr<float>()};
-    rfdetr::InferenceBatchPreprocessor preprocessor(1, 1, 2, 0, at::kFloat);
-    const auto result = preprocessor.Run(batch).reshape({6}).to(torch::kCPU);
-    REQUIRE(torch::equal(result, source.to(torch::kCPU)));
-    const auto address = preprocessor.Run(batch).data_ptr();
-    REQUIRE(preprocessor.Run(batch).data_ptr() == address);
-    CHECK(address == batch.device_images);
-    rfdetr::InferenceBatchPreprocessor half_precision(1, 1, 2, 0, at::kHalf);
-    REQUIRE(torch::equal(half_precision.Run(batch).reshape({6}).to(at::kFloat).to(torch::kCPU), source.to(torch::kCPU)));
-    const auto half_address = half_precision.Run(batch).data_ptr();
-    CHECK(half_address != batch.device_images);
-    CHECK(half_precision.Run(batch).data_ptr() == half_address);
-    auto invalid = batch;
-    invalid.num_images = 2U;
-    CHECK_THROWS_AS(preprocessor.Run(invalid), std::invalid_argument);
-    invalid.num_images = 1U;
-    invalid.device_images = nullptr;
-    CHECK_THROWS_AS(preprocessor.Run(invalid), std::invalid_argument);
+    for (const auto type : {at::kFloat, at::kHalf, at::kBFloat16}) {
+        rfdetr::GpuBatchPreprocessor preprocessor(2, 1, 2, 0, type);
+        const auto output = preprocessor.run(batch, 2);
+        const auto result = output[0].reshape({3, 2}).to(torch::kCPU).to(at::kFloat);
+        CHECK(torch::allclose(result, expected, .01, .01));
+        CHECK(output[1].to(torch::kCPU).eq(0).all().item<bool>());
+        const auto address = output.data_ptr();
+        CHECK(address != source.data_ptr());
+        CHECK(preprocessor.run(batch).data_ptr() == address);
+        CHECK(torch::equal(source.to(torch::kCPU), original));
+        auto invalid = batch;
+        invalid.num_images = 3;
+        CHECK_THROWS_AS(preprocessor.run(invalid), std::invalid_argument);
+        invalid.num_images = 0;
+        CHECK_THROWS_AS(preprocessor.run(invalid), std::invalid_argument);
+        invalid.num_images = 1;
+        invalid.device_images = nullptr;
+        CHECK_THROWS_AS(preprocessor.run(invalid), std::invalid_argument);
+    }
 }
 TEST_CASE("unfinished prediction output preserves the completed file", "[model][rfdetr][prediction_json]") {
     const auto output = std::filesystem::temp_directory_path() / ("prediction-cancel-" + std::to_string(::getpid()) + ".json");
@@ -550,6 +556,9 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     const auto run = [&](rfdetr::RfdetrRuntimeBackend& selected, bool include_masks) {
         auto submission = selected.Run(input_buffer, annotations, {}, include_masks);
         selected.ReleaseAfterCompletion(std::move(submission));
+        CHECK(annotations[0].value_count == 0U);
+        REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+        annotations[0].SettleValueCount();
         CHECK(annotations[0].value_count == 2U);
         CHECK(annotations[0].class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot);
         CHECK(labels[0].item<int>() == 0);
@@ -948,7 +957,7 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     request.save_engine_path = root.path() / "model.engine";
     request.eval_order = "tensorrt";
     request.resolution = 8;
-    request.num_queries = request.eval_max_dets = 2;
+    request.candidate_count = request.eval_max_dets = 2;
     request.limit_images = 1;
     request.allow_fp16 = false;
     request.write_report_json = false;
@@ -958,6 +967,8 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
     const auto selected_digest = io::sha256_file(descriptor);
     const auto only = session.Run(request, command);
     CHECK(only.eval_order == std::vector<std::string>{"tensorrt"});
+    CHECK(only.limits.resolved_candidate_count == 2);
+    CHECK(only.limits.resolved_eval_max_dets == 2);
     CHECK(only.processed_images == 1U);
     CHECK(only.backends.at("tensorrt").artifacts.preset_name == "rf-detr-nano");
     CHECK(only.backends.at("tensorrt").artifacts.class_layout == layout);
@@ -974,6 +985,17 @@ TEST_CASE("Validation binds a consumed ONNX descriptor before TensorRT-only mate
         CHECK(mixed.backends.at("tensorrt").artifacts.class_layout == layout);
     }
     request.eval_order = "onnx";
+    {
+        auto automatic = request;
+        automatic.save_engine_path.clear();
+        automatic.candidate_count = 0;
+        automatic.eval_max_dets = 0;
+        const auto resolved = session.Run(automatic, command);
+        CHECK(resolved.limits.resolved_candidate_count == 300);
+        CHECK(resolved.limits.resolved_eval_max_dets == 500);
+        CHECK(resolved.backends.at("onnx").artifacts.config.num_select == 300);
+        CHECK(resolved.backends.at("onnx").artifacts.source_num_select == 300);
+    }
     for (const std::size_t population : {3U, 7U}) {
         request.limit_images = population;
         std::vector<std::uint32_t> chosen, captured;
@@ -1084,4 +1106,23 @@ TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[m
         CHECK_THROWS_AS(admission.Resolve(info.num_classes, info.class_layout, source.get_token()), rfdetr::ArtifactPublicationCancelled);
         CHECK_NOTHROW(admission.RequireUnchanged());
     }
+}
+
+TEST_CASE("Prediction counts settle at readback and retain exact device custody", "[model][rfdetr][prediction][gpu]") {
+    namespace runtime = mmltk::backend::ml::runtime;
+    std::shared_ptr<rfdetr::PredictionCountStorage> storage;
+    runtime::AnalysisAnnotationStorage output{.value_capacity = 4};
+    const auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, 0);
+    rfdetr::publish_prediction_count(storage, torch::tensor({2L}, options), output, 0);
+    CHECK(output.value_count == 0);
+    REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
+    output.SettleValueCount();
+    CHECK(output.value_count == 2);
+    const auto previous = output;
+    rfdetr::publish_prediction_count(storage, torch::tensor({0L}, options), output, 0);
+    REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
+    output.SettleValueCount();
+    CHECK(output.value_count == 0);
+    CHECK(*previous.completed_value_count == 2);
+    CHECK(previous.count_custody != output.count_custody);
 }

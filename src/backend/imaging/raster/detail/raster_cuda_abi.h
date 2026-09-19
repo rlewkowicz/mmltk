@@ -69,6 +69,8 @@ struct BoxLabelInputs {
     const std::uint8_t* colors = nullptr;
     const int* labels = nullptr;
     int instance_count = 0;
+    // Optional stream-ordered compact prefix; instance_count remains the storage bound.
+    const std::int64_t* device_instance_count = nullptr;
 };
 struct MaskBoxLabelInputs {
     const bool* masks = nullptr;
@@ -76,6 +78,8 @@ struct MaskBoxLabelInputs {
     const std::uint8_t* colors = nullptr;
     const int* labels = nullptr;
     int instance_count = 0;
+    // Optional stream-ordered compact prefix; instance_count remains the storage bound.
+    const std::int64_t* device_instance_count = nullptr;
 };
 struct MaskBoxLabelRgbLaunch {
     PackedImageU8 image;

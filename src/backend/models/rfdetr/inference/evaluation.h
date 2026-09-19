@@ -14,7 +14,7 @@ struct EvaluateRequest : ModelArtifactRequest, InferenceExecutionConfig {
     std::filesystem::path compiled_path;
     std::string backend = "auto";
     std::size_t limit_images = 0U;
-    std::size_t num_queries = 0U;
+    std::size_t candidate_count = 0U;
     std::size_t eval_max_dets = 0U;
     std::size_t batch_size = 1U;
     int lanes = 0;

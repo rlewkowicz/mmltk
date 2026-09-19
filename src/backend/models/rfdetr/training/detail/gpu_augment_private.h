@@ -11,28 +11,6 @@ namespace mmltk::backend::models::rfdetr {
 namespace test_support {
 struct GpuBatchAugmenterTestAccess;
 }
-class GpuBatchPreprocessor {
-   public:
-    GpuBatchPreprocessor(std::int64_t batch_capacity, int height, int width, int device_id, at::ScalarType output_type);
-    ~GpuBatchPreprocessor();
-    GpuBatchPreprocessor(const GpuBatchPreprocessor&) = delete;
-    GpuBatchPreprocessor& operator=(const GpuBatchPreprocessor&) = delete;
-    [[nodiscard]] torch::Tensor run(const mmltk::backend::data::Batch& batch, std::int64_t output_batch_size = 0);
-    void record_consumer(cudaStream_t stream);
-    [[nodiscard]] inline std::int64_t batch_capacity() const noexcept { return batch_capacity_; }
-    [[nodiscard]] inline at::ScalarType output_type() const noexcept { return output_type_; }
-
-   private:
-    torch::Tensor output_;
-    std::int64_t batch_capacity_ = 0;
-    int height_ = 0;
-    int width_ = 0;
-    int device_id_ = -1;
-    at::ScalarType output_type_ = at::kFloat;
-    cudaEvent_t consumer_complete_ = nullptr;
-    bool consumer_pending_ = false;
-    bool has_run_ = false;
-};
 class GpuBatchAugmenter {
    public:
     GpuBatchAugmenter(const GpuAugmentationConfig& config, std::int64_t batch_capacity, int height, int width, mmltk::frameworks::gpu::DeviceContext context);

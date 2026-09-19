@@ -153,6 +153,7 @@ struct PinnedBBoxPredictionBuffers {
     torch::Tensor scores_cpu;
     torch::Tensor labels_cpu;
     torch::Tensor boxes_cpu;
+    torch::Tensor counts_cpu;
     int64_t batch_capacity = 0;
     int64_t prediction_capacity = 0;
     void ensure_capacity(int64_t batch_count, int64_t prediction_count);
@@ -216,6 +217,7 @@ struct StagedBBoxPredictionBatch {
     torch::Tensor scores_cpu;
     torch::Tensor labels_cpu;
     torch::Tensor boxes_cpu;
+    torch::Tensor counts_cpu;
 };
 struct StagedMaskPredictionBatch {
     torch::Tensor masks_cpu;

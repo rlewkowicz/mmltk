@@ -6,6 +6,7 @@
 #include <mutex>
 #include <span>
 #include <stop_token>
+#include <stdexcept>
 #include <utility>
 #include "src/backend/ml/runtime/backend_factory.h"
 #include "src/backend/data/catalog/class_catalog.h"
@@ -64,6 +65,18 @@ struct AnalysisAnnotationStorage final {
     AnalysisRegion source_region{};
     std::size_t value_capacity = 0U;
     std::size_t value_count = 0U;
+    // A provider may produce a compact prefix asynchronously. Until settlement,
+    // value_count is zero and device consumers use capacity plus device_value_count.
+    const std::int64_t* device_value_count = nullptr;
+    const std::int64_t* completed_value_count = nullptr;
+    std::shared_ptr<void> count_custody{};
+    void SettleValueCount() {
+        if (!completed_value_count) return;
+        const auto count = *completed_value_count;
+        if (count < 0 || static_cast<std::uint64_t>(count) > value_capacity)
+            throw std::runtime_error("analysis survivor count exceeds output capacity");
+        value_count = static_cast<std::size_t>(count);
+    }
     AnalysisDeviceBuffer boxes_xyxy{};
     AnalysisDeviceBuffer class_references{};
     AnalysisDeviceBuffer confidences{};

@@ -1079,8 +1079,6 @@ TEST_CASE("perceptual donor reductions preserve mask box and class support", "[b
         CHECK(outside_pixels[mode] > 0);
     }
 }
-}  // namespace
-}  // namespace mmltk::backend::models::rfdetr
 TEST_CASE("continuous augmentation boxes survive independent and empty mask support", "[backend][rfdetr][augmentation][support]") {
     using mmltk::backend::data::PackedInstance;
     using mmltk::backend::data::RLEPair;
@@ -1111,3 +1109,5 @@ TEST_CASE("continuous augmentation boxes survive independent and empty mask supp
         CHECK(vanished_mask.output_area == 0);
     }
 }
+}  // namespace
+}  // namespace mmltk::backend::models::rfdetr

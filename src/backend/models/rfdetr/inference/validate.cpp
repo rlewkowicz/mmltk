@@ -58,8 +58,8 @@ struct AlignmentSample final {
     predict.compiled_path = request.compiled_path;
     predict.backend = artifact.backend_name;
     predict.batch_size = request.batch_size;
-    predict.max_dets_per_image = request.num_queries == 0U ? 500U : request.num_queries;
-    const auto evaluation_cap = std::min(predict.max_dets_per_image, request.eval_max_dets == 0U ? predict.max_dets_per_image : request.eval_max_dets);
+    predict.max_dets_per_image = request.candidate_count;
+    const auto evaluation_cap = resolve_evaluation_max_dets(request.eval_max_dets);
     predict.output_path = request.report_json_path.empty() ? request.compiled_path.parent_path() / "validation_predictions.json" : request.report_json_path;
     predict.progress_bar = request.log_mode == ValidationLogMode::Interactive;
     predict.limit_images = request.limit_images;
@@ -164,13 +164,13 @@ struct AlignmentSample final {
         if (!predictions.cancelled) throw std::logic_error("validation did not admit an evaluator");
         // Cancellation can win between selected-backend admission and Begin.
         // No matching has occurred, so this backend has no available metrics.
-        result.summary.model_detection_budget = static_cast<std::uint32_t>(predict.max_dets_per_image);
+        result.summary.model_detection_budget = static_cast<std::uint32_t>(predictions.candidate_count);
         result.timing = predictions.timing;
         return result;
     }
     if (predictions.cancelled) dataset->limit_images(predictions.processed_images);
     result.summary = dataset->evaluate(evaluation_cap, EvaluationDetailRetention::Detailed);
-    result.summary.model_detection_budget = static_cast<std::uint32_t>(predict.max_dets_per_image);
+    result.summary.model_detection_budget = static_cast<std::uint32_t>(predictions.candidate_count);
     result.details = dataset->take_details();
     result.class_catalog = dataset->class_catalog();
     result.timing = predictions.timing;
@@ -385,10 +385,9 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
     result.images = population;
     result.categories = loader->num_classes();
     result.limits.persisted_max_instances_per_image = loader->max_instances_per_image();
-    result.limits.resolved_num_queries = options.num_queries == 0U ? 500U : options.num_queries;
-    result.limits.resolved_eval_max_dets =
-        std::min(result.limits.resolved_num_queries, options.eval_max_dets == 0U ? result.limits.resolved_num_queries : options.eval_max_dets);
-    result.limits.num_queries_automatic = options.num_queries == 0U;
+    result.limits.resolved_candidate_count = options.candidate_count;
+    result.limits.resolved_eval_max_dets = resolve_evaluation_max_dets(options.eval_max_dets);
+    result.limits.candidate_count_automatic = options.candidate_count == 0U;
     result.limits.eval_max_dets_automatic = options.eval_max_dets == 0U;
     std::vector<std::optional<AlignmentSample>> onnx_predictions;
     std::vector<std::optional<AlignmentSample>> tensorrt_predictions;
@@ -409,6 +408,7 @@ ValidationRunResult ValidationSession::State::Run(ValidateRequest& options, cons
         }
         result.backends.emplace(artifact.backend_name, evaluate_backend(backend_request, artifact, *loader, dataset, For(artifact.kind), captured_result,
                                                                         command_stream, delivery, samples));
+        result.limits.resolved_candidate_count = result.backends.at(artifact.backend_name).summary.model_detection_budget;
     }
     if (const auto onnx = result.backends.find("onnx"); onnx != result.backends.end()) {
         if (const auto trt = result.backends.find("tensorrt"); trt != result.backends.end()) {
