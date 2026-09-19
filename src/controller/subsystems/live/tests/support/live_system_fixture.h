@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -43,9 +44,11 @@ class TestLiveAlgorithm final : public LiveAlgorithm {
 };
 [[nodiscard]] inline VisualRuntimeFactory test_live_runtime_factory(std::shared_ptr<FakeImageBackend> backend,
                                                                     std::shared_ptr<std::atomic<std::uint64_t>> captures,
-                                                                    std::shared_ptr<std::atomic_bool> token_changed = {}) {
+                                                                    std::shared_ptr<std::atomic_bool> token_changed = {},
+                                                                    const std::size_t output_buffer_count = 2U) {
     return RuntimeFactory(
         0, std::move(backend), mmltk::frameworks::gpu::ImageProductLayout::Clean,
-        [captures = std::move(captures), token_changed = std::move(token_changed)] { return std::make_unique<TestLiveAlgorithm>(captures, token_changed); });
+        [captures = std::move(captures), token_changed = std::move(token_changed)] { return std::make_unique<TestLiveAlgorithm>(captures, token_changed); },
+        output_buffer_count);
 }
 }  // namespace mmltk::controller::visual_test_support

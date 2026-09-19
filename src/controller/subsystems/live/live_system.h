@@ -36,6 +36,7 @@ class LiveAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
     virtual void Start(const LiveStart&) = 0;
     virtual void SetOutputAvailableSink(std::function<void()>) = 0;
     [[nodiscard]] virtual bool AcquireOutput() = 0;
+    // Success replaces every active RGBA pixel and settles receiver writes before returning.
     [[nodiscard]] virtual bool Capture(mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream, std::stop_token) = 0;
     virtual void Stop() noexcept = 0;
 };

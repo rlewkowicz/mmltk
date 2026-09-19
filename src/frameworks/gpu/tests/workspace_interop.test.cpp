@@ -1159,6 +1159,270 @@ TEST_CASE("Workspace transfer routes preserve independent source and receiver pi
         }
     }
 }
+TEST_CASE("Cross-device display damage copies cropped planes and matches complete raw composition", "[gpu][workspace][copy]") {
+    using test_support::ImageWorkspaceTestAccess;
+    const bool peer = GENERATE(false, true);
+    const bool semantic = GENERATE(false, true);
+    CAPTURE(peer, semantic);
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->peer_access = peer;
+    backend->pitch_padding_bytes = 13U;
+    DeviceContext producer(0, backend), receiver(1, backend);
+    ImageStream source_stream(producer), receiver_stream(receiver);
+    const auto product_layout = semantic ? ImageProductLayout::CleanAndSemantic : ImageProductLayout::Clean;
+    ImageProductBuffer source(producer, product_layout), full_copy(receiver, product_layout);
+    auto layout = ImageWorkspaceTestAccess::Layout();
+    layout.offset_bytes = 128U;
+    auto workspace = ImageWorkspaceTestAccess::Create(receiver, layout);
+    workspace->Admit(workspace->identity(), layout.device_incarnation);
+    const auto display = workspace->plane(4U, 3U);
+    std::memset(reinterpret_cast<void*>(display.data - layout.offset_bytes), 219, layout.required_allocation_bytes);
+    std::array<std::array<std::uint8_t, 48U>, 2U> pixels{};
+    for (std::size_t plane = 0; plane != pixels.size(); ++plane)
+        for (std::size_t byte = 0; byte != pixels[plane].size(); ++byte)
+            pixels[plane][byte] = byte % 4U == 3U ? (plane == 0U ? 113U : 255U) : static_cast<std::uint8_t>(byte + plane * 53U);
+    std::uint32_t width = 4U, height = 3U;
+    const auto publish = [&] {
+        source.Publish(source_stream, width, height, [&](auto clean, auto overlay, auto) {
+            for (const auto plane : {clean, overlay}) {
+                if (!plane.valid()) continue;
+                const auto index = plane.descriptor.kind == ImagePlaneKind::Clean ? 0U : 1U;
+                for (std::uint32_t y = 0; y != height; ++y)
+                    std::memcpy(reinterpret_cast<std::byte*>(plane.data) + y * plane.descriptor.pitch_bytes,
+                                pixels[index].data() + y * 16U, width * 4U);
+            }
+        });
+    };
+    const auto finalizer = test_support::FakeWorkspaceFinalizer(backend);
+    const auto compare = [&] {
+        backend->record_transfers = false;
+        static_cast<void>(full_copy.CopyFrom(receiver_stream, source.Borrow()));
+        auto complete = full_copy.Borrow();
+        std::array<std::uint8_t, 192U> reference{};
+        auto target = display;
+        target.data = reinterpret_cast<CUdeviceptr>(reference.data());
+        target.descriptor.width = width;
+        target.descriptor.height = height;
+        finalizer(complete.plane(0U).plane(), semantic ? complete.plane(1U).plane() : ImagePlaneView{}, target, {}, 0U);
+        for (std::uint32_t y = 0; y != height; ++y) {
+            const auto* actual = reinterpret_cast<const std::uint8_t*>(display.data) + y * display.descriptor.pitch_bytes;
+            for (std::uint32_t x = 0; x != width * 4U; ++x) {
+                CHECK(actual[x] == reference[y * target.descriptor.pitch_bytes + x]);
+                CHECK(actual[x] == pixels[semantic ? 1U : 0U][y * 16U + x]);
+                for (std::size_t plane = 0; plane != complete.plane_count(); ++plane) {
+                    const auto raw = complete.plane(plane).plane();
+                    CHECK(*(reinterpret_cast<const std::uint8_t*>(raw.data) + y * raw.descriptor.pitch_bytes + x) == pixels[plane][y * 16U + x]);
+                }
+            }
+        }
+        const auto* allocation = reinterpret_cast<const std::uint8_t*>(display.data - layout.offset_bytes);
+        for (std::size_t offset = 0; offset != layout.required_allocation_bytes; ++offset) {
+            if (offset >= layout.offset_bytes && offset < layout.offset_bytes + layout.pitch_bytes * 3U &&
+                (offset - layout.offset_bytes) % layout.pitch_bytes < 16U) continue;
+            CHECK(allocation[offset] == 219U);
+        }
+    };
+    std::array<CUdeviceptr, 2U> receiver_bases{};
+    const auto finalize = [&](ImageWorkspaceCoverage coverage, const std::size_t expected_bytes,
+                              std::span<const ImageWorkspaceRegion> expected_regions = {}) {
+        std::array<ImagePlaneView, 2U> originals{};
+        {
+            const auto read = source.Borrow();
+            for (std::size_t index = 0U; index != read.plane_count(); ++index) originals[index] = read.plane(index).plane();
+        }
+        const std::array<ImageWorkspaceRegion, 1U> whole{{{0, 0, static_cast<int>(width), static_cast<int>(height)}}};
+        if (expected_regions.empty() && expected_bytes != 0U) expected_regions = whole;
+        backend->record_transfers = true;
+        static_cast<void>(backend->TakeTransfers());
+        workspace->Finalize(source.Borrow(), coverage, finalizer);
+        REQUIRE(workspace->revision() == source.revision());
+        const auto transfers = backend->TakeTransfers();
+        std::size_t downloaded = 0U, uploaded = 0U;
+        std::size_t source_index = 0U, destination_index = 0U;
+        const auto check_view = [&](ImagePlaneView view, const bool input, std::size_t& ordinal) {
+            REQUIRE_FALSE(expected_regions.empty());
+            const auto plane_index = ordinal / expected_regions.size();
+            const auto region = expected_regions[ordinal++ % expected_regions.size()];
+            CHECK(view.descriptor.width == static_cast<std::uint32_t>(region.x2 - region.x1));
+            CHECK(view.descriptor.height == static_cast<std::uint32_t>(region.y2 - region.y1));
+            REQUIRE(plane_index < (semantic ? 2U : 1U));
+            if (!input && receiver_bases[plane_index] == 0U) receiver_bases[plane_index] = view.data;
+            const auto base = input ? originals[plane_index].data : receiver_bases[plane_index];
+            CHECK(view.data == base + static_cast<std::size_t>(region.y1) * view.descriptor.pitch_bytes + static_cast<std::size_t>(region.x1) * 4U);
+        };
+        for (const auto& transfer : transfers) {
+            CHECK(transfer.path == (peer ? ImageCopyPath::Peer : ImageCopyPath::PinnedStaging));
+            if (transfer.source.valid()) {
+                check_view(transfer.source, true, source_index);
+                downloaded += transfer.source.descriptor.row_bytes() * transfer.source.descriptor.height;
+                CHECK(transfer.source.descriptor.pitch_bytes == 29U);
+            }
+            if (transfer.destination.valid()) {
+                check_view(transfer.destination, false, destination_index);
+                uploaded += transfer.destination.descriptor.row_bytes() * transfer.destination.descriptor.height;
+                CHECK(transfer.destination.descriptor.pitch_bytes == (semantic ? 45U : 64U));
+            }
+        }
+        CHECK(downloaded == expected_bytes * (semantic ? 2U : 1U));
+        CHECK(uploaded == downloaded);
+        CHECK(source_index == expected_regions.size() * (semantic ? 2U : 1U));
+        CHECK(destination_index == source_index);
+        compare();
+    };
+    publish();
+    backend->pitch_padding_bytes = 29U;
+    finalize({}, 48U);
+    const auto warm = workspace->StorageFootprint();
+    const std::array<ImageWorkspaceRegion, 2U> disjoint{{{0, 0, 1, 1}, {3, 2, 9, 7}}};
+    auto baseline = workspace->Content();
+    for (auto& plane : pixels) {
+        plane[0] = 99U;
+        plane[44] = 171U;
+    }
+    publish();
+    const std::array<ImageWorkspaceRegion, 2U> copied_disjoint{{{0, 0, 1, 1}, {3, 2, 4, 3}}};
+    finalize({workspace->identity(), disjoint, false, baseline}, 8U, copied_disjoint);
+    CHECK(workspace->StorageFootprint().device_bytes == warm.device_bytes);
+    CHECK(workspace->StorageFootprint().pinned_bytes == warm.pinned_bytes);
+    baseline = workspace->Content();
+    publish();
+    finalize({workspace->identity(), {}, false, baseline}, 0U);
+    baseline = workspace->Content();
+    const std::array<ImageWorkspaceRegion, 2U> clipped{{{-7, -4, 2, 1}, {9, 9, 12, 12}}};
+    for (auto& plane : pixels) plane[4] = 81U;
+    publish();
+    const std::array<ImageWorkspaceRegion, 1U> copied_clipped{{{0, 0, 2, 1}}};
+    finalize({workspace->identity(), clipped, false, baseline}, 8U, copied_clipped);
+    baseline = workspace->Content();
+    width = 2U;
+    height = 2U;
+    publish();
+    finalize({workspace->identity(), {}, false, baseline}, 0U);
+    baseline = workspace->Content();
+    width = 4U;
+    height = 3U;
+    publish();
+    finalize({workspace->identity(), {}, false, baseline}, 48U);
+    for (const int invalid : {0, 1, 2}) {
+        baseline = workspace->Content();
+        if (invalid == 1) ++baseline.owner;
+        if (invalid == 2) ++baseline.revision;
+        publish();
+        finalize({workspace->identity() + (invalid == 0 ? 1U : 0U), {}, false, baseline}, 48U);
+    }
+    baseline = workspace->Content();
+    publish();
+    backend->FailAfter(FakeImageBackend::FailurePoint::Copy, peer ? 1U : 2U);
+    CHECK_THROWS(workspace->Finalize(source.Borrow(), {workspace->identity(), disjoint, false, baseline}, finalizer));
+    CHECK_FALSE(workspace->Content().valid());
+    finalize({workspace->identity(), disjoint, false, baseline}, 48U);
+    CHECK(workspace->Settle().completion_reached);
+}
+TEST_CASE("Alternating displays accumulate skipped damage and recover from history overflow", "[gpu][workspace][copy]") {
+    using test_support::ImageWorkspaceTestAccess;
+    const bool peer = GENERATE(false, true);
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->peer_access = peer;
+    DeviceContext producer(0, backend), display(1, backend);
+    ImageStream stream(producer);
+    ImageProductBuffer product(producer, ImageProductLayout::CleanAndSemantic);
+    std::array<std::shared_ptr<ImageWorkspace>, 2U> workspaces;
+    for (auto& workspace : workspaces) {
+        workspace = ImageWorkspaceTestAccess::Create(display, ImageWorkspaceTestAccess::Layout());
+        workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    }
+    ImageWorkspaceDamage history;
+    std::array<std::uint8_t, 48U> expected{};
+    const auto content = [&] {
+        const auto read = product.Borrow();
+        return ImageWorkspaceContent{read.plane(0U).plane().allocation.owner, read.plane(0U).revision()};
+    };
+    const auto compose = test_support::FakeWorkspaceFinalizer(backend);
+    const auto present = [&](std::size_t slot, bool full) {
+        auto& workspace = workspaces[slot];
+        const auto coverage = history.Since(workspace->Content(), content(), workspace->identity());
+        CHECK(coverage.full_image == full);
+        workspace->Finalize(product.Borrow(), coverage, compose);
+        REQUIRE(workspace->Content() == content());
+        const auto plane = workspace->plane(4U, 3U);
+        for (std::size_t y = 0U; y != 3U; ++y)
+            for (std::size_t x = 0U; x != 16U; ++x)
+                CHECK(*(reinterpret_cast<const std::uint8_t*>(plane.data) + y * plane.descriptor.pitch_bytes + x) == expected[y * 16U + x]);
+    };
+    product.Publish(stream, 4U, 3U, [](auto clean, auto semantic, auto) {
+        for (const auto plane : {clean, semantic})
+            std::memset(reinterpret_cast<void*>(plane.data), 0, plane.descriptor.pitch_bytes * plane.descriptor.height);
+    });
+    history.Record(content(), {});
+    present(0U, true);
+    present(1U, true);
+    const std::array<ImageWorkspaceRegion, 1U> region{{{1, 1, 2, 2}}};
+    const auto change = [&](std::uint8_t value) {
+        const auto baseline = content();
+        expected[20U] = value;
+        product.Publish(stream, 4U, 3U, [value](auto clean, auto, auto) {
+            *(reinterpret_cast<std::uint8_t*>(clean.data) + clean.descriptor.pitch_bytes + 4U) = value;
+        });
+        history.Record(content(), {.regions = region, .full_image = false, .baseline = baseline});
+    };
+    change(37U);
+    present(0U, false);
+    change(73U);
+    present(1U, false);
+    change(99U);
+    present(0U, false);
+    for (std::uint8_t value = 100U; value != 170U; ++value) change(value);
+    present(1U, true);
+    present(0U, true);
+    change(201U);
+    present(1U, false);
+}
+TEST_CASE("Partial display copies retain raw reads until transfer settlement and scratch until finalization", "[gpu][workspace][copy]") {
+    using test_support::ImageWorkspaceTestAccess;
+    const bool peer = GENERATE(false, true);
+    ImageWorkspaceTestAccess::Reset();
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->peer_access = peer;
+    SystemImageRuntime source({.device = 0, .backend = backend, .output_layout = ImageProductLayout::CleanAndSemantic});
+    auto workspace = ImageWorkspaceTestAccess::CreateAdmitted(backend, ImageWorkspaceTestAccess::Layout());
+    const auto publish = [&] {
+        source.Publish(4U, 3U, [](auto clean, auto semantic, auto) {
+            for (const auto plane : {clean, semantic})
+                std::memset(reinterpret_cast<void*>(plane.data), 0, plane.descriptor.pitch_bytes * plane.descriptor.height);
+        });
+    };
+    const auto finalize = test_support::FakeWorkspaceFinalizer(backend);
+    publish();
+    workspace->Finalize(source.Borrow(), {}, finalize);
+    const auto baseline = workspace->Content();
+    publish();
+    auto blocked = backend->HoldStreamSettlements("partial display receiver settlement");
+    backend->defer_notifications = true;
+    auto copying = std::async(std::launch::async, [&] {
+        const std::array<ImageWorkspaceRegion, 1U> region{{{1, 1, 2, 2}}};
+        workspace->Finalize(source.Borrow(), {workspace->identity(), region, false, baseline}, finalize);
+    });
+    mmltk::testsupport::ScopedTestCleanup release{[&] { blocked->Release(); }};
+    REQUIRE(blocked->WaitEntered(std::chrono::seconds{2}));
+    auto completed = source.Completed();
+    CHECK_FALSE(source.TryAcquireOutput(completed).valid());
+    blocked->Release();
+    mmltk::testsupport::await_test_future(copying, "partial display receiver copy");
+    CHECK(workspace->ObserveAccess().completion_pending);
+    CHECK_FALSE(workspace->Contains(baseline));
+    CHECK_FALSE(workspace->ReserveWrite());
+    CHECK(backend->planes_freed == 0U);
+    // This source is deliberately unattached: its read ends at receiver copy
+    // settlement, while the independent workspace still retains its scratch.
+    CHECK(source.TryAcquireOutput(completed).valid());
+    backend->CompleteNotifications();
+    const auto settled = workspace->Settle();
+    REQUIRE(settled.completion_reached);
+    REQUIRE_FALSE(settled.failure);
+    CHECK_FALSE(workspace->ObserveAccess().completion_pending);
+}
 TEST_CASE("Workspace layout rejects overflow and inconsistent subresource bounds", "[gpu][workspace]") {
     ImageWorkspaceLayout layout{.device_incarnation = 7U,
                                 .device_uuid = {1U},
@@ -1196,12 +1460,15 @@ TEST_CASE("Workspace layout rejects overflow and inconsistent subresource bounds
 }
 TEST_CASE("Late workspace admission preserves raw storage then aliases the next clean publication", "[gpu][workspace][hardware]") {
     if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    const int source_device = GENERATE(0, 1);
+    if (source_device >= mmltk::testsupport::checked_cuda_device_count()) SKIP("second CUDA device unavailable");
+    CAPTURE(source_device);
     REQUIRE(cuInit(0U) == CUDA_SUCCESS);
-    auto allocation = std::make_unique<test_support::VulkanWorkspaceFixture>(0, 4U, 3U);
+    auto allocation = std::make_unique<test_support::VulkanWorkspaceFixture>(source_device, 4U, 3U);
     auto layout = allocation->layout();
     std::size_t finalizations = 0U;
     bool fail_finalization = false;
-    SystemImageRuntimeConfig config{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop};
+    SystemImageRuntimeConfig config{.device = source_device, .context_mode = DeviceContextMode::PrimaryInterop};
     config.workspace_finalize = [&](ImagePlaneView clean, ImagePlaneView, ImagePlaneView destination, ImageWorkspaceCoverage coverage, std::uintptr_t stream) {
         CHECK(coverage.full_image);
         ++finalizations;
@@ -1218,7 +1485,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
         if (fail_finalization) throw std::runtime_error("injected finalization failure after submission");
     };
     SystemImageRuntime runtime(std::move(config));
-    DeviceContext display(0, cuda_image_copy_backend());
+    DeviceContext display(source_device, cuda_image_copy_backend());
     const auto fill = [](ImagePlaneView clean, ImagePlaneView, std::uintptr_t stream) {
         REQUIRE(cuMemsetD2D8Async(clean.data, clean.descriptor.pitch_bytes, 37U, clean.descriptor.row_bytes(), clean.descriptor.height,
                                   reinterpret_cast<CUstream>(stream)) == CUDA_SUCCESS);
@@ -1283,7 +1550,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     CHECK_FALSE(runtime.BorrowWorkspace().valid());
     const auto grown_raw = runtime.Borrow().plane(0U).plane().data;
     const auto grown_revision = runtime.OutputFacts().revision;
-    allocation = std::make_unique<test_support::VulkanWorkspaceFixture>(0, 8U, 3U);
+    allocation = std::make_unique<test_support::VulkanWorkspaceFixture>(source_device, 8U, 3U);
     layout = allocation->layout();
     auto wrong_device = layout;
     wrong_device.device_uuid[0U] ^= 1U;
@@ -1306,17 +1573,97 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
     CHECK(finalizations == 3U);
     if (mmltk::testsupport::checked_cuda_device_count() > 1) {
-        test_support::VulkanWorkspaceFixture remote_allocation(1, 8U, 3U);
+        test_support::VulkanWorkspaceFixture remote_allocation(1 - source_device, 8U, 3U);
         const auto remote_layout = remote_allocation.layout();
-        auto remote = ImageWorkspace::Create(DeviceContext(1, cuda_image_copy_backend()), remote_layout);
+        auto remote = ImageWorkspace::Create(DeviceContext(1 - source_device, cuda_image_copy_backend()), remote_layout);
         REQUIRE(remote->QueueAllocation(remote_allocation.Export()));
         remote->Admit(remote->identity(), remote_layout.device_incarnation);
         prepare(remote);
-        CHECK(runtime.BorrowWorkspace().layout().device == 1);
+        CHECK(runtime.BorrowWorkspace().layout().device == 1 - source_device);
         CHECK(runtime.Borrow().plane(0U).plane().data == grown_raw);
         CHECK(finalizations == 3U);
         CHECK(remote->StorageFootprint().device_bytes == remote->allocation_bytes());
     }
+}
+TEST_CASE("Display damage transfers preserve complete pixels in both physical device directions", "[gpu][workspace][hardware][copy]") {
+    if (mmltk::testsupport::checked_cuda_device_count() < 2) SKIP("two CUDA devices required for display transfer");
+    const int source_device = GENERATE(0, 1);
+    const bool semantic = GENERATE(false, true);
+    const int display_device = 1 - source_device;
+    auto backend = cuda_image_copy_backend();
+    CAPTURE(source_device, display_device, semantic);
+    INFO("peer route available: " << backend->CanAccessPeer(display_device, source_device));
+    DeviceContext producer(source_device, backend), display(display_device, backend);
+    ImageStream stream(producer);
+    ImageProductBuffer product(producer, semantic ? ImageProductLayout::CleanAndSemantic : ImageProductLayout::Clean);
+    test_support::VulkanWorkspaceFixture allocation(display_device, 4U, 3U);
+    auto workspace = ImageWorkspace::Create(display, allocation.layout());
+    REQUIRE(workspace->QueueAllocation(allocation.Export()));
+    workspace->Admit(workspace->identity(), workspace->layout().device_incarnation);
+    const auto finalize = [](ImagePlaneView clean, ImagePlaneView overlay, ImagePlaneView target, ImageWorkspaceCoverage coverage, std::uintptr_t execution) {
+        const auto input = overlay.valid() ? overlay : clean;
+        const auto copy_region = [&](ImageWorkspaceRegion region) {
+            CUDA_MEMCPY2D copy{};
+            copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            copy.srcDevice = input.data;
+            copy.srcPitch = input.descriptor.pitch_bytes;
+            copy.srcXInBytes = static_cast<std::size_t>(region.x1) * 4U;
+            copy.srcY = static_cast<std::size_t>(region.y1);
+            copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+            copy.dstDevice = target.data;
+            copy.dstPitch = target.descriptor.pitch_bytes;
+            copy.dstXInBytes = copy.srcXInBytes;
+            copy.dstY = copy.srcY;
+            copy.WidthInBytes = static_cast<std::size_t>(region.x2 - region.x1) * 4U;
+            copy.Height = static_cast<std::size_t>(region.y2 - region.y1);
+            REQUIRE(cuMemcpy2DAsync(&copy, reinterpret_cast<CUstream>(execution)) == CUDA_SUCCESS);
+        };
+        if (coverage.full_image)
+            copy_region({0, 0, 4, 3});
+        else
+            for (const auto region : coverage.regions) copy_region(region);
+    };
+    const auto publish = [&](bool changed) {
+        producer.Bind();
+        product.Publish(stream, 4U, 3U, [&](auto clean, auto overlay, auto execution) {
+            for (const auto plane : {clean, overlay}) {
+                if (!plane.valid()) continue;
+                const unsigned char base = plane.descriptor.kind == ImagePlaneKind::Clean ? 37U : 91U;
+                REQUIRE(cuMemsetD2D8Async(plane.data, plane.descriptor.pitch_bytes, base, 16U, 3U, reinterpret_cast<CUstream>(execution)) == CUDA_SUCCESS);
+                if (changed)
+                    REQUIRE(cuMemsetD2D8Async(plane.data + plane.descriptor.pitch_bytes + 4U, plane.descriptor.pitch_bytes, 173U, 8U, 1U,
+                                             reinterpret_cast<CUstream>(execution)) == CUDA_SUCCESS);
+            }
+        });
+    };
+    const auto check = [&](bool changed) {
+        const auto settled = workspace->Settle();
+        REQUIRE(settled.completion_reached);
+        REQUIRE_FALSE(settled.failure);
+        REQUIRE(workspace->revision() == product.revision());
+        display.Bind();
+        std::array<std::uint8_t, 48U> bytes{};
+        const auto plane = workspace->plane(4U, 3U);
+        CUDA_MEMCPY2D read{};
+        read.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+        read.srcDevice = plane.data;
+        read.srcPitch = plane.descriptor.pitch_bytes;
+        read.dstMemoryType = CU_MEMORYTYPE_HOST;
+        read.dstHost = bytes.data();
+        read.dstPitch = read.WidthInBytes = 16U;
+        read.Height = 3U;
+        REQUIRE(cuMemcpy2D(&read) == CUDA_SUCCESS);
+        for (std::size_t index = 0U; index != bytes.size(); ++index)
+            CHECK(bytes[index] == (changed && index >= 20U && index < 28U ? 173U : semantic ? 91U : 37U));
+    };
+    publish(false);
+    workspace->Finalize(product.Borrow(), {}, finalize);
+    check(false);
+    const auto baseline = workspace->Content();
+    publish(true);
+    const std::array<ImageWorkspaceRegion, 1U> region{{{1, 1, 3, 2}}};
+    workspace->Finalize(product.Borrow(), {workspace->identity(), region, false, baseline}, finalize);
+    check(true);
 }
 TEST_CASE("Asynchronous workspace finalization retains raw custody until the owner settles its notification", "[gpu][workspace]") {
     using test_support::ImageWorkspaceTestAccess;

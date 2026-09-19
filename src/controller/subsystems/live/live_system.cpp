@@ -157,8 +157,8 @@ class LiveSystem::Impl final {
         if (!candidate.valid()) return {};
         if (!algorithm->AcquireOutput()) return {};
         bool captured = false;
-        runtime.Publish(candidate, request_.extent.width, request_.extent.height,
-                        [&](const auto target, const auto, const auto stream) { captured = algorithm->Capture(target, stream, run_stop); });
+        runtime.PublishRetained(candidate, request_.extent.width, request_.extent.height,
+                                [&](const auto target, const auto, const auto stream) { captured = algorithm->Capture(target, stream, run_stop); });
         if (!captured || run_stop.stop_requested()) {
             static_cast<void>(worker_.NotifyContinuation());
             return {};

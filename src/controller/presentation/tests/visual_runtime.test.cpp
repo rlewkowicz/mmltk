@@ -676,7 +676,7 @@ TEST_CASE("visual continuations coalesce behind the newest replaceable input") {
     std::atomic_uint64_t wake_again{0U};
     std::atomic_bool reserved{false}, failed_try{false};
     mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput baseline;
-    detail::VisualRuntimeOwner retry_owner{test_live_runtime_factory(backend, captures), [](std::exception_ptr) {},
+    detail::VisualRuntimeOwner retry_owner{test_live_runtime_factory(backend, captures, {}, 1U), [](std::exception_ptr) {},
                                            [&](detail::VisualRuntimeOwner::ActivityStage stage, std::uint64_t value) noexcept {
                                                if (stage == detail::VisualRuntimeOwner::ActivityStage::CycleFinalized) {
                                                    wake_again.store(value, std::memory_order_release);

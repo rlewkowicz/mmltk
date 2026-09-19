@@ -659,8 +659,7 @@ void ImageWorkspace::Finalize(BorrowedImageProductReadView source, ImageWorkspac
                 if (index == 0U) storage->AdoptExternalPlane(state_->allocation, allocation_bytes(), destination);
                 transfer = std::move(storage);
             }
-            static_cast<void>(transfer->CopyFrom(*execution, std::move(source)));
-            source = transfer->Borrow();
+            source = transfer->CopyDisplayFrom(*execution, std::move(source), coverage);
             state_->context->Bind();
         }
         const auto input = source.plane(0U).plane();

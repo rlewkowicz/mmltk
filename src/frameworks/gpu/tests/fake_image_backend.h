@@ -171,6 +171,16 @@ inline void CopyImagePlane(const ImagePlaneView destination, const ImagePlaneVie
 }
 class FakeImageBackend final : public ImageCopyBackend {
    public:
+    struct Transfer final {
+        ImageCopyPath path;
+        ImagePlaneView source, destination;
+    };
+    // Opt-in descriptor evidence, independent of production diagnostics.
+    bool record_transfers = false;
+    [[nodiscard]] std::vector<Transfer> TakeTransfers() {
+        std::scoped_lock lock(mutex_);
+        return std::exchange(transfers_, {});
+    }
     [[nodiscard]] std::optional<DeviceExecution> ResolveExecution(int, int) override { return {}; }
     enum class FailurePoint : std::uint8_t {
         None,
@@ -380,6 +390,7 @@ class FakeImageBackend final : public ImageCopyBackend {
     void CopyPeer(std::uintptr_t, std::uintptr_t, int, const ImagePlaneView& destination, std::uintptr_t, int, const ImagePlaneView& source) override {
         MaybeFail(FailurePoint::Copy);
         CopyImagePlane(destination, source);
+        RecordTransfer({ImageCopyPath::Peer, source, destination});
         ++peer_copies;
     }
     void CopyDeviceToHost(std::uintptr_t, const ImagePlaneView& source, void* const destination, const std::size_t destination_pitch) override {
@@ -388,6 +399,7 @@ class FakeImageBackend final : public ImageCopyBackend {
             std::memcpy(static_cast<std::byte*>(destination) + row * destination_pitch,
                         reinterpret_cast<const std::byte*>(source.data) + row * source.descriptor.pitch_bytes, source.descriptor.row_bytes());
         }
+        RecordTransfer({ImageCopyPath::PinnedStaging, source, {}});
         ++staged_downloads;
     }
     void CopyHostToDevice(std::uintptr_t, std::uintptr_t, const void* const source, const std::size_t source_pitch,
@@ -397,6 +409,7 @@ class FakeImageBackend final : public ImageCopyBackend {
             std::memcpy(reinterpret_cast<std::byte*>(destination.data) + row * destination.descriptor.pitch_bytes,
                         static_cast<const std::byte*>(source) + row * source_pitch, destination.descriptor.row_bytes());
         }
+        RecordTransfer({ImageCopyPath::PinnedStaging, {}, destination});
         ++staged_uploads;
     }
     void RecordEvent(std::uintptr_t, std::uintptr_t, const std::uintptr_t event) override {
@@ -458,6 +471,13 @@ class FakeImageBackend final : public ImageCopyBackend {
     }
 
    private:
+    void RecordTransfer(Transfer transfer) {
+        if (!record_transfers) return;
+        std::scoped_lock lock(mutex_);
+        transfers_.push_back(transfer);
+    }
+    std::vector<Transfer> transfers_;
+
     void CheckDeviceBinding(const std::uintptr_t context) {
         std::scoped_lock lock(mutex_);
         const auto found = devices_.find(context);

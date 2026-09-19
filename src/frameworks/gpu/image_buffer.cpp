@@ -1063,7 +1063,7 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFrom(ImageStream& stream, 
 }
 std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream, BorrowedImageProductReadView source, MissingPlaneSubmit initialize_missing,
                                                              const std::uint64_t revision, const bool preserve_clean,
-                                                             const ImagePlanePreservation preservation) {
+                                                             const ImagePlanePreservation preservation, const ImageWorkspaceCoverage* display_coverage) {
     if (!source.valid() || (source.plane_count() < state_->plane_count_ && !initialize_missing))
         throw std::invalid_argument("source image product lacks a receiver plane");
     if (source.lease_->product == state_) throw std::invalid_argument("an image product cannot copy from itself");
@@ -1110,27 +1110,68 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
             auto& receiver = *state_->planes_[index]->state_;
             const ImagePlaneView source_plane = source.planes_[index].plane();
             receiver.EnsurePlane(source_plane.descriptor.kind, source_plane.descriptor.width, source_plane.descriptor.height);
-            if (receiver_device == source_device) {
-                reads_submitted = true;
-                backend.CopySameDevice(state_->context_.state_->context, stream.native_handle(), receiver.plane, source_product.context_.state_->context,
-                                       source_plane);
-                paths[index] = ImageCopyPath::SameDevice;
-            } else if (!staged) {
-                reads_submitted = true;
-                backend.CopyPeer(state_->context_.state_->context, stream.native_handle(), receiver_device, receiver.plane,
-                                 source_product.context_.state_->context, source_device, source_plane);
-                paths[index] = ImageCopyPath::Peer;
-            } else {
-                const std::size_t row_bytes = source_plane.descriptor.row_bytes();
-                if (source_plane.descriptor.height > std::numeric_limits<std::size_t>::max() / row_bytes)
-                    throw std::overflow_error("staged image byte size exceeds addressable memory");
-                receiver.EnsureStaging(row_bytes * source_plane.descriptor.height);
-                LogStaging(state_->context_, source_device, row_bytes * source_plane.descriptor.height);
-                reads_submitted = true;
-                backend.CopyDeviceToHost(source_product.context_.state_->context, source_plane, receiver.staging, row_bytes);
-                backend.CopyHostToDevice(state_->context_.state_->context, stream.native_handle(), receiver.staging, row_bytes, receiver.plane);
-                paths[index] = ImageCopyPath::PinnedStaging;
+            // Keep original coordinates/pitches in storage and finalizer views.
+            // Only the backend transfer descriptors are cropped.
+            const auto visit = [&](const auto& copy) {
+                if (!display_coverage || display_coverage->full_image) {
+                    copy(receiver.plane, source_plane);
+                    return;
+                }
+                for (const auto region : display_coverage->regions) {
+                    const auto left = std::clamp<std::int64_t>(region.x1, 0, source_plane.descriptor.width);
+                    const auto top = std::clamp<std::int64_t>(region.y1, 0, source_plane.descriptor.height);
+                    const auto right = std::clamp<std::int64_t>(region.x2, 0, source_plane.descriptor.width);
+                    const auto bottom = std::clamp<std::int64_t>(region.y2, 0, source_plane.descriptor.height);
+                    if (right <= left || bottom <= top) continue;
+                    const auto crop = [&](ImagePlaneView plane) {
+                        const auto row = static_cast<std::size_t>(top);
+                        const auto column = static_cast<std::size_t>(left) * 4U;
+                        if (row > (std::numeric_limits<std::size_t>::max() - column) / plane.descriptor.pitch_bytes)
+                            throw std::overflow_error("display transfer offset exceeds addressable memory");
+                        const auto offset = row * plane.descriptor.pitch_bytes + column;
+                        if (offset > std::numeric_limits<CUdeviceptr>::max() - plane.data)
+                            throw std::overflow_error("display transfer address exceeds addressable memory");
+                        plane.data += offset;
+                        plane.descriptor.width = static_cast<std::uint32_t>(right - left);
+                        plane.descriptor.height = static_cast<std::uint32_t>(bottom - top);
+                        return plane;
+                    };
+                    copy(crop(receiver.plane), crop(source_plane));
+                }
+            };
+            if (staged) {
+                std::size_t bytes = 0U;
+                visit([&](const auto&, const ImagePlaneView& plane) {
+                    const auto row_bytes = plane.descriptor.row_bytes();
+                    if (plane.descriptor.height > (std::numeric_limits<std::size_t>::max() - bytes) / row_bytes)
+                        throw std::overflow_error("staged image byte size exceeds addressable memory");
+                    bytes += row_bytes * plane.descriptor.height;
+                });
+                if (bytes != 0U) {
+                    receiver.EnsureStaging(bytes);
+                    LogStaging(state_->context_, source_device, bytes);
+                }
             }
+            std::size_t staging_offset = 0U;
+            visit([&](const ImagePlaneView& destination, const ImagePlaneView& input) {
+                reads_submitted = true;
+                if (receiver_device == source_device) {
+                    backend.CopySameDevice(state_->context_.state_->context, stream.native_handle(), destination,
+                                           source_product.context_.state_->context, input);
+                    paths[index] = ImageCopyPath::SameDevice;
+                } else if (!staged) {
+                    backend.CopyPeer(state_->context_.state_->context, stream.native_handle(), receiver_device, destination,
+                                     source_product.context_.state_->context, source_device, input);
+                    paths[index] = ImageCopyPath::Peer;
+                } else {
+                    const auto row_bytes = input.descriptor.row_bytes();
+                    auto* staging = static_cast<std::byte*>(receiver.staging) + staging_offset;
+                    backend.CopyDeviceToHost(source_product.context_.state_->context, input, staging, row_bytes);
+                    backend.CopyHostToDevice(state_->context_.state_->context, stream.native_handle(), staging, row_bytes, destination);
+                    staging_offset += row_bytes * input.descriptor.height;
+                    paths[index] = ImageCopyPath::PinnedStaging;
+                }
+            });
         }
         backend.RecordEvent(state_->context_.state_->context, stream.native_handle(), state_->completion_);
         auto settled = stream.Settle();
@@ -1151,6 +1192,11 @@ std::array<ImageCopyPath, 2U> ImageProductBuffer::CopyFromAs(ImageStream& stream
         LogCopyFailure(state_->context_, "product", !reads_submitted || receiver_completed);
         throw;
     }
+}
+BorrowedImageProductReadView ImageProductBuffer::CopyDisplayFrom(ImageStream& stream, BorrowedImageProductReadView source,
+                                                                  const ImageWorkspaceCoverage coverage) {
+    static_cast<void>(CopyFromAs(stream, std::move(source), {}, 0U, false, ImagePlanePreservation::All, &coverage));
+    return Borrow();
 }
 BorrowedImageProductReadView ImageProductBuffer::Borrow() const {
     BorrowedImageProductReadView result{std::make_shared<BorrowedImageProductReadView::Lease>(state_)};

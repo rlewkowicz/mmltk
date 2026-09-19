@@ -249,6 +249,9 @@ class ImageProductBuffer final {
 
    private:
     friend class ImageWorkspace;
+    // Workspace-only transfer storage may contain pixels only inside coverage.
+    // Its lifetime borrow never escapes the workspace finalization boundary.
+    [[nodiscard]] BorrowedImageProductReadView CopyDisplayFrom(ImageStream&, BorrowedImageProductReadView, ImageWorkspaceCoverage);
     void AdoptExternalPlane(std::shared_ptr<void> custody, std::size_t bytes, ImagePlaneView);
     friend class ImageProductPool;
     [[nodiscard]] bool ConfigureWorkspace(std::shared_ptr<ImageWorkspace>, ImageWorkspaceFinalize);
@@ -260,7 +263,8 @@ class ImageProductBuffer final {
     void PublishAs(ImageStream&, std::uint32_t, std::uint32_t, std::uint64_t, bool, ProductSubmit);
     [[nodiscard]] std::array<ImageAllocation, 2U> Allocations() const;
     [[nodiscard]] std::array<ImageCopyPath, 2U> CopyFromAs(ImageStream&, BorrowedImageProductReadView, MissingPlaneSubmit, std::uint64_t,
-                                                           bool preserve_clean = false, ImagePlanePreservation = ImagePlanePreservation::All);
+                                                           bool preserve_clean = false, ImagePlanePreservation = ImagePlanePreservation::All,
+                                                           const ImageWorkspaceCoverage* display_coverage = nullptr);
     [[nodiscard]] bool writable() const;
     [[nodiscard]] bool ReserveWorkspaceWrite();
     void CancelWorkspaceWrite() noexcept;
