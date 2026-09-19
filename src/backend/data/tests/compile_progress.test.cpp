@@ -77,6 +77,12 @@ void overwrite_annotation(const fs::path& annotation_path, const std::string& re
     REQUIRE(file.is_open());
     file << record << "\n";
 }
+[[nodiscard]] std::fstream mutable_compiled_copy(const FixtureSpec& fixture, const fs::path& path) {
+    fs::copy_file(compiled_bin_path(fixture), path, fs::copy_options::overwrite_existing);
+    std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+    REQUIRE(file.is_open());
+    return file;
+}
 void compile_resized_fixture(const FixtureSpec& fixture,
                              mmltk::backend::imaging::resample::ImageResizeMode mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch) {
     auto config = compiler_config(fixture);
@@ -567,8 +573,7 @@ TEST_CASE("format 8 admission rejects invalid metadata and old versions", "[back
     const auto original = CompiledDataset::open(compiled_bin_path(fixture));
     const auto mutate = [&](auto change) {
         const auto path = root.path() / "invalid.bin";
-        fs::copy_file(compiled_bin_path(fixture), path, fs::copy_options::overwrite_existing);
-        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+        auto file = mutable_compiled_copy(fixture, path);
         auto header = original.header();
         auto label = original.labels().front();
         change(header, label);
@@ -704,9 +709,7 @@ TEST_CASE("compiled benchmark provenance cannot be erased while Generic identiti
     const auto original = CompiledDataset::open(compiled_bin_path(fixture));
     const auto path = root.path() / "provenance.bin";
     const auto write = [&](const ImageEntry& image, const PackedInstance& label) {
-        fs::copy_file(compiled_bin_path(fixture), path, fs::copy_options::overwrite_existing);
-        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
-        REQUIRE(file.is_open());
+        auto file = mutable_compiled_copy(fixture, path);
         file.seekp(static_cast<std::streamoff>(original.header().index_offset));
         file.write(reinterpret_cast<const char*>(&image), sizeof(image));
         file.seekp(static_cast<std::streamoff>(original.header().label_offset));

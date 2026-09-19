@@ -16,6 +16,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include "src/backend/data/benchmark_dataset_compiler.h"
 #include "src/backend/data/benchmark_hash.h"
 #include "src/common/io/file_digest.h"
@@ -762,13 +763,16 @@ void compact_annotations(NormalizedAnnotationIndex* index, const std::vector<Par
                          const bool keep_empty, mmltk::common::concurrency::CancellationObservation cancel_requested) {
     if (offsets.size() != parsed_images.size() + 1U || accepted_ends.size() != parsed_images.size())
         throw std::runtime_error("accepted annotation image ranges are inconsistent");
+    const auto accepted_range = [&](std::size_t image_index) {
+        if ((image_index & 4095U) == 0U) { throw_if_benchmark_cancelled(cancel_requested); }
+        return std::pair{checked_cast<std::size_t>(offsets[image_index], "box offset overflow"),
+                         checked_cast<std::size_t>(accepted_ends[image_index], "box offset overflow")};
+    };
     std::size_t accepted_boxes = 0U;
     std::size_t accepted_pairs = 0U;
     std::size_t accepted_images = 0U;
     for (std::size_t image_index = 0U; image_index < parsed_images.size(); ++image_index) {
-        if ((image_index & 4095U) == 0U) { throw_if_benchmark_cancelled(cancel_requested); }
-        const std::size_t begin = checked_cast<std::size_t>(offsets[image_index], "box offset overflow");
-        const std::size_t end = checked_cast<std::size_t>(accepted_ends[image_index], "box offset overflow");
+        const auto [begin, end] = accepted_range(image_index);
         if (end < begin || end > offsets[image_index + 1U] || offsets[image_index + 1U] > boxes.size())
             throw std::runtime_error("accepted annotations exceed image capacity");
         accepted_boxes = mmltk::common::math::checked_add(accepted_boxes, end - begin, "accepted box count overflow");
@@ -787,9 +791,7 @@ void compact_annotations(NormalizedAnnotationIndex* index, const std::vector<Par
     index->boxes.reserve(accepted_boxes);
     index->mask_rle_pairs.reserve(accepted_pairs);
     for (std::size_t image_index = 0U; image_index < parsed_images.size(); ++image_index) {
-        if ((image_index & 4095U) == 0U) { throw_if_benchmark_cancelled(cancel_requested); }
-        const std::size_t begin = checked_cast<std::size_t>(offsets[image_index], "box offset overflow");
-        const std::size_t end = checked_cast<std::size_t>(accepted_ends[image_index], "box offset overflow");
+        const auto [begin, end] = accepted_range(image_index);
         std::span<NormalizedBox> image_boxes = std::span(boxes).subspan(begin, end - begin);
         std::ranges::sort(image_boxes, {}, &NormalizedBox::source_ordinal);
         const std::size_t annotation_count = image_boxes.size();
