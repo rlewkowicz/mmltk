@@ -510,14 +510,7 @@ std::expected<ByteSegments, DecodeError> Reader::borrow_string_item(const std::s
     if (!count) return std::unexpected(count.error());
     if (*count > input_.size() - offset_) return std::unexpected(error(ErrorCode::UnexpectedEof));
     if (offset_ > limits_.max_bytes || *count > limits_.max_bytes - offset_) return std::unexpected(error(ErrorCode::LimitExceeded));
-    ByteSegments result;
-    if (offset_ < input_.first.size()) {
-        const auto first_count = std::min(*count, input_.first.size() - offset_);
-        result.first = input_.first.subspan(offset_, first_count);
-        result.second = input_.second.first(*count - first_count);
-    } else {
-        result.first = input_.second.subspan(offset_ - input_.first.size(), *count);
-    }
+    const auto result = payload_ranges(*count);
     offset_ += *count;
     return result;
 }

@@ -70,6 +70,17 @@ void require_decode_error(const Result& result, const wire::ErrorCode code) {
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().code == code);
 }
+template <class Check>
+void check_separate_splits(const wire::ByteView encoded, Check check) {
+    for (std::size_t split = 0U; split <= encoded.size(); ++split) {
+        CAPTURE(split);
+        const auto prefix = encoded.first(split);
+        const auto suffix = encoded.subspan(split);
+        const wire::ByteBuffer first(prefix.begin(), prefix.end());
+        const wire::ByteBuffer second(suffix.begin(), suffix.end());
+        check(wire::ByteSegments{first, second});
+    }
+}
 template <std::size_t Size>
 void require_malformed_scalar(const std::array<std::byte, Size>& bytes, const wire::ErrorCode code) {
     const auto limits = test_limits(Size, Size, 4U);
@@ -664,6 +675,129 @@ TEST_CASE("owned scalar payloads survive every segmented split and input retirem
                 CHECK(*projected == *expected_flat);
                 CHECK(*decoded == source);
             }
+        }
+    }
+}
+TEST_CASE("borrowed byte payloads alias separate live segments at every split", "[frameworks][serialization]") {
+    for (const std::size_t count : {0U, 4U, 24U}) {
+        CAPTURE(count);
+        wire::ByteBuffer encoded{std::byte{0xf6}, count < 24U ? std::byte(0x40U + count) : std::byte{0x58}};
+        if (count == 24U) encoded.push_back(std::byte{24U});
+        const auto payload_offset = encoded.size();
+        for (std::size_t index = 0U; index < count; ++index) encoded.push_back(std::byte(index * 11U));
+        const auto item_end = encoded.size();
+        encoded.push_back(std::byte{0xf6});
+        check_separate_splits(encoded, [&](const wire::ByteSegments input) {
+            struct AllocationProbe {
+                mutable std::size_t calls = 0U;
+            } probe;
+            auto limits = test_limits(encoded.size(), 3U, 0U);
+            limits.allocation_policy = {.context = &probe, .allows = [](const void* context, const wire::AllocationRequest&) noexcept {
+                ++static_cast<const AllocationProbe*>(context)->calls;
+                return false;
+            }};
+            wire::Reader reader(input, limits);
+            REQUIRE(reader.read_scalar_item(0U));
+            const auto payload = reader.borrow_bytes_item(0U);
+            REQUIRE(payload);
+            CHECK(payload->size() == count);
+            const auto first_count = input.first.size() > payload_offset ? std::min(count, input.first.size() - payload_offset) : count;
+            CHECK(payload->first.size() == first_count);
+            CHECK(payload->second.size() == count - first_count);
+            const auto expected = std::span(encoded).subspan(payload_offset, count);
+            CHECK(std::ranges::equal(payload->first, expected.first(first_count)));
+            CHECK(std::ranges::equal(payload->second, expected.subspan(first_count)));
+            if (!payload->first.empty()) {
+                const auto* const backing = input.first.size() > payload_offset ? input.first.data() + payload_offset
+                                                                                 : input.second.data() + (payload_offset - input.first.size());
+                CHECK(payload->first.data() == backing);
+            }
+            if (!payload->second.empty()) CHECK(payload->second.data() == input.second.data());
+            CHECK(reader.offset() == item_end);
+            CHECK(reader.items_read() == 2U);
+            REQUIRE(reader.read_scalar_item(0U));
+            CHECK(reader.offset() == encoded.size());
+            REQUIRE(reader.finish());
+            CHECK(probe.calls == 0U);
+        });
+    }
+}
+TEST_CASE("segmented text choices consume exactly one complete item on match or unknown key", "[frameworks][serialization]") {
+    // Unlike owned text materialization, text choices compare exact protocol bytes.
+    for (const std::string& text : {std::string{}, std::string{"ab"}, std::string{"a\xe2\x82\xac"},
+                                    std::string{"a\0b", 3U}, std::string{"\xc0\x80", 2U}}) {
+        wire::ByteBuffer encoded{std::byte(0x60U + text.size())};
+        for (const unsigned char character : text) encoded.push_back(std::byte(character));
+        const auto item_end = encoded.size();
+        encoded.push_back(std::byte{0xf6});
+        const std::array<std::string_view, 3U> choices{"other", text, text};
+        check_separate_splits(encoded, [&](const wire::ByteSegments input) {
+            for (const std::size_t choice_count : std::array<std::size_t, 3U>{0U, 1U, choices.size()}) {
+                CAPTURE(choice_count);
+                auto limits = test_limits(encoded.size(), 2U, 0U);
+                limits.allocation_policy.allows = [](const void*, const wire::AllocationRequest&) noexcept { return false; };
+                wire::Reader reader(input, limits);
+                auto scope = reader.enter_path("key");
+                const auto choice = reader.read_text_choice(0U, std::span(choices).first(choice_count));
+                if (choice_count == choices.size()) {
+                    REQUIRE(choice);
+                    CHECK(*choice == 1U);
+                } else {
+                    require_decode_error(choice, wire::ErrorCode::UnknownKey);
+                    CHECK(choice.error().offset == item_end);
+                    CHECK(choice.error().path == "key");
+                }
+                CHECK(reader.offset() == item_end);
+                CHECK(reader.items_read() == 1U);
+                REQUIRE(reader.read_scalar_item(0U));
+                CHECK(reader.offset() == encoded.size());
+                REQUIRE(reader.finish());
+            }
+        });
+    }
+}
+TEST_CASE("borrowed strings preserve admission precedence and failure cursors across separate segments", "[frameworks][serialization]") {
+    struct Failure {
+        wire::ByteBuffer encoded;
+        wire::ErrorCode code;
+        std::size_t offset;
+    };
+    for (const bool text : {false, true}) {
+        const auto major = text ? 0x60U : 0x40U;
+        const std::array failures{
+            Failure{{}, wire::ErrorCode::UnexpectedEof, 0U},
+            Failure{{std::byte(major + 25U), std::byte{1U}}, wire::ErrorCode::UnexpectedEof, 2U},
+            Failure{{std::byte(major + 4U), std::byte{'a'}}, wire::ErrorCode::UnexpectedEof, 1U},
+            Failure{{std::byte{0x99}}, wire::ErrorCode::TypeMismatch, 1U},
+            Failure{{std::byte(major + 24U), std::byte{1U}, std::byte{'a'}}, wire::ErrorCode::NonMinimal, 2U},
+        };
+        for (const auto& failure : failures) {
+            check_separate_splits(failure.encoded, [&](const wire::ByteSegments input) {
+                // Combined rejections establish byte > depth > item > parsing order.
+                for (unsigned rejection = 0U; rejection < 8U; ++rejection) {
+                    if ((rejection & 1U) != 0U && input.size() == 0U) continue;
+                    CAPTURE(text, rejection, failure.offset);
+                    auto limits = test_limits(input.size(), (rejection & 4U) != 0U ? 0U : 1U, 0U);
+                    if ((rejection & 1U) != 0U) --limits.max_bytes;
+                    limits.allocation_policy.allows = [](const void*, const wire::AllocationRequest&) noexcept { return false; };
+                    wire::Reader reader(input, limits);
+                    auto scope = reader.enter_path("payload");
+                    const auto expected_code = (rejection & 1U) != 0U ? wire::ErrorCode::LimitExceeded
+                                             : (rejection & 2U) != 0U ? wire::ErrorCode::DepthExceeded
+                                             : (rejection & 4U) != 0U ? wire::ErrorCode::LimitExceeded : failure.code;
+                    const auto expected_offset = rejection == 0U ? failure.offset : 0U;
+                    const auto check = [&](const auto& result) {
+                        require_decode_error(result, expected_code);
+                        CHECK(result.error().offset == expected_offset);
+                        CHECK(result.error().path == "payload");
+                    };
+                    const auto depth = (rejection & 2U) != 0U ? 1U : 0U;
+                    if (text) check(reader.read_text_choice(depth, {}));
+                    else check(reader.borrow_bytes_item(depth));
+                    CHECK(reader.offset() == expected_offset);
+                    CHECK(reader.items_read() == (rejection == 0U ? 1U : 0U));
+                }
+            });
         }
     }
 }
