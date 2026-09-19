@@ -104,8 +104,11 @@ For example, with existing input artifacts:
 ```
 
 See [datasets](datasets.md) for compilation and annotation requirements.
-`rfdetr compile --perceptual-downscale` selects optional perceptual shrinking;
-training exposes the independent `--aug-perceptual-downscale` option.
+Both `compile` and `rfdetr compile` accept `--resize-mode Stretch` (default)
+or `--resize-mode Letterbox`, independently of `--perceptual-downscale`.
+`rfdetr validate --resize-mode` selects geometry when compiling source input;
+existing bins retain their stored mode. Training exposes the independent
+`--aug-perceptual-downscale` option.
 Training also exposes `--use-ema`/`--no-ema`, `--resume`, and `--output-dir`.
 `--test-compiled` supplies an optional final-test split; train and validation
 remain required. Model-input commands accept `--class-layout` for a digest-bound
@@ -113,8 +116,12 @@ class descriptor.
 `rfdetr predict` accepts repeatable `--image` inputs as an alternative to
 `--compiled`, and retains CLI batch-size selection. Local video belongs to the
 GUI prediction workflow. `rfdetr evaluate` selects one backend; `rfdetr validate`
-retains its ordered multi-backend report path. The
-[workflow/artifact reference](rfdetr-workflows.md) explains these distinctions,
+retains its ordered multi-backend report path. Both accept `--candidate-count`
+for physical candidate selection and `--eval-max-dets` for COCO accumulation.
+Zero uses the admitted model's candidate count and the shared evaluation cap
+respectively. Training exposes `--eval-max-dets`; prediction has its separate
+`--max-dets-per-image`. See [count semantics](rfdetr-workflows.md#model-input-and-detection-selection).
+The [workflow/artifact reference](rfdetr-workflows.md) explains these distinctions,
 current checkpoints, metrics, and saved history.
 
 The native CLI also accepts `--log-level`, `--log-file`, and `--log-dir`.

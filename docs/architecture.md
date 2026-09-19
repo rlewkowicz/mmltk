@@ -94,7 +94,11 @@ colors, [image_operations.h](../src/backend/imaging/raster/image_operations.h)
 owns reusable raster operations, and
 [resample](../src/backend/imaging/resample) owns CPU/CUDA resizing.
 [Dataset compilation](datasets.md) owns acquisition, annotations, cache
-identity, progress, and format-7 output while consuming those operations.
+identity, progress, and the [compiled format](datasets.md#compiled-binary-format)
+while consuming those operations. The resample owner declares resize mode and
+geometry below the data layer; compilers apply it to pixels, continuous boxes,
+and categorical masks. Compiled readers expose stored mode, original extents,
+annotation metadata, and provenance without a model-layer dependency.
 
 RF-DETR's ordinary [model.h](../src/backend/models/rfdetr/core/model.h),
 [model_state.h](../src/backend/models/rfdetr/core/model_state.h), and
@@ -104,6 +108,17 @@ admission. The [RF-DETR source map](rfdetr-workflows.md#backend-ownership)
 locates training lanes, metric handoff, snapshots, optimizer, and checkpoint
 declarations. The model [registry](../src/backend/models/catalog/model_registry.cpp)
 projects descriptors from canonical model-contract contributions.
+
+[GpuBatchPreprocessor](../src/backend/models/rfdetr/core/gpu_batch_preprocessor.h)
+owns reusable normalized input for evaluation and prediction. The core
+[postprocessor](../src/backend/models/rfdetr/core/postprocess.h) owns physical
+candidate ranking, class projection, and query alignment; the shared
+[evaluator](../src/backend/models/rfdetr/core/evaluator.h) owns box/mask matching
+and COCO accumulation for standalone and training validation. Model candidate
+defaults come from the existing preset/configuration owner, while evaluation
+defaults come from the metric contract. The
+[workflow reference](rfdetr-workflows.md#model-input-and-detection-selection)
+defines their distinct counts, normalization, and annotation semantics.
 
 Capture's ordinary [capture_session.h](../src/backend/media/capture/capture_session.h)
 owns device/session access and depends on the GPU framework.
@@ -205,6 +220,12 @@ declares each producer's frame/revision relation and image projection;
 schema materialization derives native readers and
 [generated Rust observations](../src/controller/browser/application_visual_projection_emitter.h)
 from the same facts.
+That emitter also derives checked scaling for canonical visual extents/regions
+and the native Upscale output-scale constant. Frame metadata carries canvas
+extent, content rectangle, and source extent together. Rust owns the Original
+view preference and uses those facts for its sampling and display transform;
+it does not repeat native geometry inventories or infer a processing request
+from the currently retained fallback image.
 
 The [application binding generator](../src/controller/browser/application_binding_generator.cpp)
 also derives typed scalar selectors and inventories from canonical training
@@ -279,6 +300,15 @@ Annotation, Predict, Validate, Live, and Upscale. Predict's implementation is in
 Validation adds its own retained atlas/detail producer through
 [validation_samples.cpp](../src/controller/subsystems/validate/detail/validation_samples.cpp).
 Train's charts are ordinary Iced drawing and use no native image workspace.
+
+[VisualDocument](../src/controller/presentation/visual_document.h) retains
+continuous annotation coordinates and mask support independently of box
+bounds. Its materializer projects spatial members from the canonical
+annotation declarations and rasterizes masks for the receiving document.
+Annotation captures an exact displayed frame and view choice before its
+receiver copy; Upscale requests use the current selected source. The
+[viewer reference](gui-interaction.md#original-view-and-annotation-import)
+owns the Original/canvas, aspect-restoration, and import behavior.
 
 [VisualRuntimeOwner](../src/controller/presentation/visual_runtime_owner.h)
 runs dirty work and completion continuations on each producer's worker.

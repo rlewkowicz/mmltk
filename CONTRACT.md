@@ -185,6 +185,16 @@ and telemetry storage pressure, with incomplete history explicitly visible.
 Optional perceptual downscaling belongs to existing compilation and augmentation
 owners and preserves categorical annotations and their geometric transforms.
 
+Dataset compilation defaults to stretching the source into the model canvas,
+with an explicit aspect-preserving Letterbox alternative independent of RGB
+resampling policy. Compiled data preserves continuous source-box meaning,
+original annotation area, crowd and raw-ignore facts, available source
+identities, annotation order, and explicit mask presence. Supplied boxes remain
+authoritative even when mask support differs or becomes empty. Training and
+evaluation share this data meaning; crowd regions belong to evaluation rather
+than foreground supervision. Model execution owns normalization of raw compiled
+RGB independently of retained preview pixels.
+
 Images and their annotation meaning share source identity and geometry through
 preview, augmentation, upscale, and editing. Clean pixels and native semantic
 image planes remain separate until producer-owned final display composition.
@@ -198,6 +208,12 @@ Derived results match the current source and requested processing parameters.
 Iced owns fit, crop, pan, zoom, clipping, sampling, and redraws of completed
 workspace images. Native product dimensions remain independent of window size.
 Images and their attached metadata use the same view geometry.
+Original view restores source aspect from the compiled content and its paired
+source dimensions. It retains the available pixel detail; the model-canvas view
+shows the compiled geometry and any padding. Annotation import materializes the
+displayed content and its annotation meaning through the same transform.
+Upscale follows the currently selected native source; its derived pixels and
+metadata support the same independent view choice.
 Same-image revisions retain viewer identity and transforms; a new image resets
 them. Stable widget identities preserve interaction state through ordinary
 updates.
@@ -299,7 +315,8 @@ and become typed failures once at the nearest operation, worker, or external
 service boundary. A failed system preserves valid snapshots, reports failure,
 and retires its failed resources safely. Recoverable runtimes reconstruct
 lazily within that system, while independent systems continue operating.
-Persisted settings and the format-7 compiled dataset remain stable. Native RF-DETR
+Persisted settings retain their named format. Compiled datasets use format 8
+with source geometry and annotation metadata. Native RF-DETR
 checkpoints use only the current version-3 format; external upstream assets retain
 their independent import formats.
 

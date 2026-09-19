@@ -341,6 +341,11 @@ through normal UI messages, and waits for those operations before reopening.
 It resets scenario-local expectations while retaining physical allocations,
 claims, and release history. The primary compile workflow owns a private
 output directory; other lifetimes reuse prepared source and compiled assets.
+The padding-sensitive retained fixture explicitly chooses Letterbox through
+the Dataset radio and checks the stored compile mode. The model-workflow
+fixture uses the ordinary Stretch default. Padding observations therefore
+remain evidence for the selected geometry rather than assumptions about every
+compiled dataset.
 
 The native harness is split by evidence responsibility under
 [tests/wayland](../src/acceptance/tests/wayland):
@@ -475,13 +480,13 @@ sessions retain ordinary clipboard permissions.
 
 | Existing target | Evidence it owns |
 | --- | --- |
-| `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, rejection, and cancellation |
+| `mmltk_controller_annotation_tests` | Independent input/render progress, native hit testing, document/history/save behavior, stable target identity through Undo/Redo, retained input pressure, ordered command continuations, fractional raster boundaries, Original crop/aspect materialization, masks beyond boxes and present-empty masks, rejection, and cancellation |
 | `mmltk_controller_services_tests` | Counter-read interruption/size/error policies, reflected named settings, independent optional-test settings, training command construction, current-format saved history, bounded cursor reads, directory replacement/truncation, and output/resume admission |
 | `mmltk_controller_data_compute_systems_tests` | Start/input admission including absent or incompatible optional test splits, selected validation results and retained sample/detail custody, optional preview failure, incremental prediction, and video playback cancellation |
 | `mmltk_controller_browser_tests` and `mmltk_frameworks_serialization_tests` | Reflected field/enum/schema and graphics ABI facts, nested/array metric projection fixtures, package fixtures, positional output versus named persistence, lossless compact input, owned/borrowed validation, and control receipts |
 | `mmltk_frameworks_transport_tests` | Peer replacement, reconnect, output continuity, ring wrap, and transport custody |
 | `mmltk_controller_explore_tests` | Explore domain admission, settings/filter persistence, thumbnail identity, viewport priority, augmentation refresh, staged replacement, cancellation, and failure |
-| `mmltk_controller_upscale_tests` | Exact receiver copies, retained derived results, method selection/warmup, activation, cancellation, and resource retirement |
+| `mmltk_controller_upscale_tests` | Exact receiver copies, checked output geometry, paired source extent, retained derived results, method selection/warmup, activation, cancellation, and resource retirement |
 | `mmltk_controller_live_tests` | Live receiver completion/failure, queued cancellation, and settled snapshots |
 | `mmltk_controller_visual_systems_tests` | Shared visual runtime, presentation protocol/custody, native gallery cache/priority/atlas integration, acceptance gates, and cross-system workspace behavior |
 | `mmltk_frameworks_gpu_tests` | Independent raw-product/display storage, late workspace admission and availability wakes, Vulkan-owned CUDA import and backing lifetime, receiver/device transfers, acquisition/release/settlement, pressure, failure, and retirement |
@@ -504,6 +509,22 @@ by `--test rfdetr`.
 compiled-catalog cases; `--test core` also selects the separate resampling
 target above. These checks cover functional values, boundaries, failure, and
 custody; they do not substitute for the real rendered workflow case.
+
+The data cases also cover both resize modes, authoritative fractional boxes,
+source metadata/order/duplicates, present-empty masks, format-8 admission, and
+old-version rejection. RF-DETR core cases cover full physical-slot ranking,
+post-selection class filtering, query/mask alignment, focal-alpha assignment,
+crowd matching/ignore precedence, original-area ranges, per-category maxDets,
+and inclusive COCO thresholds. Training and inference cases exercise shared
+normalization and the separate candidate/evaluation budgets. These are focused
+numerical and integration checks, not a full COCO accuracy or external parity
+run; [compiled-mask limits](rfdetr-workflows.md#evaluation-metrics-and-retained-samples)
+still apply.
+
+The `browser-app` cases additionally cover generated resize settings, paired
+source/aspect geometry and inverse input mapping, Original changes without
+restarting Upscale, and rapid-navigation requests using the current selected
+source while Annotation import retains the exact displayed image/view.
 
 Use `--test all --executable TARGET` for targets not owned by a narrower suite.
 The source/CMake registrations and wrapper inventory define executable

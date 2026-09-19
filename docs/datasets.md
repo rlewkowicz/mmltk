@@ -27,8 +27,8 @@ whose file contains no instance lines. Each selected split must be nonempty.
 `categories.json` needs a nonempty `classes` array with at most 256 entries.
 IDs must be unique, dense, and start at zero or one; names must be unique,
 nonempty, NUL-free, and at most 31 bytes. The compiler rejects names that would
-require truncation in format 7. It normalizes source IDs into the immutable
-ordered foreground [class catalog](rfdetr-workflows.md#class-identity-and-model-admission).
+require truncation in the compiled format. It normalizes source IDs into the
+immutable ordered foreground [class catalog](rfdetr-workflows.md#class-identity-and-model-admission).
 For example:
 
 ```json
@@ -54,16 +54,29 @@ Each nonempty JSONL line contains one JSON object:
 | Field | Meaning |
 | --- | --- |
 | `class` | Required category name from `categories.json` |
-| `mask_rle_encoding` | Required literal `row_major_start_length` |
-| `mask_rle` | Required nonempty foreground runs, encoded as whitespace-separated `start:length` pairs |
+| `bbox_xyxy` | Continuous `[x1, y1, x2, y2]` source-pixel corners; authoritative when supplied |
+| `mask_rle` | Optional foreground runs as whitespace-separated `start:length` pairs; an empty string means a present, empty mask |
+| `mask_rle_encoding` | Required literal `row_major_start_length` when `mask_rle` is present |
 | `image_size_wh` | Optional `[width, height]`; if present, must match the PNG |
-| `bbox_xyxy` | Optional declared integer bounds used for mismatch diagnostics; compiled bounds derive from the mask |
+| `area` | Optional finite, nonnegative original annotation area in source-pixel units |
+| `iscrowd`, `ignore` | Optional boolean or integer `0`/`1`; crowd and raw ignore remain separate facts |
+| `id`, `image_id`, `category_id` | Optional nonnegative integer source annotation, image, and category identities |
 
 RLE offsets index the row-major source image: `y * width + x`. Runs must have
 positive lengths, stay inside the image, be sorted, and not overlap. This is
 start/length encoding, not alternating foreground/background counts.
-Declared bounds use `[x1, y1, x2, y2]` in absolute pixels with exclusive upper
-edges, matching the bounds computed from the mask.
+Boxes require finite coordinates and strictly ordered corners. Fractional and
+out-of-image coordinates are retained through the compile transform. If the
+box is absent, a nonempty source mask supplies its bounds before resizing;
+mask-derived upper edges are exclusive. A supplied box is never replaced by
+mask bounds, even when the two disagree. Masks may extend beyond their boxes.
+
+If `area` is absent, a present mask supplies its source foreground count,
+including zero for an empty mask; otherwise the source box supplies its area.
+`image_id` values within one JSONL file must agree. An omitted `category_id`
+uses that class's source ID from `categories.json`. Annotation IDs are optional;
+source line ordinals preserve order. Equal class/box records remain separate
+annotations.
 
 For a 432×432 image, this example covers a 24-pixel run on each of three rows
 starting at `(10, 20)`:
@@ -72,25 +85,50 @@ starting at `(10, 20)`:
 {"class":"category_1","mask_rle_encoding":"row_major_start_length","mask_rle":"8650:24 9082:24 9514:24","bbox_xyxy":[10,20,34,23],"image_size_wh":[432,432]}
 ```
 
-Malformed JSON, an unknown class, unsupported encoding, empty foreground, or
-invalid runs fail compilation. The compiler letterboxes images to the target
-dimensions and transforms masks consistently. Instances that lose all
-foreground during resizing are dropped and counted in compilation progress.
+Malformed JSON, an unknown class, unsupported mask encoding, invalid runs,
+invalid metadata, or the absence of both a valid box and a nonempty source
+mask fail compilation. A valid detection annotation survives when its resized
+mask becomes empty. Omitting `mask_rle` and supplying `"mask_rle":""` therefore
+have different meanings. Segmentation consumers require explicit mask presence;
+box-only data remains usable for detection.
 
 The format and validation implementation is in
 [dataset_compiler_scan_labels.cpp](../src/backend/data/dataset_compiler_scan_labels.cpp);
 compiled metadata is defined in
 [compiled_format.h](../src/backend/data/compiled_format.h).
 
+## Resize geometry
+
+Both generic and benchmark compilation default to **Stretch**. It fills the
+target canvas using independent horizontal and vertical scales. **Letterbox**
+preserves source aspect, centers the resized content, and fills padding with
+zero RGB. Select it explicitly with `--resize-mode Letterbox` or the Dataset
+card's radio. Geometry and optional perceptual resampling are independent
+choices; changing either requires recompiling the affected splits.
+
+[ImageResizeMode and ImageResizeGeometry](../src/backend/imaging/resample/image_resize.h)
+are the shared authority. Letterbox fits one target axis exactly, rounds the
+other resized extent to the nearest positive integer, and floors each half
+padding offset. A source coordinate becomes
+`x * resized_width / original_width + offset_x`, with the corresponding
+vertical formula. Pixels, continuous boxes, and nearest-sampled categorical
+masks use this geometry. The stored mode and original dimensions let readers
+reconstruct the content rectangle exactly.
+
+The [Original viewer](gui-interaction.md#original-view-and-annotation-import)
+restores source aspect from these compiled pixels and geometry; it does not
+recover source resolution.
+
 ## Compiled binary format
 
 The compiler writes one self-contained, versioned `.bin` file per split. It
 stores the expensive source transformations—not PNG or JSON—so runtime loading
-does not decode images, parse annotations, resize masks, letterbox inputs, or
+does not decode images, parse annotations, resize masks, resize inputs, or
 convert pixel layouts.
 
-The current format is version 7. Its authoritative definitions and validation
-rules are
+The current format is **version 8**. Format-7 and other older files fail the
+ordinary version check and must be recompiled; there is no legacy reader or
+migration path. Its authoritative definitions and validation rules are
 [compiled_format.h](../src/backend/data/compiled_format.h) and
 [compiled_file_utils.h](../src/backend/data/compiled_file_utils.h). The file is
 a native little-endian Linux format written from packed fixed-width
@@ -102,7 +140,7 @@ byte 0
 ┌──────────────────────────────────────────┐
 │ FileHeader (8,328 bytes)                 │
 ├──────────────────────────────────────────┤ index_offset = 8,328
-│ ImageEntry[num_images] (32 bytes each)   │
+│ ImageEntry[num_images] (40 bytes each)   │
 ├──────────────────────────────────────────┤
 │ zero padding to a 2 MiB boundary         │
 ├──────────────────────────────────────────┤ pixel_offset
@@ -110,7 +148,7 @@ byte 0
 │ image 1: planar RGB float32              │ fixed image_stride
 │ ...                                      │
 ├──────────────────────────────────────────┤ label_offset
-│ PackedInstance[sum(num_instances)]       │ 16 bytes each
+│ PackedInstance[sum(num_instances)]       │ 56 bytes each
 ├──────────────────────────────────────────┤ mask_rle_offset
 │ RLEPair[sum(mask_rle_pairs)]             │ 8 bytes each
 └──────────────────────────────────────────┘ total_file_size
@@ -129,7 +167,7 @@ without holes inside their respective blocks.
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
 | 0 | `uint64` | `magic` | `0x464153544c445232` |
-| 8 | `uint32` | `version` | Current value: `7` |
+| 8 | `uint32` | `version` | Current value: `8` |
 | 12 | `uint32` | `num_images` | Number of images in this split |
 | 16 | `uint32` | `image_width` | Compiled image width |
 | 20 | `uint32` | `image_height` | Compiled image height |
@@ -143,21 +181,24 @@ without holes inside their respective blocks.
 | 72 | `uint64` | `image_stride` | Bytes per image: `width × height × channels × 4` |
 | 80 | `char[256][32]` | `class_names` | NUL-terminated class names indexed by normalized class ID |
 | 8,272 | `uint32` | `max_instances_per_image` | Maximum instance count in any image |
-| 8,276 | `uint8[52]` | reserved | Zeroed space retained for format evolution |
+| 8,276 | `uint8` | `resize_mode` | `0`: Stretch; `1`: Letterbox |
+| 8,277 | `uint8[51]` | reserved | Zeroed space retained for format evolution |
 
 The pixel block begins at
-`align_up(sizeof(FileHeader) + num_images * 32, 2 MiB)`. Its size must be
+`align_up(sizeof(FileHeader) + num_images * 40, 2 MiB)`. Its size must be
 exactly `num_images * image_stride`; the label block follows it immediately,
 then the RLE block, then end of file.
 
-Each image is already letterboxed to the compiled dimensions and stored as
+Each image is already resized to the compiled dimensions and stored as
 three contiguous planes in `NCHW` order: all red pixels, then green, then blue.
 Each sample is a native IEEE-754 `float32` normalized from 8-bit RGB to
-`[0, 1]`. Letterbox padding is zero.
+`[0, 1]`. Letterbox padding is zero. These are raw unit-RGB values, without
+ImageNet normalization; [model preprocessing](rfdetr-workflows.md#model-input-and-detection-selection)
+owns that later GPU step.
 
 ### Per-image index
 
-Each packed `ImageEntry` is 32 bytes:
+Each packed `ImageEntry` is 40 bytes:
 
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
@@ -165,38 +206,58 @@ Each packed `ImageEntry` is 32 bytes:
 | 8 | `uint32` | `label_offset` | Byte offset into the label block |
 | 12 | `uint16` | `num_instances` | Number of instances for this image |
 | 14 | `uint16` | padding | Zero |
-| 16 | `uint32` | `label_bytes` | `num_instances * 16` |
+| 16 | `uint32` | `label_bytes` | `num_instances * 56` |
 | 20 | `uint32` | `original_width` | Source width before compilation |
 | 24 | `uint32` | `original_height` | Source height before compilation |
-| 28 | `uint32` | reserved | Zero |
+| 28 | `uint8` | `has_source_image_id` | Whether the source image ID is present |
+| 29 | `uint8` | `source` | `0`: Generic; `1`: COCO; `2`: Objects365; `3`: Open Images |
+| 30 | `uint16` | reserved | Zero |
+| 32 | `uint64` | `source_image_id` | Original source identity; zero when absent |
 
-The original dimensions allow consumers to reconstruct the exact letterbox
-transform without storing redundant per-image scale and padding values.
+Dense compiled image indices remain separate from source IDs. The original
+dimensions and header resize mode reconstruct the transform without redundant
+per-image scale and padding fields.
 
 ### Instances and masks
 
-Each packed `PackedInstance` is 16 bytes:
+Each packed `PackedInstance` is 56 bytes:
 
 | Byte | Type | Field | Meaning |
 | ---: | --- | --- | --- |
 | 0 | `uint8` | `class_id` | Dense zero-based index into `class_names` |
-| 1 | `uint8` | padding | Zero |
-| 2 | `int16` | `bbox_x1` | Inclusive left bound in compiled pixels |
-| 4 | `int16` | `bbox_y1` | Inclusive top bound |
-| 6 | `int16` | `bbox_x2` | Exclusive right bound |
-| 8 | `int16` | `bbox_y2` | Exclusive bottom bound |
-| 10 | `uint32` | `mask_rle_offset` | Byte offset into the RLE block |
-| 14 | `uint16` | `mask_rle_pairs` | Number of runs owned by this instance |
+| 1 | `uint8` | `flags` | Mask presence, crowd, raw ignore, annotation-ID presence, category-ID presence |
+| 2 | `float32` | `bbox_x1` | Continuous left corner in compiled pixels |
+| 6 | `float32` | `bbox_y1` | Continuous top corner |
+| 10 | `float32` | `bbox_x2` | Continuous right corner |
+| 14 | `float32` | `bbox_y2` | Continuous bottom corner |
+| 18 | `uint32` | `mask_rle_offset` | Byte offset into the RLE block |
+| 22 | `uint16` | `mask_rle_pairs` | Number of runs owned by this instance |
+| 24 | `float64` | `original_area` | Supplied or fallback area before compilation |
+| 32 | `uint64` | `annotation_id` | Source annotation identity, when present |
+| 40 | `uint64` | `source_category_id` | Source category identity, when present |
+| 48 | `uint64` | `source_ordinal` | Deterministic source annotation order |
+
+Flag bits are `1` for mask presence, `2` for crowd, `4` for raw ignore, `8` for
+annotation-ID presence, and `16` for category-ID presence. Unused bits must be
+zero. Presence bits distinguish an ID of zero from an absent identity, and a
+present empty mask from a missing mask. Absent identities have zero payloads.
 
 Every `RLEPair` is `{ uint32 start, uint32 length }` and therefore 8 bytes.
 Starts index the compiled `width × height` mask in row-major order. Runs are
-positive, sorted, non-overlapping, and contained by the image. Bounding boxes
-are recomputed from these transformed runs during compilation, so pixels,
-bounds, and masks share one geometry.
+positive, sorted, non-overlapping, and contained by the image. Mask support and
+continuous box extent remain independent after their common transform.
 
-The packed limits are intentional: class IDs occupy one byte, coordinates must
-fit signed 16-bit values, and an image's instance count and an instance's RLE
-pair count must each fit an unsigned 16-bit value. Compilation rejects values
+COCO and Objects365 category identities retain their numeric values. Open
+Images stores the identifier bytes after `/m/` in a little-endian `uint64`,
+zero-padded to eight bytes; this is reversible encoding, not a hash or dense
+class ID. The source-kind field selects the interpretation. Source identities
+stay embedded in the same file even when an adapter maps several categories
+to one foreground class.
+
+The packed limits are intentional: class IDs occupy one byte, compiled image
+axes remain bounded to 32,767, and an image's instance count and an instance's
+RLE pair count must each fit an unsigned 16-bit value. Boxes must remain finite
+and strictly ordered after conversion to float32. Compilation rejects values
 that cannot be represented.
 
 ## Compile and inspect
@@ -213,9 +274,11 @@ Supplying width without height makes the target square. The RF-DETR-specific
 `rfdetr compile` command handles its train/validation dataset preparation;
 consult its own help for model-specific dimensions and options.
 
-`rfdetr compile` accepts `--perceptual-downscale`. The GUI exposes the same
-optional choice with its compilation controls; the root `compile` command
-retains its existing option surface.
+Both `compile` and `rfdetr compile` accept `--resize-mode Stretch` (default),
+`--resize-mode Letterbox`, and `--perceptual-downscale`. The GUI exposes the
+geometry radios and separate perceptual option with its Dataset compilation
+controls. CLI `rfdetr validate` also accepts `--resize-mode` for source
+compilation; it does not reinterpret an existing bin's stored mode.
 
 To measure actual loading rather than inspect metadata:
 
@@ -241,10 +304,17 @@ checks and concurrent reservations; and
 source/phase progress projection. Download/cache identity stays with the data
 layer while resizing uses the shared imaging owners below.
 
-The normalized annotation-index cache has its own version-2 format and
-256-byte header, independent of compiled format 7.
+The adapters retain supplied boxes, areas, identities, crowd/raw-ignore flags,
+and source order. COCO-style polygon or RLE segmentation becomes source mask
+support before resizing. Open Images `IsGroupOf` becomes crowd; its category
+MID remains distinct from the mapped class. Equal boxes are not deduplicated.
+
+The normalized annotation-index cache has its own version-3 format and
+256-byte header, independent of the compiled format. It stores 32-byte image
+records, 64-byte annotation records, and mask RLE; incompatible cached indices
+are regenerated from the source annotations.
 [AnnotationRejectCounts](../src/backend/data/detail/benchmark_annotations.h)
-is the canonical declaration for its six rejection counters. Binary
+is the canonical declaration for its six count fields. Binary
 encode/decode follows reflected declaration order; compile-time guards pin
 the six names, `uint64` types, and order required by that cache format. Named
 JSON projections derive from those same fields. The
@@ -255,11 +325,11 @@ the header layout and staged publication.
 
 Compilation and GPU augmentation each expose an independent
 `perceptual_downscale` setting, false by default. RF-DETR CLI compilation uses
-`--perceptual-downscale`; training augmentation uses
-`--aug-perceptual-downscale` alongside enabled GPU augmentation. The normal
+`--perceptual-downscale`, also exposed by root `compile`; training augmentation
+uses `--aug-perceptual-downscale` alongside enabled GPU augmentation. The normal
 resizing path and its pixels remain unchanged when the option is off.
 The option affects shrinking RGB pixels, not categorical masks, boxes, class
-identity, letterbox geometry, or compiled format 7.
+identity, selected resize geometry, or compiled record layout.
 
 [RgbImageResizer](../src/backend/imaging/resample/image_resize.h) owns CPU execution and
 [GpuPerceptualDownscaler](../src/backend/imaging/resample/image_resize_cuda.h) owns reusable
@@ -301,7 +371,7 @@ the complete structural check before exposing any view:
 2. copy and validate the header magic, version, dimensions, stride, and limits;
 3. validate section order, exact sizes, 2 MiB pixel alignment, and end of file;
 4. validate every pixel and label index, original dimension, class ID,
-   bounding box, RLE span, and RLE run;
+   continuous box, original area, flags, provenance, RLE span, and RLE run;
 5. expose immutable spans over the mapped index, labels, and masks, plus direct
    fixed-stride pixel addresses.
 
@@ -346,8 +416,8 @@ batch.
 
 Most of the speed comes from moving variable-cost work out of the hot path:
 
-- PNG decode, RGB conversion, resizing, letterboxing, JSON parsing, mask
-  transformation, bounding-box derivation, and validation happen once during
+- PNG decode, RGB conversion, resizing, optional padding, JSON parsing, mask
+  transformation, source-box transformation, and validation happen once during
   compilation.
 - Runtime images have a fixed `float32` stride and O(1) address calculation.
   Labels and masks are compact packed arrays rather than per-image object

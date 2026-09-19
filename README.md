@@ -65,8 +65,11 @@ for compiled data, an image, or a local video, with Pause/Resume/Stop for video.
 The [RF-DETR workflow guide](docs/rfdetr-workflows.md) covers class identity,
 metrics, output files, and continuation. Current native checkpoints use version
 3 and saved plots require run format 2; older application checkpoints
-and old output-directory history are unsupported. Upstream weights and compiled
-dataset format 7 keep their own supported input routes.
+and old output-directory history are unsupported. Upstream weights keep their
+own supported input routes. Compiled datasets use format 8; recompile older
+bins. Dataset compilation defaults to Stretch, with Letterbox available
+explicitly. The shared viewer's Original option restores source aspect from
+compiled pixels; it does not recover source resolution.
 
 ## Quick reference
 

@@ -10,6 +10,7 @@
 - [Commands](commands.md): wrapper operations, process snapshots, native CLI,
   desktop options, and model tooling.
 - [RF-DETR workflows and artifacts](rfdetr-workflows.md): model/class admission,
+  GPU normalization, physical candidate ranking, separate candidate/COCO limits,
   shared weights selection, Transfer/Resume, automatic/manual output, training
   inputs and live progress, EMA, saved history,
   evaluation metrics and samples, and incremental image/video prediction.
@@ -23,14 +24,16 @@
   formats, workflow layout and navigation, the retained training dashboard,
   fixed Validation metrics/atlas, the shared image viewer and primary actions,
   numeric editing, shared immediate mouse input, native command settlement,
-  retained Explore measurements, paired image geometry, direct/copy acquisition,
+  retained Explore measurements, paired image geometry, Original aspect
+  restoration, upscaling the selected source, importing displayed images, direct/copy acquisition,
   retained redraws, FPS, and resource lifetime.
 
 ## Data and backend systems
 
-- [Datasets and compilation](datasets.md): source annotations, the compiled
-  binary format, optional perceptual downscaling, loading, batch leases, and
-  Explore thumbnail/atlas retention through viewport and augmentation changes.
+- [Datasets and compilation](datasets.md): source annotations and provenance,
+  format 8 and recompilation, Stretch/Letterbox geometry, optional perceptual
+  downscaling, loading, batch leases, and Explore thumbnail/atlas retention
+  through viewport and augmentation changes.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
   CUDA import, independent display/compute selection and transfers, provider

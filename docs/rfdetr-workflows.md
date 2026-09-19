@@ -51,8 +51,9 @@ distinct:
 | Model output slot | Physical classifier axis, which may include unused or background slots |
 | External output ID | Identity required by an external export format |
 
-Compiled format 7 retains its existing one-byte foreground references and
-32-byte name fields. Names must fit exactly; the compiler rejects truncation.
+The [compiled format](datasets.md#compiled-binary-format) uses one-byte
+foreground references and 32-byte name fields. Names must fit exactly; the
+compiler rejects truncation. Source category identity is stored separately.
 Training, validation, and test splits for one training run require the same
 ordered catalog. Standalone evaluation can use an explicitly verified
 permutation of the same exact names.
@@ -61,9 +62,10 @@ permutation of the same exact names.
 the ordered foreground catalog, each output slot's role, score encoding,
 no-object encoding, and provenance. Fresh native training uses sigmoid logits,
 one trailing unused output slot, and all-negative no-object supervision.
-Background and unused slots are removed before detection ranking. Current
-RF-DETR execution requires sigmoid logits; declaring a softmax layout does not
-make that execution mode supported.
+Background and unused slots participate in physical ranking and are discarded
+after selection, as described [below](#model-input-and-detection-selection).
+Current RF-DETR execution requires sigmoid logits; declaring a softmax layout
+does not make that execution mode supported.
 
 Native version-3 checkpoints embed the layout. External assets may supply
 supported embedded metadata, verified asset metadata, or a digest-bound
@@ -85,6 +87,56 @@ semantic identity, including applicable classifier, encoder, denoising, and
 match-free class axes. Unmatched destination state keeps its initialized value.
 Resume instead requires the exact native class layout and compatible saved
 state; it does not perform transfer remapping.
+
+## Model input and detection selection
+
+Compiled files contain planar RGB float32 in `[0,1]`, using the
+[stored resize geometry](datasets.md#resize-geometry). The shared
+[GpuBatchPreprocessor](../src/backend/models/rfdetr/core/gpu_batch_preprocessor.h)
+normalizes evaluation and prediction input once on the GPU with
+`(RGB - mean) / std`, using mean `[0.485, 0.456, 0.406]` and standard deviation
+`[0.229, 0.224, 0.225]`. Training augmentation uses these same normalization
+constants. Borrowed compiled pixels and retained preview pixels remain
+raw; normalization writes reusable, separately owned model-input storage and
+settles its consumers before reuse. Native, ONNX, and TensorRT prediction
+paths share this preparation, including compiled, ordinary-image, and video
+inputs.
+
+[Postprocessing](../src/backend/models/rfdetr/core/postprocess.cpp) applies
+sigmoid over the full physical query-by-class output, stably ranks flattened
+scores, and selects the requested candidate count. Equal scores retain physical
+flattened order. Only then does the admitted class layout remove unused and
+background slots and project foreground references; discarded candidates are
+not refilled. Boxes, scores, classes, and masks retain the same selected query
+identity. Continuous predicted corners clip to the model canvas, then to the
+stored image-content rectangle for compiled Letterbox input.
+
+These counts serve different purposes:
+
+| Count | Authority and meaning |
+| --- | --- |
+| Physical query count | Model architecture and admitted training/checkpoint configuration |
+| Candidate count (`num_select`) | Model configuration's default physical ranking budget; validation's `--candidate-count 0` selects it |
+| Output capacity | Checked storage bounded by the requested budget and available physical query/class pairs |
+| Surviving detections | Actual valid entries after semantic filtering and any requested confidence threshold; may be fewer than capacity |
+| COCO maxDets | Per-image, per-category evaluation caps, independent of the model candidate budget |
+
+The existing [preset catalog](../src/backend/models/rfdetr/contract/preset_catalog.h)
+supplies these default candidate counts:
+
+| Task and preset sizes | Candidates |
+| --- | ---: |
+| Detection Nano, Small, Medium, Large | 300 |
+| Segmentation Nano, Small | 100 |
+| Segmentation Medium, Large | 200 |
+| Segmentation XLarge, 2XLarge | 300 |
+
+Admitted custom configurations and resumed checkpoints retain their own
+selection counts. CLI `evaluate` and `validate` expose `--candidate-count`
+independently of `--eval-max-dets`; zero selects the model default and shared
+evaluation default respectively. Prediction's `--max-dets-per-image` selects
+its candidate/output limit, defaulting to 500; zero uses the admitted model's
+selection count. It does not change COCO evaluation policy.
 
 ## Shared weights selection
 
@@ -149,8 +201,17 @@ selection does.
 
 ## Training and query limits
 
-An image may contain more targets than the resolved query count. All targets
-remain available to supervision; the SciPy-derived rectangular assignment
+Continuous dataset boxes remain detection targets through geometric
+augmentation. Mask support and occlusion are separate from box authority;
+mask disappearance alone does not delete a valid detection target. Crowd
+annotations remain in the compiled data for evaluation but are excluded from
+foreground supervision and copy-paste donors. Segmentation training requires
+present masks for its non-crowd targets; a present empty mask stays distinct
+from a missing one. The Hungarian focal classification cost uses the configured
+focal alpha in both ordinary and CUDA matcher paths.
+
+An image may contain more targets than the resolved query count. All eligible
+targets remain available to supervision; the SciPy-derived rectangular assignment
 solver still matches at most the smaller matrix dimension in each query group.
 This changes target admission and storage sizing, not the solver or loss
 definition. Automatic query selection still respects the model's automatic cap,
@@ -241,7 +302,8 @@ show their phase without a stale image bar or loss/rate display.
 Current manifests and metric records use **format version 2**, including the
 native image-count fields. Version-1 history and other older output directories
 are rejected; there is no compatibility reader or migration. Checkpoint version
-3 and compiled dataset format 7 are independent formats.
+3 and the [compiled dataset format](datasets.md#compiled-binary-format) are
+independent formats.
 
 | File | Authority |
 | --- | --- |
@@ -297,8 +359,10 @@ and [evaluator](../src/backend/models/rfdetr/core/evaluator.cpp) define:
 
 - Box and, when available/requested, mask AP over IoU 0.50–0.95 in 0.05 steps,
   with AP50 and AP75.
-- AR at detection caps `1`, `min(10, budget)`, and the resolved detection
-  budget; the budget is reported rather than assumed to be 100.
+- AR at per-image, per-category detection caps `1`, `min(10, cap)`, and the
+  resolved evaluation cap. The shared default is **[1, 10, 500]** for boxes
+  and masks, independent of model candidate counts; an explicit
+  `--eval-max-dets` changes the cap.
 - All/small/medium/large area and per-class details, with 101-point interpolated
   precision-recall curves.
 - Precision, recall, and F1 at the threshold maximizing macro F1 over classes
@@ -306,10 +370,29 @@ and [evaluator](../src/backend/models/rfdetr/core/evaluator.cpp) define:
   threshold is reported; ties retain the first threshold. These confidence metrics use
   IoU 0.50 and are not averages across the AP IoU axis.
 
+The shared evaluator uses stored original annotation area for both box and mask
+area ranges. Compilation's [area fallback](datasets.md#instance-records) applies
+only when the source omitted area. Small, medium, and large ranges share the
+inclusive boundaries at `32²` and `96²` source pixels. Unmatched detections
+outside the current area range are ignored; their box or mask area is converted
+back to source units using the stored resize geometry.
+
+For COCO bbox/segmentation preparation, crowd determines the initial ignore
+state. Raw `ignore` metadata is preserved but is not OR-ed into that state.
+Nonignored ordinary ground truth has matching priority over ignored ground
+truth. Crowd overlap divides intersection by detection area and permits repeated
+matches. Matched crowd detections contribute neither true nor false positives,
+and crowd is excluded from the positive denominator. Area-ignored
+ground truth also stays outside the positive denominator. Matching preserves
+source order, including distinct duplicate annotations; equal-IoU choices
+follow the last annotation within the same ignore group. Score ties retain
+stable prediction order through 101-point precision accumulation.
+
 No eligible ground truth produces unavailable metrics rather than a fabricated
-zero result. Area values and geometry derive from compiled annotations. Original
-source/crowd information absent from that format cannot be reconstructed, and
-quantized compiled annotations can differ from original-annotation evaluation.
+zero result. Box-and-mask evaluation requires every ground-truth annotation to
+declare a mask; a declared empty mask is valid. Masks remain rasters at compiled
+resolution. Original-area metadata and continuous boxes do not recover discarded
+source segmentation detail or establish source-resolution segmentation parity.
 Exact AP retains compact matching records proportional to evaluated detections;
 it is not a constant-memory statistic.
 

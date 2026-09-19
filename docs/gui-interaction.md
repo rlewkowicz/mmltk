@@ -40,9 +40,12 @@ editor widget identities survive ordinary layout and native-state updates.
 
 Train uses the [retained dashboard](#training-dashboard) in the center column,
 with the shared workspace aspect selector and a separate live progress card.
-It has no native GPU image workspace. Its Dataset card keeps the optional test
-split independent of inferred train/validation paths; manual split text fields
-appear when inference is disabled. Its weights card owns Transfer/Resume.
+It has no native GPU image workspace. Its Dataset card offers Stretch and
+Letterbox compilation radios, separate from perceptual downscaling; native
+[resize defaults and geometry](datasets.md#resize-geometry) drive those controls.
+It keeps the optional test split independent of inferred train/validation
+paths; manual split text fields appear when inference is disabled. Its weights
+card owns Transfer/Resume.
 Its Output card selects Auto Output or Browse Output, shows the selected/active
 path, and loads supported saved charts. Advanced includes
 **Exponential moving average**, disabled by default, and separate
@@ -129,10 +132,10 @@ sidebars outside the overlay.
 Sample selection uses metadata paired with the displayed atlas. A held pointer
 admits a target once until that target changes or the hold ends; a publication
 revision alone does not create another selection. Navigation and overlay
-requests use the common connection/settings/system admission. Upscale and
-Annotation consume the exact displayed sample through their existing native
-owners. Annotation receives the sample's ground truth, including masks;
-detections remain a Validation viewer overlay.
+requests use the common connection/settings/system admission. Upscale follows
+the current selected sample; Annotation captures the exact displayed sample and
+view at dispatch. Annotation receives the sample's ground truth, including
+masks; detections remain a Validation viewer overlay.
 
 Validation's atlas and detail panel have **GT labels** and **Det labels**
 checkboxes. Each controls its entire ground-truth or detection layer—text,
@@ -149,6 +152,45 @@ drawn second. Separate Iced layers keep Det backgrounds above GT glyphs as well
 as GT backgrounds. The existing font, glyph layout, contrast, and alpha policy
 remain. These layer controls and color/composition rules belong to Validation;
 Explore keeps its existing palette and single caption layer.
+
+## Original view and annotation import
+
+Explore's **Original content** and Validation's **Original** controls restore
+the source aspect ratio using the compiled pixels. Stretch uses the full
+canvas with inverse anisotropic display scaling. Letterbox crops the stored
+content rectangle before restoring source aspect. Turning Original off shows
+the actual model canvas, including padding. No source image file is opened and
+no discarded source-resolution detail is recovered.
+
+The exact displayed `VisualFrame` carries canvas extent, content rectangle,
+and source extent through the graphics metadata. The Iced
+[surface geometry](../src/frontend/iced/src/presentation_surface/geometry.rs)
+keeps pixel sampling and displayed aspect distinct while applying one coherent
+mapping to boxes, masks, labels, fit, pan, zoom, clipping, and inverse input
+coordinates. This view choice reuses completed pixels; toggling Original does
+not launch another upscale or alter its processing identity.
+
+Basic, Fast, and Neural Upscale use the currently selected native detail source
+and its document facts. A previous image can remain visible while navigation
+settles, but it does not become the source of a new explicit Upscale request.
+The derived product carries the scaled canvas/content geometry and unchanged
+source extent. Checked geometry scaling and the native output-scale constant
+are [generated from native declarations](architecture.md#nativerust-boundary).
+The same Original preference then applies to the derived image.
+
+**Open in Annotation** instead captures the exact displayed image and its
+applied Original choice at dispatch, including a displayed derived result.
+The receiving owner completes its pixel copy before releasing the borrow and
+materializes continuous annotation coordinates through the same crop and aspect
+transform. The materialized aspect fits within the available compiled or
+derived content extent; it does not allocate the original source resolution.
+Later navigation or a preference change cannot alter that accepted import.
+
+Masks retain their own support bounds independently of boxes. Import can
+therefore preserve mask pixels beyond a detection box, and a present empty
+mask stays present with no runs. The native
+[document materializer](../src/controller/presentation/visual_document.cpp)
+owns this conversion and validates it before replacing the editable document.
 
 ## Training dashboard
 
@@ -289,8 +331,9 @@ application intents or own UI behavior.
 
 The WebSocket carries controls and logical UI facts. The independent FD graphics
 channel carries completed images and immutable `WorkspaceImageMetadata`:
-schema identity, frame dimensions/content region, and the corresponding native
-product projection, including atlas layout and labels where applicable.
+schema identity, frame dimensions/content region/source extent, and the
+corresponding native product projection, including atlas layout and labels where
+applicable.
 Firefox transports this payload opaquely. The
 [metadata decoder](../src/frontend/iced/src/presentation_surface/metadata.rs)
 validates its extent, schema, exact image identity, and product/source pairing
@@ -567,8 +610,8 @@ Explicit route departure or component teardown retires its display custody.
 Transforms use component identity and paired image geometry. An accepted
 Original content preference stays with the same image through route changes
 and reconnect; a different image starts from its own native preference.
-Opening Annotation captures the exact displayed source and applied crop at
-dispatch, so a later preference or image change cannot alter that import.
+The [Original and import rules](#original-view-and-annotation-import) also apply
+when a retained fallback is visible during navigation or derived work.
 
 ## Browser draw eligibility and retained fallback
 
