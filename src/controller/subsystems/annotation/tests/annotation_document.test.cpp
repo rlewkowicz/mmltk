@@ -12,6 +12,7 @@
 #include <vector>
 #include <cmath>
 #include <future>
+#include <stdexcept>
 #include <cstring>
 #include <cuda_runtime_api.h>
 #include "src/test_support/filesystem_test_utils.hpp"
@@ -515,7 +516,109 @@ TEST_CASE("Annotation valid repeated edits do not consume history and editing ou
     for (unsigned index = 0; index < 80; ++index)
         REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0, index % 2 != 0}}).outcome == d::DocumentOutcome::Applied);
     for (unsigned index = 0; index < 32; ++index) REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
+    CHECK_FALSE(editor.ui().can_undo);
+    const auto exhausted = editor.ui();
     CHECK(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
+    CHECK(editor.ui() == exhausted);
+    for (unsigned index = 0; index < 32; ++index) REQUIRE(editor.Edit({.value = c::AnnotationRedoEdit{}}).outcome == d::DocumentOutcome::Applied);
+    CHECK_FALSE(editor.ui().can_redo);
+    CHECK(editor.ui().scene.objects.front().enabled);
+}
+TEST_CASE("Annotation journal moves retain complete payloads and restore stored facts after live editor changes") {
+    namespace c = mmltk::controller;
+    namespace d = c::subsystems::annotation;
+    namespace domain = c::contracts;
+    d::AnnotationDocument editor;
+    auto scene = c::test_scene("test://journal-owned-payloads");
+    scene.objects = {{.name = domain::AnnotationText::From("attached mask"), .box = {{2, 2}, {24, 24}}, .mask = {.present = true}},
+                     {.name = domain::AnnotationText::From("second"), .box = {{30, 30}, {50, 50}}};
+    for (std::uint16_t row = 0; row != 64U; ++row)
+        for (std::uint16_t x = 0; x != 64U; x += 2U) scene.objects[0].mask.runs.push_back({row, x, x});
+    REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
+    SECTION("Aggregate attached-mask capacity refuses duplication without consuming history") {
+        scene.objects[0].mask.runs.resize(domain::kAnnotationMaskRunCapacity, {1U, 1U, 1U});
+        REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
+        REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
+        const auto before = editor.ui();
+        CHECK(editor.Edit({.value = c::AnnotationSidebarEdit{domain::AnnotationSidebarCommand::Duplicate}}).outcome == d::DocumentOutcome::Capacity);
+        CHECK(editor.ui() == before);
+        return;
+    }
+    SECTION("All admitted payload variants retain full history") {
+        struct Expected {
+            domain::AnnotationSceneContent scene;
+            domain::AnnotationEditorFacts editor;
+            std::vector<domain::AnnotationObjectIdentity> identities;
+        };
+        const auto capture = [&] {
+            c::AnnotationRenderState description;
+            editor.CaptureRender(description);
+            return Expected{editor.ui().scene, editor.ui().editor, *description.identities};
+        };
+        std::vector<std::pair<Expected, Expected>> history;
+        const auto edit = [&](c::AnnotationEdit operation) {
+            const auto before = capture();
+            REQUIRE(editor.Edit(operation).outcome == d::DocumentOutcome::Applied);
+            REQUIRE(editor.ui().document_revision == before.scene.document.revision + 1U);
+            history.emplace_back(before, capture());
+        };
+        REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
+        edit({.value = c::AnnotationSelectedObjectEdit{0U, false}});
+        edit({.value = c::AnnotationCategoryEdit{domain::AnnotationText::From("added")}});
+        REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{1U}}).outcome == d::DocumentOutcome::Applied);
+        edit({.value = c::AnnotationSidebarEdit{domain::AnnotationSidebarCommand::RedrawBox}});
+        edit({.value = c::AnnotationSidebarEdit{domain::AnnotationSidebarCommand::Duplicate}});
+        edit({.value = c::AnnotationSidebarEdit{domain::AnnotationSidebarCommand::Delete}});
+        edit({.value = c::AnnotationSceneEdit{}});
+        const auto cleared = editor.ui();
+        for (auto action : {domain::AnnotationSetupAction::PreviousFrame, domain::AnnotationSetupAction::NextFrame,
+                           domain::AnnotationSetupAction::ReloadFrame}) {
+            CHECK(editor.Edit({.value = c::AnnotationSetupEdit{action}}).outcome == d::DocumentOutcome::Rejected);
+            CHECK(editor.ui() == cleared);
+        }
+        const auto compare = [&](Expected expected) {
+            expected.scene.document.revision = editor.ui().scene.document.revision;
+            CHECK(editor.ui().scene == expected.scene);
+            CHECK(editor.ui().editor == expected.editor);
+            CHECK(capture().identities == expected.identities);
+        };
+        const auto change_live_facts = [&] {
+            REQUIRE(editor.Edit({.value = c::AnnotationHoldEdit{!editor.ui().editor.hold_save}}).outcome == d::DocumentOutcome::Applied);
+            REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{domain::AnnotationTool::Point}}).outcome == d::DocumentOutcome::Applied);
+            if (!editor.ui().scene.objects.empty())
+                REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
+        };
+        for (auto entry = history.rbegin(); entry != history.rend(); ++entry) {
+            change_live_facts();
+            REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
+            compare(entry->first);
+        }
+        CHECK_FALSE(editor.ui().can_undo);
+        for (const auto& entry : history) {
+            change_live_facts();
+            REQUIRE(editor.Edit({.value = c::AnnotationRedoEdit{}}).outcome == d::DocumentOutcome::Applied);
+            compare(entry.second);
+        }
+        CHECK_FALSE(editor.ui().can_redo);
+        const auto exhausted = editor.ui();
+        CHECK(editor.Edit({.value = c::AnnotationRedoEdit{}}).outcome == d::DocumentOutcome::Applied);
+        CHECK(editor.ui() == exhausted);
+        REQUIRE(editor.Edit({.value = c::AnnotationUndoEdit{}}).outcome == d::DocumentOutcome::Applied);
+        compare(history.back().first);
+        const auto saved = editor.ui().scene;
+        mmltk::testsupport::ScopedTempDir directory{"annotation-journal"};
+        const auto path = directory.path() / "document.cbor";
+        REQUIRE(editor.Save(path.string()).outcome == d::DocumentOutcome::Applied);
+        std::ifstream file{path, std::ios::binary};
+        const std::vector<char> characters{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+        const auto decoded = mmltk::frameworks::serialization::decode<domain::AnnotationUiState>(
+            {.first = std::as_bytes(std::span{characters})}, {.max_bytes = domain::kAnnotationUiStateByteBudget, .max_items = domain::kAnnotationUiStateByteBudget});
+        REQUIRE(decoded.has_value());
+        CHECK(decoded->scene == saved);
+        REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
+        REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0U, true}}).outcome == d::DocumentOutcome::Applied);
+        CHECK_FALSE(editor.ui().can_redo);
+    }
 }
 TEST_CASE("Annotation brush follows every segment as one cancelable transaction") {
     namespace c = mmltk::controller;
@@ -637,11 +740,13 @@ TEST_CASE("Annotation large committed scenes reuse bounded immutable storage acr
     CHECK(scratch.scene == held.scene);
     REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).render_changed);
     editor.CaptureRender(scratch);
-    CHECK(scratch.scene != held.scene);
+    CHECK(scratch.scene == held.scene);
+    CHECK(scratch.identities == held.identities);
+    CHECK(scratch.scene_revision != held.scene_revision);
     CHECK(scratch.editor.selected_object == 0U);
     CHECK_FALSE(held.editor.selected_object);
-    std::array<const c::contracts::AnnotationSceneContent*, 4U> storage{original, scratch.scene.get()};
-    std::size_t used = 2U;
+    std::array<const c::contracts::AnnotationSceneContent*, 4U> storage{original};
+    std::size_t used = 1U;
     for (unsigned index = 0; index < 32U; ++index) {
         REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0U, index % 2U != 0U}}).render_changed);
         editor.CaptureRender(scratch);
@@ -664,6 +769,38 @@ TEST_CASE("Annotation large committed scenes reuse bounded immutable storage acr
     CHECK(held.scene->frame_width == 64U);
     CHECK(held.ObjectCount() == scene.objects.size());
     CHECK(pending.preview == first_preview);
+}
+TEST_CASE("Annotation four immutable backings admit editor facts while document custody is exhausted") {
+    namespace c = mmltk::controller;
+    namespace d = c::subsystems::annotation;
+    d::AnnotationDocument editor;
+    auto scene = c::test_scene("test://four-backings");
+    scene.objects.push_back({.name = c::contracts::AnnotationText::From("box"), .box = {{4, 4}, {20, 20}}});
+    REQUIRE(editor.Open(scene).outcome == d::DocumentOutcome::Applied);
+    REQUIRE(editor.Edit({.value = c::AnnotationObjectEdit{0U}}).outcome == d::DocumentOutcome::Applied);
+    std::array<c::AnnotationRenderState, 4U> held;
+    editor.CaptureRender(held[0]);
+    for (std::size_t index = 1U; index != held.size(); ++index) {
+        REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0U, index % 2U == 0U}}).outcome == d::DocumentOutcome::Applied);
+        editor.CaptureRender(held[index]);
+    }
+    REQUIRE(editor.Edit({.value = c::AnnotationHoldEdit{true}}).outcome == d::DocumentOutcome::Applied);
+    c::AnnotationRenderState scratch;
+    editor.CaptureRender(scratch);
+    CHECK(scratch.scene == held.back().scene);
+    CHECK(scratch.editor.hold_save);
+    CHECK_FALSE(held.back().editor.hold_save);
+    REQUIRE(editor.Edit({.value = c::AnnotationSelectedObjectEdit{0U, true}}).outcome == d::DocumentOutcome::Applied);
+    CHECK_THROWS_AS(editor.CaptureRender(scratch), std::logic_error);
+    const auto reusable = held[0].scene.get();
+    held[0].scene.reset();
+    held[0].identities.reset();
+    editor.CaptureRender(scratch);
+    CHECK(scratch.scene.get() == reusable);
+    CHECK(scratch.scene->objects[0].enabled);
+    CHECK_FALSE(held[1].scene->objects[0].enabled);
+    CHECK(held[2].scene->objects[0].enabled);
+    CHECK_FALSE(held[3].scene->objects[0].enabled);
 }
 TEST_CASE("Annotation source replacement invalidates retained content even when scene revisions coincide") {
     namespace c = mmltk::controller;
@@ -970,6 +1107,9 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
     c::detail::VisualRuntimeOwner owner(c::make_native_annotation_runtime_factory({.device = 0, .maximum_width = 64U, .maximum_height = 64U}),
                                         [&](auto failure) { done.set_value(failure); });
     const bool submitted = owner.SubmitOrdered([&](auto& runtime, std::stop_token) {
+        cudaDeviceProp properties{};
+        REQUIRE(cudaGetDeviceProperties(&properties, 0) == cudaSuccess);
+        INFO(properties.name << " CC " << properties.major << '.' << properties.minor);
         auto& algorithm = dynamic_cast<c::AnnotationAlgorithm&>(*runtime.model());
         const auto open = [&](unsigned char value) {
             runtime.PublishInput(64U, 64U, [value](auto clean, auto, auto stream) {
@@ -996,10 +1136,15 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         description.scene = scene;
         description.scene_revision = 1U;
         description.document_epoch = 1U;
-        const auto render = [&](unsigned char clean_value) {
+        const auto render = [&](unsigned char clean_value, bool reject_semantic = false) {
             auto output = runtime.AcquireOutput();
             const auto input = runtime.BorrowInput();
             runtime.PublishRetained(output, 64U, 64U, [&](auto clean, auto semantic, auto stream) {
+                if (reject_semantic) {
+                    auto invalid = semantic;
+                    invalid.descriptor.pitch_bytes = 0U;
+                    REQUIRE_THROWS_AS(algorithm.Render(description, input.plane(0U).plane(), clean, invalid, stream), std::runtime_error);
+                }
                 algorithm.Render(description, input.plane(0U).plane(), clean, semantic, stream);
             });
             runtime.CommitOutput(std::move(output));
@@ -1104,6 +1249,78 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
         const auto remaining = compare_fresh();
         CHECK(pixel(remaining, 55U, 46U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
         for (const unsigned row : {44U, 46U, 48U, 50U}) CHECK(pixel(remaining, 40U, row) == std::array<unsigned char, 4U>{255, 0, 0, 92});
+        auto reordered = std::make_shared<c::contracts::AnnotationSceneContent>(*removed);
+        std::swap(reordered->objects[0], reordered->objects[2]);
+        reordered->objects[1].enabled = false;
+        reordered->palette = {{240, 1, 1}, {60, 1, 1}};
+        description.scene = reordered;
+        description.editor.selected_object = 0U;
+        ++description.scene_revision;
+        compare_fresh();
+        auto expanded = std::make_shared<c::contracts::AnnotationSceneContent>(*reordered);
+        expanded->objects[1].enabled = true;
+        expanded->objects[1].spline_knots[0].out = {{8, 32}, true};
+        expanded->objects[1].spline_knots[1].in = {{10, 32}, true};
+        for (std::uint16_t row = 24U; row < 40U; ++row) expanded->objects[0].mask.runs.push_back({row, 16U, 35U});
+        description.scene = expanded;
+        description.editor.selected_object = 1U;
+        ++description.scene_revision;
+        const auto retried = render(82U, true);
+        CHECK(compare_fresh() == retried);
+        description.editor.selected_object.reset();
+        ++description.scene_revision;
+        compare_fresh();
+        {
+            c::subsystems::annotation::AnnotationDocument history;
+            auto packed = c::test_scene("test://packed-membership");
+            packed.palette = {{0, 1, 1}};
+            packed.objects = {
+                {.name = c::contracts::AnnotationText::From("first point"), .shape = c::contracts::AnnotationShape::Point,
+                 .point = {20, 8}, .mask = {.runs = {{44U, 10U, 18U}}, .present = true}},
+                {.name = c::contracts::AnnotationText::From("middle point"), .shape = c::contracts::AnnotationShape::Point, .point = {12, 20}},
+                {.name = c::contracts::AnnotationText::From("trailing point"), .shape = c::contracts::AnnotationShape::Point,
+                 .point = {30, 30}, .mask = {.runs = {{48U, 40U, 50U}}, .present = true}}};
+            REQUIRE(history.Open(packed).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
+            REQUIRE(history.Edit({.value = c::AnnotationObjectEdit{2U}}).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
+            std::array<c::AnnotationRenderState, 4U> layouts;
+            history.CaptureRender(layouts[0]);
+            REQUIRE(history.Edit({.value = c::AnnotationSidebarEdit{c::contracts::AnnotationSidebarCommand::Delete}}).outcome ==
+                    c::subsystems::annotation::DocumentOutcome::Applied);
+            history.CaptureRender(layouts[1]);
+            REQUIRE(history.Edit({.value = c::AnnotationUndoEdit{}}).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
+            history.CaptureRender(layouts[2]);
+            REQUIRE(layouts[2].scene->objects == layouts[0].scene->objects);
+            CHECK(*layouts[2].identities == *layouts[0].identities);
+            auto spanning = std::make_shared<c::contracts::AnnotationSceneContent>(*layouts[2].scene);
+            spanning->objects[0].mask.runs[0] = {44U, 11U, 19U};
+            spanning->objects[2].point = {32, 30};
+            layouts[3].scene = spanning;
+            layouts[3].editor = layouts[2].editor;
+            layouts[3].scene_revision = layouts[2].scene_revision + 1U;
+            REQUIRE(spanning->valid());
+            std::array<std::array<unsigned char, 64U * 64U * 4U>, 4U> expected;
+            // Build fresh references before replay, so Open cannot erase the
+            // packed membership history of removal followed by restoration.
+            for (std::size_t index = 0U; index < layouts.size(); ++index) {
+                description = layouts[index];
+                open(82U);
+                expected[index] = render(82U);
+            }
+            CHECK(pixel(expected[0], 45U, 48U) == std::array<unsigned char, 4U>{255, 0, 0, 92});
+            CHECK(pixel(expected[1], 45U, 48U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
+            CHECK(expected[2] == expected[0]);
+            CHECK(pixel(expected[3], 10U, 44U) == std::array<unsigned char, 4U>{0, 0, 0, 0});
+            open(82U);
+            for (std::size_t index = 0U; index < layouts.size(); ++index) {
+                CAPTURE(index);
+                description = layouts[index];
+                // Deletion compacts the first point over the trailing mask's
+                // words. The last change spans that restored mask and the
+                // unchanged middle geometry in one aggregated host upload.
+                CHECK(render(82U) == expected[index]);
+                CHECK(render(82U) == expected[index]);
+            }
+        }
         c::subsystems::annotation::AnnotationDocument editor;
         REQUIRE(editor.Open(c::test_scene("test://fractional-box-raster")).outcome == c::subsystems::annotation::DocumentOutcome::Applied);
         REQUIRE(editor.Edit({.value = c::AnnotationToolEdit{c::contracts::AnnotationTool::Box}}).render_changed);

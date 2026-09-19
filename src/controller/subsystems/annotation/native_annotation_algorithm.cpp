@@ -37,6 +37,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         source_ = source;
         allocations_.clear();
         geometry_.clear();
+        upload_valid_ = upload_pending_ = false;
     }
     Release ReleaseResources() noexcept override {
         if (mask_upload_ != nullptr) {
@@ -259,108 +260,145 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         const auto& scene = *description.scene;
         // Reuse pinned staging only after its prior transfer has consumed it;
         // the rendering kernels themselves remain ordered on the runtime stream.
-        if (mask_upload_ != nullptr && cudaEventSynchronize(mask_upload_) != cudaSuccess) throw std::runtime_error("Annotation mask upload settlement failed");
-        std::size_t run_count = 0U;
-        for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
-            const auto& object = description.DrawingObjectAt(index);
-            if (object.enabled) run_count += object.mask.runs.size();
+        if (mask_upload_ != nullptr && cudaEventSynchronize(mask_upload_) != cudaSuccess) {
+            upload_valid_ = upload_pending_ = false;
+            throw std::runtime_error("Annotation mask upload settlement failed");
         }
-        if (geometry_.size() < description.ObjectCount()) geometry_.resize(description.ObjectCount());
-        geometry_words_.clear();
-        for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
-            const auto& object = description.DrawingObjectAt(index);
-            if (!object.enabled) continue;
-            auto& geometry = geometry_[index];
-            const auto transform = description.preview_object == index ? description.drag : std::nullopt;
-            if (!geometry.source || !SameGeometry(*geometry.source, object) || geometry.transform != transform) {
-                geometry.words.clear();
-                geometry.count = geometry.edges = geometry.handles = 0;
-                geometry.edge_offset = geometry.handle_offset = 0U;
-                const auto append_point = [&](domain::AnnotationPoint value) {
-                    geometry.words.push_back(static_cast<std::uint32_t>(std::lround(value.x)));
-                    geometry.words.push_back(static_cast<std::uint32_t>(std::lround(value.y)));
-                };
-                const auto point = [&](domain::AnnotationPoint value) {
-                    append_point(value);
-                    ++geometry.count;
-                };
-                if (object.shape == domain::AnnotationShape::Point) point(description.DrawingPoint(index));
-                if (object.shape == domain::AnnotationShape::Spline && !object.spline_knots.empty()) {
-                    point(description.DrawingKnot(index, 0U).point);
-                    const auto segments = object.spline_knots.size() - (object.spline_closed ? 0U : 1U);
-                    for (std::size_t segment = 0; segment < segments; ++segment) {
-                        const auto a = description.DrawingKnot(index, segment);
-                        const auto b = description.DrawingKnot(index, (segment + 1) % object.spline_knots.size());
-                        const auto c1 = a.out.enabled ? a.out.point : a.point;
-                        const auto c2 = b.in.enabled ? b.in.point : b.point;
-                        for (unsigned sample = 1; sample <= 16; ++sample) {
-                            const float t = static_cast<float>(sample) / 16, u = 1 - t;
-                            point({u * u * u * a.point.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.point.x,
-                                   u * u * u * a.point.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.point.y});
-                        }
-                    }
-                }
-                if (object.shape == domain::AnnotationShape::Skeleton) {
-                    for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node) point(description.DrawingNode(index, node));
-                    geometry.edge_offset = geometry.words.size();
-                    for (const auto edge : object.skeleton_edges) {
-                        if (!object.skeleton_nodes[edge.source].visible || !object.skeleton_nodes[edge.target].visible) continue;
-                        geometry.words.push_back(edge.source);
-                        geometry.words.push_back(edge.target);
-                        ++geometry.edges;
-                    }
-                }
-                geometry.handle_offset = geometry.words.size();
-                const auto handle = [&](domain::AnnotationPoint value) {
-                    append_point(value);
-                    ++geometry.handles;
-                };
-                if (object.shape == domain::AnnotationShape::Skeleton)
-                    for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
-                        if (object.skeleton_nodes[node].visible) handle(description.DrawingNode(index, node));
-                if (object.shape == domain::AnnotationShape::Spline) VisitSplineHandles(description, index, handle);
-                if (!geometry.source) geometry.source.emplace();
-                geometry.source->shape = object.shape;
-                geometry.source->point = object.point;
-                geometry.source->spline_knots = object.spline_knots;
-                geometry.source->skeleton_nodes = object.skeleton_nodes;
-                geometry.source->skeleton_edges = object.skeleton_edges;
-                geometry.source->spline_closed = object.spline_closed;
-                geometry.transform = transform;
+        if (upload_pending_) { upload_valid_ = true; upload_pending_ = false; }
+        std::size_t run_count = 0U, total_words = 0U;
+        try {
+            for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
+                const auto& object = description.DrawingObjectAt(index);
+                if (object.enabled) run_count += object.mask.runs.size();
             }
-            geometry.offset = geometry_words_.size();
-            geometry_words_.insert(geometry_words_.end(), geometry.words.begin(), geometry.words.end());
-        }
-        const auto total_words = run_count * 2 + geometry_words_.size();
-        if (total_words != 0U) {
-            const bool grew = total_words * sizeof(std::uint32_t) > mask_capacity_;
-            EnsureMasks(total_words * sizeof(std::uint32_t));
-            auto* const pairs = static_cast<std::uint32_t*>(mask_host_->data());
-            std::size_t offset = 0U;
-            // CLEANUP-IGNORE: Enabled-object traversal feeds distinct geometry, RLE packing, and drawing bodies; no repeated loop body exists.
+            if (geometry_.size() < description.ObjectCount()) geometry_.resize(description.ObjectCount());
+            // Absent indices retain capacity, but no longer own words in the
+            // compacted layout. Restoration must refill both runs and geometry.
+            for (std::size_t index = description.ObjectCount(); index < geometry_.size(); ++index) geometry_[index].enabled = false;
+            std::size_t geometry_word_count = 0U;
             for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
                 const auto& object = description.DrawingObjectAt(index);
                 if (!object.enabled) continue;
-                for (const auto run : object.mask.runs) {
-                    pairs[offset++] = static_cast<std::uint32_t>(run.row) * clean.descriptor.width + run.first;
-                    pairs[offset++] = static_cast<std::uint32_t>(run.last) - run.first + 1U;
+                auto& geometry = geometry_[index];
+                const auto transform = description.preview_object == index ? description.drag : std::nullopt;
+                geometry.changed = !geometry.source || !SameGeometry(*geometry.source, object) || geometry.transform != transform;
+                if (geometry.changed) {
+                    geometry.words.clear();
+                    geometry.count = geometry.edges = geometry.handles = 0;
+                    geometry.edge_offset = geometry.handle_offset = 0U;
+                    const auto append_point = [&](domain::AnnotationPoint value) {
+                        geometry.words.push_back(static_cast<std::uint32_t>(std::lround(value.x)));
+                        geometry.words.push_back(static_cast<std::uint32_t>(std::lround(value.y)));
+                    };
+                    const auto point = [&](domain::AnnotationPoint value) {
+                        append_point(value);
+                        ++geometry.count;
+                    };
+                    if (object.shape == domain::AnnotationShape::Point) point(description.DrawingPoint(index));
+                    if (object.shape == domain::AnnotationShape::Spline && !object.spline_knots.empty()) {
+                        point(description.DrawingKnot(index, 0U).point);
+                        const auto segments = object.spline_knots.size() - (object.spline_closed ? 0U : 1U);
+                        for (std::size_t segment = 0; segment < segments; ++segment) {
+                            const auto a = description.DrawingKnot(index, segment);
+                            const auto b = description.DrawingKnot(index, (segment + 1) % object.spline_knots.size());
+                            const auto c1 = a.out.enabled ? a.out.point : a.point;
+                            const auto c2 = b.in.enabled ? b.in.point : b.point;
+                            for (unsigned sample = 1; sample <= 16; ++sample) {
+                                const float t = static_cast<float>(sample) / 16, u = 1 - t;
+                                point({u * u * u * a.point.x + 3 * u * u * t * c1.x + 3 * u * t * t * c2.x + t * t * t * b.point.x,
+                                       u * u * u * a.point.y + 3 * u * u * t * c1.y + 3 * u * t * t * c2.y + t * t * t * b.point.y});
+                            }
+                        }
+                    }
+                    if (object.shape == domain::AnnotationShape::Skeleton) {
+                        for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node) point(description.DrawingNode(index, node));
+                        geometry.edge_offset = geometry.words.size();
+                        for (const auto edge : object.skeleton_edges) {
+                            if (!object.skeleton_nodes[edge.source].visible || !object.skeleton_nodes[edge.target].visible) continue;
+                            geometry.words.push_back(edge.source);
+                            geometry.words.push_back(edge.target);
+                            ++geometry.edges;
+                        }
+                    }
+                    geometry.handle_offset = geometry.words.size();
+                    const auto handle = [&](domain::AnnotationPoint value) {
+                        append_point(value);
+                        ++geometry.handles;
+                    };
+                    if (object.shape == domain::AnnotationShape::Skeleton)
+                        for (std::size_t node = 0; node < object.skeleton_nodes.size(); ++node)
+                            if (object.skeleton_nodes[node].visible) handle(description.DrawingNode(index, node));
+                    if (object.shape == domain::AnnotationShape::Spline) VisitSplineHandles(description, index, handle);
+                    if (!geometry.source) geometry.source.emplace();
+                    geometry.source->shape = object.shape;
+                    geometry.source->point = object.point;
+                    geometry.source->spline_knots = object.spline_knots;
+                    geometry.source->skeleton_nodes = object.skeleton_nodes;
+                    geometry.source->skeleton_edges = object.skeleton_edges;
+                    geometry.source->spline_closed = object.spline_closed;
+                    geometry.transform = transform;
                 }
+                geometry.next_offset = geometry_word_count;
+                geometry_word_count += geometry.words.size();
             }
-            std::copy(geometry_words_.begin(), geometry_words_.end(), pairs + run_count * 2);
-            std::size_t first = 0U, last = total_words;
-            if (!grew) {
-                const auto common = std::min(uploaded_words_.size(), total_words);
-                while (first < common && uploaded_words_[first] == pairs[first]) ++first;
-                if (uploaded_words_.size() == total_words)
-                    while (last > first && uploaded_words_[last - 1U] == pairs[last - 1U]) --last;
+            total_words = run_count * 2 + geometry_word_count;
+            const bool reusable = upload_valid_ && upload_width_ == clean.descriptor.width;
+            // Invalidate before touching staging, allocation, or the authoritative word
+            // mirror. Successfully recorded pending bytes are ordered for this draw;
+            // only the existing upload settlement above makes them reusable later.
+            upload_valid_ = false;
+            const bool grew = total_words * sizeof(std::uint32_t) > mask_capacity_;
+            EnsureMasks(total_words * sizeof(std::uint32_t));
+            uploaded_words_.resize(total_words);
+            std::size_t first = total_words, last = 0U, run_offset = 0U;
+            const auto changed = [&](std::size_t begin, std::size_t end) {
+                if (begin == end) return;
+                first = std::min(first, begin);
+                last = std::max(last, end);
+            };
+            for (std::size_t index = 0; index < description.ObjectCount(); ++index) {
+                const auto& object = description.DrawingObjectAt(index);
+                auto& geometry = geometry_[index];
+                if (!object.enabled) { geometry.enabled = false; continue; }
+                if (!reusable || !geometry.enabled || geometry.run_offset != run_offset || geometry.runs != object.mask.runs) {
+                    auto word = run_offset * 2U;
+                    for (const auto run : object.mask.runs) {
+                        uploaded_words_[word++] = static_cast<std::uint32_t>(run.row) * clean.descriptor.width + run.first;
+                        uploaded_words_[word++] = static_cast<std::uint32_t>(run.last) - run.first + 1U;
+                    }
+                    changed(run_offset * 2U, word);
+                    if (geometry.runs != object.mask.runs) geometry.runs = object.mask.runs;
+                }
+                const auto word_offset = run_count * 2U + geometry.next_offset;
+                if (!reusable || !geometry.enabled || geometry.changed || geometry.word_offset != word_offset) {
+                    std::copy(geometry.words.begin(), geometry.words.end(), uploaded_words_.begin() + word_offset);
+                    changed(word_offset, word_offset + geometry.words.size());
+                }
+                geometry.offset = geometry.next_offset;
+                geometry.word_offset = word_offset;
+                geometry.run_offset = run_offset;
+                geometry.enabled = true;
+                run_offset += object.mask.runs.size();
             }
-            if (last > first && cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first,
-                                                (last - first) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess)
-                throw std::runtime_error("Annotation changed geometry upload failed");
-            uploaded_words_.assign(pairs, pairs + total_words);
-            if (mask_upload_ == nullptr && cudaEventCreateWithFlags(&mask_upload_, cudaEventDisableTiming) != cudaSuccess)
-                throw std::runtime_error("Annotation mask upload event creation failed");
-            if (cudaEventRecord(mask_upload_, stream) != cudaSuccess) throw std::runtime_error("Annotation mask upload event recording failed");
+            upload_width_ = clean.descriptor.width;
+            if (grew || !reusable) { first = 0U; last = total_words; }
+            if (last > first) {
+                auto* const pairs = static_cast<std::uint32_t*>(mask_host_->data());
+                std::copy(uploaded_words_.begin() + first, uploaded_words_.begin() + last, pairs + first);
+                if (cudaMemcpyAsync(static_cast<std::uint32_t*>(mask_device_.active()) + first, pairs + first,
+                                    (last - first) * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream) != cudaSuccess)
+                    throw std::runtime_error("Annotation changed geometry upload failed");
+                if (mask_upload_ == nullptr && cudaEventCreateWithFlags(&mask_upload_, cudaEventDisableTiming) != cudaSuccess)
+                    throw std::runtime_error("Annotation mask upload event creation failed");
+                if (cudaEventRecord(mask_upload_, stream) != cudaSuccess) throw std::runtime_error("Annotation mask upload event recording failed");
+                upload_pending_ = true;
+            } else {
+                upload_valid_ = true;
+            }
+        } catch (...) {
+            upload_valid_ = upload_pending_ = false;
+            for (auto& geometry : geometry_) geometry.source.reset();
+            throw;
         }
         std::size_t offset = 0U;
         if (palette_source_ != scene.palette) {
@@ -378,6 +416,8 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                 offset += object.mask.runs.size();
                 continue;
             }
+            const raster::IntRect object_clip{std::max(clip.x1, bounds.x1), std::max(clip.y1, bounds.y1),
+                                                std::min(clip.x2, bounds.x2), std::min(clip.y2, bounds.y2)};
             const auto box = DrawingBox(description, index);
             const auto target = description.TransformsMask(index) ? description.TargetBox(index) : object.box;
             const auto color = palette_[object.category];
@@ -389,7 +429,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                          .run_count = static_cast<std::uint32_t>(object.mask.runs.size()),
                          .color = {color.r, color.g, color.b, 92U},
                          .stream = {reinterpret_cast<void*>(stream_value)},
-                         .clip = clip,
+                         .clip = object_clip,
                          .source_x = object.box.first.x,
                          .source_y = object.box.first.y,
                          .target_x = target.first.x,
@@ -409,12 +449,12 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
             const raster::PointBuffer points{geometry.count ? reinterpret_cast<const int*>(words + geometry.offset) : nullptr, geometry.count};
             int draw_status = 0;
             if (object.shape == domain::AnnotationShape::Spline && geometry.count > 1)
-                draw_status = raster::raster_polyline_rgba({overlay, points, object.spline_closed, color, 2, native_stream, clip});
+                draw_status = raster::raster_polyline_rgba({overlay, points, object.spline_closed, color, 2, native_stream, object_clip});
             if ((object.shape == domain::AnnotationShape::Point || object.shape == domain::AnnotationShape::Spline) && geometry.count == 1)
-                draw_status = raster::raster_points_rgba({overlay, points, 4, {color.r, color.g, color.b, 255}, native_stream, clip});
+                draw_status = raster::raster_points_rgba({overlay, points, 4, {color.r, color.g, color.b, 255}, native_stream, object_clip});
             if (object.shape == domain::AnnotationShape::Skeleton && geometry.edges)
                 draw_status = raster::raster_skeleton_rgba(
-                    {overlay, points, {words + geometry.offset + geometry.edge_offset, geometry.edges}, color, 2, native_stream, clip});
+                    {overlay, points, {words + geometry.offset + geometry.edge_offset, geometry.edges}, color, 2, native_stream, object_clip});
             if (draw_status != 0) throw std::runtime_error("Annotation geometry rendering failed");
             if (geometry.handles && (object.shape != domain::AnnotationShape::Spline || description.editor.selected_object == index) &&
                 raster::raster_points_rgba({overlay,
@@ -422,7 +462,7 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                             4,
                                             {color.r, color.g, color.b, 255},
                                             native_stream,
-                                            clip}) != 0)
+                                            object_clip}) != 0)
                 throw std::runtime_error("Annotation vertex rendering failed");
             if (object.shape != domain::AnnotationShape::Box && object.shape != domain::AnnotationShape::Mask) continue;
             if (description.editor.selected_object == index &&
@@ -432,14 +472,14 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
                                                        3,
                                                        {255, 255, 255, 255},
                                                        native_stream,
-                                                       clip}) != 0)
+                                                       object_clip}) != 0)
                 throw std::runtime_error("Annotation selection rendering failed");
             const raster::IntRect outline{static_cast<int>(box.first.x), static_cast<int>(box.first.y), static_cast<int>(box.second.x),
                                           static_cast<int>(box.second.y)};
             if (outline.x1 >= outline.x2 || outline.y1 >= outline.y2) continue;
             mmltk::frameworks::gpu::ensure_cuda_ok(
                 static_cast<cudaError_t>(raster::raster_box_outline_rgba(
-                    {.overlay = overlay, .box = outline, .color = color, .thickness = 2, .stream = native_stream, .clip = clip})),
+                    {.overlay = overlay, .box = outline, .color = color, .thickness = 2, .stream = native_stream, .clip = object_clip})),
                 "Annotation semantic rendering failed");
         }
         retained.epoch = description.document_epoch;
@@ -468,17 +508,22 @@ class NativeAnnotationAlgorithm final : public AnnotationAlgorithm {
         std::vector<std::uint32_t> words;
         std::optional<domain::AnnotationObject> source;
         std::optional<AnnotationDragPreview> transform;
+        std::vector<domain::AnnotationMaskRun> runs;
+        std::size_t run_offset = 0U, word_offset = 0U, next_offset = 0U;
+        bool enabled = false, changed = false;
         std::size_t offset = 0, edge_offset = 0, handle_offset = 0;
         int count = 0, edges = 0, handles = 0;
     };
     mutable std::vector<domain::AnnotationColor> palette_source_;
     mutable std::array<raster::RgbColor, domain::kAnnotationCategoryCapacity> palette_{};
     mutable std::vector<Geometry> geometry_;
-    mutable std::vector<std::uint32_t> geometry_words_, uploaded_words_;
+    mutable std::vector<std::uint32_t> uploaded_words_;
     mutable mmltk::frameworks::gpu::CudaHighWaterAllocation<void*> mask_device_;
     mutable std::unique_ptr<mmltk::frameworks::gpu::PinnedHostBuffer> mask_host_;
     mutable std::size_t mask_capacity_ = 0U;
     mutable cudaEvent_t mask_upload_ = nullptr;
+    mutable bool upload_valid_ = false, upload_pending_ = false;
+    mutable std::uint32_t upload_width_ = 0U;
     void EnsureMasks(const std::size_t bytes) const {
         if (bytes <= mask_capacity_) return;
         const auto capacity =

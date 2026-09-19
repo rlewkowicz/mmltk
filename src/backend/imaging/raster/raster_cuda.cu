@@ -379,12 +379,22 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
     }
     const std::uint64_t unclamped_end = start > UINT64_MAX - length ? UINT64_MAX : start + length;
     const std::uint64_t end = unclamped_end < pixel_count ? unclamped_end : pixel_count;
-    for (std::uint64_t pixel = start + threadIdx.x; pixel < end; pixel += blockDim.x) {
-        const int x = static_cast<int>(pixel % static_cast<std::uint64_t>(launch.overlay_region.width));
-        const int y = static_cast<int>(pixel / static_cast<std::uint64_t>(launch.overlay_region.width));
-        if (x < launch.clip.x1 || x >= launch.clip.x2 || y < launch.clip.y1 || y >= launch.clip.y2) continue;
-        raster_math::store_rgba_pixel(launch.overlay_region.pixels, launch.overlay_region.pitch_bytes, x, y,
-                                      raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
+    const auto width = static_cast<std::uint64_t>(launch.overlay_region.width);
+    const int left = max(0, launch.clip.x1), right = min(launch.overlay_region.width, launch.clip.x2);
+    const auto top = static_cast<std::uint64_t>(max(0, launch.clip.y1));
+    const auto bottom = static_cast<std::uint64_t>(min(launch.overlay_region.height, max(0, launch.clip.y2)));
+    if (left >= right || top >= bottom || start >= end) return;
+    const auto first_row = max(top, start / width);
+    const auto last_row = min(bottom, (end - 1U) / width + 1U);
+    for (auto row = first_row; row < last_row; ++row) {
+        const auto row_start = row * width;
+        const auto first = max(start, row_start + static_cast<std::uint64_t>(left));
+        const auto last = min(end, row_start + static_cast<std::uint64_t>(right));
+        for (auto pixel = first + threadIdx.x; pixel < last; pixel += blockDim.x) {
+            const int x = static_cast<int>(pixel - row_start), y = static_cast<int>(row);
+            raster_math::store_rgba_pixel(launch.overlay_region.pixels, launch.overlay_region.pitch_bytes, x, y,
+                                          raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
+        }
     }
 }
 __global__ void draw_box_outline_rgba_pitched_kernel(const draw_launch::BoxOutlineRgbaPitchedLaunch launch) {
