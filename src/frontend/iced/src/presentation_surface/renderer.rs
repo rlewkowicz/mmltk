@@ -575,51 +575,6 @@ pub(crate) fn record_drawn_detail(surface: Surface, crop: [u32; 4]) {
     });
 }
 
-pub(crate) fn viewer_upscale_request(
-    kernel: crate::generated::UpscaleKernel,
-) -> Option<crate::generated::UpscaleRequest> {
-    let (surface, _) = drawn_detail()?;
-    let frame = surface.frame?;
-    let paired = metadata::pending(frame)?;
-    if !paired.view_ready
-        || paired.surface.frame != Some(frame)
-        || !same_allocation(surface, paired.surface)
-        || !frame.belongs_to(surface)
-        || surface.viewer_identity != paired.surface.viewer_identity
-    {
-        return None;
-    }
-    if let Some(validation) = paired
-        .content
-        .validation()
-        .filter(|value| value.metadata.detail)
-    {
-        if !frame.matches_content(validation.frame())
-            || metadata::product(frame).as_ref() != Some(validation.frame())
-        {
-            return None;
-        }
-        surface.original_content(validation.frame())?;
-        return Some(crate::generated::UpscaleRequest {
-            source: validation.metadata.frame.clone(),
-            document: validation.metadata.document.clone(),
-            kernel,
-        });
-    }
-    let detail = paired.content.detail()?;
-    if !frame.matches_content(detail.frame())
-        || metadata::product(frame).as_ref() != Some(detail.frame())
-    {
-        return None;
-    }
-    surface.original_content(detail.frame())?;
-    Some(crate::generated::UpscaleRequest {
-        source: detail.explore.frame.clone(),
-        document: detail.explore.document.clone(),
-        kernel,
-    })
-}
-
 pub(crate) fn viewer_annotation_request() -> Option<crate::generated::AnnotationOpen> {
     let (surface, crop) = drawn_detail()?;
     let frame = surface.frame?;
@@ -3399,16 +3354,6 @@ mod tests {
                     source: product,
                     originalcontent: original,
                 };
-                for kernel in crate::generated::UPSCALE_KERNEL_VALUES.iter().copied() {
-                    assert_eq!(
-                        viewer_upscale_request(kernel),
-                        Some(crate::generated::UpscaleRequest {
-                            source: source.frame.clone(),
-                            document: source.document.clone(),
-                            kernel,
-                        })
-                    );
-                }
                 assert_eq!(viewer_annotation_request(), Some(expected.clone()));
                 if !original {
                     record_drawn_detail(
@@ -3432,13 +3377,6 @@ mod tests {
                     }
                     record_drawn_detail(mixed, recorded);
                     assert!(viewer_annotation_request().is_none());
-                    if invalid != 3 {
-                        // Annotation also validates its independently recorded crop.
-                        assert!(
-                            viewer_upscale_request(crate::generated::UpscaleKernel::Default)
-                                .is_none()
-                        );
-                    }
                 }
                 record_drawn_detail(surface, crop);
                 metadata::retire(physical);

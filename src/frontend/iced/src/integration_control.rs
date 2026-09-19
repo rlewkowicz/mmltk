@@ -678,6 +678,8 @@ enum Phase {
     AwaitPerceptualControl(usize),
     CompileDimensions,
     AwaitCompileDimensions,
+    CompileResizeMode,
+    AwaitCompileResizeMode,
     CompileResolution,
     AwaitCompileResolution,
     AwaitDatasetSettings(u64),
@@ -1555,6 +1557,7 @@ impl Controller {
             | Phase::CompiledDirectory
             | Phase::PerceptualControl(..)
             | Phase::CompileDimensions
+            | Phase::CompileResizeMode
             | Phase::CompileResolution
             | Phase::Compile
             | Phase::CompileActionWithProgress
@@ -2063,6 +2066,8 @@ impl Controller {
             | Phase::AwaitCompiledDirectory
             | Phase::CompileDimensions
             | Phase::AwaitCompileDimensions
+            | Phase::CompileResizeMode
+            | Phase::AwaitCompileResizeMode
             | Phase::CompileResolution
             | Phase::AwaitCompileResolution
             | Phase::AwaitDatasetSettings(..)

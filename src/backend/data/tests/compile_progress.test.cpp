@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -535,9 +536,11 @@ TEST_CASE("compiled annotations preserve continuous source meaning in both resiz
         const auto geometry = store.geometry(0);
         CHECK(geometry.resized_width == 8U);
         const float* pixels = store.image_pixels(0);
-        CHECK(pixels[0] == (mode == resize::ImageResizeMode::Stretch ? 48.0F / 255.0F : 0.0F));
-        CHECK(pixels[64] == (mode == resize::ImageResizeMode::Stretch ? 80.0F / 255.0F : 0.0F));
-        CHECK(pixels[128] == (mode == resize::ImageResizeMode::Stretch ? 112.0F / 255.0F : 0.0F));
+        // Reciprocal multiplication may differ from scalar division by one float32 step; padding stays exact.
+        const auto max_ulps = mode == resize::ImageResizeMode::Stretch ? 1U : 0U;
+        CHECK_THAT(pixels[0], Catch::Matchers::WithinULP(mode == resize::ImageResizeMode::Stretch ? 48.0F / 255.0F : 0.0F, max_ulps));
+        CHECK_THAT(pixels[64], Catch::Matchers::WithinULP(mode == resize::ImageResizeMode::Stretch ? 80.0F / 255.0F : 0.0F, max_ulps));
+        CHECK_THAT(pixels[128], Catch::Matchers::WithinULP(mode == resize::ImageResizeMode::Stretch ? 112.0F / 255.0F : 0.0F, max_ulps));
         CHECK(geometry.resized_height == (mode == resize::ImageResizeMode::Stretch ? 8U : 4U));
         const auto labels = store.image_labels(0);
         REQUIRE(labels.size() == 3U);

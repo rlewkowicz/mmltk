@@ -158,10 +158,9 @@ impl App {
                     ));
                     return Task::none();
                 }
-                let Some(request) = crate::presentation_surface::viewer_upscale_request(kernel)
-                else {
+                let Some(request) = self.model.viewer_upscale_request(kernel) else {
                     self.model.error = Some(UiError::presentation(
-                        "Explore displayed detail is unavailable.",
+                        "Explore selected detail is unavailable.",
                     ));
                     return Task::none();
                 };

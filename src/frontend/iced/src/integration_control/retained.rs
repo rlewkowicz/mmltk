@@ -4100,7 +4100,11 @@ impl State {
                     padded_width,
                     padded_height,
                 };
-                if !click(input_bounds) {
+                // Rapid round trips target the indicator, not selectable label text.
+                if !click(Rectangle {
+                    width: input_bounds.width.min(input_bounds.height),
+                    ..input_bounds
+                }) {
                     driver.fail("Firefox original-detail click dispatch failed");
                 }
                 None

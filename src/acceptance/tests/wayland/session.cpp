@@ -428,7 +428,7 @@ class ArtifactNotifications final {
     }
 }
 void compile_wayland_fixture(const mmltk::backend::data::testsupport::FixtureSpec& fixture, const std::uint32_t resolution,
-                             const mmltk::backend::imaging::resample::ImageResizeMode mode = mmltk::backend::imaging::resample::ImageResizeMode::Stretch) {
+                             const mmltk::backend::imaging::resample::ImageResizeMode mode) {
     using namespace mmltk::backend::data;
     const auto plan = DatasetCompiler::prepare({.resize_mode = mode,
                                                 .source_dir = mmltk::backend::data::testsupport::dataset_dir(fixture),
@@ -524,7 +524,7 @@ const mmltk::backend::data::testsupport::FixtureSpec& PreparedWaylandInputs::pro
         std::filesystem::copy_file(std::filesystem::path(dataset_dir(mixed_)) / mixed_.split / "000001.jsonl",
                                    std::filesystem::path(dataset_dir(probe_)) / probe_.split / "000001.jsonl",
                                    std::filesystem::copy_options::overwrite_existing);
-        compile_wayland_fixture(probe_, kCompiledResolution);
+        compile_wayland_fixture(probe_, kCompiledResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
         std::filesystem::remove_all(dataset_dir(probe_));
     }
     return probe_;
@@ -678,6 +678,7 @@ void WaylandSession::RunWorkflows() {
     CHECK(display_adapter_seen_);
     CHECK((workflow_steps_ == std::set<std::string>{"train",
                                                     "validation",
+                                                    "validation_original",
                                                     "compiled",
                                                     "image",
                                                     "video",
@@ -1631,6 +1632,8 @@ void WaylandSession::RunScenario(const std::string& viewer_scenario, const bool 
     CHECK(compiled.height == static_cast<std::uint32_t>(kCompiledResolution));
     CHECK(compiled.channels != 0U);
     CHECK_FALSE(compiled.class_names().empty());
+    CHECK(mmltk::backend::data::read_compiled_header(compiled_path.string()).resize_mode ==
+          mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     if (!last) AdvanceScenario();
 }
 void WaylandSession::AdvanceScenario() {
@@ -1706,7 +1709,7 @@ void WaylandSession::AdvanceScenario() {
     static const auto inputs = std::make_shared<PreparedWaylandInputs>();
     const auto& fixture = inputs->mixed();
     if (require_compiled && !std::filesystem::is_regular_file(mmltk::backend::data::testsupport::compiled_bin_path(fixture))) {
-        compile_wayland_fixture(fixture, kCompiledResolution);
+        compile_wayland_fixture(fixture, kCompiledResolution, mmltk::backend::imaging::resample::ImageResizeMode::Letterbox);
     }
     return inputs;
 }

@@ -304,6 +304,12 @@ pub(crate) fn install(
                         content.metadata.contentidentity,
                     )
                 })
+            })
+            .or_else(|| {
+                content
+                    .detail()?
+                    .viewer_identity()
+                    .map(|(dataset, image)| (dataset, u64::from(image)))
             }),
         fit_revision: 0,
     };

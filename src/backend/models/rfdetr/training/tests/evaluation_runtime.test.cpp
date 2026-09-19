@@ -1,5 +1,7 @@
 #include "src/backend/ml/torch/tests/catch_support.h"
 #include <catch2/matchers/catch_matchers.hpp>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <atomic>
 #include <exception>
 #include <future>
@@ -75,14 +77,15 @@ TEST_CASE("Evaluation encoding collection joins a running sibling after a consum
 }
 TEST_CASE("Evaluation staging preserves categories beyond the per-category evaluator cap", "[rfdetr][evaluation][gpu]") {
     const auto device = torch::Device(torch::kCUDA, 0);
-    const auto stream = mmltk::backend::ml::cuda::current_torch_cuda_stream_object(0).stream();
+    const auto stream = c10::cuda::getStreamFromPool(false, 0);
+    const c10::cuda::CUDAStreamGuard stream_guard(stream);
     auto slots = std::make_shared<PredictionBufferSlotPool>(1, PredictionBufferConfig{1, 3, std::nullopt, 0});
     auto lease = slots->acquire();
     lease.buffers->images.push_back({0, 17, {}});
     PostprocessedBatch batch{torch::tensor({.9F, .8F, .7F}).view({1, 3}).to(device), torch::tensor({0L, 1L, -1L}, torch::kInt64).view({1, 3}).to(device),
                              torch::tensor({0.F, 0.F, 2.F, 2.F, 3.F, 3.F, 5.F, 5.F, 0.F, 0.F, 0.F, 0.F}).view({1, 3, 4}).to(device), std::nullopt,
                              torch::tensor({2L}, torch::kInt64).to(device)};
-    auto staged = stage_prediction_batch(std::move(batch), 2, 1, std::move(lease), 0, stream);
+    auto staged = stage_prediction_batch(std::move(batch), 2, 1, std::move(lease), 0, stream.stream());
     mmltk::common::concurrency::WorkerPool workers(1);
     const auto images = collect_prediction_batch_encoding(enqueue_prediction_batch_encoding(workers, std::move(staged)));
     REQUIRE(images.size() == 1);

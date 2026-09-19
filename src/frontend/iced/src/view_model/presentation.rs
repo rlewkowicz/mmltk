@@ -91,6 +91,18 @@ impl ApplicationModel {
                 request.source.source.kind
             })
     }
+    pub(crate) fn viewer_upscale_request(
+        &self,
+        kernel: crate::generated::UpscaleKernel,
+    ) -> Option<crate::generated::UpscaleRequest> {
+        let (source, document) = self.viewer_base_source()?;
+        Self::valid_visual_source(source)?;
+        Some(crate::generated::UpscaleRequest {
+            source: source.clone(),
+            document: document.clone(),
+            kernel,
+        })
+    }
     pub fn request_upscale(&mut self, request: crate::generated::UpscaleRequest) {
         let source_kind = request.source.source.kind;
         self.requested_upscale = Some(request);

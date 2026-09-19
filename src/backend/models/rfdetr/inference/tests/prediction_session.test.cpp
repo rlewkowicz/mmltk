@@ -389,6 +389,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     empty_layout.slots.resize(2, {rfdetr::ClassSlotRole::Unused, {}});
     auto empty_request = request;
     empty_request.onnx_path = root / "empty.onnx";
+    empty_request.preset_name = "rf-detr-nano";
     write_prediction_model(empty_request.onnx_path, 2, true, empty_layout);
     std::size_t empty_deliveries = 0;
     const auto empty_result =

@@ -882,8 +882,7 @@ impl App {
                     }
                     Sample::Upscale(kernel) => {
                         if self.model.upscale_start_available()
-                            && let Some(request) =
-                                crate::presentation_surface::viewer_upscale_request(kernel)
+                            && let Some(request) = self.model.viewer_upscale_request(kernel)
                         {
                             self.model.request_upscale(request);
                             self.dispatch_viewer_desired();

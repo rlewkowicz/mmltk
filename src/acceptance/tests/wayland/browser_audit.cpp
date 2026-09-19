@@ -833,7 +833,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
         const std::uint64_t elapsed = scalar(record, "a");
         const auto expected = mmltk::backend::data::estimate_progress(compile_completed, compile_total, elapsed);
         compile_metrics = record.value("control", "") == COMPILE_PROGRESS && record.value("detail", "") == "elapsed-eta-throughput-dropped" &&
-                          compile_dropped != 0U && scalar(record, "b") == expected.remaining_seconds && scalar(record, "c") == expected.throughput_per_second &&
+                          progress && scalar(record, "b") == expected.remaining_seconds && scalar(record, "c") == expected.throughput_per_second &&
                           scalar(record, "d") == compile_dropped;
     } else if (event == "integration.dataset_complete") {
         dataset_complete = true;
@@ -1008,7 +1008,7 @@ auto BrowserAudit::consume(const nlohmann::json& record) -> void {
         }
     } else if (event == "integration.explore_detail_source") {
         detail_source = record.value("detail", "") == "padded-to-original-sampling" && scalar(record, "a") == scalar(record, "c") &&
-                        scalar(record, "b") > scalar(record, "d") && scalar(record, "d") != 0U;
+                        scalar(record, "b") >= scalar(record, "d") && scalar(record, "c") != 0U && scalar(record, "d") != 0U;
     } else if (event == "integration.explore_detail_fit") {
         detail_fit = record.value("detail", "") == "centered-contained" && numeric(record, "c") <= numeric(record, "a") + 1.0 &&
                      numeric(record, "d") <= numeric(record, "b") + 1.0 &&
@@ -1449,9 +1449,9 @@ auto BrowserAudit::readiness_blocker() const -> std::string_view {
             return std::abs(geometry.width / scale - explore_gallery.width) < 1.0 && square_atlas_frames.contains(key) && atlas_scaled_frames.contains(key);
         });
     const bool detail_containers = detail_fit;
-    // Automatic Basic may supersede the padded source before the browser's
-    // next frame. The exact source transition proves the padded product;
-    // require the original crop to have been physically drawn.
+    // Automatic Basic may supersede the model canvas before the browser's
+    // next frame. The exact source transition proves that product;
+    // require the Original view to have been physically drawn.
     const bool padded_and_original_detail = detail_source && original_detail_drawn;
     static const std::set<std::string, std::less<>> expected_upscale_modes{"basic-four-times", "fast-four-times", "neural-four-times"};
     static const std::set<std::string, std::less<>> expected_upscale_presentations{EXPLORE_UPSCALE_BASIC, EXPLORE_UPSCALE_FAST, EXPLORE_UPSCALE_NEURAL};

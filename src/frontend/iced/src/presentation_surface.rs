@@ -24,7 +24,6 @@ pub(crate) use renderer::{
     invalidate_drawn_slot, reconcile_completed, release, release_capacity_sample,
     reset_reconstruction_probe, retained_surface, retire_publication, retire_samples,
     same_allocation, trace_atlas_stage, trace_surface, viewer_annotation_request,
-    viewer_upscale_request,
 };
 pub use renderer::{FrameReady, Notification};
 use renderer::{PendingImage, SAMPLE_CAPACITY, SampleRead, copy_completed, trace_gallery_source};

@@ -713,6 +713,16 @@ impl State {
                     .as_ref()
                     .is_some_and(|draft| draft.workflows.train.compiledimensions) =>
             {
+                driver.phase = Phase::CompileResizeMode;
+                widgets.arm(driver, COMPILE_LETTERBOX)
+            }
+            Phase::CompileResizeMode => widgets.arm(driver, COMPILE_LETTERBOX),
+            Phase::AwaitCompileResizeMode
+                if settings.draft.as_ref().is_some_and(|draft| {
+                    draft.workflows.train.compileresizemode
+                        == crate::generated::ImageResizeMode::Letterbox
+                }) =>
+            {
                 driver.phase = Phase::CompileResolution;
                 widgets.arm(driver, COMPILE_RESOLUTION)
             }
@@ -738,6 +748,7 @@ impl State {
                     || train.compileddatasetdir != driver.compiled_directory
                     || train.request.resolution.to_string() != driver.resolution
                     || !train.compiledimensions
+                    || train.compileresizemode != crate::generated::ImageResizeMode::Letterbox
                     || !train.usecompileddirectorydefaults
                     || !snapshot.exploresource.available
                     || snapshot.exploresource.selection
@@ -879,6 +890,7 @@ impl State {
             Phase::CompiledDirectory => COMPILED_DIRECTORY.to_owned(),
             Phase::PerceptualControl(index) => perceptual_control_id(index),
             Phase::CompileDimensions => COMPILE_DIMENSIONS.to_owned(),
+            Phase::CompileResizeMode => COMPILE_LETTERBOX.to_owned(),
             Phase::CompileResolution => COMPILE_RESOLUTION.to_owned(),
             Phase::Compile | Phase::CompileActionWithProgress => COMPILE_DATASET.to_owned(),
             Phase::CompileProgress => COMPILE_PROGRESS.to_owned(),
@@ -1177,6 +1189,13 @@ impl State {
                     train::dataset::Message::CompileDimensionsChanged(true),
                 ))
             }
+            Phase::CompileResizeMode => {
+                driver.phase = Phase::AwaitCompileResizeMode;
+                if !click(input_bounds) {
+                    driver.fail("Firefox Letterbox radio click dispatch failed");
+                }
+                None
+            }
             Phase::CompileResolution => {
                 driver.phase = Phase::AwaitCompileResolution;
                 Some(train::Message::Dataset(
@@ -1429,6 +1448,7 @@ pub(super) const COMPILED_DIRECTORY: &str = train::COMPILED_DIRECTORY_ID;
 pub(super) const COMPILE_DIMENSIONS: &str = train::COMPILE_DIMENSIONS_ID;
 
 pub(super) const COMPILE_RESOLUTION: &str = train::COMPILE_RESOLUTION_ID;
+const COMPILE_LETTERBOX: &str = "train.dataset.resize.letterbox";
 
 pub(super) const COMPILE_PROGRESS: &str = train::COMPILE_PROGRESS_ID;
 

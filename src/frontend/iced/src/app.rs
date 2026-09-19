@@ -507,26 +507,35 @@ mod route_tests {
             let mut app = installed_app();
             app.model = model;
             app.workspace.select(FeatureId::Explore);
-            let original = app.model.explore.snapshot.clone().unwrap();
+            let source = app.model.explore.snapshot.as_mut().unwrap();
+            source.frame.content.y = 120;
+            source.frame.content.height = 240;
+            source.frame.sourceextent.height = 240;
+            let original = source.clone();
             let mut product = original.frame.clone();
             product.source.kind = crate::generated::PresentationSourceKind::Upscale;
             product.revision = 2;
-            product.extent = crate::generated::VisualExtent {
-                width: 1280,
-                height: 1280,
-            };
-            product.content = crate::generated::VisualRegion {
-                x: 0,
-                y: 320,
-                width: 1280,
-                height: 640,
-            };
+            product.extent = product
+                .extent
+                .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
+                .unwrap();
+            product.content = product
+                .content
+                .checked_scale(crate::generated::UpscaleImageMetadata::OUTPUT_SCALE)
+                .unwrap();
+            let (width, height) = (product.extent.width, product.extent.height);
+            let crop = [
+                product.content.x,
+                product.content.y,
+                product.content.width,
+                product.content.height,
+            ];
             let frame = crate::view_model::test_support::physical_frame(
                 crate::generated::presentation_source_session(product.source.kind),
                 2,
                 6,
-                1280,
-                1280,
+                width,
+                height,
             );
             let bytes = presentation_surface::metadata::encode(
                 product.clone(),
@@ -544,7 +553,7 @@ mod route_tests {
                 )),
             );
             presentation_surface::metadata::retire(input_frame);
-            presentation_surface::metadata::install(frame, 1280, 1280, 6, &bytes).unwrap();
+            presentation_surface::metadata::install(frame, width, height, 6, &bytes).unwrap();
             assert!(presentation_surface::accept_publication(frame));
             let surface = presentation_surface::metadata::surface(frame).unwrap();
             let Some(ExploreDisplay::Detail(_, content)) =
@@ -597,7 +606,7 @@ mod route_tests {
                     assert!(original);
                     assert_eq!(
                         content.configure_surface(surface, original, 0).crop,
-                        Some([0, 320, 1280, 640])
+                        Some(crop)
                     );
                 }
                 app.reduce_reply(IntentReply {
@@ -648,7 +657,7 @@ mod route_tests {
                     .detail_original(&content),
                 0,
             );
-            assert_eq!(shown.crop, Some([0, 320, 1280, 640]));
+            assert_eq!(shown.crop, Some(crop));
             presentation_surface::retire_publication(frame);
         }
     }

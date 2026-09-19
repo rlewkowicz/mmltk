@@ -832,6 +832,44 @@ mod tests {
     }
 
     #[test]
+    fn upscale_actions_use_the_selected_source_while_older_pixels_remain_displayed() {
+        for next_image in [false, true] {
+            for kernel in crate::generated::UPSCALE_KERNEL_VALUES.iter().copied() {
+                let (mut app, retained) = viewer_app();
+                let (sender, _receiver) = Connection::test_channel();
+                app.connection = Some(sender);
+                app.reconcile_viewer();
+                let previous = app.model.viewer_upscale_request(kernel).unwrap();
+                record_draw(
+                    &app,
+                    retained,
+                    [0, 0, retained.content_width, retained.content_height],
+                );
+                let snapshot = app.model.explore.snapshot.as_mut().unwrap();
+                snapshot.revision += 1;
+                snapshot.frame.revision += 1;
+                snapshot.frame.cleanrevision += 1;
+                if next_image {
+                    snapshot.selectedimage = snapshot.selectedimage.map(|index| index + 1);
+                }
+                let expected = crate::generated::UpscaleRequest {
+                    source: snapshot.frame.clone(),
+                    document: snapshot.document.clone(),
+                    kernel,
+                };
+                app.reconcile_viewer();
+                drop(app.on_explore(crate::view::explore::Outcome::UpscaleRequested(kernel)));
+                assert_eq!(app.model.requested_upscale, Some(expected));
+                assert!(app.model.error.is_none(), "{:?}", app.model.error);
+                assert_eq!(
+                    crate::presentation_surface::metadata::product(retained),
+                    Some(previous.source)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn original_toggles_preserve_pending_failed_and_completed_upscale_identity() {
         for kernel in crate::generated::UPSCALE_KERNEL_VALUES.iter().copied() {
             for status in 0..3 {

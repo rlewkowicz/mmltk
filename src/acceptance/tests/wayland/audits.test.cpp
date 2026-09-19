@@ -526,6 +526,36 @@ void rendered_probe_audit_rejects_mismatched_identity() {
     CHECK_FALSE(browser.rendered_frame_for_slots({{2U, 11U}}, 0U, 0U));
     CHECK(browser.rendered_frame_for_slots({{3U, 12U}}, 0U, 0U));
 }
+TEST_CASE("browser compile metrics accept zero drops and require consistent progress", "[workspace][audit]") {
+    const auto dropped = GENERATE(0U, 3U);
+    const auto completed = GENERATE(0U, 4U);
+    const nlohmann::json metrics{{"event", "integration.compile_metrics"},
+                                  {"control", "train.compile_dataset.progress"},
+                                  {"detail", "elapsed-eta-throughput-dropped"},
+                                  {"a", 2U},
+                                  {"b", completed == 0U ? 0U : 8U},
+                                  {"c", completed == 0U ? 0U : 2U},
+                                  {"d", dropped}};
+    BrowserAudit audit;
+    audit.consume(metrics);
+    CHECK_FALSE(audit.compile_metrics);
+    audit.consume({{"event", "integration.compile_progress"},
+                   {"control", "train.compile_dataset.progress"},
+                   {"detail", completed == 0U ? "planning" : "compiling"},
+                   {"a", 1U},
+                   {"b", completed},
+                   {"c", 20U},
+                   {"d", dropped}});
+    REQUIRE(audit.progress);
+    audit.consume(metrics);
+    CHECK(audit.compile_metrics);
+    for (const auto* field : {"b", "c", "d"}) {
+        auto inconsistent = metrics;
+        inconsistent[field] = metrics.at(field).get<unsigned>() + 1U;
+        audit.consume(inconsistent);
+        CHECK_FALSE(audit.compile_metrics);
+    }
+}
 TEST_CASE("browser audit exposes distinct integration phases for progress deadlines", "[workspace][audit]") {
     BrowserAudit audit;
     audit.consume({{"event", "integration.phase_progress"}, {"control", "startup"}, {"detail", "AwaitBootstrap"}});
