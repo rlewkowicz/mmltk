@@ -34,6 +34,7 @@ mmltk_register_retained_module_importers(
     mmltk_backend_models_rfdetr_inference
     validate.cpp
     evaluation.cpp)
+mmltk_register_ordinary_sources(mmltk_backend_models_rfdetr_inference prediction_count.cpp)
 mmltk_register_private_headers(mmltk_backend_models_rfdetr_inference prediction_count.h prediction_capacity.h prediction_raw_preparation.h dataset_batch_lease.h)
 target_include_directories(mmltk_backend_models_rfdetr_inference PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

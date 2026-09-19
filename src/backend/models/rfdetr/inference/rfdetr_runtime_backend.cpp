@@ -339,10 +339,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
         if (capacity != 0U)
             validate_annotation_buffer(annotation.confidences, runtime::AnalysisElementType::Float32, capacity * sizeof(float), 1U,
                                        static_cast<std::uint32_t>(capacity), 0U, "confidence");
-        annotation.value_count = 0U;
-        annotation.device_value_count = nullptr;
-        annotation.completed_value_count = nullptr;
-        annotation.count_custody.reset();
+        annotation.count.Reset();
         annotation.masks_available = false;
         annotation.class_domain = state_->layout->domain();
         annotation.class_catalog = state_->layout->catalog();
@@ -486,10 +483,7 @@ runtime::RuntimeSubmission RfdetrRuntimeBackend::Run(const runtime::RuntimeTenso
         return lane_->Run(input, output_storage->buffers, binding, continuation, std::move(retained_storage));
     } catch (...) {
         for (auto& annotation : annotations) {
-            annotation.value_count = 0U;
-            annotation.device_value_count = nullptr;
-            annotation.completed_value_count = nullptr;
-            annotation.count_custody.reset();
+            annotation.count.Reset();
         }
         throw;
     }

@@ -76,10 +76,7 @@ struct RfdetrAnalysisProvider::Impl final {
     std::span<runtime::AnalysisAnnotationStorage> active_annotations;
     void ClearCounts() noexcept {
         for (auto& annotation : active_annotations) {
-            annotation.value_count = 0;
-            annotation.device_value_count = nullptr;
-            annotation.completed_value_count = nullptr;
-            annotation.count_custody.reset();
+            annotation.count.Reset();
             annotation.masks_available = false;
         }
         active_annotations = {};
@@ -150,7 +147,7 @@ bool RfdetrAnalysisProvider::ObserveCompletion(const runtime::AnalysisCompletion
         auto settled = std::move(*impl_->active_submission);
         impl_->active_submission.reset();
         impl_->backend->ReleaseAfterCompletion(std::move(settled));
-        for (auto& annotation : impl_->active_annotations) annotation.SettleValueCount();
+        for (auto& annotation : impl_->active_annotations) annotation.count.SettleAfterCompletion(annotation.value_capacity);
         impl_->active_annotations = {};
         return true;
     } catch (...) {

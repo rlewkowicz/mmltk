@@ -78,7 +78,8 @@ PredictionSource PredictionSource::Device(const gpu::DeviceExecution& execution,
     result.custody_ = std::shared_ptr<void>(allocation, allocation->address);
     result.detections_ = std::move(detections);
     const auto address = reinterpret_cast<std::uintptr_t>(allocation->address);
-    result.annotations_.value_capacity = result.annotations_.value_count = result.detections_.size();
+    result.annotations_.value_capacity = result.detections_.size();
+    result.annotations_.count.SetKnown(result.detections_.size(), result.annotations_.value_capacity);
     result.annotations_.boxes_xyxy = {.address = address + pixel_bytes, .capacity_bytes = boxes_bytes};
     result.annotations_.class_references = {.address = address + pixel_bytes + boxes_bytes, .capacity_bytes = label_bytes};
     result.annotations_.masks_available = !masks.empty();

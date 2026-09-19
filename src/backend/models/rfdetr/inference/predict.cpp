@@ -298,7 +298,7 @@ class PredictionBackend final {
             storage.class_domain = native_->class_layout()->domain();
             storage.masks_available = false;
             if (count == 0) {
-                storage.value_count = 0;
+                storage.count.Reset();
                 annotations.selections[index] = {};
                 continue;
             }
@@ -396,7 +396,7 @@ struct PredictionReadback final {
         const auto stream = c10::cuda::getCurrentCUDAStream(batch.boxes.get_device());
         const auto status = cudaStreamSynchronize(stream.stream());
         if (status != cudaSuccess) throw runtime::CudaOperationError{status, "prediction readback completion"};
-        for (auto& annotation : batch.storage) annotation.SettleValueCount();
+        for (auto& annotation : batch.storage) annotation.count.SettleAfterCompletion(annotation.value_capacity);
         index_values = indices.view(batch.labels.sizes(), at::kLong);
     }
     mmltk::backend::ml::cuda::NumaHostTensor boxes, labels, scores, masks, indices;
@@ -461,7 +461,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
 }
 [[nodiscard]] std::vector<Prediction> copy_predictions(AnnotationBatch& batch, std::size_t index, float threshold, PredictionReadback& storage,
                                                        int class_count) {
-    const auto count = batch.storage[index].value_count;
+    const auto count = batch.storage[index].count.value();
     if (count == 0) return {};
     const auto boxes = storage.box_values[index];
     const auto labels = storage.label_values[index];
@@ -524,10 +524,7 @@ void deliver_prediction(const PredictionDelivery& delivery, const PredictionReco
         if (!batch.encoded_masks) upload_survivors();
         annotation = scalar_layout;
         annotation.masks = {};
-        annotation.value_count = result.size();
-        annotation.device_value_count = nullptr;
-        annotation.completed_value_count = nullptr;
-        annotation.count_custody.reset();
+        annotation.count.SetKnown(result.size(), annotation.value_capacity);
         // Reused compact buffers pair the callback metadata with precisely these survivors.
         const auto compact = [&](torch::Tensor& destination, const torch::Tensor& candidates) {
             if (!destination.defined()) destination = torch::empty({0}, candidates.options());

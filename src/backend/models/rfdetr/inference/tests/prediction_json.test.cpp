@@ -101,7 +101,8 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
     };
     for (int stage = 0; stage < 3; ++stage) {
         annotation.source_region = {.width = 2U, .height = 2U};
-        annotation.value_count = 1U;
+        annotation.value_capacity = 1U;
+        annotation.count.SetKnown(1U, annotation.value_capacity);
         annotation.boxes_xyxy.address = 11U;
         annotation.class_references.address = 12U;
         annotation.confidences.address = 13U;
@@ -115,7 +116,7 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
         });
         CHECK_FALSE(raw.available());
         CHECK_FALSE(failure.empty());
-        CHECK(annotation.value_count == 0U);
+        CHECK(annotation.count.value() == 0U);
         CHECK(annotation.boxes_xyxy.address == 0U);
         CHECK(annotation.class_references.address == 0U);
         CHECK(annotation.confidences.address == 0U);
@@ -128,7 +129,8 @@ TEST_CASE("optional raw failure preserves semantic mask JSON and the next frame"
     failure.clear();
     PredictionRawPreparation healthy(true, annotation, failure, nullptr, settle);
     healthy.Execute([&] {
-        annotation.value_count = 1U;
+        annotation.value_capacity = 1U;
+        annotation.count.SetKnown(1U, annotation.value_capacity);
         annotation.masks.address = 99U;
     });
     CHECK(healthy.available());

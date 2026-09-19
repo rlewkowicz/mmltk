@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <utility>
 #include "src/backend/ml/runtime/backend_factory.h"
+#include "src/backend/ml/runtime/analysis_value_count.h"
 #include "src/backend/data/catalog/class_catalog.h"
 namespace mmltk::backend::ml::runtime {
 inline constexpr std::size_t kMaximumAnalysisRank = 4U;
@@ -64,19 +65,7 @@ struct AnalysisCompletion final {
 struct AnalysisAnnotationStorage final {
     AnalysisRegion source_region{};
     std::size_t value_capacity = 0U;
-    std::size_t value_count = 0U;
-    // A provider may produce a compact prefix asynchronously. Until settlement,
-    // value_count is zero and device consumers use capacity plus device_value_count.
-    const std::int64_t* device_value_count = nullptr;
-    const std::int64_t* completed_value_count = nullptr;
-    std::shared_ptr<void> count_custody{};
-    void SettleValueCount() {
-        if (!completed_value_count) return;
-        const auto count = *completed_value_count;
-        if (count < 0 || static_cast<std::uint64_t>(count) > value_capacity)
-            throw std::runtime_error("analysis survivor count exceeds output capacity");
-        value_count = static_cast<std::size_t>(count);
-    }
+    AnalysisValueCount count;
     AnalysisDeviceBuffer boxes_xyxy{};
     AnalysisDeviceBuffer class_references{};
     AnalysisDeviceBuffer confidences{};
@@ -299,7 +288,7 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         for (std::size_t index = 0U; index < request.regions.size(); ++index) {
             const AnalysisRegion& region = request.regions[index];
             const AnalysisAnnotationStorage& output = request.annotations[index];
-            if (!region.valid() || output.source_region != region || output.value_capacity == 0U || output.value_count != 0U ||
+            if (!region.valid() || output.source_region != region || !output.count.empty() ||
                 region.width > request.source.width || region.height > request.source.height || region.x > request.source.width - region.width ||
                 region.y > request.source.height - region.height || !ValidateAnnotationStorage(output)) {
                 return false;
@@ -309,6 +298,11 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
     }
     [[nodiscard]] static bool ValidateAnnotationStorage(const AnalysisAnnotationStorage& output) noexcept {
         if (output.value_capacity > std::numeric_limits<std::uint32_t>::max()) { return false; }
+        if (output.value_capacity == 0U) {
+            return output.count.empty() && !output.masks_available &&
+                   output.boxes_xyxy.capacity_bytes == 0U && output.class_references.capacity_bytes == 0U &&
+                   output.confidences.capacity_bytes == 0U && output.colors_rgb.capacity_bytes == 0U && output.masks.capacity_bytes == 0U;
+        }
         const auto capacity = static_cast<std::uint32_t>(output.value_capacity);
         const std::uint32_t boxes[]{capacity, 4U};
         const std::uint32_t values[]{capacity};
@@ -329,7 +323,7 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
         if (result.terminal != AnalysisTerminal::Completed) {
             if (result.output_count != 0U || result.completion.valid()) { return false; }
             for (const AnalysisAnnotationStorage& output : request.annotations) {
-                if (output.value_count != 0U) { return false; }
+                if (!output.count.empty()) { return false; }
             }
             return true;
         }
@@ -338,7 +332,7 @@ class AnalysisProvider : public std::enable_shared_from_this<AnalysisProvider> {
             return false;
         }
         for (const AnalysisAnnotationStorage& output : request.annotations) {
-            if (output.value_count > output.value_capacity || !ValidateAnnotationStorage(output)) { return false; }
+            if (!output.count.valid(output.value_capacity) || !ValidateAnnotationStorage(output)) { return false; }
         }
         return true;
     }

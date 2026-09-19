@@ -75,6 +75,7 @@ mmltk_register_public_headers(
     mmltk_backend_ml_runtime
     BASE_DIRS ${CMAKE_SOURCE_DIR}
     FILES
+        analysis_value_count.h
         analysis_provider.h
         onnx_environment.h
         tensorrt_runtime.h
@@ -83,6 +84,8 @@ target_include_directories(mmltk_backend_ml_runtime
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+mmltk_register_ordinary_sources(mmltk_backend_ml_runtime analysis_value_count.cpp)
 
 if(BUILD_RFDETR_NATIVE)
     mmltk_register_ordinary_sources(

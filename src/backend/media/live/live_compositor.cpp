@@ -124,14 +124,14 @@ bool LiveCompositor::process_latest() {
             status = scope.Record(cudaMemset2DAsync(reinterpret_cast<void*>(slot->overlay), slot->overlay_pitch, 0, static_cast<std::size_t>(source.width) * 4U,
                                                     source.height, slot->stream));
         for (const auto& annotation : analysis.annotations) {
-            const auto capacity = annotation.device_value_count ? annotation.value_capacity : annotation.value_count;
+            const auto capacity = annotation.count.device_view() ? annotation.value_capacity : annotation.count.value();
             if (status != cudaSuccess || capacity == 0U) continue;
             const raster::InstanceOverlayRgbaWork overlay{
                 .overlay = {reinterpret_cast<std::uint8_t*>(slot->overlay), slot->overlay_pitch, static_cast<int>(source.width),
                             static_cast<int>(source.height)},
                 .instances = {reinterpret_cast<const float*>(annotation.boxes_xyxy.address),
                               reinterpret_cast<const std::uint8_t*>(annotation.colors_rgb.address),
-                              reinterpret_cast<const int*>(annotation.class_references.address), static_cast<int>(capacity), annotation.device_value_count},
+                              reinterpret_cast<const int*>(annotation.class_references.address), static_cast<int>(capacity), annotation.count.device_view()},
                 .masks = !annotation.masks_available ? nullptr : reinterpret_cast<const bool*>(annotation.masks.address),
                 .mask_alpha = 115U,
                 .box_thickness = 2,

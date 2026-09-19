@@ -20,6 +20,10 @@
 #include <array>
 #include <algorithm>
 #include <span>
+#include <memory>
+#include <cstdint>
+#include <stop_token>
+#include <utility>
 #include <vector>
 #include <filesystem>
 #include <fstream>
@@ -252,7 +256,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
     const auto without_masks = session.Run(request, command, {.completed = [](const auto& record, auto source, const auto& annotations) {
                                                REQUIRE_FALSE(record.detections.empty());
                                                CHECK_FALSE(record.detections.front().has_mask);
-                                               CHECK(annotations.value_count == 0U);
+                                               CHECK(annotations.count.value() == 0U);
                                                CHECK(annotations.boxes_xyxy.address == 0U);
                                                CHECK(annotations.class_references.address == 0U);
                                                CHECK(annotations.confidences.address == 0U);
@@ -355,7 +359,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
                                            {.completed =
                                                 [](const auto& record, auto, const auto& annotations) {
                                                     CHECK(record.detections.size() == 1U);
-                                                    CHECK(annotations.value_count == 0U);
+                                                    CHECK(annotations.count.value() == 0U);
                                                     CHECK(annotations.boxes_xyxy.address == 0U);
                                                     CHECK(record.detections.front().class_reference == 0);
                                                     CHECK(record.detections.front().has_mask);
@@ -369,7 +373,7 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
                                           .completed =
                                               [&](const auto& record, auto pixels, const auto& annotations) {
                                                   REQUIRE(record.detections.size() == 1U);
-                                                  CHECK(annotations.value_count == 1U);
+                                                  CHECK(annotations.count.value() == 1U);
                                                   REQUIRE(annotations.class_references.address != 0U);
                                                   REQUIRE(pixels.custody);
                                                   std::int32_t category = -1;
@@ -394,10 +398,9 @@ TEST_CASE("prediction delivers bounded ordered images masks and receiver-owned p
             REQUIRE(pixels.rgb8);
             REQUIRE(pixels.custody);
             CHECK(annotations.value_capacity == 0);
-            CHECK(annotations.value_count == 0);
-            CHECK(annotations.device_value_count == nullptr);
-            CHECK(annotations.completed_value_count == nullptr);
-            CHECK_FALSE(annotations.count_custody);
+            CHECK(annotations.count.value() == 0);
+            CHECK(annotations.count.device_view() == nullptr);
+            CHECK(annotations.count.empty());
             CHECK(annotations.boxes_xyxy.capacity_bytes == 0);
             CHECK(annotations.class_references.capacity_bytes == 0);
             CHECK(annotations.confidences.capacity_bytes == 0);
@@ -524,7 +527,7 @@ TEST_CASE("full HD prediction materializes masks only for threshold survivors", 
                                                 REQUIRE(record.detections.size() == 2U);
                                                 CHECK(record.detections[0].mask.area == 1920U * 1080U);
                                                 CHECK(record.detections[1].mask.area == 0U);
-                                                CHECK(annotations.value_count == 0U);
+                                                CHECK(annotations.count.value() == 0U);
                                                 CHECK(annotations.boxes_xyxy.address == 0U);
                                                 CHECK(annotations.class_references.address == 0U);
                                                 CHECK(annotations.confidences.address == 0U);
@@ -584,14 +587,28 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
     const auto run = [&](rfdetr::RfdetrRuntimeBackend& selected, bool include_masks) {
         auto submission = selected.Run(input_buffer, annotations, {}, include_masks);
         selected.ReleaseAfterCompletion(std::move(submission));
-        CHECK(annotations[0].value_count == 0U);
+        CHECK(annotations[0].count.value() == 0U);
         REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-        annotations[0].SettleValueCount();
-        CHECK(annotations[0].value_count == 2U);
+        annotations[0].count.SettleAfterCompletion(annotations[0].value_capacity);
+        CHECK(annotations[0].count.value() == 2U);
         CHECK(annotations[0].class_domain == mmltk::backend::data::catalog::ClassReferenceDomain::RawOutputSlot);
         CHECK(labels[0].item<int>() == 0);
         CHECK(labels[1].item<int>() == 1);
     };
+    SECTION("abandonment settles the pending count before releasing submission custody") {
+        {
+            auto abandoned = backend->Run(input_buffer, annotations, {}, false);
+            CHECK(annotations[0].count.pending());
+        }
+        annotations[0].count.SettleAfterCompletion(annotations[0].value_capacity);
+        CHECK(annotations[0].count.value() == 2);
+    }
+    SECTION("failure after count publication retires storage and allows retry") {
+        annotations[0].masks.shape.extents[2] = 3;
+        CHECK_THROWS(backend->Run(input_buffer, annotations, {}, true));
+        CHECK(annotations[0].count.empty());
+        annotations[0].masks.shape.extents[2] = 2;
+    }
     run(*backend, false);
     CHECK_FALSE(annotations[0].masks_available);
     CHECK(masks.eq(77).all().item<bool>());
@@ -634,10 +651,9 @@ TEST_CASE("bbox-only runtime consumers do not turn mask capacity into demand", "
         auto submission = empty_backend->Run(input_buffer, annotations,
             retain_selection ? std::span<rfdetr::RfdetrMaskSelection>(selections) : std::span<rfdetr::RfdetrMaskSelection>{}, true);
         empty_backend->ReleaseAfterCompletion(std::move(submission));
-        CHECK(annotations[0].value_count == 0);
-        CHECK(annotations[0].device_value_count == nullptr);
-        CHECK(annotations[0].completed_value_count == nullptr);
-        CHECK_FALSE(annotations[0].count_custody);
+        CHECK(annotations[0].count.value() == 0);
+        CHECK(annotations[0].count.device_view() == nullptr);
+        CHECK(annotations[0].count.empty());
         CHECK_FALSE(annotations[0].masks_available);
         CHECK(selections[0].query_indices.device_data == nullptr);
         CHECK_FALSE(selections[0].mask_logits);
@@ -1166,21 +1182,196 @@ TEST_CASE("ONNX inspection completes against its retained descriptor proof", "[m
     }
 }
 
+TEST_CASE("Analysis counts validate complete products and settled capacity", "[model][rfdetr][prediction]") {
+    namespace runtime = mmltk::backend::ml::runtime;
+    runtime::AnalysisValueCount count;
+    CHECK(count.empty());
+    CHECK(count.valid(0));
+    CHECK_NOTHROW(count.SettleAfterCompletion(0));
+    count.SetKnown(3, 4);
+    CHECK(count.value() == 3);
+    CHECK_FALSE(count.pending());
+    CHECK_FALSE(count.valid(2));
+    CHECK_THROWS(count.SetKnown(5, 4));
+    CHECK(count.value() == 3);
+    auto host = std::make_shared<std::int64_t>(2);
+    const auto publish = [&](const std::int64_t* device, const std::int64_t* completed, std::shared_ptr<void> custody, std::size_t capacity) {
+        count.PublishPending(device, completed, std::move(custody), capacity);
+    };
+    CHECK_THROWS(publish(nullptr, host.get(), host, 4));
+    CHECK_THROWS(publish(host.get(), nullptr, host, 4));
+    CHECK_THROWS(publish(host.get(), host.get(), {}, 4));
+    CHECK_THROWS(publish(host.get(), host.get(), host, 0));
+    CHECK(count.value() == 3);
+    publish(host.get(), host.get(), host, 4);
+    CHECK(count.pending());
+    CHECK(count.value() == 0);
+    CHECK_FALSE(count.empty());
+    CHECK(count.valid(4));
+    CHECK_FALSE(count.valid(0));
+    for (const auto invalid : {-1L, 5L}) {
+        *host = invalid;
+        CHECK_THROWS(count.SettleAfterCompletion(4));
+        CHECK(count.pending());
+        CHECK(count.value() == 0);
+    }
+    *host = 4;
+    count.SettleAfterCompletion(4);
+    CHECK(count.value() == 4);
+    CHECK_FALSE(count.pending());
+    CHECK_THROWS(count.SettleAfterCompletion(3));
+    const auto retained = count;
+    count.Reset();
+    CHECK(count.empty());
+    CHECK(count.device_view() == nullptr);
+    CHECK(retained.value() == 4);
+    count.SetKnown(0, 0);
+    CHECK(count.empty());
+}
+
 TEST_CASE("Prediction counts settle at readback and retain exact device custody", "[model][rfdetr][prediction][gpu]") {
     namespace runtime = mmltk::backend::ml::runtime;
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
     std::shared_ptr<rfdetr::PredictionCountStorage> storage;
     runtime::AnalysisAnnotationStorage output{.value_capacity = 4};
     const auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA, 0);
     rfdetr::publish_prediction_count(storage, torch::tensor({2L}, options), output, 0);
-    CHECK(output.value_count == 0);
+    CHECK(output.count.value() == 0);
+    CHECK(output.count.pending());
+    auto previous = output;
+    auto first_storage = std::weak_ptr(storage);
     REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
-    output.SettleValueCount();
-    CHECK(output.value_count == 2);
-    const auto previous = output;
+    output.count.SettleAfterCompletion(output.value_capacity);
+    CHECK(output.count.value() == 2);
     rfdetr::publish_prediction_count(storage, torch::tensor({0L}, options), output, 0);
+    CHECK(storage != first_storage.lock());
     REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
-    output.SettleValueCount();
-    CHECK(output.value_count == 0);
-    CHECK(*previous.completed_value_count == 2);
-    CHECK(previous.count_custody != output.count_custody);
+    output.count.SettleAfterCompletion(output.value_capacity);
+    previous.count.SettleAfterCompletion(previous.value_capacity);
+    CHECK(output.count.value() == 0);
+    CHECK(previous.count.value() == 2);
+    CHECK(previous.count.device_view() != output.count.device_view());
+    previous.count.Reset();
+    CHECK(first_storage.expired());
+    const auto reusable = storage.get();
+    rfdetr::publish_prediction_count(storage, torch::tensor({1L}, options), output, 0);
+    CHECK(storage.get() == reusable);
+    // Abandoning the published view cannot free the execution owner's queued copy.
+    output.count.Reset();
+    CHECK(storage.use_count() == 1);
+    REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
+    for (const auto invalid : {-1L, 5L}) {
+        rfdetr::publish_prediction_count(storage, torch::tensor({invalid}, options), output, 0);
+        REQUIRE(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(0).stream()) == cudaSuccess);
+        CHECK_THROWS(output.count.SettleAfterCompletion(output.value_capacity));
+        CHECK(output.count.pending());
+    }
+    output.count.Reset();
+    CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::Tensor{}, output, 0));
+    CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({2}, options), output, 0));
+    CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1}, options.dtype(at::kFloat)), output, 0));
+    CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1}, options.device(torch::kCPU)), output, 0));
+    CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1, 1}, options), output, 0));
+    CHECK_THROWS(rfdetr::publish_prediction_count(storage, torch::zeros({1}, options), output, 1));
+    CHECK(output.count.empty());
+}
+
+TEST_CASE("Analysis providers distinguish empty known and pending counts", "[model][rfdetr][prediction]") {
+    namespace runtime = mmltk::backend::ml::runtime;
+    class Provider final : public runtime::AnalysisProvider {
+     public:
+        bool asynchronous = false;
+        bool fail = false;
+        bool retired = false;
+        std::stop_source* cancel = nullptr;
+     private:
+        std::shared_ptr<std::int64_t> host_ = std::make_shared<std::int64_t>(1);
+        runtime::AnalysisAnnotationStorage* output_ = nullptr;
+        ProviderWorkResult DoAnalyze(const runtime::AnalysisRequest& request) noexcept override {
+            output_ = &request.annotations.front();
+            if (asynchronous)
+                output_->count.PublishPending(host_.get(), host_.get(), host_, output_->value_capacity);
+            else
+                output_->count.SetKnown(output_->value_capacity, output_->value_capacity);
+            if (cancel) cancel->request_stop();
+            if (fail) return {.identity = request.identity, .terminal = runtime::AnalysisTerminal::DependencyFailure};
+            return {.identity = request.identity, .terminal = runtime::AnalysisTerminal::Completed, .completed_ns = 1,
+                    .output_count = 1, .completion = request.source_ready};
+        }
+        bool ObserveCompletion(const runtime::AnalysisCompletion&) noexcept override {
+            output_->count.SettleAfterCompletion(output_->value_capacity);
+            return true;
+        }
+        void RetireIssuedWork(const ProviderWorkResult&) noexcept override {
+            retired = true;
+            output_->count.Reset();
+        }
+        void DoShutdown() noexcept override {}
+    };
+    const runtime::AnalysisRegion region{.width = 1, .height = 1};
+    runtime::AnalysisAnnotationStorage output{
+        .source_region = region, .value_capacity = 1,
+        .boxes_xyxy = {.address = 1, .capacity_bytes = 16, .shape = {.rank = 2, .extents = {1, 4}}},
+        .class_references = {.address = 1, .capacity_bytes = 4, .shape = {.rank = 1, .extents = {1}},
+                             .element_type = runtime::AnalysisElementType::Int32},
+        .confidences = {.address = 1, .capacity_bytes = 4, .shape = {.rank = 1, .extents = {1}}},
+        .colors_rgb = {.address = 1, .capacity_bytes = 3, .shape = {.rank = 2, .extents = {1, 3}},
+                       .element_type = runtime::AnalysisElementType::Uint8}};
+    const runtime::AnalysisImageView source{
+        .pixels = {.address = 1, .capacity_bytes = 3, .shape = {.rank = 3, .extents = {1, 1, 3}},
+                   .element_type = runtime::AnalysisElementType::Uint8},
+        .pitch_bytes = 3, .width = 1, .height = 1, .channels = 3, .device = 0};
+    std::stop_source cancellation;
+    runtime::AnalysisRequest request{.identity = {1, 1}, .source = source,
+                                     .source_ready = {.device = 0, .event = 1, .producer_stream = 1},
+                                     .regions = {&region, 1}, .annotations = {&output, 1}, .cancellation = cancellation.get_token()};
+    auto provider = std::make_shared<Provider>();
+    SECTION("known host provider") {
+        auto result = provider->Analyze(request);
+        REQUIRE(result.terminal() == runtime::AnalysisTerminal::Completed);
+        CHECK(output.count.value() == 1);
+        CHECK(provider->ReleaseAfterCompletion(std::move(result)));
+    }
+    SECTION("zero capacity provider") {
+        output = {.source_region = region};
+        auto result = provider->Analyze(request);
+        REQUIRE(result.terminal() == runtime::AnalysisTerminal::Completed);
+        CHECK(output.count.empty());
+        CHECK(provider->ReleaseAfterCompletion(std::move(result)));
+    }
+    SECTION("pending publication and request reuse") {
+        provider->asynchronous = true;
+        auto result = provider->Analyze(request);
+        REQUIRE(result.terminal() == runtime::AnalysisTerminal::Completed);
+        CHECK(output.count.pending());
+        CHECK(output.count.value() == 0);
+        auto second_provider = std::make_shared<Provider>();
+        CHECK(second_provider->Analyze(request).terminal() == runtime::AnalysisTerminal::InvalidInput);
+        CHECK(provider->ReleaseAfterCompletion(std::move(result)));
+        CHECK(output.count.value() == 1);
+        CHECK_FALSE(output.count.pending());
+    }
+    SECTION("failed product cannot conceal pending custody behind a zero scalar") {
+        provider->asynchronous = true;
+        provider->fail = true;
+        CHECK(provider->Analyze(request).terminal() == runtime::AnalysisTerminal::ExecutionFailure);
+        CHECK(provider->retired);
+        CHECK(output.count.empty());
+    }
+    SECTION("cancelled pending work retires before reset") {
+        provider->asynchronous = true;
+        provider->cancel = &cancellation;
+        CHECK(provider->Analyze(request).terminal() == runtime::AnalysisTerminal::Cancelled);
+        CHECK(provider->retired);
+        CHECK(output.count.empty());
+    }
+    SECTION("abandoned pending product retires") {
+        provider->asynchronous = true;
+        {
+            auto result = provider->Analyze(request);
+            REQUIRE(result.terminal() == runtime::AnalysisTerminal::Completed);
+        }
+        CHECK(provider->retired);
+        CHECK(output.count.empty());
+    }
 }
