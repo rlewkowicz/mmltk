@@ -45,7 +45,7 @@ using ::mmltk::backend::models::rfdetr::transform_augmentation_box_xyxy;
         static_cast<float>(instance.bbox_y2) * inverse_height,
     };
     mapped.source_area_pixels = augmentation_box_area(mapped.source_box_xyxy) * static_cast<float>(image_width) * static_cast<float>(image_height);
-    const auto support = resolve_augmentation_annotation_support(mapped.source_box_xyxy, mask, image_width, image_height, plan);
+    const auto support = resolve_augmentation_annotation_support(mapped.source_box_xyxy, mask, image_width, image_height, plan, false, instance.has_mask());
     mapped.output_box_xyxy = support.box_xyxy;
     mapped.output_area = support.area_pixels;
     mapped.visible = support.present;

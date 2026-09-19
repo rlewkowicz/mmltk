@@ -706,13 +706,13 @@ void test_training_adapter_matches_raw_augmentation_executor() {
                 const auto box = identity_boxes.accessor<float, 2>();
                 CHECK(box[0][0] == 0.5F);
                 CHECK(box[0][1] == 0.5F);
-                CHECK(box[0][2] == 1.0F);
-                CHECK(box[0][3] == 1.0F);
+                CHECK(box[0][2] == 0.75F);
+                CHECK(box[0][3] == 0.75F);
                 CHECK(targets.all_area.cpu().item<float>() == static_cast<float>(height * width));
                 std::vector<rfdetr::AugmentationPreviewAnnotation> identity_preview;
                 rfdetr::build_augmentation_preview_annotations(donor_labels, nullptr, nullptr, width, height, identity_preview, donor_rle);
                 REQUIRE(identity_preview.size() == 1);
-                CHECK(identity_preview[0].box_xyxy == std::array<float, 4>{0, 0, 1, 1});
+                CHECK(identity_preview[0].box_xyxy == std::array<float, 4>{.125F, .125F, .875F, .875F});
                 CHECK(identity_preview[0].visible_area_pixels == static_cast<float>(height * width));
             }
             const torch::Tensor adapted = adapter.run(source_batch, seed, epoch, rank, sequence);
@@ -1150,7 +1150,11 @@ void test_tiny_mask_training_outer_edges() {
                 plan.images.front() = rfdetr::test_support::small_object_plan(geometry);
                 const int x = int(run.start % 8);
                 const int y = int(run.start / 8);
-                const auto edges = rfdetr::test_support::small_object_edges({x, y, x + int(run.length), y + 1}, geometry);
+                // Geometric transforms preserve the declared full-canvas box;
+                // explicit erasure still trims the actual categorical support.
+                const auto edges = geometry == 3
+                                       ? rfdetr::test_support::small_object_edges({x, y, x + int(run.length), y + 1}, geometry)
+                                       : std::array<int, 4>{0, 0, 8, 4};
                 const bool present = edges[0] < edges[2] && edges[1] < edges[3];
                 const std::array<float, 4> expected{float(edges[0]) / 8, float(edges[1]) / 4, float(edges[2]) / 8, float(edges[3]) / 4};
                 rfdetr::TargetScratch scratch(1);
@@ -1826,4 +1830,55 @@ TEST_CASE("checkpoint capability rejects unknown and damaged archive containers"
     REQUIRE_THROWS(mmltk::backend::models::rfdetr::inspect_training_checkpoint(path));
     std::ofstream(path, std::ios::binary) << "PK\003\004damaged";
     REQUIRE_THROWS(mmltk::backend::models::rfdetr::inspect_training_checkpoint(path));
+}
+TEST_CASE("training excludes crowds and retains continuous targets with known empty masks", "[rfdetr][training_supervision][cuda]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    c10::cuda::CUDAStreamGuard stream_guard(training_test_stream());
+    using namespace mmltk::backend::data;
+    const std::array entries{LabelIndexEntry{0, 2, 0}};
+    const std::array indices{std::uint32_t{0}};
+    std::array labels{
+        PackedInstance{.class_id = 0, .flags = kAnnotationCrowd, .bbox_x1 = 0, .bbox_y1 = 0, .bbox_x2 = 8, .bbox_y2 = 8},
+        PackedInstance{.class_id = 1, .flags = kAnnotationMask, .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.5F},
+    };
+    const Batch batch{.num_images = 1, .label_index = entries.data(), .labels = labels.data(), .image_indices = indices.data()};
+    rfdetr::TargetScratch scratch(1);
+    for (const bool flipped : {false, true}) {
+        rfdetr::AugmentationBatchPlan plan;
+        plan.active_size = 1;
+        plan.images.resize(1);
+        plan.transforms_geometry = flipped;
+        if (flipped) {
+            plan.images[0].forward = {-1, 0, 1, 0, 1, 0};
+            plan.images[0].inverse = plan.images[0].forward;
+        }
+        auto targets = rfdetr::build_targets(batch, 8, 8, true, true, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 2, &plan);
+        rfdetr::TargetConsumerLease lease(scratch, targets, 0);
+        lease.handoff();
+        REQUIRE(targets.counts == std::vector<std::int64_t>{1});
+        CHECK(targets.all_labels.cpu().item<std::int64_t>() == 1);
+        CHECK(targets.all_iscrowd.cpu().item<std::int64_t>() == 0);
+        const auto values = targets.all_boxes.cpu();
+        const auto boxes = values.accessor<float, 2>();
+        CHECK(boxes[0][0] == (flipped ? 4.25F : 3.75F) / 8);
+        CHECK(boxes[0][1] == 5.F / 8);
+        CHECK(boxes[0][2] == 5.F / 8);
+        CHECK(boxes[0][3] == 5.F / 8);
+        REQUIRE(targets.packed_masks);
+        CHECK(targets.packed_masks->bits.cpu().sum().item<std::int64_t>() == 0);
+        CHECK(targets.all_area.cpu().item<float>() == 0);
+        CHECK(plan.images[0].cache_source_ordinal == 1);
+        CHECK(plan.images[0].cache_source_area == 0);
+    }
+    labels[1].flags = kAnnotationCrowd;
+    rfdetr::AugmentationBatchPlan plan;
+    plan.active_size = 1;
+    plan.images.resize(1);
+    auto empty = rfdetr::build_targets(batch, 8, 8, true, true, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 2, &plan);
+    rfdetr::TargetConsumerLease lease(scratch, empty, 0);
+    lease.handoff();
+    CHECK(empty.counts == std::vector<std::int64_t>{0});
+    CHECK(plan.images[0].cache_source_ordinal == -1);
+    labels[1].flags = 0;
+    CHECK_THROWS_AS(rfdetr::build_targets(batch, 8, 8, true, true, 0, scratch, "train", 8, rfdetr::TrainingSupervisionConfig{}, 2), std::runtime_error);
 }

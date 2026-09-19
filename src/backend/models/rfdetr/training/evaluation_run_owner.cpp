@@ -428,6 +428,7 @@ struct TrainingValidationRuntime::Impl {
           split_name_(std::move(split_name)),
           query_count_automatic_(query_count_automatic) {
         if (!loader_) { throw std::invalid_argument("training validation runtime requires a dataset loader"); }
+        metric_set = resolve_evaluation_metric_set(*loader_, metric_set == EvaluationMetricSet::BBoxAndMask);
         detection_limit_ = resolve_dataset_limit(loader_->max_instances_per_image(), options.eval_max_dets);
         torch_cuda::TorchCudaDeviceGuard device_guard(torch_cuda::checked_device_index(options.device_id));
         amp_enabled_ = options.amp;

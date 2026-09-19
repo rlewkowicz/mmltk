@@ -884,3 +884,22 @@ TEST_CASE("Class lane device and stream rebind retains earlier final results", "
     CHECK(lane.Gather(cpu).item<float>() == 3.F);
     CHECK(previous.item<float>() == 3.F);
 }
+TEST_CASE("matcher focal alpha changes dense and CUDA assignments consistently", "[model][rfdetr][matcher]") {
+    namespace r = mmltk::backend::models::rfdetr;
+    const auto device = GENERATE(torch::kCPU, torch::kCUDA);
+    if (device == torch::kCUDA && mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    auto outputs = make_outputs();
+    outputs.main.pred_logits = torch::tensor({{{0.F, 0.F, 0.F}, {0.F, 2.F, 0.F}}}).to(device);
+    outputs.main.pred_boxes = torch::tensor({{{.5F, .5F, .2F, .2F}, {.7F, .5F, .2F, .2F}}}).to(device);
+    auto config = make_config();
+    config.set_cost_class = 1;
+    config.set_cost_bbox = 5;
+    config.set_cost_giou = 0;
+    const auto targets = make_targets();
+    for (const double alpha : {.25, .8}) {
+        config.focal_alpha = alpha;
+        const auto indices = r::matcher_indices(outputs, targets, config, true);
+        assert_single_image_match_count(indices, 1);
+        CHECK(indices[0].first.item<std::int64_t>() == (alpha == .25 ? 1 : 0));
+    }
+}

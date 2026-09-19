@@ -538,7 +538,7 @@ torch::Tensor build_dense_matcher_cost(const OutputLayer& layer, const PreparedT
     int64_t total_targets = 0;
     for (const auto count : targets.counts) { total_targets += count; }
     if (total_targets == 0) { return torch::empty({bs, num_queries, 0}, torch::TensorOptions().dtype(torch::kFloat32).device(device)); }
-    const double alpha = 0.25;
+    const double alpha = config.focal_alpha;
     const double gamma = 2.0;
     const auto flat_pred_logits = layer.pred_logits.flatten(0, 1);
     const auto out_prob = flat_pred_logits.sigmoid();
@@ -595,7 +595,7 @@ void build_cuda_matcher_cost_into(const OutputLayer& layer, const PreparedTarget
     const auto target_labels = targets.all_labels.to(device, torch::kInt64, false, false).contiguous();
     const auto target_boxes = targets.all_boxes.to(device, torch::kFloat32, false, false).contiguous();
     pairwise_detection_cost_cuda_out(compact_cost, pred_logits, pred_boxes, target_labels, target_boxes, target_offsets.contiguous(),
-                                     target_counts.contiguous(), config.set_cost_class, config.set_cost_bbox, config.set_cost_giou);
+                                     target_counts.contiguous(), config.set_cost_class, config.set_cost_bbox, config.set_cost_giou, config.focal_alpha);
     if (!config.include_masks || !has_target_masks(targets)) { return; }
     mmltk::common::logging::ScopedProfile profile_rfdetr_matcher_cost_masks{"rfdetr.matcher.cost_masks"};
     const auto [point_coords, pred_masks_logits] = sample_matcher_mask_logits(layer, config);

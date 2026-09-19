@@ -84,10 +84,8 @@ struct AlignmentSample final {
                 [&](const PredictionRunResult& result) {
                     if (result.class_domain != mmltk::backend::data::catalog::ClassReferenceDomain::Foreground || !result.class_catalog)
                         throw std::invalid_argument("semantic evaluation requires a fully bound model class layout");
-                    masks = delivery.mask_metrics && result.masks_available &&
-                            std::ranges::all_of(std::span{loader.label_data(), loader.num_label_instances()},
-                                                [](const auto& label) { return label.mask_rle_pairs != 0U; });
-                    const auto mode = masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox;
+                    const auto mode = resolve_evaluation_metric_set(loader, delivery.mask_metrics && result.masks_available);
+                    masks = mode == EvaluationMetricSet::BBoxAndMask;
                     if (!dataset || dataset->facts().metric_set != mode)
                         dataset.emplace(loader, mode);
                     else
@@ -134,7 +132,7 @@ struct AlignmentSample final {
                             gt.class_reference = static_cast<int>(model_order[packed.class_id]);
                             gt.bbox_xyxy = {static_cast<float>(packed.bbox_x1), static_cast<float>(packed.bbox_y1), static_cast<float>(packed.bbox_x2),
                                             static_cast<float>(packed.bbox_y2)};
-                            gt.has_mask = packed.mask_rle_pairs != 0U;
+                            gt.has_mask = packed.has_mask();
                             gt.mask.width = loader.image_width();
                             gt.mask.height = loader.image_height();
                             for (std::size_t run = 0; run < packed.mask_rle_pairs; ++run) {

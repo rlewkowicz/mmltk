@@ -14,6 +14,7 @@ namespace mmltk::common::concurrency {
 class WorkerPool;
 }
 namespace mmltk::backend::models::rfdetr {
+[[nodiscard]] EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks);
 enum class EvaluationDetailRetention : std::uint8_t { CompactOnly, Detailed };
 class EvaluationDatasetOwner final {
    public:

@@ -43,23 +43,37 @@ bool augmentation_changes_support(const AugmentationImagePlan* plan) noexcept {
 }
 AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std::array<float, 4>& source_box,
                                                                       std::span<const mmltk::backend::data::RLEPair> source_mask, int width, int height,
-                                                                      const AugmentationImagePlan* plan, bool donor) {
+                                                                      const AugmentationImagePlan* plan, bool donor, bool mask_present) {
     if (width <= 0 || height <= 0) throw std::invalid_argument("augmentation support requires positive image dimensions");
     const float image_width = static_cast<float>(width), image_height = static_cast<float>(height);
-    if (donor && plan != nullptr && plan->paste_masked && source_mask.empty())
-        throw std::invalid_argument("masked augmentation paste requires original host donor support");
-    if (donor && (plan == nullptr || !plan->paste_masked)) source_mask = {};
+    mask_present = mask_present || !source_mask.empty();
+    if (donor && plan != nullptr && plan->paste_masked && source_mask.empty()) return {};
+    if (donor && (plan == nullptr || !plan->paste_masked)) {
+        source_mask = {};
+        mask_present = false;
+    }
     const auto original = source_mask.empty() ? AugmentationAnnotationSupport{transform_augmentation_box_xyxy(source_box, identity),
                                                                               augmentation_box_area(source_box) * image_width * image_height, true}
                                               : mask_extent(source_mask, width, height);
-    if (!augmentation_changes_support(plan)) return original;
+    if (!augmentation_changes_support(plan)) {
+        auto result = original;
+        result.box_xyxy = transform_augmentation_box_xyxy(source_box, identity);
+        if (mask_present && source_mask.empty()) result.area_pixels = 0;
+        return result;
+    }
     const auto& inverse = donor ? plan->paste_inverse : plan->inverse;
     auto candidate = donor ? plan->paste_output_box : transform_augmentation_box_xyxy(source_mask.empty() ? source_box : original.box_xyxy, plan->forward);
     if (donor && !source_mask.empty()) {
         const float scale = 1 / inverse[0];
         candidate = transform_augmentation_box_xyxy(original.box_xyxy, {scale, 0, -inverse[2] * scale, 0, scale, -inverse[5] * scale});
     }
-    const bool has_paste = !donor && plan->paste_donor_slot >= 0;
+    const auto detection_box = transform_augmentation_box_xyxy(source_box, plan->forward);
+    const bool has_paste = !donor && plan->paste_donor_slot >= 0 && (!plan->paste_masked || plan->paste_support_count != 0);
+    const bool modifies_visibility = donor || has_paste || plan->erasure.dropout_probability > 0 || plan->erasure.rectangular != 0;
+    if (!modifies_visibility && source_mask.empty()) {
+        return {detection_box, mask_present ? 0.0F : augmentation_box_area(detection_box) * image_width * image_height,
+                augmentation_box_area(detection_box) > 0};
+    }
     if (has_paste && plan->paste_masked && (plan->paste_support == nullptr || plan->paste_support_count == 0))
         throw std::invalid_argument("masked augmentation paste requires original host donor support");
     const std::span<const mmltk::backend::data::RLEPair> donor_mask =
@@ -86,6 +100,13 @@ AugmentationAnnotationSupport resolve_augmentation_annotation_support(const std:
     if (result.present)
         result.box_xyxy = {static_cast<float>(min_x) / image_width, static_cast<float>(min_y) / image_height, static_cast<float>(max_x + 1) / image_width,
                            static_cast<float>(max_y + 1) / image_height};
+    // Raster support governs custom erasure and occlusion. Pure geometry keeps
+    // the supplied continuous detection box, even when its resized mask vanishes.
+    if (!modifies_visibility) {
+        result.box_xyxy = detection_box;
+        result.present = augmentation_box_area(detection_box) > 0;
+    }
+    if (mask_present && source_mask.empty()) result.area_pixels = 0;
     return result;
 }
 }  // namespace mmltk::backend::models::rfdetr

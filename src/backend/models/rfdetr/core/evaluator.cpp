@@ -12,6 +12,11 @@
 import mmltk.common.logging.mmltk_logging;
 import mmltk.common.logging.profile_utils;
 namespace mmltk::backend::models::rfdetr {
+EvaluationMetricSet resolve_evaluation_metric_set(const mmltk::backend::data::DatasetLoader& loader, bool request_masks) {
+    const bool masks = request_masks && std::ranges::all_of(std::span{loader.label_data(), loader.num_label_instances()},
+                                                         [](const auto& annotation) { return annotation.has_mask(); });
+    return masks ? EvaluationMetricSet::BBoxAndMask : EvaluationMetricSet::BBox;
+}
 using CompactImageMatchRecord = EvaluationDatasetOwner::MatchRecord;
 using ImageEvaluationMatches = EvaluationDatasetOwner::ImageMatches;
 class CocoDataset {
@@ -89,13 +94,12 @@ class CocoDataset {
     std::vector<std::uint32_t> ground_truth_ordinals_;
     std::vector<double> image_area_scale_;
     std::vector<double> ground_truth_areas_;
+    std::vector<std::uint8_t> ground_truth_flags_;
     std::vector<std::array<size_t, kEvaluationAreaCount>> area_ground_truth_totals_;
-    std::vector<std::array<size_t, kEvaluationAreaCount>> mask_area_ground_truth_totals_;
     std::optional<std::vector<GroundTruthMask>> ground_truth_masks_;
     std::optional<std::vector<std::pair<std::uint32_t, std::uint32_t>>> ground_truth_mask_runs_;
     std::uint32_t ground_truth_mask_height_ = 0;
     std::uint32_t ground_truth_mask_width_ = 0;
-    std::vector<size_t> ground_truth_totals_;
     std::vector<size_t> ground_truth_nonempty_categories_;
     std::unordered_map<int, size_t> image_id_to_index_;
     mutable std::vector<std::vector<CompactImageMatchRecord>> bbox_matches_by_category_;
@@ -125,11 +129,11 @@ constexpr auto kIouThresholds = kEvaluationIouThresholds;
 double evaluation_box_area(const std::array<float, 4>& box) {
     return std::max(0.0, static_cast<double>(box[2]) - box[0]) * std::max(0.0, static_cast<double>(box[3]) - box[1]);
 }
-double bbox_iou(const std::array<float, 4>& lhs, const std::array<float, 4>& rhs) {
+double bbox_iou(const std::array<float, 4>& lhs, const std::array<float, 4>& rhs, bool crowd) {
     const double left = std::max(lhs[0], rhs[0]), top = std::max(lhs[1], rhs[1]);
     const double right = std::min(lhs[2], rhs[2]), bottom = std::min(lhs[3], rhs[3]);
     const double intersect = std::max(0.0, right - left) * std::max(0.0, bottom - top);
-    const double union_area = evaluation_box_area(lhs) + evaluation_box_area(rhs) - intersect;
+    const double union_area = crowd ? evaluation_box_area(lhs) : evaluation_box_area(lhs) + evaluation_box_area(rhs) - intersect;
     return union_area <= 0.0 ? 0.0 : intersect / union_area;
 }
 uint32_t intersection_area_runs(const std::span<const std::pair<std::uint32_t, std::uint32_t>> lhs_runs,
@@ -210,18 +214,17 @@ size_t group_staged_predictions_by_category(const BBoxPredictionView& prediction
     }
     return selected_count;
 }
-// COCO ranges overlap exactly at 32² and 96². Compiled annotations do not
-// contain crowd/ignore flags; only the supported area exclusion is represented.
+// COCO ranges overlap exactly at 32² and 96².
 bool evaluation_area_contains(const size_t area, const double value) {
     constexpr std::array<double, kEvaluationAreaCount> minimum{0.0, 0.0, 1024.0, 9216.0};
     constexpr std::array<double, kEvaluationAreaCount> maximum{1.0e10, 1024.0, 9216.0, 1.0e10};
     return value >= minimum[area] && value <= maximum[area];
 }
-template <typename ScoreFn, typename IoUFn, typename GroundTruthAreaFn, typename PredictionAreaFn>
+template <typename ScoreFn, typename IoUFn, typename GroundTruthAreaFn, typename PredictionAreaFn, typename CrowdFn>
 void match_category_predictions(const std::vector<std::uint32_t>& prediction_indices, const std::span<const std::uint32_t> ground_truth_ordinals,
                                 const std::uint32_t image_ordinal, const std::uint16_t category_index, ImageMatchingScratch& scratch,
                                 std::vector<CompactImageMatchRecord>& output, size_t& iou_candidate_count, ScoreFn&& score_fn, IoUFn&& iou_fn,
-                                GroundTruthAreaFn&& ground_truth_area, PredictionAreaFn&& prediction_area) {
+                                GroundTruthAreaFn&& ground_truth_area, PredictionAreaFn&& prediction_area, CrowdFn&& crowd) {
     scratch.unmatched_threshold_bits.assign(ground_truth_ordinals.size(), {kAllThresholdBits, kAllThresholdBits, kAllThresholdBits, kAllThresholdBits});
     scratch.candidates.reserve(ground_truth_ordinals.size());
     std::uint32_t rank = 0;
@@ -252,11 +255,12 @@ void match_category_predictions(const std::vector<std::uint32_t>& prediction_ind
             // the latter has a larger IoU. Every area owns independent state.
             for (const bool ignore_group : {false, true}) {
                 for (const auto& candidate : scratch.candidates) {
-                    if ((!evaluation_area_contains(area, ground_truth_area(candidate.ground_truth_index))) != ignore_group) continue;
+                    const bool is_crowd = crowd(candidate.ground_truth_index);
+                    if ((is_crowd || !evaluation_area_contains(area, ground_truth_area(candidate.ground_truth_index))) != ignore_group) continue;
                     auto& unmatched = scratch.unmatched_threshold_bits[candidate.ground_truth_index][area];
                     const auto available = static_cast<std::uint16_t>(unmatched & candidate.eligible_threshold_bits & ~matched);
                     matched |= available;
-                    unmatched &= static_cast<std::uint16_t>(~available);
+                    if (!is_crowd) unmatched &= static_cast<std::uint16_t>(~available);
                     if (ignore_group) ignored |= available;
                 }
             }
@@ -345,13 +349,12 @@ CocoDataset::CocoDataset(const CocoDataset& other)
       ground_truth_ordinals_(other.ground_truth_ordinals_),
       image_area_scale_(other.image_area_scale_),
       ground_truth_areas_(other.ground_truth_areas_),
+      ground_truth_flags_(other.ground_truth_flags_),
       area_ground_truth_totals_(other.area_ground_truth_totals_),
-      mask_area_ground_truth_totals_(other.mask_area_ground_truth_totals_),
       ground_truth_masks_(other.ground_truth_masks_),
       ground_truth_mask_runs_(other.ground_truth_mask_runs_),
       ground_truth_mask_height_(other.ground_truth_mask_height_),
       ground_truth_mask_width_(other.ground_truth_mask_width_),
-      ground_truth_totals_(other.ground_truth_totals_),
       ground_truth_nonempty_categories_(other.ground_truth_nonempty_categories_),
       image_id_to_index_(other.image_id_to_index_),
       bbox_matches_by_category_(other.bbox_matches_by_category_),
@@ -393,7 +396,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     if (metric_set == EvaluationMetricSet::BBoxAndMask) {
         rle_data = loader.rle_data();
         rle_pair_count = loader.num_rle_pairs();
-        if ((label_count != 0U && (rle_data == nullptr || rle_pair_count == 0)) || rle_pair_count > std::numeric_limits<std::uint32_t>::max()) {
+        if ((rle_pair_count != 0U && rle_data == nullptr) || rle_pair_count > std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error("bbox-and-mask evaluation requires a bounded mask RLE payload");
         }
         const uint64_t mask_pixels = static_cast<uint64_t>(loader.image_height()) * loader.image_width();
@@ -429,7 +432,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
                 throw std::runtime_error("compiled evaluation annotation contains an unusable bbox");
             }
             if (metric_set == EvaluationMetricSet::BBoxAndMask) {
-                if (packed.mask_rle_pairs == 0 || packed.mask_rle_offset % sizeof(mmltk::backend::data::RLEPair) != 0) {
+                if (!packed.has_mask() || packed.mask_rle_offset % sizeof(mmltk::backend::data::RLEPair) != 0) {
                     throw std::runtime_error("bbox-and-mask evaluation requires a mask for every annotation");
                 }
                 const size_t rle_start_index = packed.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair);
@@ -457,6 +460,7 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
             (static_cast<double>(entry.original_width) / geometry.resized_width) * (static_cast<double>(entry.original_height) / geometry.resized_height);
     }
     out.ground_truth_areas_.resize(label_count);
+    out.ground_truth_flags_.resize(label_count);
     out.ground_truth_boxes_.resize(label_count);
     out.ground_truth_categories_.resize(label_count);
     out.ground_truth_ordinals_.resize(label_count);
@@ -483,7 +487,10 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
                 static_cast<float>(packed.bbox_x2),
                 static_cast<float>(packed.bbox_y2),
             };
-            out.ground_truth_areas_[dense_index] = evaluation_box_area(out.ground_truth_boxes_[dense_index]) * out.image_area_scale_[image_index];
+            out.ground_truth_areas_[dense_index] = packed.original_area;
+            // COCO _prepare assigns ignore from iscrowd for bbox and segm,
+            // superseding raw ignore. Retain the raw flag without OR-ing it.
+            out.ground_truth_flags_[dense_index] = packed.flags;
             out.ground_truth_categories_[dense_index] = packed.class_id;
             out.ground_truth_ordinals_[dense_index] = annotation_ordinal;
             if (metric_set == EvaluationMetricSet::BBoxAndMask) {
@@ -524,26 +531,22 @@ CocoDataset CocoDataset::load_from_loader(const mmltk::backend::data::DatasetLoa
     return out;
 }
 void CocoDataset::rebuild_ground_truth_totals() {
-    ground_truth_totals_.assign(catalog_->size(), 0);
     area_ground_truth_totals_.assign(catalog_->size(), {});
-    mask_area_ground_truth_totals_.assign(ground_truth_masks_ ? catalog_->size() : 0U, {});
     for (size_t image_index = 0; image_index < image_ids_.size(); ++image_index) {
         for (size_t category_index = 0; category_index < catalog_->size(); ++category_index) {
             const auto span = ground_truth_spans_[ground_truth_span_index(image_index, category_index)];
-            ground_truth_totals_[category_index] += span.count;
-            for (size_t gt = span.offset; gt < span.offset + span.count; ++gt)
+            for (size_t gt = span.offset; gt < span.offset + span.count; ++gt) {
+                if ((ground_truth_flags_[gt] & mmltk::backend::data::kAnnotationCrowd) != 0U) continue;
                 for (size_t area = 0; area < kEvaluationAreaCount; ++area) {
                     area_ground_truth_totals_[category_index][area] += evaluation_area_contains(area, ground_truth_areas_[gt]) ? 1U : 0U;
-                    if (ground_truth_masks_)
-                        mask_area_ground_truth_totals_[category_index][area] +=
-                            evaluation_area_contains(area, (*ground_truth_masks_)[gt].area * image_area_scale_[image_index]) ? 1U : 0U;
                 }
+            }
         }
     }
     ground_truth_nonempty_categories_.clear();
     ground_truth_nonempty_categories_.reserve(catalog_->size());
     for (size_t category_index = 0; category_index < catalog_->size(); ++category_index) {
-        if (ground_truth_totals_[category_index] != 0) { ground_truth_nonempty_categories_.push_back(category_index); }
+        if (area_ground_truth_totals_[category_index][0] != 0) { ground_truth_nonempty_categories_.push_back(category_index); }
     }
     bbox_metric_scratch_.reset(catalog_->size());
     if (metric_set_ == EvaluationMetricSet::BBoxAndMask) {
@@ -581,6 +584,7 @@ void CocoDataset::limit_images(const size_t limit) {
     ground_truth_spans_.resize(retained_span_count);
     image_area_scale_.resize(limit);
     ground_truth_areas_.resize(retained_annotation_count);
+    ground_truth_flags_.resize(retained_annotation_count);
     ground_truth_boxes_.resize(retained_annotation_count);
     ground_truth_categories_.resize(retained_annotation_count);
     ground_truth_ordinals_.resize(retained_annotation_count);
@@ -663,10 +667,12 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
             scratch.predictions_by_category[category_index], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category_index), scratch,
             result.bbox, bbox_iou_candidate_count, bbox_prediction_score,
             [this, span, &scratch](const std::uint32_t prediction_index, const size_t ground_truth_index) {
-                return bbox_iou(scratch.staged_boxes[prediction_index], ground_truth_boxes_[span.offset + ground_truth_index]);
+                return bbox_iou(scratch.staged_boxes[prediction_index], ground_truth_boxes_[span.offset + ground_truth_index],
+                                (ground_truth_flags_[span.offset + ground_truth_index] & mmltk::backend::data::kAnnotationCrowd) != 0U);
             },
             [this, span](size_t index) { return ground_truth_areas_[span.offset + index]; },
-            [this, image_index, &scratch](size_t index) { return evaluation_box_area(scratch.staged_boxes[index]) * image_area_scale_[image_index]; });
+            [this, image_index, &scratch](size_t index) { return evaluation_box_area(scratch.staged_boxes[index]) * image_area_scale_[image_index]; },
+            [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
     }
     result.prediction_count = result.bbox.size();
     if (mask_mode) {
@@ -691,17 +697,20 @@ ImageEvaluationMatches CocoDataset::match_staged_predictions(const std::int64_t 
             match_category_predictions(
                 scratch.predictions_by_category[category_index], span_ordinals(span), image_ordinal, static_cast<std::uint16_t>(category_index), scratch,
                 mask_matches, mask_iou_candidate_count, bbox_prediction_score,
-                [span, &masks, &runs, &prediction_mask_at](const std::uint32_t prediction_index, const size_t ground_truth_index) {
+                [this, span, &masks, &runs, &prediction_mask_at](const std::uint32_t prediction_index, const size_t ground_truth_index) {
                     const EncodedMask& prediction_mask = prediction_mask_at(prediction_index);
                     const GroundTruthMask& ground_truth_mask = masks[span.offset + ground_truth_index];
                     const auto ground_truth_runs =
                         std::span<const std::pair<std::uint32_t, std::uint32_t>>(runs).subspan(ground_truth_mask.run_offset, ground_truth_mask.run_count);
                     const std::uint32_t intersect = intersection_area(prediction_mask, ground_truth_runs);
-                    const std::uint64_t union_area = static_cast<std::uint64_t>(prediction_mask.area) + ground_truth_mask.area - intersect;
+                    const bool crowd = (ground_truth_flags_[span.offset + ground_truth_index] & mmltk::backend::data::kAnnotationCrowd) != 0U;
+                    const std::uint64_t union_area =
+                        crowd ? prediction_mask.area : static_cast<std::uint64_t>(prediction_mask.area) + ground_truth_mask.area - intersect;
                     return union_area == 0 ? 0.0 : static_cast<double>(intersect) / static_cast<double>(union_area);
                 },
-                [this, span, image_index](size_t index) { return (*ground_truth_masks_)[span.offset + index].area * image_area_scale_[image_index]; },
-                [this, image_index, &prediction_mask_at](size_t index) { return prediction_mask_at(index).area * image_area_scale_[image_index]; });
+                [this, span](size_t index) { return ground_truth_areas_[span.offset + index]; },
+                [this, image_index, &prediction_mask_at](size_t index) { return prediction_mask_at(index).area * image_area_scale_[image_index]; },
+                [this, span](size_t index) { return (ground_truth_flags_[span.offset + index] & mmltk::backend::data::kAnnotationCrowd) != 0U; });
         }
     }
     result.bbox_iou_candidate_count = bbox_iou_candidate_count;
@@ -758,7 +767,7 @@ EvalSummary CocoDataset::evaluate(const size_t max_dets_per_image, EvaluationDet
         const auto reduce_range = [&](const size_t begin, const size_t end) {
             for (size_t category = begin; category < end; ++category) {
                 reduce_category_matches(matches_by_category[category],
-                                        (kind == EvaluationMetricKind::Mask ? mask_area_ground_truth_totals_ : area_ground_truth_totals_)[category], caps,
+                                        area_ground_truth_totals_[category], caps,
                                         scratch.categories[category]);
             }
         };

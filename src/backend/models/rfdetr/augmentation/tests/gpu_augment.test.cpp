@@ -333,6 +333,16 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
         CHECK(output[0].box_xyxy == plan.paste_output_box);
         CHECK(output[0].visible_area_pixels == 25.0F);
     }
+    SECTION("known empty masked donor pastes no support and leaves source geometry unchanged") {
+        plan.paste_support = nullptr;
+        plan.paste_support_count = 0;
+        donor.mask_rle_pairs = 0;
+        build_augmentation_preview_annotations(std::span{&source, 1U}, &donor, &plan, 8, 8, output, runs);
+        REQUIRE(output.size() == 1);
+        CHECK(output[0].box_xyxy == std::array<float, 4>{0, 0, .625F, .625F});
+        CHECK(output[0].visible_area_pixels == 9.F);
+        CHECK(output[0].occluder_index == -1);
+    }
     SECTION("identity and photometric plans resolve masks and preserve empty records") {
         const auto original_source = source;
         for (const bool masked : {true, false}) {
@@ -351,7 +361,7 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
                 build_augmentation_preview_annotations(std::span{&source, 1U}, nullptr, identity, 8, 8, output, runs);
                 REQUIRE(output.size() == 1);
                 if (masked) {
-                    CHECK(output[0].box_xyxy == std::array<float, 4>{0.125F, 0.125F, 0.5F, 0.5F});
+                    CHECK(output[0].box_xyxy == std::array<float, 4>{0, 0, 0.125F, 0.125F});
                     CHECK(output[0].visible_area_pixels == 9.0F);
                 } else {
                     CHECK(output[0].box_xyxy[0] == output[0].box_xyxy[2]);
@@ -364,13 +374,13 @@ TEST_CASE("native augmentation resolves exact visible support", "[backend][model
         source.mask_rle_pairs = 1;
         CHECK_THROWS_AS(build_augmentation_preview_annotations(std::span{&source, 1U}, nullptr, nullptr, 8, 8, output, empty_run), std::runtime_error);
     }
-    SECTION("translation clips masks to output pixel edges") {
+    SECTION("translation preserves continuous box clipping independently of mask edges") {
         plan.paste_donor_slot = -1;
         plan.forward[2] = -0.25F;
         plan.inverse[2] = 0.25F;
         build_augmentation_preview_annotations(std::span{&source, 1U}, nullptr, &plan, 8, 8, output, runs);
         REQUIRE(output.size() == 1);
-        CHECK(output[0].box_xyxy == std::array<float, 4>{0, 0.125F, 0.25F, 0.5F});
+        CHECK(output[0].box_xyxy == std::array<float, 4>{0, 0, 0.375F, 0.625F});
         CHECK(output[0].visible_area_pixels == 6.0F);
     }
 }
@@ -532,7 +542,7 @@ TEST_CASE("raw augmentation is deterministic, seed-sensitive, bounded, and reuse
     };
     const AugmentationMappedInstance mapped = map_augmentation_instance(source_box, 4, 4, &transformed_plan);
     CHECK(mapped.visible);
-    for (const float coordinate : mapped.output_box_xyxy) CHECK(std::floor(coordinate * 4) == coordinate * 4);
+    CHECK(mapped.output_box_xyxy == transform_augmentation_box_xyxy(mapped.source_box_xyxy, transformed_plan.forward));
     CHECK(mapped.output_box_xyxy != mapped.source_box_xyxy);
     CHECK(executor.workspace_capacity_bytes() == capacity_bytes);
     bool observed_flip = false;
@@ -1071,3 +1081,33 @@ TEST_CASE("perceptual donor reductions preserve mask box and class support", "[b
 }
 }  // namespace
 }  // namespace mmltk::backend::models::rfdetr
+TEST_CASE("continuous augmentation boxes survive independent and empty mask support", "[backend][rfdetr][augmentation][support]") {
+    using mmltk::backend::data::PackedInstance;
+    using mmltk::backend::data::RLEPair;
+    PackedInstance annotation{.flags = mmltk::backend::data::kAnnotationMask,
+                              .bbox_x1 = 1.25F, .bbox_y1 = 2.5F, .bbox_x2 = 6.25F, .bbox_y2 = 7.25F};
+    const std::array runs{RLEPair{27, 1}};
+    for (const auto mask : {std::span<const RLEPair>{}, std::span<const RLEPair>{runs}}) {
+        AugmentationImagePlan plan;
+        const auto identity = map_augmentation_instance(annotation, 8, 8, &plan, mask);
+        CHECK(identity.visible);
+        CHECK(identity.output_box_xyxy == std::array<float, 4>{1.25F / 8, 2.5F / 8, 6.25F / 8, 7.25F / 8});
+        CHECK(identity.output_area == (mask.empty() ? 0.F : 1.F));
+        plan.forward = {-1, 0, 1, 0, 1, 0};
+        plan.inverse = plan.forward;
+        const auto flipped = map_augmentation_instance(annotation, 8, 8, &plan, mask);
+        CHECK(flipped.visible);
+        CHECK(flipped.output_box_xyxy == std::array<float, 4>{1.75F / 8, 2.5F / 8, 6.75F / 8, 7.25F / 8});
+        plan.forward = {2, 0, -.5F, 0, 2, -.5F};
+        plan.inverse = {.5F, 0, .25F, 0, .5F, .25F};
+        const auto cropped = map_augmentation_instance(annotation, 8, 8, &plan, mask);
+        CHECK(cropped.visible);
+        CHECK(cropped.output_box_xyxy == std::array<float, 4>{0, .125F, 1, 1});
+        plan.forward = {1, 0, .625F, 0, 1, 0};
+        plan.inverse = {1, 0, -.625F, 0, 1, 0};
+        const auto vanished_mask = map_augmentation_instance(annotation, 8, 8, &plan, mask);
+        CHECK(vanished_mask.visible);
+        CHECK(vanished_mask.output_box_xyxy == std::array<float, 4>{6.25F / 8, 2.5F / 8, 1, 7.25F / 8});
+        CHECK(vanished_mask.output_area == 0);
+    }
+}

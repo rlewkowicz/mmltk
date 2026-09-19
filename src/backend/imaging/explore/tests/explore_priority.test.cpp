@@ -557,7 +557,7 @@ TEST_CASE("Explore tiny support keeps exact outer edges under atlas and detail s
                                                    float(rectangle[3]) / height};
         const auto support = augment::resolve_augmentation_annotation_support({0, 0, 1, 1}, runs, width, height, nullptr);
         REQUIRE(support.present);
-        REQUIRE(support.box_xyxy == identity_bounds);
+        REQUIRE(support.box_xyxy == std::array<float, 4>{0, 0, 1, 1});
         REQUIRE(support.area_pixels == static_cast<float>((rectangle[2] - rectangle[0]) * (rectangle[3] - rectangle[1])));
         for (int transform = 0; transform < 4; ++transform) {
             CAPTURE(transform);

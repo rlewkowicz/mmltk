@@ -590,7 +590,8 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
             image_ids[static_cast<int64_t>(image_pos)] = static_cast<int64_t>(dataset_index) + 1;
             for (int64_t instance_index = 0; instance_index < static_cast<int64_t>(entry.num_instances); ++instance_index) {
                 const auto& instance = batch.labels[static_cast<size_t>(entry.label_begin) + static_cast<size_t>(instance_index)];
-                if (require_masks && instance.mask_rle_pairs == 0)
+                if (instance.is_crowd()) continue;
+                if (require_masks && !instance.has_mask())
                     throw std::runtime_error("segmentation training requires decodable masks for every instance");
                 if (instance.mask_rle_pairs != 0 && batch.rle_pairs == nullptr) throw std::runtime_error("mask_rle storage is missing");
                 const auto runs = instance.mask_rle_pairs != 0 ? std::span{batch.rle_pairs + instance.mask_rle_offset / sizeof(mmltk::backend::data::RLEPair),
@@ -617,7 +618,7 @@ PreparedTargets build_targets(const mmltk::backend::data::Batch& batch, int imag
 #endif
                 // Source support is already validated by the native mapper.
                 // Donor metadata describes those pixels independently of loss selection.
-                float source_area = runs.empty() ? mapped.source_area_pixels : 0.0F;
+                float source_area = instance.has_mask() ? 0.0F : mapped.source_area_pixels;
                 for (const auto& pair : runs) {
                     if (include_masks) {
                         int64_t* mask_words = packed_masks_data + static_cast<size_t>(target_index) * static_cast<size_t>(staging.mask_words_per_instance);

@@ -336,6 +336,7 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
             const auto& entry = batch.label_index[batch.image_indices[image]];
             require(plan.cache_source_ordinal < entry.num_instances, "donor cache source ordinal exceeds source labels");
             const auto& instance = batch.labels[entry.label_begin + plan.cache_source_ordinal];
+            require(!instance.is_crowd(), "crowd annotation cannot enter the donor cache");
             require(instance.mask_rle_pairs == 0 || batch.rle_pairs != nullptr, "donor cache source mask storage is missing");
             donor_support_[static_cast<std::size_t>(image)].reserve(instance.mask_rle_pairs);
         }
@@ -366,7 +367,7 @@ cudaStream_t GpuBatchAugmenter::finish_batch(const mmltk::backend::data::Batch& 
                 metadata.dataset_index = plan.cache_source_dataset_index;
                 metadata.area = plan.cache_source_area;
                 metadata.box = plan.cache_source_box;
-                metadata.has_mask = instance.mask_rle_pairs != 0;
+                metadata.has_mask = instance.has_mask();
             }
         }
         float* donor_boxes = resources_->donor_boxes_cpu_.data_ptr<float>();

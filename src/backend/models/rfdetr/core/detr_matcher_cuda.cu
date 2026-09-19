@@ -37,7 +37,7 @@ template <typename Logit, typename Box>
 __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, const Box* pred_boxes, const int64_t* target_labels, const float* target_boxes,
                                     const int64_t* target_offsets, const int64_t* target_counts, int64_t batch_size, int64_t query_count, int64_t class_count,
                                     int64_t output_query_stride, int64_t max_targets, int64_t total_targets, float class_cost, float bbox_cost,
-                                    float giou_cost) {
+                                    float giou_cost, float focal_alpha) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t total = batch_size * query_count * max_targets;
     if (index >= total) { return; }
@@ -53,8 +53,8 @@ __global__ void matcher_cost_kernel(float* output, const Logit* pred_logits, con
     const float logit = static_cast<float>(pred_logits[(batch_index * query_count + query_index) * class_count + class_index]);
     const float probability = 1.0f / (1.0f + expf(-logit));
     const float one_minus_probability = 1.0f - probability;
-    const float positive_class_cost = 0.25f * one_minus_probability * one_minus_probability * stable_softplus(-logit);
-    const float negative_class_cost = 0.75f * probability * probability * stable_softplus(logit);
+    const float positive_class_cost = focal_alpha * one_minus_probability * one_minus_probability * stable_softplus(-logit);
+    const float negative_class_cost = (1.0f - focal_alpha) * probability * probability * stable_softplus(logit);
     const Box* prediction = pred_boxes + (batch_index * query_count + query_index) * 4;
     const float* target = target_boxes + target_index * 4;
     const float prediction_float[4] = {static_cast<float>(prediction[0]), static_cast<float>(prediction[1]), static_cast<float>(prediction[2]),
@@ -138,7 +138,7 @@ float checked_cost_coefficient(const double value, const char* name) {
 }
 void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::Tensor& pred_logits, const torch::Tensor& pred_boxes,
                                       const torch::Tensor& target_labels, const torch::Tensor& target_boxes, const torch::Tensor& target_offsets,
-                                      const torch::Tensor& target_counts, double class_cost, double bbox_cost, double giou_cost) {
+                                      const torch::Tensor& target_counts, double class_cost, double bbox_cost, double giou_cost, double focal_alpha) {
     check_matcher_tensor(output, torch::kFloat32, 3, "matcher cost output");
     check_matcher_floating_tensor(pred_logits, 3, "matcher logits");
     check_matcher_floating_tensor(pred_boxes, 3, "matcher boxes");
@@ -168,6 +168,7 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
                 "matcher target-box storage does not match its shape");
     const int64_t output_extent = checked_extent({batch, output.size(1), max_targets}, std::numeric_limits<int64_t>::max(), "matcher output pointer extent");
     TORCH_CHECK(output_extent <= output.numel(), "matcher output storage does not cover its checked pointer extent");
+    const float checked_alpha = checked_cost_coefficient(focal_alpha, "matcher focal alpha");
     const float checked_class_cost = checked_cost_coefficient(class_cost, "matcher class cost");
     const float checked_bbox_cost = checked_cost_coefficient(bbox_cost, "matcher box cost");
     const float checked_giou_cost = checked_cost_coefficient(giou_cost, "matcher generalized-IoU cost");
@@ -183,7 +184,7 @@ void pairwise_detection_cost_cuda_out(const torch::Tensor& output, const torch::
             matcher_cost_kernel<Logit, Box><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
                 output.data_ptr<float>(), pred_logits.data_ptr<Logit>(), pred_boxes.data_ptr<Box>(), target_labels.data_ptr<int64_t>(),
                 target_boxes.data_ptr<float>(), target_offsets.data_ptr<int64_t>(), target_counts.data_ptr<int64_t>(), batch, queries, classes, output.size(1),
-                max_targets, total_targets, checked_class_cost, checked_bbox_cost, checked_giou_cost);
+                max_targets, total_targets, checked_class_cost, checked_bbox_cost, checked_giou_cost, checked_alpha);
         });
     });
     TORCH_CHECK(cudaGetLastError() == cudaSuccess, "matcher cost CUDA kernel launch failed");

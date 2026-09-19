@@ -35,7 +35,8 @@ r::Prediction box(int category, std::array<float, 4> bounds, float score = 1.0F)
 }
 class EvaluationFixture final {
    public:
-    explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128) : root_("evaluator-answers") {
+    explicit EvaluationFixture(const std::vector<std::vector<r::Prediction>>& images, int resolution = 128,
+                               const std::vector<std::vector<nlohmann::json>>& metadata = {}) : root_("evaluator-answers") {
         const data::testsupport::FixtureSpec fixture{root_.path().string(), "train", 128, 128, static_cast<int>(images.size()), 0, 0};
         data::testsupport::create_synthetic_dataset(fixture);
         constexpr std::array names{"person", "ret", "scope", "iron_sight", "anchor_dot", "glint"};
@@ -43,19 +44,23 @@ class EvaluationFixture final {
             auto name = std::to_string(image + 1U);
             name.insert(0U, 6U - name.size(), '0');
             std::ofstream output(std::filesystem::path(data::testsupport::dataset_dir(fixture)) / "train" / (name + ".jsonl"));
+            std::size_t ordinal = 0;
             for (const auto& annotation : images[image]) {
                 std::string runs;
                 for (const auto& [start, count] : annotation.mask.runs) {
                     if (!runs.empty()) runs += ' ';
                     runs += std::to_string(start) + ':' + std::to_string(count);
                 }
-                output << nlohmann::json{{"class", names[annotation.class_reference]},
-                                         {"bbox_xyxy", annotation.bbox_xyxy},
-                                         {"mask_rle_encoding", "row_major_start_length"},
-                                         {"mask_rle", runs},
-                                         {"image_size_wh", {128, 128}}}
-                              .dump()
-                       << '\n';
+                nlohmann::json record{{"class", names[annotation.class_reference]},
+                                      {"bbox_xyxy", annotation.bbox_xyxy},
+                                      {"image_size_wh", {128, 128}}};
+                if (annotation.has_mask) {
+                    record["mask_rle_encoding"] = "row_major_start_length";
+                    record["mask_rle"] = runs;
+                }
+                if (!metadata.empty()) record.update(metadata.at(image).at(ordinal));
+                ++ordinal;
+                output << record.dump() << '\n';
             }
         }
         data::CompilerConfig config;
@@ -281,4 +286,79 @@ TEST_CASE("each native double IoU threshold is inclusive at its exact rational b
         REQUIRE(matches.bbox.size() == 1U);
         CHECK(matches.bbox.front().area_matched_bits[0] == static_cast<std::uint16_t>((1U << (index + 1U)) - 1U));
     }
+}
+TEST_CASE("COCO crowds repeat ignore matches while ordinary annotations retain priority", "[rfdetr][evaluation][gpu]") {
+    const auto crowd = box(0, {0, 0, 128, 128});
+    const auto ordinary = box(0, {10, 10, 30, 30});
+    EvaluationFixture fixture({{crowd, ordinary, box(1, {0, 0, 128, 128})}}, 128,
+                              {{{{"iscrowd", true}}, {{"ignore", true}}, {{"iscrowd", true}, {"ignore", false}}}});
+    r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+    CHECK(fixture.loader->label_data()[1].raw_ignore());
+    const auto prediction = box(0, {10, 10, 28, 30}, .9F);
+    auto matches = match(owner, 0, {prediction, prediction, prediction, box(1, {4, 4, 8, 8})}, 10, true);
+    REQUIRE(matches.bbox.size() == 4U);
+    REQUIRE(matches.mask);
+    for (const auto* records : {&matches.bbox, &*matches.mask}) {
+        // Ordinary IoU=.9 takes precedence over crowd overlap=1 through .9;
+        // the crowd absorbs the .95 threshold and every subsequent detection.
+        CHECK((*records)[0].area_matched_bits[0] == 1023U);
+        CHECK((*records)[0].area_ignored_bits[0] == 512U);
+        CHECK((*records)[1].area_ignored_bits[0] == 1023U);
+        CHECK((*records)[2].area_ignored_bits[0] == 1023U);
+        CHECK((*records)[3].area_ignored_bits[0] == 1023U);
+    }
+    owner.merge_matches(std::move(matches));
+    const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
+    CHECK(summary.bbox.ap == Approx(.9));
+    CHECK(summary.mask->ap == Approx(.9));
+    const auto details = owner.take_details();
+    CHECK(row(details, r::EvaluationArea::All, 0U).ground_truth_count == 1U);
+    CHECK_FALSE(row(details, r::EvaluationArea::All, 1U).available);
+    CHECK_FALSE(row(details, r::EvaluationArea::All, 1U, r::EvaluationMetricKind::Mask).available);
+}
+TEST_CASE("evaluation retains duplicate fractional boxes and declared source area", "[rfdetr][evaluation][gpu]") {
+    const auto annotation = box(0, {10.25F, 11.5F, 20.75F, 22.25F});
+    EvaluationFixture fixture({{annotation, annotation}}, 64, {{{{"area", 9216.0}}, {{"area", 9216.0}}}});
+    r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+    CHECK(owner.facts().ground_truth_count == 2U);
+    auto prediction = annotation;
+    for (auto& coordinate : prediction.bbox_xyxy) coordinate *= .5F;
+    // Use the compiled categorical mask so this case isolates stored area.
+    prediction.mask = {};
+    prediction.mask.width = prediction.mask.height = 64;
+    const auto& packed = fixture.loader->label_data()[0];
+    const auto* runs = fixture.loader->rle_data() + packed.mask_rle_offset / sizeof(data::RLEPair);
+    for (std::size_t i = 0; i < packed.mask_rle_pairs; ++i) {
+        prediction.mask.runs.emplace_back(runs[i].start, runs[i].length);
+        prediction.mask.area += runs[i].length;
+    }
+    owner.merge_matches(match(owner, 0, {prediction, prediction}, 10, true));
+    const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
+    CHECK(summary.bbox.ap == Approx(1));
+    CHECK(summary.mask->ap == Approx(1));
+    const auto details = owner.take_details();
+    for (const auto kind : {r::EvaluationMetricKind::Box, r::EvaluationMetricKind::Mask}) {
+        CHECK_FALSE(row(details, r::EvaluationArea::Small, 0U, kind).available);
+        CHECK(row(details, r::EvaluationArea::Medium, 0U, kind).ground_truth_count == 2U);
+        CHECK(row(details, r::EvaluationArea::Large, 0U, kind).ground_truth_count == 2U);
+    }
+}
+TEST_CASE("known empty evaluation masks remain positive annotations and missing masks fail admission", "[rfdetr][evaluation][gpu]") {
+    auto annotation = box(0, {1.25F, 2.5F, 7.75F, 8.5F});
+    annotation.mask.runs.clear();
+    annotation.mask.area = 0;
+    EvaluationFixture fixture({{annotation}});
+    r::EvaluationDatasetOwner owner(*fixture.loader, r::EvaluationMetricSet::BBoxAndMask);
+    CHECK(owner.facts().mask_rle_pair_count == 0U);
+    CHECK(r::resolve_evaluation_metric_set(*fixture.loader, true) == r::EvaluationMetricSet::BBoxAndMask);
+    owner.merge_matches(match(owner, 0, {annotation}, 10, true));
+    const auto summary = owner.evaluate(10, r::EvaluationDetailRetention::Detailed);
+    CHECK(summary.bbox.ap == Approx(1));
+    REQUIRE(summary.mask);
+    CHECK(summary.mask->available);
+    CHECK(summary.mask->ap == 0);
+    annotation.has_mask = false;
+    EvaluationFixture missing({{annotation}});
+    CHECK(r::resolve_evaluation_metric_set(*missing.loader, true) == r::EvaluationMetricSet::BBox);
+    CHECK_THROWS_AS(r::EvaluationDatasetOwner(*missing.loader, r::EvaluationMetricSet::BBoxAndMask), std::runtime_error);
 }
