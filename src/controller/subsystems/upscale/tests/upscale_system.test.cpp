@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <onnxruntime_cxx_api.h>
 #include <exception>
 #include <fcntl.h>
 #include <filesystem>
@@ -54,13 +55,28 @@ using namespace visual_test_support;
 using mmltk::frameworks::gpu::test_support::FakeImageBackend;
 using mmltk::frameworks::gpu::test_support::RuntimeFactory;
 using namespace std::chrono_literals;
+struct ReferenceEnvironment final {
+    std::optional<std::string> prior;
+    ReferenceEnvironment() {
+        if (const auto* value = std::getenv("MMLTK_UPSCALE_ONNX_REFERENCE")) prior = value;
+    }
+    ~ReferenceEnvironment() {
+        if (prior)
+            static_cast<void>(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", prior->c_str(), 1));
+        else
+            static_cast<void>(::unsetenv("MMLTK_UPSCALE_ONNX_REFERENCE"));
+    }
+};
+
 class FailingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
-    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        if (target.valid()) Fill(target, 0U);
+    }
     explicit FailingUpscaleAlgorithm(std::shared_ptr<std::atomic_uint32_t> runs, const bool physical = false) : runs_(std::move(runs)), physical_(physical) {}
     void Warm() override {}
     void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
-             const std::function<bool()>&) override {
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override {
         if (runs_->fetch_add(1U, std::memory_order_acq_rel) == 1U) {
             if (physical_)
                 throw mmltk::frameworks::gpu::ImageStreamExecutionFailure(
@@ -78,6 +94,10 @@ struct UpscaleActivationProbe final {
     std::atomic<std::size_t> warms{0U};
     std::atomic<std::size_t> runs{0U};
     std::atomic<std::size_t> fallback_activations{0U};
+    std::array<std::atomic_uint32_t, 3U> warm_runs{};
+    std::array<std::atomic_uint32_t, 3U> warm_widths{};
+    std::array<std::atomic_uint32_t, 3U> warm_heights{};
+    std::atomic_bool warm_geometry_valid{true};
     std::array<std::atomic_bool, 3U> ready{};
     std::atomic_bool fail_warm{false};
     std::atomic_bool hold_warm{false};
@@ -90,7 +110,9 @@ struct UpscaleActivationProbe final {
 };
 class ActivationUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
-    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        if (target.valid()) Fill(target, 0U);
+    }
     explicit ActivationUpscaleAlgorithm(std::shared_ptr<UpscaleActivationProbe> probe) : probe_(std::move(probe)) {}
     void Warm() override {
         const auto call = probe_->warms.fetch_add(1U, std::memory_order_acq_rel);
@@ -102,13 +124,21 @@ class ActivationUpscaleAlgorithm final : public UpscaleAlgorithm {
         Activate();
         if (call == 0U) probe_->first_warm_completed.set_value();
     }
-    void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
-             const std::function<bool()>&) override {
+    void Run(UpscaleKernel kernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
+             const std::function<bool()>&, UpscalePurpose purpose = UpscalePurpose::Normal) override {
         if (!probe_->ready[0U].load(std::memory_order_acquire)) {
             probe_->fallback_activations.fetch_add(1U, std::memory_order_acq_rel);
             Activate();
         }
         probe_->runs.fetch_add(1U, std::memory_order_acq_rel);
+        if (purpose == UpscalePurpose::Warm) {
+            const auto index = static_cast<std::size_t>(kernel);
+            ++probe_->warm_runs[index];
+            probe_->warm_widths[index] = source.descriptor.width;
+            probe_->warm_heights[index] = source.descriptor.height;
+            if (target.descriptor.width != source.descriptor.width * 4U || target.descriptor.height != source.descriptor.height * 4U)
+                probe_->warm_geometry_valid = false;
+        }
         Fill(target, *reinterpret_cast<const std::uint8_t*>(source.data));
     }
 
@@ -125,11 +155,13 @@ struct UpscaleAdmissionRaceProbe final {
 };
 class RacingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
-    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        if (target.valid()) Fill(target, 0U);
+    }
     explicit RacingUpscaleAlgorithm(std::shared_ptr<UpscaleAdmissionRaceProbe> probe) : probe_(std::move(probe)) {}
     void Warm() override {}
     void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
-             const std::function<bool()>&) override {
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override {
         const auto value = *reinterpret_cast<const std::uint8_t*>(source.data);
         probe_->received_value.store(value, std::memory_order_release);
         probe_->received_width.store(source.descriptor.width, std::memory_order_release);
@@ -147,13 +179,15 @@ struct UpscaleReleaseFailureProbe final {
 };
 class ReleaseFailingUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
-    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        if (target.valid()) Fill(target, 0U);
+    }
     explicit ReleaseFailingUpscaleAlgorithm(std::shared_ptr<UpscaleReleaseFailureProbe> probe)
         : probe_(std::move(probe)), failure_(std::make_exception_ptr(std::runtime_error("deterministic Upscale release failure"))) {}
     ~ReleaseFailingUpscaleAlgorithm() override { probe_->destroyed.store(true, std::memory_order_release); }
     void Warm() override { probe_->warmed.set_value(); }
-    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t,
-             const std::function<bool()>&) override {}
+    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override { Fill(target, 0U); }
     [[nodiscard]] Release ReleaseResources() noexcept override {
         probe_->releases.fetch_add(1U, std::memory_order_acq_rel);
         return {.all_released = false, .failure = failure_};
@@ -227,6 +261,7 @@ TEST_CASE("Upscale equal extent source changes replace actual receiver pixels") 
     for (const auto value : {3U, 19U, 3U}) {
         source.Publish({16U, 8U}, static_cast<std::uint8_t>(value));
         const auto input = source.frame();
+        const auto clears = backend->plane_clears.load();
         static_cast<void>(upscale.Start(test_upscale_request({.source = input})));
         REQUIRE(events.Wait([&] { return upscale.snapshot().ready && upscale.snapshot().input == input; }));
         const auto output = upscale.BorrowDocument(upscale.snapshot().frame);
@@ -235,7 +270,50 @@ TEST_CASE("Upscale equal extent source changes replace actual receiver pixels") 
         const auto* pixels = reinterpret_cast<const std::uint8_t*>(plane.data);
         CHECK(pixels[0] == value);
         CHECK(pixels[(plane.descriptor.height - 1U) * plane.descriptor.pitch_bytes + plane.descriptor.row_bytes() - 1U] == value);
+        CHECK(backend->plane_clears.load() == clears);
+        const auto semantic = output.pixels.plane(1U).plane();
+        for (std::uint32_t y = 0U; y < plane.descriptor.height; ++y)
+            for (std::size_t x = 0U; x < plane.descriptor.row_bytes(); ++x) {
+                REQUIRE(pixels[y * plane.descriptor.pitch_bytes + x] == value);
+                REQUIRE(reinterpret_cast<const std::uint8_t*>(semantic.data)[y * semantic.descriptor.pitch_bytes + x] == 0U);
+            }
     }
+}
+TEST_CASE("Upscale complete fake writers replace poisoned retained planes", "[upscale]") {
+    using namespace mmltk::frameworks::gpu;
+    const auto method = GENERATE(UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr);
+    const bool warm = GENERATE(false, true);
+    auto backend = std::make_shared<FakeImageBackend>();
+    backend->pitch_padding_bytes = 23U;
+    auto kernel = std::make_shared<std::atomic<UpscaleKernel>>(UpscaleKernel::Default);
+    auto runtime = TestUpscaleAlgorithm::CreateRuntime(backend, kernel, {})(std::make_shared<ImageProductRevisionSequence>());
+    runtime->BeginWork();
+    auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
+    REQUIRE(model != nullptr);
+    runtime->PublishInput(3U, 5U, [](auto clean, auto semantic, auto) {
+        Fill(clean, 31U);
+        Fill(semantic, 77U);
+    });
+    const auto input = runtime->BorrowInput();
+    auto candidate = runtime->AcquireOutput();
+    const auto clears = backend->plane_clears.load();
+    runtime->PublishRetained(candidate, 12U, 20U, [&](auto clean, auto semantic, auto stream) {
+        Fill(clean, 0xD7U);
+        Fill(semantic, 0xA9U);
+        model->Run(method, input.plane(0U).plane(), clean, stream, {}, warm ? UpscalePurpose::Warm : UpscalePurpose::Normal);
+        model->Semantics(warm ? ImagePlaneView{} : input.plane(1U).plane(), semantic, stream);
+    });
+    const auto product = runtime->CommitOutput(std::move(candidate));
+    const auto read = product.Borrow();
+    REQUIRE(read.valid());
+    for (std::size_t index = 0U; index < 2U; ++index) {
+        const auto plane = read.plane(index).plane();
+        const auto expected = index == 0U ? static_cast<std::uint8_t>(method) + 1U : warm ? 0U : 77U;
+        for (std::uint32_t y = 0U; y < plane.descriptor.height; ++y)
+            for (std::size_t byte = 0U; byte < plane.descriptor.row_bytes(); ++byte)
+                REQUIRE(reinterpret_cast<const std::uint8_t*>(plane.data)[y * plane.descriptor.pitch_bytes + byte] == expected);
+    }
+    CHECK(backend->plane_clears.load() == clears);
 }
 TEST_CASE("Upscale exact repeats avoid copying and method switches preserve completed pixels") {
     auto backend = std::make_shared<FakeImageBackend>();
@@ -695,40 +773,49 @@ TEST_CASE("Upscale completed and failed facts require exact immutable document m
 // CLEANUP-IGNORE: Warm idempotence and injected release-failure custody use distinct algorithms and lifecycle
 // assertions.
 TEST_CASE("Upscale warm activates every mode once and repeated ready signals are idempotent") {
+    const VisualExtent extent{GENERATE(1U, 225U, 449U), 5U};
     auto backend = std::make_shared<FakeImageBackend>();
     auto activation = std::make_shared<UpscaleActivationProbe>();
     auto completed = activation->first_warm_completed.get_future();
     EventGate events;
-    UpscaleSystem upscale{kDevice,
+    UpscaleSystem upscale{{.device = 0, .maximum_width = 2048U, .maximum_height = 1024U},
                           RuntimeFactory(
                               0, backend, mmltk::frameworks::gpu::ImageProductLayout::CleanAndSemantic,
                               [activation] { return std::make_unique<ActivationUpscaleAlgorithm>(activation); }, 4U),
                           [](const VisualFrame&) { return VisualDocumentRead{}; }, [&events](UpscaleSystem::event_type) { events.Advance(); }};
-    upscale.Warm({32U, 32U});
-    upscale.Warm({32U, 32U});
+    upscale.Warm(extent);
+    upscale.Warm(extent);
     REQUIRE(completed.wait_for(2s) == std::future_status::ready);
     completed.get();
-    upscale.Warm({32U, 32U});
+    upscale.Warm(extent);
     REQUIRE(events.Wait([&] { return std::ranges::all_of(upscale.snapshot().methods, [](const auto& method) { return method.warm; }); }));
     CHECK(activation->warms.load(std::memory_order_acquire) == 1U);
-    CHECK(activation->runs.load(std::memory_order_acquire) == 9U);
-    for (const auto& ready : activation->ready) CHECK(ready.load(std::memory_order_acquire));
+    CHECK(activation->runs.load(std::memory_order_acquire) == 3U);
+    CHECK(activation->warm_geometry_valid.load());
+    for (std::size_t i = 0; i < activation->warm_runs.size(); ++i) {
+        CHECK(activation->warm_runs[i].load() == 1U);
+        CHECK(activation->warm_widths[i].load() == extent.width);
+        CHECK(activation->warm_heights[i].load() == extent.height);
+        CHECK(activation->ready[i].load());
+    }
+    CHECK_FALSE(upscale.snapshot().ready);
+    CHECK_FALSE(upscale.BorrowFrame().valid());
+    const VisualExtent replacement{extent.width, 3U};
+    const auto warm_revision = upscale.snapshot().revision;
+    upscale.Warm(replacement);
+    REQUIRE(events.Wait([&] { return upscale.snapshot().revision >= warm_revision + 3U; }));
+    CHECK(activation->runs.load() == 6U);
+    CHECK(activation->warms.load() == 1U);
+    for (std::size_t i = 0; i < activation->warm_runs.size(); ++i) {
+        CHECK(activation->warm_runs[i].load() == 2U);
+        CHECK(activation->warm_widths[i].load() == replacement.width);
+        CHECK(activation->warm_heights[i].load() == replacement.height);
+    }
 }
 TEST_CASE("Upscale CUDA tile replay preserves reference pixels and pitched receiver storage", "[upscale_gpu]") {
     if (!has_cuda_device()) SKIP("CUDA device unavailable");
     using namespace mmltk::frameworks::gpu;
-    struct ReferenceEnvironment final {
-        std::optional<std::string> prior;
-        ReferenceEnvironment() {
-            if (const auto* value = std::getenv("MMLTK_UPSCALE_ONNX_REFERENCE")) prior = value;
-        }
-        ~ReferenceEnvironment() {
-            if (prior)
-                static_cast<void>(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", prior->c_str(), 1));
-            else
-                static_cast<void>(::unsetenv("MMLTK_UPSCALE_ONNX_REFERENCE"));
-        }
-    } environment;
+    ReferenceEnvironment environment;
     constexpr std::uint32_t width = 197U, height = 193U;
     SystemImageRuntime source{{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop}};
     SystemImageRuntime readback{{.device = 0, .context_mode = DeviceContextMode::PrimaryInterop}};
@@ -843,21 +930,223 @@ TEST_CASE("Native Upscale warm aggregate retires before model and primary contex
     CHECK_FALSE(retirement.custody.valid());
     CHECK_NOTHROW(runtime.reset());
 }
-void run_native_upscale(mmltk::frameworks::gpu::SystemImageRuntime& runtime, UpscaleKernel kernel, const std::function<bool()>& current = {}) {
+void run_native_upscale(mmltk::frameworks::gpu::SystemImageRuntime& runtime, UpscaleKernel kernel, const std::function<bool()>& current = {},
+                        UpscalePurpose purpose = UpscalePurpose::Normal, VisualExtent extent = {8U, 8U}) {
     runtime.BeginWork();
     auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime.model());
     REQUIRE(model != nullptr);
-    if (!runtime.BorrowInput().valid()) {
-        runtime.PublishInput(8U, 8U, [model](auto clean, auto semantic, auto stream) {
+    const bool replace_input = [&] {
+        const auto input = runtime.BorrowInput();
+        return !input.valid() || input.plane(0U).plane().descriptor.width != extent.width || input.plane(0U).plane().descriptor.height != extent.height;
+    }();
+    if (replace_input) {
+        runtime.PublishInput(extent.width, extent.height, [model](auto clean, auto semantic, auto stream) {
             model->Semantics({}, clean, stream);
             model->Semantics({}, semantic, stream);
         });
     }
     const auto input = runtime.BorrowInput();
-    runtime.Publish(32U, 32U, [&](auto clean, auto semantic, auto stream) {
-        model->Run(kernel, input.plane(0U).plane(), clean, stream, current);
+    auto candidate = runtime.AcquireOutput();
+    runtime.PublishRetained(candidate, extent.width * 4U, extent.height * 4U, [&](auto clean, auto semantic, auto stream) {
+        model->Run(kernel, input.plane(0U).plane(), clean, stream, current, purpose);
         model->Semantics({}, semantic, stream);
     });
+    static_cast<void>(runtime.CommitOutput(std::move(candidate)));
+}
+[[nodiscard]] std::array<std::vector<std::uint8_t>, 2U> native_upscale_pixels(mmltk::frameworks::gpu::SystemImageRuntime& runtime) {
+    runtime.CompleteWork();
+    const auto read = runtime.Borrow();
+    REQUIRE(read.valid());
+    std::array<std::vector<std::uint8_t>, 2U> pixels;
+    for (std::size_t index = 0U; index < pixels.size(); ++index) {
+        const auto plane = read.plane(index).plane();
+        REQUIRE(plane.valid());
+        pixels[index].resize(plane.descriptor.row_bytes() * plane.descriptor.height);
+        REQUIRE(cudaMemcpy2D(pixels[index].data(), plane.descriptor.row_bytes(), reinterpret_cast<const void*>(plane.data),
+                             plane.descriptor.pitch_bytes, plane.descriptor.row_bytes(), plane.descriptor.height, cudaMemcpyDeviceToHost) == cudaSuccess);
+    }
+    return pixels;
+}
+TEST_CASE("Native warm purpose retains full extent and provider readiness with one tiled image", "[upscale_gpu]") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    using namespace mmltk::frameworks::gpu;
+    const auto method = GENERATE(UpscaleKernel::Default, UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr);
+    const VisualExtent extent{GENERATE(8U, 225U, 449U), 5U};
+    const bool reference_run = GENERATE(false, true);
+    ReferenceEnvironment environment;
+    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
+    std::array<unsigned, static_cast<std::size_t>(Stage::Count)> counts{};
+    auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) { ++counts[static_cast<std::size_t>(stage)]; })(
+        std::make_shared<ImageProductRevisionSequence>());
+    const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
+    run_native_upscale(*runtime, method, {}, UpscalePurpose::Warm, extent);
+    const auto expected = native_upscale_pixels(*runtime);
+    const auto count = [&](Stage stage) { return counts[static_cast<std::size_t>(stage)]; };
+    const auto* model = dynamic_cast<UpscaleAlgorithm*>(runtime->model());
+    REQUIRE(model != nullptr);
+    if (method == UpscaleKernel::Default) {
+        CHECK(count(Stage::BasicLaunchAdmitted) == 2U);
+        CHECK(count(Stage::TilePrepared) == 0U);
+        CHECK_FALSE(model->GraphReplay(method));
+    } else {
+        const unsigned core = method == UpscaleKernel::ShiftLut ? 192U : 224U;
+        const unsigned tiles = (extent.width + core - 1U) / core;
+        CHECK(count(Stage::TilePrepared) == tiles);
+        CHECK(count(Stage::TileInferred) == tiles);
+        CHECK(count(Stage::TileStitched) == tiles);
+        CHECK(model->GraphReplay(method) == (method == UpscaleKernel::RealPlksr || !reference_run));
+        if (method == UpscaleKernel::ShiftLut) {
+            CHECK(count(Stage::WarmSubmitted) == (reference_run ? tiles : std::max(3U, tiles)));
+            CHECK(count(Stage::CompletionRecorded) == 1U);
+        } else {
+            CHECK(count(Stage::ContextCreated) == 2U);
+            CHECK(count(Stage::ReplaySettled) == 2U);
+            CHECK(count(Stage::CompletionRecorded) == std::min(2U, tiles));
+        }
+    }
+    const auto warmed = counts;
+    {
+        const auto held = runtime->Borrow();
+        REQUIRE(held.valid());
+        const auto descriptor = held.plane(0U).plane().descriptor;
+        CHECK(descriptor.width == extent.width * 4U);
+        CHECK(descriptor.height == extent.height * 4U);
+        // A normal call never adds readiness work and cannot overwrite a reader.
+        run_native_upscale(*runtime, method, {}, UpscalePurpose::Normal, extent);
+        CHECK(native_upscale_pixels(*runtime) == expected);
+        CHECK(runtime->Borrow().plane(0U).plane().data != held.plane(0U).plane().data);
+        CHECK(count(Stage::BuffersAllocated) == warmed[static_cast<std::size_t>(Stage::BuffersAllocated)]);
+        CHECK(count(Stage::ContextCreated) == warmed[static_cast<std::size_t>(Stage::ContextCreated)]);
+        if (method == UpscaleKernel::ShiftLut) {
+            const auto tiles = (extent.width + 191U) / 192U;
+            CHECK(count(Stage::WarmSubmitted) - warmed[static_cast<std::size_t>(Stage::WarmSubmitted)] == tiles);
+        }
+    }
+}
+TEST_CASE("Native warm cancellation joins touched tile lanes and retries resident buffers", "[upscale_gpu]") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    using namespace mmltk::frameworks::gpu;
+    const auto method = GENERATE(UpscaleKernel::ShiftLut, UpscaleKernel::RealPlksr);
+    const auto boundary = GENERATE(Stage::TilePrepared, Stage::TileInferred, Stage::TileStitched, Stage::CompletionRecorded);
+    const unsigned occurrence = GENERATE(1U, 2U);
+    if (method == UpscaleKernel::ShiftLut && boundary == Stage::CompletionRecorded && occurrence == 2U) return;
+    const VisualExtent extent{449U, 5U};
+    bool armed = false, current = true;
+    unsigned observed = 0U;
+    std::array<unsigned, static_cast<std::size_t>(Stage::Count)> counts{};
+    auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
+        ++counts[static_cast<std::size_t>(stage)];
+        if (armed && stage == boundary && ++observed == occurrence) {
+            current = false;
+            armed = false;
+        }
+    })(std::make_shared<ImageProductRevisionSequence>());
+    const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
+    run_native_upscale(*runtime, method, {}, UpscalePurpose::Warm, extent);
+    const auto expected = native_upscale_pixels(*runtime);
+    const auto resident = counts;
+    armed = true;
+    CHECK_NOTHROW(run_native_upscale(*runtime, method, [&] { return current; }, UpscalePurpose::Warm, extent));
+    CHECK_FALSE(armed);
+    CHECK_FALSE(current);
+    CHECK_NOTHROW(runtime->CompleteWork());
+    current = true;
+    run_native_upscale(*runtime, method, [&] { return current; }, UpscalePurpose::Warm, extent);
+    CHECK(native_upscale_pixels(*runtime) == expected);
+    for (const auto stage : {Stage::BuffersAllocated, Stage::ContextCreated, Stage::StreamCreated, Stage::EventCreated})
+        CHECK(counts[static_cast<std::size_t>(stage)] == resident[static_cast<std::size_t>(stage)]);
+}
+TEST_CASE("ONNX ordinary inference leaves proactive readiness to an explicit warm request", "[upscale_gpu]") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    using namespace mmltk::frameworks::gpu;
+    const bool reference_run = GENERATE(false, true);
+    ReferenceEnvironment environment;
+    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", reference_run ? "1" : "0", 1) == 0);
+    unsigned inferences = 0U, preparations = 0U, stitches = 0U;
+    auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
+        if (stage == Stage::WarmSubmitted) ++inferences;
+        if (stage == Stage::TilePrepared) ++preparations;
+        if (stage == Stage::TileStitched) ++stitches;
+    })(std::make_shared<ImageProductRevisionSequence>());
+    const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
+    run_native_upscale(*runtime, UpscaleKernel::ShiftLut);
+    const auto expected = native_upscale_pixels(*runtime);
+    CHECK(inferences == 1U);
+    CHECK_FALSE(dynamic_cast<UpscaleAlgorithm*>(runtime->model())->GraphReplay(UpscaleKernel::ShiftLut));
+    run_native_upscale(*runtime, UpscaleKernel::ShiftLut, {}, UpscalePurpose::Warm);
+    CHECK(native_upscale_pixels(*runtime) == expected);
+    CHECK(inferences == (reference_run ? 2U : 3U));
+    CHECK(preparations == 2U);
+    CHECK(stitches == 2U);
+    CHECK(dynamic_cast<UpscaleAlgorithm*>(runtime->model())->GraphReplay(UpscaleKernel::ShiftLut) == !reference_run);
+}
+TEST_CASE("ONNX first-capture fallback keeps warm execution to one image and disables readiness retries", "[upscale_gpu]") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    using namespace mmltk::frameworks::gpu;
+    ReferenceEnvironment environment;
+    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", "0", 1) == 0);
+    bool reject = true;
+    unsigned inferences = 0U, preparations = 0U, stitches = 0U, buffers = 0U;
+    auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
+        if (stage == Stage::TilePrepared) ++preparations;
+        if (stage == Stage::TileStitched) ++stitches;
+        if (stage == Stage::BuffersAllocated) ++buffers;
+        if (stage == Stage::WarmSubmitted) {
+            ++inferences;
+            if (std::exchange(reject, false))
+                throw Ort::Exception("CUDA failure 900: injected first-capture restriction", ORT_FAIL);
+        }
+    })(std::make_shared<ImageProductRevisionSequence>());
+    const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
+    run_native_upscale(*runtime, UpscaleKernel::ShiftLut, {}, UpscalePurpose::Warm);
+    const auto expected = native_upscale_pixels(*runtime);
+    CHECK_FALSE(reject);
+    CHECK_FALSE(dynamic_cast<UpscaleAlgorithm*>(runtime->model())->GraphReplay(UpscaleKernel::ShiftLut));
+    CHECK(inferences == 1U);
+    CHECK(preparations == 1U);
+    CHECK(stitches == 1U);
+    const auto resident_buffers = buffers;
+    run_native_upscale(*runtime, UpscaleKernel::ShiftLut, {}, UpscalePurpose::Warm);
+    CHECK(native_upscale_pixels(*runtime) == expected);
+    CHECK(inferences == 2U);
+    CHECK(preparations == 2U);
+    CHECK(stitches == 2U);
+    CHECK(buffers == resident_buffers);
+    CHECK_FALSE(dynamic_cast<UpscaleAlgorithm*>(runtime->model())->GraphReplay(UpscaleKernel::ShiftLut));
+}
+TEST_CASE("ONNX warm readiness withdrawal settles its final bound tile before retry", "[upscale_gpu]") {
+    if (!has_cuda_device()) SKIP("CUDA device unavailable");
+    using Stage = mmltk::backend::imaging::upscale::ImageUpscalerExecutionStage;
+    using namespace mmltk::frameworks::gpu;
+    ReferenceEnvironment environment;
+    REQUIRE(::setenv("MMLTK_UPSCALE_ONNX_REFERENCE", "0", 1) == 0);
+    const unsigned occurrence = GENERATE(2U, 3U);
+    bool current = true;
+    unsigned inferences = 0U, preparations = 0U, stitches = 0U, contexts = 0U;
+    auto runtime = make_native_upscale_runtime_factory(kDevice, [&](Stage stage) {
+        if (stage == Stage::TilePrepared) ++preparations;
+        if (stage == Stage::TileStitched) ++stitches;
+        if (stage == Stage::ContextCreated) ++contexts;
+        if (stage == Stage::WarmSubmitted && ++inferences == occurrence) current = false;
+    })(std::make_shared<ImageProductRevisionSequence>());
+    const auto retire = mmltk::testsupport::ScopedTestCleanup{[&] { CHECK(runtime->Retire().safe_to_destroy); }};
+    run_native_upscale(*runtime, UpscaleKernel::ShiftLut, [&] { return current; }, UpscalePurpose::Warm);
+    CHECK_FALSE(current);
+    CHECK(inferences == occurrence);
+    CHECK(preparations == 1U);
+    CHECK(stitches == 1U);
+    CHECK_NOTHROW(runtime->CompleteWork());
+    current = true;
+    run_native_upscale(*runtime, UpscaleKernel::ShiftLut, [&] { return current; }, UpscalePurpose::Warm);
+    CHECK_NOTHROW(runtime->CompleteWork());
+    CHECK(contexts == 1U);
+    CHECK(preparations == 2U);
+    CHECK(stitches == 2U);
+    CHECK(dynamic_cast<UpscaleAlgorithm*>(runtime->model())->GraphReplay(UpscaleKernel::ShiftLut));
 }
 class NativeUpscaleSource final {
    public:
@@ -1329,10 +1618,10 @@ TEST_CASE("Upscale warm failure is isolated and Start retains first-use activati
     CHECK_FALSE(upscale.snapshot().busy);
     CHECK_FALSE(upscale.snapshot().ready);
     REQUIRE(events.Wait([&] { return upscale.snapshot().methods[1U].warm && upscale.snapshot().methods[2U].warm; }));
-    CHECK(activation->runs.load(std::memory_order_acquire) == 6U);
+    CHECK(activation->runs.load(std::memory_order_acquire) == 2U);
     static_cast<void>(upscale.Start(test_upscale_request({.source = source.frame(), .kernel = UpscaleKernel::RealPlksr})));
     REQUIRE(events.Wait([&] { return upscale.snapshot().ready; }));
-    REQUIRE(events.Wait([&] { return activation->runs.load(std::memory_order_acquire) == 7U; }));
+    REQUIRE(events.Wait([&] { return activation->runs.load(std::memory_order_acquire) == 3U; }));
     CHECK(activation->fallback_activations.load(std::memory_order_acquire) == 1U);
     for (const auto& ready : activation->ready) CHECK(ready.load(std::memory_order_acquire));
     CHECK(upscale.snapshot().methods[0U].initialization_failed);

@@ -88,7 +88,8 @@ class ImageUpscalerProcessOwner final {
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] ImageUpscalerOutcome run_rgba8(ImageUpscalerModelHandle handle, ImageUpscalerMode mode, const std::uint8_t* source, std::size_t source_pitch,
                                                  std::uint32_t width, std::uint32_t height, std::uint8_t* target, std::size_t target_pitch,
-                                                 std::uintptr_t stream, ImageUpscalerCurrent current = image_upscaler_current);
+                                                 std::uintptr_t stream, ImageUpscalerCurrent current = image_upscaler_current,
+                                                 ImageUpscalerPurpose purpose = ImageUpscalerPurpose::Normal);
     [[nodiscard]] std::uintptr_t operation_stream(ImageUpscalerMode mode, int device_id, ImageUpscalerCurrent current = image_upscaler_current);
     [[nodiscard]] bool graph_replay(ImageUpscalerMode mode) const;
 

@@ -10,6 +10,7 @@
 #include <onnxruntime_cxx_api.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -198,6 +199,11 @@ TEST_CASE("ONNX graph capture permits independent worker allocation and retains 
     CHECK(actual == expected);
 }
 TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pitched crop borders", "[upscale_gpu]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    cudaDeviceProp device{};
+    REQUIRE(cudaGetDeviceProperties(&device, 0) == cudaSuccess);
+    INFO("CUDA device 0: " << device.name << ", CC " << device.major << '.' << device.minor);
     namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
     const auto width = GENERATE(1U, 3U, 19U, 257U);
     const auto height = GENERATE(1U, 5U);
@@ -217,9 +223,12 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
     const std::uint32_t halo = lut ? 32U : 16U;
     const std::uint32_t crop_x = width > 1 ? 1U : 0U;
     const auto crop_width = width - crop_x;
+    const bool crop_top = GENERATE(false, true);
+    const std::uint32_t crop_y = crop_top && height > 1U ? 1U : 0U;
+    const auto crop_height = height - crop_y;
     const auto origin = crop_width > 192 ? 192U : 0U;
-    const tiles::Tile tile{.origin_x = origin, .origin_y = 0, .core_width = std::min(192U, crop_width - origin), .core_height = height};
-    tiles::prepare_tile(device_source.as<std::uint8_t>(), pitch, width, height, crop_x, 0, crop_width, height, tile, lut, halo, device_tile.as<float>(),
+    const tiles::Tile tile{.origin_x = origin, .origin_y = 0, .core_width = std::min(192U, crop_width - origin), .core_height = crop_height};
+    tiles::prepare_tile(device_source.as<std::uint8_t>(), pitch, width, height, crop_x, crop_y, crop_width, crop_height, tile, lut, halo, device_tile.as<float>(),
                         stream.get());
     REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
     std::vector<float> actual(3U * 256U * 256U);
@@ -232,12 +241,13 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
         const auto channel = index / (256U * 256U);
         const auto x =
             reflected(static_cast<int>(tile.origin_x + index % 256U) - static_cast<int>(halo), static_cast<int>(crop_width)) + static_cast<int>(crop_x);
-        const auto y = reflected(static_cast<int>(index / 256U % 256U) - static_cast<int>(halo), static_cast<int>(height));
+        const auto y = reflected(static_cast<int>(index / 256U % 256U) - static_cast<int>(halo), static_cast<int>(crop_height)) + static_cast<int>(crop_y);
         const float byte = source[static_cast<std::size_t>(y) * pitch + static_cast<std::size_t>(x) * 4 + channel];
         const float normalized = std::fma(byte, 1.0F / 255.0F, -means[channel]) / deviations[channel];
-        REQUIRE(normalized == reference[channel * width * height + static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)]);
+        REQUIRE(std::bit_cast<std::uint32_t>(normalized) ==
+                std::bit_cast<std::uint32_t>(reference[channel * width * height + static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)]));
         const float expected = std::clamp(std::fma(normalized, deviations[channel], means[channel]), 0.0F, 1.0F) * (lut ? 255.0F : 1.0F);
-        REQUIRE(actual[index] == expected);
+        REQUIRE(std::bit_cast<std::uint32_t>(actual[index]) == std::bit_cast<std::uint32_t>(expected));
         REQUIRE(std::floor(actual[index] / 4.0F) == std::floor(expected / 4.0F));
     }
     std::vector<std::uint8_t> unchanged(source.size());
@@ -245,10 +255,18 @@ TEST_CASE("Direct neural tile preparation preserves FP32 lookup decisions and pi
     CHECK(unchanged == source);
 }
 TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched guard bytes", "[upscale_gpu]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    cudaDeviceProp device{};
+    REQUIRE(cudaGetDeviceProperties(&device, 0) == cudaSuccess);
+    INFO("CUDA device 0: " << device.name << ", CC " << device.major << '.' << device.minor);
     namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
     const bool lut = GENERATE(false, true);
-    constexpr std::uint32_t width = 196, height = 12;
-    constexpr std::size_t pitch = width * 4 + 23;
+    const auto width = GENERATE(1U, 3U, 19U, 196U, 257U, 1028U);
+    const auto height = GENERATE(1U, 5U, 12U, 20U);
+    const std::uint32_t source_width = (width + 3U) / 4U;
+    const std::uint32_t source_height = (height + 3U) / 4U;
+    const std::size_t pitch = width * 4U + 23U;
     constexpr std::size_t tile_plane = 1024U * 1024U;
     std::vector<float> model(3U * tile_plane);
     for (std::size_t index = 0; index < model.size(); ++index) {
@@ -261,10 +279,9 @@ TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched
     Stream stream;
     REQUIRE(cudaMemcpyAsync(input.as<void>(), model.data(), model.size() * sizeof(float), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
     REQUIRE(cudaMemcpyAsync(target.as<void>(), result.data(), result.size(), cudaMemcpyHostToDevice, stream.get()) == cudaSuccess);
-    constexpr std::array<tiles::Tile, 2> layout{{
-        {.origin_x = 0, .origin_y = 0, .core_width = 47, .core_height = 3},
-        {.origin_x = 47, .origin_y = 0, .core_width = 2, .core_height = 3},
-    }};
+    std::vector<tiles::Tile> layout;
+    for (std::uint32_t x = 0U; x < source_width; x += 47U)
+        layout.push_back({.origin_x = x, .origin_y = 0U, .core_width = std::min(47U, source_width - x), .core_height = source_height});
     const auto halo = lut ? 32U : 16U;
     for (const auto tile : layout) tiles::stitch_tile(input.as<float>(), tile, lut, halo, target.as<std::uint8_t>(), pitch, width, height, stream.get());
     REQUIRE(cudaStreamSynchronize(stream.get()) == cudaSuccess);
@@ -272,6 +289,7 @@ TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched
     for (const auto tile : layout) {
         for (std::uint32_t y = 0; y < tile.core_height * 4; ++y) {
             for (std::uint32_t x = 0; x < tile.core_width * 4; ++x) {
+                if (y >= height || tile.origin_x * 4U + x >= width) continue;
                 const auto destination = static_cast<std::size_t>(y) * pitch + (tile.origin_x * 4 + x) * 4;
                 for (std::size_t c = 0; c < 3; ++c) {
                     const auto value = model[c * tile_plane + (y + halo * 4) * 1024 + x + halo * 4];
@@ -287,6 +305,11 @@ TEST_CASE("Direct tile stitching preserves rounding ties alpha seams and pitched
     for (std::size_t byte = pitch * height; byte < result.size(); ++byte) REQUIRE(result[byte] == 0xA9);
 }
 TEST_CASE("Resident ShiftLUT tiled RGBA matches independent upstream oracles across graph replay and capacity changes", "[upscale_gpu]") {
+    if (mmltk::testsupport::checked_cuda_device_count() == 0) SKIP("CUDA device unavailable");
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
+    cudaDeviceProp device{};
+    REQUIRE(cudaGetDeviceProperties(&device, 0) == cudaSuccess);
+    INFO("CUDA device 0: " << device.name << ", CC " << device.major << '.' << device.minor);
     namespace tiles = mmltk::backend::imaging::upscale::image_upscaler_cuda;
     namespace lut = mmltk::backend::imaging::upscale::shiftlut;
     const bool graph = GENERATE(false, true);

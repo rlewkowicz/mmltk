@@ -333,7 +333,9 @@ class OnnxImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapter<O
                 // The fixed tensors and all preparation/stitching use this owned
                 // stream. ORT replays its captured tile only after the new input
                 // is ready; no tensor is resized or rebound during its lifetime.
-                if (run_tile(request.current) == ImageUpscalerOutcome::Cancelled || !request.current()) {
+                const auto inferred = run_tile(request.current);
+                if (inferred == ImageUpscalerOutcome::Completed) Checkpoint(ImageUpscalerExecutionStage::TileInferred);
+                if (inferred == ImageUpscalerOutcome::Cancelled || !request.current()) {
                     if (timed) timing_.pending.store(false, std::memory_order_release);
                     ensure_cuda_ok(cudaEventRecord(completion_, stream_), "complete cancelled ONNX inference");
                     return false;
@@ -341,6 +343,17 @@ class OnnxImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapter<O
                 image_upscaler_cuda::stitch_request_tile(output_.data(), tile, descriptor().kind, descriptor().halo, request, restored_width, restored_height,
                                                          stream_);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch ONNX upscaler tile composition");
+                Checkpoint(ImageUpscalerExecutionStage::TileStitched);
+            }
+        }
+        // The full image is already stitched. Only ONNX's existing capture
+        // readiness may need more executions of the last valid fixed binding.
+        // Ordinary requests and graph-disabled fallback never receive a tail.
+        while (request.purpose == ImageUpscalerPurpose::Warm && graph_enabled_ && inference_runs_ < 3U) {
+            if (run_tile(request.current) == ImageUpscalerOutcome::Cancelled || !request.current()) {
+                if (timed) timing_.pending.store(false, std::memory_order_release);
+                ensure_cuda_ok(cudaEventRecord(completion_, stream_), "complete cancelled ONNX warm readiness");
+                return false;
             }
         }
         if (timed) {
@@ -358,6 +371,7 @@ class OnnxImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapter<O
             ensure_cuda_ok(cudaLaunchHostFunc(stream_, completed, &timing_), "enqueue ONNX upscaler completion diagnostic");
         }
         ensure_cuda_ok(cudaEventRecord(completion_, stream_), "cudaEventRecord for ONNX upscaler completion");
+        Checkpoint(ImageUpscalerExecutionStage::CompletionRecorded);
         return true;
     }
     mmltk::backend::ml::runtime::OnnxEnvironment environment_;

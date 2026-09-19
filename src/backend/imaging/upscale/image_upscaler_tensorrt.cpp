@@ -46,7 +46,7 @@ struct TensorRtTileLane {
     cudaEvent_t completion = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
-    bool submitted = false;
+    bool touched = false;
     TensorRtTileLane() = default;
     TensorRtTileLane(const TensorRtTileLane&) = delete;
     TensorRtTileLane& operator=(const TensorRtTileLane&) = delete;
@@ -145,7 +145,7 @@ class TensorRtImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapt
                 if (cleanup_.Record(cudaStreamDestroy(lane.stream), "destroy TensorRT lane stream")) lane.stream = nullptr;
                 CleanupCheckpoint(cleanup_, ImageUpscalerExecutionStage::StreamDestroyed);
             }
-            lane.submitted = false;
+            lane.touched = false;
         }
         if (settled && source_ready_ != nullptr) {
             if (cleanup_.Record(cudaEventDestroy(source_ready_), "destroy TensorRT source fence")) source_ready_ = nullptr;
@@ -242,19 +242,25 @@ class TensorRtImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapt
         lane.graph_exec = nullptr;
         return ImageUpscalerOutcome::Completed;
     }
-    void await_lane(TensorRtTileLane& lane) {
-        if (!lane.submitted) { return; }
-        ensure_cuda_ok(cudaStreamWaitEvent(lane.stream, lane.completion, 0U), "cudaStreamWaitEvent for TensorRT image upscaler lane reuse");
-        lane.submitted = false;
-    }
     void publish_lanes(const cudaStream_t consumer_stream) {
         cudaError_t first_error = cudaSuccess;
+        const char* first_operation = "join TensorRT upscaler completion";
         for (TensorRtTileLane& lane : lanes_) {
-            if (!lane.submitted) { continue; }
+            if (!lane.touched) { continue; }
+            const cudaError_t recorded = cudaEventRecord(lane.completion, lane.stream);
+            if (first_error == cudaSuccess && recorded != cudaSuccess) {
+                first_error = recorded;
+                first_operation = "cudaEventRecord for TensorRT upscaler completion";
+            }
+            if (recorded != cudaSuccess) continue;
+            Checkpoint(ImageUpscalerExecutionStage::CompletionRecorded);
             const cudaError_t status = cudaStreamWaitEvent(consumer_stream, lane.completion, 0U);
-            if (first_error == cudaSuccess && status != cudaSuccess) { first_error = status; }
+            if (first_error == cudaSuccess && status != cudaSuccess) {
+                first_error = status;
+                first_operation = "cudaStreamWaitEvent for TensorRT upscaler completion";
+            }
         }
-        ensure_cuda_ok(first_error, "cudaStreamWaitEvent for TensorRT upscaler completion");
+        ensure_cuda_ok(first_error, first_operation);
     }
     void wait_lanes_for_source() {
         for (TensorRtTileLane& lane : lanes_) {
@@ -265,6 +271,7 @@ class TensorRtImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapt
                                     const std::uint32_t restored_height) {
         if (!request.current()) return false;
         ensure_cuda_ok(cudaEventRecord(source_ready_, consumer_stream), "cudaEventRecord for TensorRT upscaler source");
+        for (auto& lane : lanes_) lane.touched = false;
         wait_lanes_for_source();
         const bool completed = submit_tiles_after_source(request, restored_width, restored_height);
         publish_lanes(consumer_stream);
@@ -277,7 +284,9 @@ class TensorRtImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapt
             for (std::uint32_t x = 0U; x < request.crop_width; x += core_extent) {
                 if (!request.current()) return false;
                 TensorRtTileLane& lane = lanes_[dispatch % lanes_.size()];
-                await_lane(lane);
+                // Reuse is ordered by this lane's stream. Mark custody before
+                // preparation so cancellation joins even a preparation-only lane.
+                lane.touched = true;
                 const image_upscaler_cuda::Tile tile =
                     image_upscaler_cuda::prepare_request_tile(request, x, y, core_extent, descriptor().kind, descriptor().halo, lane.input.data(), lane.stream);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch TensorRT upscaler tile preparation");
@@ -288,12 +297,12 @@ class TensorRtImageUpscalerRuntime final : public TiledImageUpscalerRuntimeAdapt
                 } else if (!lane.context->enqueueV3(lane.stream)) {
                     engine_->CheckOperation(false, "TensorRT upscaler enqueue failed");
                 }
+                Checkpoint(ImageUpscalerExecutionStage::TileInferred);
                 if (!request.current()) return false;
                 image_upscaler_cuda::stitch_request_tile(lane.output.data(), tile, descriptor().kind, descriptor().halo, request, restored_width,
                                                          restored_height, lane.stream);
                 ensure_cuda_ok(cudaPeekAtLastError(), "launch TensorRT upscaler tile composition");
-                ensure_cuda_ok(cudaEventRecord(lane.completion, lane.stream), "cudaEventRecord for TensorRT upscaler tile");
-                lane.submitted = true;
+                Checkpoint(ImageUpscalerExecutionStage::TileStitched);
                 ++dispatch;
             }
         }

@@ -5,6 +5,7 @@
 #include <exception>
 #include "src/frameworks/gpu/image_failure.h"
 namespace mmltk::backend::imaging::upscale {
+enum class ImageUpscalerPurpose : std::uint8_t { Normal, Warm };
 enum class ImageUpscalerOutcome : std::uint8_t { Completed, Cancelled };
 // Invocation-scoped view: neither the runtime nor a queued request owns it.
 using ImageUpscalerCurrent = std::function_ref<bool()>;
@@ -24,6 +25,7 @@ struct ImageUpscalerRequest {
     std::uint32_t crop_width = 0U;
     std::uint32_t crop_height = 0U;
     ImageUpscalerCurrent current{image_upscaler_current};
+    ImageUpscalerPurpose purpose = ImageUpscalerPurpose::Normal;
 };
 struct ImageUpscalerUnsettledFailure final {
     std::exception_ptr failure{};
@@ -63,6 +65,9 @@ enum class ImageUpscalerExecutionStage : std::uint8_t {
     PreprocessAdmitted,
     TargetAdmitted,
     TilePrepared,
+    TileInferred,
+    TileStitched,
+    CompletionRecorded,
     BindingsReady,
     RuntimeEnqueued,
     Count,

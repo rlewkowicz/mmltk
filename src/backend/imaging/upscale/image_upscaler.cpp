@@ -635,7 +635,7 @@ ImageUpscalerProcessOwner::operator bool() const noexcept { return owner_ != nul
 ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerModelHandle handle, const ImageUpscalerMode mode, const std::uint8_t* source,
                                                           const std::size_t source_pitch, const std::uint32_t width, const std::uint32_t height,
                                                           std::uint8_t* target, const std::size_t target_pitch, const std::uintptr_t stream_handle,
-                                                          ImageUpscalerCurrent current) {
+                                                          ImageUpscalerCurrent current, const ImageUpscalerPurpose purpose) {
     const auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
     if (source == nullptr || target == nullptr || stream == nullptr || width == 0U || height == 0U || width > std::numeric_limits<std::uint32_t>::max() / 4U ||
         height > std::numeric_limits<std::uint32_t>::max() / 4U)
@@ -702,7 +702,8 @@ ImageUpscalerOutcome ImageUpscalerProcessOwner::run_rgba8(const ImageUpscalerMod
                                            .crop_y = 0U,
                                            .crop_width = width,
                                            .crop_height = height,
-                                           .current = current};
+                                           .current = current,
+                                           .purpose = purpose};
         const ImageUpscalerRuntimeOutput output = slot.runtime->enqueue(request, stream);
         if (owner->checkpoint) owner->checkpoint(ImageUpscalerExecutionStage::RuntimeEnqueued);
         if (output.outcome == ImageUpscalerOutcome::Cancelled || !current()) return cancel();

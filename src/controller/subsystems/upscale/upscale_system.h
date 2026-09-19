@@ -32,13 +32,14 @@ struct UpscaleRequest final {
     bool operator==(const UpscaleRequest&) const = default;
 };
 enum class UpscaleFailureKind : std::uint8_t { Failed, Unavailable, Physical };
+using UpscalePurpose = mmltk::backend::imaging::upscale::ImageUpscalerPurpose;
 class UpscaleAlgorithm : public mmltk::frameworks::gpu::SystemImageModel {
    public:
     ~UpscaleAlgorithm() override = default;
     virtual void Warm() = 0;
     [[nodiscard]] virtual bool GraphReplay(UpscaleKernel) const { return false; }
     virtual void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView source, mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
-                     const std::function<bool()>& current = {}) = 0;
+                     const std::function<bool()>& current = {}, UpscalePurpose purpose = UpscalePurpose::Normal) = 0;
     virtual void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) = 0;
 };
 struct UpscaleMethodSnapshot final {

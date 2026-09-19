@@ -38,6 +38,7 @@ function(mmltk_add_controller_upscale_tests)
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upscale_system.test.cpp)
     target_link_libraries(mmltk_controller_upscale_tests PRIVATE
         mmltk_controller_upscale_test_support mmltk::backend::ml::runtime mmltk_controller_explore_test_support
+        mmltk::vendor::onnxruntime
         mmltk::controller::data_compute_systems)
     catch_discover_tests(mmltk_controller_upscale_tests
         TEST_PREFIX "controller::upscale::" DISCOVERY_MODE PRE_TEST ADD_TAGS_AS_LABELS)

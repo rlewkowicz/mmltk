@@ -119,9 +119,13 @@ function(mmltk_add_backend_imaging_upscale_tests)
     mmltk_register_ordinary_sources(mmltk_backend_imaging_upscale_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/shiftlut_model_format.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/shiftlut_lookup.test.cpp
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/shiftlut_reference.cu)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/shiftlut_reference.cu
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/nis_sharpen.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/nis_sharpen_reference.cu)
     mmltk_register_private_headers(mmltk_backend_imaging_upscale_tests
-        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/shiftlut_reference.h)
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/shiftlut_reference.h
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/nis_sharpen_reference.h)
+    target_include_directories(mmltk_backend_imaging_upscale_tests PRIVATE ${CMAKE_CURRENT_FUNCTION_LIST_DIR})
     set_target_properties(mmltk_backend_imaging_upscale_tests PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         CUDA_RESOLVE_DEVICE_SYMBOLS ON CUDA_SEPARABLE_COMPILATION ON)

@@ -115,29 +115,25 @@ __global__ void sharpen_kernel(const void* source, const std::size_t source_pitc
     const float source_y = (static_cast<float>(y) + 0.5F) * static_cast<float>(config.crop_height) / static_cast<float>(config.output_height) - 0.5F;
     const std::uint32_t phase_x = device::phase(source_x);
     const std::uint32_t phase_y = device::phase(source_y);
-    float3 horizontal = make_float3(0.0F, 0.0F, 0.0F);
-    float3 vertical = make_float3(0.0F, 0.0F, 0.0F);
-#pragma unroll
-    for (std::uint32_t tap = 0U; tap < device::kFilterTaps; ++tap) {
-        const int offset = static_cast<int>(tap) - 2;
-        const HalfRgba horizontal_sample = load_clamped(scaled, config, static_cast<int>(x) + offset, static_cast<int>(y));
-        const HalfRgba vertical_sample = load_clamped(scaled, config, static_cast<int>(x), static_cast<int>(y) + offset);
-        const float horizontal_coefficient = device::kUsmCoefficients.values[phase_x][tap];
-        const float vertical_coefficient = device::kUsmCoefficients.values[phase_y][tap];
-        horizontal.x = fmaf(horizontal_coefficient, __half2float(horizontal_sample.red), horizontal.x);
-        horizontal.y = fmaf(horizontal_coefficient, __half2float(horizontal_sample.green), horizontal.y);
-        horizontal.z = fmaf(horizontal_coefficient, __half2float(horizontal_sample.blue), horizontal.z);
-        vertical.x = fmaf(vertical_coefficient, __half2float(vertical_sample.red), vertical.x);
-        vertical.y = fmaf(vertical_coefficient, __half2float(vertical_sample.green), vertical.y);
-        vertical.z = fmaf(vertical_coefficient, __half2float(vertical_sample.blue), vertical.z);
-    }
     const float horizontal_gradient =
         fabsf(0.2126F * (__half2float(left.red) - __half2float(right.red)) + 0.7152F * (__half2float(left.green) - __half2float(right.green)) +
               0.0722F * (__half2float(left.blue) - __half2float(right.blue)));
     const float vertical_gradient =
         fabsf(0.2126F * (__half2float(top.red) - __half2float(bottom.red)) + 0.7152F * (__half2float(top.green) - __half2float(bottom.green)) +
               0.0722F * (__half2float(top.blue) - __half2float(bottom.blue)));
-    const float3 detail = horizontal_gradient <= vertical_gradient ? horizontal : vertical;
+    const bool horizontal = horizontal_gradient <= vertical_gradient;
+    const std::uint32_t selected_phase = horizontal ? phase_x : phase_y;
+    float3 detail = make_float3(0.0F, 0.0F, 0.0F);
+#pragma unroll
+    for (std::uint32_t tap = 0U; tap < device::kFilterTaps; ++tap) {
+        const int offset = static_cast<int>(tap) - 2;
+        const HalfRgba sample = load_clamped(scaled, config, static_cast<int>(x) + (horizontal ? offset : 0),
+                                             static_cast<int>(y) + (horizontal ? 0 : offset));
+        const float coefficient = device::kUsmCoefficients.values[selected_phase][tap];
+        detail.x = fmaf(coefficient, __half2float(sample.red), detail.x);
+        detail.y = fmaf(coefficient, __half2float(sample.green), detail.y);
+        detail.z = fmaf(coefficient, __half2float(sample.blue), detail.z);
+    }
     const float magnitude = fabsf(fmaf(0.2126F, detail.x, fmaf(0.7152F, detail.y, 0.0722F * detail.z)));
     const float strength = 0.18F + 0.16F * fminf(1.0F, magnitude * 8.0F);
     const float4 color = make_float4(fmaf(strength, detail.x, __half2float(center.red)), fmaf(strength, detail.y, __half2float(center.green)),

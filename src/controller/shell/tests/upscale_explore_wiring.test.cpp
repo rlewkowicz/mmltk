@@ -13,6 +13,7 @@
 #include "src/controller/browser/application_materializer.h"
 #include "src/controller/shell/application_system_storage.h"
 #include "src/frameworks/gpu/tests/fake_image_backend.h"
+#include <cstring>
 #include "src/common/system/cpu_affinity.h"
 namespace mmltk::controller::shell {
 namespace {
@@ -26,15 +27,17 @@ struct ShellWarmProbe final {
 };
 class ShellWarmAlgorithm final : public UpscaleAlgorithm {
    public:
-    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        if (target.valid()) std::memset(reinterpret_cast<void*>(target.data), 0, target.descriptor.pitch_bytes * target.descriptor.height);
+    }
     explicit ShellWarmAlgorithm(std::shared_ptr<ShellWarmProbe> probe) : probe_(std::move(probe)) {}
     void Warm() override {
         probe_->calls.fetch_add(1U, std::memory_order_acq_rel);
         if (probe_->fail) throw std::runtime_error("shell warm failure");
         probe_->completed.set_value();
     }
-    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t,
-             const std::function<bool()>&) override {}
+    void Run(UpscaleKernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t stream,
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override { Semantics({}, target, stream); }
 
    private:
     std::shared_ptr<ShellWarmProbe> probe_;

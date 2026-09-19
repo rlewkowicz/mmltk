@@ -162,7 +162,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
         return operation && operation.graph_replay(static_cast<native_upscale::ImageUpscalerMode>(kernel));
     }
     void Run(const UpscaleKernel kernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target,
-             const std::uintptr_t stream, const std::function<bool()>& current) override {
+             const std::uintptr_t stream, const std::function<bool()>& current, const UpscalePurpose purpose) override {
         if (current && !current()) return;
         const auto source_context = stream_context(stream, "resolve Upscale image-runtime context");
         Activate(source_context);
@@ -195,7 +195,7 @@ class NativeUpscaleModel final : public UpscaleAlgorithm {
             stream_bridge_->AwaitSource(stream, model_stream);
             const auto outcome = operation.run_rgba8(models_[index], mode, reinterpret_cast<const std::uint8_t*>(source.data), source.descriptor.pitch_bytes,
                                                      source.descriptor.width, source.descriptor.height, reinterpret_cast<std::uint8_t*>(target.data),
-                                                     target.descriptor.pitch_bytes, model_stream, still_current);
+                                                     target.descriptor.pitch_bytes, model_stream, still_current, purpose);
             stream_bridge_->JoinModel(stream, model_stream);
             if (outcome == native_upscale::ImageUpscalerOutcome::Cancelled) return;
         } catch (const native_upscale::ImageUpscalerUnsettledFailure& failure) {
@@ -344,9 +344,9 @@ class UpscaleSystem::Impl final {
                     const auto input = runtime.BorrowInput();
                     const auto dimensions = input.plane(0U).plane().descriptor;
                     const auto target = checked_upscale_output_extent({dimensions.width, dimensions.height});
-                    runtime.Publish(candidate, target.width, target.height, [model, &input, index, &current](auto clean, auto semantic, auto stream) {
+                    runtime.PublishRetained(candidate, target.width, target.height, [model, &input, index, &current](auto clean, auto semantic, auto stream) {
                         const auto kernel = static_cast<UpscaleKernel>(index);
-                        for (unsigned replay = 0U; replay < 3U && current(); ++replay) model->Run(kernel, input.plane(0U).plane(), clean, stream, current);
+                        if (current()) model->Run(kernel, input.plane(0U).plane(), clean, stream, current, UpscalePurpose::Warm);
                         if (semantic.valid() && current()) model->Semantics({}, semantic, stream);
                     });
                     warm_span.Finish();
@@ -558,26 +558,30 @@ class UpscaleSystem::Impl final {
                             AcquireOutput(runtime, stop, reuse_clean ? baseline.product : mmltk::frameworks::gpu::SystemImageRuntime::CompletedOutput{},
                                           mmltk::frameworks::gpu::ImagePlanePreservation::Clean);
                         if (!output_candidate.valid() || !current()) return {};
-                        runtime.Publish(output_candidate, target.width, target.height,
-                                        [this, model, &input, request, reuse_clean, demand, stop](const auto output, const auto semantic, const auto stream) {
-                                            if (diagnostics_.valid())
-                                                diagnostics_.Emit([&] {
-                                                    auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleOutputAllocation, demand);
-                                                    fact.value = output.data;
-                                                    fact.detail = output.descriptor.pitch_bytes;
-                                                    fact.context.capacity_width = output.descriptor.width;
-                                                    fact.context.capacity_height = output.descriptor.height;
-                                                    return fact;
-                                                });
-                                            const auto output_current = [this, demand, stop] {
-                                                std::scoped_lock lock(mutex_);
-                                                return demand == demand_ && !stop.stop_requested();
-                                            };
-                                            if (!output_current()) return;
-                                            if (!reuse_clean) model->Run(request.kernel, input.plane(0U).plane(), output, stream, output_current);
-                                            if (!output_current()) return;
-                                            model->Semantics(input.plane(1U).plane(), semantic, stream);
-                                        });
+                        const auto write_output =
+                            [this, model, &input, request, reuse_clean, demand, stop](const auto output, const auto semantic, const auto stream) {
+                                if (diagnostics_.valid())
+                                    diagnostics_.Emit([&] {
+                                        auto fact = Diagnostic(VisualDiagnosticOperation::UpscaleOutputAllocation, demand);
+                                        fact.value = output.data;
+                                        fact.detail = output.descriptor.pitch_bytes;
+                                        fact.context.capacity_width = output.descriptor.width;
+                                        fact.context.capacity_height = output.descriptor.height;
+                                        return fact;
+                                    });
+                                const auto output_current = [this, demand, stop] {
+                                    std::scoped_lock lock(mutex_);
+                                    return demand == demand_ && !stop.stop_requested();
+                                };
+                                if (!output_current()) return;
+                                if (!reuse_clean) model->Run(request.kernel, input.plane(0U).plane(), output, stream, output_current);
+                                if (!output_current()) return;
+                                model->Semantics(input.plane(1U).plane(), semantic, stream);
+                            };
+                        if (reuse_clean)
+                            runtime.Publish(output_candidate, target.width, target.height, write_output);
+                        else
+                            runtime.PublishRetained(output_candidate, target.width, target.height, write_output);
                         {
                             std::scoped_lock lock(mutex_);
                             if (demand != demand_ || stop.stop_requested()) return {};

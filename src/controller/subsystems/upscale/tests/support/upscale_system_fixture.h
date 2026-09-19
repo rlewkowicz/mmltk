@@ -38,7 +38,7 @@ class TestUpscaleAlgorithm final : public UpscaleAlgorithm {
     }
     void Warm() override {}
     void Run(const UpscaleKernel kernel, mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
-             const std::function<bool()>&) override {
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override {
         kernel_->store(kernel, std::memory_order_release);
         if (runs_) runs_->fetch_add(1U, std::memory_order_acq_rel);
         if (gate_ && (!runs_ || runs_->load() == gate_run_)) {
@@ -64,11 +64,13 @@ struct UpscaleExtentProbe final {
 };
 class ExtentUpscaleAlgorithm final : public UpscaleAlgorithm {
    public:
-    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, mmltk::frameworks::gpu::ImagePlaneView, std::uintptr_t) override {}
+    void Semantics(mmltk::frameworks::gpu::ImagePlaneView, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t) override {
+        if (target.valid()) Fill(target, 0U);
+    }
     explicit ExtentUpscaleAlgorithm(std::shared_ptr<UpscaleExtentProbe> probe) : probe_(std::move(probe)) {}
     void Warm() override {}
     void Run(UpscaleKernel, const mmltk::frameworks::gpu::ImagePlaneView source, const mmltk::frameworks::gpu::ImagePlaneView target, std::uintptr_t,
-             const std::function<bool()>&) override {
+             const std::function<bool()>&, UpscalePurpose = UpscalePurpose::Normal) override {
         {
             std::scoped_lock lock(probe_->mutex);
             probe_->sources.push_back(source);
