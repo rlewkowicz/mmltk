@@ -386,15 +386,20 @@ __global__ void draw_manual_mask_runs_rgba_pitched_kernel(const draw_launch::Man
     if (left >= right || top >= bottom || start >= end) return;
     const auto first_row = max(top, start / width);
     const auto last_row = min(bottom, (end - 1U) / width + 1U);
-    for (auto row = first_row; row < last_row; ++row) {
-        const auto row_start = row * width;
-        const auto first = max(start, row_start + static_cast<std::uint64_t>(left));
-        const auto last = min(end, row_start + static_cast<std::uint64_t>(right));
-        for (auto pixel = first + threadIdx.x; pixel < last; pixel += blockDim.x) {
-            const int x = static_cast<int>(pixel - row_start), y = static_cast<int>(row);
-            raster_math::store_rgba_pixel(launch.overlay_region.pixels, launch.overlay_region.pitch_bytes, x, y,
-                                          raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
-        }
+    if (first_row >= last_row) return;
+    const auto clipped_width = static_cast<std::uint64_t>(right - left);
+    const auto first_row_left = first_row * width + static_cast<std::uint64_t>(left);
+    const auto last_row_left = (last_row - 1U) * width + static_cast<std::uint64_t>(left);
+    // Flatten only the clipped rectangle. Clamping each endpoint also removes
+    // a horizontally missed endpoint row without visiting any of its pixels.
+    const auto first = min(max(start, first_row_left), first_row_left + clipped_width) - first_row_left;
+    const auto last = (last_row - first_row - 1U) * clipped_width +
+                      (min(max(end, last_row_left), last_row_left + clipped_width) - last_row_left);
+    if (first >= last) return;
+    for (auto pixel = first + threadIdx.x; pixel < last; pixel += blockDim.x) {
+        const int x = left + static_cast<int>(pixel % clipped_width), y = static_cast<int>(first_row + pixel / clipped_width);
+        raster_math::store_rgba_pixel(launch.overlay_region.pixels, launch.overlay_region.pitch_bytes, x, y,
+                                      raster_math::RgbaPixelU8{launch.color.r, launch.color.g, launch.color.b, launch.color.a});
     }
 }
 __global__ void draw_box_outline_rgba_pitched_kernel(const draw_launch::BoxOutlineRgbaPitchedLaunch launch) {
