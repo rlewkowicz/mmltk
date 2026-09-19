@@ -57,7 +57,6 @@ struct ApplicationBrowserHost::Impl final {
     [[nodiscard]] bool publish_record(const ServerRecord& record, const transport::BrowserRecordPriority record_priority) noexcept {
         try {
             wire::ByteBuffer encoded;
-            encoded.reserve(kMaxIntentValueBytes);
             const auto encoding = encode_server_record(record, encoded);
             if (!encoding) {
                 diagnostics.Emit([&] {
@@ -122,7 +121,7 @@ struct ApplicationBrowserHost::Impl final {
                     epoch = ++input_epoch;
                     auto bootstrap = materialize_bootstrap(*installed);
                     bootstrap.input_epoch = epoch;
-                    (void)publish_record(bootstrap, transport::BrowserRecordPriority::Critical);
+                    (void)publish_record(std::move(bootstrap), transport::BrowserRecordPriority::Critical);
                 }
                 return;
             }
@@ -188,7 +187,7 @@ struct ApplicationBrowserHost::Impl final {
                     if constexpr (std::same_as<Type, Intent>) {
                         const auto endpoint_id = value.endpoint_id;
                         const auto correlation = value.correlation;
-                        const auto reply = dispatch_intent(*installed, std::move(value));
+                        auto reply = dispatch_intent(*installed, std::move(value));
                         if (reply.error.has_value()) {
                             diagnostics.Emit([&] {
                                 return services::RuntimeDiagnosticFact{
@@ -212,7 +211,7 @@ struct ApplicationBrowserHost::Impl final {
                                 };
                             });
                         }
-                        const bool published = publish_record(reply, transport::BrowserRecordPriority::Critical);
+                        const bool published = publish_record(std::move(reply), transport::BrowserRecordPriority::Critical);
                         if (!published) {
                             diagnostics.Emit([&] {
                                 return services::RuntimeDiagnosticFact{
@@ -307,7 +306,7 @@ struct ApplicationBrowserHost::Impl final {
     void publish(SystemEvent event) noexcept {
         if (!admission.load(std::memory_order_acquire)) return;
         const auto record_priority = priority(event.delivery);
-        (void)publish_record(event, record_priority);
+        (void)publish_record(std::move(event), record_priority);
     }
     void continuity_lost() noexcept {
         diagnostics.Emit([&] {

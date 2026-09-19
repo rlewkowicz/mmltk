@@ -625,26 +625,69 @@ template <ObjectLayout Layout, class T>
         return wire::Value(std::move(object));
     }
 }
+struct NamedFieldMatch final {
+    const wire::Value* value = nullptr;
+    bool duplicate = false;
+};
+struct NamedFieldDeclaration final {
+    std::string_view name;
+    std::size_t index;
+};
+template <class T, std::size_t Count>
+constexpr void append_named_field_declarations(std::array<NamedFieldDeclaration, Count>& fields, std::size_t& index) {
+    visit_bases<T>([&]<class Base>() { append_named_field_declarations<Base>(fields, index); });
+    visit_members<T>([&]<class>(const auto& fact) {
+        fields[index] = {.name = fact.member_name, .index = index};
+        ++index;
+    });
+}
+template <class T>
+inline constexpr auto kNamedFieldDeclarations = [] consteval {
+    std::array<NamedFieldDeclaration, flattened_member_count<T>()> fields{};
+    std::size_t index = 0U;
+    append_named_field_declarations<T>(fields, index);
+    std::ranges::sort(fields, {}, &NamedFieldDeclaration::name);
+    return fields;
+}();
+// Gather facts without validating: errors remain in base/member declaration order.
+template <class T>
+[[nodiscard]] const std::string* gather_named_fields(const wire::Value::Object& object, const std::span<NamedFieldMatch> matches) {
+    constexpr const auto& declarations = kNamedFieldDeclarations<T>;
+    const std::string* unknown = nullptr;
+    for (const auto& [name, value] : object) {
+        const auto field = std::ranges::lower_bound(declarations, name, {}, &NamedFieldDeclaration::name);
+        if (field == declarations.end() || field->name != name) {
+            if (unknown == nullptr) unknown = &name;
+        } else {
+            auto& match = matches[field->index];
+            if (match.value == nullptr)
+                match.value = &value;
+            else
+                match.duplicate = true;
+        }
+    }
+    return unknown;
+}
 template <class T>
     requires(!mmltk::frameworks::reflection::kOpaqueRelationStorage<T>)
-void decode_reflected_object_fields(T& result, const wire::Value::Object& object, std::optional<wire::DecodeError>& failure) {
+void decode_reflected_object_fields(T& result, const std::span<const NamedFieldMatch> matches, std::size_t& index,
+                                    std::optional<wire::DecodeError>& failure) {
     visit_bases<T>([&]<class Base>() {
-        if (!failure) { decode_reflected_object_fields(static_cast<Base&>(result), object, failure); }
+        if (!failure) { decode_reflected_object_fields(static_cast<Base&>(result), matches, index, failure); }
     });
     visit_members<T>([&]<class Declaration>(const auto& fact) {
         if constexpr (requires { Declaration::pointer; }) {
             if (!failure) {
                 constexpr auto member = Declaration::pointer;
                 const std::string_view name = fact.member_name;
-                const auto source = std::ranges::find_if(object, [name](const auto& field) { return field.first == name; });
-                if (source != object.end()) {
-                    const auto duplicate = std::ranges::find_if(std::next(source), object.end(), [name](const auto& field) { return field.first == name; });
-                    if (duplicate != object.end()) {
+                const auto& source = matches[index++];
+                if (source.value != nullptr) {
+                    if (source.duplicate) {
                         failure = decode_error(wire::ErrorCode::DuplicateKey);
                         prepend_path(*failure, name);
                         return;
                     }
-                    auto decoded = from_member_value_into<Declaration>(result.*member, source->second);
+                    auto decoded = from_member_value_into<Declaration>(result.*member, *source.value);
                     if (!decoded) {
                         failure = decoded.error();
                         prepend_path(*failure, name);
@@ -659,17 +702,6 @@ void decode_reflected_object_fields(T& result, const wire::Value::Object& object
             }
         }
     });
-}
-template <class T>
-[[nodiscard]] bool reflected_object_has_member(const std::string_view name) {
-    bool found = false;
-    visit_bases<T>([&]<class Base>() {
-        if (!found) found = reflected_object_has_member<Base>(name);
-    });
-    visit_members<T>([&]<class>(const auto& fact) {
-        if (!found) found = fact.member_name == name;
-    });
-    return found;
 }
 template <class T>
 [[nodiscard]] std::expected<T, wire::DecodeError> finish_decoded_object(T result, const wire::Value::Object& object, const std::size_t source_index,
@@ -692,12 +724,14 @@ template <class T>
         if (object == nullptr) return std::unexpected(decode_error(wire::ErrorCode::TypeMismatch));
         T result{};
         std::optional<wire::DecodeError> failure;
-        decode_reflected_object_fields(result, *object, failure);
+        std::array<NamedFieldMatch, flattened_member_count<T>()> matches{};
+        const auto* unknown = gather_named_fields<T>(*object, matches);
+        std::size_t index = 0U;
+        decode_reflected_object_fields(result, matches, index, failure);
         if (failure) return std::unexpected(std::move(*failure));
-        const auto unknown = std::ranges::find_if(*object, [](const auto& field) { return !reflected_object_has_member<T>(field.first); });
-        if (unknown != object->end()) {
+        if (unknown != nullptr) {
             auto error = decode_error(wire::ErrorCode::UnknownKey);
-            prepend_path(error, unknown->first);
+            prepend_path(error, *unknown);
             return std::unexpected(std::move(error));
         }
         return result;

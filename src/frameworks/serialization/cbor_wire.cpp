@@ -363,26 +363,31 @@ std::expected<std::size_t, DecodeError> Reader::size_argument(const std::uint8_t
     if (*encoded > std::numeric_limits<std::size_t>::max()) { return std::unexpected(error(ErrorCode::Overflow)); }
     return static_cast<std::size_t>(*encoded);
 }
+ByteSegments Reader::payload_ranges(const std::size_t count) const noexcept {
+    if (offset_ >= input_.first.size()) return {.first = input_.second.subspan(offset_ - input_.first.size(), count)};
+    const auto first_count = std::min(count, input_.first.size() - offset_);
+    return {.first = input_.first.subspan(offset_, first_count), .second = input_.second.first(count - first_count)};
+}
 std::expected<ByteBuffer, DecodeError> Reader::bytes(const std::size_t count) {
     if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
     if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
-    ByteBuffer result(count);
-    for (std::byte& destination : result) {
-        auto next = byte();
-        if (!next) { return std::unexpected(next.error()); }
-        destination = *next;
-    }
+    const auto ranges = payload_ranges(count);
+    ByteBuffer result;
+    result.reserve(count);
+    if (!ranges.first.empty()) result.insert(result.end(), ranges.first.begin(), ranges.first.end());
+    if (!ranges.second.empty()) result.insert(result.end(), ranges.second.begin(), ranges.second.end());
+    offset_ += count;
     return result;
 }
 std::expected<std::string, DecodeError> Reader::text(const std::size_t count) {
     if (count > input_.size() - offset_) { return std::unexpected(error(ErrorCode::UnexpectedEof)); }
     if (count > limits_.max_bytes - offset_) { return std::unexpected(error(ErrorCode::LimitExceeded)); }
-    std::string result(count, '\0');
-    for (char& destination : result) {
-        auto next = byte();
-        if (!next) { return std::unexpected(next.error()); }
-        destination = static_cast<char>(std::to_integer<unsigned char>(*next));
-    }
+    const auto ranges = payload_ranges(count);
+    std::string result;
+    result.reserve(count);
+    if (!ranges.first.empty()) result.append(reinterpret_cast<const char*>(ranges.first.data()), ranges.first.size());
+    if (!ranges.second.empty()) result.append(reinterpret_cast<const char*>(ranges.second.data()), ranges.second.size());
+    offset_ += count;
     if (!valid_utf8(result)) { return std::unexpected(error(ErrorCode::InvalidUtf8)); }
     return result;
 }
@@ -600,7 +605,7 @@ std::expected<FlatValue, DecodeError> Reader::read_flat_item(const std::size_t d
         if (!item) { return std::unexpected(item.error()); }
         auto scalar = read_flat_scalar(*item, true);
         if (!scalar) { return std::unexpected(scalar.error()); }
-        const auto flat_scalar = std::visit(
+        auto flat_scalar = std::visit(
             []<class T>(T&& leaf) -> std::optional<FlatValue::Scalar> {
                 if constexpr (std::is_same_v<std::remove_cvref_t<T>, FlatValue::Array>) {
                     return std::nullopt;
@@ -626,7 +631,7 @@ std::expected<Value, DecodeError> Reader::read_item(const std::size_t depth, con
         auto scalar = read_flat_scalar(*head, apply_allocation_policy, materialize);
         if (!scalar) { return std::unexpected(scalar.error()); }
         if (!materialize) { return Value{}; }
-        return scalar->visit([]<class T>(T&& leaf) -> Value {
+        return std::move(*scalar).visit([]<class T>(T&& leaf) -> Value {
             if constexpr (std::is_same_v<std::remove_cvref_t<T>, FlatValue::Array>) {
                 return Value{};
             } else {

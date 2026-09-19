@@ -255,3 +255,92 @@ TEST_CASE("test_unencodable_terminal_notifies_without_later_submission", "[model
     test_unencodable_terminal_notifies_without_later_submission();
 }
 TEST_CASE("test_telemetry_distinct_heads_drain_by_sequence", "[model][rfdetr][training][telemetry]") { test_telemetry_distinct_heads_drain_by_sequence(); }
+
+TEST_CASE("telemetry retains complete history JSON through progress epoch and terminal projections", "[model][rfdetr][training][telemetry]") {
+    namespace serial = mmltk::frameworks::serialization;
+    mmltk::testsupport::ScopedTempDir temp{"mmltk-telemetry-projections"};
+    HeldHistory held(temp.path());
+    std::array<r::TrainingMetricProgress, 3U> progress{};
+    progress[0].phase = r::TrainingPhase::Starting;
+    progress[0].total_images = 4096U;
+    progress[1] = progress[0];
+    progress[1].phase = r::TrainingPhase::EpochComplete;
+    progress[1].completed_images = 4096U;
+    progress[1].scalars.total = 0.125;
+    progress[1].epoch_global_loss = 0.25;
+    progress[1].checkpoint_path = temp.path() / "best.pt";
+    progress[2] = progress[1];
+    progress[2].phase = r::TrainingPhase::Completed;
+    held.writer->Submit(progress[0], r::TrainingRecordRole::Boundary);
+    held.writer->Submit(progress[1], r::TrainingRecordRole::Epoch);
+    held.writer->Finish(progress[2], {.history_size = 1U});
+    held.Drain();
+    REQUIRE_FALSE(held.writer->persistence().degraded);
+    const auto read_json = [&](const char* name) {
+        std::ifstream input(temp.path() / name);
+        REQUIRE(input.good());
+        return nlohmann::json::parse(input);
+    };
+    const auto manifest = read_json("run.json");
+    std::vector<std::byte> scratch(r::kTrainingManifestBytes);
+    const serial::wire::Limits limits{.max_bytes = scratch.size(), .max_items = 65536U, .max_depth = 32U};
+    r::TrainingRun run;
+    run.configuration.output_dir = temp.path();
+    run.run_id = manifest.at("run_id").get<std::string>();
+    run.attempt_id = held.writer->attempt_id();
+    run.checkpoint_attempt_id = run.attempt_id;
+    CHECK(manifest == serial::reflected_json(run, scratch, limits));
+    const std::array roles{r::TrainingRecordRole::Boundary, r::TrainingRecordRole::Epoch, r::TrainingRecordRole::Terminal};
+    std::array<nlohmann::json, 3U> records;
+    std::istringstream history(held.history);
+    for (std::size_t index = 0U; index < records.size(); ++index) {
+        std::string line;
+        REQUIRE(static_cast<bool>(std::getline(history, line)));
+        r::TrainingRecord expected;
+        expected.run_id = run.run_id;
+        expected.attempt_id = run.attempt_id;
+        expected.sequence = index;
+        expected.role = roles[index];
+        expected.progress = progress[index];
+        if (index == 0U) expected.attempt_configuration = run.configuration;
+        records[index] = serial::reflected_json(expected, scratch, limits);
+        CHECK(nlohmann::json::parse(line) == records[index]);
+        CHECK(line == records[index].dump());
+    }
+    std::string excess;
+    CHECK_FALSE(static_cast<bool>(std::getline(history, excess)));
+    const auto projection = [&](std::size_t index, const char* phase) {
+        auto value = serial::reflected_json(progress[index], scratch, limits);
+        value["record"] = records[index];
+        value["phase"] = phase;
+        value["eval_lanes"] = 1;
+        value["effective_batch_per_rank"] = 1U;
+        value["effective_batch_global"] = 1U;
+        value["training_supervision"] = serial::reflected_json(run.configuration.training_supervision, scratch, limits);
+        value["persistence_degraded"] = false;
+        value["dropped_records"] = 0U;
+        return value;
+    };
+    auto epoch = projection(1U, "epoch_complete");
+    epoch["train_loss"] = 0.25;
+    epoch["evaluated_weights"] = "ordinary";
+    CHECK(read_json("log.txt") == epoch);
+    auto terminal = projection(2U, "completed");
+    CHECK(read_json("progress.json") == terminal);
+    terminal["preset_name"] = run.configuration.preset_name;
+    terminal["output_dir"] = temp.path().string();
+    terminal["checkpoint"] = (temp.path() / "checkpoint.pt").string();
+    terminal["best_checkpoint"] = progress[2].checkpoint_path.string();
+    terminal["best_is_ema"] = false;
+    terminal["best_is_fallback"] = false;
+    terminal["best_regular_metric"] = nullptr;
+    terminal["best_ema_metric"] = nullptr;
+    terminal["last_epoch"] = 0;
+    terminal["history_size"] = 1U;
+    terminal["dataset_max_instances"] = {{"train", 0U}, {"val", 0U}, {"test", nullptr}, {"largest", 0U}};
+    terminal["query_resolution"] = {{"source", ""}, {"resolved", 0U}, {"required", 0U}, {"automatic_query_cap", 0U},
+                                     {"automatic", false}, {"requested_override", false}};
+    terminal["gpu_augmentation"] = serial::reflected_json(run.configuration.gpu_augmentation, scratch, limits);
+    terminal["test"] = nullptr;
+    CHECK(read_json("results.json") == terminal);
+}

@@ -169,9 +169,10 @@ struct TrainingTelemetryWriter::Impl final {
         record.evaluated_weights = run.evaluated_weights;
         if (record.progress.phase == TrainingPhase::Starting) record.attempt_configuration = run.configuration;
         const auto directory = run.configuration.output_dir;
-        append_file(directory / "metrics.jsonl", serial::reflected_json(record, scratch, limits));
+        auto record_json = serial::reflected_json(record, scratch, limits);
+        append_file(directory / "metrics.jsonl", record_json);
         auto projection = serial::reflected_json(record.progress, scratch, limits);
-        projection["record"] = serial::reflected_json(record, scratch, limits);
+        projection["record"] = std::move(record_json);
         projection["phase"] = legacy_phase(record.progress.phase);
         projection["eval_lanes"] = run.execution.eval_lanes;
         projection["effective_batch_per_rank"] = run.execution.effective_batch_per_rank;

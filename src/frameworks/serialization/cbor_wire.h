@@ -232,6 +232,8 @@ class Reader {
     [[nodiscard]] std::expected<std::byte, DecodeError> byte();
     [[nodiscard]] std::expected<std::uint64_t, DecodeError> argument(std::uint8_t additional);
     [[nodiscard]] std::expected<std::size_t, DecodeError> size_argument(std::uint8_t additional);
+    // Only called after the whole payload passes EOF and byte-budget admission.
+    [[nodiscard]] ByteSegments payload_ranges(std::size_t count) const noexcept;
     [[nodiscard]] std::expected<ByteBuffer, DecodeError> bytes(std::size_t count);
     [[nodiscard]] bool allocation_allowed(AllocationKind kind, std::size_t size) const noexcept;
     [[nodiscard]] std::expected<ItemHead, DecodeError> item_head(std::size_t depth);

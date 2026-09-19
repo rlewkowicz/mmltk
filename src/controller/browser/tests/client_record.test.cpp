@@ -20,6 +20,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -377,6 +378,65 @@ TEST_CASE("browser server records preserve reply and event error vocabulary", "[
         const auto roundtrip = decode_server_record(wire::ByteSegments{.first = encoded, .second = {}});
         REQUIRE(roundtrip);
         CHECK(*roundtrip == event);
+    }
+}
+TEST_CASE("consumed server records retain empty and large nested leaf ownership", "[controller][browser][protocol][limits]") {
+    for (const std::size_t size : {0U, 65535U, 65536U, 65537U}) {
+        const wire::Value payload(wire::Value::Object{
+            {"nested", wire::Value(wire::Value::Array{wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}});
+        for (const ServerRecord& source : std::array<ServerRecord, 3U>{
+                 SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload},
+                 Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload}}},
+                 IntentReply{.correlation = 9U, .result = payload}}) {
+            auto owned = source;
+            wire::ByteBuffer expected;
+            REQUIRE(encode_server_record(source, expected));
+            wire::ByteBuffer encoded;
+            std::visit([&](auto& record) { REQUIRE(encode_server_record(ServerRecord{std::move(record)}, encoded)); }, owned);
+            CHECK(encoded == expected);
+            for (const std::size_t split : std::array<std::size_t, 3U>{0U, encoded.size() / 2U, encoded.size()}) {
+                const auto decoded = decode_server_record({std::span(encoded).first(split), std::span(encoded).subspan(split)});
+                REQUIRE(decoded);
+                CHECK(*decoded == source);
+            }
+            wire::ByteBuffer reused(65536U, std::byte{0xcc});
+            REQUIRE(encode_server_record(source, reused));
+            CHECK(reused == expected);
+        }
+    }
+}
+TEST_CASE("complete server records preserve exact 64 KiB neighboring extents", "[controller][browser][protocol][limits]") {
+    for (const std::size_t target : {65535U, 65536U, 65537U}) {
+        const auto payload = [](std::size_t text_size) {
+            return wire::Value(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{
+                wire::Value(std::string(text_size, 'x')), wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))})}});
+        };
+        for (ServerRecord source : std::array<ServerRecord, 3U>{
+                 SystemEvent{.system_id = 1U, .event_id = 2U, .state_revision = 7U, .value = payload(32768U)},
+                 Bootstrap{.schema_fingerprint = {11U, 13U}, .input_epoch = 1U, .snapshots = {{.system_id = 1U, .value = payload(32768U)}}},
+                 IntentReply{.correlation = 9U, .result = payload(32768U)}}) {
+            wire::ByteBuffer expected;
+            REQUIRE(encode_server_record(source, expected));
+            REQUIRE(expected.size() < target);
+            const auto text_size = 32768U + target - expected.size();
+            // Both text lengths retain the same canonical CBOR length-head width.
+            REQUIRE(text_size <= 65535U);
+            std::visit([&]<class Record>(Record& record) {
+                if constexpr (std::is_same_v<Record, SystemEvent>) record.value = payload(text_size);
+                else if constexpr (std::is_same_v<Record, Bootstrap>) record.snapshots.front().value = payload(text_size);
+                else if constexpr (std::is_same_v<Record, IntentReply>) record.result = payload(text_size);
+            }, source);
+            REQUIRE(encode_server_record(source, expected));
+            REQUIRE(expected.size() == target);
+            auto owned = source;
+            wire::ByteBuffer encoded;
+            std::visit([&](auto& record) { REQUIRE(encode_server_record(ServerRecord{std::move(record)}, encoded)); }, owned);
+            REQUIRE(encoded.size() == target);
+            CHECK(encoded == expected);
+            const auto decoded = decode_server_record({encoded, {}});
+            REQUIRE(decoded);
+            CHECK(*decoded == source);
+        }
     }
 }
 TEST_CASE("output records admit bounded scene collections and complete bootstrap payloads", "[controller][browser][protocol][limits]") {

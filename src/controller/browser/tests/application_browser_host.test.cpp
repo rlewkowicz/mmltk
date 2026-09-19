@@ -637,6 +637,55 @@ TEST_CASE("browser admission settles acceptance redraw callbacks before releasin
     CHECK(gate->AwaitInitialRelease(0U) == ExploreAcceptanceGate::WaitResult::Stale);
     CHECK_FALSE(host.accepting());
 }
+TEST_CASE("direct host retains nested event bytes after publisher ownership ends") {
+    RunningHost server{OpenPressure::None};
+    LoopbackWebSocket peer{server.websocket()};
+    REQUIRE(peer.receive());
+    for (const std::size_t size : {0U, 65535U, 65536U, 65537U}) {
+        SystemEvent event{
+            .system_id = 1U,
+            .event_id = 2U,
+            .delivery = contracts::reflection::EventDelivery::Critical,
+            .state_revision = size + 1U,
+            .value = wire::Value(wire::Value::Object{{"nested", wire::Value(wire::Value::Array{
+                wire::Value(std::string(size, 'x')), wire::Value(wire::ByteBuffer(size, std::byte{0xa5}))})}}),
+        };
+        wire::ByteBuffer expected;
+        REQUIRE(encode_server_record(ServerRecord{event}, expected));
+        server.context()->owner->publish(std::move(event));
+        event = {};
+        const auto frame = peer.receive();
+        REQUIRE(frame);
+        CHECK(frame->payload == expected);
+    }
+}
+TEST_CASE("direct host queues exact 64 KiB neighboring records with retired publisher storage") {
+    RunningHost server{OpenPressure::None};
+    LoopbackWebSocket peer{server.websocket()};
+    REQUIRE(peer.receive());
+    for (const std::size_t target : {65535U, 65536U, 65537U}) {
+        const auto payload = [](std::size_t text_size) {
+            return wire::Value(wire::Value::Array{wire::Value(std::string(text_size, 'x')),
+                                                 wire::Value(wire::ByteBuffer(31U, std::byte{0xa5}))});
+        };
+        SystemEvent event{.system_id = 1U, .event_id = 2U, .delivery = contracts::reflection::EventDelivery::Critical,
+                          .state_revision = 7U, .value = payload(32768U)};
+        wire::ByteBuffer expected;
+        REQUIRE(encode_server_record(ServerRecord{event}, expected));
+        REQUIRE(expected.size() < target);
+        const auto text_size = 32768U + target - expected.size();
+        REQUIRE(text_size <= 65535U);
+        event.value = payload(text_size);
+        REQUIRE(encode_server_record(ServerRecord{event}, expected));
+        REQUIRE(expected.size() == target);
+        server.context()->owner->publish(std::move(event));
+        event = {};
+        const auto frame = peer.receive();
+        REQUIRE(frame);
+        REQUIRE(frame->payload.size() == target);
+        CHECK(frame->payload == expected);
+    }
+}
 TEST_CASE("direct host drops transient pressure in the real open epoch") {
     RunningHost server{OpenPressure::Transient};
     LoopbackWebSocket peer{server.websocket()};

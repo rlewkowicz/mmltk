@@ -138,8 +138,9 @@ concept PublicRawCborAppend =
         mmltk::frameworks::serialization::implementation::detail::append_reflected_object_fields<Layout>(source, object, failure);
     };
 template <class Owner>
-concept PublicRawCborValueDecode = requires(Owner& destination, const wire::Value::Object& object, std::optional<wire::DecodeError>& failure) {
-    mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, object, failure);
+concept PublicRawCborValueDecode = requires(Owner& destination, std::span<const mmltk::frameworks::serialization::implementation::detail::NamedFieldMatch> matches,
+                                          std::size_t& index, std::optional<wire::DecodeError>& failure) {
+    mmltk::frameworks::serialization::implementation::detail::decode_reflected_object_fields(destination, matches, index, failure);
 };
 template <class Owner>
 concept PublicRawCborProjectedDecode = requires(Owner& destination, wire::Reader& reader) {
@@ -309,6 +310,66 @@ TEST_CASE("reflected CBOR flattens inherited members base first and enforces the
     CHECK(rejected_encode.error().code == wire::ErrorCode::LimitExceeded);
     CHECK(rejected_encode.error().path == "inherited_limit");
     CHECK(rejected_bytes.empty());
+}
+TEST_CASE("named object validation retains declaration order across shuffled and conflicting fields", "[frameworks][serialization][reflection]") {
+    namespace cbor = mmltk::frameworks::serialization;
+    const auto check = [](wire::Value::Object fields, wire::ErrorCode code, std::string_view path) {
+        InheritedCbor destination;
+        destination.derived_count = 91U;
+        destination.optional_count = 8U;
+        const auto before = destination;
+        const wire::Value input(std::move(fields));
+        const auto input_before = input;
+        const auto result = cbor::decode_into(destination, input);
+        require_decode_error(result, code);
+        CHECK(result.error().path == path);
+        CHECK(result.error().offset == 0U);
+        CHECK(destination == before);
+        CHECK(input == input_before);
+    };
+    const wire::Value::Object valid{{"optional_count", wire::Value(std::uint64_t{6})},
+                                  {"derived_count", wire::Value(std::uint64_t{5})},
+                                  {"inherited_limit", wire::Value(std::uint64_t{7})}};
+    for (const bool duplicate_first : {false, true}) {
+        auto fields = valid;
+        fields.insert(duplicate_first ? fields.begin() : fields.end(), {"derived_count", wire::Value{}});
+        if (duplicate_first) {
+            fields.back().second = wire::Value(std::uint64_t{10});
+            // An invalid earlier base still wins over an earlier input duplicate.
+            check(fields, wire::ErrorCode::LimitExceeded, "inherited_limit");
+            fields.back().second = wire::Value(std::uint64_t{7});
+        }
+        check(fields, wire::ErrorCode::DuplicateKey, "derived_count");
+        fields.erase(std::ranges::find_if(fields, [](const auto& field) { return field.first == "inherited_limit"; }));
+        check(fields, wire::ErrorCode::UnknownKey, "inherited_limit");
+    }
+    auto fields = valid;
+    fields.insert(fields.begin(), {"unknown_first", wire::Value{}});
+    fields.emplace_back("unknown_last", wire::Value{});
+    check(fields, wire::ErrorCode::UnknownKey, "unknown_first");
+    fields[1].second = wire::Value(std::string("malformed optional"));
+    check(fields, wire::ErrorCode::TypeMismatch, "optional_count");
+    fields.emplace_back("optional_count", wire::Value{});
+    check(fields, wire::ErrorCode::DuplicateKey, "optional_count");
+    fields.emplace_back("inherited_limit", wire::Value{});
+    check(fields, wire::ErrorCode::DuplicateKey, "inherited_limit");
+}
+TEST_CASE("opaque named values preserve ordered admission and nested error precedence", "[frameworks][serialization][opaque]") {
+    namespace cbor = mmltk::frameworks::serialization;
+    for (const bool known_first : {false, true}) {
+        wire::Value::Object fields{{"unknown", wire::Value{}}, {"mask", wire::Value(std::uint64_t{1})}};
+        if (known_first) std::ranges::reverse(fields);
+        OpaqueFixtureOwner destination;
+        destination.value = 73U;
+        const auto before = destination;
+        const wire::Value input(wire::Value::Object{{"overrides", wire::Value(std::move(fields))},
+                                                   {"value", wire::Value(std::uint64_t{19})}});
+        const auto result = cbor::decode_into(destination, input);
+        require_decode_error(result, wire::ErrorCode::UnknownKey);
+        CHECK(result.error().path == (known_first ? "overrides.unknown" : "overrides.mask"));
+        CHECK(result.error().offset == 0U);
+        CHECK(destination == before);
+    }
 }
 TEST_CASE("reflected structural bounds retain inherited fields and declaration owned bytes", "[frameworks][serialization][reflection][bounds]") {
     namespace cbor = mmltk::frameworks::serialization;
@@ -574,6 +635,187 @@ TEST_CASE("bounded_cbor_round_trips_deterministic_maps_and_segmented_input", "[f
     const auto decoded = wire::decode({std::span(encoded).first(split), std::span(encoded).subspan(split)}, {128U, 32U, 8U});
     REQUIRE(decoded.has_value());
     REQUIRE(std::get<wire::Value::Object>(decoded->storage).at(0).first == "first");
+}
+TEST_CASE("owned scalar payloads survive every segmented split and input retirement", "[frameworks][serialization]") {
+    for (const std::size_t length : {0U, 31U, 257U}) {
+        const std::string text(length, 'x');
+        const wire::ByteBuffer bytes(length, std::byte{0xa5});
+        for (const wire::Value& source : {wire::Value(text), wire::Value(bytes), wire::Value(std::string("a\xe2\x82\xac")),
+                                        wire::Value(wire::Value::Array{}),
+                                        wire::Value(wire::Value::Array{wire::Value(text), wire::Value(bytes), wire::Value(std::int64_t{-17})})}) {
+            wire::ByteBuffer encoded;
+            REQUIRE(wire::encode(source, encoded, test_limits(2048U)));
+            const auto limits = test_limits(encoded.size());
+            const auto expected_flat = wire::FlatValue::from_value(source, {.max_bytes = 2048U, .max_items = 256U, .max_depth = 4U});
+            REQUIRE(expected_flat);
+            for (std::size_t split = 0; split <= encoded.size(); ++split) {
+                auto input = encoded;
+                const wire::ByteSegments segments{std::span(input).first(split), std::span(input).subspan(split)};
+                const auto decoded = wire::decode(segments, limits);
+                const auto flat = wire::Reader(segments, limits).read_flat();
+                REQUIRE(decoded);
+                REQUIRE(flat);
+                std::ranges::fill(input, std::byte{});
+                CHECK(*decoded == source);
+                CHECK(*flat == *expected_flat);
+                // Const projections retain their source and return independent ownership.
+                const auto projected = wire::FlatValue::from_value(*decoded, {.max_bytes = 2048U, .max_items = 256U, .max_depth = 4U});
+                REQUIRE(projected);
+                CHECK(*projected == *expected_flat);
+                CHECK(*decoded == source);
+            }
+        }
+    }
+}
+TEST_CASE("configured maximum scalar and flat array inputs retain independent ownership", "[frameworks][serialization]") {
+    constexpr wire::DynamicValueLimits admitted{.max_bytes = 65536U, .max_items = 256U, .max_depth = 1U};
+    wire::Value::Array items;
+    for (std::size_t index = 0U; index < admitted.max_items; ++index) {
+        if (index % 2U == 0U) items.emplace_back(std::string(257U, 'x'));
+        else items.emplace_back(wire::ByteBuffer(257U, std::byte{0xa5}));
+    }
+    for (const wire::Value& source : {wire::Value(std::string(admitted.max_bytes, 'x')),
+                                     wire::Value(wire::ByteBuffer(admitted.max_bytes, std::byte{0xa5})), wire::Value(items)}) {
+        const auto expected = wire::FlatValue::from_value(source, admitted);
+        REQUIRE(expected);
+        const bool array = std::holds_alternative<wire::Value::Array>(source.storage);
+        const auto item_limit = array ? admitted.max_items + 1U : 1U;
+        const auto measured = wire::CountingEncoder(test_limits(128U * 1024U, item_limit, admitted.max_depth)).measure(source);
+        REQUIRE(measured);
+        const auto limits = test_limits(*measured, item_limit, admitted.max_depth);
+        wire::ByteBuffer encoded;
+        REQUIRE(wire::encode(source, encoded, limits));
+        REQUIRE(encoded.size() == limits.max_bytes);
+        // A constant six splits bounds maximum-payload work to O(encoded bytes).
+        for (const auto split : std::array<std::size_t, 6U>{0U, 1U, 5U, encoded.size() / 2U, encoded.size() - 1U, encoded.size()}) {
+            auto input = encoded;
+            const wire::ByteSegments segments{std::span(input).first(split), std::span(input).subspan(split)};
+            wire::Reader reader(segments, limits);
+            const auto flat = reader.read_flat();
+            REQUIRE(flat);
+            CHECK(reader.offset() == encoded.size());
+            const auto value = wire::decode(segments, limits);
+            REQUIRE(value);
+            std::ranges::fill(input, std::byte{});
+            CHECK(*flat == *expected);
+            CHECK(*value == source);
+        }
+        auto insufficient = limits;
+        --insufficient.max_bytes;
+        const auto rejected = wire::Reader({encoded, {}}, insufficient).read_flat();
+        require_decode_error(rejected, wire::ErrorCode::LimitExceeded);
+        CHECK(rejected.error().offset == 0U);
+        if (array) {
+            insufficient = limits;
+            --insufficient.max_items;
+            require_decode_error(wire::Reader({encoded, {}}, insufficient).read_flat(), wire::ErrorCode::LimitExceeded);
+        }
+    }
+    require_decode_error(wire::FlatValue::text(std::string(admitted.max_bytes + 1U, 'x'), admitted.max_bytes), wire::ErrorCode::LimitExceeded);
+    require_decode_error(wire::FlatValue::bytes(wire::ByteBuffer(admitted.max_bytes + 1U), admitted.max_bytes), wire::ErrorCode::LimitExceeded);
+    items.emplace_back(std::uint64_t{1U});
+    require_decode_error(wire::FlatValue::from_value(wire::Value(std::move(items)), admitted), wire::ErrorCode::LimitExceeded);
+}
+TEST_CASE("segmented scalar failures preserve complete payload admission and offsets", "[frameworks][serialization]") {
+    const std::array payload{std::byte{0x64}, std::byte{'a'}, std::byte{0xe2}, std::byte{0x82}, std::byte{0xac}};
+    for (const auto head : {std::byte{0x44}, std::byte{0x64}}) {
+        auto encoded = payload;
+        encoded[0] = head;
+        for (std::size_t size = 0U; size <= encoded.size(); ++size) {
+            for (std::size_t split = 0U; split <= size; ++split) {
+                const wire::ByteSegments input{std::span(encoded).first(split), std::span(encoded).subspan(split, size - split)};
+                // Truncated payloads exceed both remaining input and remaining budget.
+                wire::Reader reader(input, test_limits(size));
+                auto scope = reader.enter_path("payload");
+                const auto value = reader.read_flat();
+                if (size == encoded.size()) {
+                    REQUIRE(value);
+                    CHECK(reader.offset() == size);
+                } else {
+                    require_decode_error(value, wire::ErrorCode::UnexpectedEof);
+                    CHECK(value.error().offset == (size == 0U ? 0U : 1U));
+                    CHECK(value.error().path == "payload");
+                    CHECK(reader.offset() == value.error().offset);
+                }
+            }
+        }
+    }
+    auto invalid = payload;
+    invalid.back() = std::byte{'x'};
+    for (std::size_t split = 0U; split <= invalid.size(); ++split) {
+        const wire::ByteSegments input{std::span(invalid).first(split), std::span(invalid).subspan(split)};
+        const auto value = wire::Reader(input, test_limits(invalid.size())).read_flat();
+        require_decode_error(value, wire::ErrorCode::InvalidUtf8);
+        CHECK(value.error().offset == invalid.size());
+        auto limits = test_limits(invalid.size() - 1U);
+        const auto budget = wire::Reader(input, limits).read_flat();
+        require_decode_error(budget, wire::ErrorCode::LimitExceeded);
+        CHECK(budget.error().offset == 0U);
+        limits.max_bytes = invalid.size();
+        limits.allocation_policy.allows = [](const void*, const wire::AllocationRequest&) noexcept { return false; };
+        const auto denied = wire::Reader(input, limits).read_flat();
+        require_decode_error(denied, wire::ErrorCode::LimitExceeded);
+        CHECK(denied.error().offset == 1U);
+    }
+}
+TEST_CASE("scalar allocation admission reports exact kind size path and cursor", "[frameworks][serialization]") {
+    struct Observation {
+        const wire::Reader* reader = nullptr;
+        mutable std::size_t calls = 0U;
+        mutable wire::AllocationKind kind{};
+        mutable std::size_t size = 0U;
+        mutable std::size_t offset = 0U;
+        mutable bool path_matches = false;
+    };
+    for (const auto kind : {wire::AllocationKind::Text, wire::AllocationKind::Bytes}) {
+        const std::array encoded{kind == wire::AllocationKind::Text ? std::byte{0x64} : std::byte{0x44},
+                                 std::byte{'a'}, std::byte{'b'}, std::byte{'c'}, std::byte{'d'}};
+        for (std::size_t split = 0U; split <= encoded.size(); ++split) {
+            Observation observed;
+            auto limits = test_limits(encoded.size());
+            limits.allocation_policy = {.context = &observed, .allows = [](const void* context, const wire::AllocationRequest& request) noexcept {
+                const auto& state = *static_cast<const Observation*>(context);
+                ++state.calls;
+                state.kind = request.kind;
+                state.size = request.size;
+                state.offset = state.reader->offset();
+                state.path_matches = request.path.size() == 2U && request.path[0].name == "outer" && request.path[1].name == "payload";
+                return false;
+            }};
+            wire::Reader reader({std::span(encoded).first(split), std::span(encoded).subspan(split)}, limits);
+            observed.reader = &reader;
+            auto outer = reader.enter_path("outer");
+            auto inner = reader.enter_path("payload");
+            const auto rejected = reader.read_flat();
+            require_decode_error(rejected, wire::ErrorCode::LimitExceeded);
+            CHECK(observed.calls == 1U);
+            CHECK(observed.kind == kind);
+            CHECK(observed.size == 4U);
+            CHECK(observed.path_matches);
+            CHECK(observed.offset == 1U);
+            CHECK(reader.offset() == 1U);
+            CHECK(rejected.error().offset == 1U);
+            CHECK(rejected.error().path == "outer.payload");
+        }
+    }
+}
+TEST_CASE("malformed UTF8 categories consume complete segmented payloads before failure", "[frameworks][serialization]") {
+    for (const wire::ByteBuffer& encoded : {
+             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc2}, std::byte{'x'}}, // invalid continuation
+             wire::ByteBuffer{std::byte{0x62}, std::byte{0xc0}, std::byte{0x80}}, // overlong
+             wire::ByteBuffer{std::byte{0x63}, std::byte{0xed}, std::byte{0xa0}, std::byte{0x80}}, // surrogate
+             wire::ByteBuffer{std::byte{0x64}, std::byte{0xf4}, std::byte{0x90}, std::byte{0x80}, std::byte{0x80}}, // out of range
+         }) {
+        for (std::size_t split = 0U; split <= encoded.size(); ++split) {
+            wire::Reader reader({std::span(encoded).first(split), std::span(encoded).subspan(split)}, test_limits(encoded.size()));
+            auto scope = reader.enter_path("payload");
+            const auto rejected = reader.read_flat();
+            require_decode_error(rejected, wire::ErrorCode::InvalidUtf8);
+            CHECK(rejected.error().path == "payload");
+            CHECK(rejected.error().offset == encoded.size());
+            CHECK(reader.offset() == encoded.size());
+        }
+    }
 }
 TEST_CASE("CBOR byte peeks preserve offsets across empty input and segment transitions", "[frameworks][serialization]") {
     const std::array bytes{std::byte{0xf6}, std::byte{0x18}, std::byte{0x18}, std::byte{0xf6}};

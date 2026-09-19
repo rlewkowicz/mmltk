@@ -724,10 +724,9 @@ fn decode_value(
             }
             let mut fields = Vec::with_capacity(count);
             for _ in 0..count {
-                let key = decode_value(bytes, cursor, max_depth, depth + 1)?
-                    .text()
-                    .ok_or_else(|| ProtocolError("CBOR map key is not text".into()))?
-                    .to_owned();
+                let Value::Text(key) = decode_value(bytes, cursor, max_depth, depth + 1)? else {
+                    return Err(ProtocolError("CBOR map key is not text".into()));
+                };
                 if fields.iter().any(|(known, _)| known == &key) {
                     return Err(ProtocolError("duplicate CBOR map key".into()));
                 }
@@ -888,6 +887,36 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn owned_map_keys_preserve_error_precedence_and_cursor() {
+        for (bytes, message, expected_cursor) in [
+            (&[0xa1, 0x01, 0xff][..], "CBOR map key is not text", 2),
+            (&[0xa1, 0x61, 0xff, 0xff][..], "invalid UTF-8 text", 3),
+            (&[0xa1, 0x81, 0xff, 0xff][..], "unsupported CBOR simple value", 3),
+            (
+                &[0xa2, 0x61, b'x', 0x00, 0x61, b'x', 0xff][..],
+                "duplicate CBOR map key",
+                6,
+            ),
+        ] {
+            let mut cursor = 0;
+            let error = decode_value(bytes, &mut cursor, MAX_INTENT_VALUE_DEPTH, 0).unwrap_err();
+            assert_eq!(error.0, message);
+            assert_eq!(cursor, expected_cursor);
+        }
+        for size in [0, 31, 65535, 65536, 65537] {
+            let key = "x".repeat(size);
+            let source = Value::Object(vec![(key, Value::Text("owned value".into()))]);
+            let mut encoded = Vec::new();
+            encode_value(&source, &mut encoded).unwrap();
+            let mut cursor = 0;
+            let decoded = decode_value(&encoded, &mut cursor, MAX_INTENT_VALUE_DEPTH, 0).unwrap();
+            assert_eq!(cursor, encoded.len());
+            encoded.fill(0);
+            assert_eq!(decoded, source);
+        }
     }
 
     #[test]

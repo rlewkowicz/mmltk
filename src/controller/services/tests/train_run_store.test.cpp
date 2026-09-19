@@ -41,6 +41,8 @@ void test_current_training_history_pages_and_attempt_configuration() {
     REQUIRE(manifest.attempt_id == writer.attempt_id());
     std::uint64_t cursor = 0;
     std::optional<r::TrainingRecord> last;
+    std::ifstream history(temp.path() / "metrics.jsonl");
+    REQUIRE(history.good());
     do {
         auto page = store.Read({store.generation(), cursor, 1});
         REQUIRE(page.records.size() <= 1);
@@ -48,6 +50,12 @@ void test_current_training_history_pages_and_attempt_configuration() {
         REQUIRE(page.next_cursor > cursor);
         cursor = page.next_cursor;
         last = page.records.back();
+        std::string line;
+        REQUIRE(static_cast<bool>(std::getline(history, line)));
+        const auto persisted = mmltk::frameworks::serialization::decode_reflected_json<r::TrainingRecord>(
+            line, {.max_bytes = r::kTrainingRecordBytes, .max_items = 8192U, .max_depth = 32U});
+        CHECK(*last == persisted);
+        if (last->progress.phase == r::TrainingPhase::Starting) CHECK(last->attempt_configuration == run.configuration);
         if (!page.more) break;
     } while (true);
     REQUIRE(last.has_value());
@@ -72,6 +80,11 @@ void test_current_training_history_pages_and_attempt_configuration() {
         malformed << "999}\n";
     }
     REQUIRE_THROWS(store.Read({store.generation(), cursor, 1}));
+    {
+        std::ofstream oversized(temp.path() / "metrics.jsonl", std::ios::trunc);
+        oversized << std::string(r::kTrainingRecordBytes + 1U, ' ') << '\n';
+    }
+    REQUIRE_THROWS_WITH(store.Read({store.generation(), 0, 1}), Catch::Matchers::ContainsSubstring("training history record exceeds byte limit"));
     const auto fresh = TrainRunStore::ResolveOutput(temp.path());
     REQUIRE(fresh != temp.path());
     REQUIRE(fresh.filename() == "run-0001");
