@@ -300,6 +300,56 @@ where
         self
     }
 
+    fn modifier_element(&self, renderer: &Renderer) -> Element<'_, Message, Theme, Renderer> {
+        let txt_size = self.size.unwrap_or_else(|| renderer.default_size());
+
+        let icon_size = txt_size * 2.5 / 4.0;
+        let btn_mod = |c| {
+            Container::<Message, Theme, Renderer>::new(Text::new(format!(" {c} ")).size(icon_size))
+                .center_y(Length::Shrink)
+                .center_x(Length::Shrink)
+        };
+
+        let default_padding = DEFAULT_PADDING;
+
+        if self.padding.top < default_padding.top
+            || self.padding.bottom < default_padding.bottom
+            || self.padding.right < default_padding.right
+        {
+            Element::new(
+                Row::<Message, Theme, Renderer>::new()
+                    .spacing(1)
+                    .width(Length::Shrink)
+                    .push(btn_mod('+'))
+                    .push(btn_mod('-')),
+            )
+        } else {
+            Element::new(
+                Column::<Message, Theme, Renderer>::new()
+                    .spacing(1)
+                    .width(Length::Shrink)
+                    .push(btn_mod('▲'))
+                    .push(btn_mod('▼')),
+            )
+        }
+    }
+
+    fn modifier_tree<'tree>(
+        tree: &'tree mut Tree,
+        element: &mut Element<'_, Message, Theme, Renderer>,
+    ) -> &'tree mut Tree {
+        if tree.children.len() > 1 {
+            let child_tree = &mut tree.children[1];
+            child_tree.diff(element.as_widget_mut());
+            child_tree
+        } else {
+            let mut child_tree = Tree::new(element.as_widget());
+            child_tree.diff(element.as_widget_mut());
+            tree.children.insert(1, child_tree);
+            &mut tree.children[1]
+        }
+    }
+
     fn decrease_value(&mut self, shell: &mut Shell<Message>) {
         if self.value.clone() > self.min() + self.step.clone()
             && self.valid(&(self.value.clone() - self.step.clone()))
@@ -428,47 +478,8 @@ where
             .content
             .layout(&mut tree.children[0], renderer, &limits);
         let limits2 = Limits::new(Size::new(0.0, 0.0), content.size());
-        let txt_size = self.size.unwrap_or_else(|| renderer.default_size());
-
-        let icon_size = txt_size * 2.5 / 4.0;
-        let btn_mod = |c| {
-            Container::<Message, Theme, Renderer>::new(Text::new(format!(" {c} ")).size(icon_size))
-                .center_y(Length::Shrink)
-                .center_x(Length::Shrink)
-        };
-
-        let default_padding = DEFAULT_PADDING;
-
-        let mut element = if self.padding.top < default_padding.top
-            || self.padding.bottom < default_padding.bottom
-            || self.padding.right < default_padding.right
-        {
-            Element::new(
-                Row::<Message, Theme, Renderer>::new()
-                    .spacing(1)
-                    .width(Length::Shrink)
-                    .push(btn_mod('+'))
-                    .push(btn_mod('-')),
-            )
-        } else {
-            Element::new(
-                Column::<Message, Theme, Renderer>::new()
-                    .spacing(1)
-                    .width(Length::Shrink)
-                    .push(btn_mod('▲'))
-                    .push(btn_mod('▼')),
-            )
-        };
-
-        let input_tree = if let Some(child_tree) = tree.children.get_mut(1) {
-            child_tree.diff(element.as_widget_mut());
-            child_tree
-        } else {
-            let mut child_tree = Tree::new(element.as_widget());
-            child_tree.diff(element.as_widget_mut());
-            tree.children.insert(1, child_tree);
-            &mut tree.children[1]
-        };
+        let mut element = self.modifier_element(renderer);
+        let input_tree = Self::modifier_tree(tree, &mut element);
 
         let mut modifier = element
             .as_widget_mut()
@@ -502,49 +513,8 @@ where
         if let Some(modifier_layout) = children.next()
             && !self.ignore_buttons
         {
-            let txt_size = self.size.unwrap_or_else(|| renderer.default_size());
-            let icon_size = txt_size * 2.5 / 4.0;
-
-            let btn_mod = |c| {
-                Container::<Message, Theme, Renderer>::new(
-                    Text::new(format!(" {c} ")).size(icon_size),
-                )
-                .center_y(Length::Shrink)
-                .center_x(Length::Shrink)
-            };
-
-            let default_padding = DEFAULT_PADDING;
-
-            let mut element = if self.padding.top < default_padding.top
-                || self.padding.bottom < default_padding.bottom
-                || self.padding.right < default_padding.right
-            {
-                Element::new(
-                    Row::<Message, Theme, Renderer>::new()
-                        .spacing(1)
-                        .width(Length::Shrink)
-                        .push(btn_mod('+'))
-                        .push(btn_mod('-')),
-                )
-            } else {
-                Element::new(
-                    Column::<Message, Theme, Renderer>::new()
-                        .spacing(1)
-                        .width(Length::Shrink)
-                        .push(btn_mod('▲'))
-                        .push(btn_mod('▼')),
-                )
-            };
-
-            let modifier_tree = if let Some(child_tree) = tree.children.get_mut(1) {
-                child_tree.diff(element.as_widget_mut());
-                child_tree
-            } else {
-                let mut child_tree = Tree::new(element.as_widget());
-                child_tree.diff(element.as_widget_mut());
-                tree.children.insert(1, child_tree);
-                &mut tree.children[1]
-            };
+            let mut element = self.modifier_element(renderer);
+            let modifier_tree = Self::modifier_tree(tree, &mut element);
 
             element
                 .as_widget_mut()
@@ -1052,7 +1022,71 @@ mod tests {
 
     fn layout(input: &mut TestNumberInput<'_>, tree: &mut Tree) -> Node {
         tree.diff(input as &mut dyn Widget<TestMessage, iced_widget::Theme, Renderer>);
-        input.layout(tree, &Renderer, &Limits::new(Size::ZERO, Size::new(240.0, 100.0)))
+        let node = input.layout(tree, &Renderer, &Limits::new(Size::ZERO, Size::new(240.0, 100.0)));
+        assert_operation(input, tree, &node);
+        node
+    }
+
+    #[derive(Default)]
+    struct OperationTrace(Vec<(String, Rectangle)>);
+
+    impl Operation for OperationTrace {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+
+        fn container(&mut self, _: Option<&widget::Id>, bounds: Rectangle) {
+            self.0.push(("container".into(), bounds));
+        }
+
+        fn text_input(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: Rectangle,
+            _: &mut dyn widget::operation::TextInput,
+        ) {
+            self.0.push(("input".into(), bounds));
+        }
+
+        fn focusable(
+            &mut self,
+            _: Option<&widget::Id>,
+            bounds: Rectangle,
+            _: &mut dyn widget::operation::Focusable,
+        ) {
+            self.0.push(("focusable".into(), bounds));
+        }
+
+        fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+            self.0.push((text.into(), bounds));
+        }
+    }
+
+    fn assert_operation(input: &mut TestNumberInput<'_>, tree: &mut Tree, node: &Node) {
+        let mut trace = OperationTrace::default();
+        input.operate(tree, Layout::new(node), &Renderer, &mut trace);
+        let mut expected: Vec<(String, Rectangle)> = vec![
+            ("container".into(), node.bounds()),
+            ("input".into(), node.children()[0].bounds()),
+            ("focusable".into(), node.children()[0].bounds()),
+        ];
+        if !input.ignore_buttons {
+            let modifier = Layout::new(node).children().nth(1).unwrap();
+            expected.push(("container".into(), modifier.bounds()));
+            let glyphs = if input.padding.top < 5.0
+                || input.padding.bottom < 5.0
+                || input.padding.right < 5.0
+            {
+                [" + ", " - "]
+            } else {
+                [" ▲ ", " ▼ "]
+            };
+            for (button, glyph) in modifier.children().zip(glyphs) {
+                expected.push(("container".into(), button.bounds()));
+                expected.push((glyph.into(), button.children().next().unwrap().bounds()));
+            }
+        }
+        assert_eq!(trace.0, expected);
     }
 
     fn deliver(input: &mut TestNumberInput<'_>, tree: &mut Tree, node: &Node,
@@ -1101,14 +1135,25 @@ mod tests {
             assert!(matches!(text.cursor().state(&Value::new("42")), cursor::State::Index(1)));
         }
         // Font/padding and orientation changes use the normal modifier diff.
-        for padding in [1.0, 10.0, 1.0] {
+        for (padding, size, icon_size, font) in [
+            (1.0, 22.0, 13.75, iced_core::Font::MONOSPACE),
+            (10.0, 18.0, 11.25, iced_core::Font::DEFAULT),
+            (1.0, 16.0, 10.0, iced_core::Font::MONOSPACE),
+        ] {
             input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed)
-                .width(200).padding(padding).set_size(22.0).font(iced_core::Font::MONOSPACE);
+                .width(200).padding(padding).set_size(size).font(font);
             let node = layout(&mut input, &mut tree);
             assert_eq!(tree.children.len(), 2);
-            let icon = tree.children[1].children[0].children[0].state
+            let icon = tree.children[1].children[0].state
                 .downcast_ref::<iced_widget::text::State<Paragraph>>().raw();
-            assert_eq!(icon.size(), iced_core::Pixels(13.75));
+            assert_eq!(icon.size(), iced_core::Pixels(icon_size));
+            // The content font does not override the modifier's default font.
+            assert_eq!(icon.font(), iced_core::Font::DEFAULT);
+            assert_eq!(tree.children[1].children.as_ptr(), modifier_children);
+            assert!(tree.state.downcast_ref::<ModifierState>().increase_pressed);
+            let text = tree.children[0].state.downcast_ref::<text_input::State<Paragraph>>();
+            assert!(text.is_focused());
+            assert!(matches!(text.cursor().state(&Value::new("42")), cursor::State::Index(1)));
             let buttons = node.children()[1].children();
             if padding == 1.0 { assert!(buttons[1].bounds().x > buttons[0].bounds().x); }
             else { assert!(buttons[1].bounds().y > buttons[0].bounds().y); }
@@ -1117,6 +1162,40 @@ mod tests {
         tree.children.push(Tree::empty());
         input.diff(&mut tree);
         assert_eq!(tree.children.len(), 2);
+    }
+
+    #[test]
+    fn number_input_operate_creates_only_visible_missing_modifiers() {
+        let value = 42;
+        let mut input = TestNumberInput::new(&value, 0..=100, TestMessage::Changed).width(200);
+        let mut tree = Tree::new(&input as &dyn Widget<TestMessage, iced_widget::Theme, Renderer>);
+        for padding in [1.0, 10.0] {
+            input = input.padding(padding);
+            let node = layout(&mut input, &mut tree);
+            let text = tree.children[0].state.downcast_mut::<text_input::State<Paragraph>>();
+            text.focus();
+            text.move_cursor_to(1);
+            tree.state.downcast_mut::<ModifierState>().decrease_pressed = true;
+            tree.children.truncate(1);
+            input = input.ignore_buttons(true);
+            assert_operation(&mut input, &mut tree, &node);
+            assert_eq!(tree.children.len(), 1, "ignored modifiers must not be created");
+            input = input.ignore_buttons(false);
+            assert_operation(&mut input, &mut tree, &node);
+            assert_eq!(tree.children.len(), 2);
+            let modifier_children = tree.children[1].children.as_ptr();
+            let node = layout(&mut input, &mut tree);
+            input = input.ignore_buttons(true);
+            let ignored_node = layout(&mut input, &mut tree);
+            assert_eq!(ignored_node.size(), node.size());
+            assert_eq!(ignored_node.children()[1].bounds(), node.children()[1].bounds());
+            input = input.ignore_buttons(false);
+            assert_eq!(tree.children[1].children.as_ptr(), modifier_children);
+            assert!(tree.state.downcast_ref::<ModifierState>().decrease_pressed);
+            let text = tree.children[0].state.downcast_ref::<text_input::State<Paragraph>>();
+            assert!(text.is_focused());
+            assert!(matches!(text.cursor().state(&Value::new("42")), cursor::State::Index(1)));
+        }
     }
 
     #[test]
