@@ -72,9 +72,13 @@ unsupported-host override. GCC 14 is confined to the GCC 16.2 bootstrap.
 Explicit ONNX, simdjson, and cppcheck source builds use GCC 16.2 while retaining
 their configured language policies. Vendored dependencies keep their own
 policies; Firefox retains its cached Clang toolchain and bootstrap sysroot.
-The owned `third_party/iced_plot` crate supplies retained Train charts through
-the frontend Cargo workspace. Its Rust, manifest, and WGSL sources participate
-in browser bundle invalidation.
+The frontend Cargo workspace includes the owned `third_party/iced_plot` and
+`third_party/iced_aw` crates. Plot Rust, manifest, and WGSL inputs and iced_aw
+Rust/manifest inputs participate in browser bundle invalidation.
+The frontend check target compiles, with `--no-run`, the host Rust suites
+selected by the [browser-app test route](validation.md#native-and-browser-suites),
+including its explicit iced_aw library selection. These host checks and tests
+remain separate from the optimized `trunk build --release` Wasm bundle.
 
 [CMakeLists.txt](../CMakeLists.txt) requires exactly CMake 4.4.3.
 [MmltkToolchain.cmake](../cmake/MmltkToolchain.cmake) enforces compiler paths

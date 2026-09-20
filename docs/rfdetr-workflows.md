@@ -316,9 +316,13 @@ independent formats.
 The declarations are in
 [training_metrics.h](../src/backend/models/rfdetr/contract/training_metrics.h).
 The independent [telemetry writer](../src/backend/models/rfdetr/training/telemetry_writer.cpp)
-owns serialization and file writes. Training submits bounded records without
-waiting for charts, browser delivery, or telemetry disk I/O. Intermediate live
-records can coalesce; epoch and terminal records have reserved queue custody.
+owns serialization and file writes. It materializes each typed record's JSON
+once, appends it to `metrics.jsonl`, then moves that value into the
+`progress.json` projection. History append still precedes progress publication;
+epoch and final projections follow their existing write order.
+Training submits bounded records without waiting for charts, browser delivery,
+or telemetry disk I/O. Intermediate live records can coalesce; epoch and terminal
+records have reserved queue custody.
 Contention, capacity exhaustion, or persistence failure marks history incomplete
 and is reported in the GUI while training continues. Checkpoint failures keep
 their ordinary operation-failure behavior.

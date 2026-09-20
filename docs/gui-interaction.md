@@ -253,6 +253,13 @@ summaries. Plot objects, series, and GPU buffers retain useful capacity.
 The vendored [plot widget](../third_party/iced_plot/src/plot_widget.rs) keeps
 settled view state independently of the temporary Iced widget tree. Axis labels
 sit outside the shader region, with a rotated Y title and theme-aware text.
+Cursor captions reconcile after each event's final camera and bounds changes.
+Their immutable payload is shared by pending publication, messages, and settled
+state; unchanged views reuse it, and leaving an active caption clears it once.
+The [plot shader](../third_party/iced_plot/src/plot_renderer/shader.rs) draws
+content, selection/highlights, and crosshairs in painter order within one
+chart-sized MSAA pass and resolve, followed by the existing clipped composite
+pass.
 These ownership and bounded-work properties are not measured overhead or
 throughput guarantees. Vendored
 [plot picking](../third_party/iced_plot/src/picking.rs) bounds pending GPU
@@ -278,6 +285,12 @@ These filter inputs remain mounted with stable native field identities when
 mutation is temporarily unavailable. Disabling their input callback preserves
 focus through pending filter admission and settlement. Settings and filters
 still use their owning typed mutation paths.
+
+The vendored [NumberInput](../third_party/iced_aw/src/widget/number_input.rs)
+retains its text-input and modifier child trees through diff and layout.
+Layout and widget operations share the modifier construction and reconcile
+existing child state, including row/column changes driven by padding. This
+preserves focus, selection, and editing state under the application policy above.
 
 ## Typed application boundary
 
@@ -378,6 +391,11 @@ and history. It validates peer ownership on admission, consumes stale-document
 records as cancellation, and preserves every accepted path-dependent sample.
 Peer replacement queues old-gesture cleanup before replacement input.
 
+Undo/Redo uses a directional view of the retained journal entry, then moves that
+entry to the opposite journal after admission and live-payload preparation.
+It preserves the bounded history, stored editor facts, object/element identities,
+and complete mutation payloads without constructing a reversed entry copy.
+
 ## Document commands and settlement
 
 Annotation Open, Edit, and Save execute after earlier admitted mouse records
@@ -403,6 +421,25 @@ and active GPU work. The renderer retains its active description through
 settlement and may replace the newest unsubmitted description. If output storage
 is occupied, it retains the clean baseline and pending work and arms a real
 availability notification while input progresses.
+
+The [document owner](../src/controller/subsystems/annotation/annotation_reducer.cpp)
+retains committed scene/identity content by document revision in four reusable
+immutable backings. Editor facts and gesture previews are captured separately,
+so a selection or tool change can reuse scene content while readers hold older
+descriptions. A capture after a document edit selects an available backing;
+source replacement invalidates retained content even when revision numbers coincide.
+
+The [native renderer](../src/controller/subsystems/annotation/native_annotation_algorithm.cpp)
+keeps packed mask/geometry upload content separately from each output allocation's
+semantic damage. Reuse follows actual content, packed offsets, dimensions, and
+backing capacity. Changed words upload as one enclosing range; removed or disabled
+objects invalidate their packed membership. Upload validity is restored only
+after the existing upload event settles, and pinned staging stays protected
+until then. Growth or failure requires refilling affected storage.
+Raster work intersects each object's conservative bounds with output damage,
+including mask support beyond boxes and selection handles, while preserving
+painter order. Shared flat-run rasterization enumerates only pixels admitted
+by the run and clip.
 
 Logical UI facts describe the latest committed document; rendered scene and
 frame facts describe the exact completed pixels, even when newer input has
@@ -470,6 +507,13 @@ storage while display buffers are occupied. Clean/semantic products retain both
 raw planes and use fused finalization. Completed products and front/back display
 roles can be selected without copying pixels. Allocation and logical product
 revision remain independent.
+
+Live capture and fresh/warm Upscale writers replace every active output pixel
+through `PublishRetained`, reusing storage without preparing an overwritten
+baseline. Semantic-only Upscale publications use ordinary `Publish` with clean
+plane preservation. Other partial producers retain their existing initialization
+and preservation requirements. Provider warm execution is described in
+[GPU execution](gpu-execution.md#upscale-warm-execution).
 
 Pending workspace finalization retains its completion-draining product owner.
 Even if a cross-device transfer has released its raw input read, that product
@@ -603,6 +647,15 @@ and completion notifications, including while the viewport stays still.
 During an augmentation refresh, retained clean pixels and their meaning remain
 paired until each replacement completes; see the
 [thumbnail cache rules](datasets.md#explore-thumbnails-and-atlas-residency).
+
+The [paired content owner](../src/frontend/iced/src/presentation_surface/metadata.rs)
+prepares caption data when validated image metadata is installed, then shares
+it through pending and retained display content. Detail reads its original or
+derived scene from that same immutable metadata owner. The
+[category-caption index](../src/frontend/iced/src/presentation_surface/labels.rs)
+provides constant-time lookup by catalog reference while constructing text and
+paragraphs only for referenced categories. Label visibility and class filtering
+apply during drawing and reuse this prepared content.
 
 Select, Next, Previous, and Close cancel the departed detail viewer's derived
 request while retaining the last displayed GPU frame for replacement.

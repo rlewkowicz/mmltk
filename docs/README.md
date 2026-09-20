@@ -19,25 +19,27 @@
 
 - [Architecture and source guide](architecture.md): entrypoints, native systems,
   shared Linux/image facilities, reflected CLI and persistence boundaries,
-  generated bindings, frontend components, and vendor ownership.
+  serialization ownership and lookup, generated bindings, frontend components,
+  and vendor ownership.
 - [GUI interaction and presentation](gui-interaction.md): application wire
   formats, workflow layout and navigation, the retained training dashboard,
   fixed Validation metrics/atlas, the shared image viewer and primary actions,
-  numeric editing, shared immediate mouse input, native command settlement,
-  retained Explore measurements, paired image geometry, Original aspect
-  restoration, upscaling the selected source, importing displayed images, direct/copy acquisition,
-  retained redraws, FPS, and resource lifetime.
+  retained numeric editing and captions, shared immediate mouse input, native
+  command settlement, Annotation content/damage, retained Explore measurements,
+  paired image geometry, Original aspect restoration, upscaling the selected
+  source, importing displayed images, direct/copy acquisition, retained redraws,
+  FPS, and resource lifetime.
 
 ## Data and backend systems
 
 - [Datasets and compilation](datasets.md): source annotations and provenance,
   format 8 and recompilation, Stretch/Letterbox geometry, optional perceptual
-  downscaling, loading, batch leases, and Explore thumbnail/atlas retention
-  through viewport and augmentation changes.
+  downscaling, quantized planar preparation, local batch capacity and leases,
+  and Explore thumbnail/atlas retention through viewport and augmentation changes.
 - [GPU execution and image loading](gpu-execution.md): device/NUMA placement,
   H2D and GDRCopy, reusable checkpoint/export readbacks, Vulkan allocation and
-  CUDA import, independent display/compute selection and transfers, provider
-  capture, and capability inspection.
+  CUDA import, independent display/compute selection and damage transfers,
+  Upscale warming, provider capture, and capability inspection.
 
 ## Engineering, validation, and operations
 

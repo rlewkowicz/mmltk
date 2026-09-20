@@ -119,6 +119,20 @@ The [Original viewer](gui-interaction.md#original-view-and-annotation-import)
 restores source aspect from these compiled pixels and geometry; it does not
 recover source resolution.
 
+Both compilers use `RgbImageResizer::resize_to_planar` to project packed RGB8
+into the compiled planar float canvas. Perceptual shrinking writes directly
+to those planes while preserving RGB8 quantization followed by
+`float(byte) * (1.0F / 255.0F)`. Ordinary AVIR resizing and enlargement reuse
+the resizer's byte scratch. Identity conversion and zero Letterbox padding
+retain the same pixel values.
+
+Categorical mask resizing uses the
+[shared RLE sampler](../src/backend/data/mask_rle_utils.cpp). It validates sorted
+source runs and advances through them monotonically using retained nearest-pixel
+axis lookups. Repeated source rows reuse the sampled target row. Only the target
+bitmap is materialized for the existing encoder; source bounds and foreground
+counts still come from the source runs.
+
 ## Compiled binary format
 
 The compiler writes one self-contained, versioned `.bin` file per split. It
@@ -309,6 +323,15 @@ and source order. COCO-style polygon or RLE segmentation becomes source mask
 support before resizing. Open Images `IsGroupOf` becomes crowd; its category
 MID remains distinct from the mapped class. Equal boxes are not deduplicated.
 
+Each COCO-style fill-parser worker retains its own segmentation parser, dense
+mask, and polygon-intersection capacity, resetting logical contents between
+annotations. Box-only Open Images compaction supplies absent mask storage
+without allocating an empty mask vector per annotation. These choices preserve
+annotation order, rejection accounting, and explicit mask presence.
+Download callers install transfer-progress callbacks only when an observer is
+enabled; the unobserved segmented in-flight path skips progress locking and
+clock reads.
+
 The normalized annotation-index cache has its own version-3 format and
 256-byte header, independent of the compiled format. It stores 32-byte image
 records, 64-byte annotation records, and mask RLE; incompatible cached indices
@@ -348,6 +371,14 @@ stream, producer dependencies, and exact source/destination custody. Tables
 and tightly sized working buffers are reused; cross-stream reuse follows GPU
 completion, and capacity pressure is bounded. The augmentation owner prepares
 configuration changes transactionally before admitting the new execution.
+
+CUDA retains its prepared byte-input transfer table with the backing allocation
+and establishes reuse through existing completion submissions. Float-only input
+does not prepare that table. Geometry-dependent axis tables remain separate;
+growth or failed preparation invalidates the affected reuse. Small-footprint
+accumulation traverses rows directly with the same sample and compensated-sum
+order. Large-footprint accumulation retains its strided traversal and reduction
+tree; filtering, thresholds, alpha handling, and rounding are unchanged.
 
 Compilation records the selected resampling policy in its benchmark compilation
 facts without changing downloaded source-cache identity. Recompile when changing
@@ -411,6 +442,14 @@ while retaining image order inside each chunk. A block contains at least one
 whole chunk, so its actual extent depends on batch size. Batch sharding selects
 complete batch ordinals for a rank, and `drop_last` controls the partial final
 batch.
+
+The local schedule bounds storage: slot count is the smaller of prefetch depth
+and locally scheduled batch count, retaining one control slot when that count
+is zero. Worker count also respects useful slots and eligible CPUs. Pixel
+storage and read-list reservations cover the largest locally scheduled batch;
+an empty shard prepares no pixel payload. A delivered batch's
+`image_capacity_bytes` remains its active image count times `image_stride`,
+independently of retained backing capacity.
 
 ## Why compiled loading is fast
 
@@ -476,9 +515,9 @@ cannot support it.
 Use `--prefetch-factor`, worker, CPU-affinity, and NUMA options only on commands
 that expose them; the exact surface is listed by that command's `--help`.
 Measure the real workload before increasing prefetch depth: each slot owns
-capacity for a full batch, so extra overlap also consumes more pinned or device
-memory. See [GPU-local execution](gpu-execution.md) for placement, transport,
-capability inspection, and functional GDR checks.
+capacity for the local schedule's largest batch, so additional useful slots
+consume more pinned or device memory. See [GPU-local execution](gpu-execution.md)
+for placement, transport, capability inspection, and functional GDR checks.
 
 ## Explore thumbnails and atlas residency
 

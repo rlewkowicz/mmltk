@@ -178,11 +178,24 @@ physically full destination rejects a valid next value with the typed capacity
 error; rejected input preserves its existing values.
 
 [cbor_wire.h](../src/frameworks/serialization/cbor_wire.h) owns bounded CBOR
-reading, including non-consuming lookahead across split input storage.
+reading, including non-consuming lookahead across split input storage. Owned
+text and byte decoding copies admitted payload spans directly from at most two
+input segments; borrowed decoding exposes those same ranges under its existing
+input lifetime. Owned leaf values move into their destination containers.
 [reflected_cbor_detail.h](../src/frameworks/serialization/reflected_cbor_detail.h)
-derives typed decoding and contextual key errors. Application positional
+derives typed decoding and contextual key errors. Named-object lookup uses a
+compile-time sorted index derived from materialized native declarations, with
+one lookup per incoming key. Validation still follows base/member declaration
+order, followed by the first unknown key in wire order. Opaque relations retain
+their separate wire-order decoding. Application positional
 records and named persistence retain their separate
 [wire policies](gui-interaction.md#typed-application-boundary).
+
+The browser host moves owned Bootstrap, Reply, and Event temporaries into their
+server records. CBOR encoding measures the required byte count before reserving
+output storage. Rust map decoding likewise moves its decoded key strings into
+the map. Const encoding APIs, validation limits, error precedence, and transport
+delivery policy retain their existing contracts.
 
 [gui_settings.cpp](../src/controller/contracts/gui_settings.cpp) projects
 same-name source, UI, training-target, and shared loading fields through their

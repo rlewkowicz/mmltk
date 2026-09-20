@@ -185,9 +185,42 @@ GPU-to-CPU-to-GPU pixel transfer. A cross-device route without peer access may
 use pinned host staging; explicitly enabled pixel probes also read back small
 GPU samples. These are separate from the same-GPU display path.
 
+### Display transfer coverage
+
+`ImageWorkspace` validates damage against the exact display allocation,
+initialized extent, and prior product owner/revision. Missing or incompatible
+baseline facts require a full fill. For admitted partial coverage on a different
+device, its private transfer storage copies only the clipped regions of each
+plane, retaining original coordinates and pitches for final composition.
+The pinned route packs those regions into retained per-plane staging sized for their
+combined bytes. Raw readers remain held through transfer settlement; transfer
+scratch remains held through final display completion.
+
+This partial storage stays inside the workspace finalization boundary.
+Public `ImageProductBuffer::CopyFrom` operations continue to produce complete
+receiver-owned raw products. The implementation is in
+[image_buffer.cpp](../src/frameworks/gpu/image_buffer.cpp) and
+[image_workspace.cpp](../src/frameworks/gpu/image_workspace.cpp).
+
 The [standalone CUDA/Vulkan diagnostic](validation.md#standalone-cudavulkan-diagnostic)
 exercises allocation, descriptor, timeline, pixel, and exporter-exit behavior
 without a browser. It complements packaged Wayland acceptance.
+
+## Upscale warm execution
+
+The [Upscale controller](../src/controller/subsystems/upscale/upscale_system.cpp)
+admits proactive warming once per method and passes an explicit
+`ImageUpscalerPurpose::Warm` through the native execution request. A warm request
+computes one complete image. The [ONNX runtime](../src/backend/imaging/upscale/image_upscaler_onnx.cpp) alone
+supplies any remaining executions needed to reach its three-inference graph
+readiness threshold after tiling, reusing the last valid fixed tile binding
+without another image preparation or stitch. Ordinary requests and graph-disabled
+fallback have no readiness tail.
+
+Basic, ONNX, and TensorRT keep their existing arithmetic, storage, cancellation,
+and completion rules. TensorRT records a final completion event and consumer
+wait for each touched lane, including a lane that reached only preparation
+before cancellation; its stream orders repeated use of that lane's fixed buffers.
 
 ## ONNX capture and verification storage
 
