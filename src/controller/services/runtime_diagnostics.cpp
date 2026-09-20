@@ -74,8 +74,9 @@ class BoundedJsonWriter final {
         if (!field_prefix(wrote_field) || !append("\"name\":") || !string(event)) { return false; }
         return append("}}");
     }
-    [[nodiscard]] bool benchmark_event(const std::string_view event, const std::string_view json_fields) noexcept {
-        return append("{\"kind\":\"benchmark_dataset\",\"name\":") && string(event) && append(",\"fields\":") && append(json_fields) && append("}");
+    [[nodiscard]] bool benchmark_event(const std::string_view event, const std::string_view json_fields, const std::int64_t steady_ns) noexcept {
+        return append("{\"kind\":\"benchmark_dataset\",\"steady_ns\":") && integer(steady_ns) && append(",\"name\":") && string(event) &&
+               append(",\"fields\":") && append(json_fields) && append("}");
     }
     [[nodiscard]] std::string_view view() const noexcept { return {destination_.data(), size_}; }
 
@@ -402,7 +403,8 @@ void RuntimeDiagnosticTarget::State::write_benchmark_trace(const std::string_vie
         }
         std::array<char, DiagnosticsClient::kRecordCapacity> record;
         BoundedJsonWriter writer{record};
-        if (!writer.benchmark_event(event, json_fields)) {
+        const auto steady_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (!writer.benchmark_event(event, json_fields, steady_ns)) {
             fail_delivery();
             return;
         }

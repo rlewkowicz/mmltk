@@ -575,9 +575,11 @@ TEST_CASE("runtime diagnostics owns bounded benchmark trace JSONL", "[gui][servi
     RuntimeDiagnostics runtime{diagnostics.producer()};
     const auto target = runtime.target();
     REQUIRE(target.benchmark_trace_enabled());
+    const auto before = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     target.write_benchmark_trace("benchmark.publication.complete", R"({"output":"/tmp/compiled","train_images":100})");
     target.write_benchmark_trace("benchmark.publication.complete", "{\n\"train_images\":100}");
     target.write_benchmark_trace("benchmark.publication.complete", R"({"train_images":})");
+    target.write_benchmark_trace("benchmark.publication.complete", nlohmann::json{{"payload", std::string(DiagnosticsClient::kRecordCapacity, 'x')}}.dump());
     CHECK(diagnostics.counters().accepted == 1U);
     diagnostics.flush();
     std::array<char, DiagnosticsClient::kRecordCapacity> record{};
@@ -587,6 +589,9 @@ TEST_CASE("runtime diagnostics owns bounded benchmark trace JSONL", "[gui][servi
     CHECK(jsonl.contains(R"("kind":"benchmark_dataset")"));
     CHECK(jsonl.contains(R"("name":"benchmark.publication.complete")"));
     CHECK(jsonl.contains(R"("train_images":100)"));
+    const auto timestamp = nlohmann::json::parse(jsonl).at("steady_ns").get<std::int64_t>();
+    CHECK(timestamp >= before);
+    CHECK(timestamp <= std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
     diagnostics.close(DiagnosticsCloseMode::Discard);
 }
 TEST_CASE("diagnostics close publishes one synchronous owner terminal for manual clients", "[gui][services]") {

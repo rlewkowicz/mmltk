@@ -41,6 +41,7 @@ function(mmltk_add_controller_shell_tests)
         mmltk_controller_shell_tests
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/application_lifecycle_contract.test.cpp
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/upscale_explore_wiring.test.cpp
+        ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/dataset_wiring.test.cpp
     )
     mmltk_configure_component(
         mmltk_controller_shell_tests PRIVATE_DECLARATIONS)
@@ -57,6 +58,9 @@ function(mmltk_add_controller_shell_tests)
         mmltk::controller::contracts
         mmltk::controller::shell
         mmltk_frameworks_gpu_test_support
+        mmltk::controller::direct_services
+        nlohmann_json
+        CUDA::cudart
     )
     catch_discover_tests(
         mmltk_controller_shell_tests

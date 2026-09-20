@@ -6,8 +6,8 @@
 #include "src/common/concurrency/event_cancellation.h"
 namespace mmltk::controller {
 ArtifactDatasetRuntime::ArtifactDatasetRuntime() = default;
-ArtifactDatasetRuntime::ArtifactDatasetRuntime(services::ArtifactStore store, services::ArtifactDiagnosticObserver diagnostics)
-    : store_(std::move(store)), diagnostics_(diagnostics) {}
+ArtifactDatasetRuntime::ArtifactDatasetRuntime(services::ArtifactStore store, services::RuntimeDiagnosticTarget diagnostics)
+    : store_(std::move(store)), diagnostics_(std::move(diagnostics)) {}
 services::ArtifactCompileResult ArtifactDatasetRuntime::Compile(const services::ArtifactCompileRequest& request, const std::stop_token stop,
                                                                 const std::function<void(const contracts::ArtifactProgress&)>& progress) {
     mmltk::common::concurrency::ScopedEventCancellation<services::ArtifactCancellationSource> cancellation{stop};
@@ -17,7 +17,16 @@ services::ArtifactCompileResult ArtifactDatasetRuntime::Compile(const services::
                                                         (*static_cast<std::function<void(const contracts::ArtifactProgress&)>*>(context))(value);
                                                     } catch (...) {}
                                                 }};
-    return store_.compile(request, cancellation.token(), observer, diagnostics_);
+    services::ArtifactDiagnosticObserver diagnostics;
+    if (diagnostics_.benchmark_trace_enabled()) {
+        diagnostics.benchmark = {
+            .context = &diagnostics_,
+            .report = [](const void* context, const std::string_view event, const std::string_view fields) noexcept {
+                static_cast<const services::RuntimeDiagnosticTarget*>(context)->write_benchmark_trace(event, fields);
+            },
+        };
+    }
+    return store_.compile(request, cancellation.token(), observer, diagnostics);
 }
 contracts::ArtifactInspection ArtifactDatasetRuntime::Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>& paths,
                                                               const std::string_view preset, const std::uint32_t resolution, const std::stop_token stop) {

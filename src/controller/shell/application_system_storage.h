@@ -11,6 +11,7 @@
 #include "src/controller/contracts/application_systems.h"
 #include "src/controller/presentation/visual_diagnostics.h"
 #include "src/controller/presentation/visual_runtime.h"
+#include "src/controller/services/runtime_diagnostics.h"
 #include "src/frameworks/gpu/device_execution.h"
 namespace mmltk::controller::shell {
 struct ApplicationSystemConfiguration final {
@@ -25,6 +26,7 @@ struct ApplicationSystemConfiguration final {
     services::FileDialogClient file_dialog{};
     services::VastProviderClient provider{};
     std::filesystem::path training_executable{};
+    services::RuntimeDiagnosticTarget dataset_diagnostics{};
 };
 [[nodiscard]] std::unique_ptr<ExploreSystem> make_shell_explore_system(SettingsSystem&, const ApplicationSystemConfiguration&,
                                                                        const mmltk::frameworks::gpu::DeviceExecution&,

@@ -12,6 +12,7 @@
 #include "src/controller/contracts/application_boundary.h"
 #include "src/controller/contracts/artifact.h"
 #include "src/controller/services/artifact_store.h"
+#include "src/controller/services/runtime_diagnostics.h"
 #include "src/controller/services/settings_system.h"
 #include "src/controller/runtime/local_run.h"
 namespace mmltk::controller {
@@ -35,7 +36,7 @@ class DatasetRuntime {
 class ArtifactDatasetRuntime final : public DatasetRuntime {
    public:
     ArtifactDatasetRuntime();
-    explicit ArtifactDatasetRuntime(services::ArtifactStore, services::ArtifactDiagnosticObserver = {});
+    explicit ArtifactDatasetRuntime(services::ArtifactStore, services::RuntimeDiagnosticTarget = {});
     [[nodiscard]] services::ArtifactCompileResult Compile(const services::ArtifactCompileRequest&, std::stop_token,
                                                           const std::function<void(const contracts::ArtifactProgress&)>&) override;
     [[nodiscard]] contracts::ArtifactInspection Inspect(const std::array<std::filesystem::path, contracts::kArtifactSplitCapacity>&, std::string_view,
@@ -43,7 +44,7 @@ class ArtifactDatasetRuntime final : public DatasetRuntime {
 
    private:
     services::ArtifactStore store_;
-    services::ArtifactDiagnosticObserver diagnostics_{};
+    services::RuntimeDiagnosticTarget diagnostics_{};
 };
 class DatasetSystem final {
    public:
