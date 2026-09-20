@@ -1140,6 +1140,8 @@ TEST_CASE("Native annotation raster retains allocation damage and exact mask-tra
                     auto invalid = semantic;
                     invalid.descriptor.pitch_bytes = 0U;
                     REQUIRE_THROWS_AS(algorithm.Render(description, input.plane(0U).plane(), clean, invalid, stream), std::runtime_error);
+                    // Consume the deliberately injected runtime error before the independent valid retry.
+                    REQUIRE(cudaGetLastError() == cudaErrorInvalidValue);
                 }
                 algorithm.Render(description, input.plane(0U).plane(), clean, semantic, stream);
             });

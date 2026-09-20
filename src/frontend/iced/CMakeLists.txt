@@ -193,6 +193,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             "${MMLTK_CARGO_EXECUTABLE}" test
             --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
             --package iced_aw
+            --lib
             --no-default-features
             --features number_input,selection_list
             --locked
@@ -224,6 +225,7 @@ if(BUILD_MMLTK_BROWSER_APP AND BUILD_RFDETR_NATIVE)
             "${MMLTK_CARGO_EXECUTABLE}" test
             --manifest-path "${MMLTK_FRONTEND_ICED_SOURCE_DIR}/Cargo.toml"
             --package iced_aw
+            --lib
             --no-default-features
             --features number_input,selection_list
             --locked

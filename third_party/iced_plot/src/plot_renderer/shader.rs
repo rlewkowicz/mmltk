@@ -1778,6 +1778,69 @@ fn chart_composite_region(physical: Rectangle, window: Rectangle) -> Option<([f3
 #[cfg(test)]
 mod retained_target_tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn encode_layered_fixture_reference(renderer: &PlotRenderer, params: RenderParams) {
+        // Reproduce the three separate passes from 427b5dd5 for this fixed
+        // fill/selection/highlight/crosshair fixture, without draw_in_pass.
+        let targets = renderer.msaa_targets.as_ref().unwrap();
+        let (_, visible) = renderer.composite_region.unwrap();
+        for layer in 0..3 {
+            let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("prior chart layer reference"),
+                color_attachments: &[Some(msaa_attachment(targets,
+                    if layer == 0 { LoadOp::Clear(Color::TRANSPARENT) } else { LoadOp::Load }))],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            pass.set_viewport(0.0, 0.0, targets.width as f32, targets.height as f32, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, targets.width, targets.height);
+            match layer {
+                0 => {
+                    renderer.grid.draw(&mut pass, &renderer.camera_bind_group);
+                    pass.set_pipeline(renderer.pipelines.fill.as_ref().unwrap());
+                    pass.set_bind_group(0, &renderer.camera_bind_group, &[]);
+                    let fill = renderer.buffers.fills.as_ref().unwrap();
+                    pass.set_vertex_buffer(0, fill.buffer.slice(..));
+                    pass.draw(0..fill.vertex_count, 0..1);
+                }
+                1 => {
+                    pass.set_pipeline(renderer.pipelines.overlay.as_ref().unwrap());
+                    let selection = renderer.buffers.selection.as_ref().unwrap();
+                    pass.set_vertex_buffer(0, selection.buffer.slice(..));
+                    pass.draw(0..selection.vertex_count, 0..1);
+                    let highlight = renderer.buffers.highlight.as_ref().unwrap();
+                    pass.set_vertex_buffer(0, highlight.buffer.slice(..));
+                    for quad in 0..highlight.vertex_count / 4 {
+                        pass.draw(quad * 4..(quad + 1) * 4, 0..1);
+                    }
+                }
+                _ => {
+                    pass.set_pipeline(renderer.pipelines.line_overlay.as_ref().unwrap());
+                    let crosshairs = renderer.buffers.crosshairs.as_ref().unwrap();
+                    pass.set_vertex_buffer(0, crosshairs.buffer.slice(..));
+                    pass.draw(0..crosshairs.vertex_count, 0..1);
+                }
+            }
+        }
+        let mut pass = params.encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("prior chart composite reference"),
+            color_attachments: &[Some(target_attachment(params.target))],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+        pass.set_viewport(visible.x, visible.y, visible.width, visible.height, 0.0, 1.0);
+        pass.set_scissor_rect(params.clip_bounds.x, params.clip_bounds.y,
+            params.clip_bounds.width, params.clip_bounds.height);
+        pass.set_pipeline(renderer.pipelines.composite.as_ref().unwrap());
+        pass.set_bind_group(0, &targets.composite_bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn chart_single_resolve_preserves_layer_colors_alpha_and_clip_guards() {
@@ -1799,63 +1862,115 @@ mod retained_target_tests {
         renderer.prepare_frame(&device, &queue, &viewport, &state.bounds, &state);
         assert_eq!(MSAA_SAMPLE_COUNT, 4);
         renderer.ensure_fill_pipeline(&device);
-        // Constant interior colors deliberately separate draw order from edges,
-        // line antialiasing, camera projection, and text rasterization.
-        let vertices = |positions: &[[f32; 2]], color: [f32; 4]| {
-            let mut values = Vec::new();
-            for position in positions { values.extend_from_slice(position); values.extend_from_slice(&color); }
-            values
-        };
-        let fill = vertices(&[[-0.75, -0.75], [0.75, -0.75], [-0.75, 0.75],
-            [-0.75, 0.75], [0.75, -0.75], [0.75, 0.75]], [1.0, 0.0, 0.0, 0.5]);
-        VertexBuffer::upload(&mut renderer.buffers.fills, &device, &queue, bytemuck::cast_slice(&fill), 6);
-        let selection = vertices(&[[-0.5, 0.5], [0.5, 0.5], [-0.5, -0.5], [0.5, -0.5]], [0.0, 1.0, 0.0, 0.5]);
-        VertexBuffer::upload(&mut renderer.buffers.selection, &device, &queue, bytemuck::cast_slice(&selection), 4);
-        let highlight = vertices(&[[-0.25, 0.25], [0.25, 0.25], [-0.25, -0.25], [0.25, -0.25]], [0.0, 0.0, 1.0, 0.5]);
-        VertexBuffer::upload(&mut renderer.buffers.highlight, &device, &queue, bytemuck::cast_slice(&highlight), 4);
-        let crosshairs = vertices(&[[0.015625, -0.75], [0.015625, 0.75], [-0.75, -0.015625], [0.75, -0.015625]], [1.0, 1.0, 1.0, 0.5]);
-        VertexBuffer::upload(&mut renderer.buffers.crosshairs, &device, &queue, bytemuck::cast_slice(&crosshairs), 4);
-        let target = create_color_texture(&device, "plot color fixture", 64, 64, 1, format,
-            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC);
+        // Fractional-alpha pixels must match the prior GPU sequence exactly.
+        // Opaque interiors also retain fixed independent color/order expectations.
+        let target = create_color_texture(
+            &device, "plot color fixture", 64, 64, 1, format,
+            TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        );
         let view = target.create_view(&Default::default());
         let readback = device.create_buffer(&BufferDescriptor {
-            label: Some("plot color pixels"), size: 64 * 256,
-            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ, mapped_at_creation: false,
+            label: Some("plot color pixels"),
+            size: 64 * 256,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
         });
-        let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let _clear = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("plot fixture clear"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view, resolve_target: None, depth_slice: None,
-                    ops: Operations { load: LoadOp::Clear(Color::TRANSPARENT), store: StoreOp::Store },
-                })], depth_stencil_attachment: None, timestamp_writes: None,
-                occlusion_query_set: None, multiview_mask: None,
-            });
-        }
-        renderer.encode(RenderParams { encoder: &mut encoder, target: &view,
-            clip_bounds: &Rectangle { x: 10, y: 10, width: 44, height: 44 } });
-        encoder.copy_texture_to_buffer(target.as_image_copy(), TexelCopyBufferInfo {
-            buffer: &readback, layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(64) },
-        }, Extent3d { width: 64, height: 64, depth_or_array_layers: 1 });
-        let _ = queue.submit([encoder.finish()]);
-        let (send, receive) = std::sync::mpsc::channel();
-        readback.slice(..).map_async(MapMode::Read, move |result| send.send(result).unwrap());
-        device.poll(PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(5)) }).unwrap();
-        receive.recv().unwrap().unwrap();
-        let pixels = readback.slice(..).get_mapped_range();
-        let pixel = |x: usize, y: usize| &pixels[(y * 64 + x) * 4..(y * 64 + x + 1) * 4];
-        for (x, y, expected) in [(12, 12, [128, 0, 0, 128]), (20, 20, [64, 128, 0, 192]),
-            (28, 28, [32, 64, 128, 224]), (32, 28, [144, 160, 192, 240]), (32, 32, [200, 208, 224, 248])] {
-            assert_eq!(pixel(x, y), expected, "interior at {x},{y}");
-        }
-        for y in 0..64 { for x in 0..64 {
-            if !(10..54).contains(&x) || !(10..54).contains(&y) {
-                assert_eq!(pixel(x, y), [0, 0, 0, 0], "untouched clip guard at {x},{y}");
+        let vertices = |positions: &[[f32; 2]], color: [f32; 4]| {
+            let mut values = Vec::new();
+            for position in positions {
+                values.extend_from_slice(position);
+                values.extend_from_slice(&color);
             }
-        } }
-        drop(pixels);
-        readback.unmap();
+            values
+        };
+        for alpha in [0.5, 1.0] {
+            let fill = vertices(
+                &[[-0.75, -0.75], [0.75, -0.75], [-0.75, 0.75],
+                  [-0.75, 0.75], [0.75, -0.75], [0.75, 0.75]],
+                [1.0, 0.0, 0.0, alpha],
+            );
+            VertexBuffer::upload(&mut renderer.buffers.fills, &device, &queue, bytemuck::cast_slice(&fill), 6);
+            let selection = vertices(
+                &[[-0.5, 0.5], [0.5, 0.5], [-0.5, -0.5], [0.5, -0.5]],
+                [0.0, 1.0, 0.0, alpha],
+            );
+            VertexBuffer::upload(&mut renderer.buffers.selection, &device, &queue, bytemuck::cast_slice(&selection), 4);
+            let highlight = vertices(
+                &[[-0.25, 0.25], [0.25, 0.25], [-0.25, -0.25], [0.25, -0.25]],
+                [0.0, 0.0, 1.0, alpha],
+            );
+            VertexBuffer::upload(&mut renderer.buffers.highlight, &device, &queue, bytemuck::cast_slice(&highlight), 4);
+            let crosshairs = vertices(
+                &[[0.015625, -0.75], [0.015625, 0.75], [-0.75, -0.015625], [0.75, -0.015625]],
+                [1.0, 1.0, 1.0, alpha],
+            );
+            VertexBuffer::upload(&mut renderer.buffers.crosshairs, &device, &queue, bytemuck::cast_slice(&crosshairs), 4);
+            let render_pixels = |prior: bool| {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let _clear = encoder.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("plot fixture clear"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: Operations { load: LoadOp::Clear(Color::TRANSPARENT), store: StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
+                let clip_bounds = Rectangle { x: 10, y: 10, width: 44, height: 44 };
+                let params = RenderParams { encoder: &mut encoder, target: &view, clip_bounds: &clip_bounds };
+                if prior {
+                    encode_layered_fixture_reference(&renderer, params);
+                } else {
+                    renderer.encode(params);
+                }
+                encoder.copy_texture_to_buffer(target.as_image_copy(), TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(64) },
+                }, Extent3d { width: 64, height: 64, depth_or_array_layers: 1 });
+                let _ = queue.submit([encoder.finish()]);
+                let (send, receive) = std::sync::mpsc::channel();
+                readback.slice(..).map_async(MapMode::Read, move |result| send.send(result).unwrap());
+                device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(5)),
+                }).unwrap();
+                receive.recv().unwrap().unwrap();
+                let pixels = readback.slice(..).get_mapped_range().to_vec();
+                readback.unmap();
+                pixels
+            };
+            let reference = render_pixels(true);
+            let pixels = render_pixels(false);
+            assert_eq!(pixels.len(), reference.len());
+            for (index, (actual, expected)) in pixels.chunks_exact(4).zip(reference.chunks_exact(4)).enumerate() {
+                assert_eq!(actual, expected, "prior-sequence pixel at {},{} with alpha {alpha}", index % 64, index / 64);
+            }
+            let pixel = |x: usize, y: usize| &pixels[(y * 64 + x) * 4..(y * 64 + x + 1) * 4];
+            if alpha == 1.0 {
+                for (x, y, expected) in [
+                    (12, 12, [255, 0, 0, 255]),
+                    (20, 20, [0, 255, 0, 255]),
+                    (28, 28, [0, 0, 255, 255]),
+                    (32, 28, [255, 255, 255, 255]),
+                    (32, 32, [255, 255, 255, 255]),
+                ] {
+                    assert_eq!(pixel(x, y), expected, "opaque interior at {x},{y}");
+                }
+            }
+            for y in 0..64 {
+                for x in 0..64 {
+                    if !(10..54).contains(&x) || !(10..54).contains(&y) {
+                        assert_eq!(pixel(x, y), [0, 0, 0, 0], "untouched clip guard at {x},{y}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

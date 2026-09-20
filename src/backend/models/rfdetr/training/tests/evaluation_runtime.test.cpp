@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers.hpp>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime_api.h>
 #include <atomic>
 #include <exception>
 #include <future>
@@ -77,6 +78,8 @@ TEST_CASE("Evaluation encoding collection joins a running sibling after a consum
 }
 TEST_CASE("Evaluation staging preserves categories beyond the per-category evaluator cap", "[rfdetr][evaluation][gpu]") {
     const auto device = torch::Device(torch::kCUDA, 0);
+    // Bind the driver context even when earlier cases initialized LibTorch's stream pool.
+    REQUIRE(cudaSetDevice(0) == cudaSuccess);
     const auto stream = c10::cuda::getStreamFromPool(false, 0);
     const c10::cuda::CUDAStreamGuard stream_guard(stream);
     auto slots = std::make_shared<PredictionBufferSlotPool>(1, PredictionBufferConfig{1, 3, std::nullopt, 0});

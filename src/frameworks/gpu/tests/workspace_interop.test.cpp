@@ -1491,7 +1491,7 @@ TEST_CASE("Late workspace admission preserves raw storage then aliases the next 
     auto completed = runtime.Completed();
     const auto raw = runtime.Borrow().plane(0U).plane().data;
     auto workspace = ImageWorkspace::Create(display, layout);
-    CHECK_THROWS(workspace->Admit(workspace->identity(), 8U));
+    CHECK_THROWS_AS(workspace->Admit(workspace->identity(), layout.device_incarnation + 1U), std::invalid_argument);
     auto descriptor = allocation->Export();
     REQUIRE(descriptor.get() >= 0);
     mmltk::common::io::ScopedFd transferred(descriptor.release());
