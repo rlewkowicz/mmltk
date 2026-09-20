@@ -110,6 +110,49 @@ pub(super) fn primary_action_measured(control: String, token: u32, bounds: [Rect
     let _ = (control, token, bounds);
 }
 
+// Inspect the current tree: accumulated draw observations cannot prove absence.
+pub(super) fn benchmark_visibility(
+    index: usize,
+    enabled: bool,
+    dataset: crate::generated::BenchmarkDatasetVariant,
+    revision: u64,
+) -> iced::Task<crate::message::Message> {
+    if !reporting_enabled() {
+        return iced::Task::none();
+    }
+    use crate::view::train;
+    let validation = enabled && dataset == crate::generated::BenchmarkDatasetVariant::Coconut;
+    iced::Task::batch(
+        [
+            (train::BENCHMARK_CUSTOM_ID, enabled),
+            (train::BENCHMARK_COCONUT_ID, enabled),
+            (train::COCONUT_VALIDATION_ID, validation),
+            (train::STOCK_VALIDATION_ID, validation),
+            (train::COCONUT_STOCK_ID, validation),
+        ]
+        .into_iter()
+        .map(move |(control, expected)| {
+            super::widget_ops::measure_control(control.to_owned()).then(move |bounds| {
+                emit(|sink| {
+                    let present = bounds.target.width > 0.0 && bounds.target.height > 0.0;
+                    sink.record(
+                        "integration.benchmark_visibility",
+                        control,
+                        "current-tree",
+                        [
+                            index as f64,
+                            expected as u8 as f64,
+                            present as u8 as f64,
+                            revision as f64,
+                        ],
+                    );
+                });
+                iced::Task::none()
+            })
+        }),
+    )
+}
+
 pub(super) fn primary_page(page: FeatureId, scale: f32) {
     if !reporting_enabled() {
         return;
@@ -984,6 +1027,87 @@ mod tests {
     use crate::view::explore;
     use iced::Rectangle;
     use std::cell::Cell;
+
+    #[test]
+    fn benchmark_visibility_gates_tasks_and_measures_current_presence_and_absence() {
+        use crate::generated::BenchmarkDatasetVariant::{CocoCustom, Coconut};
+        use crate::view::train;
+        use iced::advanced::widget::Id;
+        use iced::futures::StreamExt;
+
+        let controls = [
+            train::BENCHMARK_CUSTOM_ID,
+            train::BENCHMARK_COCONUT_ID,
+            train::COCONUT_VALIDATION_ID,
+            train::STOCK_VALIDATION_ID,
+            train::COCONUT_STOCK_ID,
+        ];
+        for reporting in [false, true] {
+            let capture = Capture::new(reporting);
+            let driver = Controller::new(
+                true,
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                "quiet".into(),
+            );
+            assert!(driver.driver.running());
+            for (enabled, dataset, present_count) in [
+                (true, Coconut, 5),
+                (true, CocoCustom, 2),
+                (false, Coconut, 0),
+                // Deliberately inconsistent tree: evidence must measure it,
+                // rather than manufacture presence from the selection.
+                (true, Coconut, 1),
+            ] {
+                let task = super::benchmark_visibility(4, enabled, dataset, 73);
+                let actions = iced_runtime::task::into_stream(task);
+                if !reporting {
+                    assert!(actions.is_none());
+                    assert!(capture.records().is_empty());
+                    continue;
+                }
+                let mut actions = actions.unwrap();
+                let mut measurements = 0;
+                while let Some(action) = iced::futures::executor::block_on(actions.next()) {
+                    let iced_runtime::Action::Widget(mut operation) = action else {
+                        panic!("passive visibility must schedule only widget measurements");
+                    };
+                    // Exercise the real measurement operation with this current
+                    // tree's containers, including missing controls.
+                    operation.traverse(&mut |operation| {
+                        for control in &controls[..present_count] {
+                            operation.container(
+                                Some(&Id::from(*control)),
+                                Rectangle::new(iced::Point::ORIGIN, iced::Size::new(80.0, 24.0)),
+                            );
+                        }
+                    });
+                    let _ = operation.finish();
+                    measurements += 1;
+                }
+                assert_eq!(measurements, 5);
+                let records = capture.records();
+                assert_eq!(records.len(), 5);
+                for (position, control) in controls.iter().enumerate() {
+                    let matching = records
+                        .iter()
+                        .filter(|record| record.1 == *control)
+                        .collect::<Vec<_>>();
+                    assert_eq!(matching.len(), 1);
+                    let record = matching[0];
+                    assert_eq!(record.0, "integration.benchmark_visibility");
+                    assert_eq!(record.2, "current-tree");
+                    let expected = enabled && (position < 2 || dataset == Coconut);
+                    assert_eq!(
+                        record.3,
+                        [4.0, expected as u8 as f64, (position < present_count) as u8 as f64, 73.0],
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn snapshot_conflict_reporting_projects_fields_and_retains_installed_state() {

@@ -721,7 +721,7 @@ impl State {
                     if !unchanged { driver.fail("disabled benchmark source control changed state"); return Task::none(); }
                     reporting::emit(|sink| sink.record("integration.benchmark_inactive", DATASET_BROWSE, "unchanged", [7.0, 1.0, snapshot.revision as f64, 0.0]));
                 }
-                let visibility = benchmark_visibility(index, enabled, selection.dataset, snapshot.revision);
+                let visibility = reporting::benchmark_visibility(index, enabled, selection.dataset, snapshot.revision);
                 if index == 11 {
                     self.perceptual_baseline = perceptual_control_values(&settings.draft.as_ref().unwrap().workflows.train);
                     driver.phase = Phase::PerceptualControl(0);
@@ -1583,19 +1583,152 @@ pub(super) const ERROR_COPY: &str = crate::view::error_modal::COPY_ID;
 
 pub(super) const ERROR_DISMISS: &str = crate::view::error_modal::DISMISS_ID;
 
-// Inspect the current widget tree: cumulative rendered-control observations cannot prove absence.
-fn benchmark_visibility(index: usize, enabled: bool, dataset: crate::generated::BenchmarkDatasetVariant, revision: u64) -> Task<RootMessage> {
-    let validation = enabled && dataset == crate::generated::BenchmarkDatasetVariant::Coconut;
-    Task::batch([
-        (train::BENCHMARK_CUSTOM_ID, enabled), (train::BENCHMARK_COCONUT_ID, enabled),
-        (train::COCONUT_VALIDATION_ID, validation), (train::STOCK_VALIDATION_ID, validation),
-        (train::COCONUT_STOCK_ID, validation),
-    ].into_iter().map(move |(control, expected)| {
-        widget_ops::measure_control(control.to_owned()).then(move |bounds| {
-            let present = bounds.target.width > 0.0 && bounds.target.height > 0.0;
-            reporting::emit(|sink| sink.record("integration.benchmark_visibility", control, "current-tree",
-                [index as f64, expected as u8 as f64, present as u8 as f64, revision as f64]));
-            Task::<RootMessage>::none()
-        })
-    }))
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generated::{
+        BenchmarkDatasetSelection, BenchmarkDatasetVariant as Dataset,
+        CoconutValidation as Validation,
+    };
+    use crate::integration_control::Controller;
+    use iced::futures::StreamExt;
+
+    #[test]
+    fn quiet_benchmark_settlement_advances_all_choices_and_arms_perceptual_handoff() {
+        let capture = reporting::Capture::new(false);
+        for baseline in [false, true] {
+            for dataset in [Dataset::CocoCustom, Dataset::Coconut] {
+                for validation in [
+                    Validation::Coconut,
+                    Validation::Stock,
+                    Validation::CoconutStock,
+                ] {
+                    let mut controller = Controller::new(
+                        true,
+                        false,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        "quiet".into(),
+                    );
+                    assert!(controller.driver.running());
+                    let original = BenchmarkDatasetSelection { dataset, validation };
+                    controller.lifecycle.benchmark_baseline = baseline;
+                    controller.lifecycle.benchmark_selection = Some(original.clone());
+                    let mut model = crate::view_model::test_support::bootstrapped();
+                    let mut settings = crate::view::settings::SettingsModel::default();
+                    let choices = [
+                        (true, dataset, validation),
+                        (true, Dataset::Coconut, validation),
+                        (true, Dataset::Coconut, Validation::Stock),
+                        (true, Dataset::Coconut, Validation::CoconutStock),
+                        (true, Dataset::Coconut, Validation::Coconut),
+                        (true, Dataset::CocoCustom, Validation::Coconut),
+                        (true, Dataset::Coconut, Validation::Coconut),
+                        (true, Dataset::Coconut, Validation::Coconut),
+                        (true, Dataset::Coconut, validation),
+                        (true, dataset, validation),
+                        (baseline, dataset, validation),
+                        (false, dataset, validation),
+                    ];
+                    controller.driver.phase = Phase::BenchmarkChoice(0);
+                    for (index, (enabled, dataset, validation)) in choices.into_iter().enumerate() {
+                        assert_eq!(controller.driver.phase, Phase::BenchmarkChoice(index));
+                        settings.install(model.settings_snapshot.as_ref().unwrap());
+                        drop(controller.lifecycle.advance_lifecycle(
+                            &mut controller.driver,
+                            &mut controller.widgets,
+                            &model,
+                            &settings,
+                            1.0,
+                            FeatureId::Train,
+                        ));
+                        // Real clicks/native replies are covered by packaged
+                        // acceptance. Here settle the native result and exercise
+                        // the ordinary lifecycle transition with reporting off.
+                        controller.widgets.location_completed();
+                        controller.driver.phase = Phase::AwaitBenchmarkChoice(index);
+                        let snapshot = model.settings_snapshot.as_mut().unwrap();
+                        if index != 7 {
+                            snapshot.revision += 1;
+                        }
+                        let train = &mut snapshot.settingsstate.workflows.train;
+                        train.compilebenchmarkdatasetoverride = !enabled;
+                        train.benchmarkselection = BenchmarkDatasetSelection {
+                            dataset,
+                            validation,
+                        };
+                        settings.install(snapshot);
+                        let waiting = controller.lifecycle.advance_lifecycle(
+                            &mut controller.driver,
+                            &mut controller.widgets,
+                            &model,
+                            &settings,
+                            1.0,
+                            FeatureId::Train,
+                        );
+                        assert!(iced_runtime::task::into_stream(waiting).is_none());
+                        assert_eq!(controller.driver.phase, Phase::AwaitBenchmarkChoice(index));
+                        let snapshot = model.settings_snapshot.as_mut().unwrap();
+                        snapshot
+                            .settingsstate
+                            .workflows
+                            .train
+                            .compilebenchmarkdatasetoverride = enabled;
+                        settings.install(snapshot);
+                        let task = controller.lifecycle.advance_lifecycle(
+                            &mut controller.driver,
+                            &mut controller.widgets,
+                            &model,
+                            &settings,
+                            1.0,
+                            FeatureId::Train,
+                        );
+                        if index == 11 {
+                            assert_eq!(controller.driver.phase, Phase::PerceptualControl(0));
+                            assert!(controller.widgets.location_pending());
+                            let mut actions = iced_runtime::task::into_stream(task).unwrap();
+                            let mut located = 0;
+                            while let Some(action) = iced::futures::executor::block_on(actions.next()) {
+                                match action {
+                                    iced_runtime::Action::Widget(operation) => {
+                                        let _ = operation.finish();
+                                    }
+                                    iced_runtime::Action::Output(RootMessage::Integration(
+                                        crate::integration_control::Message::Scoped { message, .. },
+                                    )) => {
+                                        let crate::integration_control::Message::Located { control, .. } = *message else {
+                                            panic!("handoff must locate the first perceptual control");
+                                        };
+                                        assert_eq!(control, perceptual_control_id(0));
+                                        located += 1;
+                                    }
+                                    _ => panic!("unexpected perceptual handoff task"),
+                                }
+                            }
+                            assert_eq!(located, 1);
+                            assert_eq!(
+                                controller.lifecycle.perceptual_baseline,
+                                perceptual_control_values(
+                                    &settings.draft.as_ref().unwrap().workflows.train,
+                                ),
+                            );
+                        } else {
+                            assert_eq!(controller.driver.phase, Phase::BenchmarkChoice(index + 1));
+                            assert!(!controller.widgets.location_pending());
+                            assert!(iced_runtime::task::into_stream(task).is_none());
+                        }
+                        if index >= 10 {
+                            assert_eq!(
+                                settings.draft.as_ref().unwrap().workflows.train.benchmarkselection,
+                                original,
+                            );
+                        }
+                        assert!(controller.driver.reporting.state_is_absent());
+                        assert!(capture.records().is_empty());
+                    }
+                }
+            }
+        }
+    }
 }
